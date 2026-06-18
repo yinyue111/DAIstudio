@@ -1,0 +1,36 @@
+[project]
+name = "ai-studio-backend"
+version = "1.0.0"
+description = "Internal AI image/video generation platform — FastAPI backend"
+requires-python = ">=3.10"
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+# Alembic migration scripts are generated/boilerplate; the local venv isn't ours.
+extend-exclude = ["alembic/versions", ".venv", "storage"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "C4"]
+ignore = [
+    "B008",   # function call (Depends()/Header()) in argument default — idiomatic FastAPI
+    "E501",   # line length is enforced via formatter, not as a hard error
+    "UP038",  # isinstance((X, Y)) tuple form is fine
+    "B904",   # raise ... from — API handlers deliberately translate domain errors
+              # into HTTPException; chaining the original is noise here
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["E501", "F401", "B011"]
+"app/celery_app.py" = ["E402", "F401"]  # task import must follow app creation
+
+[tool.ruff.lint.isort]
+known-first-party = ["app"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+filterwarnings = [
+    "ignore::DeprecationWarning",
+    "ignore::UserWarning",
+]

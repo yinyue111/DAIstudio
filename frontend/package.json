@@ -1,0 +1,27 @@
+{
+  "name": "ai-studio-frontend",
+  "version": "0.1.0",
+  "private": true,
+  "engines": {
+    "node": ">=20.9.0"
+  },
+  "scripts": {
+    "dev": "next dev --webpack -p 3000",
+    "build": "next build --webpack",
+    "start": "next start -p 3000"
+  },
+  "dependencies": {
+    "next": "16.2.9",
+    "qrcode": "^1.5.4",
+    "react": "18.3.1",
+    "react-dom": "18.3.1"
+  },
+  "devDependencies": {
+    "autoprefixer": "10.4.19",
+    "postcss": "8.5.15",
+    "tailwindcss": "3.4.6"
+  },
+  "overrides": {
+    "postcss": "8.5.15"
+  }
+}

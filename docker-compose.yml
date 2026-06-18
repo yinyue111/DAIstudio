@@ -1,0 +1,193 @@
+# One-command stack: Postgres + Redis + API + Worker + Beat + Frontend.
+#   docker compose up -d --build
+# First run, create the admin + seed (set a strong ADMIN_PASSWORD, or omit it
+# and init_db prints a one-time generated password — never a fixed default):
+#   ADMIN_PASSWORD='<strong-secret>' docker compose run --rm -e ADMIN_PASSWORD api \
+#       python -m scripts.init_db --admin-phone 13800000000 --credits 1000
+# Gateway key / other secrets are read from backend/.env (env_file below).
+# DATABASE_URL / REDIS_URL are overridden here for the container network.
+# Production frontend should usually be served behind the same reverse proxy as
+# the API; set NEXT_PUBLIC_API_BASE only for split-origin deployments.
+# Production: set POSTGRES_PASSWORD + METRICS_TOKEN in the environment. Service
+# ports bind to localhost by default; publish them through nginx/reverse proxy.
+# If nginx reaches the API through Docker bridge instead of 127.0.0.1, include
+# that bridge CIDR in TRUSTED_PROXY_IPS (for example: 127.0.0.1,172.16.0.0/12).
+
+name: ai-media-studio
+
+x-pg-password: &pg_password ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD to a strong database password}
+
+services:
+  postgres:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: *pg_password
+      POSTGRES_DB: ai_studio
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  migrate:
+    build: ./backend
+    env_file: ./backend/.env
+    environment:
+      DATABASE_URL: postgresql+psycopg2://postgres:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD to a strong database password}@postgres:5432/ai_studio
+      REDIS_URL: redis://redis:6379/0
+      DEBUG: ${DEBUG:-false}
+      PAYMENT_MOCK_ENABLED: ${PAYMENT_MOCK_ENABLED:-false}
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-https://dream.aiwuq.cn}
+      CORS_ORIGINS: ${CORS_ORIGINS:-https://dream.aiwuq.cn}
+      PAYMENT_FRONTEND_BASE_URL: ${PAYMENT_FRONTEND_BASE_URL:-https://dream.aiwuq.cn}
+      TRUSTED_PROXY_IPS: ${TRUSTED_PROXY_IPS:-127.0.0.1,172.16.0.0/12}
+      METRICS_TOKEN: ${METRICS_TOKEN:?set METRICS_TOKEN to protect /metrics}
+      PAYMENT_CONFIG_SECRET: ${PAYMENT_CONFIG_SECRET:?set PAYMENT_CONFIG_SECRET to encrypt payment merchant keys}
+      SMS_PROVIDER: ${SMS_PROVIDER:?set SMS_PROVIDER to a real implemented provider}
+      SMS_HTTP_URL: ${SMS_HTTP_URL:-}
+      SMS_HTTP_API_KEY: ${SMS_HTTP_API_KEY:-}
+      SMS_HTTP_TIMEOUT_SECONDS: ${SMS_HTTP_TIMEOUT_SECONDS:-10}
+      SMS_SIGN_NAME: ${SMS_SIGN_NAME:-}
+      SMS_TEMPLATE_CODE: ${SMS_TEMPLATE_CODE:-}
+    command: alembic upgrade head
+    volumes:
+      - media:/app/storage
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  api:
+    build: ./backend
+    restart: unless-stopped
+    env_file: ./backend/.env
+    environment:
+      DATABASE_URL: postgresql+psycopg2://postgres:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD to a strong database password}@postgres:5432/ai_studio
+      REDIS_URL: redis://redis:6379/0
+      DEBUG: ${DEBUG:-false}
+      PAYMENT_MOCK_ENABLED: ${PAYMENT_MOCK_ENABLED:-false}
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-https://dream.aiwuq.cn}
+      CORS_ORIGINS: ${CORS_ORIGINS:-https://dream.aiwuq.cn}
+      PAYMENT_FRONTEND_BASE_URL: ${PAYMENT_FRONTEND_BASE_URL:-https://dream.aiwuq.cn}
+      TRUSTED_PROXY_IPS: ${TRUSTED_PROXY_IPS:-127.0.0.1,172.16.0.0/12}
+      METRICS_TOKEN: ${METRICS_TOKEN:?set METRICS_TOKEN to protect /metrics}
+      PAYMENT_CONFIG_SECRET: ${PAYMENT_CONFIG_SECRET:?set PAYMENT_CONFIG_SECRET to encrypt payment merchant keys}
+      SMS_PROVIDER: ${SMS_PROVIDER:?set SMS_PROVIDER to a real implemented provider}
+      SMS_HTTP_URL: ${SMS_HTTP_URL:-}
+      SMS_HTTP_API_KEY: ${SMS_HTTP_API_KEY:-}
+      SMS_HTTP_TIMEOUT_SECONDS: ${SMS_HTTP_TIMEOUT_SECONDS:-10}
+      SMS_SIGN_NAME: ${SMS_SIGN_NAME:-}
+      SMS_TEMPLATE_CODE: ${SMS_TEMPLATE_CODE:-}
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000
+    volumes:
+      - media:/app/storage
+    ports:
+      - "127.0.0.1:${API_PORT:-8000}:8000"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/api/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+  worker:
+    build: ./backend
+    restart: unless-stopped
+    # No -B here: beat runs in its own service so scaling workers (--scale
+    # worker=N) does NOT start N schedulers racing on the same cron jobs.
+    command: celery -A app.celery_app.celery_app worker -l info --concurrency=${WORKER_CONCURRENCY:-1}
+    env_file: ./backend/.env
+    environment:
+      DATABASE_URL: postgresql+psycopg2://postgres:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD to a strong database password}@postgres:5432/ai_studio
+      REDIS_URL: redis://redis:6379/0
+      DEBUG: ${DEBUG:-false}
+      PAYMENT_MOCK_ENABLED: ${PAYMENT_MOCK_ENABLED:-false}
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-https://dream.aiwuq.cn}
+      PAYMENT_FRONTEND_BASE_URL: ${PAYMENT_FRONTEND_BASE_URL:-https://dream.aiwuq.cn}
+      TRUSTED_PROXY_IPS: ${TRUSTED_PROXY_IPS:-127.0.0.1,172.16.0.0/12}
+      METRICS_TOKEN: ${METRICS_TOKEN:?set METRICS_TOKEN to protect /metrics}
+      PAYMENT_CONFIG_SECRET: ${PAYMENT_CONFIG_SECRET:?set PAYMENT_CONFIG_SECRET to encrypt payment merchant keys}
+      SMS_PROVIDER: ${SMS_PROVIDER:?set SMS_PROVIDER to a real implemented provider}
+      SMS_HTTP_URL: ${SMS_HTTP_URL:-}
+      SMS_HTTP_API_KEY: ${SMS_HTTP_API_KEY:-}
+      SMS_HTTP_TIMEOUT_SECONDS: ${SMS_HTTP_TIMEOUT_SECONDS:-10}
+      SMS_SIGN_NAME: ${SMS_SIGN_NAME:-}
+      SMS_TEMPLATE_CODE: ${SMS_TEMPLATE_CODE:-}
+    mem_limit: 2g  # Chromium + ffmpeg renders are memory-heavy; cap to protect the host
+    volumes:
+      - media:/app/storage
+    healthcheck:
+      test: ["CMD-SHELL", "celery -A app.celery_app.celery_app inspect ping -d celery@$$HOSTNAME || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+  beat:
+    build: ./backend
+    restart: unless-stopped
+    # Exactly ONE scheduler for the whole stack (retention cleanup, stuck-task
+    # reaper, video-resume). Do not scale this service.
+    command: celery -A app.celery_app.celery_app beat -l info
+    env_file: ./backend/.env
+    environment:
+      DATABASE_URL: postgresql+psycopg2://postgres:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD to a strong database password}@postgres:5432/ai_studio
+      REDIS_URL: redis://redis:6379/0
+      DEBUG: ${DEBUG:-false}
+      PAYMENT_MOCK_ENABLED: ${PAYMENT_MOCK_ENABLED:-false}
+      METRICS_TOKEN: ${METRICS_TOKEN:?set METRICS_TOKEN to protect /metrics}
+      PAYMENT_CONFIG_SECRET: ${PAYMENT_CONFIG_SECRET:?set PAYMENT_CONFIG_SECRET to encrypt payment merchant keys}
+      SMS_PROVIDER: ${SMS_PROVIDER:?set SMS_PROVIDER to a real implemented provider}
+      SMS_HTTP_URL: ${SMS_HTTP_URL:-}
+      SMS_HTTP_API_KEY: ${SMS_HTTP_API_KEY:-}
+      SMS_HTTP_TIMEOUT_SECONDS: ${SMS_HTTP_TIMEOUT_SECONDS:-10}
+      SMS_SIGN_NAME: ${SMS_SIGN_NAME:-}
+      SMS_TEMPLATE_CODE: ${SMS_TEMPLATE_CODE:-}
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+  frontend:
+    restart: unless-stopped
+    build:
+      context: ./frontend
+      args:
+        NEXT_PUBLIC_API_BASE: ${NEXT_PUBLIC_API_BASE:-}
+    ports:
+      - "127.0.0.1:${FRONTEND_PORT:-3000}:3000"
+    depends_on:
+      api:
+        condition: service_healthy
+
+  # Optional object storage (swap services/storage.py to use it):
+  # minio:
+  #   image: minio/minio
+  #   command: server /data --console-address ":9001"
+  #   environment:
+  #     MINIO_ROOT_USER: minio
+  #     MINIO_ROOT_PASSWORD: minio12345
+  #   ports: ["9000:9000", "9001:9001"]
+  #   volumes: ["miniodata:/data"]
+
+volumes:
+  pgdata:
+  media:
+  # miniodata:

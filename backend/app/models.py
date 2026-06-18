@@ -1,0 +1,275 @@
+"""ORM models. Mirrors the schema in the spec, plus two small config tables
+(model_configs, app_settings) so the gateway model ids / costs are editable from
+the admin UI instead of code."""
+from __future__ import annotations
+
+from datetime import datetime
+
+from sqlalchemy import (
+    JSON,
+    BigInteger,
+    Boolean,
+    CheckConstraint,
+    DateTime,
+    ForeignKey,
+    Integer,
+    String,
+    Text,
+    func,
+)
+from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.orm import Mapped, mapped_column
+
+from .db import Base
+
+# Portable types: JSONB / BIGINT on PostgreSQL (production), JSON / INTEGER on
+# SQLite (so the same models run in lightweight tests / quick local trials).
+JSONType = JSON().with_variant(JSONB(), "postgresql")
+BigIntPK = BigInteger().with_variant(Integer, "sqlite")
+
+
+class User(Base):
+    __tablename__ = "users"
+
+    id: Mapped[int] = mapped_column(BigIntPK, primary_key=True, autoincrement=True)
+    phone: Mapped[str] = mapped_column(String(20), unique=True, nullable=False, index=True)
+    password_hash: Mapped[str | None] = mapped_column(String(255))
+    nickname: Mapped[str | None] = mapped_column(String(64))
+    avatar: Mapped[str | None] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(String(16), default="active")  # active/pending/disabled
+    is_admin: Mapped[bool] = mapped_column(Boolean, default=False)
+    # bumped on password change / logout-all to invalidate existing JWTs
+    token_version: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    department: Mapped[str | None] = mapped_column(String(64))
+    balance_credits: Mapped[int] = mapped_column(BigInteger, default=0)
+    frozen_credits: Mapped[int] = mapped_column(BigInteger, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    last_login_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class PhoneWhitelist(Base):
+    __tablename__ = "phone_whitelist"
+
+    phone: Mapped[str] = mapped_column(String(20), primary_key=True)
+    note: Mapped[str | None] = mapped_column(String(128))
+    department: Mapped[str | None] = mapped_column(String(64))
+    added_by: Mapped[int | None] = mapped_column(BigInteger)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class CreditTransaction(Base):
+    __tablename__ = "credit_transactions"
+
+    id: Mapped[int] = mapped_column(BigIntPK, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("users.id"), index=True)
+    type: Mapped[str] = mapped_column(String(16), nullable=False)  # grant/freeze/settle/refund/unlock
+    change: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    balance_after: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    biz_type: Mapped[str | None] = mapped_column(String(32))  # gen_task / unlock / admin
+    biz_ref: Mapped[int | None] = mapped_column(BigInteger)
+    note: Mapped[str | None] = mapped_column(String(255))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class PaymentOrder(Base):
+    __tablename__ = "payment_orders"
+    __table_args__ = (
+        CheckConstraint("amount_cents > 0", name="ck_payment_orders_amount_cents_positive"),
+        CheckConstraint("credits > 0", name="ck_payment_orders_credits_positive"),
+        CheckConstraint("provider in ('alipay', 'wechat')", name="ck_payment_orders_provider_valid"),
+        CheckConstraint(
+            "status in ('pending', 'paid', 'closed', 'failed')",
+            name="ck_payment_orders_status_valid",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(BigIntPK, primary_key=True, autoincrement=True)
+    order_no: Mapped[str] = mapped_column(String(64), unique=True, nullable=False, index=True)
+    user_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("users.id"), index=True)
+    provider: Mapped[str] = mapped_column(String(16), nullable=False)  # alipay/wechat
+    package_id: Mapped[str] = mapped_column(String(32), nullable=False)
+    amount_cents: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    credits: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    status: Mapped[str] = mapped_column(String(16), default="pending", index=True)
+    code_url: Mapped[str | None] = mapped_column(Text)
+    provider_trade_no: Mapped[str | None] = mapped_column(String(128))
+    raw: Mapped[dict | None] = mapped_column(JSONType)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    paid_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
+class PaymentPackage(Base):
+    __tablename__ = "payment_packages"
+    __table_args__ = (
+        CheckConstraint("amount_cents > 0", name="ck_payment_packages_amount_cents_positive"),
+        CheckConstraint("credits > 0", name="ck_payment_packages_credits_positive"),
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    title: Mapped[str] = mapped_column(String(64), nullable=False)
+    amount_cents: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    credits: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    badge: Mapped[str | None] = mapped_column(String(32))
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    sort_order: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
+class PaymentProviderConfig(Base):
+    __tablename__ = "payment_provider_configs"
+    __table_args__ = (
+        CheckConstraint(
+            "provider in ('alipay', 'wechat')",
+            name="ck_payment_provider_configs_provider_valid",
+        ),
+        CheckConstraint("mode in ('mock', 'live')", name="ck_payment_provider_configs_mode_valid"),
+    )
+
+    provider: Mapped[str] = mapped_column(String(16), primary_key=True)  # alipay/wechat
+    enabled: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    mode: Mapped[str] = mapped_column(String(16), default="mock", nullable=False)  # mock/live
+    public_config: Mapped[dict | None] = mapped_column(JSONType)
+    secret_config: Mapped[dict | None] = mapped_column(JSONType)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
+class UploadedAsset(Base):
+    __tablename__ = "uploaded_assets"
+
+    key: Mapped[str] = mapped_column(String(255), primary_key=True)
+    user_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("users.id"), index=True)
+    mime: Mapped[str | None] = mapped_column(String(64))
+    width: Mapped[int | None] = mapped_column(Integer)
+    height: Mapped[int | None] = mapped_column(Integer)
+    bytes: Mapped[int | None] = mapped_column(BigInteger)
+    original_filename: Mapped[str | None] = mapped_column(String(255))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class ParseRecord(Base):
+    __tablename__ = "parse_records"
+
+    id: Mapped[int] = mapped_column(BigIntPK, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("users.id"), index=True)
+    url: Mapped[str] = mapped_column(Text, nullable=False)
+    assets: Mapped[list | None] = mapped_column(JSONType)  # [{type,url,thumb}]
+    status: Mapped[str] = mapped_column(String(16), default="queued")  # queued/done/failed
+    error: Mapped[str | None] = mapped_column(Text)
+    cached_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class GenTask(Base):
+    __tablename__ = "gen_tasks"
+
+    id: Mapped[int] = mapped_column(BigIntPK, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("users.id"), index=True)
+    source_asset_url: Mapped[str | None] = mapped_column(Text)
+    source_type: Mapped[str | None] = mapped_column(String(8))  # image/video
+    category: Mapped[str] = mapped_column(String(8), nullable=False)  # image/video
+    stage: Mapped[str] = mapped_column(String(8), default="preview")  # preview/final
+    prompt: Mapped[dict | None] = mapped_column(JSONType)  # structured + final_text
+    model_use: Mapped[str | None] = mapped_column(String(16))  # vision/image/video
+    params: Mapped[dict | None] = mapped_column(JSONType)
+    status: Mapped[str] = mapped_column(String(16), default="queued")  # queued/running/succeeded/failed
+    cost_frozen: Mapped[int] = mapped_column(BigInteger, default=0)
+    cost_settled: Mapped[int] = mapped_column(BigInteger, default=0)
+    external_task_id: Mapped[str | None] = mapped_column(Text)  # async video task id
+    # video lifecycle sub-state (DB-recoverable): submitting/polling/downloading
+    phase: Mapped[str | None] = mapped_column(String(16))
+    external_submitted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    parent_task_id: Mapped[int | None] = mapped_column(BigInteger)  # video final -> preview
+    error: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class GenAsset(Base):
+    __tablename__ = "gen_assets"
+
+    id: Mapped[int] = mapped_column(BigIntPK, primary_key=True, autoincrement=True)
+    task_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("gen_tasks.id"), index=True)
+    user_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("users.id"), index=True)
+    type: Mapped[str] = mapped_column(String(8))  # image/video
+    preview_url: Mapped[str | None] = mapped_column(Text)
+    hd_url: Mapped[str | None] = mapped_column(Text)
+    watermarked: Mapped[bool] = mapped_column(Boolean, default=True)
+    unlocked: Mapped[bool] = mapped_column(Boolean, default=False)
+    favorite: Mapped[bool] = mapped_column(Boolean, default=False)
+    width: Mapped[int | None] = mapped_column(Integer)
+    height: Mapped[int | None] = mapped_column(Integer)
+    duration: Mapped[int | None] = mapped_column(Integer)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class GatewayCall(Base):
+    """Per-invocation gateway call log (real cost / usage accounting).
+
+    Records every model-gateway call so spend can be reconciled against the
+    provider's actual consumption (token usage where the provider reports it),
+    not just the internal credit estimate."""
+
+    __tablename__ = "gateway_calls"
+
+    id: Mapped[int] = mapped_column(BigIntPK, primary_key=True, autoincrement=True)
+    user_id: Mapped[int | None] = mapped_column(BigInteger, index=True)
+    task_id: Mapped[int | None] = mapped_column(BigInteger, index=True)
+    kind: Mapped[str] = mapped_column(String(16))  # reverse/image/video_submit/video_poll
+    model_id: Mapped[str | None] = mapped_column(String(128))
+    status: Mapped[str | None] = mapped_column(String(16))  # ok/failed
+    latency_ms: Mapped[int | None] = mapped_column(Integer)
+    prompt_tokens: Mapped[int | None] = mapped_column(Integer)
+    completion_tokens: Mapped[int | None] = mapped_column(Integer)
+    total_tokens: Mapped[int | None] = mapped_column(Integer)
+    detail: Mapped[dict | None] = mapped_column(JSONType)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class AuditLog(Base):
+    __tablename__ = "audit_logs"
+
+    id: Mapped[int] = mapped_column(BigIntPK, primary_key=True, autoincrement=True)
+    user_id: Mapped[int | None] = mapped_column(BigInteger)
+    action: Mapped[str] = mapped_column(String(64))
+    biz_type: Mapped[str | None] = mapped_column(String(32))
+    biz_id: Mapped[int | None] = mapped_column(BigInteger)
+    ip: Mapped[str | None] = mapped_column(String(64))
+    detail: Mapped[dict | None] = mapped_column(JSONType)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+# --- Runtime-editable config (seeded from models.yaml) ---
+
+
+class ModelConfig(Base):
+    __tablename__ = "model_configs"
+
+    id: Mapped[int] = mapped_column(BigIntPK, primary_key=True, autoincrement=True)
+    use: Mapped[str] = mapped_column(String(16), unique=True, nullable=False)  # vision/image/video
+    model_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    cost_credits: Mapped[int] = mapped_column(BigInteger, default=1)  # cost to run / freeze
+    unlock_cost: Mapped[int] = mapped_column(BigInteger, default=0)  # extra cost to unlock HD
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    extra: Mapped[dict | None] = mapped_column(JSONType)  # endpoint paths / field maps for video
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
+class AppSetting(Base):
+    __tablename__ = "app_settings"
+
+    key: Mapped[str] = mapped_column(String(64), primary_key=True)
+    value: Mapped[dict | None] = mapped_column(JSONType)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )

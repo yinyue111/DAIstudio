@@ -1,0 +1,39 @@
+# VCS / local tooling
+.git
+.github
+.claude
+.pytest_cache
+.ruff_cache
+.DS_Store
+
+# Secrets and local environment
+backend/.env
+backend/.env.*
+!backend/.env.example
+frontend/.env.local
+frontend/.env.*.local
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Python runtime
+.venv
+venv
+backend/.venv
+__pycache__
+*.pyc
+
+# Node / Next runtime
+frontend/node_modules
+frontend/.next
+node_modules
+.next
+
+# Runtime data
+backend/storage
+backend/backups
+backend/celerybeat-schedule*
+*.db
+*.sqlite
+*.sqlite3

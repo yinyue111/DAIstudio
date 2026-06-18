@@ -1,0 +1,41 @@
+# Seed config for model_configs + defaults (only used on first boot to populate
+# the DB; afterwards edit live via the admin UI / PUT /api/admin/models).
+#
+# Gateway base_url + api_key live in .env (secrets), NOT here.
+#
+# IMPORTANT: set model_id to the real ids your gateway exposes. The values below
+# were aligned with the current /v1/models response from the configured gateway
+# on 2026-06-16.
+
+models:
+  - use: vision        # 反推:图 -> 结构化提示词  (/v1/chat/completions)
+    model_id: gpt-5.5
+    cost_credits: 1
+    unlock_cost: 0
+    enabled: true
+
+  - use: image         # 文生图:词 -> 图          (/v1/images/generations)
+    model_id: gpt-image-2
+    cost_credits: 5     # frozen on submit (produces N watermarked previews)
+    unlock_cost: 5      # charged when the user unlocks one HD image
+    enabled: true
+    # Optional: enable true 图+指令->图 (reverse-off). When set, an instruction
+    # with an image source is sent to this image-to-image endpoint instead of
+    # plain text->image. Leave unset to always use text->image.
+    # extra:
+    #   edit_path: /v1/images/edits
+
+  - use: video         # 文生视频 (Volcengine Ark / Doubao Seedance, async)
+    model_id: doubao-seedance-1-5-pro-251215
+    cost_credits: 50     # full render cost (final stage)
+    unlock_cost: 0
+    enabled: true
+    extra:
+      preview_cost: 5    # cheap freeze for the preview stage
+    # Video gateway base_url/api_key + format=ark live in .env
+    # (VIDEO_GATEWAY_BASE_URL / VIDEO_GATEWAY_API_KEY / VIDEO_GATEWAY_FORMAT).
+
+defaults:
+  reverse_prompt_enabled: true
+  image_n: 4
+  image_size: 1024x1024

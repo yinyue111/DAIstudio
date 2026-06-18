@@ -1,0 +1,124 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: dark;
+}
+
+@layer base {
+  body {
+    @apply bg-base text-snow font-body antialiased;
+    /* ambient aurora glow behind everything */
+    background-image:
+      radial-gradient(900px 520px at 12% -8%, rgba(123, 97, 255, 0.22), transparent 60%),
+      radial-gradient(820px 500px at 92% 4%, rgba(255, 95, 162, 0.16), transparent 58%),
+      radial-gradient(700px 600px at 50% 120%, rgba(52, 224, 255, 0.10), transparent 60%);
+    background-attachment: fixed;
+  }
+
+  h1, h2, h3, h4 {
+    @apply font-display tracking-tight;
+  }
+
+  ::selection {
+    background: rgba(123, 97, 255, 0.35);
+  }
+
+  /* slim, on-brand scrollbars */
+  ::-webkit-scrollbar { width: 10px; height: 10px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb {
+    background: rgba(255, 255, 255, 0.10);
+    border-radius: 999px;
+    border: 2px solid transparent;
+    background-clip: padding-box;
+  }
+  ::-webkit-scrollbar-thumb:hover { background: rgba(255, 255, 255, 0.18); background-clip: padding-box; }
+}
+
+@layer components {
+  /* ---- Surfaces ---- */
+  .card {
+    @apply rounded-xl3 border border-line bg-surface/70 shadow-card backdrop-blur-xl;
+  }
+  .glass {
+    @apply rounded-xl3 border border-line bg-white/5 backdrop-blur-xl;
+  }
+  .panel {
+    @apply rounded-xl4 border border-line2 bg-surface/80 shadow-pop backdrop-blur-2xl;
+  }
+
+  /* ---- Buttons ---- */
+  .btn {
+    @apply inline-flex select-none items-center justify-center gap-2 rounded-full px-4 py-2
+           text-sm font-display font-medium transition-all duration-200
+           disabled:cursor-not-allowed disabled:opacity-50;
+  }
+  .btn-primary {
+    @apply btn bg-brand text-white shadow-glow-sm
+           hover:shadow-glow hover:brightness-110 active:scale-[0.98];
+  }
+  .btn-secondary {
+    @apply btn border border-line2 bg-white/5 text-snow hover:bg-white/10 active:scale-[0.98];
+  }
+  .btn-ghost {
+    @apply btn text-mist hover:bg-white/5 hover:text-snow;
+  }
+  .btn-sm { @apply px-3 py-1.5 text-xs; }
+  .btn-lg { @apply px-6 py-3 text-[15px]; }
+
+  /* ---- Form controls ---- */
+  .input,
+  .select,
+  .textarea {
+    @apply w-full rounded-xl border border-line bg-base2/60 px-3.5 py-2.5 text-sm
+           text-snow outline-none transition
+           placeholder:text-fog
+           focus:border-iris/70 focus:bg-base2 focus:ring-2 focus:ring-iris/25;
+  }
+  .select { @apply appearance-none pr-9; }
+
+  /* ---- Chips / pills / badges ---- */
+  .chip {
+    @apply inline-flex items-center gap-1.5 rounded-full border border-line bg-white/5
+           px-3 py-1 text-xs text-mist transition hover:border-line2 hover:text-snow;
+  }
+  .chip-active {
+    @apply border-transparent bg-brand text-white shadow-glow-sm;
+  }
+  .badge {
+    @apply inline-flex items-center rounded-full px-2 py-0.5 text-[11px] font-display font-medium;
+  }
+
+  .label {
+    @apply mb-1.5 block text-xs font-display font-medium text-fog;
+  }
+
+  /* gradient text + hairline divider */
+  .text-grad {
+    @apply bg-brand bg-clip-text text-transparent;
+  }
+  .hr {
+    @apply h-px w-full border-0 bg-gradient-to-r from-transparent via-line2 to-transparent;
+  }
+
+  /* masonry waterfall (CSS columns) */
+  .masonry {
+    column-gap: 1rem;
+    column-count: 2;
+  }
+  @media (min-width: 640px) { .masonry { column-count: 3; } }
+  @media (min-width: 1024px) { .masonry { column-count: 4; } }
+  .masonry > * { break-inside: avoid; margin-bottom: 1rem; }
+
+  /* loading shimmer skeleton */
+  .skeleton {
+    @apply relative overflow-hidden rounded-xl2 bg-white/5;
+  }
+  .skeleton::after {
+    content: "";
+    @apply absolute inset-0 -translate-x-full animate-shimmer;
+    background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.08), transparent);
+  }
+}

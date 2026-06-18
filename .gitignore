@@ -1,0 +1,39 @@
+# secrets
+backend/.env
+backend/.env.*
+!backend/.env.example
+frontend/.env.local
+frontend/.env.*.local
+*.pem
+*.key
+*.p12
+*.pfx
+
+# python
+__pycache__/
+*.pyc
+.venv/
+backend/.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+
+# celery beat runtime schedule
+backend/celerybeat-schedule*
+
+# storage / media
+backend/storage/
+backend/backups/
+*.sqlite
+*.sqlite3
+*.db
+
+# node / next
+node_modules/
+.next/
+frontend/node_modules/
+frontend/.next/
+
+# os
+.DS_Store
+.claude/

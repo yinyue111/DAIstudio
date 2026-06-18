@@ -1,0 +1,553 @@
+from datetime import datetime, timedelta, timezone
+
+import pytest
+
+from app.config import settings
+from app.db import SessionLocal
+from app.models import PaymentOrder
+from app.services import payment_config, payments
+
+
+def test_mock_payments_only_allowed_on_local_urls(monkeypatch):
+    monkeypatch.setattr(settings, "debug", True)
+    monkeypatch.setattr(settings, "payment_mock_enabled", True)
+    monkeypatch.setattr(settings, "public_base_url", "http://localhost:8000")
+    monkeypatch.setattr(settings, "payment_frontend_base_url", "http://127.0.0.1:3000")
+    assert payments.mock_payments_allowed() is True
+
+    monkeypatch.setattr(settings, "public_base_url", "https://dream.aiwuq.cn")
+    monkeypatch.setattr(settings, "payment_frontend_base_url", "https://dream.aiwuq.cn")
+    assert payments.mock_payments_allowed() is False
+
+
+def test_payment_packages_and_create_order(client, make_user, auth):
+    make_user("13900000200", balance=100)
+    h = auth("13900000200")
+
+    pkgs = client.get("/api/payments/packages", headers=h)
+    assert pkgs.status_code == 200
+    assert {p["id"] for p in pkgs.json()} >= {"starter", "creator", "pro"}
+
+    r = client.post("/api/payments/orders", json={
+        "provider": "alipay",
+        "package_id": "starter",
+    }, headers=h)
+    assert r.status_code == 200, r.text
+    order = r.json()
+    assert order["status"] == "pending"
+    assert order["credits"] == 120
+    assert order["amount_cents"] == 990
+    assert order["code_url"]
+
+    got = client.get(f"/api/payments/orders/{order['order_no']}", headers=h)
+    assert got.status_code == 200
+    assert got.json()["order_no"] == order["order_no"]
+
+
+def test_mock_payment_marks_paid_and_grants_once(client, make_user, auth):
+    make_user("13900000201", balance=100)
+    h = auth("13900000201")
+
+    order = client.post("/api/payments/orders", json={
+        "provider": "wechat",
+        "package_id": "creator",
+    }, headers=h).json()
+    before = client.get("/api/me", headers=h).json()["balance_credits"]
+
+    paid1 = client.post(f"/api/payments/orders/{order['order_no']}/mock-pay", headers=h)
+    assert paid1.status_code == 200, paid1.text
+    assert paid1.json()["status"] == "paid"
+    assert client.get("/api/me", headers=h).json()["balance_credits"] == before + 420
+
+    paid2 = client.post(f"/api/payments/orders/{order['order_no']}/mock-pay", headers=h)
+    assert paid2.status_code == 200, paid2.text
+    assert client.get("/api/me", headers=h).json()["balance_credits"] == before + 420
+
+
+def test_payment_order_requires_owner(client, make_user, auth):
+    make_user("13900000202", balance=100)
+    make_user("13900000203", balance=100)
+    h1 = auth("13900000202")
+    h2 = auth("13900000203")
+
+    order = client.post("/api/payments/orders", json={
+        "provider": "alipay",
+        "package_id": "starter",
+    }, headers=h1).json()
+
+    assert client.get(f"/api/payments/orders/{order['order_no']}", headers=h2).status_code == 404
+    assert client.post(f"/api/payments/orders/{order['order_no']}/mock-pay", headers=h2).status_code == 404
+
+
+def test_create_order_rejects_bad_package(client, make_user, auth):
+    make_user("13900000204", balance=100)
+    h = auth("13900000204")
+
+    r = client.post("/api/payments/orders", json={
+        "provider": "alipay",
+        "package_id": "missing",
+    }, headers=h)
+    assert r.status_code == 400
+    assert "套餐" in r.text
+
+
+def test_create_order_keeps_failed_order_when_gateway_fails(client, make_user, auth, monkeypatch):
+    make_user("13900000214", balance=100)
+    h = auth("13900000214")
+    monkeypatch.setattr("app.services.payments._provider_code_url", lambda *_a, **_k: (_ for _ in ()).throw(
+        payments.PaymentError("gateway down")
+    ))
+
+    r = client.post("/api/payments/orders", json={
+        "provider": "alipay",
+        "package_id": "starter",
+    }, headers=h)
+    assert r.status_code == 400
+    db = SessionLocal()
+    try:
+        rows = db.query(PaymentOrder).filter(PaymentOrder.user_id.isnot(None)).all()
+        assert any(row.status == payments.FAILED and row.raw.get("error") == "gateway down" for row in rows)
+    finally:
+        db.close()
+
+
+def test_alipay_notify_requires_signature_even_when_mock_is_enabled(client, make_user, auth):
+    make_user("13900000205", balance=100)
+    h = auth("13900000205")
+
+    order = client.post("/api/payments/orders", json={
+        "provider": "alipay",
+        "package_id": "starter",
+    }, headers=h).json()
+    before = client.get("/api/me", headers=h).json()["balance_credits"]
+
+    unsigned = client.post("/api/payments/alipay/notify", data={
+        "out_trade_no": order["order_no"],
+        "trade_no": "ali_unsigned",
+        "trade_status": "TRADE_SUCCESS",
+        "total_amount": "9.90",
+    })
+    assert unsigned.status_code == 200
+    assert unsigned.text == "fail"
+    assert client.get("/api/me", headers=h).json()["balance_credits"] == before
+    assert client.get(f"/api/payments/orders/{order['order_no']}", headers=h).json()["status"] == "pending"
+
+
+def test_wechat_notify_requires_signature_even_when_mock_is_enabled(client, make_user, auth):
+    make_user("13900000206", balance=100)
+    h = auth("13900000206")
+
+    order = client.post("/api/payments/orders", json={
+        "provider": "wechat",
+        "package_id": "creator",
+    }, headers=h).json()
+    before = client.get("/api/me", headers=h).json()["balance_credits"]
+
+    unsigned = client.post("/api/payments/wechat/notify", json={
+        "resource": {
+            "out_trade_no": order["order_no"],
+            "transaction_id": "wx_unsigned",
+            "amount": {"total": 2990, "currency": "CNY"},
+        },
+    })
+    assert unsigned.status_code == 401
+    assert client.get("/api/me", headers=h).json()["balance_credits"] == before
+    assert client.get(f"/api/payments/orders/{order['order_no']}", headers=h).json()["status"] == "pending"
+
+
+def test_public_payment_config_exposes_mock_ready_providers(client, make_user, auth):
+    make_user("13900000211", balance=100)
+    h = auth("13900000211")
+    r = client.get("/api/payments/config", headers=h)
+    assert r.status_code == 200, r.text
+    providers = {p["provider"]: p for p in r.json()["providers"]}
+    assert providers["alipay"]["ready"] is True
+    assert providers["wechat"]["ready"] is True
+
+
+def test_wechat_notify_rejects_non_success_even_with_valid_signature(client, make_user, auth, monkeypatch):
+    make_user("13900000212", balance=100)
+    h = auth("13900000212")
+
+    order = client.post("/api/payments/orders", json={
+        "provider": "wechat",
+        "package_id": "creator",
+    }, headers=h).json()
+    before = client.get("/api/me", headers=h).json()["balance_credits"]
+    monkeypatch.setattr("app.services.payments.wechat_signature_valid", lambda db, headers, body: True)
+
+    r = client.post("/api/payments/wechat/notify", json={
+        "event_type": "TRANSACTION.SUCCESS",
+        "resource": {
+            "out_trade_no": order["order_no"],
+            "transaction_id": "wx_closed",
+            "trade_state": "CLOSED",
+            "success_time": "2026-06-18T12:00:00+08:00",
+            "amount": {"total": 2990, "currency": "CNY"},
+        },
+    })
+    assert r.status_code == 400
+    assert client.get("/api/me", headers=h).json()["balance_credits"] == before
+    assert client.get(f"/api/payments/orders/{order['order_no']}", headers=h).json()["status"] == "pending"
+
+
+def test_wechat_signature_requires_configured_platform_serial(monkeypatch):
+    db = SessionLocal()
+    try:
+        monkeypatch.setattr(
+            "app.services.payment_config.runtime_or_env",
+            lambda db, provider: payment_config.ProviderRuntimeConfig(
+                provider="wechat",
+                enabled=True,
+                mode="live",
+                public={"platform_serial_no": "expected"},
+                secret={"platform_cert_pem": "dummy"},
+            ),
+        )
+        monkeypatch.setattr("app.services.payments._rsa_sha256_verify", lambda *args: True)
+        headers = {
+            "Wechatpay-Signature": "sig",
+            "Wechatpay-Timestamp": "1",
+            "Wechatpay-Nonce": "nonce",
+        }
+        assert payments.wechat_signature_valid(db, headers, b"{}") is False
+    finally:
+        db.close()
+
+
+def test_alipay_notify_requires_configured_app_id(monkeypatch):
+    db = SessionLocal()
+    try:
+        monkeypatch.setattr(
+            "app.services.payment_config.runtime_or_env",
+            lambda db, provider: payment_config.ProviderRuntimeConfig(
+                provider="alipay",
+                enabled=True,
+                mode="live",
+                public={"app_id": "expected-app"},
+                secret={"public_key": "dummy"},
+            ),
+        )
+        with pytest.raises(payments.PaymentError, match="缺少 app_id"):
+            payments.verify_alipay_notify(db, {
+                "out_trade_no": "order-1",
+                "trade_status": "TRADE_SUCCESS",
+                "total_amount": "9.90",
+                "sign": "sig",
+            })
+    finally:
+        db.close()
+
+
+def test_alipay_notify_requires_configured_seller_id(monkeypatch):
+    db = SessionLocal()
+    try:
+        monkeypatch.setattr(
+            "app.services.payment_config.runtime_or_env",
+            lambda db, provider: payment_config.ProviderRuntimeConfig(
+                provider="alipay",
+                enabled=True,
+                mode="live",
+                public={"app_id": "expected-app", "seller_id": "seller-001"},
+                secret={"public_key": "dummy"},
+            ),
+        )
+        with pytest.raises(payments.PaymentError, match="缺少 seller_id"):
+            payments.verify_alipay_notify(db, {
+                "out_trade_no": "order-1",
+                "trade_status": "TRADE_SUCCESS",
+                "total_amount": "9.90",
+                "app_id": "expected-app",
+                "sign": "sig",
+            })
+        with pytest.raises(payments.PaymentError, match="seller_id 不匹配"):
+            payments.verify_alipay_notify(db, {
+                "out_trade_no": "order-1",
+                "trade_status": "TRADE_SUCCESS",
+                "total_amount": "9.90",
+                "app_id": "expected-app",
+                "seller_id": "seller-002",
+                "sign": "sig",
+            })
+    finally:
+        db.close()
+
+
+def test_wechat_notify_requires_configured_merchant_fields(monkeypatch):
+    db = SessionLocal()
+    try:
+        monkeypatch.setattr(
+            "app.services.payment_config.runtime_or_env",
+            lambda db, provider: payment_config.ProviderRuntimeConfig(
+                provider="wechat",
+                enabled=True,
+                mode="live",
+                public={"appid": "wx-app", "mchid": "mch-id"},
+                secret={},
+            ),
+        )
+        with pytest.raises(payments.PaymentError, match="缺少 appid"):
+            payments.ensure_wechat_merchant_matches(db, {"mchid": "mch-id"})
+        with pytest.raises(payments.PaymentError, match="缺少 mchid"):
+            payments.ensure_wechat_merchant_matches(db, {"appid": "wx-app"})
+    finally:
+        db.close()
+
+
+def test_env_provider_fallback_requires_callback_credentials(client, monkeypatch):
+    monkeypatch.setattr(settings, "alipay_app_id", "app")
+    monkeypatch.setattr(settings, "alipay_private_key", "private")
+    monkeypatch.setattr(settings, "alipay_public_key", "")
+    db = SessionLocal()
+    try:
+        cfg = payment_config.runtime_or_env(db, "alipay")
+        assert cfg.enabled is False
+
+        monkeypatch.setattr(settings, "wechat_pay_appid", "wx")
+        monkeypatch.setattr(settings, "wechat_pay_mchid", "mch")
+        monkeypatch.setattr(settings, "wechat_pay_serial_no", "serial")
+        monkeypatch.setattr(settings, "wechat_pay_private_key", "private")
+        monkeypatch.setattr(settings, "wechat_pay_api_v3_key", "")
+        monkeypatch.setattr(settings, "wechat_pay_platform_cert_pem", "cert")
+        cfg = payment_config.runtime_or_env(db, "wechat")
+        assert cfg.enabled is False
+    finally:
+        db.close()
+
+
+def test_live_provider_requires_effective_https_notify_url(client, monkeypatch):
+    monkeypatch.setattr(settings, "public_base_url", "http://localhost:8000")
+    issues = payment_config.validate_provider(
+        "alipay",
+        {
+            "app_id": "app",
+            "gateway_url": "https://openapi.alipay.com/gateway.do",
+            # notify_url intentionally omitted: validator must check the
+            # effective PUBLIC_BASE_URL + notify path, not skip validation.
+        },
+        {"private_key": "private", "public_key": "public"},
+        enabled=True,
+        mode="live",
+    )
+    assert "支付回调地址必须使用 HTTPS" in issues
+
+
+def test_mark_paid_rejects_wrong_provider_and_expired_orders(client, make_user, auth):
+    make_user("13900000207", balance=100)
+    h = auth("13900000207")
+    order = client.post("/api/payments/orders", json={
+        "provider": "alipay",
+        "package_id": "starter",
+    }, headers=h).json()
+
+    db = SessionLocal()
+    try:
+        with pytest.raises(payments.PaymentError, match="渠道"):
+            payments.mark_paid(db, order["order_no"], provider="wechat")
+
+        row = db.query(PaymentOrder).filter(PaymentOrder.order_no == order["order_no"]).one()
+        row.expires_at = datetime.now(timezone.utc) - timedelta(minutes=1)
+        db.commit()
+        with pytest.raises(payments.PaymentError, match="过期"):
+            payments.mark_paid(db, order["order_no"], provider="alipay")
+        db.refresh(row)
+        assert row.status == payments.CLOSED
+    finally:
+        db.close()
+
+    assert client.get("/api/me", headers=h).json()["balance_credits"] == 100
+
+
+def test_verified_provider_notify_rejects_expired_order(client, make_user, auth):
+    make_user("13900000215", balance=100)
+    h = auth("13900000215")
+    order = client.post("/api/payments/orders", json={
+        "provider": "alipay",
+        "package_id": "starter",
+    }, headers=h).json()
+
+    db = SessionLocal()
+    try:
+        row = db.query(PaymentOrder).filter(PaymentOrder.order_no == order["order_no"]).one()
+        row.expires_at = datetime.now(timezone.utc) - timedelta(minutes=1)
+        db.commit()
+        with pytest.raises(payments.PaymentError, match="过期"):
+            payments.mark_paid(
+                db,
+                order["order_no"],
+                provider="alipay",
+                provider_trade_no="ali_delayed_success",
+                raw={"verified_provider_notify": True},
+                allow_expired=True,
+            )
+        db.refresh(row)
+        assert row.status == payments.CLOSED
+    finally:
+        db.close()
+
+    assert client.get("/api/me", headers=h).json()["balance_credits"] == 100
+
+
+def test_admin_can_customize_payment_package(client, make_user, auth):
+    make_user("13900000208", balance=100, admin=True)
+    make_user("13900000209", balance=100)
+    admin_h = auth("13900000208")
+    user_h = auth("13900000209")
+
+    r = client.post("/api/admin/payments/packages", json={
+        "id": "custom_1",
+        "title": "自定义包",
+        "amount_cents": 1234,
+        "credits": 567,
+        "badge": "测试",
+        "enabled": True,
+        "sort_order": 1,
+        "admin_password": "pass123456",
+    }, headers=admin_h)
+    assert r.status_code == 200, r.text
+
+    pkgs = client.get("/api/payments/packages", headers=user_h).json()
+    assert any(p["id"] == "custom_1" and p["amount_cents"] == 1234 for p in pkgs)
+
+    order = client.post("/api/payments/orders", json={
+        "provider": "alipay",
+        "package_id": "custom_1",
+    }, headers=user_h)
+    assert order.status_code == 200, order.text
+    assert order.json()["amount_cents"] == 1234
+    assert order.json()["credits"] == 567
+
+
+def test_admin_payment_package_requires_admin_password(client, make_user, auth):
+    make_user("13900000218", balance=100, admin=True)
+    h = auth("13900000218")
+
+    r = client.post("/api/admin/payments/packages", json={
+        "id": "custom_no_password",
+        "title": "无二次校验包",
+        "amount_cents": 1234,
+        "credits": 567,
+        "enabled": True,
+    }, headers=h)
+    assert r.status_code == 403
+
+    ok = client.post("/api/admin/payments/packages", json={
+        "id": "custom_with_password",
+        "title": "有二次校验包",
+        "amount_cents": 1234,
+        "credits": 567,
+        "enabled": True,
+        "admin_password": "pass123456",
+    }, headers=h)
+    assert ok.status_code == 200, ok.text
+
+    disabled = client.request(
+        "DELETE",
+        "/api/admin/payments/packages/custom_with_password",
+        json={"admin_password": "pass123456"},
+        headers=h,
+    )
+    assert disabled.status_code == 200, disabled.text
+
+
+def test_admin_payment_provider_config_is_masked_and_validated(client, make_user, auth):
+    make_user("13900000210", balance=100, admin=True)
+    h = auth("13900000210")
+
+    bad = client.put("/api/admin/payments/providers/wechat", json={
+        "provider": "wechat",
+        "enabled": True,
+        "mode": "live",
+        "public_config": {"appid": "wx", "mchid": "mch", "serial_no": "serial"},
+        "secret_config": {"api_v3_key": "too-short"},
+        "admin_password": "pass123456",
+    }, headers=h)
+    assert bad.status_code == 400
+
+    ok = client.put("/api/admin/payments/providers/alipay", json={
+        "provider": "alipay",
+        "enabled": True,
+        "mode": "mock",
+        "public_config": {"app_id": "ali-app"},
+        "secret_config": {"private_key": "secret-private", "public_key": "secret-public"},
+        "admin_password": "pass123456",
+    }, headers=h)
+    assert ok.status_code == 200, ok.text
+    body = ok.json()
+    assert body["public_config"]["app_id"] == "ali-app"
+    assert body["secret_config_masked"]["private_key"] == "已配置"
+    assert "secret-private" not in ok.text
+
+    cfg = client.get("/api/admin/payments/config", headers=h)
+    assert cfg.status_code == 200
+    assert "secret-private" not in cfg.text
+
+
+def test_admin_payment_provider_rejects_unofficial_gateway_url(client, make_user, auth):
+    make_user("13900000213", balance=100, admin=True)
+    h = auth("13900000213")
+
+    r = client.put("/api/admin/payments/providers/alipay", json={
+        "provider": "alipay",
+        "enabled": True,
+        "mode": "live",
+        "public_config": {
+            "app_id": "ali-app",
+            "seller_id": "seller-001",
+            "gateway_url": "http://127.0.0.1:9000/gateway.do",
+        },
+        "secret_config": {"private_key": "secret-private", "public_key": "secret-public"},
+        "admin_password": "pass123456",
+    }, headers=h)
+    assert r.status_code == 400
+    assert "官方 HTTPS" in r.text
+
+
+def test_admin_payment_provider_rejects_external_notify_url(client, make_user, auth):
+    make_user("13900000216", balance=100, admin=True)
+    h = auth("13900000216")
+
+    r = client.put("/api/admin/payments/providers/alipay", json={
+        "provider": "alipay",
+        "enabled": True,
+        "mode": "live",
+        "public_config": {
+            "app_id": "ali-app",
+            "seller_id": "seller-001",
+            "gateway_url": "https://openapi.alipay.com/gateway.do",
+            "notify_url": "https://evil.example.com/api/payments/alipay/notify",
+        },
+        "secret_config": {"private_key": "secret-private", "public_key": "secret-public"},
+        "admin_password": "pass123456",
+    }, headers=h)
+    assert r.status_code == 400
+    assert "同域" in r.text
+
+
+def test_admin_payment_provider_requires_admin_password(client, make_user, auth):
+    make_user("13900000217", balance=100, admin=True)
+    h = auth("13900000217")
+
+    r = client.put("/api/admin/payments/providers/alipay", json={
+        "provider": "alipay",
+        "enabled": True,
+        "mode": "mock",
+        "public_config": {"app_id": "ali-app"},
+        "secret_config": {"private_key": "secret-private", "public_key": "secret-public"},
+    }, headers=h)
+    assert r.status_code == 403
+
+
+def test_alipay_live_provider_requires_seller_id():
+    issues = payment_config.validate_provider(
+        "alipay",
+        {
+            "app_id": "app",
+            "gateway_url": "https://openapi.alipay.com/gateway.do",
+            "notify_url": "https://dream.aiwuq.cn/api/payments/alipay/notify",
+        },
+        {"private_key": "private", "public_key": "public"},
+        enabled=True,
+        mode="live",
+    )
+    assert "支付宝商户 PID / seller_id 未配置" in issues
