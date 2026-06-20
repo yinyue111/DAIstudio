@@ -3,8 +3,10 @@ from __future__ import annotations
 
 from celery import Celery
 from celery.schedules import crontab
+from celery.signals import beat_init, worker_init
 
 from .config import settings
+from .runtime_config import validate_runtime_config
 
 celery_app = Celery(
     "ai_studio",
@@ -39,6 +41,17 @@ celery_app.conf.update(
         },
     },
 )
+
+
+@worker_init.connect
+def _validate_worker_runtime_config(**_kwargs) -> None:
+    validate_runtime_config()
+
+
+@beat_init.connect
+def _validate_beat_runtime_config(**_kwargs) -> None:
+    validate_runtime_config()
+
 
 # ensure task functions are registered
 from . import tasks  # noqa: E402,F401

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 import secrets
 import time
 from datetime import datetime, timedelta, timezone
@@ -16,14 +17,16 @@ from decimal import Decimal, InvalidOperation
 from urllib.parse import quote_plus, urlparse
 
 import httpx
-from sqlalchemy import select
+from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session
 
 from ..config import settings
 from ..models import PaymentOrder, User
-from . import credits, payment_config
+from . import credits, locks, payment_config
+from .config_store import get_bool_setting
 
 PAYMENT_PACKAGES = payment_config.DEFAULT_PAYMENT_PACKAGES
+log = logging.getLogger("payments")
 
 VALID_PROVIDERS = {"alipay", "wechat"}
 PENDING = "pending"
@@ -64,18 +67,28 @@ def list_packages(db: Session, *, enabled_only: bool = True) -> list[dict]:
 
 
 def public_config(db: Session) -> dict:
+    payment_enabled = get_bool_setting(db, "payment_enabled", False)
     status = payment_config.export_public_status(db)
-    return {
-        "packages": status.get("packages", []),
-        "providers": [
-            {
+    mock_allowed = mock_payments_allowed()
+    providers = []
+    if payment_enabled:
+        for p in status.get("providers", []):
+            provider_mode = p.get("mode") or "mock"
+            provider_enabled = bool(p.get("enabled"))
+            provider_ready = bool(p.get("ready"))
+            if provider_mode == "mock":
+                provider_enabled = mock_allowed
+                provider_ready = mock_allowed
+            providers.append({
                 "provider": p["provider"],
-                "enabled": bool(p.get("enabled")) or mock_payments_allowed(),
-                "ready": bool(p.get("ready")) or mock_payments_allowed(),
-                "mode": p.get("mode") if p.get("ready") else ("mock" if mock_payments_allowed() else p.get("mode")),
-            }
-            for p in status.get("providers", [])
-        ],
+                "enabled": provider_enabled,
+                "ready": provider_ready,
+                "mode": provider_mode,
+            })
+    return {
+        "enabled": payment_enabled,
+        "packages": status.get("packages", []) if payment_enabled else [],
+        "providers": providers,
     }
 
 
@@ -211,6 +224,18 @@ def _notify_url(provider: str, cfg: payment_config.ProviderRuntimeConfig) -> str
 
 def _alipay_precreate(order: PaymentOrder, cfg: payment_config.ProviderRuntimeConfig) -> tuple[str, dict]:
     notify_url = _notify_url("alipay", cfg)
+    expires_at = _aware(order.expires_at)
+    timeout_express = None
+    if expires_at:
+        timeout_minutes = max(1, int((expires_at - _now()).total_seconds() // 60))
+        timeout_express = f"{timeout_minutes}m"
+    biz_content = {
+        "out_trade_no": order.order_no,
+        "total_amount": f"{order.amount_cents / 100:.2f}",
+        "subject": f"{settings.payment_subject_prefix} {order.credits}积分",
+    }
+    if timeout_express:
+        biz_content["timeout_express"] = timeout_express
     params = {
         "app_id": cfg.public.get("app_id"),
         "method": "alipay.trade.precreate",
@@ -220,15 +245,7 @@ def _alipay_precreate(order: PaymentOrder, cfg: payment_config.ProviderRuntimeCo
         "timestamp": _now().strftime("%Y-%m-%d %H:%M:%S"),
         "version": "1.0",
         "notify_url": notify_url,
-        "biz_content": json.dumps(
-            {
-                "out_trade_no": order.order_no,
-                "total_amount": f"{order.amount_cents / 100:.2f}",
-                "subject": f"{settings.payment_subject_prefix} {order.credits}积分",
-            },
-            ensure_ascii=False,
-            separators=(",", ":"),
-        ),
+        "biz_content": json.dumps(biz_content, ensure_ascii=False, separators=(",", ":")),
     }
     sign_src = "&".join(f"{k}={params[k]}" for k in sorted(params))
     params["sign"] = _rsa_sha256_sign(sign_src, cfg.secret.get("private_key") or "")
@@ -266,6 +283,7 @@ def _wechat_authorization(
 def _wechat_native(order: PaymentOrder, cfg: payment_config.ProviderRuntimeConfig) -> tuple[str, dict]:
     path = "/v3/pay/transactions/native"
     notify_url = _notify_url("wechat", cfg)
+    expires_at = _aware(order.expires_at)
     payload = {
         "appid": cfg.public.get("appid"),
         "mchid": cfg.public.get("mchid"),
@@ -274,6 +292,8 @@ def _wechat_native(order: PaymentOrder, cfg: payment_config.ProviderRuntimeConfi
         "notify_url": notify_url,
         "amount": {"total": order.amount_cents, "currency": "CNY"},
     }
+    if expires_at:
+        payload["time_expire"] = expires_at.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
     body = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
     headers = {
         "Authorization": _wechat_authorization("POST", path, body, cfg),
@@ -320,35 +340,67 @@ def _provider_code_url(order: PaymentOrder, db: Session) -> tuple[str, dict]:
 
 
 def create_order(db: Session, user: User, provider: str, package_id: str) -> PaymentOrder:
+    if not get_bool_setting(db, "payment_enabled", False):
+        raise PaymentError("支付充值功能未开启")
     if provider not in VALID_PROVIDERS:
         raise PaymentError("支付渠道非法")
     pkg = package_by_id(db, package_id)
     _assert_positive_package(pkg)
-    order = PaymentOrder(
-        order_no=make_order_no(provider),
-        user_id=user.id,
-        provider=provider,
-        package_id=pkg["id"],
-        amount_cents=int(pkg["amount_cents"]),
-        credits=int(pkg["credits"]),
-        status=PENDING,
-        expires_at=_now() + timedelta(minutes=settings.payment_order_expire_minutes),
-    )
-    db.add(order)
-    db.commit()
-    db.refresh(order)
+    lock_key = f"payment:create:{user.id}"
+    lock_ttl = max(180, int(settings.gateway_timeout_seconds) + 60)
+    lock_token = locks.acquire(lock_key, ttl=lock_ttl)
+    if not lock_token:
+        raise PaymentError("支付订单正在创建,请稍后重试")
     try:
-        code_url, raw = _provider_code_url(order, db)
-    except Exception as e:
-        order.status = FAILED
-        order.raw = {"error": str(e)[:500]}
+        now = _now()
+        db.execute(
+            update(PaymentOrder)
+            .where(
+                PaymentOrder.user_id == user.id,
+                PaymentOrder.status == PENDING,
+                PaymentOrder.expires_at < now,
+            )
+            .values(status=CLOSED)
+        )
+        pending_count = db.execute(
+            select(func.count())
+            .select_from(PaymentOrder)
+            .where(
+                PaymentOrder.user_id == user.id,
+                PaymentOrder.status == PENDING,
+                PaymentOrder.expires_at >= now,
+            )
+        ).scalar_one()
+        if int(pending_count or 0) >= int(settings.payment_order_pending_limit):
+            db.commit()
+            raise PaymentError("待支付订单过多,请先完成或等待旧订单过期")
+        order = PaymentOrder(
+            order_no=make_order_no(provider),
+            user_id=user.id,
+            provider=provider,
+            package_id=pkg["id"],
+            amount_cents=int(pkg["amount_cents"]),
+            credits=int(pkg["credits"]),
+            status=PENDING,
+            expires_at=now + timedelta(minutes=settings.payment_order_expire_minutes),
+        )
+        db.add(order)
         db.commit()
-        raise
-    order.code_url = code_url
-    order.raw = raw
-    db.commit()
-    db.refresh(order)
-    return order
+        db.refresh(order)
+        try:
+            code_url, raw = _provider_code_url(order, db)
+        except Exception as e:
+            order.status = FAILED
+            order.raw = {"error": str(e)[:500]}
+            db.commit()
+            raise
+        order.code_url = code_url
+        order.raw = raw
+        db.commit()
+        db.refresh(order)
+        return order
+    finally:
+        locks.release(lock_key, lock_token)
 
 
 def user_order(db: Session, order_no: str, user_id: int) -> PaymentOrder | None:
@@ -361,6 +413,16 @@ def user_order(db: Session, order_no: str, user_id: int) -> PaymentOrder | None:
 
 
 def list_user_orders(db: Session, user_id: int, limit: int = 20) -> list[PaymentOrder]:
+    db.execute(
+        update(PaymentOrder)
+        .where(
+            PaymentOrder.user_id == user_id,
+            PaymentOrder.status == PENDING,
+            PaymentOrder.expires_at < _now(),
+        )
+        .values(status=CLOSED)
+    )
+    db.commit()
     return list(
         db.execute(
             select(PaymentOrder)
@@ -398,13 +460,25 @@ def mark_paid(
     _assert_positive_order(order)
     if order.status == PAID:
         return order, False
+    if provider_trade_no:
+        existing = db.execute(
+            select(PaymentOrder).where(
+                PaymentOrder.provider == order.provider,
+                PaymentOrder.provider_trade_no == provider_trade_no,
+                PaymentOrder.id != order.id,
+            )
+        ).scalar_one_or_none()
+        if existing is not None:
+            raise PaymentError("支付流水号已入账到其他订单")
     expires_at = _aware(order.expires_at)
     now = _now()
-    if expires_at and expires_at < now:
+    if expires_at and expires_at < now and not allow_expired:
         order.status = CLOSED
         db.commit()
         raise PaymentError("订单已过期")
     payable_statuses = (PENDING,)
+    if allow_expired and order.status == CLOSED and not order.paid_at:
+        payable_statuses = (PENDING, CLOSED)
     if order.status not in payable_statuses:
         raise PaymentError("订单状态不可入账")
     order.status = PAID
@@ -508,6 +582,11 @@ def wechat_signature_valid(db: Session, headers: dict, body: bytes) -> bool:
         or headers.get("wechatpay-serial-no")
     )
     if expected_serial and supplied_serial != expected_serial:
+        log.warning(
+            "wechat notify platform serial mismatch expected=%s supplied=%s",
+            expected_serial,
+            supplied_serial,
+        )
         return False
     supplied = headers.get("Wechatpay-Signature") or headers.get("wechatpay-signature")
     timestamp = headers.get("Wechatpay-Timestamp") or headers.get("wechatpay-timestamp")
@@ -520,7 +599,11 @@ def wechat_signature_valid(db: Session, headers: dict, body: bytes) -> bool:
         return False
     if abs(int(time.time()) - ts) > 300:
         return False
-    message = f"{timestamp}\n{nonce}\n{body.decode()}\n"
+    try:
+        decoded_body = body.decode()
+    except UnicodeDecodeError:
+        return False
+    message = f"{timestamp}\n{nonce}\n{decoded_body}\n"
     return _rsa_sha256_verify(message, supplied, platform_cert)
 
 

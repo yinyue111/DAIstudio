@@ -1,18 +1,25 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { api, downloadBlob, getToken } from "../../lib/api";
 import Nav from "../../components/Nav";
+import AssetMedia, { assetPreviewSrc } from "../../components/AssetMedia";
 
 function srcOf(a) {
-  return a.preview_url || (a.unlocked ? a.hd_url || "" : "");
+  return assetPreviewSrc(a);
+}
+
+const TERMINAL_STATUSES = new Set(["succeeded", "failed", "needs_review"]);
+
+function isTerminalStatus(status) {
+  return TERMINAL_STATUSES.has(status);
 }
 
 function unlockConfirm(asset, me, cfg) {
   const type = asset.type === "video" ? "视频" : "图片";
   const balance = Number(me?.balance_credits ?? 0);
-  const cost = Number(cfg?.models?.[asset.type]?.unlock_cost || 0);
+  const cost = Number(asset.unlock_cost ?? cfg?.models?.[asset.type]?.unlock_cost ?? 0);
   return window.confirm(`解锁${type}高清将扣除 ${cost} 积分，当前余额 ${balance}，确认继续？`);
 }
 
@@ -27,13 +34,31 @@ export default function HistoryPage() {
   const [lightbox, setLightbox] = useState(null);
   const [msg, setMsg] = useState("");
   const [finalizingId, setFinalizingId] = useState(null);
+  const trackersRef = useRef(new Map());
 
   useEffect(() => {
     if (!getToken()) return router.push("/login");
     api.me().then(setMe).catch(() => router.push("/login"));
     api.config().then(setCfg).catch(() => {});
     load(true);
+    return () => {
+      trackersRef.current.forEach((stop) => stop());
+      trackersRef.current.clear();
+    };
   }, []);
+
+  function syncTaskTracking(list) {
+    const nextIds = new Set((list || []).filter((t) => !isTerminalStatus(t.status)).map((t) => t.id));
+    trackersRef.current.forEach((stop, id) => {
+      if (!nextIds.has(id)) {
+        stop();
+        trackersRef.current.delete(id);
+      }
+    });
+    nextIds.forEach((id) => {
+      if (!trackersRef.current.has(id)) trackersRef.current.set(id, trackTask(id));
+    });
+  }
 
   async function load(reset) {
     if (loading) return;  // guard against double-click duplicate pages
@@ -41,7 +66,9 @@ export default function HistoryPage() {
     const off = reset ? 0 : (tasks?.length || 0);  // derive offset from list, not stale state
     try {
       const list = await api.tasks(PAGE, off);
-      setTasks(reset ? list : [...(tasks || []), ...list]);
+      const nextTasks = reset ? list : [...(tasks || []), ...list];
+      setTasks(nextTasks);
+      syncTaskTracking(nextTasks);
       setHasMore(list.length === PAGE);
     } catch (e) {
       setMsg(e.message);
@@ -60,18 +87,66 @@ export default function HistoryPage() {
     }
   }
 
+  function upsertTask(next) {
+    setTasks((current) => {
+      const list = current || [];
+      const exists = list.some((t) => t.id === next.id);
+      if (exists) return list.map((t) => (t.id === next.id ? next : t));
+      return [next, ...list];
+    });
+  }
+
+  function trackTask(taskId) {
+    let stopped = false;
+    let failures = 0;
+    const tick = async () => {
+      try {
+        const task = await api.task(taskId);
+        failures = 0;
+        upsertTask(task);
+        if (isTerminalStatus(task.status)) {
+          const stop = trackersRef.current.get(task.id);
+          if (stop) {
+            stop();
+            trackersRef.current.delete(task.id);
+          }
+          api.me().then(setMe).catch(() => {});
+          return;
+        }
+      } catch (e) {
+        failures += 1;
+        if (failures >= 5) {
+          setMsg(`连续获取任务状态失败: ${e.message}`);
+          stopped = true;
+          trackersRef.current.delete(taskId);
+          return;
+        }
+      }
+      if (!stopped) setTimeout(tick, 3000);
+    };
+    tick();
+    return () => { stopped = true; };
+  }
+
   async function renderFinal(taskId) {
     if (finalizingId) return;
+    const cost = Number(cfg?.models?.video?.final_cost ?? cfg?.models?.video?.cost_credits ?? 0);
+    const balance = Number(me?.balance_credits ?? 0);
+    if (!window.confirm(`渲染完整视频将冻结 ${cost} 积分，当前余额 ${balance}，确认继续？`)) return;
     setMsg("");
     setFinalizingId(taskId);
     try {
-      await api.generate({
+      const task = await api.generate({
         category: "video",
         stage: "final",
         parent_task_id: taskId,
         params: {},
       });
-      await load(true);
+      upsertTask(task);
+      if (!isTerminalStatus(task.status) && !trackersRef.current.has(task.id)) {
+        trackersRef.current.set(task.id, trackTask(task.id));
+      }
+      load(true);
       api.me().then(setMe).catch(() => {});
     } catch (e) {
       setMsg(e.message);
@@ -130,10 +205,16 @@ export default function HistoryPage() {
           </div>
         ) : (
           <div className="space-y-4">
-            {tasks.map((t) => (
+            {tasks.map((t) => {
+              const finalStatus = t.final_status;
+              const finalAssetCount = Number(t.final_asset_count || 0);
+              const hasActiveOrSucceededFinal = ["queued", "running", "needs_review"].includes(finalStatus)
+                || (finalStatus === "succeeded" && finalAssetCount > 0);
+              const hasFailedFinal = finalStatus === "failed";
+              return (
               <div key={t.id} className="card p-4 animate-fadeup">
                 <div className="mb-3 flex flex-wrap items-center gap-2 text-sm">
-                  <span className="font-display font-semibold text-snow">#{t.id}</span>
+                  <span className="font-display font-semibold text-snow">{taskSummaryLabel(t)}</span>
                   <span className="chip">{t.category === "video" ? "视频" : "图片"}</span>
                   {t.stage === "preview" && t.category === "video" && (
                     <span className="chip">预览</span>
@@ -156,20 +237,36 @@ export default function HistoryPage() {
                         <HistoryAssetButton key={a.id} asset={a} onOpen={() => setLightbox(a)} />
                       ))}
                     </div>
-                    {t.category === "video" && t.stage === "preview" && t.status === "succeeded" && (
+                    {t.category === "video" && t.stage === "preview" && t.status === "succeeded" && hasActiveOrSucceededFinal && (
+                      <p className="mt-3 rounded-lg border border-line bg-white/5 px-3 py-2 text-center text-xs text-fog">
+                        已提交完整渲染
+                      </p>
+                    )}
+                    {t.category === "video" && t.stage === "preview" && t.status === "succeeded" && hasFailedFinal && !hasActiveOrSucceededFinal && (
+                      <p className="mt-3 rounded-lg border border-warn/30 bg-warn/10 px-3 py-2 text-center text-xs text-warn">
+                        完整渲染失败，可重新提交
+                      </p>
+                    )}
+                    {t.category === "video" && t.stage === "preview" && t.status === "succeeded" && !hasActiveOrSucceededFinal && (
                       <button
                         onClick={() => renderFinal(t.id)}
                         disabled={finalizingId === t.id}
                         className="btn-primary btn-sm mt-3 w-full"
                       >
-                        {finalizingId === t.id ? "提交中…" : "方向满意 → 渲染完整视频"}
+                        {finalizingId === t.id
+                          ? "提交中…"
+                          : `方向满意 → 渲染完整视频(${Number(cfg?.models?.video?.final_cost ?? cfg?.models?.video?.cost_credits ?? 0)}积分)`}
                       </button>
                     )}
                   </div>
                 ) : (
                   <div className="flex items-center justify-between gap-2">
                     <p className="text-xs text-fog">
-                      {t.status === "failed" ? t.error || "生成失败" : "暂无结果素材"}
+                      {t.status === "failed"
+                        ? t.error || "生成失败"
+                        : t.status === "needs_review"
+                          ? t.error || "提交状态未知，等待管理员对账"
+                          : "暂无结果素材"}
                     </p>
                     {t.status === "failed" && (
                       <button onClick={() => retry(t.id)} className="btn-secondary btn-sm">重试</button>
@@ -177,7 +274,8 @@ export default function HistoryPage() {
                   </div>
                 )}
               </div>
-            ))}
+              );
+            })}
             {hasMore && (
               <div className="text-center">
                 <button onClick={() => load(false)} disabled={loading} className="btn-secondary">
@@ -204,18 +302,16 @@ export default function HistoryPage() {
               <div className="flex min-h-64 items-center justify-center rounded-xl2 bg-black/30 px-6 text-sm text-fog">
                 {lightbox.unlocked ? "预览暂不可用，请稍后重试。" : "预览暂不可用，请先解锁后再下载高清。"}
               </div>
-            ) : lightbox.type === "video" ? (
-              <video
-                src={srcOf(lightbox)}
+            ) : (
+              <AssetMedia
+                asset={lightbox}
+                interactive
                 controls
                 autoPlay
+                muted={false}
                 className="mx-auto max-h-[76vh] w-auto rounded-xl2"
-              />
-            ) : (
-              <img
-                src={srcOf(lightbox)}
-                alt=""
-                className="mx-auto max-h-[76vh] w-auto rounded-xl2"
+                fallbackClassName="flex min-h-64 items-center justify-center rounded-xl2 bg-black/30 px-6 text-sm text-fog"
+                onError={(e) => setMsg(e?.message || "预览加载失败")}
               />
             )}
             <div className="mt-3 flex items-center justify-between gap-2 text-sm">
@@ -252,20 +348,11 @@ function HistoryAssetButton({ asset, onOpen }) {
         <div className="flex h-full w-full items-center justify-center px-3 text-center text-xs text-fog">
           预览暂不可用
         </div>
-      ) : asset.type === "video" ? (
-        <video
-          src={src}
-          muted
-          preload="metadata"
-          playsInline
-          className="h-full w-full cursor-zoom-in object-contain bg-black/20"
-        />
       ) : (
-        <img
-          src={src}
-          alt=""
-          loading="lazy"
+        <AssetMedia
+          asset={asset}
           className="h-full w-full cursor-zoom-in object-contain transition group-hover:scale-105"
+          fallbackClassName="flex h-full w-full items-center justify-center px-3 text-center text-xs text-fog"
         />
       )}
       {asset.unlocked && (
@@ -276,7 +363,7 @@ function HistoryAssetButton({ asset, onOpen }) {
 }
 
 function statusZh(s) {
-  return { queued: "排队中", running: "生成中", succeeded: "已完成", failed: "失败" }[s] || s;
+  return { queued: "排队中", running: "生成中", succeeded: "已完成", failed: "失败", needs_review: "待人工对账" }[s] || s;
 }
 function statusStyle(s) {
   return {
@@ -284,7 +371,18 @@ function statusStyle(s) {
     running: "bg-aqua/15 text-aqua",
     succeeded: "bg-ok/15 text-ok",
     failed: "bg-bad/15 text-bad",
+    needs_review: "bg-warn/15 text-warn",
   }[s] || "bg-white/10 text-mist";
+}
+
+function taskSummaryLabel(t) {
+  if (t.category === "image") {
+    const count = Number(t.saved_count ?? t.assets?.length ?? 0);
+    const requested = Number(t.requested_count ?? count);
+    if (t.partial) return `${count}/${requested} 张图片`;
+    return `${count || requested || 1} 张图片`;
+  }
+  return t.stage === "final" ? "完整视频" : "视频预览";
 }
 
 function mediaAspectStyle(a) {

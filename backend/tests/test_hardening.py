@@ -101,7 +101,7 @@ def test_generated_image_over_pixel_limit_is_rejected(client, make_user, auth, m
     assert r.status_code == 200, r.text
     task = client.get(f"/api/tasks/{r.json()['id']}", headers=h).json()
     assert task["status"] == "failed"
-    assert "无法解析" in task["error"]
+    assert task["error"] == "图片生成失败，已退回冻结积分，请稍后重试"
     assert client.get("/api/me", headers=h).json()["balance_credits"] == 1000
 
 
@@ -279,6 +279,24 @@ def test_generate_rejects_oversized_duration(client, make_user, auth):
     }, headers=h)
     assert r.status_code == 400
     assert "时长" in r.text
+
+
+def test_generate_accepts_max_15_min_video_duration(client, make_user, auth):
+    make_user("13900000028", balance=1000, admin=True)
+    h = auth("13900000028")
+    client.put("/api/admin/models", json={
+        "use": "video", "model_id": "mock-video", "cost_credits": 50,
+        "unlock_cost": 0, "enabled": True, "extra": {"preview_cost": 5},
+        "admin_password": "pass123456",
+    }, headers=h)
+    r = client.post("/api/generate", json={
+        "source_type": "image",
+        "category": "video", "stage": "preview", "instruction": "x",
+        "params": {"duration": 900, "resolution": "480p", "ratio": "9:16"},
+    }, headers=h)
+    assert r.status_code == 200, r.text
+    task = client.get(f"/api/tasks/{r.json()['id']}", headers=h).json()
+    assert task["status"] == "succeeded"
 
 
 def test_admin_rejects_negative_model_cost(client, make_user, auth):

@@ -8,12 +8,15 @@ Revises: 0003_user_password_hash
 Create Date: 2026-06-17
 """
 import sqlalchemy as sa
+
 from alembic import op
 
 revision = "0004_gateway_calls"
 down_revision = "0003_user_password_hash"
 branch_labels = None
 depends_on = None
+
+BIGINT_PK = sa.BigInteger().with_variant(sa.Integer(), "sqlite")
 
 
 def upgrade() -> None:
@@ -23,7 +26,7 @@ def upgrade() -> None:
         return
     op.create_table(
         "gateway_calls",
-        sa.Column("id", sa.BigInteger(), primary_key=True, autoincrement=True),
+        sa.Column("id", BIGINT_PK, primary_key=True, autoincrement=True),
         sa.Column("user_id", sa.BigInteger(), nullable=True, index=True),
         sa.Column("task_id", sa.BigInteger(), nullable=True, index=True),
         sa.Column("kind", sa.String(length=16), nullable=False),

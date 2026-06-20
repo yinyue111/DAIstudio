@@ -70,8 +70,8 @@ chmod +x scripts/*.sh
 ADMIN_PHONE=13800000000 ./scripts/setup.sh
 ```
 
-`setup.sh` 会:建 venv 并装后端依赖 → (可选)装 Playwright Chromium → 建表 + 写入种子模型配置 +
-创建管理员(并发放 1000 额度)→ 前端 `npm install`。
+`setup.sh` 会:建 venv 并装后端依赖 → (可选)装 Playwright Chromium → 显式执行本地开发建表 + 写入种子模型配置 +
+创建管理员(并发放 1000 额度)→ 前端 `npm install`。生产初始化不要走开发建表，必须先跑 Alembic 迁移。
 
 > 网关密钥已写入 `backend/.env`(`GATEWAY_BASE_URL` / `GATEWAY_API_KEY`)。该文件已被 `.gitignore`,
 > 不要提交。模型 `model_id` 请按你网关 `/v1/models` 的真实值在「管理后台 → 模型配置」里改。
@@ -90,7 +90,7 @@ ADMIN_PHONE=13800000000 ./scripts/setup.sh
 打开 http://localhost:3000,用管理员账号登录:**手机号 `13800000000`**。管理员密码不再有固定默认值——
 `setup.sh` 会调用 `init_db`,**未设 `ADMIN_PASSWORD` 时它会生成一次性随机密码并打印**(仅显示一次,请保存并尽快改密);
 也可在运行前 `export ADMIN_PHONE=... ADMIN_PASSWORD=...` 自定义。其他员工在登录页切到「注册」,
-用白名单内的手机号 + 自设密码注册即可(短信暂未接入)。
+用白名单内的手机号 + 自设密码注册即可。短信验证码注册默认关闭，可在管理后台完成短信网关配置后再开启。
 
 ---
 
@@ -101,25 +101,26 @@ ADMIN_PHONE=13800000000 ./scripts/setup.sh
 ```bash
 export POSTGRES_PASSWORD='<强随机数据库密码>'
 export METRICS_TOKEN='<强随机监控访问令牌>'
-export PAYMENT_CONFIG_SECRET='<强随机支付配置加密密钥>'
-export SMS_PROVIDER='http'
-export SMS_HTTP_URL='<你的真实短信网关 HTTPS 地址>'
+export PAYMENT_CONFIG_SECRET='<强随机密钥,至少32位,用于加密后台保存的支付/模型密钥>'
 docker compose up -d --build
-# 首次:建管理员 + 种子配置(设强密码,或省略 ADMIN_PASSWORD 让 init_db 打印一次性随机密码)
+# 首次:等待 migrate 服务完成 Alembic 后,建管理员 + 种子配置
+# (设强密码,或省略 ADMIN_PASSWORD 让 init_db 打印一次性随机密码)
 ADMIN_PASSWORD='<强随机密码>' docker compose run --rm -e ADMIN_PASSWORD api \
   python -m scripts.init_db --admin-phone 13800000000 --credits 1000
 ```
 
 起 Postgres + Redis + 迁移任务 + API + Worker + Beat + 前端；生产迁移由独立 `migrate` 服务执行
-`alembic upgrade head`，API 容器只在迁移成功后启动。
+`alembic upgrade head`，API 容器只在迁移成功后启动。`init_db` 在生产只做 seed/admin，不会隐式建表。
 网关密钥仍从 `backend/.env` 读;`DATABASE_URL/REDIS_URL` 由 compose 注入。生产默认同域部署:
 `https://dream.aiwuq.cn` 访问前端,`/api`、`/media`、`/ws` 反代到后端。Nginx 模板见
 `deploy/nginx/dream.aiwuq.cn.conf`。
 Compose 默认只把 API/前端绑定到 `127.0.0.1:${API_PORT:-8000}` 和
 `127.0.0.1:${FRONTEND_PORT:-3000}`,不要直接裸露到公网;公网流量走 nginx/HTTPS。生产还需要在
-`backend/.env` 或宿主环境中确认强 `JWT_SECRET`、`METRICS_TOKEN`、已实现并可发送的真实 `SMS_PROVIDER`
-(可用通用 HTTP 短信网关: `SMS_PROVIDER=http` + `SMS_HTTP_URL`)以及支付密钥加密用的
-`PAYMENT_CONFIG_SECRET`。Compose 会默认覆盖为 `DEBUG=false`、`PAYMENT_MOCK_ENABLED=false`;本地调试才显式
+`backend/.env` 或宿主环境中确认强 `JWT_SECRET`、`METRICS_TOKEN` 和 `PAYMENT_CONFIG_SECRET`。短信验证码注册和支付充值默认关闭；
+开启短信前配置真实 HTTP 短信网关(`SMS_PROVIDER=http` + `SMS_HTTP_URL`)；开启真实支付前设置支付密钥加密用的
+`PAYMENT_CONFIG_SECRET`，再在管理后台配置商户资料和套餐。后台模型 API Key 默认也使用该密钥加密
+(如需分离可另设 `MODEL_CONFIG_SECRET`)。Compose 会在缺少 `PAYMENT_CONFIG_SECRET` 时直接拒绝启动，并默认覆盖为
+`DEBUG=false`、`PAYMENT_MOCK_ENABLED=false`;本地调试才显式
 `DEBUG=true PAYMENT_MOCK_ENABLED=true docker compose ...`。
 
 ## 数据库迁移(Alembic)
@@ -138,7 +139,7 @@ alembic revision --autogenerate -m "add xxx"      # 改了 models 后生成新�
 
 ## 端到端流程(与产品一致)
 
-1. 手机号 + 密码 注册 / 登录(注册需手机号在白名单内;短信暂未接入)。
+1. 手机号 + 密码 注册 / 登录(注册需手机号在白名单内;短信验证码可由管理员配置后开启)。
 2. 粘贴链接(小红书/抖音/普通网页) → 抓取页面 → 返回图片/视频资源列表。
 3. 勾选要参考的一张图 / 一段视频。
 4. (可选)反推:调视觉大模型输出结构化提示词,可编辑;关闭反推则走「图 + 指令 → 图」。
@@ -175,7 +176,7 @@ alembic revision --autogenerate -m "add xxx"      # 改了 models 后生成新�
   内网/回环/链路本地(含 `169.254.169.254` 元数据)/保留/多播/CGNAT 一律拒绝;
   额外归一化 IPv4-mapped IPv6(`::ffff:127.0.0.1`)。抓取**禁用自动重定向**,
   每一跳的 Location 重新做 SSRF 校验;Playwright 用 `page.route` 拦截内网请求。
-- **输入校验**:生成参数 `n`(≤8)、`size`(WxH 且单边 ≤4096px)、`duration`(≤30s)
+- **输入校验**:生成参数 `n`(≤8)、`size`(WxH 且单边 ≤4096px)、`duration`(≤`MAX_VIDEO_SECONDS`, 默认 900s/15min)
   在入口 clamp/拒绝,挡住资源耗尽。
 - 密码:PBKDF2-SHA256 加盐哈希存储;登录失败防爆破**按手机号 + 按 IP** 双维度限流。
 - **JWT**:`DEBUG=false` 且仍为默认密钥时拒绝启动(防伪造 token)。
@@ -242,7 +243,7 @@ backend/
       audit.py         审计日志
     routers/           auth / me / parse / prompt / generate / tasks / assets / admin / ws
   models.yaml          模型用途 + 成本积分种子
-  scripts/init_db.py   建表 + 种子 + 建管理员
+  scripts/init_db.py   种子 + 建管理员(仅 --create-tables-dev-only 时开发建表)
   .env(.example)       配置(密钥)
 frontend/
   app/                 login / 工作台(/) / 个人主页(/profile) / 历史记录(/history) / 管理后台(/admin)
@@ -290,7 +291,7 @@ scripts/               setup / run_backend / run_worker / run_frontend
 
 ### 上一轮生产化
 
-- **认证改为手机号 + 密码**:注册(白名单内)/ 登录,PBKDF2 加盐哈希,登录失败防爆破;短信暂不接。
+- **认证改为手机号 + 密码**:注册(白名单内)/ 登录,PBKDF2 加盐哈希,登录失败防爆破;短信验证码支持后台开关。
 - **实时进度 WebSocket**:工作台经 `WS /ws/tasks/{id}` 推进度,断连自动回退轮询。
 - **Alembic 迁移**:`alembic/` 初始迁移就绪,`alembic upgrade head` 可建全表;生产用迁移代替自动建表。
 - **Docker 一键部署**:`docker-compose.yml` + 前后端 Dockerfile(API 自动迁移、Worker 含每日清理 beat)。
@@ -348,10 +349,10 @@ scripts/               setup / run_backend / run_worker / run_frontend
   - **已有数据库需在「管理后台 → 模型配置」把 video 的 model_id 设为 `doubao-seedance-1-5-pro-251215` 并启用**
     (`models.yaml` 仅对全新初始化生效;种子不会覆盖已存在的行)。
   - 其它视频网关:把 `VIDEO_GATEWAY_FORMAT=openai` 走通用适配(路径见 `models.yaml` 的 `video.extra`)。
-- 短信:`services/sms.py` 内置本地 mock 和通用 HTTP 短信网关适配器。生产可设置
-  `SMS_PROVIDER=http`、`SMS_HTTP_URL=<短信服务 HTTPS 地址>`、可选 `SMS_HTTP_API_KEY`；
-  该网关会收到 `{phone, code, sign_name, template_code}` JSON。直连阿里云/腾讯云 SDK 还未启用,
-  需要新增 provider 实现、签名/模板报备和测试后再开放生产配置。
+- 短信:`services/sms.py` 内置本地 mock 和通用 HTTP 短信网关适配器。短信验证码注册默认关闭；生产开启前设置
+  `SMS_PROVIDER=http`、`SMS_HTTP_URL=<短信服务 HTTPS 地址>`、可选 `SMS_HTTP_API_KEY`，
+  并在管理后台打开“短信验证码注册”。该网关会收到 `{phone, code, sign_name, template_code}` JSON。
+  直连阿里云/腾讯云 SDK 还未启用，需要新增 provider 实现、签名/模板报备和测试后再开放生产配置。
 - 存储:`services/storage.py` 为本地实现,换 MinIO/OSS 只需替换 `save_bytes/public_url`。
-- 生产部署:建议 PostgreSQL/Redis 独立实例,前端 `next build && next start`,后端用 gunicorn+uvicorn worker,
-  内网或 VPN/反代 + JWT。
+- 生产部署:Compose 是单机/MVP 支持路径(API 用单进程 uvicorn,前置 nginx/HTTPS);高并发场景再切到
+  PostgreSQL/Redis 独立实例、前端 `next build && next start`、后端 gunicorn+uvicorn 多 worker,并同步健康检查和超时参数。

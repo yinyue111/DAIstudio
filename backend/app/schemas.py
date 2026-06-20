@@ -1,6 +1,7 @@
 """Pydantic request/response models."""
 from __future__ import annotations
 
+import json
 from datetime import datetime
 from typing import Any, Literal
 
@@ -10,8 +11,8 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 # --- Auth (phone + password) ---
 class RegisterIn(BaseModel):
     phone: str
-    password: str
-    sms_code: str
+    password: str = Field(max_length=128)
+    sms_code: str | None = None
     nickname: str | None = None
 
 
@@ -21,7 +22,7 @@ class SmsCodeIn(BaseModel):
 
 class LoginIn(BaseModel):
     phone: str
-    password: str
+    password: str = Field(max_length=128)
 
 
 class TokenOut(BaseModel):
@@ -30,13 +31,25 @@ class TokenOut(BaseModel):
 
 
 class ChangePasswordIn(BaseModel):
-    old_password: str
-    new_password: str
+    old_password: str = Field(max_length=128)
+    new_password: str = Field(max_length=128)
 
 
 class ResetPasswordIn(BaseModel):
-    password: str
-    admin_password: str | None = None
+    password: str = Field(max_length=128)
+    admin_password: str | None = Field(default=None, max_length=128)
+
+
+class AdminTaskRefundIn(BaseModel):
+    admin_password: str | None = Field(default=None, max_length=128)
+    note: str | None = Field(default=None, max_length=255)
+
+
+class AdminTaskSettleIn(BaseModel):
+    result_url: str = Field(min_length=1, max_length=2048)
+    external_task_id: str | None = Field(default=None, max_length=256)
+    admin_password: str | None = Field(default=None, max_length=128)
+    note: str | None = Field(default=None, max_length=255)
 
 
 class UserOut(BaseModel):
@@ -61,6 +74,8 @@ class Asset(BaseModel):
     type: str  # image / video
     url: str
     thumb: str | None = None
+    original_url: str | None = None
+    original_thumb: str | None = None
     width: int | None = None
     height: int | None = None
     thumb_width: int | None = None
@@ -79,6 +94,7 @@ class ParseOut(BaseModel):
 class ReverseIn(BaseModel):
     asset_url: str
     target: Literal["image", "video"] = "image"  # selects prompt dimensions
+    source_type: Literal["image", "video"] | None = None
     # For a video asset_url with target=video: a cover/keyframe image to fall
     # back to when server-side keyframe sampling is unavailable.
     fallback_image: str | None = None
@@ -87,12 +103,15 @@ class ReverseIn(BaseModel):
 class ReverseOut(BaseModel):
     structured: dict[str, Any]
     final_text: str
+    charged_credits: int = 0
+    reference_count: int = 1
 
 
 # --- Generate ---
 class GenerateIn(BaseModel):
     # optional: pure text-to-image needs no reference; only set when generating
     # from a scraped reference asset (same-style / first-frame).
+    client_request_id: str | None = Field(default=None, min_length=8, max_length=128)
     source_asset_url: str | None = None
     source_type: Literal["image", "video"] = "image"
     category: Literal["image", "video"] = "image"
@@ -111,6 +130,7 @@ class TaskOut(BaseModel):
     id: int
     category: str
     stage: str
+    parent_task_id: int | None = None
     status: str
     model_use: str | None = None
     cost_frozen: int
@@ -121,6 +141,9 @@ class TaskOut(BaseModel):
     saved_count: int | None = None
     skipped_count: int | None = None
     progress: int = 0
+    final_task_id: int | None = None
+    final_status: str | None = None
+    final_asset_count: int = 0
     created_at: datetime | None = None
     finished_at: datetime | None = None
     assets: list[AssetOut] = Field(default_factory=list)
@@ -143,6 +166,7 @@ class AssetOut(BaseModel):
     expires_at: datetime | None = None
     days_left: int | None = None
     category: str | None = None
+    unlock_cost: int = 0
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -160,7 +184,17 @@ class PaymentPackageOut(BaseModel):
 
 class PaymentCreateIn(BaseModel):
     provider: Literal["alipay", "wechat"] = "alipay"
-    package_id: str
+    package_id: str = Field(min_length=1, max_length=32)
+
+    @field_validator("package_id")
+    @classmethod
+    def _package_id(cls, v: str) -> str:
+        value = v.strip()
+        if not value:
+            raise ValueError("套餐 ID 不能为空")
+        if not re_match_package_id(value):
+            raise ValueError("套餐 ID 只能包含字母、数字、下划线和短横线")
+        return value
 
 
 class PaymentOrderOut(BaseModel):
@@ -185,42 +219,61 @@ class WhitelistIn(BaseModel):
     phone: str
     note: str | None = None
     department: str | None = None
-    admin_password: str | None = None
+    admin_password: str | None = Field(default=None, max_length=128)
 
 
 class WhitelistDeleteIn(BaseModel):
-    admin_password: str | None = None
+    admin_password: str | None = Field(default=None, max_length=128)
 
 
 class QuotaGrantIn(BaseModel):
     user_id: int
     amount: int = Field(gt=0)
-    note: str | None = None
-    admin_password: str | None = None
-    idempotency_key: str | None = Field(default=None, max_length=128)
+    note: str | None = Field(default=None, max_length=255)
+    admin_password: str | None = Field(default=None, max_length=128)
+    idempotency_key: str = Field(min_length=8, max_length=128)
 
 
 class UserStatusIn(BaseModel):
     status: Literal["active", "pending", "disabled"]
-    admin_password: str | None = None
+    admin_password: str | None = Field(default=None, max_length=128)
 
 
 class ModelConfigIn(BaseModel):
     model_config = ConfigDict(protected_namespaces=())
 
     use: Literal["vision", "image", "video"]
-    model_id: str = Field(min_length=1)
+    model_id: str = Field(min_length=1, max_length=128)
+    provider: Literal[
+        "openai",
+        "volcengine_ark",
+        "openrouter",
+        "siliconflow",
+        "deepseek",
+        "moonshot",
+        "zhipu",
+        "dashscope",
+        "baidu_qianfan",
+        "tencent_hunyuan",
+        "yinyue",
+        "custom_openai",
+    ] | None = None
+    base_url: str | None = Field(default=None, max_length=512)
+    api_key: str | None = Field(default=None, max_length=4096)
+    api_key_clear: bool = False
+    gateway_format: Literal["openai", "ark"] | None = None
     cost_credits: int = Field(ge=0)
     unlock_cost: int = Field(default=0, ge=0)
     enabled: bool = True
     extra: dict[str, Any] | None = None
-    admin_password: str | None = None
+    admin_password: str | None = Field(default=None, max_length=128)
 
     @field_validator("extra")
     @classmethod
     def _validate_extra_costs(cls, v: dict[str, Any] | None):
         if v is None:
             return v
+        _validate_json_payload_size(v, 16 * 1024, "extra")
         if "preview_cost" in v:
             try:
                 preview_cost = int(v["preview_cost"])
@@ -231,14 +284,68 @@ class ModelConfigIn(BaseModel):
             v = {**v, "preview_cost": preview_cost}
         return v
 
+    @field_validator("base_url")
+    @classmethod
+    def _normalise_base_url(cls, v: str | None):
+        if v is None:
+            return None
+        text = v.strip().rstrip("/")
+        return text or None
+
+    @field_validator("api_key")
+    @classmethod
+    def _normalise_api_key(cls, v: str | None):
+        if v is None:
+            return None
+        return v.strip()
+
+
+class ModelProbeIn(BaseModel):
+    use: Literal["vision", "image", "video"] | None = None
+    provider: Literal[
+        "openai",
+        "volcengine_ark",
+        "openrouter",
+        "siliconflow",
+        "deepseek",
+        "moonshot",
+        "zhipu",
+        "dashscope",
+        "baidu_qianfan",
+        "tencent_hunyuan",
+        "yinyue",
+        "custom_openai",
+    ] | None = None
+    base_url: str | None = Field(default=None, max_length=512)
+    api_key: str | None = Field(default=None, max_length=4096)
+    gateway_format: Literal["openai", "ark"] | None = None
+    admin_password: str | None = Field(default=None, max_length=128)
+
+    @field_validator("base_url")
+    @classmethod
+    def _normalise_probe_base_url(cls, v: str | None):
+        if v is None:
+            return None
+        text = v.strip().rstrip("/")
+        return text or None
+
+    @field_validator("api_key")
+    @classmethod
+    def _normalise_probe_api_key(cls, v: str | None):
+        if v is None:
+            return None
+        return v.strip()
+
 
 class SettingsIn(BaseModel):
     reverse_prompt_enabled: bool | None = None
+    sms_auth_enabled: bool | None = None
+    payment_enabled: bool | None = None
     image_n: int | None = Field(default=None, ge=1, le=8)
     image_size: str | None = None
     asset_retention_days: int | None = Field(default=None, ge=1, le=3650)
     audit_retention_days: int | None = Field(default=None, ge=1, le=3650)
-    admin_password: str | None = None
+    admin_password: str | None = Field(default=None, max_length=128)
 
 
 class PaymentPackageIn(BaseModel):
@@ -249,7 +356,7 @@ class PaymentPackageIn(BaseModel):
     badge: str | None = Field(default=None, max_length=32)
     enabled: bool = True
     sort_order: int = 0
-    admin_password: str | None = None
+    admin_password: str | None = Field(default=None, max_length=128)
 
     @field_validator("id")
     @classmethod
@@ -263,7 +370,7 @@ class PaymentPackageIn(BaseModel):
 
 
 class PaymentPackageDisableIn(BaseModel):
-    admin_password: str | None = None
+    admin_password: str | None = Field(default=None, max_length=128)
 
 
 class PaymentProviderConfigIn(BaseModel):
@@ -272,13 +379,20 @@ class PaymentProviderConfigIn(BaseModel):
     mode: Literal["mock", "live"] = "mock"
     public_config: dict[str, Any] = Field(default_factory=dict)
     secret_config: dict[str, Any] = Field(default_factory=dict)
-    admin_password: str | None = None
+    admin_password: str | None = Field(default=None, max_length=128)
+
+    @field_validator("public_config", "secret_config")
+    @classmethod
+    def _validate_provider_config_size(cls, v: dict[str, Any]):
+        _validate_json_payload_size(v, 64 * 1024, "支付配置")
+        return v
 
 
 class PaymentProviderConfigOut(BaseModel):
     provider: str
     enabled: bool
     mode: str
+    source: str = "db"
     public_config: dict[str, Any] = Field(default_factory=dict)
     secret_config_masked: dict[str, str] = Field(default_factory=dict)
     configured: bool = False
@@ -303,6 +417,15 @@ def re_match_package_id(value: str) -> bool:
     import re
 
     return bool(re.fullmatch(r"[A-Za-z0-9_-]+", value))
+
+
+def _validate_json_payload_size(value: dict[str, Any], max_bytes: int, label: str) -> None:
+    try:
+        raw = json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    except (TypeError, ValueError) as e:
+        raise ValueError(f"{label} 必须是可序列化 JSON") from e
+    if len(raw) > max_bytes:
+        raise ValueError(f"{label} 不能超过 {max_bytes // 1024}KB")
 
 
 TaskOut.model_rebuild()

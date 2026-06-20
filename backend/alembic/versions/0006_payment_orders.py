@@ -5,12 +5,15 @@ Revises: 0005_video_lifecycle
 Create Date: 2026-06-18
 """
 import sqlalchemy as sa
+
 from alembic import op
 
 revision = "0006_payment_orders"
 down_revision = "0005_video_lifecycle"
 branch_labels = None
 depends_on = None
+
+BIGINT_PK = sa.BigInteger().with_variant(sa.Integer(), "sqlite")
 
 
 def upgrade() -> None:
@@ -20,7 +23,7 @@ def upgrade() -> None:
         return
     op.create_table(
         "payment_orders",
-        sa.Column("id", sa.BigInteger(), primary_key=True, autoincrement=True),
+        sa.Column("id", BIGINT_PK, primary_key=True, autoincrement=True),
         sa.Column("order_no", sa.String(length=64), nullable=False),
         sa.Column("user_id", sa.BigInteger(), sa.ForeignKey("users.id"), nullable=False),
         sa.Column("provider", sa.String(length=16), nullable=False),

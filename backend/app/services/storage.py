@@ -13,7 +13,16 @@ from urllib.parse import unquote, urlparse
 from ..config import settings
 
 ROOT = Path(settings.storage_dir)
-LOCAL_MEDIA_SUBDIRS = {"preview", "video_preview", "hd", "video_hd", "upload", "upload_preview"}
+LOCAL_MEDIA_SUBDIRS = {
+    "preview",
+    "video_preview",
+    "hd",
+    "video_hd",
+    "upload",
+    "upload_preview",
+    "upload_model_ref",
+    "model_ref",
+}
 
 
 def _ensure(subdir: str) -> Path:
@@ -27,6 +36,18 @@ def save_bytes(data: bytes, subdir: str, ext: str) -> str:
     _ensure(subdir)
     name = f"{uuid.uuid4().hex}.{ext.lstrip('.')}"
     key = f"{subdir}/{name}"
+    with open(ROOT / key, "wb") as f:
+        f.write(data)
+    return key
+
+
+def save_bytes_named(data: bytes, subdir: str, filename: str) -> str:
+    """Save bytes under a caller-chosen safe filename in ``subdir``."""
+    _ensure(subdir)
+    safe = Path(filename).name
+    if not safe or safe in {".", ".."} or "/" in safe:
+        raise ValueError("非法文件名")
+    key = f"{subdir}/{safe}"
     with open(ROOT / key, "wb") as f:
         f.write(data)
     return key
@@ -75,7 +96,19 @@ def upload_api_url(key: str | None) -> str | None:
 
 
 def local_path(key: str) -> Path:
-    return ROOT / key
+    if not key:
+        raise ValueError("非法存储 key")
+    parts = key.split("/")
+    if len(parts) < 2 or parts[0] not in LOCAL_MEDIA_SUBDIRS:
+        raise ValueError("非法存储 key")
+    if key.startswith("/") or ".." in parts:
+        raise ValueError("非法存储 key")
+    try:
+        resolved = (ROOT / key).resolve()
+        resolved.relative_to(ROOT.resolve())
+    except (ValueError, OSError) as e:
+        raise ValueError("非法存储 key") from e
+    return resolved
 
 
 def key_from_url(url: str) -> str | None:

@@ -1,0 +1,310 @@
+"""Admin-configured model providers and model probing."""
+
+from app.db import SessionLocal
+from app.models import GenTask, ModelConfig
+from app.services import gateway
+from app.services.model_gateway_config import decrypt_row_api_key
+
+
+def test_admin_model_config_encrypts_and_masks_api_key(client, make_user, auth):
+    make_user("13900001001", balance=1000, admin=True)
+    h = auth("13900001001")
+
+    r = client.put(
+        "/api/admin/models",
+        json={
+            "use": "image",
+            "provider": "openai",
+            "base_url": "https://api.openai.com/v1",
+            "gateway_format": "openai",
+            "api_key": "sk-model-secret",
+            "model_id": "gpt-image-2",
+            "cost_credits": 5,
+            "unlock_cost": 5,
+            "enabled": True,
+            "admin_password": "pass123456",
+        },
+        headers=h,
+    )
+    assert r.status_code == 200, r.text
+
+    got = client.get("/api/admin/models", headers=h)
+    assert got.status_code == 200, got.text
+    image = next(m for m in got.json()["models"] if m["use"] == "image")
+    assert image["api_key_configured"] is True
+    assert image["api_key_masked"] == "已配置"
+    assert "sk-model-secret" not in got.text
+
+    db = SessionLocal()
+    try:
+        row = db.query(ModelConfig).filter(ModelConfig.use == "image").one()
+        assert row.api_key_encrypted != "sk-model-secret"
+        assert decrypt_row_api_key(row) == "sk-model-secret"
+    finally:
+        db.close()
+
+
+def test_admin_model_config_empty_key_keeps_existing_secret(client, make_user, auth):
+    make_user("13900001002", balance=1000, admin=True)
+    h = auth("13900001002")
+    body = {
+        "use": "vision",
+        "provider": "custom_openai",
+        "base_url": "https://vision.example.com/v1",
+        "gateway_format": "openai",
+        "model_id": "vision-a",
+        "cost_credits": 1,
+        "unlock_cost": 0,
+        "enabled": True,
+        "admin_password": "pass123456",
+    }
+    r = client.put("/api/admin/models", json={**body, "api_key": "first-key"}, headers=h)
+    assert r.status_code == 200, r.text
+    r = client.put("/api/admin/models", json={**body, "model_id": "vision-b"}, headers=h)
+    assert r.status_code == 200, r.text
+
+    db = SessionLocal()
+    try:
+        row = db.query(ModelConfig).filter(ModelConfig.use == "vision").one()
+        assert row.model_id == "vision-b"
+        assert decrypt_row_api_key(row) == "first-key"
+    finally:
+        db.close()
+
+
+def test_admin_model_config_rejects_gateway_identity_change_without_new_key(client, make_user, auth):
+    make_user("13900001005", balance=1000, admin=True)
+    h = auth("13900001005")
+    body = {
+        "use": "image",
+        "provider": "openai",
+        "base_url": "https://saved.example.com/v1",
+        "gateway_format": "openai",
+        "model_id": "gpt-image-2",
+        "cost_credits": 5,
+        "unlock_cost": 5,
+        "enabled": True,
+        "admin_password": "pass123456",
+    }
+    first = client.put("/api/admin/models", json={**body, "api_key": "saved-key"}, headers=h)
+    assert first.status_code == 200, first.text
+
+    changed = client.put(
+        "/api/admin/models",
+        json={**body, "base_url": "https://other.example.com/v1"},
+        headers=h,
+    )
+    assert changed.status_code == 400
+    assert "重新输入 API Key" in changed.text
+
+    changed_with_key = client.put(
+        "/api/admin/models",
+        json={**body, "base_url": "https://other.example.com/v1", "api_key": "new-key"},
+        headers=h,
+    )
+    assert changed_with_key.status_code == 200, changed_with_key.text
+
+
+def test_admin_model_config_rejects_partial_gateway_config(client, make_user, auth):
+    make_user("13900001004", balance=1000, admin=True)
+    h = auth("13900001004")
+    db = SessionLocal()
+    try:
+        row = db.query(ModelConfig).filter(ModelConfig.use == "image").one()
+        row.provider = None
+        row.base_url = None
+        row.api_key_encrypted = None
+        row.gateway_format = None
+        db.commit()
+    finally:
+        db.close()
+    body = {
+        "use": "image",
+        "provider": "openai",
+        "gateway_format": "openai",
+        "model_id": "gpt-image-2",
+        "cost_credits": 5,
+        "unlock_cost": 5,
+        "enabled": True,
+        "admin_password": "pass123456",
+    }
+
+    only_base = client.put(
+        "/api/admin/models",
+        json={**body, "base_url": "https://api.openai.com/v1"},
+        headers=h,
+    )
+    assert only_base.status_code == 400
+    assert "同时配置" in only_base.text
+
+    only_key = client.put(
+        "/api/admin/models",
+        json={**body, "api_key": "sk-model-secret"},
+        headers=h,
+    )
+    assert only_key.status_code == 400
+    assert "同时配置" in only_key.text
+
+
+def test_admin_model_config_blocks_gateway_change_with_active_tasks(client, make_user, auth):
+    uid = make_user("13900001007", balance=1000, admin=True)
+    h = auth("13900001007")
+    body = {
+        "use": "image",
+        "provider": "openai",
+        "base_url": "https://saved.example.com/v1",
+        "gateway_format": "openai",
+        "api_key": "saved-key",
+        "model_id": "gpt-image-2",
+        "cost_credits": 5,
+        "unlock_cost": 5,
+        "enabled": True,
+        "admin_password": "pass123456",
+    }
+    first = client.put("/api/admin/models", json=body, headers=h)
+    assert first.status_code == 200, first.text
+
+    db = SessionLocal()
+    try:
+        t = GenTask(
+            user_id=uid,
+            category="image",
+            stage="preview",
+            model_use="image",
+            prompt={"final_text": "queued"},
+            params={},
+            status="queued",
+            cost_frozen=5,
+        )
+        db.add(t)
+        db.commit()
+        tid = t.id
+    finally:
+        db.close()
+
+    changed = client.put(
+        "/api/admin/models",
+        json={**body, "api_key": "new-key"},
+        headers=h,
+    )
+    assert changed.status_code == 409
+    assert "仍有排队" in changed.text
+
+    price_only = client.put(
+        "/api/admin/models",
+        json={**body, "api_key": "", "cost_credits": 8},
+        headers=h,
+    )
+    assert price_only.status_code == 200, price_only.text
+
+    db = SessionLocal()
+    try:
+        task = db.get(GenTask, tid)
+        task.status = "failed"
+        db.commit()
+    finally:
+        db.close()
+
+    changed_after_finish = client.put(
+        "/api/admin/models",
+        json={**body, "api_key": "new-key"},
+        headers=h,
+    )
+    assert changed_after_finish.status_code == 200, changed_after_finish.text
+
+
+def test_admin_probe_models_uses_unsaved_or_saved_key(client, make_user, auth, monkeypatch):
+    make_user("13900001003", balance=1000, admin=True)
+    h = auth("13900001003")
+    seen = []
+
+    def fake_list_models(cfg):
+        seen.append((cfg.base_url, cfg.api_key, cfg.gateway_format))
+        return [{"id": "model-a"}, {"id": "model-b", "owned_by": "provider"}]
+
+    monkeypatch.setattr(gateway, "list_models", fake_list_models)
+    r = client.post(
+        "/api/admin/models/probe",
+        json={
+            "use": "image",
+            "provider": "openai",
+            "base_url": "https://probe.example.com/v1",
+            "api_key": "probe-key",
+            "gateway_format": "openai",
+        },
+        headers=h,
+    )
+    assert r.status_code == 200, r.text
+    assert [m["id"] for m in r.json()["models"]] == ["model-a", "model-b"]
+    assert seen[-1] == ("https://probe.example.com/v1", "probe-key", "openai")
+
+    save = client.put(
+        "/api/admin/models",
+        json={
+            "use": "image",
+            "provider": "openai",
+            "base_url": "https://saved.example.com/v1",
+            "api_key": "saved-key",
+            "gateway_format": "openai",
+            "model_id": "model-a",
+            "cost_credits": 5,
+            "unlock_cost": 5,
+            "enabled": True,
+            "admin_password": "pass123456",
+        },
+        headers=h,
+    )
+    assert save.status_code == 200, save.text
+    r = client.post(
+        "/api/admin/models/probe",
+        json={"use": "image", "admin_password": "pass123456"},
+        headers=h,
+    )
+    assert r.status_code == 200, r.text
+    assert seen[-1] == ("https://saved.example.com/v1", "saved-key", "openai")
+
+
+def test_admin_probe_rejects_saved_key_with_temporary_base_url(client, make_user, auth, monkeypatch):
+    make_user("13900001006", balance=1000, admin=True)
+    h = auth("13900001006")
+    called = False
+
+    def fake_list_models(cfg):
+        nonlocal called
+        called = True
+        return [{"id": "model-a"}]
+
+    monkeypatch.setattr(gateway, "list_models", fake_list_models)
+    save = client.put(
+        "/api/admin/models",
+        json={
+            "use": "image",
+            "provider": "openai",
+            "base_url": "https://saved.example.com/v1",
+            "api_key": "saved-key",
+            "gateway_format": "openai",
+            "model_id": "model-a",
+            "cost_credits": 5,
+            "unlock_cost": 5,
+            "enabled": True,
+            "admin_password": "pass123456",
+        },
+        headers=h,
+    )
+    assert save.status_code == 200, save.text
+
+    no_password = client.post("/api/admin/models/probe", json={"use": "image"}, headers=h)
+    assert no_password.status_code == 403
+
+    leaked = client.post(
+        "/api/admin/models/probe",
+        json={
+            "use": "image",
+            "base_url": "https://attacker.example.com/v1",
+            "admin_password": "pass123456",
+        },
+        headers=h,
+    )
+    assert leaked.status_code == 400
+    assert "不能临时覆盖 Base URL" in leaked.text
+    assert called is False

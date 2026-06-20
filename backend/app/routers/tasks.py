@@ -10,14 +10,21 @@ from sqlalchemy.orm import Session
 
 from ..db import get_db
 from ..deps import get_current_user
-from ..models import GenAsset, GenTask, User
+from ..models import GenTask, User
 from ..redis_client import redis_client
-from ..schemas import AssetOut, TaskOut
-from ..services import credits
+from ..schemas import TaskOut
+from ..services import credits, generation
 from ..services.config_store import get_model_config
-from ..services.progress import get_progress
+from ..services.generation import assert_model_snapshot_compatible, model_snapshot
 from ..services.ssrf import SsrfError, assert_safe_user_asset_url
-from .generate import _assert_reference_access, _estimate_cost, _validate_params
+from ..services.task_output import build_task_out, build_task_outs
+from .generate import (
+    _assert_reference_access,
+    _default_image_n,
+    _estimate_cost,
+    _estimate_cost_from_snapshot,
+    _validate_params,
+)
 
 router = APIRouter(prefix="/api", tags=["tasks"])
 
@@ -26,65 +33,6 @@ _WS_TICKET_TTL_SECONDS = 60
 
 def _page(limit: int, offset: int, cap: int) -> tuple[int, int]:
     return min(max(int(limit), 1), cap), max(int(offset), 0)
-
-
-def to_asset_out(asset: GenAsset) -> AssetOut:
-    out = AssetOut.model_validate(asset)
-    # Never reveal the HD url until the asset is unlocked/paid.
-    if not asset.unlocked:
-        out.hd_url = None
-    return out
-
-
-def _progress_for(task: GenTask) -> int:
-    # terminal tasks are always 100 — no need to hit Redis for them
-    if task.status in ("succeeded", "failed"):
-        return 100
-    return get_progress(task.id)["percent"]
-
-
-def build_task_out(db: Session, task: GenTask) -> TaskOut:
-    assets = list(
-        db.execute(
-            select(GenAsset).where(GenAsset.task_id == task.id).order_by(GenAsset.id)
-        ).scalars()
-    )
-    out = TaskOut.model_validate(task)
-    out.assets = [to_asset_out(a) for a in assets]
-    out.progress = _progress_for(task)
-    _decorate_partial(out, task)
-    return out
-
-
-def build_task_outs(db: Session, tasks: list[GenTask]) -> list[TaskOut]:
-    """Batched builder for lists — one asset query for the whole page (no N+1),
-    and Redis progress only for the (usually few) non-terminal tasks."""
-    ids = [t.id for t in tasks]
-    by_task: dict[int, list[GenAsset]] = {}
-    if ids:
-        rows = db.execute(
-            select(GenAsset).where(GenAsset.task_id.in_(ids)).order_by(GenAsset.id)
-        ).scalars()
-        for a in rows:
-            by_task.setdefault(a.task_id, []).append(a)
-    outs: list[TaskOut] = []
-    for t in tasks:
-        out = TaskOut.model_validate(t)
-        out.assets = [to_asset_out(a) for a in by_task.get(t.id, [])]
-        out.progress = _progress_for(t)
-        _decorate_partial(out, t)
-        outs.append(out)
-    return outs
-
-
-def _decorate_partial(out: TaskOut, task: GenTask) -> None:
-    params = task.params or {}
-    if not params.get("_partial"):
-        return
-    out.partial = True
-    out.requested_count = params.get("_requested_n")
-    out.saved_count = params.get("_saved_n")
-    out.skipped_count = params.get("_skipped_n")
 
 
 def _retry_params(task: GenTask) -> dict:
@@ -154,7 +102,7 @@ def retry_task(task_id: int, db: Session = Depends(get_db),
     try:
         task_params = _validate_params(task.category, _retry_params(task))
         if task.category == "image" and task_params.get("n") is None:
-            task_params["n"] = 1
+            task_params["n"] = _default_image_n(db)
         n_images = int(task_params.get("n") or 1) if task.category == "image" else 1
     except (TypeError, ValueError):
         raise HTTPException(400, "任务参数非法,无法重试")
@@ -171,7 +119,16 @@ def retry_task(task_id: int, db: Session = Depends(get_db),
         task_params.get("reference_image_url"),
         task_params.get("first_frame_image"),
     )
-    cost = _estimate_cost(model, task.category, task.stage, n_images)
+    snapshot = (task.params or {}).get("_model_snapshot") or model_snapshot(model)
+    try:
+        assert_model_snapshot_compatible(model, snapshot)
+    except generation.ModelSnapshotMismatchError as e:
+        raise HTTPException(409, str(e)) from e
+    task_params["_model_snapshot"] = snapshot
+    if snapshot:
+        cost = _estimate_cost_from_snapshot(snapshot, task.category, task.stage, n_images)
+    else:
+        cost = _estimate_cost(model, task.category, task.stage, n_images)
     if cost < 0:
         raise HTTPException(400, "任务成本配置非法,无法重试")
 

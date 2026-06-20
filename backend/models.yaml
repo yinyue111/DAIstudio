@@ -1,7 +1,9 @@
 # Seed config for model_configs + defaults (only used on first boot to populate
 # the DB; afterwards edit live via the admin UI / PUT /api/admin/models).
 #
-# Gateway base_url + api_key live in .env (secrets), NOT here.
+# Gateway base_url + api_key can live in .env as a fallback, or be configured
+# per model from the admin UI. API keys saved from the admin UI are encrypted
+# with MODEL_CONFIG_SECRET/PAYMENT_CONFIG_SECRET, never stored here.
 #
 # IMPORTANT: set model_id to the real ids your gateway exposes. The values below
 # were aligned with the current /v1/models response from the configured gateway
@@ -32,10 +34,12 @@ models:
     enabled: true
     extra:
       preview_cost: 5    # cheap freeze for the preview stage
-    # Video gateway base_url/api_key + format=ark live in .env
-    # (VIDEO_GATEWAY_BASE_URL / VIDEO_GATEWAY_API_KEY / VIDEO_GATEWAY_FORMAT).
+    # Video gateway base_url/api_key + format=ark can be configured in the admin
+    # UI, or via VIDEO_GATEWAY_BASE_URL / VIDEO_GATEWAY_API_KEY / VIDEO_GATEWAY_FORMAT.
 
 defaults:
   reverse_prompt_enabled: true
+  sms_auth_enabled: false
+  payment_enabled: false
   image_n: 4
   image_size: 1024x1024

@@ -8,6 +8,7 @@ supplied cover image when keyframe sampling isn't available.
 from __future__ import annotations
 
 import base64
+import inspect
 from urllib.parse import urlparse
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -19,8 +20,9 @@ from ..deps import get_current_user
 from ..models import User
 from ..redis_client import redis_client
 from ..schemas import ReverseIn, ReverseOut
-from ..services import asset_refs, credits, gateway, usage, video_frames
+from ..services import asset_refs, credits, gateway, storage, usage, video_frames
 from ..services.config_store import get_model_config, get_setting
+from ..services.model_gateway_config import runtime_config_for_model
 from ..services.ssrf import SsrfError, assert_safe_user_asset_url
 
 router = APIRouter(prefix="/api/prompt", tags=["prompt"])
@@ -39,6 +41,10 @@ def _is_unsupported_video_url(url: str) -> bool:
     return urlparse(url).path.lower().endswith(_UNSUPPORTED_VIDEO_EXTS)
 
 
+def _is_video_source(body: ReverseIn) -> bool:
+    return body.source_type == "video" or _looks_like_video_url(body.asset_url)
+
+
 def _gateway_ref(db: Session, user: User, url: str | None) -> str | None:
     try:
         return asset_refs.gateway_ref_for_user_asset(db, user.id, url)
@@ -50,15 +56,30 @@ def _collect_refs(body: ReverseIn, db: Session, user: User) -> list[str]:
     """Resolve the asset into one or more image refs (URLs or base64 data-URIs)
     to feed the vision model. The image-target/video-url mismatch is rejected by
     the caller before this runs."""
-    if not _looks_like_video_url(body.asset_url):
+    if not _is_video_source(body):
         ref = _gateway_ref(db, user, body.asset_url)
         return [ref] if ref else []
 
+    key = storage.key_from_url(body.asset_url)
+    local_video_path = None
+    if key:
+        try:
+            local_video_path = asset_refs.generated_video_reference_path(db, user.id, key)
+        except asset_refs.AssetRefError as e:
+            raise HTTPException(404, str(e))
+
     # video + target=video: sample keyframes for motion-aware understanding
     if not settings.effective_mock_mode and video_frames.available():
-        frames = video_frames.sample_keyframes(
-            body.asset_url, n=settings.reverse_video_frames
-        )
+        try:
+            if local_video_path is not None:
+                frames = video_frames.sample_keyframes_from_path(
+                    str(local_video_path),
+                    n=settings.reverse_video_frames,
+                )
+            else:
+                frames = video_frames.sample_keyframes(body.asset_url, n=settings.reverse_video_frames)
+        except asset_refs.AssetRefError as e:
+            raise HTTPException(404, str(e))
         if frames:
             return ["data:image/jpeg;base64," + base64.b64encode(f).decode()
                     for f in frames]
@@ -82,6 +103,17 @@ def _rate_limit(user_id: int) -> None:
         raise HTTPException(429, "反推过于频繁,请稍后再试")
 
 
+def _accepts_gateway_config(fn) -> bool:
+    try:
+        sig = inspect.signature(fn)
+    except (TypeError, ValueError):
+        return True
+    return "gateway_config" in sig.parameters or any(
+        p.kind == inspect.Parameter.VAR_KEYWORD
+        for p in sig.parameters.values()
+    )
+
+
 @router.post("/reverse", response_model=ReverseOut)
 def reverse(body: ReverseIn, db: Session = Depends(get_db),
             user: User = Depends(get_current_user)):
@@ -94,7 +126,8 @@ def reverse(body: ReverseIn, db: Session = Depends(get_db),
     except SsrfError as e:
         raise HTTPException(400, f"素材链接被安全策略拦截:{e}")
     # a video source only makes sense for video reverse; keep the clear hint
-    if _looks_like_video_url(body.asset_url) and body.target != "video":
+    is_video_source = _is_video_source(body)
+    if is_video_source and body.target != "video":
         raise HTTPException(400, "反推只支持图片素材;视频素材请使用封面图进行反推")
     if _is_unsupported_video_url(body.asset_url):
         raise HTTPException(400, "暂不支持 HLS/m3u8 视频反推,请使用 mp4/webm/mov 或封面图")
@@ -107,7 +140,7 @@ def reverse(body: ReverseIn, db: Session = Depends(get_db),
 
     unit_cost = max(0, int(model.cost_credits or 0))
     precharged = 0
-    if _looks_like_video_url(body.asset_url) and body.target == "video":
+    if is_video_source and body.target == "video":
         precharged = unit_cost * max(1, int(settings.reverse_video_frames or 1))
         if precharged:
             try:
@@ -136,7 +169,10 @@ def reverse(body: ReverseIn, db: Session = Depends(get_db),
                                         note=f"preauth_refund target={body.target}")
             raise HTTPException(400, str(e))
     try:
-        result = gateway.reverse_prompt(refs, model.model_id, target=body.target)
+        kwargs = {"target": body.target}
+        if _accepts_gateway_config(gateway.reverse_prompt):
+            kwargs["gateway_config"] = runtime_config_for_model(model, "vision")
+        result = gateway.reverse_prompt(refs, model.model_id, **kwargs)
     except gateway.GatewayError as e:
         if cost:
             credits.refund_consumed(db, user.id, cost, biz_type="reverse",
@@ -145,7 +181,7 @@ def reverse(body: ReverseIn, db: Session = Depends(get_db),
                           user_id=user.id, status="failed",
                           detail={"target": body.target, "cost": cost,
                                   "error": str(e)[:200]})
-        raise HTTPException(502, f"反推失败:{e}")
+        raise HTTPException(502, "反推失败:上游视觉模型调用失败,请稍后重试")
     except Exception as e:  # noqa: BLE001
         if cost:
             credits.refund_consumed(db, user.id, cost, biz_type="reverse",
@@ -154,11 +190,16 @@ def reverse(body: ReverseIn, db: Session = Depends(get_db),
                           user_id=user.id, status="failed",
                           detail={"target": body.target, "cost": cost,
                                   "error": str(e)[:200]})
-        raise HTTPException(502, f"反推失败:{e}")
+        raise HTTPException(502, "反推失败:服务暂时不可用,请稍后重试")
 
     # real-cost accounting: persist the provider's token usage for this call
     usage.record_call(db, kind="reverse", model_id=model.model_id, user_id=user.id,
                       status="ok", latency_ms=result.get("latency_ms"),
                       usage=result.get("usage"),
                       detail={"target": body.target, "frames": len(refs), "cost": cost})
-    return ReverseOut(structured=result["structured"], final_text=result["final_text"])
+    return ReverseOut(
+        structured=result["structured"],
+        final_text=result["final_text"],
+        charged_credits=cost,
+        reference_count=max(1, len(refs)),
+    )

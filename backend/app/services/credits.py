@@ -12,6 +12,8 @@ account stay consistent.
 """
 from __future__ import annotations
 
+import re
+
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -22,11 +24,56 @@ class InsufficientCredits(Exception):
     pass
 
 
+_SETTLE_RESERVED_RE = re.compile(r"(?:^|\s)reserved=(\d+)")
+
+
 def _lock_user(db: Session, user_id: int) -> User:
     user = db.execute(
         select(User).where(User.id == user_id).with_for_update()
     ).scalar_one()
     return user
+
+
+def _settled_reserved_amount(tx: CreditTransaction) -> int:
+    note = tx.note or ""
+    match = _SETTLE_RESERVED_RE.search(note)
+    if match:
+        return max(0, int(match.group(1)))
+    # Existing app-written settle rows include this note. Rows without it cannot
+    # prove any reservation was released, so they do not reduce the guard amount.
+    return 0
+
+
+def _outstanding_reserved_for_biz(db: Session, user_id: int, biz_ref: int | None) -> int | None:
+    if biz_ref is None:
+        return None
+    rows = db.execute(
+        select(CreditTransaction).where(
+            CreditTransaction.user_id == user_id,
+            CreditTransaction.biz_type == "gen_task",
+            CreditTransaction.biz_ref == biz_ref,
+            CreditTransaction.type.in_(("freeze", "refund", "settle")),
+        )
+    ).scalars()
+    outstanding = 0
+    for tx in rows:
+        if tx.type == "freeze":
+            outstanding += max(0, -int(tx.change or 0))
+        elif tx.type == "refund":
+            outstanding -= max(0, int(tx.change or 0))
+        elif tx.type == "settle":
+            outstanding -= _settled_reserved_amount(tx)
+    return max(0, outstanding)
+
+
+def _assert_biz_reserved(db: Session, user_id: int, biz_ref: int | None, amount: int) -> None:
+    outstanding = _outstanding_reserved_for_biz(db, user_id, biz_ref)
+    if outstanding is None:
+        return
+    if amount > outstanding:
+        raise InsufficientCredits(
+            f"任务冻结额度不足:任务 {biz_ref} 需要释放 {amount},当前任务冻结 {outstanding}"
+        )
 
 
 def _record(db: Session, user: User, type_: str, change: int, biz_type: str | None,
@@ -101,6 +148,11 @@ def settle(db: Session, user_id: int, reserved: int, real_cost: int,
         raise InsufficientCredits(
             f"冻结额度不足:需要释放 {reserved},当前冻结 {user.frozen_credits}"
         )
+    try:
+        _assert_biz_reserved(db, user_id, biz_ref, reserved)
+    except InsufficientCredits:
+        db.rollback()
+        raise
     user.frozen_credits -= reserved
     if refund_part:
         user.balance_credits += refund_part
@@ -123,6 +175,11 @@ def refund(db: Session, user_id: int, amount: int, biz_ref: int | None,
         raise InsufficientCredits(
             f"冻结额度不足:需要退回 {amount},当前冻结 {user.frozen_credits}"
         )
+    try:
+        _assert_biz_reserved(db, user_id, biz_ref, amount)
+    except InsufficientCredits:
+        db.rollback()
+        raise
     user.frozen_credits -= amount
     user.balance_credits += amount
     _record(db, user, "refund", amount, "gen_task", biz_ref)

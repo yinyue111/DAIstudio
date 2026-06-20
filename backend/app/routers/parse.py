@@ -19,8 +19,9 @@ from ..redis_client import redis_client
 from ..schemas import ParseIn, ParseOut
 from ..services import audit, gateway, storage
 from ..services.fetcher import parse_url
+from ..services.safe_logging import redact_url_for_log
 from ..services.ssrf import SsrfError
-from ..services.watermark import make_image_preview
+from ..services.watermark import make_image_preview, make_model_reference
 
 router = APIRouter(prefix="/api", tags=["parse"])
 log = logging.getLogger("parse")
@@ -65,7 +66,16 @@ def _localize_media_url(url: str | None, db: Session | None = None, user_id: int
             raw,
             max_pixels=int(settings.parse_localize_image_max_pixels),
         )
+        model_ref_png, _, _ = make_model_reference(
+            raw,
+            max_pixels=int(settings.parse_localize_image_max_pixels),
+        )
         key = storage.save_bytes(preview_png, "preview", "png")
+        model_ref_key = storage.save_bytes_named(
+            model_ref_png,
+            "model_ref",
+            key.split("/", 1)[1],
+        )
         if db is not None and user_id is not None:
             db.merge(
                 UploadedAsset(
@@ -78,9 +88,20 @@ def _localize_media_url(url: str | None, db: Session | None = None, user_id: int
                     original_filename="parsed-preview.png",
                 )
             )
+            db.merge(
+                UploadedAsset(
+                    key=model_ref_key,
+                    user_id=user_id,
+                    mime="image/png",
+                    width=preview_w,
+                    height=preview_h,
+                    bytes=len(model_ref_png),
+                    original_filename="parsed-model-ref.png",
+                )
+            )
         return storage.public_url(key)
     except Exception as e:  # noqa: BLE001
-        log.info("parse media localize skipped url=%s error=%s", url[:120], e)
+        log.info("parse media localize skipped url=%s error=%s", redact_url_for_log(url), e)
         return None
 
 
@@ -94,9 +115,10 @@ def _localize_assets(assets: list[dict], db: Session | None = None,
             local = _localize_media_url(item.get("url"), db=db, user_id=user_id)
             if local:
                 item["original_url"] = item.get("url")
+                if item.get("thumb"):
+                    item["original_thumb"] = item.get("thumb")
                 item["url"] = local
-                if not item.get("thumb"):
-                    item["thumb"] = local
+                item["thumb"] = local
                 localized_count += 1
         elif localized_count < _LOCALIZE_IMAGE_LIMIT and item.get("type") == "video":
             local_thumb = _localize_media_url(item.get("thumb"), db=db, user_id=user_id)
@@ -144,7 +166,8 @@ def submit_parse(body: ParseIn, request: Request,
         db.commit()
         redis_client.setex(_cache_key(url, user.id), settings.parse_cache_minutes * 60, str(rec.id))
         audit.log(db, user_id=user.id, action="parse", biz_type="parse",
-                  biz_id=rec.id, ip=get_client_ip(request), detail={"url": url, "n": len(assets)})
+                  biz_id=rec.id, ip=get_client_ip(request),
+                  detail={"url": redact_url_for_log(url), "n": len(assets)})
     except SsrfError as e:
         rec.status = "failed"
         rec.error = str(e)
@@ -158,7 +181,7 @@ def submit_parse(body: ParseIn, request: Request,
         raise HTTPException(422, f"抓取失败:{e}")
     except Exception as e:  # noqa: BLE001
         # unexpected error: keep details server-side, give the user a clean hint
-        log.exception("parse failed for url=%s", url)
+        log.exception("parse failed for url=%s", redact_url_for_log(url))
         rec.status = "failed"
         rec.error = str(e)[:500]
         db.commit()

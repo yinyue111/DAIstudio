@@ -277,6 +277,52 @@ def test_extract_assets_caps_result_count(monkeypatch):
     ]
 
 
+def test_platform_extractors_share_parse_max_assets_cap(monkeypatch):
+    monkeypatch.setattr(fetcher.settings, "parse_max_assets", 3)
+    images = [
+        {
+            "urlDefault": f"https://sns-webpic-qc.xhscdn.com/full-{i}.jpg",
+            "urlPre": f"https://sns-webpic-qc.xhscdn.com/preview-{i}.jpg",
+        }
+        for i in range(8)
+    ]
+    html = (
+        "<script>window.__INITIAL_STATE__="
+        + str({"note": {"noteDetailMap": {"abc": {"note": {"imageList": images}}}}})
+          .replace("'", '"')
+        + "</script>"
+    )
+
+    assets = fetcher._extract_xiaohongshu_assets(html)
+
+    assert len(assets) == 3
+    assert [a["url"] for a in assets] == [
+        "https://sns-webpic-qc.xhscdn.com/full-0.jpg",
+        "https://sns-webpic-qc.xhscdn.com/full-1.jpg",
+        "https://sns-webpic-qc.xhscdn.com/full-2.jpg",
+    ]
+
+
+def test_weixin_extractor_shares_parse_max_assets_cap(monkeypatch):
+    monkeypatch.setattr(fetcher.settings, "parse_max_assets", 2)
+    html = (
+        '<div id="js_content">'
+        + "".join(
+            f'<img data-src="https://mmbiz.qpic.cn/mmbiz_jpg/{i}/640" data-type="jpeg">'
+            for i in range(6)
+        )
+        + "</div>"
+    )
+
+    assets = fetcher._extract_weixin_assets(html, "https://mp.weixin.qq.com/s/abc")
+
+    assert len(assets) == 2
+    assert [a["url"] for a in assets] == [
+        "https://mmbiz.qpic.cn/mmbiz_jpg/0/0",
+        "https://mmbiz.qpic.cn/mmbiz_jpg/1/0",
+    ]
+
+
 def test_generic_srcset_picks_largest_not_last():
     # srcset has no ordering requirement; descending order must still pick the
     # biggest, not the trailing (smallest) candidate.
@@ -474,10 +520,39 @@ def test_xiaohongshu_timeout_checks_canonical_security_redirect(monkeypatch):
         fetcher.parse_url("https://www.xiaohongshu.com/explore/abc?xsec_token=deadbeef")
     except ValueError as e:
         assert "安全校验" in str(e)
+        assert "上传图片参考" in str(e)
     else:
         raise AssertionError("expected ValueError")
 
     assert seen == [
+        "https://www.xiaohongshu.com/explore/abc?xsec_token=deadbeef",
+        "https://www.xiaohongshu.com/explore/abc",
+    ]
+
+
+def test_xiaohongshu_security_check_falls_back_to_render(monkeypatch):
+    rendered = """
+    <html><body>
+      <script>window.__INITIAL_STATE__={
+        "note": {"noteDetailMap": {"abc": {"note": {"imageList": [
+          {"urlDefault": "http://sns-webpic-qc.xhscdn.com/full-a!nd_dft_wlteh_jpg_3"}
+        ]}}}}
+      }</script>
+    </body></html>
+    """
+    calls = []
+
+    def fake_httpx(url, **_kwargs):
+        calls.append(url)
+        raise ValueError("小红书返回安全校验:当前笔记暂时无法浏览(error_code=300031)")
+
+    monkeypatch.setattr(fetcher, "_render_with_httpx", fake_httpx)
+    monkeypatch.setattr(fetcher, "_render_with_playwright", lambda _url: rendered)
+
+    assets = fetcher.parse_url("https://www.xiaohongshu.com/explore/abc?xsec_token=deadbeef")
+
+    assert assets[0]["url"] == "https://sns-webpic-qc.xhscdn.com/full-a!nd_dft_wlteh_jpg_3"
+    assert calls == [
         "https://www.xiaohongshu.com/explore/abc?xsec_token=deadbeef",
         "https://www.xiaohongshu.com/explore/abc",
     ]

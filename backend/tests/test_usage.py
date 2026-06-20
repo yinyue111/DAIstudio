@@ -1,9 +1,10 @@
 """Real-cost accounting (gateway_calls) + video keyframe graceful fallback."""
+from datetime import datetime, timezone
 from types import SimpleNamespace
 
 from app.db import SessionLocal
-from app.models import CreditTransaction, GatewayCall
-from app.services import gateway, video_frames
+from app.models import AuditLog, CreditTransaction, GatewayCall, GenTask, User
+from app.services import audit, credits, gateway, usage, video_frames
 
 
 def test_reverse_logs_gateway_call(client, make_user, auth):
@@ -121,6 +122,112 @@ def test_admin_report_includes_reverse_model_call_spend(client, make_user, auth)
     assert row["spend_credits"] == 7
 
 
+def test_usage_report_does_not_count_refunds_as_negative_spend(client, make_user, auth):
+    uid = make_user("13900000039", balance=1000, admin=True)
+    h = auth("13900000039")
+    db = SessionLocal()
+    try:
+        credits.consume(db, uid, 10, biz_type="reverse", biz_ref=1, note="reverse")
+        credits.refund_consumed(db, uid, 10, biz_type="reverse", biz_ref=1, note="manual refund")
+    finally:
+        db.close()
+
+    report = client.get("/api/admin/usage/report", headers=h).json()
+    row = next(x for x in report["per_user"] if x["phone"] == "13900000039")
+    assert row["spend_credits"] == 10
+
+
+def test_usage_report_attributes_generation_spend_to_finished_date(client, make_user, auth):
+    uid = make_user("13900000139", balance=1000, admin=True)
+    h = auth("13900000139")
+    freeze_dt = datetime(2026, 1, 1, 12, tzinfo=timezone.utc)
+    finish_dt = datetime(2026, 1, 2, 12, tzinfo=timezone.utc)
+    db = SessionLocal()
+    try:
+        user = db.get(User, uid)
+        user.balance_credits = 990
+        db.add(GenTask(
+            user_id=uid,
+            category="image",
+            stage="preview",
+            status="succeeded",
+            prompt={"final_text": "x"},
+            params={"n": 1},
+            cost_frozen=10,
+            cost_settled=6,
+            finished_at=finish_dt,
+        ))
+        db.add(CreditTransaction(
+            user_id=uid,
+            type="freeze",
+            change=-10,
+            balance_after=990,
+            biz_type="gen_task",
+            biz_ref=999,
+            created_at=freeze_dt,
+        ))
+        db.add(CreditTransaction(
+            user_id=uid,
+            type="settle",
+            change=4,
+            balance_after=994,
+            biz_type="gen_task",
+            biz_ref=999,
+            created_at=finish_dt,
+        ))
+        db.commit()
+    finally:
+        db.close()
+
+    jan1 = client.get(
+        "/api/admin/usage/report?start=2026-01-01T00:00:00%2B00:00&end=2026-01-01T23:59:59%2B00:00",
+        headers=h,
+    ).json()
+    jan2 = client.get(
+        "/api/admin/usage/report?start=2026-01-02T00:00:00%2B00:00&end=2026-01-02T23:59:59%2B00:00",
+        headers=h,
+    ).json()
+
+    row1 = next(x for x in jan1["per_user"] if x["phone"] == "13900000139")
+    row2 = next(x for x in jan2["per_user"] if x["phone"] == "13900000139")
+    assert row1["spend_credits"] == 0
+    assert row2["spend_credits"] == 6
+    assert jan1["daily"] == []
+    assert jan2["daily"] == [{"date": "2026-01-02", "spend_credits": 6}]
+
+
+def test_usage_report_end_date_includes_full_day(client, make_user, auth):
+    uid = make_user("13900000149", balance=1000, admin=True)
+    h = auth("13900000149")
+    finish_dt = datetime(2026, 6, 19, 18, 30, tzinfo=timezone.utc)
+    db = SessionLocal()
+    try:
+        db.add(GenTask(
+            user_id=uid,
+            category="image",
+            stage="preview",
+            status="succeeded",
+            prompt={"final_text": "x"},
+            params={"n": 1},
+            cost_frozen=10,
+            cost_settled=6,
+            finished_at=finish_dt,
+        ))
+        db.commit()
+    finally:
+        db.close()
+
+    report = client.get(
+        "/api/admin/usage/report?start=2026-06-19&end=2026-06-19",
+        headers=h,
+    ).json()
+
+    row = next(x for x in report["per_user"] if x["phone"] == "13900000149")
+    assert row["spend_credits"] == 6
+    daily = next(x for x in report["daily"] if x["date"] == "2026-06-19")
+    assert daily["spend_credits"] >= 6
+
+
 def test_image_generation_logs_gateway_call(client, make_user, auth):
     make_user("13900000031", balance=1000)
     h = auth("13900000031")
@@ -136,6 +243,45 @@ def test_image_generation_logs_gateway_call(client, make_user, auth):
         assert rows, "an image generation must be logged"
     finally:
         db.close()
+
+
+def test_usage_and_audit_logging_do_not_commit_caller_transaction(client, make_user):
+    uid = make_user("13900000143", balance=1000)
+    db = SessionLocal()
+    try:
+        user = db.get(User, uid)
+        user.nickname = "dirty-but-uncommitted"
+        usage.record_call(
+            db,
+            kind="image",
+            model_id="mock-image",
+            user_id=uid,
+            status="ok",
+            detail={"case": "isolation"},
+        )
+        audit.log(
+            db,
+            user_id=uid,
+            action="transaction_isolation_check",
+            detail={"case": "isolation"},
+        )
+        db.rollback()
+    finally:
+        db.close()
+
+    check = SessionLocal()
+    try:
+        assert check.get(User, uid).nickname is None
+        assert check.query(GatewayCall).filter(
+            GatewayCall.user_id == uid,
+            GatewayCall.detail == {"case": "isolation"},
+        ).count() == 1
+        assert check.query(AuditLog).filter(
+            AuditLog.user_id == uid,
+            AuditLog.action == "transaction_isolation_check",
+        ).count() == 1
+    finally:
+        check.close()
 
 
 def test_failed_image_generation_logs_gateway_call(client, make_user, auth, monkeypatch):
@@ -225,6 +371,30 @@ def test_video_reverse_rejects_video_url_for_image_target(client, make_user, aut
 def test_keyframe_sampling_blocked_url_returns_empty():
     # SSRF-blocked / unreachable source must degrade gracefully, never raise
     assert video_frames.sample_keyframes("http://127.0.0.1/x.mp4", n=2) == []
+
+
+def test_keyframe_sampling_rejects_non_video_bytes(monkeypatch):
+    monkeypatch.setattr(video_frames, "FFMPEG", "/usr/bin/ffmpeg")
+    monkeypatch.setattr(video_frames, "_download_capped", lambda *_a, **_k: b"<html>not video</html>")
+    assert video_frames.sample_keyframes("http://x/not-video.mp4", n=2) == []
+
+
+def test_keyframe_sampling_uses_full_duration_for_long_video(monkeypatch):
+    monkeypatch.setattr(video_frames, "FFMPEG", "/usr/bin/ffmpeg")
+    monkeypatch.setattr(video_frames, "_download_capped", lambda *_a, **_k: b"\x00\x00\x00\x18ftypmp42")
+    monkeypatch.setattr(video_frames, "_duration_seconds", lambda _path: 900.0)
+    stamps = []
+
+    def fake_grab(_src, ts, dst):
+        stamps.append(ts)
+        with open(dst, "wb") as f:
+            f.write(b"jpg")
+        return True
+
+    monkeypatch.setattr(video_frames, "_grab_frame", fake_grab)
+
+    assert video_frames.sample_keyframes("http://x/long.mp4", n=3) == [b"jpg", b"jpg", b"jpg"]
+    assert stamps == [0.0, 300.0, 600.0]
 
 
 def test_keyframe_sampling_busy_returns_empty(monkeypatch):

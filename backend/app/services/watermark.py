@@ -39,6 +39,26 @@ def make_image_preview(
     return buf.getvalue(), hd_w, hd_h
 
 
+def make_model_reference(
+    image_bytes: bytes,
+    max_side: int = 768,
+    *,
+    max_pixels: int | None = None,
+) -> tuple[bytes, int, int]:
+    """Return a clean, bounded PNG reference for model inputs."""
+    img = Image.open(io.BytesIO(image_bytes))
+    hd_w, hd_h = img.size
+    if max_pixels is not None and hd_w * hd_h > max_pixels:
+        raise ValueError("图片像素超出上限")
+    img = img.convert("RGB")
+    scale = min(1.0, max_side / max(img.size))
+    if scale < 1.0:
+        img = img.resize((int(img.width * scale), int(img.height * scale)))
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue(), hd_w, hd_h
+
+
 def image_ext(img_bytes: bytes) -> str:
     """Best-effort extension for raw gateway image bytes."""
     try:

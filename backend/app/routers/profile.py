@@ -3,6 +3,8 @@ with 30-day (configurable) retention. Expired assets are filtered out and
 best-effort purged on load."""
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
+
 from fastapi import APIRouter, Depends
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
@@ -13,6 +15,7 @@ from ..models import GenAsset, GenTask, User
 from ..redis_client import redis_client
 from ..schemas import AssetOut, UserOut
 from ..services import retention
+from ..services.asset_output import to_asset_out
 
 router = APIRouter(prefix="/api/profile", tags=["profile"])
 
@@ -34,8 +37,14 @@ def _maybe_purge(db: Session, user_id: int) -> None:
 
 @router.get("")
 def profile(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    _maybe_purge(db, user.id)
     days = retention.get_retention_days(db)
-    base = select(func.count()).select_from(GenAsset).where(GenAsset.user_id == user.id)
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    base = (
+        select(func.count())
+        .select_from(GenAsset)
+        .where(GenAsset.user_id == user.id, GenAsset.created_at >= cutoff)
+    )
     images = db.execute(base.where(GenAsset.type == "image")).scalar() or 0
     videos = db.execute(base.where(GenAsset.type == "video")).scalar() or 0
     unlocked = db.execute(base.where(GenAsset.unlocked.is_(True))).scalar() or 0
@@ -64,10 +73,11 @@ def my_assets(type: str = "all", favorite: bool = False,
     _maybe_purge(db, user.id)
 
     days = retention.get_retention_days(db)
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
     q = (
-        select(GenAsset, GenTask.category)
+        select(GenAsset, GenTask)
         .join(GenTask, GenTask.id == GenAsset.task_id)
-        .where(GenAsset.user_id == user.id)
+        .where(GenAsset.user_id == user.id, GenAsset.created_at >= cutoff)
         .order_by(GenAsset.id.desc())
     )
     if type in ("image", "video"):
@@ -78,14 +88,10 @@ def my_assets(type: str = "all", favorite: bool = False,
     q = q.limit(limit).offset(offset)
 
     out: list[AssetOut] = []
-    for asset, category in db.execute(q).all():
-        if retention.is_expired(asset.created_at, days):
-            continue
-        ao = AssetOut.model_validate(asset)
-        if not asset.unlocked:
-            ao.hd_url = None  # hide HD until unlocked
+    for asset, task in db.execute(q).all():
+        ao = to_asset_out(db, asset, task=task)
         ao.expires_at = retention.expiry_of(asset.created_at, days)
         ao.days_left = retention.days_left(asset.created_at, days)
-        ao.category = category
+        ao.category = task.category
         out.append(ao)
     return out

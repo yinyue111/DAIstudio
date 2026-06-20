@@ -9,6 +9,8 @@ from ..models import AppSetting, ModelConfig
 
 DEFAULT_SETTINGS = {
     "reverse_prompt_enabled": True,
+    "sms_auth_enabled": False,
+    "payment_enabled": False,
     "image_n": 4,
     "image_size": "1024x1024",
     "asset_retention_days": 30,
@@ -32,6 +34,17 @@ def get_setting(db: Session, key: str, default=None):
         return DEFAULT_SETTINGS.get(key, default)
     # values are stored as {"v": ...}
     return (row.value or {}).get("v", DEFAULT_SETTINGS.get(key, default))
+
+
+def get_bool_setting(db: Session, key: str, default: bool = False) -> bool:
+    value = get_setting(db, key, default)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(default)
 
 
 def set_setting(db: Session, key: str, value) -> None:

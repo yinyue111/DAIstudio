@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import io
+import uuid
 
 from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse
@@ -15,7 +16,8 @@ from ..models import UploadedAsset, User
 from ..redis_client import redis_client
 from ..schemas import Asset
 from ..services import audit, storage
-from ..services.watermark import make_image_preview
+from ..services.request_limits import enforce_content_length
+from ..services.watermark import make_image_preview, make_model_reference
 
 router = APIRouter(prefix="/api/uploads", tags=["uploads"])
 _UPLOAD_RATE_LIMIT = 30
@@ -75,6 +77,7 @@ async def upload_image(
 ):
     _rate_limit_upload(user.id)
     limit = int(settings.max_upload_image_bytes)
+    enforce_content_length(request, limit + 1024 * 1024, f"图片不能超过 {limit // 1024 // 1024}MB")
     data = await file.read(limit + 1)
     if not data:
         raise HTTPException(400, "请选择要上传的图片")
@@ -83,15 +86,20 @@ async def upload_image(
 
     ext, width, height = _inspect_image(data)
     try:
-        preview_png, _, _ = make_image_preview(data)
+        preview_png, _, _ = make_image_preview(data, max_pixels=settings.max_upload_image_pixels)
+        model_ref_png, _, _ = make_model_reference(data, max_pixels=settings.max_upload_image_pixels)
     except Exception:  # noqa: BLE001
         raise HTTPException(400, "图片内容无法解析,请更换文件")
 
     upload_key = None
     preview_key = None
+    model_ref_key = None
     try:
-        upload_key = storage.save_bytes(data, "upload", ext)
-        preview_key = storage.save_bytes(preview_png, "upload_preview", "png")
+        stem = uuid.uuid4().hex
+        upload_key = storage.save_bytes_named(data, "upload", f"{stem}.{ext}")
+        preview_key = storage.save_bytes_named(preview_png, "upload_preview", f"{stem}.png")
+        model_ref_key = storage.save_bytes_named(model_ref_png, "upload_model_ref", f"{stem}.png")
+        original_filename = file.filename or upload_key.rsplit("/", 1)[-1]
         db.add(
             UploadedAsset(
                 key=upload_key,
@@ -100,7 +108,7 @@ async def upload_image(
                 width=width,
                 height=height,
                 bytes=len(data),
-                original_filename=file.filename,
+                original_filename=original_filename,
             )
         )
         db.add(
@@ -111,13 +119,24 @@ async def upload_image(
                 width=width,
                 height=height,
                 bytes=len(preview_png),
-                original_filename=f"preview:{file.filename or upload_key.rsplit('/', 1)[-1]}",
+                original_filename=f"preview:{original_filename}",
+            )
+        )
+        db.add(
+            UploadedAsset(
+                key=model_ref_key,
+                user_id=user.id,
+                mime="image/png",
+                width=width,
+                height=height,
+                bytes=len(model_ref_png),
+                original_filename=f"model-ref:{original_filename}",
             )
         )
         db.commit()
     except Exception:  # noqa: BLE001
         db.rollback()
-        _cleanup_storage_keys(upload_key, preview_key)
+        _cleanup_storage_keys(upload_key, preview_key, model_ref_key)
         raise
     audit.log(
         db,

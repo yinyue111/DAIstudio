@@ -3,19 +3,32 @@ orchestration logic stays import-safe and unit-testable."""
 from __future__ import annotations
 
 from .celery_app import celery_app
+from .config import settings
 from .services import generation
 
+_LOCK_RETRY_COUNTDOWN_SECONDS = 30
+_LOCK_RETRY_MAX = max(
+    20,
+    int((settings.celery_task_time_limit_seconds + 360) / _LOCK_RETRY_COUNTDOWN_SECONDS) + 1,
+)
 
-@celery_app.task(name="generate.image", bind=True, max_retries=0)
+
+@celery_app.task(name="generate.image", bind=True, max_retries=_LOCK_RETRY_MAX)
 def generate_image_task(self, task_id: int) -> None:
-    generation.run_image_task(task_id)
+    try:
+        generation.run_image_task(task_id)
+    except generation.TaskLockedError as e:
+        raise self.retry(exc=e, countdown=_LOCK_RETRY_COUNTDOWN_SECONDS, max_retries=_LOCK_RETRY_MAX)
 
 
-@celery_app.task(name="generate.video", bind=True, max_retries=0)
+@celery_app.task(name="generate.video", bind=True, max_retries=_LOCK_RETRY_MAX)
 def generate_video_task(self, task_id: int) -> None:
     # submit only; a self-re-enqueuing poll task drives it to completion so the
     # worker is never blocked across a long render.
-    generation.start_video_task(task_id)
+    try:
+        generation.start_video_task(task_id)
+    except generation.TaskLockedError as e:
+        raise self.retry(exc=e, countdown=_LOCK_RETRY_COUNTDOWN_SECONDS, max_retries=_LOCK_RETRY_MAX)
 
 
 @celery_app.task(name="poll.video", bind=True, max_retries=0)

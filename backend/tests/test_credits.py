@@ -103,6 +103,27 @@ def test_settle_and_refund_cannot_exceed_frozen_balance():
     assert (u.balance_credits, u.frozen_credits) == (30, 20)
 
 
+def test_refund_cannot_spend_another_task_reservation():
+    db = make_session()
+    u = User(phone="13900000003", status="active", balance_credits=100, frozen_credits=0)
+    db.add(u)
+    db.commit()
+    db.refresh(u)
+
+    credits.freeze(db, u.id, 20, biz_ref=1)
+    db.refresh(u)
+    assert (u.balance_credits, u.frozen_credits) == (80, 20)
+
+    with pytest.raises(credits.InsufficientCredits):
+        credits.refund(db, u.id, 20, biz_ref=2)
+    db.refresh(u)
+    assert (u.balance_credits, u.frozen_credits) == (80, 20)
+
+    credits.refund(db, u.id, 20, biz_ref=1)
+    db.refresh(u)
+    assert (u.balance_credits, u.frozen_credits) == (100, 0)
+
+
 def test_negative_credit_amounts_are_rejected():
     db = make_session()
     u = User(phone="13900000001", status="active", balance_credits=50, frozen_credits=10)

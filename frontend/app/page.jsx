@@ -2,9 +2,10 @@
 
 import { useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
-import { api, downloadBlob, getToken, wsUrl } from "../lib/api";
+import { api, authenticatedObjectUrl, downloadBlob, getToken, wsUrl } from "../lib/api";
 import Nav from "../components/Nav";
 import PromptLibraryBrowser, { STUDIO_DRAFT_PROMPT_KEY } from "../components/PromptLibraryBrowser";
+import AssetMedia, { assetPreviewSrc } from "../components/AssetMedia";
 
 const RATIOS = [
   { key: "1:1", label: "1:1", hint: "头像 / 方图", w: 1, h: 1 },
@@ -32,6 +33,19 @@ const VIDEO_QUALITIES = [
   { key: "720p", label: "720p", hint: "标准" },
   { key: "1080p", label: "1080p", hint: "高清" },
 ];
+const VIDEO_DURATION_PRESETS = [
+  { seconds: 5, label: "5s", hint: "短镜头预览" },
+  { seconds: 8, label: "8s", hint: "平台常用短片" },
+  { seconds: 10, label: "10s", hint: "完整短镜头" },
+  { seconds: 15, label: "15s", hint: "广告片段" },
+  { seconds: 30, label: "30s", hint: "短广告" },
+  { seconds: 60, label: "1min", hint: "完整广告" },
+  { seconds: 180, label: "3min", hint: "口播/种草" },
+  { seconds: 300, label: "5min", hint: "长内容" },
+  { seconds: 600, label: "10min", hint: "长视频" },
+  { seconds: 900, label: "15min", hint: "最长" },
+];
+const TERMINAL_TASK_STATUSES = new Set(["succeeded", "failed", "needs_review"]);
 
 const EXAMPLES = [
   "赛博朋克城市夜景，霓虹灯反射在湿漉漉的街道上，电影感，超广角",
@@ -67,14 +81,19 @@ export default function Home() {
   const [selected, setSelected] = useState(null);
   const [reversing, setReversing] = useState(false);
   const [structured, setStructured] = useState({}); // editable reverse dimensions
+  const [structuredSource, setStructuredSource] = useState("");
   const [structOpen, setStructOpen] = useState(true);
+  const [negativeTouched, setNegativeTouched] = useState(false);
+  const [promptDirty, setPromptDirty] = useState(false);
 
   // run state
   const [task, setTask] = useState(null);
   const [runningSnapshot, setRunningSnapshot] = useState(null);
   const [submitting, setSubmitting] = useState(false);
   const [msg, setMsg] = useState("");
+  const [trackingLost, setTrackingLost] = useState(false);
   const [lightbox, setLightbox] = useState(null);
+  const [finalTaskId, setFinalTaskId] = useState(null);
 
   // gallery
   const [works, setWorks] = useState(null);
@@ -82,7 +101,14 @@ export default function Home() {
   const pollRef = useRef(null);
   const wsRef = useRef(null);
   const activeIdRef = useRef(null); // id of the task currently being tracked
+  const selectedRef = useRef(null);
+  const refVersionRef = useRef(0);
+  const parseRequestRef = useRef(0);
+  const uploadRequestRef = useRef(0);
+  const reverseRequestRef = useRef(0);
+  const pendingGenerateRequestRef = useRef(null);
   const uploadInputRef = useRef(null);
+  const objectUrlsRef = useRef(new Set());
 
   useEffect(() => {
     if (!getToken()) return router.push("/login");
@@ -103,12 +129,14 @@ export default function Home() {
       const draft = window.localStorage.getItem(STUDIO_DRAFT_PROMPT_KEY);
       if (draft) {
         setPrompt(draft);
+        setPromptDirty(true);
         window.localStorage.removeItem(STUDIO_DRAFT_PROMPT_KEY);
       }
     } catch (e) {}
     return () => {
       if (pollRef.current) clearInterval(pollRef.current);
       if (wsRef.current) try { wsRef.current.close(); } catch (e) {}
+      revokeUploadedObjectUrls();
     };
   }, []);
 
@@ -118,7 +146,25 @@ export default function Home() {
     setRatio(nearestRatio(current.w, current.h, videoRatioOptions()));
   }, [category, ratio]);
 
+  useEffect(() => {
+    selectedRef.current = selected;
+  }, [selected]);
+
   function refreshMe() { api.me().then(setMe).catch(() => {}); }
+
+  function modelEnabled(kind) {
+    if (!cfg) return true;
+    return cfg.models?.[kind]?.enabled !== false;
+  }
+
+  function switchCategory(kind) {
+    if (!modelEnabled(kind)) {
+      setMsg(`${kind === "video" ? "视频" : "图片"}模型未启用，请联系管理员配置后再使用。`);
+      return;
+    }
+    setMsg("");
+    setCategory(kind);
+  }
 
   async function loadWorks() {
     try {
@@ -132,40 +178,87 @@ export default function Home() {
   }
 
   // ---- reference: parse + reverse ----
+  function revokeUploadedObjectUrls() {
+    objectUrlsRef.current.forEach((u) => URL.revokeObjectURL(u));
+    objectUrlsRef.current.clear();
+  }
+
+  function clearReverseState({ clearPrompt = false } = {}) {
+    setStructured({});
+    setStructuredSource("");
+    if (!negativeTouched) setNegative("");
+    if (clearPrompt) {
+      setPrompt("");
+      setPromptDirty(false);
+    }
+  }
+
   async function doParse() {
-    if (!url.trim()) return;
-    setMsg(""); setAssets([]); setSelected(null); setParsing(true);
+    if (!url.trim() || parsing) return;
+    const reqId = ++parseRequestRef.current;
+    const refVersion = ++refVersionRef.current;
+    reverseRequestRef.current += 1;
+    revokeUploadedObjectUrls();
+    setMsg(""); setAssets([]); setSelected(null); clearReverseState(); setParsing(true);
+    setRefOpen(true);
     try {
       const r = await api.parse(url.trim());
+      if (refVersion !== refVersionRef.current) return;
       setAssets(r.assets || []);
       if (!r.assets?.length) setMsg("未在该页面发现可用素材");
-    } catch (e) { setMsg(e.message); } finally { setParsing(false); }
+    } catch (e) {
+      if (refVersion === refVersionRef.current) setMsg(e.message);
+    } finally {
+      if (reqId === parseRequestRef.current) setParsing(false);
+    }
   }
 
   async function doUploadImage(file) {
     if (!file || uploading) return;
     if (!file.type?.startsWith("image/")) {
       setMsg("请选择图片文件");
+      if (uploadInputRef.current) uploadInputRef.current.value = "";
       return;
     }
+    const reqId = ++uploadRequestRef.current;
+    const refVersion = ++refVersionRef.current;
+    reverseRequestRef.current += 1;
     setMsg("");
     setUploading(true);
     try {
       const uploaded = await api.uploadImage(file);
-      setAssets((current) => [uploaded, ...current]);
-      pickAsset(uploaded);
+      if (refVersion !== refVersionRef.current) return;
+      const previewUrl = URL.createObjectURL(file);
+      objectUrlsRef.current.add(previewUrl);
+      const displayAsset = {
+        ...uploaded,
+        display_url: previewUrl,
+        display_thumb: previewUrl,
+      };
+      setAssets((current) => [displayAsset, ...current]);
+      pickAsset(displayAsset);
       setCategory("image");
-      setStructured({});
+      clearReverseState();
+      setRefOpen(true);
     } catch (e) {
-      setMsg(e.message);
+      if (refVersion === refVersionRef.current) setMsg(e.message);
     } finally {
-      setUploading(false);
-      if (uploadInputRef.current) uploadInputRef.current.value = "";
+      if (reqId === uploadRequestRef.current) {
+        setUploading(false);
+        if (uploadInputRef.current) uploadInputRef.current.value = "";
+      }
     }
   }
 
   function pickAsset(a) {
+    const previousSignature = assetSignature(selectedRef.current);
+    const nextSignature = assetSignature(a);
     setSelected(a);
+    if (previousSignature !== nextSignature) {
+      reverseRequestRef.current += 1;
+      setReversing(false);
+      clearReverseState();
+    }
     const dims = assetDims(a);
     if (a.type === "video") {
       setCategory("video");
@@ -177,40 +270,59 @@ export default function Home() {
 
   async function doReverse() {
     if (!selected) return;
+    const target = selected;
+    const targetSignature = assetSignature(target);
+    const reqId = ++reverseRequestRef.current;
+    const isCurrent = () => (
+      reqId === reverseRequestRef.current
+      && assetSignature(selectedRef.current) === targetSignature
+    );
     setReversing(true); setMsg("");
     try {
-      const isVideo = selected.type === "video";
-      const refUrl = isVideo ? selected.url || selected.thumb : selected.url;
-      const r = await api.reverse(refUrl, category, isVideo ? selected.thumb : null);
-      setPrompt(r.final_text || "");
+      const isVideo = target.type === "video";
+      const refUrl = isVideo ? target.url || target.thumb : target.url;
+      const reverseTarget = isVideo ? "video" : category;
+      const r = await api.reverse(refUrl, reverseTarget, isVideo ? target.thumb : null, target.type);
+      if (!isCurrent()) return;
       const s = r.structured || {};
       setStructured(s);
+      setStructuredSource(targetSignature);
+      setPrompt(composePromptFromStructured(s, r.final_text || ""));
+      setPromptDirty(false);
       setStructOpen(true);
-      // pre-fill the negative box from the reversed 负向 dimension
-      if (s["负向"] && !negative) { setNegative(s["负向"]); setShowNegative(true); }
+      if (s["负向"] && !negativeTouched) {
+        setNegative(s["负向"]);
+        setShowNegative(true);
+      }
+      if (typeof r.charged_credits === "number") {
+        const suffix = r.reference_count > 1 ? `（${r.reference_count} 帧）` : "";
+        setMsg(`反推完成，已扣 ${r.charged_credits} 积分${suffix}`);
+      }
       refreshMe();
-    } catch (e) { setMsg(e.message); } finally { setReversing(false); }
+    } catch (e) {
+      if (isCurrent()) setMsg(e.message);
+    } finally {
+      if (reqId === reverseRequestRef.current) setReversing(false);
+    }
   }
 
   function clearRef() {
-    setSelected(null); setStructured({}); setAssets([]); setUrl("");
+    refVersionRef.current += 1;
+    parseRequestRef.current += 1;
+    uploadRequestRef.current += 1;
+    reverseRequestRef.current += 1;
+    revokeUploadedObjectUrls();
+    setParsing(false);
+    setUploading(false);
+    setReversing(false);
+    if (uploadInputRef.current) uploadInputRef.current.value = "";
+    setSelected(null); clearReverseState(); setAssets([]); setUrl("");
   }
 
   // rebuild the prompt text from the (possibly edited) reverse dimensions
   function recompose() {
-    const order = [
-      "主体", "细节特征", "场景背景", "风格", "景别", "构图", "视角镜头", "视角构图",
-      "主体动作", "镜头运动", "运动节奏", "时序分镜", "光线", "色调配色", "材质纹理",
-      "氛围情绪", "后期质感", "转场",
-    ];
-    const skip = new Set(["负向", "标签", "文字水印", "时长建议", "final_text"]);
-    const parts = [];
-    for (const k of order) if (structured[k] && !skip.has(k)) parts.push(structured[k]);
-    for (const k of Object.keys(structured))
-      if (!order.includes(k) && !skip.has(k) && structured[k]) parts.push(structured[k]);
-    let text = parts.join(", ");
-    if (structured["标签"]) text += (text ? ", " : "") + structured["标签"];
-    setPrompt(text);
+    setPrompt(composePromptFromStructured(structured, prompt));
+    setPromptDirty(false);
   }
 
   function applyLibraryPrompt(text, mode = "replace") {
@@ -220,9 +332,23 @@ export default function Home() {
       if (mode !== "append" || !current.trim()) return next;
       return `${current.trim()}\n\n${next}`;
     });
+    setPromptDirty(true);
   }
 
   // ---- generate ----
+  function generateClientRequestId(stage, signature) {
+    const existing = pendingGenerateRequestRef.current;
+    if (existing?.stage === stage && existing?.signature === signature && existing?.id) return existing.id;
+    const random = (
+      typeof window !== "undefined" && window.crypto?.randomUUID
+        ? window.crypto.randomUUID()
+        : `${Date.now()}-${Math.random().toString(16).slice(2)}`
+    );
+    const id = `studio-${stage}-${random}`;
+    pendingGenerateRequestRef.current = { stage, signature, id };
+    return id;
+  }
+
   async function submit(stage = "preview") {
     if (submitting) return;  // reentrancy guard: protects every caller incl. double-clicks + Ctrl+Enter
     if (!prompt.trim() && !selected) { setMsg("请输入提示词，或从参考反推"); return; }
@@ -232,15 +358,30 @@ export default function Home() {
       // current tab (the user may have switched tabs after the preview).
       const isFinal = stage === "final" && task;
       const effCategory = isFinal ? task.category : category;
+      if (!modelEnabled(effCategory)) {
+        setMsg(`${effCategory === "video" ? "视频" : "图片"}模型未启用，请联系管理员配置后再使用。`);
+        return;
+      }
       const ratioPool = effCategory === "video" ? videoRatioOptions() : RATIOS;
       const rt = ratioPool.find((r) => r.key === ratio) || ratioPool[0];
       const imageSize = imageSizeFor(rt, imageQuality, cfg?.image_size_max_dim || 4096);
       const dims = selected ? assetDims(selected) : null;
       const refImage = selected ? (selected.type === "video" ? selected.thumb : selected.url) : null;
+      const effectiveStructured = (
+        selected && structuredSource && structuredSource !== assetSignature(selected)
+          ? {}
+          : structured
+      );
+      const promptText = prompt.trim();
+      const finalText = (
+        promptDirty
+          ? promptText
+          : (composePromptFromStructured(effectiveStructured) || promptText)
+      ) || "生成同风格的新素材";
       // image reference chosen but not reversed -> send an instruction so the
       // worker actually feeds the reference image to the edit endpoint (图+指令→图),
       // instead of a plain text-to-image that ignores it.
-      const useRefImage = !isFinal && selected && selected.type === "image" && Object.keys(structured).length === 0;
+      const useRefImage = !isFinal && selected && selected.type === "image" && Object.keys(effectiveStructured).length === 0;
       const payload = {
         source_asset_url: selected ? selected.url : null,
         source_type: selected ? selected.type : "image",
@@ -248,8 +389,8 @@ export default function Home() {
         stage,
         parent_task_id: isFinal ? task.id : null,
         prompt: {
-          ...(Object.keys(structured).length ? structured : {}),
-          final_text: prompt.trim() || "生成同风格的新素材",
+          ...(Object.keys(effectiveStructured).length ? effectiveStructured : {}),
+          final_text: finalText,
           ...(useRefImage ? { instruction: prompt.trim() || "参考所选图生成同款风格的新素材" } : {}),
         },
         params:
@@ -261,7 +402,7 @@ export default function Home() {
                 ...(negative ? { negative_prompt: negative } : {}),
               }
             : {
-                duration: Number(vDuration),
+                duration: boundedVideoDuration(vDuration, cfg?.video_duration_max_seconds || 900),
                 resolution: vResolution,
                 target_resolution: vResolution,
                 ratio: rt.key,
@@ -270,15 +411,27 @@ export default function Home() {
                 ...(negative ? { negative_prompt: negative } : {}),
               },
       };
+      payload.client_request_id = generateClientRequestId(stage, JSON.stringify(payload));
       const t = await api.generate(payload);
+      pendingGenerateRequestRef.current = null;
       setTask(t);
+      if (stage === "preview") setFinalTaskId(null);
+      if (isFinal) setFinalTaskId(t.id);
+      setTrackingLost(false);
       setRunningSnapshot({
         category: effCategory,
         n: effCategory === "image" ? Number(payload.params?.n || n || 1) : 1,
         ratio: rt,
       });
       refreshMe(); startTracking(t.id);
-    } catch (e) { setMsg(e.message); } finally { setSubmitting(false); }
+    } catch (e) {
+      if (isRequestTimeoutError(e)) {
+        setMsg(`${e.message}。任务可能已提交，重新点击会复用同一次请求，避免重复扣费。`);
+      } else {
+        pendingGenerateRequestRef.current = null;
+        setMsg(e.message);
+      }
+    } finally { setSubmitting(false); }
   }
 
   async function startTracking(id) {
@@ -286,6 +439,7 @@ export default function Home() {
     if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null; }
     if (wsRef.current) { try { wsRef.current.close(); } catch (e) {} }
     activeIdRef.current = id;
+    setTrackingLost(false);
     let done = false;
     try {
       const { ticket } = await api.taskWsTicket(id);
@@ -305,13 +459,14 @@ export default function Home() {
           try { ws.close(); } catch (_e) {}
           return;
         }
-        const terminal = d.status === "succeeded" || d.status === "failed";
+        const terminal = isTerminalTaskStatus(d.status);
         setTask((p) => (
           p && p.id === id
             ? { ...p, status: d.status, progress: terminal ? 100 : d.percent, error: d.error || p.error }
             : p
         ));
         if (terminal) {
+          setTrackingLost(false);
           done = true;
           api.task(id).then((t) => { if (activeIdRef.current === id) setTask(t); }).catch(() => {});
           refreshMe(); loadWorks();
@@ -328,32 +483,42 @@ export default function Home() {
   function startPolling(id) {
     if (pollRef.current) clearInterval(pollRef.current);
     let fails = 0;
-    pollRef.current = setInterval(async () => {
+    const interval = setInterval(async () => {
       // a newer task took over -> stop this stale loop, don't clobber its state
-      if (activeIdRef.current !== id) { clearInterval(pollRef.current); pollRef.current = null; return; }
+      if (activeIdRef.current !== id) {
+        clearInterval(interval);
+        if (pollRef.current === interval) pollRef.current = null;
+        return;
+      }
       try {
         const t = await api.task(id);
         fails = 0;
         if (activeIdRef.current !== id) return;
-        if (t.status === "succeeded" || t.status === "failed") {
+        if (isTerminalTaskStatus(t.status)) {
           setTask({ ...t, progress: 100 });
-          clearInterval(pollRef.current); pollRef.current = null;
+          setTrackingLost(false);
+          clearInterval(interval);
+          if (pollRef.current === interval) pollRef.current = null;
           refreshMe(); loadWorks();
         } else {
           setTask(t);
+          setTrackingLost(false);
         }
       } catch (e) {
         // tolerate transient errors; only give up after several in a row
         if (++fails >= 5) {
-          clearInterval(pollRef.current); pollRef.current = null;
+          clearInterval(interval);
+          if (pollRef.current === interval) pollRef.current = null;
+          setTrackingLost(true);
           setMsg("无法获取任务进度,请稍后刷新页面查看结果。");
         }
       }
     }, 1200);
+    pollRef.current = interval;
   }
 
   async function unlock(asset) {
-    const cost = Number(cfg?.models?.[asset.type]?.unlock_cost || 0);
+    const cost = Number(asset.unlock_cost ?? cfg?.models?.[asset.type]?.unlock_cost ?? 0);
     const balance = Number(me?.balance_credits ?? 0);
     if (!window.confirm(`解锁${asset.type === "video" ? "视频" : "图片"}高清将扣除 ${cost} 积分，当前余额 ${balance}，确认继续？`)) return;
     try {
@@ -370,23 +535,52 @@ export default function Home() {
     } catch (e) { setMsg(e.message); }
   }
 
-  const running = task && task.status !== "succeeded" && task.status !== "failed";
+  async function refreshActiveTask() {
+    if (!task?.id) return;
+    setMsg("");
+    try {
+      const t = await api.task(task.id);
+      setTask(t);
+      setTrackingLost(false);
+      if (!isTerminalTaskStatus(t.status)) startTracking(t.id);
+      else { refreshMe(); loadWorks(); }
+    } catch (e) {
+      setMsg(e.message);
+    }
+  }
+
+  const activeNonTerminalTask = Boolean(task && !isTerminalTaskStatus(task.status));
+  const running = activeNonTerminalTask;
+  const showRunningProgress = activeNonTerminalTask && !trackingLost;
   const unitCost = cfg?.models?.[category]?.cost_credits || 0;
   const videoPreviewCost = cfg?.models?.video?.preview_cost ?? Math.max(1, Math.floor((cfg?.models?.video?.cost_credits || 0) / 10));
   const videoFinalCost = cfg?.models?.video?.final_cost ?? cfg?.models?.video?.cost_credits ?? 0;
   const reverseCost = cfg?.models?.vision?.cost_credits || 0;
+  const reverseImageCost = cfg?.reverse?.image_cost ?? reverseCost;
+  const reverseVideoFrameCount = Number(cfg?.reverse?.video_frame_count || 1);
+  const reverseVideoMaxCost = cfg?.reverse?.video_max_cost ?? (reverseCost * reverseVideoFrameCount);
+  const selectedReverseCost = selected?.type === "video" ? reverseVideoMaxCost : reverseImageCost;
+  const selectedReverseCostLabel = selected?.type === "video" && reverseVideoFrameCount > 1
+    ? `${selectedReverseCost}积分(最多${reverseVideoFrameCount}帧)`
+    : `${selectedReverseCost}积分`;
   const reverseEnabled = cfg?.defaults?.reverse_prompt_enabled !== false; // admin switch
   const ratioOptions = category === "video" ? videoRatioOptions() : RATIOS;
   const rt = ratioOptions.find((r) => r.key === ratio) || ratioOptions[0];
   const maxImageN = Number(cfg?.image_n_max || 8);
   const imageCount = boundedImageCount(n, maxImageN);
+  const maxVideoDuration = Number(cfg?.video_duration_max_seconds || 900);
+  const videoDuration = boundedVideoDuration(vDuration, maxVideoDuration);
   const currentImageSize = imageSizeFor(rt, imageQuality, cfg?.image_size_max_dim || 4096);
   const estCost = category === "image" ? unitCost * imageCount : videoPreviewCost;
+  const currentModelEnabled = modelEnabled(category);
+  const currentGatewayMock = cfg?.gateways?.[category]?.mock_mode ?? cfg?.mock_mode;
   const gatewayStatus = cfg === null
     ? "检测生成网关中"
-    : cfg.mock_mode
-      ? "演示模式 · 占位素材"
-      : "已连接生成网关";
+    : !currentModelEnabled
+      ? `${category === "video" ? "视频" : "图片"}模型未启用`
+      : currentGatewayMock
+        ? `${category === "video" ? "视频" : "图片"}演示模式 · 占位素材`
+        : `${category === "video" ? "视频" : "图片"}网关已连接`;
 
   return (
     <div className="min-h-screen">
@@ -412,18 +606,30 @@ export default function Home() {
           <div className="panel p-2.5">
             {/* image / video tabs */}
             <div className="mb-2.5 flex items-center gap-1 rounded-full border border-line bg-base2/50 p-1 text-sm">
-              {[["image", "✦ 文生图"], ["video", "▶ 文生视频"]].map(([k, label]) => (
+              {[["image", "✦ 文生图"], ["video", "▶ 文生视频"]].map(([k, label]) => {
+                const disabled = !modelEnabled(k);
+                return (
                 <button
                   key={k}
-                  onClick={() => setCategory(k)}
+                  onClick={() => switchCategory(k)}
+                  disabled={disabled}
+                  title={disabled ? "模型未启用，请联系管理员配置" : ""}
                   className={`flex-1 rounded-full px-4 py-1.5 font-display font-medium transition-all ${
-                    category === k ? "bg-brand text-white shadow-glow-sm" : "text-mist hover:text-snow"
+                    disabled
+                      ? "cursor-not-allowed text-fog opacity-45"
+                      : category === k ? "bg-brand text-white shadow-glow-sm" : "text-mist hover:text-snow"
                   }`}
                 >
                   {label}
                 </button>
-              ))}
+                );
+              })}
             </div>
+            {!currentModelEnabled && (
+              <p className="mb-2 rounded-xl border border-warn/30 bg-warn/10 px-3 py-2 text-sm text-warn">
+                当前{category === "video" ? "视频" : "图片"}模型未启用，请管理员在后台模型配置中启用后再生成。
+              </p>
+            )}
 
             {/* prompt */}
             <div className="rounded-xl3 border border-line bg-base2/40 p-3">
@@ -431,7 +637,7 @@ export default function Home() {
                 className="textarea h-28 resize-none border-0 bg-transparent px-1 text-[15px] focus:ring-0"
                 placeholder="描述你想要的画面，越具体越好（主体 / 风格 / 光线 / 色调 / 构图）… ⌘/Ctrl + Enter 生成"
                 value={prompt}
-                onChange={(e) => setPrompt(e.target.value)}
+                onChange={(e) => { setPrompt(e.target.value); setPromptDirty(true); }}
                 onKeyDown={(e) => {
                   if ((e.metaKey || e.ctrlKey) && e.key === "Enter") { e.preventDefault(); submit("preview"); }
                 }}
@@ -439,7 +645,7 @@ export default function Home() {
               {/* example chips */}
               <div className="mt-1 flex flex-wrap gap-1.5">
                 {EXAMPLES.map((ex, i) => (
-                  <button key={i} onClick={() => setPrompt(ex)} className="chip" title={ex}>
+                  <button key={i} onClick={() => { setPrompt(ex); setPromptDirty(true); }} className="chip" title={ex}>
                     ✦ {ex.slice(0, 12)}…
                   </button>
                 ))}
@@ -449,6 +655,40 @@ export default function Home() {
                 >
                   提示词库
                 </button>
+              </div>
+              <div className="mt-3 flex flex-col gap-2 border-t border-line pt-3 sm:flex-row sm:items-center sm:justify-between">
+                <div className="flex flex-wrap gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setRefOpen((v) => !v)}
+                    className={`btn-secondary btn-sm border-iris/50 bg-iris/10 text-snow shadow-glow-sm hover:bg-iris/20 ${
+                      selected ? "border-transparent bg-brand text-white" : ""
+                    }`}
+                  >
+                    {selected ? "已选参考素材" : "参考链接反推"}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => uploadInputRef.current?.click()}
+                    disabled={uploading}
+                    className="btn-secondary btn-sm"
+                  >
+                    {uploading ? "上传中…" : "上传图片参考 / 编辑源"}
+                  </button>
+                  <input
+                    ref={uploadInputRef}
+                    type="file"
+                    accept="image/jpeg,image/png,image/webp,image/gif"
+                    className="hidden"
+                    onChange={(e) => doUploadImage(e.target.files?.[0])}
+                  />
+                </div>
+                {selected && (
+                  <div className="flex min-w-0 items-center gap-2 rounded-full border border-line bg-white/5 px-2 py-1 text-xs text-fog">
+                    <span className="badge bg-iris/20 text-iris-400">{selected.type === "video" ? "视频参考" : "图片参考"}</span>
+                    <span className="truncate">{selectedLabel(selected)}</span>
+                  </div>
+                )}
               </div>
             </div>
 
@@ -481,7 +721,10 @@ export default function Home() {
                         <input
                           className="input px-2.5 py-1.5 text-xs"
                           value={structured[k] || ""}
-                          onChange={(e) => setStructured({ ...structured, [k]: e.target.value })}
+                          onChange={(e) => {
+                            setStructured({ ...structured, [k]: e.target.value });
+                            setPromptDirty(false);
+                          }}
                         />
                       </div>
                     ))}
@@ -550,11 +793,28 @@ export default function Home() {
                 <>
                   <div className="flex items-center gap-2">
                     <span className="text-xs text-fog">时长</span>
-                    <div className="flex gap-1">
-                      {[5, 8, 10].map((v) => (
-                        <button key={v} onClick={() => setVDuration(v)} className={`chip ${Number(vDuration) === v ? "chip-active" : ""}`}>{v}s</button>
+                    <div className="flex max-w-full gap-1 overflow-x-auto pb-1">
+                      {VIDEO_DURATION_PRESETS.filter((p) => p.seconds <= maxVideoDuration).map((p) => (
+                        <button
+                          key={p.seconds}
+                          onClick={() => setVDuration(p.seconds)}
+                          title={p.hint}
+                          className={`chip shrink-0 ${videoDuration === p.seconds ? "chip-active" : ""}`}
+                        >
+                          {p.label}
+                        </button>
                       ))}
                     </div>
+                    <input
+                      className="input w-24 px-2 py-1 text-xs"
+                      type="number"
+                      min="1"
+                      max={maxVideoDuration}
+                      value={vDuration}
+                      onChange={(e) => setVDuration(e.target.value)}
+                      onBlur={() => setVDuration(boundedVideoDuration(vDuration, maxVideoDuration))}
+                      title={`最长 ${formatDuration(maxVideoDuration)}`}
+                    />
                   </div>
                   <div className="flex items-center gap-2">
                     <span className="text-xs text-fog">质量</span>
@@ -578,24 +838,21 @@ export default function Home() {
                     onChange={(e) => setSeed(e.target.value.replace(/[^0-9]/g, ""))} />
                 </label>
               )}
-              <button onClick={() => setRefOpen((v) => !v)} className={`chip ml-auto ${selected ? "chip-active" : ""}`}>
-                {selected ? "已选参考" : "＋ 参考链接反推"}
-              </button>
             </div>
 
             {showNegative && (
               <input className="input mt-2" placeholder="不想出现的元素：文字, 水印, 多余手指, 畸变…"
-                value={negative} onChange={(e) => setNegative(e.target.value)} />
+                value={negative} onChange={(e) => { setNegative(e.target.value); setNegativeTouched(true); }} />
             )}
 
             {/* generate bar */}
             <div className="mt-3 flex items-center justify-between gap-3 px-1">
               <p className="text-xs text-fog">
                 {estCost ? (
-                  <>预计消耗 <b className="text-mist">{category === "video" ? `预览 ${videoPreviewCost} · 完整 ${videoFinalCost} · ${vResolution}` : estCost}</b> 积分</>
+                  <>预计消耗 <b className="text-mist">{category === "video" ? `预览 ${videoPreviewCost} · 完整 ${videoFinalCost} · ${formatDuration(videoDuration)} · ${vResolution}` : estCost}</b> 积分</>
                 ) : "提交后冻结预估积分"}
               </p>
-              <button onClick={() => submit("preview")} disabled={submitting || running} className="btn-primary btn-lg min-w-32">
+              <button onClick={() => submit("preview")} disabled={submitting || running || !currentModelEnabled} className="btn-primary btn-lg min-w-32">
                 {submitting || running ? "生成中…" : category === "video" ? "生成预览 ▶" : "立即生成 ✦"}
               </button>
             </div>
@@ -618,13 +875,6 @@ export default function Home() {
                     >
                       {uploading ? "上传中…" : "上传图片"}
                     </button>
-                    <input
-                      ref={uploadInputRef}
-                      type="file"
-                      accept="image/jpeg,image/png,image/webp,image/gif"
-                      className="hidden"
-                      onChange={(e) => doUploadImage(e.target.files?.[0])}
-                    />
                   </div>
                 </div>
                 {selected?.type === "image" && selected?.url?.includes("/api/uploads/upload/") && (
@@ -639,17 +889,7 @@ export default function Home() {
                         className={`relative aspect-square overflow-hidden rounded-lg border transition ${
                           selected === a ? "border-iris ring-2 ring-iris/40" : "border-line hover:border-line2"
                         }`}>
-                        {a.type === "video" ? (
-                          a.thumb ? (
-                            <img src={a.thumb} alt="" className="h-full w-full object-cover" />
-                          ) : a.url ? (
-                            <video src={a.url} muted preload="metadata" className="h-full w-full object-cover" />
-                          ) : (
-                            <div className="flex h-full w-full items-center justify-center text-fog">🎬</div>
-                          )
-                        ) : (
-                          <img src={a.thumb || a.url} alt="" className="h-full w-full object-cover" />
-                        )}
+                        <ReferenceAssetPreview asset={a} />
                         <span className="badge absolute left-1 top-1 bg-black/60 text-[10px] text-white">{a.type}</span>
                       </button>
                     ))}
@@ -657,7 +897,7 @@ export default function Home() {
                 )}
                 {selected && reverseEnabled && (
                   <button onClick={doReverse} disabled={reversing} className="btn-secondary btn-sm mt-3">
-                    {reversing ? "反推中…" : `✦ 反推所选${selected.type === "video" ? "视频" : "图片"}为提示词${reverseCost ? ` · ${reverseCost}积分` : ""}`}
+                    {reversing ? "反推中…" : `✦ 反推所选${selected.type === "video" ? "视频" : "图片"}为提示词${selectedReverseCost ? ` · ${selectedReverseCostLabel}` : ""}`}
                   </button>
                 )}
                 {selected && !reverseEnabled && (
@@ -677,10 +917,10 @@ export default function Home() {
           <section className="mx-auto mt-8 max-w-3xl animate-fadeup">
             <div className="card p-4">
               <div className="mb-3 flex items-center justify-between">
-                <span className="text-sm font-display font-semibold">本次生成 · #{task.id}</span>
+                <span className="text-sm font-display font-semibold">{taskResultTitle(task, runningSnapshot)}</span>
                 <span className={`badge ${statusStyle(task.status)}`}>{statusZh(task.status)}</span>
               </div>
-              {running && (
+              {showRunningProgress && (
                 <div className="mb-4">
                   <div className="mb-2 h-1.5 w-full overflow-hidden rounded-full bg-white/8">
                     <div className="h-full rounded-full bg-brand transition-all duration-500" style={{ width: `${task.progress || 8}%` }} />
@@ -698,6 +938,17 @@ export default function Home() {
                   </div>
                 </div>
               )}
+              {trackingLost && !isTerminalTaskStatus(task?.status) && (
+                <div className="mb-4 rounded-lg border border-warn/30 bg-warn/10 px-3 py-2 text-sm text-warn">
+                  <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+                    <span>前端已停止等待该任务，后端可能仍在生成。</span>
+                    <div className="flex gap-2">
+                      <button type="button" onClick={refreshActiveTask} className="btn-secondary btn-sm">刷新任务状态</button>
+                      <a href="/history" className="btn-secondary btn-sm">去历史查看</a>
+                    </div>
+                  </div>
+                </div>
+              )}
               {task.error && <p className="mb-3 rounded-lg bg-bad/10 px-3 py-2 text-sm text-bad">{task.error}</p>}
               {task.partial && (
                 <p className="mb-3 rounded-lg bg-warn/10 px-3 py-2 text-sm text-warn">
@@ -711,7 +962,12 @@ export default function Home() {
                   ))}
                 </div>
               )}
-              {task.category === "video" && task.stage === "preview" && task.status === "succeeded" && (
+              {task.category === "video" && task.stage === "preview" && task.status === "succeeded" && finalTaskId && (
+                <a href="/history" className="btn-secondary mt-4 block w-full text-center">
+                  完整视频已提交 · 去历史查看
+                </a>
+              )}
+              {task.category === "video" && task.stage === "preview" && task.status === "succeeded" && !finalTaskId && (
                 <button onClick={() => submit("final")} disabled={submitting} className="btn-primary mt-4 w-full">
                   {submitting ? "提交中…" : `方向满意 → 渲染完整视频 · ${videoFinalCost}积分`}
                 </button>
@@ -760,7 +1016,25 @@ export default function Home() {
 /* ---------- sub-components ---------- */
 
 function srcOf(a) {
-  return a.preview_url || (a.unlocked ? a.hd_url || "" : "");
+  return assetPreviewSrc(a);
+}
+
+function taskResultTitle(task, runningSnapshot) {
+  if (!task) return "本次生成";
+  if (task.category === "image") {
+    const assetsCount = Number(task.assets?.length || 0);
+    const saved = Number(task.saved_count ?? assetsCount);
+    const snapshotCount = runningSnapshot?.category === "image" ? runningSnapshot.n : null;
+    const requestedValue = task.requested_count ?? snapshotCount ?? assetsCount;
+    const requested = Number(requestedValue || 1);
+    if (task.partial) return `本次生成 · ${saved}/${requested} 张`;
+    if (!isTerminalTaskStatus(task.status)) return `本次生成 · ${requested} 张`;
+    return `本次生成 · ${saved || requested} 张`;
+  }
+  if (task.category === "video") {
+    return task.stage === "final" ? "本次生成 · 完整视频" : "本次生成 · 视频预览";
+  }
+  return "本次生成";
 }
 
 function ResultCard({ a, onOpen, onUnlock, onDownload }) {
@@ -773,10 +1047,12 @@ function ResultCard({ a, onOpen, onUnlock, onDownload }) {
           <div className="flex h-full w-full items-center justify-center px-3 text-center text-xs text-fog">
             预览暂不可用
           </div>
-        ) : a.type === "video" ? (
-          <video src={src} muted preload="metadata" playsInline className="h-full w-full object-contain" />
         ) : (
-          <img src={src} alt="" loading="lazy" className="h-full w-full object-contain transition group-hover:scale-105" />
+          <AssetMedia
+            asset={a}
+            className="h-full w-full object-contain transition group-hover:scale-105"
+            fallbackClassName="flex h-full w-full items-center justify-center px-3 text-center text-xs text-fog"
+          />
         )}
         {a.unlocked && <span className="badge absolute right-1.5 top-1.5 bg-brand text-white">HD</span>}
       </div>
@@ -803,10 +1079,12 @@ function MasonryItem({ a, onOpen }) {
         <div className="flex h-full w-full items-center justify-center px-3 text-center text-xs text-fog">
           预览暂不可用
         </div>
-      ) : a.type === "video" ? (
-        <video src={src} muted preload="metadata" playsInline className="h-full w-full object-contain bg-black/20" />
       ) : (
-        <img src={src} alt="" loading="lazy" className="h-full w-full object-contain transition duration-300 group-hover:scale-[1.04]" />
+        <AssetMedia
+          asset={a}
+          className="h-full w-full object-contain transition duration-300 group-hover:scale-[1.04]"
+          fallbackClassName="flex h-full w-full items-center justify-center px-3 text-center text-xs text-fog"
+        />
       )}
       <div className="pointer-events-none absolute inset-0 flex items-end bg-gradient-to-t from-black/60 via-transparent to-transparent opacity-0 transition group-hover:opacity-100">
         <span className="m-2 flex items-center gap-1 text-xs text-white/90">
@@ -820,7 +1098,6 @@ function MasonryItem({ a, onOpen }) {
 
 function Lightbox({ a, onClose, onUnlock, onDownload }) {
   const src = srcOf(a);
-  const isVid = a.type === "video";
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 p-4 backdrop-blur-sm" role="dialog" aria-modal="true" onClick={onClose}>
       <div className="panel max-h-[92vh] max-w-3xl overflow-auto p-3" onClick={(e) => e.stopPropagation()}>
@@ -828,10 +1105,16 @@ function Lightbox({ a, onClose, onUnlock, onDownload }) {
           <div className="flex min-h-64 items-center justify-center rounded-xl2 bg-black/30 px-6 text-sm text-fog">
             {a.unlocked ? "预览暂不可用，请稍后重试。" : "预览暂不可用，请先解锁后再下载高清。"}
           </div>
-        ) : isVid ? (
-          <video src={src} controls autoPlay className="mx-auto max-h-[76vh] w-auto rounded-xl2" />
         ) : (
-          <img src={src} alt="" className="mx-auto max-h-[76vh] w-auto rounded-xl2" />
+          <AssetMedia
+            asset={a}
+            interactive
+            controls
+            autoPlay
+            muted={false}
+            className="mx-auto max-h-[76vh] w-auto rounded-xl2"
+            fallbackClassName="flex min-h-64 items-center justify-center rounded-xl2 bg-black/30 px-6 text-sm text-fog"
+          />
         )}
         <div className="mt-3 flex items-center justify-between gap-2 text-sm">
           <span className="text-fog">
@@ -859,6 +1142,93 @@ function assetDims(a) {
   if (!w || !h) { w = Number(a.thumb_width); h = Number(a.thumb_height); }
   if (!w || !h) return null;
   return { width: w, height: h };
+}
+
+function selectedLabel(a) {
+  if (!a) return "";
+  const dims = assetDims(a);
+  const dimText = dims ? `${dims.width}x${dims.height}` : "未识别尺寸";
+  if (a.original_url) return `已本地化 · ${dimText}`;
+  if (a.original_thumb) return `视频封面 · ${dimText}`;
+  if (a.url?.includes("/api/uploads/upload/")) return `上传图片 · ${dimText}`;
+  return `链接素材 · ${dimText}`;
+}
+
+function mediaThumbSrc(a) {
+  return a?.display_thumb || a?.display_url || a?.thumb || a?.url || "";
+}
+
+function ReferenceAssetPreview({ asset }) {
+  const [failed, setFailed] = useState(false);
+  const [secureSrc, setSecureSrc] = useState("");
+  const rawSrc = mediaThumbSrc(asset);
+  useEffect(() => {
+    setFailed(false);
+    setSecureSrc("");
+    if (!rawSrc || !rawSrc.includes("/api/uploads/")) return;
+    let cancelled = false;
+    let objectUrl = "";
+    authenticatedObjectUrl(rawSrc)
+      .then((url) => {
+        if (cancelled) {
+          URL.revokeObjectURL(url);
+          return;
+        }
+        objectUrl = url;
+        setSecureSrc(url);
+      })
+      .catch(() => {
+        if (!cancelled) setFailed(true);
+      });
+    return () => {
+      cancelled = true;
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
+    };
+  }, [rawSrc]);
+  if (failed) {
+    return (
+      <div className="flex h-full w-full flex-col items-center justify-center gap-1 bg-base2 text-[10px] text-fog">
+        <span>{asset?.type === "video" ? "🎬" : "图片"}</span>
+        <span>预览不可用</span>
+      </div>
+    );
+  }
+  if (asset?.type === "video") {
+    if (asset.thumb) {
+      return <img src={secureSrc || rawSrc} alt="" className="h-full w-full object-cover" onError={() => setFailed(true)} />;
+    }
+    if (asset.url) {
+      return <video src={asset.url} muted preload="metadata" className="h-full w-full object-cover" onError={() => setFailed(true)} />;
+    }
+    return <div className="flex h-full w-full items-center justify-center text-fog">🎬</div>;
+  }
+  const src = secureSrc || rawSrc;
+  if (!src) return <div className="flex h-full w-full items-center justify-center bg-base2 text-xs text-fog">无预览</div>;
+  return <img src={src} alt="" className="h-full w-full object-cover" onError={() => setFailed(true)} />;
+}
+
+function assetSignature(a) {
+  if (!a) return "";
+  return [a.type || "", a.url || "", a.thumb || ""].join("|");
+}
+
+function composePromptFromStructured(structured, fallbackText = "") {
+  const fallback = String(fallbackText || "").trim();
+  if (!structured || !Object.keys(structured).length) return fallback;
+  const finalText = String(structured.final_text || structured["final_text"] || fallbackText || "").trim();
+  const order = [
+    "主体", "商品服装", "细节特征", "场景背景", "广告目标", "风格", "景别", "构图",
+    "视角镜头", "视角构图", "主体动作", "镜头运动", "运动节奏", "剪辑节奏", "时序分镜",
+    "字幕卖点", "光线", "色调配色", "材质纹理", "氛围情绪", "后期质感", "转场", "一致性约束",
+  ];
+  const skip = new Set(["负向", "标签", "文字水印", "时长建议", "final_text"]);
+  const parts = [];
+  for (const k of order) if (structured[k] && !skip.has(k)) parts.push(structured[k]);
+  for (const k of Object.keys(structured))
+    if (!order.includes(k) && !skip.has(k) && structured[k]) parts.push(structured[k]);
+  let text = parts.join(", ");
+  if (structured["标签"]) text += (text ? ", " : "") + structured["标签"];
+  return text.trim() || finalText;
 }
 
 function ratioKeyForSize(size) {
@@ -901,6 +1271,21 @@ function boundedImageCount(value, max = 8) {
   return Math.max(1, Math.min(limit, parsed));
 }
 
+function boundedVideoDuration(value, max = 900) {
+  const limit = Math.max(1, Number(max) || 900);
+  const parsed = Number.parseInt(value, 10);
+  if (!Number.isFinite(parsed)) return 5;
+  return Math.max(1, Math.min(limit, parsed));
+}
+
+function formatDuration(seconds) {
+  const s = Math.max(1, Number.parseInt(seconds, 10) || 1);
+  if (s < 60) return `${s}s`;
+  const minutes = Math.floor(s / 60);
+  const rest = s % 60;
+  return rest ? `${minutes}m${rest}s` : `${minutes}min`;
+}
+
 function videoRatioOptions() {
   return RATIOS.filter((r) => VIDEO_RATIO_KEYS.has(r.key));
 }
@@ -921,8 +1306,12 @@ function mediaAspectStyle(a, fallback = "1 / 1") {
   return { aspectRatio: `${dims.width} / ${dims.height}` };
 }
 
+function isTerminalTaskStatus(s) {
+  return TERMINAL_TASK_STATUSES.has(s);
+}
+
 function statusZh(s) {
-  return { queued: "排队中", running: "生成中", succeeded: "已完成", failed: "失败" }[s] || s;
+  return { queued: "排队中", running: "生成中", succeeded: "已完成", failed: "失败", needs_review: "待人工对账" }[s] || s;
 }
 function statusStyle(s) {
   return {
@@ -930,5 +1319,10 @@ function statusStyle(s) {
     running: "bg-aqua/15 text-aqua",
     succeeded: "bg-ok/15 text-ok",
     failed: "bg-bad/15 text-bad",
+    needs_review: "bg-warn/15 text-warn",
   }[s] || "bg-white/10 text-mist";
+}
+
+function isRequestTimeoutError(e) {
+  return String(e?.message || "").includes("请求超时");
 }

@@ -12,6 +12,12 @@ import jwt
 from .config import settings
 
 _PBKDF2_ITERATIONS = 240_000
+_DUMMY_PASSWORD_SALT = b"ai-studio-login-dummy-salt"
+_DUMMY_PASSWORD_HASH = (
+    f"pbkdf2_sha256${_PBKDF2_ITERATIONS}$"
+    f"{b64encode(_DUMMY_PASSWORD_SALT).decode()}$"
+    f"{b64encode(hashlib.pbkdf2_hmac('sha256', b'not-the-password', _DUMMY_PASSWORD_SALT, _PBKDF2_ITERATIONS)).decode()}"
+)
 
 
 def hash_password(password: str) -> str:
@@ -34,6 +40,10 @@ def verify_password(password: str, encoded: str | None) -> bool:
         return hmac.compare_digest(dk, b64decode(hash_b64))
     except Exception:
         return False
+
+
+def dummy_password_hash() -> str:
+    return _DUMMY_PASSWORD_HASH
 
 
 def create_access_token(user_id: int, token_version: int = 0) -> str:

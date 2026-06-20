@@ -4,13 +4,17 @@ Image: gateway returns N images -> we save HD + a watermarked low-res preview
 per image, settle the frozen estimate against real cost.
 Video: submit async job -> poll to completion -> save preview (and HD for final
 stage). Idempotent: a task that already reached a terminal state is skipped.
-Any failure refunds the frozen credits.
+Failures refund the frozen credits only when the provider state is known. Video
+submits with an unknown upstream state are held for admin reconciliation.
 """
 from __future__ import annotations
 
+import inspect
 import logging
 import time
 from datetime import datetime, timezone
+from types import SimpleNamespace
+from uuid import uuid4
 
 from sqlalchemy import select, update
 
@@ -21,12 +25,127 @@ from ..redis_client import redis_client
 from . import asset_refs, credits, gateway, locks, storage, usage, video_frames
 from .config_store import get_model_config, get_setting
 from .image_options import IMAGE_SIZES
+from .model_gateway_config import (
+    RuntimeGatewayConfig,
+    gateway_key_fingerprint,
+    runtime_config_for_model,
+)
 from .progress import set_progress
-from .watermark import image_ext, make_image_preview
+from .watermark import image_ext, make_image_preview, make_model_reference
 
 log = logging.getLogger("generation")
 
-_TERMINAL = ("succeeded", "failed")
+NEEDS_REVIEW = "needs_review"
+_TERMINAL = ("succeeded", "failed", NEEDS_REVIEW)
+
+
+class TaskLockedError(RuntimeError):
+    pass
+
+
+class VideoResultValidationError(RuntimeError):
+    """The provider returned a terminal result, but the persisted media is bad."""
+
+
+class ModelSnapshotMismatchError(RuntimeError):
+    """A task snapshot no longer matches the configured model gateway secret."""
+
+
+def model_snapshot(model) -> dict:
+    gateway_cfg = runtime_config_for_model(model, getattr(model, "use", None))
+    return {
+        "model_id": model.model_id,
+        "cost_credits": int(model.cost_credits or 0),
+        "unlock_cost": int(model.unlock_cost or 0),
+        "extra": model.extra or {},
+        "provider": gateway_cfg.provider,
+        "base_url": gateway_cfg.base_url,
+        "gateway_format": gateway_cfg.gateway_format,
+        "gateway_source": gateway_cfg.source,
+        "gateway_key_fingerprint": gateway_key_fingerprint(gateway_cfg),
+    }
+
+
+def _model_from_snapshot(task: GenTask, fallback_model):
+    snapshot = ((task.params or {}).get("_model_snapshot") or {})
+    if not snapshot:
+        return fallback_model
+    assert_model_snapshot_compatible(fallback_model, snapshot)
+    return SimpleNamespace(
+        model_id=snapshot.get("model_id") or fallback_model.model_id,
+        cost_credits=int(snapshot.get("cost_credits") or 0),
+        unlock_cost=int(snapshot.get("unlock_cost") or 0),
+        extra=snapshot.get("extra") or {},
+        provider=snapshot.get("provider"),
+        base_url=snapshot.get("base_url"),
+        api_key_encrypted=getattr(fallback_model, "api_key_encrypted", None),
+        gateway_format=snapshot.get("gateway_format"),
+        gateway_source=snapshot.get("gateway_source"),
+        use=getattr(fallback_model, "use", None) or task.category,
+        enabled=True,
+    )
+
+
+def assert_model_snapshot_compatible(model, snapshot: dict) -> None:
+    expected = (snapshot or {}).get("gateway_key_fingerprint")
+    if not expected:
+        return
+    current_cfg = runtime_config_for_model(model, getattr(model, "use", None))
+    if gateway_key_fingerprint(current_cfg) != expected:
+        raise ModelSnapshotMismatchError(
+            "模型网关配置已变更,该任务快照不能继续使用。请重新生成预览后再试。"
+        )
+
+
+def _gateway_config_from_model(model, use: str) -> RuntimeGatewayConfig:
+    cfg = runtime_config_for_model(model, use)
+    expected = getattr(model, "gateway_key_fingerprint", None)
+    if expected and expected != gateway_key_fingerprint(cfg):
+        raise ModelSnapshotMismatchError(
+            "模型网关配置已变更,该任务快照不能继续使用。请重新生成预览后再试。"
+        )
+    return cfg
+
+
+def _accepts_gateway_config(fn) -> bool:
+    try:
+        sig = inspect.signature(fn)
+    except (TypeError, ValueError):
+        return True
+    return "gateway_config" in sig.parameters or any(
+        p.kind == inspect.Parameter.VAR_KEYWORD
+        for p in sig.parameters.values()
+    )
+
+
+def _gen_image_with_model_config(model, prompt: str, *, n: int, size: str,
+                                 reference_image_url: str | None,
+                                 edit_path: str | None,
+                                 extra_payload: dict | None) -> list[bytes]:
+    kwargs = {
+        "n": n,
+        "size": size,
+        "reference_image_url": reference_image_url,
+        "edit_path": edit_path,
+        "extra_payload": extra_payload,
+    }
+    if _accepts_gateway_config(gateway.gen_image):
+        kwargs["gateway_config"] = _gateway_config_from_model(model, "image")
+    return gateway.gen_image(prompt, model.model_id, **kwargs)
+
+
+def _submit_video_with_model_config(model, prompt: str, params: dict) -> str:
+    kwargs = {"extra": model.extra}
+    if _accepts_gateway_config(gateway.submit_video):
+        kwargs["gateway_config"] = _gateway_config_from_model(model, "video")
+    return gateway.submit_video(prompt, model.model_id, params, **kwargs)
+
+
+def _poll_video_with_model_config(model, external_task_id: str) -> dict:
+    kwargs = {"extra": model.extra}
+    if _accepts_gateway_config(gateway.poll_video):
+        kwargs["gateway_config"] = _gateway_config_from_model(model, "video")
+    return gateway.poll_video(external_task_id, model.model_id, **kwargs)
 
 
 def claim_terminal(db, task_id: int, status: str, *, error: str | None = None,
@@ -49,6 +168,10 @@ def claim_terminal(db, task_id: int, status: str, *, error: str | None = None,
         .values(**values)
     )
     return (res.rowcount or 0) == 1
+
+
+def is_terminal_status(status: str | None) -> bool:
+    return status in _TERMINAL
 
 # Configurable so ops can tune render polling without code changes.
 VIDEO_POLL_MAX_SECONDS = settings.video_poll_max_seconds
@@ -197,9 +320,10 @@ def _video_media_meta(key: str | None, fallback_duration: int | None) -> dict:
 
 def run_image_task(task_id: int) -> None:
     lock_key = f"gen:lock:{task_id}"
-    if not locks.acquire(lock_key):
-        log.warning("image task %s already locked, skip duplicate", task_id)
-        return
+    lock_token = locks.acquire(lock_key)
+    if not lock_token:
+        log.warning("image task %s locked by another worker, retry later", task_id)
+        raise TaskLockedError(f"image task {task_id} locked")
     db = SessionLocal()
     try:
         task = db.get(GenTask, task_id)
@@ -212,6 +336,7 @@ def run_image_task(task_id: int) -> None:
         model = get_model_config(db, "image")
         if not model or not model.enabled:
             raise RuntimeError("未配置可用的图像模型")
+        model = _model_from_snapshot(task, model)
 
         n = int((task.params or {}).get("n") or get_setting(db, "image_n", 4))
         params = task.params or {}
@@ -236,9 +361,15 @@ def run_image_task(task_id: int) -> None:
         mode = "edit" if (ref and edit_path) else "txt2img"
         t0 = time.time()
         try:
-            images = gateway.gen_image(prompt, model.model_id, n=n, size=size,
-                                       reference_image_url=ref, edit_path=edit_path,
-                                       extra_payload=extra_payload)
+            images = _gen_image_with_model_config(
+                model,
+                prompt,
+                n=n,
+                size=size,
+                reference_image_url=ref,
+                edit_path=edit_path,
+                extra_payload=extra_payload,
+            )
             if not images:
                 raise RuntimeError("图片网关未返回任何结果")
         except Exception as e:  # noqa: BLE001
@@ -263,9 +394,18 @@ def run_image_task(task_id: int) -> None:
                     raw,
                     max_pixels=int(settings.generated_image_max_pixels),
                 )
+                model_ref_png, _, _ = make_model_reference(
+                    raw,
+                    max_pixels=int(settings.generated_image_max_pixels),
+                )
                 hd_key = storage.save_bytes(raw, "hd", image_ext(raw))
                 pv_key = storage.save_bytes(preview_png, "preview", "png")
-                written_keys += [hd_key, pv_key]
+                model_ref_key = storage.save_bytes_named(
+                    model_ref_png,
+                    "model_ref",
+                    pv_key.split("/", 1)[1],
+                )
+                written_keys += [hd_key, pv_key, model_ref_key]
                 db.add(
                     GenAsset(
                         task_id=task.id,
@@ -312,9 +452,14 @@ def run_image_task(task_id: int) -> None:
             db.rollback()  # another runner finalized -> discard our row + files
             _unlink_keys(written_keys)
             return
-        credits.settle(db, task.user_id, reserved=task.cost_frozen,
-                       real_cost=real_cost, biz_ref=task.id, commit=False)
-        db.commit()
+        try:
+            credits.settle(db, task.user_id, reserved=task.cost_frozen,
+                           real_cost=real_cost, biz_ref=task.id, commit=False)
+            db.commit()
+        except Exception:
+            db.rollback()
+            _unlink_keys(written_keys)
+            raise
         if partial_detail:
             usage.record_call(db, kind="image", model_id=model.model_id,
                               user_id=task.user_id, task_id=task.id, status="ok",
@@ -322,10 +467,10 @@ def run_image_task(task_id: int) -> None:
         set_progress(task_id, 100, "succeeded")
     except Exception as e:  # noqa: BLE001
         log.exception("image task %s failed", task_id)
-        _fail_and_refund(db, task_id, str(e))
+        _fail_and_refund(db, task_id, str(e), public_error="图片生成失败，已退回冻结积分，请稍后重试")
     finally:
         db.close()
-        locks.release(lock_key)
+        locks.release(lock_key, lock_token)
 
 
 # Liveness TTL must exceed the worst-case single poll round-trip (a slow gateway
@@ -337,7 +482,7 @@ _POLL_MAX_CONSEC_ERRORS = 3
 _VIDEO_DOWNLOAD_MAX_ATTEMPTS = max(1, int(settings.video_download_max_attempts or 1))
 _VIDEO_DOWNLOAD_LIVENESS_TTL = max(
     _POLL_LIVENESS_TTL,
-    int(settings.image_download_timeout_seconds) * _VIDEO_DOWNLOAD_MAX_ATTEMPTS + 60,
+    int(settings.video_download_timeout_seconds) * _VIDEO_DOWNLOAD_MAX_ATTEMPTS + 60,
 )
 
 
@@ -363,6 +508,10 @@ def _poll_alive_key(task_id: int) -> str:
 
 def _download_alive_key(task_id: int) -> str:
     return f"video:download:alive:{task_id}"
+
+
+def _download_lock_key(task_id: int) -> str:
+    return f"video:download:lock:{task_id}"
 
 
 def _mark_poll_alive(task_id: int) -> None:
@@ -421,9 +570,25 @@ def _enqueue_poll(task_id: int) -> None:
 
 def _finalize_or_retry_video_download(db, task: GenTask, model, result: dict) -> bool:
     """Return True when finalised; False when a recoverable download retry was queued."""
+    lock_key = _download_lock_key(task.id)
+    lock_token = locks.acquire(lock_key, ttl=_VIDEO_DOWNLOAD_LIVENESS_TTL)
+    if not lock_token:
+        _mark_video_download_alive(task.id)
+        log.info("video task %s download/finalize already in progress", task.id)
+        return False
     _mark_video_download_alive(task.id)
     try:
         _finalize_video_success(db, task, model, result)
+        return True
+    except VideoResultValidationError as e:
+        usage.record_call(db, kind="video_download", model_id=model.model_id,
+                          user_id=task.user_id, task_id=task.id,
+                          status="failed",
+                          detail={"stage": task.stage,
+                                  "external_task_id": task.external_task_id,
+                                  "permanent": True,
+                                  "error": str(e)[:300]})
+        _fail_and_refund(db, task.id, str(e), public_error="视频结果下载失败，已退回冻结积分，请稍后重试")
         return True
     except Exception as e:  # noqa: BLE001
         _mark_video_download_alive(task.id)
@@ -447,6 +612,8 @@ def _finalize_or_retry_video_download(db, task: GenTask, model, result: dict) ->
             _enqueue_poll(task.id)
             return False
         raise
+    finally:
+        locks.release(lock_key, lock_token)
 
 
 def _video_submit_params(db, task: GenTask) -> dict:
@@ -468,17 +635,18 @@ def _video_submit_params(db, task: GenTask) -> dict:
     ref_w, ref_h = _reference_dimensions(task)
     if not params.get("ratio"):
         params["ratio"] = _video_ratio(ref_w, ref_h)
-    # image-to-video: animate the chosen reference image as the first frame
-    if task.source_asset_url:
-        first_frame = params.get("reference_image_url")
-        if task.source_type == "image":
-            first_frame = first_frame or task.source_asset_url
-        if first_frame:
-            params["first_frame_image"] = _gateway_reference_image(
-                db,
-                task,
-                params.get("first_frame_image") or first_frame,
-            )
+    # image-to-video: every client-supplied first-frame/reference URL must be
+    # resolved by this backend before it reaches the model gateway. Do not forward
+    # user URLs directly, even after SSRF validation, because the gateway would
+    # fetch them outside our ownership/content checks.
+    first_frame = params.get("first_frame_image") or params.get("reference_image_url")
+    if task.source_type == "image":
+        first_frame = first_frame or task.source_asset_url
+    if first_frame:
+        safe_ref = _gateway_reference_image(db, task, first_frame)
+        params["first_frame_image"] = safe_ref
+        if params.get("reference_image_url"):
+            params["reference_image_url"] = safe_ref
     return params
 
 
@@ -528,9 +696,10 @@ def start_video_task(task_id: int) -> None:
     State (external_task_id, submit time, effective params, phase) is persisted
     so the render can be resumed from the DB even if this worker dies."""
     lock_key = f"gen:lock:{task_id}"
-    if not locks.acquire(lock_key):
-        log.warning("video task %s already locked, skip duplicate", task_id)
-        return
+    lock_token = locks.acquire(lock_key)
+    if not lock_token:
+        log.warning("video task %s locked by another worker, retry later", task_id)
+        raise TaskLockedError(f"video task {task_id} locked")
     submitted = False
     db = SessionLocal()
     try:
@@ -562,15 +731,22 @@ def start_video_task(task_id: int) -> None:
             model = get_model_config(db, "video")
             if not model or not model.enabled:
                 raise RuntimeError("未配置可用的视频模型")
+            model = _model_from_snapshot(task, model)
 
             prompt = _final_prompt(task)
             original_params = dict(task.params or {})
+            if not original_params.get("_video_request_id"):
+                original_params["_video_request_id"] = f"video-{task.id}-{uuid4().hex}"
+                task.params = original_params
+                db.commit()
             params = _video_submit_params(db, task)
+            params.setdefault("request_id", original_params["_video_request_id"])
 
             submit_t0 = time.time()
             try:
-                ext_id = gateway.submit_video(prompt, model.model_id, params, extra=model.extra)
+                ext_id = _submit_video_with_model_config(model, prompt, params)
             except Exception as e:  # noqa: BLE001
+                unknown = _submit_state_unknown(e)
                 usage.record_call(db, kind="video_submit", model_id=model.model_id,
                                   user_id=task.user_id, task_id=task.id, status="failed",
                                   latency_ms=int((time.time() - submit_t0) * 1000),
@@ -579,7 +755,12 @@ def start_video_task(task_id: int) -> None:
                                           "duration": params.get("duration"),
                                           "target_duration": params.get("target_duration"),
                                           "ratio": params.get("ratio"),
+                                          "request_id": params.get("request_id"),
+                                          "submit_state_unknown": unknown,
                                           "error": str(e)[:300]})
+                if unknown:
+                    _hold_for_reconciliation(db, task_id, str(e))
+                    return
                 raise
             usage.record_call(db, kind="video_submit", model_id=model.model_id,
                               user_id=task.user_id, task_id=task.id, status="ok",
@@ -602,10 +783,10 @@ def start_video_task(task_id: int) -> None:
             submitted = True
     except Exception as e:  # noqa: BLE001
         log.exception("video submit %s failed", task_id)
-        _fail_and_refund(db, task_id, str(e))
+        _fail_and_refund(db, task_id, str(e), public_error="视频提交失败，已退回冻结积分，请稍后重试")
     finally:
         db.close()
-        locks.release(lock_key)
+        locks.release(lock_key, lock_token)
 
     if submitted:
         _mark_poll_alive(task_id)
@@ -626,6 +807,7 @@ def poll_video_once(task_id: int) -> None:
         if not model:
             _fail_and_refund(db, task_id, "视频模型配置缺失")
             return
+        model = _model_from_snapshot(task, model)
 
         _mark_poll_alive(task_id)  # tell the recovery beat this chain is alive
 
@@ -652,7 +834,7 @@ def poll_video_once(task_id: int) -> None:
             return
 
         try:
-            res = gateway.poll_video(task.external_task_id, model.model_id, extra=model.extra)
+            res = _poll_video_with_model_config(model, task.external_task_id)
         except Exception as e:  # noqa: BLE001
             if isinstance(e, gateway.GatewayError) and getattr(e, "transient", False):
                 usage.record_call(db, kind="video_poll", model_id=model.model_id,
@@ -670,7 +852,12 @@ def poll_video_once(task_id: int) -> None:
             log.warning("poll error %s/%s for task %s: %s",
                         fails, _POLL_MAX_CONSEC_ERRORS, task_id, e)
             if fails >= _POLL_MAX_CONSEC_ERRORS:
-                _fail_and_refund(db, task_id, f"视频轮询连续失败: {e}")
+                _fail_and_refund(
+                    db,
+                    task_id,
+                    f"视频轮询连续失败: {e}",
+                    public_error="视频状态查询失败，已退回冻结积分，请稍后重试",
+                )
             else:
                 _enqueue_poll(task_id)
             return
@@ -684,7 +871,12 @@ def poll_video_once(task_id: int) -> None:
                               detail={"stage": task.stage,
                                       "external_task_id": task.external_task_id,
                                       "error": str(res.get("error"))[:300]})
-            _fail_and_refund(db, task_id, res.get("error") or "视频网关返回失败")
+            _fail_and_refund(
+                db,
+                task_id,
+                res.get("error") or "视频网关返回失败",
+                public_error="视频生成失败，已退回冻结积分，请稍后重试",
+            )
             return
         if status == "succeeded":
             usage.record_call(db, kind="video_poll", model_id=model.model_id,
@@ -700,7 +892,7 @@ def poll_video_once(task_id: int) -> None:
         _enqueue_poll(task_id)
     except Exception as e:  # noqa: BLE001
         log.exception("poll_video_once %s failed", task_id)
-        _fail_and_refund(db, task_id, str(e))
+        _fail_and_refund(db, task_id, str(e), public_error="视频生成失败，已退回冻结积分，请稍后重试")
     finally:
         db.close()
 
@@ -711,7 +903,7 @@ def _finalize_video_success(db, task: GenTask, model, result: dict) -> None:
     # Only mock mode may legitimately lack a URL; a real "succeeded" with no URL
     # is a failure (don't fabricate a placeholder and charge for it).
     if not result.get("mock") and not video_url:
-        raise RuntimeError("视频网关返回成功但未提供视频地址")
+        raise VideoResultValidationError("视频网关返回成功但未提供视频地址")
     if video_url:
         params["_video_result_url"] = video_url
     params["_video_download_attempts"] = int(params.get("_video_download_attempts") or 0) + 1
@@ -738,7 +930,14 @@ def _finalize_video_success(db, task: GenTask, model, result: dict) -> None:
             set_progress(task.id, 92, "running")
             _mark_video_download_alive(task.id)
             media_subdir = "video_hd" if task.stage == "final" else "video_preview"
-            media_key = gateway.download_to_storage(video_url, media_subdir, "mp4")
+            media_key = gateway.download_to_storage(
+                video_url,
+                media_subdir,
+                "mp4",
+                max_bytes=int(settings.video_download_max_bytes),
+                timeout_seconds=int(settings.video_download_timeout_seconds),
+                allowed_content_types=("video/", "application/octet-stream", "binary/octet-stream"),
+            )
             _mark_video_download_alive(task.id)
             written_keys.append(media_key)
             local = storage.public_url(media_key)
@@ -746,11 +945,15 @@ def _finalize_video_success(db, task: GenTask, model, result: dict) -> None:
         except Exception as e:  # noqa: BLE001
             raise RuntimeError(f"视频结果下载落盘失败: {e}") from e
         # Reject non-video content: a gateway returning an HTML error page or a
-        # corrupt file would otherwise be saved + charged as a "video". When
-        # ffprobe is available, require at least one decodable video stream.
+        # corrupt file would otherwise be saved + charged as a "video". Real
+        # video mode requires ffprobe so this check cannot silently disappear on
+        # a misbuilt worker image.
+        if not settings.effective_video_mock and not video_frames.FFPROBE:
+            _unlink_keys(written_keys)
+            raise VideoResultValidationError("服务器缺少 ffprobe,无法校验视频结果")
         if video_frames.FFPROBE and not media_meta.get("width"):
             _unlink_keys(written_keys)
-            raise RuntimeError("视频网关返回的不是有效视频(无视频流)")
+            raise VideoResultValidationError("视频网关返回的不是有效视频(无视频流)")
         if task.stage == "final":
             # gate full video behind unlock; poster = the source first frame
             hd_url = local
@@ -787,10 +990,55 @@ def _finalize_video_success(db, task: GenTask, model, result: dict) -> None:
         db.rollback()  # another runner finalized first -> discard our row + files
         _unlink_keys(written_keys)
         return
-    credits.settle(db, task.user_id, reserved=task.cost_frozen,
-                   real_cost=real_cost, biz_ref=task.id, commit=False)
-    db.commit()
+    try:
+        credits.settle(db, task.user_id, reserved=task.cost_frozen,
+                       real_cost=real_cost, biz_ref=task.id, commit=False)
+        db.commit()
+    except Exception:
+        db.rollback()
+        _unlink_keys(written_keys)
+        raise
     set_progress(task.id, 100, "succeeded")
+
+
+def admin_settle_needs_review_video(
+    db,
+    task: GenTask,
+    *,
+    result_url: str,
+    external_task_id: str | None = None,
+) -> None:
+    claimed_for_reconciliation = task.status == "running" and task.phase == "reconciling"
+    if task.status != NEEDS_REVIEW and not claimed_for_reconciliation:
+        raise ValueError("仅待对账任务可执行成功结算")
+    if task.category != "video":
+        raise ValueError("仅视频任务支持补结果结算")
+    model = get_model_config(db, "video")
+    if not model:
+        raise ValueError("未配置视频模型")
+    model = _model_from_snapshot(task, model)
+    params = dict(task.params or {})
+    if external_task_id:
+        task.external_task_id = external_task_id
+    task.phase = "downloading"
+    task.error = None
+    task.finished_at = None
+    task.params = params
+    db.flush()
+    task_id = task.id
+    try:
+        _finalize_video_success(db, task, model, {"status": "succeeded", "url": result_url})
+    except Exception as e:
+        db.rollback()
+        task = db.get(GenTask, task_id)
+        if task is not None and task.status not in _TERMINAL:
+            task.status = NEEDS_REVIEW
+            task.phase = "reconciling"
+            task.error = f"补结果结算失败:{str(e)[:900]}"
+            task.finished_at = None
+            db.commit()
+            set_progress(task.id, 100, NEEDS_REVIEW)
+        raise
 
 
 def resume_stuck_videos(db) -> int:
@@ -816,7 +1064,53 @@ def resume_stuck_videos(db) -> int:
     return resumed
 
 
-def _fail_and_refund(db, task_id: int, error: str) -> None:
+def _hold_for_reconciliation(db, task_id: int, error: str) -> None:
+    """Terminal hold for video submits where the provider may already be working.
+
+    The user's reservation stays frozen until an admin/operator checks the
+    provider side and either refunds or settles manually. This avoids turning
+    client-side submit timeouts into free duplicate upstream renders.
+    """
+    try:
+        db.rollback()
+        task = db.get(GenTask, task_id)
+        if not task:
+            return
+        params = dict(task.params or {})
+        request_id = params.get("_video_request_id")
+        message = (
+            "视频提交状态未知,已冻结额度等待人工对账。"
+            f"request_id={request_id or 'unknown'}; error={error[:500]}"
+        )
+        if not claim_terminal(db, task_id, NEEDS_REVIEW, error=message):
+            db.rollback()
+            return
+        db.commit()
+        set_progress(task_id, 100, NEEDS_REVIEW)
+    except Exception:
+        log.exception("reconciliation hold failed for task %s", task_id)
+        db.rollback()
+
+
+def _submit_state_unknown(exc: Exception) -> bool:
+    """True when the upstream submit may have been accepted.
+
+    Non-idempotent submit calls use retries=0, so network timeouts, 429 and 5xx
+    leave us unsure whether the provider accepted the render. Terminal 4xx
+    request/auth errors are treated as definite failures and refunded.
+    """
+    if isinstance(exc, gateway.GatewayError):
+        explicit = getattr(exc, "submit_state_unknown", None)
+        if explicit is not None:
+            return bool(explicit)
+        status_code = getattr(exc, "status_code", None)
+        if status_code is not None and status_code < 500 and status_code != 429:
+            return False
+        return bool(getattr(exc, "transient", False) or status_code is None or status_code >= 500)
+    return True
+
+
+def _fail_and_refund(db, task_id: int, error: str, *, public_error: str | None = None) -> None:
     try:
         db.rollback()  # clear any partial work from the failed attempt
         task = db.get(GenTask, task_id)
@@ -825,7 +1119,7 @@ def _fail_and_refund(db, task_id: int, error: str) -> None:
         # Idempotent: only the runner that claims the failed transition refunds.
         # If another runner (success path / reaper / duplicate) already finalized
         # this task, rowcount is 0 and we must NOT refund again.
-        if not claim_terminal(db, task_id, "failed", error=error):
+        if not claim_terminal(db, task_id, "failed", error=public_error or error):
             db.rollback()
             return
         if task.cost_frozen and task.cost_settled == 0:

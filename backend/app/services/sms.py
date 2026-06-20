@@ -16,6 +16,7 @@ import httpx
 
 from ..config import settings
 from ..redis_client import redis_client
+from .ssrf import pinned_client
 
 log = logging.getLogger("sms")
 
@@ -26,6 +27,24 @@ class SmsError(Exception):
 
 def implemented_providers() -> set[str]:
     return {"mock", "http"}
+
+
+def readiness_issues(*, allow_mock: bool | None = None) -> list[str]:
+    provider = (settings.sms_provider or "").strip().lower()
+    issues: list[str] = []
+    if provider not in implemented_providers():
+        return [f"SMS_PROVIDER={settings.sms_provider} 暂未实现"]
+    if allow_mock is None:
+        allow_mock = settings.debug
+    if provider == "mock":
+        if not allow_mock:
+            issues.append("生产环境不能使用 mock 短信渠道")
+        return issues
+    if provider == "http":
+        if not settings.sms_http_url.strip():
+            issues.append("SMS_HTTP_URL 未配置")
+        return issues
+    return issues
 
 
 def _k(prefix: str, phone: str) -> str:
@@ -39,39 +58,53 @@ def can_send(phone: str) -> tuple[bool, int]:
     return True, 0
 
 
-def send_code(phone: str) -> str:
-    ok, ttl = can_send(phone)
-    if not ok:
-        raise SmsError(f"请稍后再试({ttl}s 后可重新发送)")
+def _reserve_send_slot(phone: str) -> int:
+    """Atomically reserve cooldown + hourly quota before contacting provider."""
+    cooldown_key = _k("cooldown", phone)
+    reserved = redis_client.set(
+        cooldown_key,
+        "1",
+        ex=settings.sms_send_cooldown_seconds,
+        nx=True,
+    )
+    if not reserved:
+        ttl = redis_client.ttl(cooldown_key)
+        raise SmsError(f"请稍后再试({max(0, int(ttl or 0))}s 后可重新发送)")
 
     hourly_key = _k("hourly", phone)
-    sent = int(redis_client.get(hourly_key) or 0)
-    if sent >= settings.sms_send_hourly_limit:
+    sent = int(redis_client.incr(hourly_key) or 0)
+    if sent == 1:
+        redis_client.expire(hourly_key, 3600)
+    if sent > settings.sms_send_hourly_limit:
+        redis_client.delete(cooldown_key)
+        redis_client.decr(hourly_key)
         raise SmsError("发送过于频繁,请一小时后再试")
+    return sent
 
+
+def _rollback_send_slot(phone: str, sent: int) -> None:
+    redis_client.delete(_k("code", phone))
+    redis_client.delete(_k("cooldown", phone))
+    redis_client.delete(_k("fail", phone))
+    hourly_key = _k("hourly", phone)
+    if sent <= 1:
+        redis_client.delete(hourly_key)
+    else:
+        redis_client.decr(hourly_key)
+
+
+def send_code(phone: str) -> str:
+    sent = _reserve_send_slot(phone)
     code = f"{secrets.randbelow(1_000_000):06d}"
     redis_client.setex(_k("code", phone), settings.sms_code_ttl_seconds, code)
-    redis_client.setex(_k("cooldown", phone), settings.sms_send_cooldown_seconds, "1")
     redis_client.delete(_k("fail", phone))
-
-    pipe = redis_client.pipeline()
-    pipe.incr(hourly_key)
-    if sent == 0:
-        pipe.expire(hourly_key, 3600)
-    pipe.execute()
 
     try:
         _dispatch(phone, code)
     except Exception:
         # Provider failed before delivery. Roll back Redis-side quota/cooldown so
         # the user can retry after the operator fixes the SMS channel.
-        redis_client.delete(_k("code", phone))
-        redis_client.delete(_k("cooldown", phone))
-        redis_client.delete(_k("fail", phone))
-        if sent == 0:
-            redis_client.delete(hourly_key)
-        else:
-            redis_client.decr(hourly_key)
+        _rollback_send_slot(phone, sent)
         raise
     return code
 
@@ -100,7 +133,7 @@ def _send_http(phone: str, code: str) -> None:
         "template_code": settings.sms_template_code,
     }
     try:
-        with httpx.Client(timeout=settings.sms_http_timeout_seconds) as client:
+        with pinned_client(settings.sms_http_url, timeout=settings.sms_http_timeout_seconds) as client:
             res = client.post(settings.sms_http_url, headers=headers, json=payload)
     except httpx.HTTPError as e:
         raise SmsError(f"短信网关调用失败:{e}") from e

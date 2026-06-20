@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import { api, setToken } from "../../lib/api";
 
@@ -32,20 +32,50 @@ export default function LoginPage() {
   const [smsCode, setSmsCode] = useState("");
   const [nickname, setNickname] = useState("");
   const [smsSending, setSmsSending] = useState(false);
+  const [smsCooldown, setSmsCooldown] = useState(0);
+  const [smsAuthEnabled, setSmsAuthEnabled] = useState(false);
+  const [registrationEnabled, setRegistrationEnabled] = useState(true);
+  const [featuresLoaded, setFeaturesLoaded] = useState(false);
+  const [featuresError, setFeaturesError] = useState("");
   const [msg, setMsg] = useState("");
   const [loading, setLoading] = useState(false);
 
   const isRegister = mode === "register";
 
+  useEffect(() => {
+    api.authFeatures()
+      .then((f) => {
+        setSmsAuthEnabled(!!(f.sms_required_for_registration ?? f.sms_auth_enabled));
+        setRegistrationEnabled(f.registration_enabled !== false);
+        setFeaturesLoaded(true);
+        setFeaturesError("");
+      })
+      .catch(() => {
+        setRegistrationEnabled(false);
+        setFeaturesLoaded(false);
+        setFeaturesError("注册配置加载失败，请刷新重试");
+      });
+  }, []);
+
+  useEffect(() => {
+    if (smsCooldown <= 0) return undefined;
+    const timer = setInterval(() => {
+      setSmsCooldown((n) => Math.max(0, n - 1));
+    }, 1000);
+    return () => clearInterval(timer);
+  }, [smsCooldown]);
+
   async function submit() {
     setMsg("");
     if (!/^1[3-9]\d{9}$/.test(phone)) return setMsg("请输入正确的手机号");
-    if (password.length < 10) return setMsg("密码至少 10 位");
-    if (isRegister && !smsCode.trim()) return setMsg("请输入短信验证码");
+    if (password.length < 6) return setMsg("密码至少 6 位");
+    if (isRegister && (!featuresLoaded || featuresError)) return setMsg(featuresError || "注册配置加载中，请稍后重试");
+    if (isRegister && !registrationEnabled) return setMsg("注册暂未开放，请联系管理员开启短信验证码注册");
+    if (isRegister && smsAuthEnabled && !smsCode.trim()) return setMsg("请输入短信验证码");
     setLoading(true);
     try {
       const r = isRegister
-        ? await api.register(phone, password, smsCode.trim(), nickname || undefined)
+        ? await api.register(phone, password, smsAuthEnabled ? smsCode.trim() : undefined, nickname || undefined)
         : await api.login(phone, password);
       setToken(r.access_token);
       router.push("/");
@@ -62,8 +92,14 @@ export default function LoginPage() {
     setSmsSending(true);
     try {
       const r = await api.sendSmsCode(phone);
+      if (r.disabled) {
+        setMsg("短信验证未开启");
+        return;
+      }
+      setSmsCooldown(Number(r.retry_after || 60));
       setMsg(r.code ? `验证码已发送，本地测试码: ${r.code}` : "验证码已发送");
     } catch (e) {
+      if (e.retryAfter) setSmsCooldown(e.retryAfter);
       setMsg(e.message);
     } finally {
       setSmsSending(false);
@@ -84,7 +120,9 @@ export default function LoginPage() {
             欢迎<span className="text-grad">回来</span>
           </h1>
           <p className="mt-2 text-[15px] text-mist">
-            {isRegister ? "注册账号 · 白名单手机号 + 验证码" : "手机号 + 密码登录"}
+            {isRegister
+              ? featuresError ? "注册账号 · 配置加载失败" : !registrationEnabled ? "注册账号 · 暂未开放" : smsAuthEnabled ? "注册账号 · 白名单手机号 + 验证码" : "注册账号 · 白名单手机号"
+              : "手机号 + 密码登录"}
           </p>
         </div>
 
@@ -121,19 +159,38 @@ export default function LoginPage() {
                 value={nickname}
                 onChange={(e) => setNickname(e.target.value)}
               />
-              <label className="label">短信验证码</label>
-              <div className="mb-4 grid grid-cols-[1fr_auto] gap-2">
-                <input
-                  className="input"
-                  placeholder="6 位验证码"
-                  value={smsCode}
-                  onChange={(e) => setSmsCode(e.target.value.replace(/\D/g, "").slice(0, 6))}
-                  inputMode="numeric"
-                />
-                <button onClick={sendCode} disabled={smsSending} type="button" className="btn-secondary whitespace-nowrap">
-                  {smsSending ? "发送中…" : "获取验证码"}
-                </button>
-              </div>
+              {featuresError && (
+                <p className="mb-4 rounded-xl border border-bad/30 bg-bad/10 px-3 py-2 text-sm text-bad">
+                  {featuresError}
+                </p>
+              )}
+              {featuresLoaded && !registrationEnabled && (
+                <p className="mb-4 rounded-xl border border-warn/30 bg-warn/10 px-3 py-2 text-sm text-warn">
+                  当前未开放自助注册，请联系管理员开启短信验证码注册。
+                </p>
+              )}
+              {smsAuthEnabled && (
+                <>
+                  <label className="label">短信验证码</label>
+                  <div className="mb-4 grid grid-cols-[1fr_auto] gap-2">
+                    <input
+                      className="input"
+                      placeholder="6 位验证码"
+                      value={smsCode}
+                      onChange={(e) => setSmsCode(e.target.value.replace(/\D/g, "").slice(0, 6))}
+                      inputMode="numeric"
+                    />
+                    <button
+                      onClick={sendCode}
+                      disabled={smsSending || smsCooldown > 0}
+                      type="button"
+                      className="btn-secondary whitespace-nowrap"
+                    >
+                      {smsSending ? "发送中…" : smsCooldown > 0 ? `${smsCooldown}s` : "获取验证码"}
+                    </button>
+                  </div>
+                </>
+              )}
             </>
           )}
 
@@ -141,13 +198,13 @@ export default function LoginPage() {
           <input
             type="password"
             className="input mb-5"
-            placeholder="至少 10 位"
+            placeholder="至少 6 位"
             value={password}
             onChange={(e) => setPassword(e.target.value)}
             onKeyDown={(e) => e.key === "Enter" && submit()}
           />
 
-          <button onClick={submit} disabled={loading} className="btn-primary btn-lg w-full">
+          <button onClick={submit} disabled={loading || (isRegister && (!featuresLoaded || !!featuresError || !registrationEnabled))} className="btn-primary btn-lg w-full">
             {loading ? "请稍候…" : isRegister ? "注册并登录" : "登录"}
           </button>
 

@@ -4,6 +4,8 @@
 # and init_db prints a one-time generated password — never a fixed default):
 #   ADMIN_PASSWORD='<strong-secret>' docker compose run --rm -e ADMIN_PASSWORD api \
 #       python -m scripts.init_db --admin-phone 13800000000 --credits 1000
+# The migrate service runs Alembic first; init_db only seeds config/admin and
+# does not create tables in production.
 # Gateway key / other secrets are read from backend/.env (env_file below).
 # DATABASE_URL / REDIS_URL are overridden here for the container network.
 # Production frontend should usually be served behind the same reverse proxy as
@@ -55,8 +57,8 @@ services:
       PAYMENT_FRONTEND_BASE_URL: ${PAYMENT_FRONTEND_BASE_URL:-https://dream.aiwuq.cn}
       TRUSTED_PROXY_IPS: ${TRUSTED_PROXY_IPS:-127.0.0.1,172.16.0.0/12}
       METRICS_TOKEN: ${METRICS_TOKEN:?set METRICS_TOKEN to protect /metrics}
-      PAYMENT_CONFIG_SECRET: ${PAYMENT_CONFIG_SECRET:?set PAYMENT_CONFIG_SECRET to encrypt payment merchant keys}
-      SMS_PROVIDER: ${SMS_PROVIDER:?set SMS_PROVIDER to a real implemented provider}
+      PAYMENT_CONFIG_SECRET: ${PAYMENT_CONFIG_SECRET:?set PAYMENT_CONFIG_SECRET to encrypt admin-saved secrets}
+      SMS_PROVIDER: ${SMS_PROVIDER:-mock}
       SMS_HTTP_URL: ${SMS_HTTP_URL:-}
       SMS_HTTP_API_KEY: ${SMS_HTTP_API_KEY:-}
       SMS_HTTP_TIMEOUT_SECONDS: ${SMS_HTTP_TIMEOUT_SECONDS:-10}
@@ -85,8 +87,8 @@ services:
       PAYMENT_FRONTEND_BASE_URL: ${PAYMENT_FRONTEND_BASE_URL:-https://dream.aiwuq.cn}
       TRUSTED_PROXY_IPS: ${TRUSTED_PROXY_IPS:-127.0.0.1,172.16.0.0/12}
       METRICS_TOKEN: ${METRICS_TOKEN:?set METRICS_TOKEN to protect /metrics}
-      PAYMENT_CONFIG_SECRET: ${PAYMENT_CONFIG_SECRET:?set PAYMENT_CONFIG_SECRET to encrypt payment merchant keys}
-      SMS_PROVIDER: ${SMS_PROVIDER:?set SMS_PROVIDER to a real implemented provider}
+      PAYMENT_CONFIG_SECRET: ${PAYMENT_CONFIG_SECRET:?set PAYMENT_CONFIG_SECRET to encrypt admin-saved secrets}
+      SMS_PROVIDER: ${SMS_PROVIDER:-mock}
       SMS_HTTP_URL: ${SMS_HTTP_URL:-}
       SMS_HTTP_API_KEY: ${SMS_HTTP_API_KEY:-}
       SMS_HTTP_TIMEOUT_SECONDS: ${SMS_HTTP_TIMEOUT_SECONDS:-10}
@@ -122,8 +124,8 @@ services:
       PAYMENT_FRONTEND_BASE_URL: ${PAYMENT_FRONTEND_BASE_URL:-https://dream.aiwuq.cn}
       TRUSTED_PROXY_IPS: ${TRUSTED_PROXY_IPS:-127.0.0.1,172.16.0.0/12}
       METRICS_TOKEN: ${METRICS_TOKEN:?set METRICS_TOKEN to protect /metrics}
-      PAYMENT_CONFIG_SECRET: ${PAYMENT_CONFIG_SECRET:?set PAYMENT_CONFIG_SECRET to encrypt payment merchant keys}
-      SMS_PROVIDER: ${SMS_PROVIDER:?set SMS_PROVIDER to a real implemented provider}
+      PAYMENT_CONFIG_SECRET: ${PAYMENT_CONFIG_SECRET:?set PAYMENT_CONFIG_SECRET to encrypt admin-saved secrets}
+      SMS_PROVIDER: ${SMS_PROVIDER:-mock}
       SMS_HTTP_URL: ${SMS_HTTP_URL:-}
       SMS_HTTP_API_KEY: ${SMS_HTTP_API_KEY:-}
       SMS_HTTP_TIMEOUT_SECONDS: ${SMS_HTTP_TIMEOUT_SECONDS:-10}
@@ -154,8 +156,8 @@ services:
       DEBUG: ${DEBUG:-false}
       PAYMENT_MOCK_ENABLED: ${PAYMENT_MOCK_ENABLED:-false}
       METRICS_TOKEN: ${METRICS_TOKEN:?set METRICS_TOKEN to protect /metrics}
-      PAYMENT_CONFIG_SECRET: ${PAYMENT_CONFIG_SECRET:?set PAYMENT_CONFIG_SECRET to encrypt payment merchant keys}
-      SMS_PROVIDER: ${SMS_PROVIDER:?set SMS_PROVIDER to a real implemented provider}
+      PAYMENT_CONFIG_SECRET: ${PAYMENT_CONFIG_SECRET:?set PAYMENT_CONFIG_SECRET to encrypt admin-saved secrets}
+      SMS_PROVIDER: ${SMS_PROVIDER:-mock}
       SMS_HTTP_URL: ${SMS_HTTP_URL:-}
       SMS_HTTP_API_KEY: ${SMS_HTTP_API_KEY:-}
       SMS_HTTP_TIMEOUT_SECONDS: ${SMS_HTTP_TIMEOUT_SECONDS:-10}

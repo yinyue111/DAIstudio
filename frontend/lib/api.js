@@ -8,6 +8,7 @@ const PARSE_TIMEOUT_MS = 90_000;
 const REVERSE_TIMEOUT_MS = 120_000;
 const UPLOAD_TIMEOUT_MS = 120_000;
 const DOWNLOAD_TIMEOUT_MS = 300_000;
+const GENERATE_TIMEOUT_MS = 180_000;
 
 export function wsUrl(path) {
   const base = API_BASE || (typeof window !== "undefined" ? window.location.origin : "");
@@ -27,13 +28,25 @@ export function clearToken() {
   window.localStorage.removeItem("token");
 }
 
+export class ApiError extends Error {
+  constructor(message, { status, detail } = {}) {
+    super(message);
+    this.name = "ApiError";
+    this.status = status;
+    this.detail = detail;
+    if (detail && typeof detail === "object" && !Array.isArray(detail)) {
+      this.retryAfter = Number(detail.retry_after || 0);
+    }
+  }
+}
+
 // Authenticated file download that reuses the same 401 -> clear-token + redirect
 // handling as request(), so CSV/asset downloads don't drift from the REST path.
 export async function downloadBlob(path, filename) {
   const headers = {};
   const t = getToken();
   if (t) headers["Authorization"] = `Bearer ${t}`;
-  const { res, blob } = await fetchBlobWithTimeout(
+  const { res, blob, errorText } = await fetchBlobWithTimeout(
     `${API_BASE}${path}`,
     { headers },
     DOWNLOAD_TIMEOUT_MS,
@@ -43,13 +56,34 @@ export async function downloadBlob(path, filename) {
     if (typeof window !== "undefined") window.location.href = "/login";
     throw new Error("登录已过期，请重新登录");
   }
-  if (!res.ok) throw new Error(`下载失败 (${res.status})`);
+  if (!res.ok) throw new Error(errorTextToMessage(errorText, res.status, "下载失败"));
   const u = URL.createObjectURL(blob);
   const a = document.createElement("a");
   a.href = u;
   if (filename) a.download = filename;
   a.click();
   URL.revokeObjectURL(u);
+}
+
+export async function authenticatedObjectUrl(pathOrUrl) {
+  if (!pathOrUrl) return "";
+  const url = /^https?:\/\//.test(pathOrUrl) ? pathOrUrl : `${API_BASE}${pathOrUrl}`;
+  const expectedOrigin = new URL(API_BASE || window.location.origin, window.location.origin).origin;
+  const actualOrigin = new URL(url, window.location.origin).origin;
+  if (actualOrigin !== expectedOrigin) {
+    throw new Error("仅支持加载平台内受保护素材");
+  }
+  const headers = {};
+  const t = getToken();
+  if (t) headers["Authorization"] = `Bearer ${t}`;
+  const { res, blob, errorText } = await fetchBlobWithTimeout(url, { headers }, DOWNLOAD_TIMEOUT_MS);
+  if (res.status === 401) {
+    clearToken();
+    if (typeof window !== "undefined") window.location.href = "/login";
+    throw new Error("登录已过期，请重新登录");
+  }
+  if (!res.ok) throw new Error(errorTextToMessage(errorText, res.status, "预览加载失败"));
+  return URL.createObjectURL(blob);
 }
 
 async function withTimeout(timeoutMs, operation) {
@@ -78,9 +112,9 @@ async function fetchTextWithTimeout(url, options = {}, timeoutMs = DEFAULT_TIMEO
 async function fetchBlobWithTimeout(url, options = {}, timeoutMs = DEFAULT_TIMEOUT_MS) {
   return withTimeout(timeoutMs, async (signal) => {
     const res = await fetch(url, { ...options, signal });
-    if (!res.ok) return { res, blob: null };
+    if (!res.ok) return { res, blob: null, errorText: await res.text().catch(() => "") };
     const blob = await res.blob();
-    return { res, blob };
+    return { res, blob, errorText: "" };
   });
 }
 
@@ -96,8 +130,21 @@ function detailToMessage(detail, status) {
     });
     return msgs.filter(Boolean).join("; ") || `请求失败 (${status})`;
   }
-  if (detail && typeof detail === "object") return detail.msg || JSON.stringify(detail);
+  if (detail && typeof detail === "object") return detail.message || detail.msg || JSON.stringify(detail);
   return `请求失败 (${status})`;
+}
+
+function errorTextToMessage(text, status, fallback = "请求失败") {
+  if (text) {
+    try {
+      const data = JSON.parse(text);
+      return detailToMessage(data && data.detail, status);
+    } catch (e) {
+      const clipped = text.trim().slice(0, 160);
+      if (clipped) return clipped;
+    }
+  }
+  return `${fallback} (${status})`;
 }
 
 async function request(path, { method = "GET", body, auth = true, timeoutMs = DEFAULT_TIMEOUT_MS } = {}) {
@@ -115,11 +162,12 @@ async function request(path, { method = "GET", body, auth = true, timeoutMs = DE
     },
     timeoutMs,
   );
-  if (res.status === 401) {
+  if (res.status === 401 && auth) {
     clearToken();
     if (typeof window !== "undefined" && !path.startsWith("/api/auth")) {
       window.location.href = "/login";
     }
+    throw new ApiError("登录已过期，请重新登录", { status: 401 });
   }
   let data = null;
   if (text) {
@@ -133,7 +181,10 @@ async function request(path, { method = "GET", body, auth = true, timeoutMs = DE
     }
   }
   if (!res.ok) {
-    throw new Error(detailToMessage(data && data.detail, res.status));
+    throw new ApiError(detailToMessage(data && data.detail, res.status), {
+      status: res.status,
+      detail: data && data.detail,
+    });
   }
   return data;
 }
@@ -153,9 +204,10 @@ async function upload(path, formData, { auth = true } = {}) {
     },
     UPLOAD_TIMEOUT_MS,
   );
-  if (res.status === 401) {
+  if (res.status === 401 && auth) {
     clearToken();
     if (typeof window !== "undefined") window.location.href = "/login";
+    throw new ApiError("登录已过期，请重新登录", { status: 401 });
   }
   let data = null;
   if (text) {
@@ -167,7 +219,10 @@ async function upload(path, formData, { auth = true } = {}) {
     }
   }
   if (!res.ok) {
-    throw new Error(detailToMessage(data && data.detail, res.status));
+    throw new ApiError(detailToMessage(data && data.detail, res.status), {
+      status: res.status,
+      detail: data && data.detail,
+    });
   }
   return data;
 }
@@ -179,6 +234,7 @@ export const api = {
       body: { phone, password, sms_code, nickname },
       auth: false,
     }),
+  authFeatures: () => request("/api/auth/features", { auth: false }),
   sendSmsCode: (phone) =>
     request("/api/auth/sms/send", { method: "POST", body: { phone }, auth: false }),
   login: (phone, password) =>
@@ -204,17 +260,21 @@ export const api = {
     form.append("file", file);
     return upload("/api/uploads/image", form);
   },
-  reverse: (asset_url, target = "image", fallback_image = null) =>
+  reverse: (asset_url, target = "image", fallback_image = null, source_type = null) =>
     request("/api/prompt/reverse", {
       method: "POST",
-      body: { asset_url, target, fallback_image },
+      body: { asset_url, target, fallback_image, source_type },
       timeoutMs: REVERSE_TIMEOUT_MS,
     }),
-  generate: (payload) => request("/api/generate", { method: "POST", body: payload }),
+  generate: (payload) =>
+    request("/api/generate", { method: "POST", body: payload, timeoutMs: GENERATE_TIMEOUT_MS }),
   task: (id) => request(`/api/tasks/${id}`),
   taskWsTicket: (id) => request(`/api/tasks/${id}/ws-ticket`, { method: "POST" }),
   tasks: (limit = 30, offset = 0) => request(`/api/tasks?limit=${limit}&offset=${offset}`),
   unlock: (assetId) => request(`/api/assets/${assetId}/unlock`, { method: "POST" }),
+  playbackTicket: (assetId) => request(`/api/assets/${assetId}/playback-ticket`, { method: "POST" }),
+  playbackUrl: (assetId, ticket) =>
+    `${API_BASE}/api/assets/${assetId}/stream?ticket=${encodeURIComponent(ticket)}`,
   favoriteAsset: (assetId) => request(`/api/assets/${assetId}/favorite`, { method: "POST" }),
   deleteAsset: (assetId) => request(`/api/assets/${assetId}`, { method: "DELETE" }),
   retryTask: (taskId) => request(`/api/tasks/${taskId}/retry`, { method: "POST" }),
@@ -233,9 +293,16 @@ export const api = {
     request(`/api/admin/users/${userId}/reset_password`, { method: "POST", body }),
   adminModels: () => request("/api/admin/models"),
   adminSaveModel: (body) => request("/api/admin/models", { method: "PUT", body }),
+  adminProbeModels: (body) => request("/api/admin/models/probe", { method: "POST", body }),
   adminReport: (qs = "") => request(`/api/admin/usage/report${qs}`),
   adminReportCsvUrl: (qs = "") => `${API_BASE}/api/admin/usage/report${qs}`,
   adminAudit: (qs = "") => request(`/api/admin/audit${qs}`),
+  adminReviewTasks: (limit = 50, offset = 0) =>
+    request(`/api/admin/tasks/review?limit=${limit}&offset=${offset}`),
+  adminRefundReviewTask: (taskId, body) =>
+    request(`/api/admin/tasks/${taskId}/refund_review`, { method: "POST", body }),
+  adminSettleReviewTask: (taskId, body) =>
+    request(`/api/admin/tasks/${taskId}/settle_review`, { method: "POST", body }),
   adminSettings: () => request("/api/admin/settings"),
   adminSaveSettings: (body) => request("/api/admin/settings", { method: "PUT", body }),
   adminGateway: () => request("/api/admin/gateway"),

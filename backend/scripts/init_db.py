@@ -1,7 +1,8 @@
-"""Create tables, seed model config, and bootstrap an admin user.
+"""Seed model config and bootstrap an admin user.
 
 Usage (from backend/ with venv active):
     python -m scripts.init_db --admin-phone 13800000000 --credits 1000
+    python -m scripts.init_db --create-tables-dev-only --admin-phone 13800000000
 
 Idempotent: safe to re-run.
 """
@@ -11,6 +12,7 @@ import argparse
 import os
 import secrets
 
+from app.config import settings
 from app.db import Base, SessionLocal, engine
 from app.models import PhoneWhitelist, User
 from app.security import hash_password
@@ -25,6 +27,11 @@ def main():
     # otherwise a strong one-time password is generated and printed once.
     ap.add_argument("--admin-password", default=None)
     ap.add_argument("--credits", type=int, default=1000)
+    ap.add_argument(
+        "--create-tables-dev-only",
+        action="store_true",
+        help="Create tables via SQLAlchemy metadata. Refused when DEBUG=false; production must run Alembic.",
+    )
     args = ap.parse_args()
 
     provided_password = args.admin_password or os.environ.get("ADMIN_PASSWORD")
@@ -33,7 +40,11 @@ def main():
         provided_password = secrets.token_urlsafe(12)
         generated = provided_password
 
-    Base.metadata.create_all(bind=engine)
+    if args.create_tables_dev_only:
+        if not settings.debug:
+            raise SystemExit("--create-tables-dev-only is only allowed when DEBUG=true; run alembic upgrade head first")
+        Base.metadata.create_all(bind=engine)
+
     db = SessionLocal()
     try:
         seed_from_yaml(db)

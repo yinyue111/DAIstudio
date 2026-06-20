@@ -13,6 +13,7 @@ from ..db import SessionLocal
 from ..deps import resolve_token_user
 from ..models import GenTask
 from ..redis_client import redis_client
+from ..services.generation import is_terminal_status
 from ..services.progress import get_progress
 
 router = APIRouter(tags=["ws"])
@@ -82,7 +83,7 @@ async def task_progress(websocket: WebSocket, task_id: int, ticket: str = ""):
             # OR on the periodic auth re-check (honours mid-stream logout/disable).
             recheck_auth = ticks % _AUTH_RECHECK_EVERY == 0
             recheck_task = ticks % _DB_STATUS_RECHECK_EVERY == 0
-            if status in (None, "succeeded", "failed") or recheck_auth or recheck_task:
+            if status is None or is_terminal_status(status) or recheck_auth or recheck_task:
                 db = SessionLocal()
                 try:
                     if resolve_token_user(db, user_id, tv) is None:
@@ -90,19 +91,19 @@ async def task_progress(websocket: WebSocket, task_id: int, ticket: str = ""):
                         return
                     task = db.get(GenTask, task_id)
                     db_status = task.status if task else "failed"
-                    if db_status in ("succeeded", "failed") or status in (None, "succeeded", "failed"):
+                    if is_terminal_status(db_status) or status is None or is_terminal_status(status):
                         status = db_status
                         error = task.error if task else None
                     phase = task.phase if task else None
                 finally:
                     db.close()
-            if status in ("succeeded", "failed"):
+            if is_terminal_status(status):
                 percent = 100
             await websocket.send_json(
                 {"task_id": task_id, "status": status, "percent": percent,
                  "phase": phase, "error": error}
             )
-            if status in ("succeeded", "failed"):
+            if is_terminal_status(status):
                 break
             await asyncio.sleep(1.0)
     except WebSocketDisconnect:

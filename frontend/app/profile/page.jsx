@@ -4,16 +4,17 @@ import { useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { api, clearToken, downloadBlob, getToken } from "../../lib/api";
 import Nav from "../../components/Nav";
+import AssetMedia, { assetPreviewSrc } from "../../components/AssetMedia";
 
 const PAGE = 30;
 function srcOf(a) {
-  return a.preview_url || (a.unlocked ? a.hd_url || "" : "");
+  return assetPreviewSrc(a);
 }
 
 function unlockConfirm(asset, me, cfg) {
   const type = asset.type === "video" ? "视频" : "图片";
   const balance = Number(me?.balance_credits ?? 0);
-  const cost = Number(cfg?.models?.[asset.type]?.unlock_cost || 0);
+  const cost = Number(asset.unlock_cost ?? cfg?.models?.[asset.type]?.unlock_cost ?? 0);
   return window.confirm(`解锁${type}高清将扣除 ${cost} 积分，当前余额 ${balance}，确认继续？`);
 }
 
@@ -29,6 +30,8 @@ export default function ProfilePage() {
   const [hasMore, setHasMore] = useState(false);
   const [lightbox, setLightbox] = useState(null);
   const [msg, setMsg] = useState("");
+  const [busyAssetIds, setBusyAssetIds] = useState(() => new Set());
+  const busyAssetIdsRef = useRef(new Set());
 
   // change password
   const [pwOpen, setPwOpen] = useState(false);
@@ -76,33 +79,57 @@ export default function ProfilePage() {
   }
 
   function patchAsset(updated) {
-    setAssets((prev) => (prev || []).map((x) => (x.id === updated.id ? updated : x)));
+    setAssets((prev) => {
+      const list = prev || [];
+      if (filter === "fav" && updated.favorite === false) {
+        return list.filter((x) => x.id !== updated.id);
+      }
+      return list.map((x) => (x.id === updated.id ? updated : x));
+    });
     if (lightbox && lightbox.id === updated.id) setLightbox(updated);
+  }
+
+  async function withAssetBusy(assetId, fn) {
+    if (busyAssetIdsRef.current.has(assetId)) return;
+    busyAssetIdsRef.current.add(assetId);
+    setBusyAssetIds(new Set(busyAssetIdsRef.current));
+    try {
+      await fn();
+    } finally {
+      busyAssetIdsRef.current.delete(assetId);
+      setBusyAssetIds(new Set(busyAssetIdsRef.current));
+    }
   }
 
   async function unlock(asset) {
     if (!unlockConfirm(asset, me, cfg)) return;
-    try {
-      patchAsset(await api.unlock(asset.id));
-      api.me().then(setMe).catch(() => {});
-      api.profile().then(setData).catch(() => {});
-    } catch (e) { setMsg(e.message); }
+    await withAssetBusy(asset.id, async () => {
+      try {
+        patchAsset(await api.unlock(asset.id));
+        api.me().then(setMe).catch(() => {});
+        api.profile().then(setData).catch(() => {});
+      } catch (e) { setMsg(e.message); }
+    });
   }
 
   async function toggleFav(asset) {
-    try { patchAsset(await api.favoriteAsset(asset.id)); }
-    catch (e) { setMsg(e.message); }
+    await withAssetBusy(asset.id, async () => {
+      try { patchAsset(await api.favoriteAsset(asset.id)); }
+      catch (e) { setMsg(e.message); }
+    });
   }
 
   async function del(asset) {
     const label = asset.type === "video" ? "视频" : "图片";
     if (!window.confirm(`确认删除这条${label}素材？删除后不可恢复。`)) return;
-    try {
-      await api.deleteAsset(asset.id);
-      setAssets((prev) => (prev || []).filter((x) => x.id !== asset.id));
-      if (lightbox && lightbox.id === asset.id) setLightbox(null);
-      api.profile().then(setData).catch(() => {});
-    } catch (e) { setMsg(e.message); }
+    await withAssetBusy(asset.id, async () => {
+      try {
+        await api.deleteAsset(asset.id);
+        setAssets((prev) => (prev || []).filter((x) => x.id !== asset.id));
+        if (lightbox && lightbox.id === asset.id) setLightbox(null);
+        api.profile().then(setData).catch(() => {});
+      } catch (e) { setMsg(e.message); }
+    });
   }
 
   async function download(asset) {
@@ -113,7 +140,7 @@ export default function ProfilePage() {
 
   async function changePassword() {
     setPwMsg("");
-    if (newPw.length < 10) return setPwMsg("新密码至少 10 位");
+    if (newPw.length < 6) return setPwMsg("新密码至少 6 位");
     try {
       await api.changePassword(oldPw, newPw);
       clearToken();
@@ -157,7 +184,7 @@ export default function ProfilePage() {
             <div className="mt-5 flex flex-wrap items-center gap-2 border-t border-line pt-5 animate-fadeup">
               <input type="password" className="input w-44" placeholder="原密码"
                 value={oldPw} onChange={(e) => setOldPw(e.target.value)} />
-              <input type="password" className="input w-44" placeholder="新密码(≥10 位)"
+              <input type="password" className="input w-44" placeholder="新密码(≥6 位)"
                 value={newPw} onChange={(e) => setNewPw(e.target.value)} />
               <button onClick={changePassword} className="btn-primary btn-sm">确认修改</button>
               <span className="text-xs text-fog">修改后需重新登录</span>
@@ -209,6 +236,7 @@ export default function ProfilePage() {
             <div className="masonry">
               {assets.map((a) => {
                 const src = srcOf(a);
+                const busy = busyAssetIds.has(a.id);
                 return (
                   <div key={a.id} className="group overflow-hidden rounded-xl2 border border-line bg-base2">
                     <button onClick={() => setLightbox(a)} className="relative block w-full cursor-zoom-in bg-black/20" style={mediaAspectStyle(a)}>
@@ -216,11 +244,12 @@ export default function ProfilePage() {
                         <div className="flex h-full w-full items-center justify-center px-3 text-center text-xs text-fog">
                           预览暂不可用
                         </div>
-                      ) : a.type === "video" ? (
-                        <video src={src} muted preload="metadata" playsInline className="h-full w-full object-contain" />
                       ) : (
-                        <img src={src} alt="" loading="lazy"
-                          className="h-full w-full object-contain transition duration-300 group-hover:scale-[1.04]" />
+                        <AssetMedia
+                          asset={a}
+                          className="h-full w-full object-contain transition duration-300 group-hover:scale-[1.04]"
+                          fallbackClassName="flex h-full w-full items-center justify-center px-3 text-center text-xs text-fog"
+                        />
                       )}
                       <span className="badge absolute left-2 top-2 bg-black/60 text-white">
                         {a.type === "video" ? "视频" : "图片"}
@@ -232,17 +261,17 @@ export default function ProfilePage() {
                     </button>
                     <div className="flex items-center justify-between gap-1 p-2">
                       <div className="flex items-center gap-2">
-                        <button onClick={() => toggleFav(a)} title="收藏"
-                          className={`text-base leading-none transition ${a.favorite ? "text-rose" : "text-fog hover:text-snow"}`}>
+                        <button onClick={() => toggleFav(a)} disabled={busy} title="收藏"
+                          className={`text-base leading-none transition disabled:opacity-50 ${a.favorite ? "text-rose" : "text-fog hover:text-snow"}`}>
                           {a.favorite ? "★" : "☆"}
                         </button>
-                        <button onClick={() => del(a)} title="删除"
-                          className="text-fog transition hover:text-bad">🗑</button>
+                        <button onClick={() => del(a)} disabled={busy} title="删除"
+                          className="text-fog transition hover:text-bad disabled:opacity-50">🗑</button>
                       </div>
                       {a.unlocked ? (
-                        <button onClick={() => download(a)} className="btn-primary btn-sm">下载</button>
+                        <button onClick={() => download(a)} disabled={busy} className="btn-primary btn-sm">下载</button>
                       ) : (
-                        <button onClick={() => unlock(a)} className="btn-secondary btn-sm">解锁</button>
+                        <button onClick={() => unlock(a)} disabled={busy} className="btn-secondary btn-sm">解锁</button>
                       )}
                     </div>
                   </div>
@@ -267,12 +296,17 @@ export default function ProfilePage() {
               <div className="flex min-h-64 items-center justify-center rounded-xl2 bg-black/30 px-6 text-sm text-fog">
                 {lightbox.unlocked ? "预览暂不可用，请稍后重试。" : "预览暂不可用，请先解锁后再下载高清。"}
               </div>
-            ) : lightbox.type === "video" ? (
-              <video src={srcOf(lightbox)}
-                controls autoPlay className="mx-auto max-h-[76vh] w-auto rounded-xl2" />
             ) : (
-              <img src={srcOf(lightbox)}
-                alt="" className="mx-auto max-h-[76vh] w-auto rounded-xl2" />
+              <AssetMedia
+                asset={lightbox}
+                interactive
+                controls
+                autoPlay
+                muted={false}
+                className="mx-auto max-h-[76vh] w-auto rounded-xl2"
+                fallbackClassName="flex min-h-64 items-center justify-center rounded-xl2 bg-black/30 px-6 text-sm text-fog"
+                onError={(e) => setMsg(e?.message || "预览加载失败")}
+              />
             )}
             <div className="mt-3 flex items-center justify-between gap-2 text-sm">
               <span className="text-fog">
@@ -280,11 +314,11 @@ export default function ProfilePage() {
                 {lightbox.days_left != null ? ` · ${lightbox.days_left} 天后过期` : ""}
               </span>
               <div className="flex gap-2">
-                <button onClick={() => toggleFav(lightbox)} className="btn-ghost btn-sm">
+                <button onClick={() => toggleFav(lightbox)} disabled={busyAssetIds.has(lightbox.id)} className="btn-ghost btn-sm">
                   {lightbox.favorite ? "★ 已收藏" : "☆ 收藏"}
                 </button>
-                {!lightbox.unlocked && <button onClick={() => unlock(lightbox)} className="btn-primary btn-sm">解锁高清</button>}
-                {lightbox.unlocked && <button onClick={() => download(lightbox)} className="btn-primary btn-sm">下载</button>}
+                {!lightbox.unlocked && <button onClick={() => unlock(lightbox)} disabled={busyAssetIds.has(lightbox.id)} className="btn-primary btn-sm">解锁高清</button>}
+                {lightbox.unlocked && <button onClick={() => download(lightbox)} disabled={busyAssetIds.has(lightbox.id)} className="btn-primary btn-sm">下载</button>}
                 <button onClick={() => setLightbox(null)} className="btn-secondary btn-sm">关闭</button>
               </div>
             </div>

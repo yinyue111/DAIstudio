@@ -41,6 +41,10 @@ def gateway_ref_for_user_asset(db: Session, user_id: int, url: str | None) -> st
             row_mime = row.mime
             if key.startswith("upload/"):
                 path = _gateway_image_path(key)
+            elif key.startswith("upload_preview/"):
+                path = _upload_preview_model_ref_path(key)
+            elif key.startswith("preview/"):
+                path = _preview_model_ref_path(key)
             else:
                 path = storage.local_path(key)
         elif key.startswith(("upload/", "upload_preview/")):
@@ -91,16 +95,33 @@ def _image_data_uri(raw: bytes, fallback_mime: str | None = None) -> str:
 
 
 def _gateway_image_path(upload_key: str):
-    """Use the compressed authenticated preview for gateway refs when present.
+    """Use a clean compressed model ref for gateway refs when present.
 
     The original upload may be up to tens of MB. Sending it as a data URI for
     every concurrent batch image request creates huge JSON payloads and gateway
-    timeouts. The preview is already owner-gated and visually sufficient as a
-    reference/edit input.
+    timeouts. Do not use the public preview here because it is intentionally
+    watermarked.
     """
     original = storage.local_path(upload_key)
+    model_ref = storage.local_path(upload_key.replace("upload/", "upload_model_ref/", 1).rsplit(".", 1)[0] + ".png")
     preview = storage.local_path(upload_key.replace("upload/", "upload_preview/", 1))
+    if model_ref.exists():
+        return model_ref
     return preview if preview.exists() else original
+
+
+def _upload_preview_model_ref_path(preview_key: str):
+    model_ref = storage.local_path(
+        preview_key.replace("upload_preview/", "upload_model_ref/", 1)
+    )
+    preview = storage.local_path(preview_key)
+    return model_ref if model_ref.exists() else preview
+
+
+def _preview_model_ref_path(preview_key: str):
+    model_ref = storage.local_path(preview_key.replace("preview/", "model_ref/", 1))
+    preview = storage.local_path(preview_key)
+    return model_ref if model_ref.exists() else preview
 
 
 def generated_asset_reference_path(db: Session, user_id: int, key: str):
@@ -118,17 +139,46 @@ def generated_asset_reference_path(db: Session, user_id: int, key: str):
     ).first()
     is_hd = key.startswith(("hd/", "video_hd/"))
     if not asset:
-        if is_hd:
-            raise AssetRefError("生成素材不存在")
-        return storage.local_path(key)
+        raise AssetRefError("生成素材不存在")
     if asset.user_id != user_id:
         raise AssetRefError("生成素材不存在")
     if is_hd and not asset.unlocked:
         raise AssetRefError("请先解锁该素材后再作为参考")
+    if key.startswith("preview/"):
+        model_ref_key = key.replace("preview/", "model_ref/", 1)
+        model_ref_path = storage.local_path(model_ref_key)
+        if model_ref_path.exists() and model_ref_path.is_file():
+            return model_ref_path
     if asset.preview_url:
         preview_key = storage.key_from_url(asset.preview_url)
         if preview_key and preview_key.startswith(("preview/", "video_preview/")):
+            if preview_key.startswith("preview/"):
+                model_ref_key = preview_key.replace("preview/", "model_ref/", 1)
+                model_ref_path = storage.local_path(model_ref_key)
+                if model_ref_path.exists() and model_ref_path.is_file():
+                    return model_ref_path
             preview_path = storage.local_path(preview_key)
             if preview_path.exists() and preview_path.is_file():
                 return preview_path
     return storage.local_path(key)
+
+
+def generated_video_reference_path(db: Session, user_id: int, key: str):
+    """Owner-gated local video path for reverse-video keyframe sampling."""
+    asset = db.query(GenAsset).filter(
+        or_(
+            GenAsset.preview_url == storage.public_url(key),
+            GenAsset.hd_url == storage.public_url(key),
+        )
+    ).first()
+    is_hd = key.startswith("video_hd/")
+    if not asset:
+        raise AssetRefError("生成视频不存在")
+    if asset.user_id != user_id:
+        raise AssetRefError("生成视频不存在")
+    if is_hd and not asset.unlocked:
+        raise AssetRefError("请先解锁该视频后再作为参考")
+    path = storage.local_path(key)
+    if not path.exists() or not path.is_file():
+        raise AssetRefError("视频文件不存在")
+    return path

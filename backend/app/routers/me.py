@@ -6,6 +6,7 @@ from sqlalchemy.orm import Session
 from ..db import get_db
 from ..deps import get_client_ip, get_current_user
 from ..models import User
+from ..password_policy import MIN_PASSWORD_LEN
 from ..redis_client import redis_client
 from ..schemas import ChangePasswordIn, UserOut
 from ..security import hash_password, verify_password
@@ -13,7 +14,6 @@ from ..services import audit
 
 router = APIRouter(prefix="/api", tags=["me"])
 
-MIN_PASSWORD_LEN = 10
 PASSWORD_FAIL_LIMIT = 8
 PASSWORD_FAIL_WINDOW = 15 * 60
 

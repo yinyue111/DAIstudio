@@ -12,10 +12,12 @@ from sqlalchemy import (
     CheckConstraint,
     DateTime,
     ForeignKey,
+    Index,
     Integer,
     String,
     Text,
     func,
+    text,
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
@@ -71,6 +73,23 @@ class CreditTransaction(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
+class AdminIdempotencyKey(Base):
+    __tablename__ = "admin_idempotency_keys"
+    __table_args__ = (
+        CheckConstraint("scope in ('quota_grant')", name="ck_admin_idempotency_scope_valid"),
+        Index("uq_admin_idempotency_scope_key", "admin_id", "scope", "key", unique=True),
+    )
+
+    id: Mapped[int] = mapped_column(BigIntPK, primary_key=True, autoincrement=True)
+    admin_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("users.id"))
+    scope: Mapped[str] = mapped_column(String(32), nullable=False)
+    key: Mapped[str] = mapped_column(String(128), nullable=False)
+    target_user_id: Mapped[int | None] = mapped_column(BigInteger)
+    amount: Mapped[int | None] = mapped_column(BigInteger)
+    note: Mapped[str | None] = mapped_column(String(255))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
 class PaymentOrder(Base):
     __tablename__ = "payment_orders"
     __table_args__ = (
@@ -100,6 +119,16 @@ class PaymentOrder(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
+
+
+Index(
+    "uq_payment_orders_provider_trade_no",
+    PaymentOrder.provider,
+    PaymentOrder.provider_trade_no,
+    unique=True,
+    postgresql_where=text("provider_trade_no IS NOT NULL"),
+    sqlite_where=text("provider_trade_no IS NOT NULL"),
+)
 
 
 class PaymentPackage(Base):
@@ -180,6 +209,7 @@ class GenTask(Base):
     prompt: Mapped[dict | None] = mapped_column(JSONType)  # structured + final_text
     model_use: Mapped[str | None] = mapped_column(String(16))  # vision/image/video
     params: Mapped[dict | None] = mapped_column(JSONType)
+    client_request_id: Mapped[str | None] = mapped_column(String(128))
     status: Mapped[str] = mapped_column(String(16), default="queued")  # queued/running/succeeded/failed
     cost_frozen: Mapped[int] = mapped_column(BigInteger, default=0)
     cost_settled: Mapped[int] = mapped_column(BigInteger, default=0)
@@ -191,6 +221,33 @@ class GenTask(Base):
     error: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+Index(
+    "uq_gen_tasks_active_final_per_preview",
+    GenTask.user_id,
+    GenTask.parent_task_id,
+    unique=True,
+    postgresql_where=text(
+        "category = 'video' AND stage = 'final' "
+        "AND status IN ('queued','running','needs_review') "
+        "AND parent_task_id IS NOT NULL"
+    ),
+    sqlite_where=text(
+        "category = 'video' AND stage = 'final' "
+        "AND status IN ('queued','running','needs_review') "
+        "AND parent_task_id IS NOT NULL"
+    ),
+)
+
+Index(
+    "uq_gen_tasks_user_client_request_id",
+    GenTask.user_id,
+    GenTask.client_request_id,
+    unique=True,
+    postgresql_where=text("client_request_id IS NOT NULL"),
+    sqlite_where=text("client_request_id IS NOT NULL"),
+)
 
 
 class GenAsset(Base):
@@ -256,6 +313,10 @@ class ModelConfig(Base):
     id: Mapped[int] = mapped_column(BigIntPK, primary_key=True, autoincrement=True)
     use: Mapped[str] = mapped_column(String(16), unique=True, nullable=False)  # vision/image/video
     model_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    provider: Mapped[str | None] = mapped_column(String(32))
+    base_url: Mapped[str | None] = mapped_column(String(512))
+    api_key_encrypted: Mapped[str | None] = mapped_column(Text)
+    gateway_format: Mapped[str | None] = mapped_column(String(16))  # openai | ark
     cost_credits: Mapped[int] = mapped_column(BigInteger, default=1)  # cost to run / freeze
     unlock_cost: Mapped[int] = mapped_column(BigInteger, default=0)  # extra cost to unlock HD
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)

@@ -3,20 +3,21 @@ platform settings, audit log, gateway status."""
 from __future__ import annotations
 
 import csv
-import hashlib
 import io
 import re
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from ..config import settings as app_config
 from ..db import get_db
 from ..deps import get_client_ip, require_admin
 from ..models import (
+    AdminIdempotencyKey,
     AuditLog,
     CreditTransaction,
     GatewayCall,
@@ -25,10 +26,14 @@ from ..models import (
     PhoneWhitelist,
     User,
 )
+from ..password_policy import MIN_PASSWORD_LEN
 from ..redis_client import redis_client
 from ..schemas import (
+    AdminTaskRefundIn,
+    AdminTaskSettleIn,
     AuditOut,
     ModelConfigIn,
+    ModelProbeIn,
     PaymentPackageDisableIn,
     PaymentPackageIn,
     PaymentPackageOut,
@@ -43,8 +48,29 @@ from ..schemas import (
     WhitelistIn,
 )
 from ..security import hash_password, verify_password
-from ..services import audit, credits, payment_config
+from ..services import (
+    audit,
+    credits,
+    gateway,
+    generation,
+    payment_config,
+    payments,
+    safe_logging,
+    sms,
+)
 from ..services.config_store import DEFAULT_SETTINGS, get_setting, set_settings
+from ..services.model_gateway_config import (
+    PROVIDER_PRESETS,
+    ModelGatewayConfigError,
+    apply_model_gateway_update,
+    encrypted_key_present,
+    model_to_admin_dict,
+    normalise_base_url,
+    normalise_gateway_format,
+    normalise_provider,
+    runtime_config_from_probe,
+)
+from ..services.task_output import build_task_out
 
 router = APIRouter(prefix="/api/admin", tags=["admin"])
 _IMAGE_SIZE_RE = re.compile(r"^(\d{2,5})x(\d{2,5})$")
@@ -53,19 +79,71 @@ _ADMIN_CONFIRM_TTL_SECONDS = 300
 _ADMIN_CONFIRM_FAIL_LIMIT = 8
 _ADMIN_CONFIRM_FAIL_IP_LIMIT = 30
 _ADMIN_CONFIRM_FAIL_WINDOW_SECONDS = 15 * 60
+_QUOTA_GRANT_REPLAY_WINDOW_SECONDS = 10 * 60
+_ACTIVE_MODEL_TASK_STATUSES = ("queued", "running", generation.NEEDS_REVIEW)
+
+
+def _model_gateway_update_values(row: ModelConfig, body: ModelConfigIn) -> tuple[
+    str | None,
+    str | None,
+    str | None,
+]:
+    fields = getattr(body, "model_fields_set", set())
+    provider = body.provider if "provider" in fields else row.provider
+    base_url = body.base_url if "base_url" in fields else row.base_url
+    gateway_format = body.gateway_format if "gateway_format" in fields else row.gateway_format
+    return provider, base_url, gateway_format
 
 
 def _page(limit: int, offset: int, cap: int) -> tuple[int, int]:
     return min(max(int(limit), 1), cap), max(int(offset), 0)
 
 
-def _parse_date(s: str | None) -> datetime | None:
+def _gateway_update_changes_runtime(row: ModelConfig, body: ModelConfigIn) -> bool:
+    provider, base_url, gateway_format = _model_gateway_update_values(row, body)
+    current_provider = normalise_provider(row.provider)
+    current_base_url = normalise_base_url(row.base_url)
+    current_gateway_format = normalise_gateway_format(row.gateway_format, current_provider, row.use)
+    next_provider = normalise_provider(provider)
+    next_base_url = normalise_base_url(base_url)
+    next_gateway_format = normalise_gateway_format(gateway_format, next_provider, row.use)
+    current_key_present = encrypted_key_present(row)
+    new_key_supplied = body.api_key not in (None, "", "__keep__", "已配置")
+    next_key_present = False if body.api_key_clear else (True if new_key_supplied else current_key_present)
+    return (
+        current_provider != next_provider
+        or current_base_url != next_base_url
+        or current_gateway_format != next_gateway_format
+        or current_key_present != next_key_present
+        or new_key_supplied
+    )
+
+
+def _assert_no_active_model_tasks(db: Session, use: str) -> None:
+    active_id = db.execute(
+        select(GenTask.id)
+        .where(
+            GenTask.model_use == use,
+            GenTask.status.in_(_ACTIVE_MODEL_TASK_STATUSES),
+        )
+        .limit(1)
+    ).scalar_one_or_none()
+    if active_id is not None:
+        raise HTTPException(
+            409,
+            "当前模型仍有排队、运行中或待对账任务,请等待任务结束或处理后再切换网关配置",
+        )
+
+
+def _parse_date(s: str | None, *, end_of_day: bool = False) -> datetime | None:
     if not s:
         return None
     try:
         dt = datetime.fromisoformat(s)
     except ValueError:
         raise HTTPException(400, f"日期格式应为 ISO(YYYY-MM-DD),收到:{s}")
+    if end_of_day and re.fullmatch(r"\d{4}-\d{2}-\d{2}", s):
+        dt = dt.replace(hour=23, minute=59, second=59, microsecond=999999)
     # gen_tasks.finished_at / created_at are tz-aware; a naive bound would raise
     # on PostgreSQL ("can't compare offset-naive and offset-aware"). Assume UTC.
     return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
@@ -78,6 +156,12 @@ def _csv_cell(value):
     if text.lstrip(" \t\r\n").startswith(_CSV_FORMULA_PREFIXES):
         return "'" + text
     return text
+
+
+def _date_key(dt: datetime | None) -> str | None:
+    if not dt:
+        return None
+    return dt.date().isoformat()
 
 
 def _require_admin_password(admin: User, password: str | None, request: Request | None = None) -> None:
@@ -97,15 +181,58 @@ def _require_admin_password(admin: User, password: str | None, request: Request 
     redis_client.delete(fail_key)
 
 
-def _grant_idempotency_key(admin_id: int, body: QuotaGrantIn) -> str:
+def _quota_grant_idempotency_raw(body: QuotaGrantIn) -> str:
     raw = (body.idempotency_key or "").strip()
-    if raw:
-        if not re.fullmatch(r"[A-Za-z0-9_.:-]{8,128}", raw):
-            raise HTTPException(400, "idempotency_key 格式非法")
-        return f"admin:quota:{admin_id}:{raw}"
-    basis = f"{body.user_id}:{body.amount}:{(body.note or '').strip()}"
-    digest = hashlib.sha256(basis.encode("utf-8")).hexdigest()[:24]
-    return f"admin:quota:{admin_id}:auto:{digest}"
+    if not raw:
+        raise HTTPException(400, "idempotency_key 必填")
+    if not re.fullmatch(r"[A-Za-z0-9_.:-]{8,128}", raw):
+        raise HTTPException(400, "idempotency_key 格式非法")
+    return raw
+
+
+def _reserve_quota_grant_idempotency(
+    db: Session,
+    *,
+    admin_id: int,
+    body: QuotaGrantIn,
+    note: str,
+) -> tuple[str, bool]:
+    raw = _quota_grant_idempotency_raw(body)
+    try:
+        db.add(
+            AdminIdempotencyKey(
+                admin_id=admin_id,
+                scope="quota_grant",
+                key=raw,
+                target_user_id=body.user_id,
+                amount=body.amount,
+                note=note,
+            )
+        )
+        db.flush()
+    except IntegrityError as e:
+        db.rollback()
+        existing = db.execute(
+            select(AdminIdempotencyKey).where(
+                AdminIdempotencyKey.admin_id == admin_id,
+                AdminIdempotencyKey.scope == "quota_grant",
+                AdminIdempotencyKey.key == raw,
+            )
+        ).scalar_one_or_none()
+        if not existing:
+            raise HTTPException(409, "重复的额度发放请求已拦截,请更换幂等键") from e
+        if (
+            int(existing.target_user_id or 0) == int(body.user_id)
+            and int(existing.amount or 0) == int(body.amount)
+            and (existing.note or "") == note
+        ):
+            return raw, False
+        raise HTTPException(409, "幂等键已用于不同额度发放请求") from e
+    return raw, True
+
+
+def _quota_grant_fingerprint(admin_id: int, body: QuotaGrantIn, note: str) -> str:
+    return f"admin:quota:fingerprint:{admin_id}:{body.user_id}:{body.amount}:{note}"
 
 
 # ----------------------------------------------------------------- whitelist
@@ -132,6 +259,95 @@ def add_whitelist(body: WhitelistIn, db: Session = Depends(get_db),
               biz_id=None, ip=get_client_ip(request) if request else None,
               detail={"phone": body.phone, "department": body.department})
     return {"ok": True}
+
+
+@router.post("/tasks/{task_id}/refund_review", response_model=object)
+def refund_needs_review_task(
+    task_id: int,
+    body: AdminTaskRefundIn,
+    db: Session = Depends(get_db),
+    admin: User = Depends(require_admin),
+    request: Request = None,
+):
+    _require_admin_password(admin, body.admin_password, request)
+    task = db.get(GenTask, task_id)
+    if not task:
+        raise HTTPException(404, "任务不存在")
+    claimed = db.execute(
+        update(GenTask)
+        .where(GenTask.id == task_id, GenTask.status == generation.NEEDS_REVIEW)
+        .values(status="running", phase="reconciling", error=None)
+    ).rowcount
+    if (claimed or 0) != 1:
+        db.rollback()
+        db.refresh(task)
+        return build_task_out(db, task)
+    db.refresh(task)
+    if task.cost_frozen and task.cost_settled == 0:
+        try:
+            credits.refund(db, task.user_id, task.cost_frozen, biz_ref=task.id, commit=False)
+        except credits.InsufficientCredits as e:
+            db.rollback()
+            raise HTTPException(400, str(e))
+    note = (body.note or "").strip()
+    task.status = "failed"
+    task.error = note or "管理员对账后已退款"
+    task.phase = None
+    task.finished_at = datetime.now(timezone.utc)
+    db.commit()
+    db.refresh(task)
+    audit.log(db, user_id=admin.id, action="refund_review_task", biz_type="gen_task",
+              biz_id=task.id, ip=get_client_ip(request) if request else None,
+              detail={"target_user_id": task.user_id, "note": note})
+    return build_task_out(db, task)
+
+
+@router.post("/tasks/{task_id}/settle_review", response_model=object)
+def settle_needs_review_task(
+    task_id: int,
+    body: AdminTaskSettleIn,
+    db: Session = Depends(get_db),
+    admin: User = Depends(require_admin),
+    request: Request = None,
+):
+    _require_admin_password(admin, body.admin_password, request)
+    task = db.get(GenTask, task_id)
+    if not task:
+        raise HTTPException(404, "任务不存在")
+    claimed = db.execute(
+        update(GenTask)
+        .where(GenTask.id == task_id, GenTask.status == generation.NEEDS_REVIEW)
+        .values(status="running", phase="reconciling", error=None, finished_at=None)
+    ).rowcount
+    if (claimed or 0) != 1:
+        db.rollback()
+        db.refresh(task)
+        return build_task_out(db, task)
+    db.refresh(task)
+    try:
+        generation.admin_settle_needs_review_video(
+            db,
+            task,
+            result_url=body.result_url.strip(),
+            external_task_id=(body.external_task_id or "").strip() or None,
+        )
+    except ValueError as e:
+        db.rollback()
+        raise HTTPException(400, str(e))
+    except Exception as e:  # noqa: BLE001
+        db.rollback()
+        raise HTTPException(400, f"补结果结算失败:{e}")
+    db.refresh(task)
+    note = (body.note or "").strip()
+    audit.log(db, user_id=admin.id, action="settle_review_task", biz_type="gen_task",
+              biz_id=task.id, ip=get_client_ip(request) if request else None,
+              detail={
+                  "target_user_id": task.user_id,
+                  "result_url": safe_logging.redact_url_for_log(body.result_url),
+                  "external_task_id": body.external_task_id,
+                  "note": note,
+              })
+    return build_task_out(db, task)
 
 
 @router.delete("/whitelist/{phone}")
@@ -177,8 +393,8 @@ def set_user_status(user_id: int, body: UserStatusIn, db: Session = Depends(get_
 def reset_password(user_id: int, body: ResetPasswordIn, db: Session = Depends(get_db),
                    admin: User = Depends(require_admin), request: Request = None):
     _require_admin_password(admin, body.admin_password, request)
-    if len(body.password) < 10:
-        raise HTTPException(400, "密码至少 10 位")
+    if len(body.password) < MIN_PASSWORD_LEN:
+        raise HTTPException(400, f"密码至少 {MIN_PASSWORD_LEN} 位")
     user = db.get(User, user_id)
     if not user:
         raise HTTPException(404, "用户不存在")
@@ -203,18 +419,78 @@ def grant_quota(body: QuotaGrantIn, db: Session = Depends(get_db),
         raise HTTPException(400, "单次发放额度不能超过 100000")
     if not db.get(User, body.user_id):
         raise HTTPException(404, "用户不存在")
-    idem_key = _grant_idempotency_key(admin.id, body)
-    if not redis_client.set(idem_key, "1", nx=True, ex=_ADMIN_CONFIRM_TTL_SECONDS):
-        raise HTTPException(409, "重复的额度发放请求已拦截,请稍后再试或更换幂等键")
+    fingerprint_key = _quota_grant_fingerprint(admin.id, body, note)
+    previous_key = redis_client.get(fingerprint_key)
+    if previous_key and previous_key != (body.idempotency_key or "").strip():
+        existing = db.execute(
+            select(AdminIdempotencyKey).where(
+                AdminIdempotencyKey.admin_id == admin.id,
+                AdminIdempotencyKey.scope == "quota_grant",
+                AdminIdempotencyKey.key == str(previous_key),
+                AdminIdempotencyKey.target_user_id == body.user_id,
+                AdminIdempotencyKey.amount == body.amount,
+                AdminIdempotencyKey.note == note,
+            )
+        ).scalar_one_or_none()
+        if existing:
+            user = db.get(User, body.user_id)
+            if not user:
+                raise HTTPException(404, "用户不存在")
+            return user
+    idem_key, created_idem = _reserve_quota_grant_idempotency(
+        db,
+        admin_id=admin.id,
+        body=body,
+        note=note,
+    )
+    if not created_idem:
+        user = db.get(User, body.user_id)
+        if not user:
+            raise HTTPException(404, "用户不存在")
+        return user
     try:
-        user = credits.grant(db, body.user_id, body.amount, note=note)
+        user = credits.grant(db, body.user_id, body.amount, note=note, commit=False)
+        db.commit()
+        db.refresh(user)
     except ValueError as e:
-        redis_client.delete(idem_key)
+        db.rollback()
         raise HTTPException(400, str(e))
+    redis_client.setex(fingerprint_key, _QUOTA_GRANT_REPLAY_WINDOW_SECONDS, idem_key)
     audit.log(db, user_id=admin.id, action="grant_quota", biz_type="admin",
               biz_id=body.user_id, ip=get_client_ip(request) if request else None,
-              detail={"amount": body.amount, "note": note, "idempotency_key": body.idempotency_key})
+              detail={"amount": body.amount, "note": note, "idempotency_key": idem_key})
     return user
+
+
+@router.get("/tasks/review")
+def list_review_tasks(
+    db: Session = Depends(get_db),
+    _: User = Depends(require_admin),
+    limit: int = 50,
+    offset: int = 0,
+):
+    limit, offset = _page(limit, offset, 200)
+    rows = list(
+        db.execute(
+            select(GenTask)
+            .where(GenTask.status == generation.NEEDS_REVIEW)
+            .order_by(GenTask.id.desc())
+            .limit(limit)
+            .offset(offset)
+        ).scalars()
+    )
+    out = []
+    for row in rows:
+        item = build_task_out(db, row).model_dump()
+        item.update({
+            "user_id": row.user_id,
+            "phase": row.phase,
+            "external_task_id": row.external_task_id,
+            "external_submitted_at": row.external_submitted_at,
+            "video_request_id": (row.params or {}).get("_video_request_id"),
+        })
+        out.append(item)
+    return out
 
 
 # -------------------------------------------------------------- usage report
@@ -225,28 +501,50 @@ def usage_report(db: Session = Depends(get_db), _: User = Depends(require_admin)
     """Per-user / per-department spend. Optional ISO date range (filters on
     settled task finish time + unlock time). ``format=csv`` streams a CSV."""
     start_dt = _parse_date(start)
-    end_dt = _parse_date(end)
+    end_dt = _parse_date(end, end_of_day=True)
 
-    # Credit spend is reconstructed from immutable credit_transactions, not
-    # gen_tasks. A generation's real cost is the net of freeze(-reserved) plus
-    # settle/refund(+unused/+all). This survives task retention cleanup.
-    spend_tx_types = ("freeze", "settle", "refund", "unlock", "consume")
+    spend_by_user: dict[int, int] = {}
+    daily_by_date: dict[str, int] = {}
+
+    # Generation spend belongs to the terminal task date, not the separate
+    # freeze/refund transaction dates. Cross-day renders otherwise distort
+    # daily and bounded reports.
+    task_spend_q = (
+        select(GenTask.user_id, GenTask.cost_settled, GenTask.finished_at)
+        .where(GenTask.status == "succeeded", GenTask.cost_settled > 0)
+    )
+    if start_dt:
+        task_spend_q = task_spend_q.where(GenTask.finished_at >= start_dt)
+    if end_dt:
+        task_spend_q = task_spend_q.where(GenTask.finished_at <= end_dt)
+    for uid, cost, finished_at in db.execute(task_spend_q).all():
+        value = int(cost or 0)
+        spend_by_user[uid] = spend_by_user.get(uid, 0) + value
+        day = _date_key(finished_at)
+        if day:
+            daily_by_date[day] = daily_by_date.get(day, 0) + value
+
+    # Synchronous model/asset charges stay anchored to their transaction date.
+    # Exclude gen_task freeze/settle/refund rows; they are represented above by
+    # GenTask.cost_settled on the finished_at date.
+    sync_tx_types = ("unlock", "consume")
     spend_q = (
         select(
             CreditTransaction.user_id,
             func.coalesce(func.sum(-CreditTransaction.change), 0),
         )
-        .where(CreditTransaction.type.in_(spend_tx_types))
+        .where(
+            CreditTransaction.type.in_(sync_tx_types),
+            CreditTransaction.biz_type != "gen_task",
+        )
         .group_by(CreditTransaction.user_id)
     )
     if start_dt:
         spend_q = spend_q.where(CreditTransaction.created_at >= start_dt)
     if end_dt:
         spend_q = spend_q.where(CreditTransaction.created_at <= end_dt)
-    spend_by_user = {
-        uid: max(0, int(total))
-        for uid, total in db.execute(spend_q).all()
-    }
+    for uid, total in db.execute(spend_q).all():
+        spend_by_user[uid] = max(0, spend_by_user.get(uid, 0) + int(total or 0))
 
     task_q = (
         select(GenTask.user_id, func.count(), GenTask.category)
@@ -291,11 +589,14 @@ def usage_report(db: Session = Depends(get_db), _: User = Depends(require_admin)
     per_dept_list = [{"department": k, "spend_credits": v}
                      for k, v in sorted(per_dept.items(), key=lambda x: -x[1])]
 
-    # daily spend trend from the same durable transaction facts
+    # Daily trend: terminal task spend + synchronous transaction spend.
     daily_q = (
         select(func.date(CreditTransaction.created_at),
                func.coalesce(func.sum(-CreditTransaction.change), 0))
-        .where(CreditTransaction.type.in_(spend_tx_types))
+        .where(
+            CreditTransaction.type.in_(sync_tx_types),
+            CreditTransaction.biz_type != "gen_task",
+        )
         .group_by(func.date(CreditTransaction.created_at))
         .order_by(func.date(CreditTransaction.created_at))
     )
@@ -303,7 +604,10 @@ def usage_report(db: Session = Depends(get_db), _: User = Depends(require_admin)
         daily_q = daily_q.where(CreditTransaction.created_at >= start_dt)
     if end_dt:
         daily_q = daily_q.where(CreditTransaction.created_at <= end_dt)
-    daily_by_date = {str(d): max(0, int(s)) for d, s in db.execute(daily_q).all() if d}
+    for d, s in db.execute(daily_q).all():
+        if d:
+            key = str(d)
+            daily_by_date[key] = max(0, daily_by_date.get(key, 0) + int(s or 0))
     daily = [{"date": d, "spend_credits": daily_by_date[d]}
              for d in sorted(daily_by_date)]
 
@@ -332,11 +636,10 @@ def usage_report(db: Session = Depends(get_db), _: User = Depends(require_admin)
 @router.get("/models")
 def get_models(db: Session = Depends(get_db), _: User = Depends(require_admin)):
     rows = list(db.execute(select(ModelConfig).order_by(ModelConfig.use)).scalars())
-    return [
-        {"use": r.use, "model_id": r.model_id, "cost_credits": r.cost_credits,
-         "unlock_cost": r.unlock_cost, "enabled": r.enabled, "extra": r.extra}
-        for r in rows
-    ]
+    return {
+        "providers": PROVIDER_PRESETS,
+        "models": [model_to_admin_dict(r) for r in rows],
+    }
 
 
 @router.put("/models")
@@ -347,6 +650,20 @@ def upsert_model(body: ModelConfigIn, db: Session = Depends(get_db),
     if row is None:
         row = ModelConfig(use=body.use)
         db.add(row)
+    elif _gateway_update_changes_runtime(row, body):
+        _assert_no_active_model_tasks(db, body.use)
+    provider, base_url, gateway_format = _model_gateway_update_values(row, body)
+    try:
+        apply_model_gateway_update(
+            row,
+            provider=provider,
+            base_url=base_url,
+            api_key=body.api_key,
+            api_key_clear=body.api_key_clear,
+            gateway_format=gateway_format,
+        )
+    except ModelGatewayConfigError as e:
+        raise HTTPException(400, str(e)) from e
     row.model_id = body.model_id
     row.cost_credits = body.cost_credits
     row.unlock_cost = body.unlock_cost
@@ -356,10 +673,41 @@ def upsert_model(body: ModelConfigIn, db: Session = Depends(get_db),
     audit.log(db, user_id=admin.id, action="update_model", biz_type="admin",
               ip=get_client_ip(request) if request else None,
               detail={"use": body.use, "model_id": body.model_id,
+                      "provider": body.provider, "base_url": body.base_url,
+                      "gateway_format": body.gateway_format,
+                      "api_key_changed": bool(body.api_key or body.api_key_clear),
                       "cost_credits": body.cost_credits,
                       "unlock_cost": body.unlock_cost,
                       "enabled": body.enabled})
     return {"ok": True}
+
+
+@router.post("/models/probe")
+def probe_models(body: ModelProbeIn, db: Session = Depends(get_db),
+                 admin: User = Depends(require_admin), request: Request = None):
+    fallback = None
+    if body.use:
+        fallback = db.execute(select(ModelConfig).where(ModelConfig.use == body.use)).scalar_one_or_none()
+    if fallback is not None and fallback.api_key_encrypted and not body.api_key:
+        _require_admin_password(admin, body.admin_password, request)
+    try:
+        cfg = runtime_config_from_probe(
+            use=body.use,
+            provider=body.provider,
+            base_url=body.base_url,
+            api_key=body.api_key,
+            gateway_format=body.gateway_format,
+            fallback_row=fallback,
+        )
+        models = gateway.list_models(cfg)
+    except (ModelGatewayConfigError, gateway.GatewayError) as e:
+        raise HTTPException(400, str(e)) from e
+    return {
+        "provider": cfg.provider,
+        "base_url": cfg.base_url,
+        "gateway_format": cfg.gateway_format,
+        "models": models,
+    }
 
 
 # ------------------------------------------------------------ platform settings
@@ -384,6 +732,23 @@ def put_settings(body: SettingsIn, db: Session = Depends(get_db),
                 ):
                     raise HTTPException(400, f"默认图片尺寸非法(最大 {app_config.max_image_dim}px)")
             changed[key] = val
+    if changed.get("sms_auth_enabled") is True:
+        sms_issues = sms.readiness_issues()
+        if sms_issues:
+            raise HTTPException(400, "短信验证码注册未就绪: " + "; ".join(sms_issues))
+    if changed.get("payment_enabled") is True:
+        payment_status = payment_config.export_public_status(db)
+        ready = any(
+            provider.get("enabled")
+            and provider.get("ready")
+            and (
+                provider.get("mode") != "mock"
+                or payments.mock_payments_allowed()
+            )
+            for provider in payment_status.get("providers", [])
+        )
+        if not ready:
+            raise HTTPException(400, "支付充值功能未就绪: 请先配置至少一个可用支付渠道")
     if changed:
         set_settings(db, changed)
     audit.log(db, user_id=admin.id, action="update_settings", biz_type="admin",
@@ -493,7 +858,7 @@ def admin_disable_payment_package(
 
 @router.get("/payments/providers", response_model=list[PaymentProviderConfigOut])
 def admin_payment_providers(db: Session = Depends(get_db), _: User = Depends(require_admin)):
-    return payment_config.list_providers(db)
+    return payment_config.list_providers_with_runtime(db)
 
 
 @router.put("/payments/providers/{provider}", response_model=PaymentProviderConfigOut)
@@ -520,6 +885,7 @@ def admin_save_payment_provider(
         )
     except payment_config.PaymentConfigError as e:
         raise HTTPException(400, str(e))
+    safe_public_config = payment_config.public_config_for_provider(provider, body.public_config)
     audit.log(
         db,
         user_id=admin.id,
@@ -530,8 +896,12 @@ def admin_save_payment_provider(
             "provider": provider,
             "enabled": body.enabled,
             "mode": body.mode,
-            "public_config": body.public_config,
-            "secret_keys": sorted((body.secret_config or {}).keys()),
+            "public_config": safe_public_config,
+            "secret_keys": sorted(
+                key
+                for key in (body.secret_config or {})
+                if key in payment_config.SECRET_FIELDS.get(provider, set())
+            ),
         },
     )
     return payment_config.provider_out(row)

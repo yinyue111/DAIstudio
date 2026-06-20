@@ -2,9 +2,13 @@
 eager Celery + mock gateway)."""
 from urllib.parse import urlparse
 
+import pytest
+from sqlalchemy.exc import IntegrityError
+
 from app.db import SessionLocal
-from app.models import GenAsset, GenTask, PhoneWhitelist
+from app.models import GenAsset, GenTask, ModelConfig, PhoneWhitelist
 from app.services import sms, storage
+from app.services.config_store import set_setting
 
 
 def test_health(client):
@@ -21,13 +25,13 @@ def test_health(client):
 def test_register_login_me(client):
     db = SessionLocal()
     db.add(PhoneWhitelist(phone="13700000002", note="x", department="dev"))
+    set_setting(db, "sms_auth_enabled", False)
     db.commit()
     db.close()
 
-    code = sms.send_code("13700000002")
     r = client.post("/api/auth/register",
                     json={"phone": "13700000002", "password": "secret1234",
-                          "sms_code": code})
+                          "sms_code": ""})
     assert r.status_code == 200, r.text
     token = r.json()["access_token"]
 
@@ -40,11 +44,72 @@ def test_register_login_me(client):
                       json={"phone": "13700000002", "password": "nope"})
     assert bad.status_code == 401
 
-    # not whitelisted
+    # not whitelisted: keep a generic 400 so registration cannot be used to
+    # enumerate which phone numbers are authorized.
     no = client.post("/api/auth/register",
                      json={"phone": "13700000099", "password": "secret1234",
                            "sms_code": "000000"})
-    assert no.status_code == 403
+    assert no.status_code == 400
+    assert "注册申请无法完成" in no.text
+
+
+def test_sms_register_switch_requires_code_when_enabled(client):
+    db = SessionLocal()
+    db.add(PhoneWhitelist(phone="13700000003", note="x", department="dev"))
+    set_setting(db, "sms_auth_enabled", True)
+    db.commit()
+    db.close()
+
+    missing = client.post("/api/auth/register",
+                          json={"phone": "13700000003", "password": "secret1234"})
+    assert missing.status_code == 400
+    assert "短信验证码" in missing.text
+
+    code = sms.send_code("13700000003")
+    ok = client.post("/api/auth/register",
+                     json={"phone": "13700000003", "password": "secret1234",
+                           "sms_code": code})
+    assert ok.status_code == 200, ok.text
+
+    db = SessionLocal()
+    try:
+        set_setting(db, "sms_auth_enabled", False)
+    finally:
+        db.close()
+
+
+def test_sms_send_returns_disabled_when_switch_is_off(client):
+    db = SessionLocal()
+    try:
+        set_setting(db, "sms_auth_enabled", False)
+    finally:
+        db.close()
+
+    r = client.post("/api/auth/sms/send", json={"phone": "13700000004"})
+    assert r.status_code == 200, r.text
+    assert r.json() == {"ok": False, "disabled": True}
+
+
+def test_production_registration_requires_sms_switch(client, monkeypatch):
+    monkeypatch.setattr("app.routers.auth.settings.debug", False)
+    db = SessionLocal()
+    try:
+        db.add(PhoneWhitelist(phone="13700000005", note="x", department="dev"))
+        set_setting(db, "sms_auth_enabled", False)
+        db.commit()
+    finally:
+        db.close()
+
+    features = client.get("/api/auth/features")
+    assert features.status_code == 200, features.text
+    assert features.json()["registration_enabled"] is False
+
+    r = client.post(
+        "/api/auth/register",
+        json={"phone": "13700000005", "password": "secret1234"},
+    )
+    assert r.status_code == 400
+    assert "注册暂未开放" in r.text
 
 
 def test_generate_unlock_profile(client, make_user, auth):
@@ -85,6 +150,70 @@ def test_generate_unlock_profile(client, make_user, auth):
     g = client.get("/api/profile/assets", headers=h).json()
     assert any(x["id"] == a0["id"] for x in g)
     assert g[0]["days_left"] is not None
+
+
+def test_generate_client_request_id_replays_existing_task(client, make_user, auth):
+    make_user("13900000167", balance=1000)
+    h = auth("13900000167")
+    payload = {
+        "client_request_id": "studio-retry-001",
+        "source_asset_url": "http://example.com/retry.png",
+        "source_type": "image",
+        "category": "image",
+        "stage": "preview",
+        "instruction": "same request should not double charge",
+        "params": {"n": 2, "size": "256x256"},
+    }
+
+    first = client.post("/api/generate", json=payload, headers=h)
+    assert first.status_code == 200, first.text
+    second = client.post("/api/generate", json=payload, headers=h)
+    assert second.status_code == 200, second.text
+    assert second.json()["id"] == first.json()["id"]
+
+    db = SessionLocal()
+    try:
+        tasks = db.query(GenTask).filter(
+            GenTask.client_request_id == "studio-retry-001",
+        ).all()
+        assert len(tasks) == 1
+    finally:
+        db.close()
+    assert client.get("/api/me", headers=h).json()["balance_credits"] == 990
+
+
+def test_generate_client_request_id_rejects_different_payload(client, make_user, auth):
+    make_user("13900000168", balance=1000)
+    h = auth("13900000168")
+    payload = {
+        "client_request_id": "studio-retry-002",
+        "source_asset_url": "http://example.com/retry.png",
+        "source_type": "image",
+        "category": "image",
+        "stage": "preview",
+        "instruction": "first request",
+        "params": {"n": 1, "size": "256x256"},
+    }
+
+    first = client.post("/api/generate", json=payload, headers=h)
+    assert first.status_code == 200, first.text
+    conflict = client.post(
+        "/api/generate",
+        json={**payload, "instruction": "different request"},
+        headers=h,
+    )
+    assert conflict.status_code == 409
+    assert "client_request_id 已用于不同请求" in conflict.text
+
+    db = SessionLocal()
+    try:
+        tasks = db.query(GenTask).filter(
+            GenTask.client_request_id == "studio-retry-002",
+        ).all()
+        assert len(tasks) == 1
+    finally:
+        db.close()
+    assert client.get("/api/me", headers=h).json()["balance_credits"] == 995
 
 
 def test_external_asset_download_streams_from_temp_file(client, make_user, auth, monkeypatch):
@@ -368,6 +497,9 @@ def test_video_final_is_idempotent_for_same_preview(client, make_user, auth, mon
     second = client.post("/api/generate", json=payload, headers=h)
     assert second.status_code == 200, second.text
     assert second.json()["id"] == first.json()["id"]
+    assert second.json()["progress"] == 100
+    assert second.json()["assets"]
+    assert second.json()["assets"][0]["type"] == "video"
 
     db = SessionLocal()
     try:
@@ -379,6 +511,285 @@ def test_video_final_is_idempotent_for_same_preview(client, make_user, auth, mon
     finally:
         db.close()
     assert client.get("/api/me", headers=h).json()["balance_credits"] == 945
+
+
+def test_db_rejects_duplicate_active_final_for_same_preview(client, make_user):
+    uid = make_user("13900000142", balance=1000)
+    db = SessionLocal()
+    try:
+        preview = GenTask(
+            user_id=uid,
+            category="video",
+            stage="preview",
+            status="succeeded",
+            prompt={"final_text": "preview"},
+            params={},
+        )
+        db.add(preview)
+        db.commit()
+        first = GenTask(
+            user_id=uid,
+            category="video",
+            stage="final",
+            parent_task_id=preview.id,
+            status="queued",
+            prompt={"final_text": "final"},
+            params={},
+        )
+        second = GenTask(
+            user_id=uid,
+            category="video",
+            stage="final",
+            parent_task_id=preview.id,
+            status="needs_review",
+            prompt={"final_text": "final"},
+            params={},
+        )
+        db.add_all([first, second])
+        with pytest.raises(IntegrityError):
+            db.commit()
+    finally:
+        db.rollback()
+        db.close()
+
+
+def test_video_final_integrity_error_replays_active_final(client, make_user, auth, monkeypatch):
+    make_user("13900000143", balance=1000, admin=True)
+    h = auth("13900000143")
+    assert client.put("/api/admin/models", json={
+        "use": "video",
+        "model_id": "mock-video",
+        "cost_credits": 50,
+        "unlock_cost": 0,
+        "enabled": True,
+        "admin_password": "pass123456",
+        "extra": {"preview_cost": 5},
+    }, headers=h).status_code == 200
+
+    preview = client.post("/api/generate", json={
+        "source_asset_url": "http://example.com/source-video.mp4",
+        "source_type": "video",
+        "category": "video",
+        "stage": "preview",
+        "instruction": "preview for active final replay",
+        "params": {
+            "duration": 2,
+            "reference_image_url": "http://example.com/cover.jpg",
+        },
+    }, headers=h)
+    assert preview.status_code == 200, preview.text
+    parent_id = preview.json()["id"]
+
+    db = SessionLocal()
+    try:
+        final = GenTask(
+            user_id=make_user("13900000143"),
+            category="video",
+            stage="final",
+            parent_task_id=parent_id,
+            status="queued",
+            prompt={"final_text": "existing final"},
+            params={},
+            cost_frozen=50,
+        )
+        db.add(final)
+        db.commit()
+        final_id = final.id
+    finally:
+        db.close()
+
+    from sqlalchemy.orm import Session
+
+    import app.routers.generate as generate_router
+
+    real_flush = Session.flush
+    real_existing_active_final = generate_router._existing_active_final
+    tripped = {"value": False}
+    active_lookup_count = {"value": 0}
+
+    def flush_once_then_fail(self, *args, **kwargs):
+        if not tripped["value"]:
+            tripped["value"] = True
+            raise IntegrityError("duplicate active final", {}, Exception("unique"))
+        return real_flush(self, *args, **kwargs)
+
+    def delayed_existing_active_final(*args, **kwargs):
+        active_lookup_count["value"] += 1
+        if active_lookup_count["value"] <= 2:
+            return None
+        return real_existing_active_final(*args, **kwargs)
+
+    monkeypatch.setattr(Session, "flush", flush_once_then_fail)
+    monkeypatch.setattr(generate_router, "_existing_active_final", delayed_existing_active_final)
+
+    r = client.post("/api/generate", json={
+        "category": "video",
+        "stage": "final",
+        "parent_task_id": parent_id,
+        "params": {},
+    }, headers=h)
+    assert r.status_code == 200, r.text
+    assert r.json()["id"] == final_id
+
+
+def test_video_final_uses_preview_model_snapshot_price(client, make_user, auth, monkeypatch, tiny_mp4):
+    make_user("13900000147", balance=1000, admin=True)
+    h = auth("13900000147")
+    assert client.put("/api/admin/models", json={
+        "use": "video",
+        "model_id": "mock-video-old",
+        "cost_credits": 50,
+        "unlock_cost": 0,
+        "enabled": True,
+        "extra": {"preview_cost": 5},
+        "admin_password": "pass123456",
+    }, headers=h).status_code == 200
+
+    preview = client.post("/api/generate", json={
+        "category": "video",
+        "stage": "preview",
+        "prompt": {"final_text": "snapshot video"},
+        "params": {"duration": 2},
+    }, headers=h)
+    assert preview.status_code == 200, preview.text
+
+    assert client.put("/api/admin/models", json={
+        "use": "video",
+        "model_id": "mock-video-new",
+        "cost_credits": 200,
+        "unlock_cost": 0,
+        "enabled": True,
+        "extra": {"preview_cost": 20},
+        "admin_password": "pass123456",
+    }, headers=h).status_code == 200
+
+    seen = {}
+
+    def fake_submit(_prompt, model_id, _params, extra=None):
+        seen["model_id"] = model_id
+        seen["extra"] = extra
+        return "external-snapshot-final"
+
+    monkeypatch.setattr("app.services.gateway.submit_video", fake_submit)
+    monkeypatch.setattr(
+        "app.services.gateway.poll_video",
+        lambda *_args, **_kwargs: {
+            "status": "succeeded",
+            "url": "http://example.com/final.mp4",
+        },
+    )
+    monkeypatch.setattr(
+        "app.services.gateway.download_to_storage",
+        lambda _url, subdir, ext, **_kwargs: storage.save_bytes(tiny_mp4, subdir, ext),
+    )
+
+    final = client.post("/api/generate", json={
+        "category": "video",
+        "stage": "final",
+        "parent_task_id": preview.json()["id"],
+        "params": {},
+    }, headers=h)
+    assert final.status_code == 200, final.text
+    task = client.get(f"/api/tasks/{final.json()['id']}", headers=h).json()
+    assert task["cost_frozen"] == 50
+    assert task["cost_settled"] == 50
+    assert seen["model_id"] == "mock-video-old"
+
+
+def test_video_final_rejects_stale_preview_gateway_key_snapshot(client, make_user, auth):
+    make_user("13900000178", balance=1000, admin=True)
+    h = auth("13900000178")
+    body = {
+        "use": "video",
+        "provider": "custom_openai",
+        "base_url": "https://video-gateway.example.com/v1",
+        "gateway_format": "openai",
+        "model_id": "mock-video",
+        "cost_credits": 50,
+        "unlock_cost": 0,
+        "enabled": True,
+        "extra": {"preview_cost": 5},
+        "admin_password": "pass123456",
+    }
+    first = client.put("/api/admin/models", json={**body, "api_key": "old-key"}, headers=h)
+    assert first.status_code == 200, first.text
+
+    preview = client.post("/api/generate", json={
+        "category": "video",
+        "stage": "preview",
+        "prompt": {"final_text": "snapshot drift"},
+        "params": {"duration": 2},
+    }, headers=h)
+    assert preview.status_code == 200, preview.text
+
+    changed = client.put("/api/admin/models", json={**body, "api_key": "new-key"}, headers=h)
+    assert changed.status_code == 200, changed.text
+
+    final = client.post("/api/generate", json={
+        "category": "video",
+        "stage": "final",
+        "parent_task_id": preview.json()["id"],
+        "params": {},
+    }, headers=h)
+    assert final.status_code == 409
+    assert "模型网关配置已变更" in final.text
+
+
+def test_video_final_can_regenerate_after_succeeded_task_loses_asset(
+    client, make_user, auth, monkeypatch, tiny_mp4
+):
+    make_user("13900000164", balance=1000, admin=True)
+    h = auth("13900000164")
+    assert client.put("/api/admin/models", json={
+        "use": "video",
+        "model_id": "mock-video",
+        "cost_credits": 50,
+        "unlock_cost": 0,
+        "enabled": True,
+        "extra": {"preview_cost": 5},
+        "admin_password": "pass123456",
+    }, headers=h).status_code == 200
+    preview = client.post("/api/generate", json={
+        "category": "video",
+        "stage": "preview",
+        "prompt": {"final_text": "rebuild final"},
+        "params": {"duration": 2},
+    }, headers=h)
+    assert preview.status_code == 200, preview.text
+
+    monkeypatch.setattr("app.services.gateway.submit_video", lambda *_args, **_kwargs: "external-rebuild")
+    monkeypatch.setattr(
+        "app.services.gateway.poll_video",
+        lambda *_args, **_kwargs: {
+            "status": "succeeded",
+            "url": "http://example.com/final.mp4",
+        },
+    )
+    monkeypatch.setattr(
+        "app.services.gateway.download_to_storage",
+        lambda _url, subdir, ext, **_kwargs: storage.save_bytes(tiny_mp4, subdir, ext),
+    )
+
+    first = client.post("/api/generate", json={
+        "category": "video",
+        "stage": "final",
+        "parent_task_id": preview.json()["id"],
+        "params": {},
+    }, headers=h)
+    assert first.status_code == 200, first.text
+    first_task = client.get(f"/api/tasks/{first.json()['id']}", headers=h).json()
+    asset_id = first_task["assets"][0]["id"]
+    assert client.delete(f"/api/assets/{asset_id}", headers=h).status_code == 200
+
+    second = client.post("/api/generate", json={
+        "category": "video",
+        "stage": "final",
+        "parent_task_id": preview.json()["id"],
+        "params": {},
+    }, headers=h)
+    assert second.status_code == 200, second.text
+    assert second.json()["id"] != first.json()["id"]
+    assert client.get(f"/api/tasks/{second.json()['id']}", headers=h).json()["assets"]
 
 
 def test_image_hd_extension_matches_jpeg_response(client, make_user, auth, monkeypatch):
@@ -643,8 +1054,24 @@ def test_retry_requires_failed(client, make_user, auth):
 
 
 def test_retry_reprices_failed_image_task(client, make_user, auth):
-    uid = make_user("13900000082", balance=1000, admin=True)
-    h = auth("13900000082")
+    uid = make_user("13900000144", balance=1000)
+    h = auth("13900000144")
+    db = SessionLocal()
+    try:
+        set_setting(db, "image_n", 4)
+    finally:
+        db.close()
+    admin_phone = "13900000165"
+    make_user(admin_phone, balance=1000, admin=True)
+    admin_h = auth(admin_phone)
+    assert client.put("/api/admin/models", json={
+        "use": "image",
+        "model_id": "mock-image",
+        "cost_credits": 5,
+        "unlock_cost": 5,
+        "enabled": True,
+        "admin_password": "pass123456",
+    }, headers=admin_h).status_code == 200
     db = SessionLocal()
     try:
         t = GenTask(
@@ -653,7 +1080,7 @@ def test_retry_reprices_failed_image_task(client, make_user, auth):
             stage="preview",
             prompt={"final_text": "retry reprices"},
             model_use="image",
-            params={"n": 2, "size": "256x256"},
+            params={"size": "256x256"},
             status="failed",
             cost_frozen=5,
             cost_settled=0,
@@ -667,4 +1094,120 @@ def test_retry_reprices_failed_image_task(client, make_user, auth):
     r = client.post(f"/api/tasks/{tid}/retry", headers=h)
     assert r.status_code == 200, r.text
     task = client.get(f"/api/tasks/{tid}", headers=h).json()
-    assert task["cost_frozen"] == 10
+    assert task["cost_frozen"] == 20
+    assert len(task["assets"]) == 4
+    db = SessionLocal()
+    try:
+        assert db.get(GenTask, tid).params["n"] == 4
+    finally:
+        db.close()
+
+
+def test_retry_preserves_existing_model_snapshot_price(client, make_user, auth):
+    uid = make_user("13900000166", balance=1000)
+    h = auth("13900000166")
+    original_model = None
+    db = SessionLocal()
+    try:
+        model = db.query(ModelConfig).filter(ModelConfig.use == "image").one()
+        original_model = {
+            "model_id": model.model_id,
+            "cost_credits": model.cost_credits,
+            "unlock_cost": model.unlock_cost,
+            "enabled": model.enabled,
+            "extra": model.extra,
+        }
+        model.model_id = "new-mock-image"
+        model.cost_credits = 99
+        model.unlock_cost = 99
+        model.enabled = True
+        t = GenTask(
+            user_id=uid,
+            category="image",
+            stage="preview",
+            prompt={"final_text": "retry old snapshot"},
+            model_use="image",
+            params={
+                "n": 2,
+                "size": "256x256",
+                "_model_snapshot": {
+                    "model_id": "old-mock-image",
+                    "cost_credits": 5,
+                    "unlock_cost": 7,
+                    "extra": {},
+                },
+            },
+            status="failed",
+            cost_frozen=10,
+            cost_settled=0,
+        )
+        db.add(t)
+        db.commit()
+        tid = t.id
+    finally:
+        db.close()
+
+    try:
+        r = client.post(f"/api/tasks/{tid}/retry", headers=h)
+        assert r.status_code == 200, r.text
+        task = client.get(f"/api/tasks/{tid}", headers=h).json()
+        assert task["cost_frozen"] == 10
+        assert task["cost_settled"] == 10
+        db = SessionLocal()
+        try:
+            params = db.get(GenTask, tid).params
+            assert params["_model_snapshot"]["model_id"] == "old-mock-image"
+            assert params["_model_snapshot"]["cost_credits"] == 5
+        finally:
+            db.close()
+    finally:
+        if original_model:
+            db = SessionLocal()
+            try:
+                model = db.query(ModelConfig).filter(ModelConfig.use == "image").one()
+                for key, value in original_model.items():
+                    setattr(model, key, value)
+                db.commit()
+            finally:
+                db.close()
+
+
+def test_retry_rejects_stale_gateway_key_snapshot(client, make_user, auth):
+    make_user("13900000179", balance=1000, admin=True)
+    h = auth("13900000179")
+    body = {
+        "use": "image",
+        "provider": "custom_openai",
+        "base_url": "https://image-gateway.example.com/v1",
+        "gateway_format": "openai",
+        "model_id": "mock-image",
+        "cost_credits": 5,
+        "unlock_cost": 5,
+        "enabled": True,
+        "admin_password": "pass123456",
+    }
+    first = client.put("/api/admin/models", json={**body, "api_key": "old-key"}, headers=h)
+    assert first.status_code == 200, first.text
+    task = client.post("/api/generate", json={
+        "category": "image",
+        "stage": "preview",
+        "prompt": {"final_text": "retry drift"},
+        "params": {"n": 1, "size": "256x256"},
+    }, headers=h)
+    assert task.status_code == 200, task.text
+    tid = task.json()["id"]
+
+    db = SessionLocal()
+    try:
+        db_task = db.get(GenTask, tid)
+        db_task.status = "failed"
+        db_task.error = "force retry"
+        db.commit()
+    finally:
+        db.close()
+
+    changed = client.put("/api/admin/models", json={**body, "api_key": "new-key"}, headers=h)
+    assert changed.status_code == 200, changed.text
+    retry = client.post(f"/api/tasks/{tid}/retry", headers=h)
+    assert retry.status_code == 409
+    assert "模型网关配置已变更" in retry.text

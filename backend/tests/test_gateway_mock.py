@@ -1,9 +1,12 @@
 """Mock gateway + watermark pipeline (no network)."""
 import base64
 import time
+from pathlib import Path
 
 from app.config import settings
 from app.services import gateway
+from app.services.model_gateway_config import RuntimeGatewayConfig
+from app.services.safe_logging import redact_url_for_log
 from app.services.watermark import image_ext, make_image_preview
 
 
@@ -53,6 +56,16 @@ def test_compose_final_fallback():
     assert "text" in r["final_text"]  # negative appended
 
 
+def test_compose_final_uses_reverse_dimension_order():
+    r = gateway._parse_structured(
+        '{"光线":"soft left key light","主体":"red product bottle",'
+        '"场景背景":"white studio","风格":"premium product photo"}'
+    )
+
+    text = r["final_text"]
+    assert text.index("主体") < text.index("场景背景") < text.index("风格") < text.index("光线")
+
+
 def test_parse_structured_fenced():
     r = gateway._parse_structured('```json\n{"主体":"x","final_text":"hello"}\n```')
     assert r["structured"]["主体"] == "x"
@@ -62,15 +75,171 @@ def test_parse_structured_fenced():
 def test_decode_image_response_downloads_each_url_once(monkeypatch):
     calls = []
 
-    def fake_download(url):
-        calls.append(url)
+    def fake_download(url, **kwargs):
+        calls.append((url, kwargs))
         return b"image-bytes"
 
     monkeypatch.setattr(gateway, "_download", fake_download)
     out = gateway._decode_image_response({"data": [{"url": "https://example.com/a.png"}]})
 
     assert out == [b"image-bytes"]
-    assert calls == ["https://example.com/a.png"]
+    assert calls == [(
+        "https://example.com/a.png",
+        {
+            "max_bytes": settings.generated_image_max_bytes,
+            "allowed_content_types": ("image/",),
+            "timeout_seconds": settings.image_download_timeout_seconds,
+        },
+    )]
+
+
+def test_decode_image_response_rejects_oversized_base64(monkeypatch):
+    monkeypatch.setattr(settings, "generated_image_max_bytes", 2)
+
+    try:
+        gateway._decode_image_response({"data": [{"b64_json": base64.b64encode(b"abcd").decode()}]})
+    except gateway.GatewayError as e:
+        assert "大小上限" in str(e)
+    else:
+        raise AssertionError("oversized image payload should fail")
+
+
+def test_download_error_does_not_leak_signed_url(monkeypatch):
+    class FakeStream:
+        is_redirect = False
+        status_code = 403
+        headers = {}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+    class FakeClient:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def stream(self, *_args, **_kwargs):
+            return FakeStream()
+
+    monkeypatch.setattr(gateway.httpx, "Client", FakeClient)
+    signed = "https://cdn.example.com/video.mp4?token=secret-token"
+    try:
+        gateway.download_bytes(signed)
+    except gateway.GatewayError as e:
+        assert "secret-token" not in str(e)
+        assert "cdn.example.com" not in str(e)
+        assert "403" in str(e)
+    else:
+        raise AssertionError("download should fail")
+
+
+def test_download_to_path_rejects_explicit_non_video_type(monkeypatch, tmp_path):
+    class FakeStream:
+        is_redirect = False
+        status_code = 200
+        headers = {"content-type": "text/html"}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def iter_bytes(self):
+            yield b"<html>not video</html>"
+
+    class FakeClient:
+        def __init__(self, *_args, **kwargs):
+            self.timeout = kwargs.get("timeout")
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def stream(self, *_args, **_kwargs):
+            return FakeStream()
+
+    seen = {}
+
+    def fake_client(*args, **kwargs):
+        seen["timeout"] = kwargs.get("timeout")
+        return FakeClient(*args, **kwargs)
+
+    monkeypatch.setattr(gateway.httpx, "Client", fake_client)
+    out = Path(tmp_path) / "bad.mp4"
+
+    try:
+        gateway.download_to_path(
+            "https://cdn.example.com/rendered",
+            out,
+            timeout_seconds=123,
+            allowed_content_types=("video/", "application/octet-stream"),
+        )
+    except gateway.GatewayError as e:
+        assert "类型" in str(e)
+    else:
+        raise AssertionError("download should reject text/html")
+
+    assert seen["timeout"] == 123
+    assert not out.exists()
+
+
+def test_download_rejects_compressed_result_and_uses_identity_header(monkeypatch):
+    seen = {}
+
+    class FakeStream:
+        is_redirect = False
+        status_code = 200
+        headers = {"content-type": "image/png", "content-encoding": "gzip"}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def iter_raw(self):
+            yield b"compressed"
+
+    @gateway.contextmanager
+    def fake_guarded_stream(_client, method, url, **kwargs):
+        seen.update({"method": method, "url": url, "headers": kwargs.get("headers")})
+        yield FakeStream()
+
+    monkeypatch.setattr(gateway, "_guarded_stream", fake_guarded_stream)
+
+    try:
+        gateway._download(
+            "https://cdn.example.com/a.png",
+            max_bytes=1024,
+            allowed_content_types=("image/",),
+        )
+    except gateway.GatewayError as e:
+        assert "压缩编码" in str(e)
+    else:
+        raise AssertionError("compressed media downloads must be rejected")
+
+    assert seen["headers"]["Accept-Encoding"] == "identity"
+
+
+def test_redact_url_for_log_strips_userinfo_query_and_fragment():
+    redacted = redact_url_for_log("https://user:pass@example.com:8443/a.png?sig=secret#token")
+
+    assert redacted == "https://example.com:8443/a.png?<redacted>#<redacted>"
+    assert "user" not in redacted
+    assert "pass" not in redacted
+    assert "secret" not in redacted
+    assert "token" not in redacted
 
 
 def test_image_edit_repeats_without_n(monkeypatch):
@@ -129,6 +298,63 @@ def test_text_to_image_repeats_without_n(monkeypatch):
     assert all(retries == 0 for _method, _url, _payload, _timeout, retries in calls)
 
 
+def test_text_to_image_uses_per_model_gateway_config(monkeypatch):
+    monkeypatch.setattr(settings, "mock_mode", False)
+    raw = base64.b64encode(gateway._mock_image("x", "256x256", 0)).decode()
+    calls = []
+    cfg = RuntimeGatewayConfig(
+        use="image",
+        provider="custom_openai",
+        base_url="https://model-gateway.example.com/v1",
+        api_key="model-key",
+        gateway_format="openai",
+    )
+
+    def fake_request_json(method, url, *, headers, payload, timeout, retries):
+        calls.append((method, url, headers, dict(payload)))
+        return {"data": [{"b64_json": raw}]}
+
+    monkeypatch.setattr(gateway, "_request_json", fake_request_json)
+    imgs = gateway.gen_image("a cat", "gpt-image-x", n=1, size="256x256", gateway_config=cfg)
+
+    assert len(imgs) == 1
+    assert calls[0][1] == "https://model-gateway.example.com/v1/images/generations"
+    assert calls[0][2]["Authorization"] == "Bearer model-key"
+    assert calls[0][3]["model"] == "gpt-image-x"
+
+
+def test_reverse_uses_per_model_gateway_config(monkeypatch):
+    monkeypatch.setattr(settings, "mock_mode", False)
+    seen = {}
+    cfg = RuntimeGatewayConfig(
+        use="vision",
+        provider="custom_openai",
+        base_url="https://vision-gateway.example.com/v1",
+        api_key="vision-key",
+        gateway_format="openai",
+    )
+
+    def fake_post(path, payload, timeout=None, config=None):
+        seen["path"] = path
+        seen["payload"] = payload
+        seen["timeout"] = timeout
+        seen["config"] = config
+        return {
+            "choices": [{
+                "message": {"content": '{"final_text":"same style","主体":"cat"}'},
+            }],
+            "usage": {"total_tokens": 9},
+        }
+
+    monkeypatch.setattr(gateway, "_post", fake_post)
+    res = gateway.reverse_prompt("https://example.com/ref.png", "vision-model", gateway_config=cfg)
+
+    assert res["final_text"] == "same style"
+    assert seen["path"] == "/chat/completions"
+    assert seen["config"] is cfg
+    assert seen["payload"]["model"] == "vision-model"
+
+
 def test_text_to_image_repeated_requests_run_in_parallel(monkeypatch):
     monkeypatch.setattr(settings, "mock_mode", False)
     monkeypatch.setattr(settings, "gateway_base_url", "http://gateway.test")
@@ -172,3 +398,25 @@ def test_text_to_image_returns_partial_successes(monkeypatch):
 
     assert len(imgs) == 3
     assert calls["n"] == 4
+
+
+def test_text_to_image_retries_transient_gateway_status(monkeypatch):
+    monkeypatch.setattr(settings, "mock_mode", False)
+    monkeypatch.setattr(settings, "gateway_base_url", "http://gateway.test")
+    monkeypatch.setattr(settings, "gateway_api_key", "test-key")
+    monkeypatch.setattr(settings, "image_gateway_parallelism", 4)
+    monkeypatch.setattr(settings, "image_gateway_max_retries", 1)
+    raw = base64.b64encode(gateway._mock_image("x", "256x256", 0)).decode()
+    calls = {"n": 0}
+
+    def flaky_request_json(method, url, *, headers, payload, timeout, retries):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise gateway.GatewayError("upstream 502", status_code=502, transient=True)
+        return {"data": [{"b64_json": raw}]}
+
+    monkeypatch.setattr(gateway, "_request_json", flaky_request_json)
+    imgs = gateway.gen_image("a cat", "gpt-image-2", n=4, size="256x256")
+
+    assert len(imgs) == 4
+    assert calls["n"] == 5

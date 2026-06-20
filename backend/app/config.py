@@ -56,10 +56,12 @@ class Settings(BaseSettings):
     # not wait as long as render endpoints.
     image_gateway_timeout_seconds: int = 600
     image_download_timeout_seconds: int = 600
+    generated_image_max_bytes: int = 80 * 1024 * 1024
     # Batch image generation is implemented as repeated single-image requests
     # because the current gateway rejects n/tool-count parameters. Run those
     # repeated requests concurrently so n=4/8 does not become a serial queue.
     image_gateway_parallelism: int = 8
+    image_gateway_max_retries: int = 1
     # When true (or when gateway_api_key is empty) the gateway client returns
     # locally generated placeholder media so the whole flow runs offline.
     mock_mode: bool = False
@@ -73,13 +75,18 @@ class Settings(BaseSettings):
     video_submit_timeout_seconds: int = 300
     # Async video render polling (a worker stays busy for up to this long per
     # render — tune down, or run a dedicated video worker, under high load).
-    video_poll_max_seconds: int = 1800
+    video_poll_max_seconds: int = 7200
     video_poll_interval_seconds: int = 5
     video_download_max_attempts: int = 5
+    # Provider-rendered videos can be large and remote object storage may be
+    # slow after generation completes. Keep the media download timeout wider
+    # than image downloads while preserving content-type and size checks.
+    video_download_timeout_seconds: int = 3600
+    video_download_max_bytes: int = 2 * 1024 * 1024 * 1024
 
     # Hard ceiling for a single Celery task. Must exceed image render waits and
     # video lifecycle backstops so the worker does not kill valid long renders.
-    celery_task_time_limit_seconds: int = 2700
+    celery_task_time_limit_seconds: int = 8100
 
     # --- Storage (local filesystem for the bare-metal MVP) ---
     storage_dir: str = str(BASE_DIR / "storage")
@@ -123,8 +130,14 @@ class Settings(BaseSettings):
     max_image_n: int = 8
     max_image_dim: int = 4096  # max width/height for a requested image size
     max_upload_image_bytes: int = 20 * 1024 * 1024
-    max_upload_image_pixels: int = 50_000_000
-    max_video_seconds: int = 30
+    max_upload_image_pixels: int = 24_000_000
+    payment_notify_max_body_bytes: int = 64 * 1024
+    payment_order_rate_limit_per_hour: int = 20
+    payment_order_pending_limit: int = 5
+    # Production SSRF guard for operator-configured egress endpoints. Leave
+    # blank unless a gateway really must point at an internal host.
+    trusted_egress_hosts: str = ""
+    max_video_seconds: int = 15 * 60
     max_prompt_chars: int = 8_000
     max_generate_params_bytes: int = 16_384
     # How many keyframes to sample from a reference video for understanding.
@@ -149,6 +162,9 @@ class Settings(BaseSettings):
     # Used to encrypt payment merchant secrets stored from the admin UI. In
     # production set this to a strong random value and keep it outside the DB.
     payment_config_secret: str = ""
+    # Used to encrypt model-provider API keys configured from the admin UI.
+    # Falls back to PAYMENT_CONFIG_SECRET when left blank for small deployments.
+    model_config_secret: str = ""
     # Optional merchant PID/seller id expected in Alipay notify payloads.
     alipay_seller_id: str = ""
 
@@ -165,6 +181,7 @@ class Settings(BaseSettings):
     wechat_pay_appid: str = ""
     wechat_pay_mchid: str = ""
     wechat_pay_serial_no: str = ""
+    wechat_pay_platform_serial_no: str = ""
     wechat_pay_private_key: str = ""
     wechat_pay_api_v3_key: str = ""
     wechat_pay_platform_cert_pem: str = ""
@@ -190,17 +207,21 @@ class Settings(BaseSettings):
         return [o.strip() for o in self.trusted_proxy_ips.split(",") if o.strip()]
 
     @property
+    def trusted_egress_host_list(self) -> list[str]:
+        return [o.strip().lower() for o in self.trusted_egress_hosts.split(",") if o.strip()]
+
+    @property
     def effective_mock_mode(self) -> bool:
         return self.mock_mode or not self.gateway_api_key or not self.gateway_base_url
 
     # Video gateway resolves to its own creds when set, else the main gateway.
     @property
     def video_base(self) -> str:
-        return self.video_gateway_base_url or self.gateway_base_url
+        return self.video_gateway_base_url or (self.gateway_base_url if self.video_gateway_format == "openai" else "")
 
     @property
     def video_key(self) -> str:
-        return self.video_gateway_api_key or self.gateway_api_key
+        return self.video_gateway_api_key or (self.gateway_api_key if self.video_gateway_format == "openai" else "")
 
     @property
     def effective_video_mock(self) -> bool:

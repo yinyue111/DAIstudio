@@ -24,6 +24,10 @@ DEFAULT_PAYMENT_PACKAGES = [
 ]
 
 VALID_PROVIDERS = {"alipay", "wechat"}
+PUBLIC_FIELDS = {
+    "alipay": {"app_id", "seller_id", "gateway_url", "notify_url"},
+    "wechat": {"appid", "mchid", "serial_no", "platform_serial_no", "gateway_url", "notify_url"},
+}
 SECRET_FIELDS = {
     "alipay": {"private_key", "public_key"},
     "wechat": {"private_key", "api_v3_key", "platform_cert_pem"},
@@ -36,6 +40,7 @@ NOTIFY_PATHS = {
     "alipay": "/api/payments/alipay/notify",
     "wechat": "/api/payments/wechat/notify",
 }
+_ADMIN_OVERRIDE_KEY = "_admin_override"
 
 
 class PaymentConfigError(Exception):
@@ -49,6 +54,7 @@ class ProviderRuntimeConfig:
     mode: str
     public: dict[str, Any]
     secret: dict[str, str]
+    source: str = "db"
 
 
 def _fernet() -> Fernet:
@@ -95,6 +101,45 @@ def _normalise_secret(provider: str, current: dict | None, incoming: dict | None
             continue
         next_secret[key] = encrypt_secret(text)
     return next_secret
+
+
+def _admin_overrides_provider(row: PaymentProviderConfig) -> bool:
+    """True once the DB row contains an operator-authored provider decision.
+
+    Seeded default rows are disabled/mock/empty so local dev and env-only
+    production configs can still fall back. As soon as an admin saves public or
+    secret config, switches live mode, or enables the provider, the row becomes
+    authoritative, including when later disabled.
+    """
+    return bool(
+        (row.public_config or {}).get(_ADMIN_OVERRIDE_KEY)
+        or row.enabled
+        or (row.mode or "mock") != "mock"
+        or public_config_for_provider(row.provider, row.public_config)
+        or row.secret_config
+    )
+
+
+def _public_config_without_internal(public: dict | None) -> dict:
+    return {k: v for k, v in dict(public or {}).items() if not str(k).startswith("_")}
+
+
+def public_config_for_provider(
+    provider: str,
+    public: dict | None,
+    *,
+    reject_unknown: bool = False,
+) -> dict:
+    allowed = PUBLIC_FIELDS.get(provider, set())
+    raw = dict(public or {})
+    unknown = sorted(
+        str(key)
+        for key in raw
+        if not str(key).startswith("_") and str(key) not in allowed
+    )
+    if reject_unknown and unknown:
+        raise PaymentConfigError("支付 public_config 包含非法字段: " + ", ".join(unknown))
+    return {str(k): v for k, v in raw.items() if str(k) in allowed}
 
 
 def decrypt_secret_config(provider: str, secret_config: dict | None) -> dict[str, str]:
@@ -199,12 +244,25 @@ def get_runtime_provider(db: Session, provider: str) -> ProviderRuntimeConfig | 
     row = get_provider(db, provider)
     if not row:
         return None
+    secret = decrypt_secret_config(provider, row.secret_config)
     return ProviderRuntimeConfig(
         provider=provider,
         enabled=bool(row.enabled),
         mode=row.mode or "mock",
-        public=row.public_config or {},
-        secret=decrypt_secret_config(provider, row.secret_config),
+        public=public_config_for_provider(provider, row.public_config),
+        secret=secret,
+        source="db",
+    )
+
+
+def _disabled_runtime(provider: str, *, source: str = "none") -> ProviderRuntimeConfig:
+    return ProviderRuntimeConfig(
+        provider=provider,
+        enabled=False,
+        mode="mock",
+        public={},
+        secret={},
+        source=source,
     )
 
 
@@ -221,6 +279,7 @@ def _fallback_public(provider: str) -> dict:
             "appid": settings.wechat_pay_appid,
             "mchid": settings.wechat_pay_mchid,
             "serial_no": settings.wechat_pay_serial_no,
+            "platform_serial_no": settings.wechat_pay_platform_serial_no,
             "gateway_url": settings.wechat_pay_gateway_url,
             "notify_url": settings.wechat_pay_notify_url,
         }
@@ -243,14 +302,29 @@ def _fallback_secret(provider: str) -> dict:
 
 
 def runtime_or_env(db: Session | None, provider: str) -> ProviderRuntimeConfig:
-    row_cfg = get_runtime_provider(db, provider) if db is not None else None
-    if row_cfg and (
-        row_cfg.enabled
-        or row_cfg.mode != "mock"
-        or any(row_cfg.public.values())
-        or any(row_cfg.secret.values())
-    ):
-        return row_cfg
+    if db is not None:
+        row = get_provider(db, provider)
+        if row is not None and _admin_overrides_provider(row):
+            try:
+                row_cfg = get_runtime_provider(db, provider)
+            except PaymentConfigError:
+                return _disabled_runtime(provider, source="db")
+            if not row_cfg:
+                return _disabled_runtime(provider, source="db")
+            # Once an admin row exists, DB is the authority. A disabled or
+            # invalid DB config must not be silently overridden by env vars.
+            if not row_cfg.enabled:
+                return row_cfg
+            issues = validate_provider(
+                provider,
+                row_cfg.public,
+                row_cfg.secret,
+                enabled=row_cfg.enabled,
+                mode=row_cfg.mode,
+            )
+            if issues:
+                return _disabled_runtime(provider, source="db")
+            return row_cfg
     public = _fallback_public(provider)
     secret = _fallback_secret(provider)
     env_ready = False
@@ -273,22 +347,23 @@ def runtime_or_env(db: Session | None, provider: str) -> ProviderRuntimeConfig:
     if env_ready:
         issues = validate_provider(provider, public, secret, enabled=True, mode="live")
         if issues:
-            return ProviderRuntimeConfig(provider=provider, enabled=False, mode="mock", public={}, secret={})
+            return _disabled_runtime(provider)
         return ProviderRuntimeConfig(
             provider=provider,
             enabled=True,
             mode="live",
             public=public,
             secret=secret,
+            source="env",
         )
-    return ProviderRuntimeConfig(provider=provider, enabled=False, mode="mock", public={}, secret={})
+    return _disabled_runtime(provider, source="none")
 
 
 def validate_provider(provider: str, public: dict | None, secret: dict | None,
                       *, enabled: bool, mode: str) -> list[str]:
     if provider not in VALID_PROVIDERS:
         return ["支付渠道非法"]
-    public = public or {}
+    public = public_config_for_provider(provider, public)
     secret = secret or {}
     issues: list[str] = []
     if not enabled:
@@ -329,6 +404,7 @@ def validate_provider(provider: str, public: dict | None, secret: dict | None,
             ("appid", "微信 APPID"),
             ("mchid", "微信商户号"),
             ("serial_no", "微信商户证书序列号"),
+            ("platform_serial_no", "微信平台证书序列号"),
         ):
             if not str(public.get(key) or "").strip():
                 issues.append(f"{label} 未配置")
@@ -345,30 +421,53 @@ def validate_provider(provider: str, public: dict | None, secret: dict | None,
     return issues
 
 
+def _required_fields_present(provider: str, public: dict | None, secret: dict | None,
+                             *, mode: str) -> bool:
+    if mode == "mock":
+        return False
+    if provider == "alipay":
+        public_keys = ("app_id", "seller_id")
+        secret_keys = ("private_key", "public_key")
+    elif provider == "wechat":
+        public_keys = ("appid", "mchid", "serial_no", "platform_serial_no")
+        secret_keys = ("private_key", "api_v3_key", "platform_cert_pem")
+    else:
+        return False
+    return all(str((public or {}).get(k) or "").strip() for k in public_keys) and all(
+        str((secret or {}).get(k) or "").strip() for k in secret_keys
+    )
+
+
 def provider_out(row: PaymentProviderConfig) -> dict:
     provider = row.provider
     issues: list[str] = []
+    public = public_config_for_provider(provider, row.public_config)
     try:
         secret = decrypt_secret_config(provider, row.secret_config)
     except PaymentConfigError as e:
         secret = {}
         issues.append(str(e))
-    issues.extend(
-        validate_provider(
-            provider,
-            row.public_config or {},
-            secret,
-            enabled=bool(row.enabled),
-            mode=row.mode or "mock",
-        )
+    validation_issues = validate_provider(
+        provider,
+        public,
+        secret,
+        enabled=bool(row.enabled),
+        mode=row.mode or "mock",
+    )
+    issues.extend(validation_issues)
+    required_present = _required_fields_present(
+        provider,
+        public,
+        secret,
+        mode=row.mode or "mock",
     )
     return {
         "provider": provider,
         "enabled": bool(row.enabled),
         "mode": row.mode or "mock",
-        "public_config": row.public_config or {},
+        "public_config": public,
         "secret_config_masked": mask_secret_config(provider, row.secret_config),
-        "configured": not issues,
+        "configured": required_present,
         "ready": bool(row.enabled) and not issues,
         "issues": issues,
     }
@@ -382,6 +481,36 @@ def list_providers(db: Session) -> list[dict]:
         ).scalars()
     )
     return [provider_out(r) for r in rows]
+
+
+def list_providers_with_runtime(db: Session) -> list[dict]:
+    by_provider = {p["provider"]: p for p in list_providers(db)}
+    out = []
+    for provider in sorted(VALID_PROVIDERS):
+        current = dict(by_provider.get(provider) or {
+            "provider": provider,
+            "enabled": False,
+            "mode": "mock",
+            "public_config": {},
+            "secret_config_masked": {},
+            "configured": False,
+            "ready": False,
+            "issues": [],
+        })
+        runtime = runtime_or_env(db, provider)
+        if runtime.enabled and runtime.source == "env" and not current.get("ready"):
+            current.update({
+                "enabled": True,
+                "mode": runtime.mode,
+                "configured": True,
+                "ready": True,
+                "issues": [],
+                "source": "env",
+            })
+        else:
+            current["source"] = runtime.source
+        out.append(current)
+    return out
 
 
 def save_provider(db: Session, provider: str, enabled: bool, mode: str,
@@ -399,7 +528,8 @@ def save_provider(db: Session, provider: str, enabled: bool, mode: str,
     if row is None:
         row = PaymentProviderConfig(provider=provider)
         db.add(row)
-    public = dict(public_config or {})
+    public = public_config_for_provider(provider, public_config, reject_unknown=True)
+    public[_ADMIN_OVERRIDE_KEY] = True
     if public.get("gateway_url"):
         public["gateway_url"] = str(public["gateway_url"]).strip().rstrip("/")
     if public.get("notify_url"):
@@ -420,8 +550,7 @@ def save_provider(db: Session, provider: str, enabled: bool, mode: str,
 
 
 def export_public_status(db: Session) -> dict:
-    providers = list_providers(db)
     return {
         "packages": [package_to_dict(p) for p in list_packages(db, enabled_only=True)],
-        "providers": providers,
+        "providers": list_providers_with_runtime(db),
     }

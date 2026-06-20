@@ -10,6 +10,7 @@ import logging
 
 from sqlalchemy.orm import Session
 
+from ..db import SessionLocal
 from ..models import AuditLog
 
 logger = logging.getLogger("audit")
@@ -25,8 +26,10 @@ def log(
     ip: str | None = None,
     detail: dict | None = None,
 ) -> bool:
+    del db  # audit logging must not commit or roll back caller transactions
+    audit_db = SessionLocal()
     try:
-        db.add(
+        audit_db.add(
             AuditLog(
                 user_id=user_id,
                 action=action,
@@ -36,10 +39,12 @@ def log(
                 detail=detail,
             )
         )
-        db.commit()
+        audit_db.commit()
         return True
     except Exception as e:  # noqa: BLE001
-        db.rollback()
+        audit_db.rollback()
         logger.warning("audit log write failed action=%s biz_type=%s biz_id=%s: %s",
                        action, biz_type, biz_id, e)
         return False
+    finally:
+        audit_db.close()

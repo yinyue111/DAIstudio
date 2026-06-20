@@ -1,3 +1,4 @@
+import base64
 import io
 from urllib.parse import urlparse
 
@@ -29,12 +30,22 @@ def test_upload_image_returns_reference_asset(client, make_user, auth):
     assert asset["type"] == "image"
     assert asset["width"] == 32
     assert asset["height"] == 48
-    assert urlparse(asset["url"]).path.startswith("/api/uploads/upload/")
-    assert urlparse(asset["thumb"]).path.startswith("/api/uploads/upload_preview/")
+    url_key = urlparse(asset["url"]).path.removeprefix("/api/uploads/")
+    thumb_key = urlparse(asset["thumb"]).path.removeprefix("/api/uploads/")
+    assert url_key.startswith("upload/")
+    assert thumb_key.startswith("upload_preview/")
+    assert url_key.split("/", 1)[1].rsplit(".", 1)[0] == thumb_key.split("/", 1)[1].rsplit(".", 1)[0]
+    model_ref_key = "upload_model_ref/" + url_key.split("/", 1)[1].rsplit(".", 1)[0] + ".png"
+    db = SessionLocal()
+    try:
+        assert db.get(UploadedAsset, model_ref_key) is not None
+    finally:
+        db.close()
     assert client.get(urlparse(asset["url"]).path).status_code == 401
     assert client.get(urlparse(asset["url"]).path, headers=h).status_code == 200
     assert client.get(urlparse(asset["thumb"]).path).status_code == 401
     assert client.get(urlparse(asset["thumb"]).path, headers=h).status_code == 200
+    assert client.get(f"/api/uploads/{model_ref_key}", headers=h).status_code == 404
 
 
 def test_upload_image_commits_even_when_audit_fails(client, make_user, auth, monkeypatch):
@@ -67,6 +78,18 @@ def test_upload_image_rejects_non_image(client, make_user, auth):
     )
     assert r.status_code == 400
     assert "有效图片" in r.text
+
+
+def test_upload_image_rejects_oversized_content_length(client, make_user, auth, monkeypatch):
+    make_user("13900000109", balance=1000)
+    h = auth("13900000109")
+    monkeypatch.setattr("app.routers.uploads.settings.max_upload_image_bytes", 16)
+    r = client.post(
+        "/api/uploads/image",
+        files={"file": ("ref.png", _png_bytes(), "image/png")},
+        headers=h,
+    )
+    assert r.status_code == 413
 
 
 def test_uploaded_image_can_drive_reference_edit_generation(
@@ -115,6 +138,9 @@ def test_uploaded_image_can_drive_reference_edit_generation(
     }, headers=h)
     assert r.status_code == 200, r.text
     assert seen["reference_image_url"].startswith("data:image/png;base64,")
+    ref_bytes = base64.b64decode(seen["reference_image_url"].split(",", 1)[1])
+    ref_img = Image.open(io.BytesIO(ref_bytes))
+    assert ref_img.size == (40, 80)
     assert seen["edit_path"] == "/v1/images/edits"
     assert seen["size"] == "512x1024"
 

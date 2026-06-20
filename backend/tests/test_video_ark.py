@@ -1,6 +1,7 @@
 """Volcengine Ark (Seedance) video adapter — payload shaping (no network)."""
 from app.config import settings
 from app.services import gateway
+from app.services.model_gateway_config import RuntimeGatewayConfig
 
 
 def test_ark_text_flags():
@@ -12,6 +13,11 @@ def test_ark_text_flags():
     assert "--ratio 16:9" in t
     assert "--seed 42" in t
     assert "--watermark false" in t
+
+
+def test_ark_text_allows_15_min_duration():
+    t = gateway._ark_text("long ad sequence", {"duration": 900, "resolution": "1080p"})
+    assert "--duration 900" in t
 
 
 def test_ark_content_image_to_video():
@@ -79,3 +85,103 @@ def test_generic_video_submit_preserves_first_frame(monkeypatch):
     assert task_id == "task-1"
     assert seen["payload"]["image_url"] == "https://example.com/cover.jpg"
     assert "first_frame_image" not in seen["payload"]
+
+
+def test_generic_video_submit_filters_internal_params(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(settings, "mock_mode", False)
+    monkeypatch.setattr(settings, "video_gateway_base_url", "https://video.example.com")
+    monkeypatch.setattr(settings, "video_gateway_api_key", "test-key")
+    monkeypatch.setattr(settings, "video_gateway_format", "openai")
+    def fake_post(path, payload, timeout=120):
+        seen["payload"] = payload
+        return {"id": "task-1"}
+
+    monkeypatch.setattr(gateway, "_video_post", fake_post)
+
+    task_id = gateway.submit_video(
+        "animate",
+        "video-model",
+        {
+            "duration": 5,
+            "resolution": "720p",
+            "ratio": "9:16",
+            "request_id": "video-1",
+            "target_resolution": "1080p",
+            "target_duration": 8,
+            "preview_resolution": "480p",
+            "reference_image_url": "http://localhost/upload-preview.png",
+            "_model_snapshot": {"model_id": "x"},
+            "_video_request_id": "internal",
+            "first_frame_image": "https://example.com/cover.jpg",
+        },
+        extra={"first_frame_field": "image_url"},
+    )
+
+    assert task_id == "task-1"
+    assert seen["payload"] == {
+        "model": "video-model",
+        "prompt": "animate",
+        "duration": 5,
+        "resolution": "720p",
+        "ratio": "9:16",
+        "request_id": "video-1",
+        "image_url": "https://example.com/cover.jpg",
+    }
+
+
+def test_video_ark_uses_per_model_gateway_config(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(settings, "mock_mode", False)
+    cfg = RuntimeGatewayConfig(
+        use="video",
+        provider="volcengine_ark",
+        base_url="https://ark.model.example.com/api/v3",
+        api_key="ark-key",
+        gateway_format="ark",
+    )
+
+    def fake_request(method, url, *, headers, json=None, timeout, retries):
+        seen["method"] = method
+        seen["url"] = url
+        seen["headers"] = headers
+        seen["json"] = json
+        class Resp:
+            status_code = 200
+            is_redirect = False
+            def json(self):
+                return {"id": "ark-task-1"}
+        return Resp()
+
+    monkeypatch.setattr(gateway, "_request", fake_request)
+    task_id = gateway.submit_video(
+        "animate",
+        "doubao-seedance-x",
+        {"duration": 5, "ratio": "9:16"},
+        gateway_config=cfg,
+    )
+
+    assert task_id == "ark-task-1"
+    assert seen["url"] == "https://ark.model.example.com/api/v3/contents/generations/tasks"
+    assert seen["headers"]["Authorization"] == "Bearer ark-key"
+    assert seen["json"]["model"] == "doubao-seedance-x"
+
+
+def test_generic_video_poll_accepts_data_dict(monkeypatch):
+    monkeypatch.setattr(settings, "mock_mode", False)
+    monkeypatch.setattr(settings, "video_gateway_base_url", "https://video.example.com")
+    monkeypatch.setattr(settings, "video_gateway_api_key", "test-key")
+    monkeypatch.setattr(settings, "video_gateway_format", "openai")
+    monkeypatch.setattr(
+        gateway,
+        "_video_get",
+        lambda *_args, **_kwargs: {
+            "status": "succeeded",
+            "data": {"url": "https://cdn.example.com/video.mp4"},
+        },
+    )
+
+    res = gateway.poll_video("task-1", "video-model")
+
+    assert res["status"] == "succeeded"
+    assert res["url"] == "https://cdn.example.com/video.mp4"

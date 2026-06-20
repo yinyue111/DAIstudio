@@ -9,6 +9,7 @@ from fastapi import FastAPI, Header, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import text
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from . import observability
 from .config import settings
@@ -32,60 +33,99 @@ from .routers import (
 from .routers import (
     config as config_router,
 )
+from .runtime_config import validate_model_gateway_rows, validate_runtime_config
 from .services.config_store import seed_from_yaml
 from .services.payment_config import seed_defaults as seed_payment_defaults
-from .services.payments import mock_payments_allowed, public_base_is_local
-from .services.sms import implemented_providers as implemented_sms_providers
 
 setup_logging()
 log = logging.getLogger("main")
 
 
-# Known placeholder / weak secrets that must never reach production. Includes the
-# .env.example sample so "copy example + set DEBUG=false" still refuses to boot.
-_INSECURE_JWT_SECRETS = {
-    "",
-    "change-me-in-production",
-    "please-change-me-to-a-long-random-string",
-}
-_MIN_JWT_SECRET_LEN = 32
+class BodyTooLargeError(Exception):
+    pass
 
 
-def validate_runtime_config() -> None:
-    if not public_base_is_local() and settings.debug:
-        raise RuntimeError("PUBLIC_BASE_URL 非本地域名时禁止 DEBUG=true")
-    if not settings.debug and settings.sms_provider == "mock":
-        raise RuntimeError("生产环境(DEBUG=false)禁止 SMS_PROVIDER=mock")
-    if not settings.debug and settings.sms_provider not in implemented_sms_providers():
-        raise RuntimeError(
-            "生产环境(DEBUG=false)仅支持已实现的 SMS_PROVIDER="
-            f"{','.join(sorted(implemented_sms_providers() - {'mock'}))}"
+class BodySizeLimitMiddleware:
+    """Count bytes actually read from selected public endpoints.
+
+    Content-Length can be absent or wrong (chunked uploads/callbacks), so the
+    guard wraps the ASGI receive channel and aborts once the consumed body
+    crosses the route-specific limit.
+    """
+
+    def __init__(self, app: ASGIApp):
+        self.app = app
+
+    def _limit_for_path(self, path: str) -> int | None:
+        if path == "/api/uploads/image":
+            return int(settings.max_upload_image_bytes) + 1024 * 1024
+        if path in {"/api/payments/alipay/notify", "/api/payments/wechat/notify"}:
+            return int(settings.payment_notify_max_body_bytes)
+        if path == "/api/payments/orders":
+            return 32 * 1024
+        if path.startswith("/api/admin/"):
+            return 256 * 1024
+        if path in {
+            "/api/auth/register",
+            "/api/auth/login",
+            "/api/auth/sms/send",
+            "/api/me/password",
+        }:
+            return 32 * 1024
+        if path in {"/api/generate", "/api/prompt/reverse", "/api/parse"}:
+            return 256 * 1024
+        return None
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope.get("type") != "http":
+            await self.app(scope, receive, send)
+            return
+        limit = self._limit_for_path(str(scope.get("path") or ""))
+        if not limit:
+            await self.app(scope, receive, send)
+            return
+        for key, value in scope.get("headers") or []:
+            if key.lower() == b"content-length":
+                try:
+                    declared = int(value.decode("latin1"))
+                except ValueError:
+                    await self._send_plain(send, 400, "Content-Length 非法")
+                    return
+                if declared > limit:
+                    await self._send_plain(send, 413, "请求体过大")
+                    return
+                break
+
+        seen = 0
+
+        async def limited_receive() -> Message:
+            nonlocal seen
+            message = await receive()
+            if message.get("type") == "http.request":
+                seen += len(message.get("body") or b"")
+                if seen > limit:
+                    raise BodyTooLargeError
+            return message
+
+        try:
+            await self.app(scope, limited_receive, send)
+        except BodyTooLargeError:
+            await self._send_plain(send, 413, "请求体过大")
+
+    @staticmethod
+    async def _send_plain(send: Send, status: int, text: str) -> None:
+        body = text.encode("utf-8")
+        await send(
+            {
+                "type": "http.response.start",
+                "status": status,
+                "headers": [
+                    (b"content-type", b"text/plain; charset=utf-8"),
+                    (b"content-length", str(len(body)).encode("ascii")),
+                ],
+            }
         )
-    # Production must never silently fall back to local placeholder generations.
-    if not settings.debug and (settings.mock_mode or not settings.gateway_base_url or not settings.gateway_api_key):
-        raise RuntimeError("生产环境(DEBUG=false)必须配置真实 GATEWAY_BASE_URL/GATEWAY_API_KEY 且 MOCK_MODE=false")
-    # Fail fast: a production deploy must not run with a default/weak JWT secret,
-    # otherwise anyone can forge tokens for any user (incl. admin).
-    if not settings.debug and (
-        settings.jwt_secret in _INSECURE_JWT_SECRETS
-        or len(settings.jwt_secret) < _MIN_JWT_SECRET_LEN
-    ):
-        raise RuntimeError(
-            "JWT_SECRET 不安全(为占位值或过短)。生产环境(DEBUG=false)拒绝启动,"
-            f"请设置长度 >= {_MIN_JWT_SECRET_LEN} 的强随机密钥"
-            "(如 python -c \"import secrets;print(secrets.token_urlsafe(48))\")。"
-        )
-    if not settings.debug and observability.metrics_enabled and not settings.metrics_token:
-        raise RuntimeError("生产环境(DEBUG=false)启用 /metrics 时必须设置 METRICS_TOKEN")
-    if not settings.debug and settings.payment_mock_enabled:
-        raise RuntimeError("生产环境(DEBUG=false)必须设置 PAYMENT_MOCK_ENABLED=false")
-    if settings.payment_mock_enabled and not mock_payments_allowed():
-        raise RuntimeError(
-            "PAYMENT_MOCK_ENABLED=true 仅允许 PUBLIC_BASE_URL 和 "
-            "PAYMENT_FRONTEND_BASE_URL 同时为 localhost/127.0.0.1"
-        )
-    if settings.payment_config_secret and len(settings.payment_config_secret) < 32:
-        raise RuntimeError("PAYMENT_CONFIG_SECRET 过短,请使用长度 >= 32 的强随机密钥")
+        await send({"type": "http.response.body", "body": body})
 
 
 @asynccontextmanager
@@ -100,6 +140,7 @@ async def lifespan(app: FastAPI):
     try:
         seed_from_yaml(db)
         seed_payment_defaults(db)
+        validate_model_gateway_rows(db)
     finally:
         db.close()
     init_sentry()
@@ -107,8 +148,15 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title=settings.app_name, lifespan=lifespan)
+app = FastAPI(
+    title=settings.app_name,
+    lifespan=lifespan,
+    docs_url="/docs" if settings.debug else None,
+    redoc_url="/redoc" if settings.debug else None,
+    openapi_url="/openapi.json" if settings.debug else None,
+)
 
+app.add_middleware(BodySizeLimitMiddleware)
 app.add_middleware(RequestContextMiddleware)
 app.add_middleware(
     CORSMiddleware,

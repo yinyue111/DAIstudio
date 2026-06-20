@@ -46,3 +46,11 @@ def test_video_cost_estimate():
     assert _estimate_cost(m2, "video", "preview") == 5
     # image always full cost
     assert _estimate_cost(m, "image", "preview") == 50
+
+
+def test_public_config_exposes_video_duration_limit(client, make_user, auth):
+    make_user("13900000180", balance=1000)
+    h = auth("13900000180")
+    r = client.get("/api/config", headers=h)
+    assert r.status_code == 200, r.text
+    assert r.json()["video_duration_max_seconds"] == 900

@@ -42,11 +42,12 @@ import httpx
 from bs4 import BeautifulSoup
 
 from ..config import settings
+from .safe_logging import redact_url_for_log
 from .ssrf import (
     MAX_REDIRECTS,
     SsrfError,
     assert_safe_url,
-    pinned_safe_resolution,
+    pinned_client,
 )
 
 log = logging.getLogger("fetcher")
@@ -161,7 +162,7 @@ def _safe_asset_url(url: str | None) -> str | None:
     try:
         return assert_safe_url(url)
     except SsrfError:
-        log.warning("dropped unsafe fetched asset url: %s", url)
+        log.warning("dropped unsafe fetched asset url: %s", redact_url_for_log(url))
         return None
 
 
@@ -182,6 +183,7 @@ def _same_site_or_platform(page_url: str, request_url: str) -> bool:
 def _filter_safe_assets(assets: list[dict]) -> list[dict]:
     out: list[dict] = []
     seen: set[str] = set()
+    cap = max(1, int(settings.parse_max_assets or 1))
     for asset in assets:
         url = _safe_asset_url(asset.get("url"))
         if not url or url in seen:
@@ -190,6 +192,8 @@ def _filter_safe_assets(assets: list[dict]) -> list[dict]:
         cleaned = {**asset, "url": url, "thumb": thumb}
         out.append(cleaned)
         seen.add(url)
+        if len(out) >= cap:
+            break
     return out
 
 
@@ -230,7 +234,11 @@ def _install_ssrf_route(page, page_url: str) -> None:
                         body=body,
                     )
                 except Exception as e:  # noqa: BLE001
-                    log.warning("blocked playwright proxied request %s: %s", req_url[:120], e)
+                    log.warning(
+                        "blocked playwright proxied request %s: %s",
+                        redact_url_for_log(req_url),
+                        e,
+                    )
                     route.abort()
                 return
             route.abort()
@@ -370,9 +378,9 @@ def _render_with_httpx(url: str, timeout: float = 20.0,
     headers = {"User-Agent": UA, "Referer": origin, "Accept": "text/html,*/*",
                "Accept-Encoding": "gzip, deflate"}
     assert_safe_url(url)
-    with httpx.Client(follow_redirects=False, timeout=timeout, headers=headers) as c:
-        for _ in range(MAX_REDIRECTS + 1):
-            with pinned_safe_resolution(url), c.stream("GET", url) as r:
+    for _ in range(MAX_REDIRECTS + 1):
+        with pinned_client(url, follow_redirects=False, timeout=timeout, headers=headers) as c:
+            with c.stream("GET", url) as r:
                 if r.is_redirect and r.headers.get("location"):
                     url = urljoin(url, r.headers["location"])
                     blocked = _xhs_block_message(url)
@@ -1025,7 +1033,7 @@ def _extract_weixin_assets(html: str, base_url: str) -> list[dict]:
         prop = (m.get("property") or m.get("name") or "").lower()
         if prop in ("og:image", "twitter:image"):
             push(m.get("content"), "image")
-    return out
+    return _filter_safe_assets(out)
 
 
 # --- Platform registry ------------------------------------------------------
@@ -1039,34 +1047,86 @@ def _timeout_hint(platform: str = "") -> str:
             "请稍后重试或更换可公开访问链接")
 
 
+def _xhs_security_hint(reason: str | None = None) -> str:
+    prefix = reason or "小红书返回安全校验:当前笔记暂时无法浏览"
+    return (
+        f"{prefix}。当前环境没有拿到公开可访问素材；请确认链接在未登录浏览器也能打开，"
+        "或保存/截图后使用「上传图片参考」。"
+    )
+
+
 def _run_xiaohongshu(url: str) -> list[dict]:
+    blocked_reason: str | None = None
+    should_try_canonical = False
+    rendered_empty = False
+
+    def render_httpx(candidate: str, *, timeout: float, max_read_seconds: float,
+                     max_body_bytes: int) -> list[dict]:
+        nonlocal blocked_reason
+        try:
+            html = _render_with_httpx(
+                candidate,
+                timeout=timeout,
+                max_read_seconds=max_read_seconds,
+                max_body_bytes=max_body_bytes,
+            )
+        except ValueError as e:
+            msg = str(e)
+            if "小红书返回安全校验" in msg:
+                blocked_reason = msg
+                log.warning("xiaohongshu returned security check for %s: %s",
+                            redact_url_for_log(candidate), msg)
+                return []
+            raise
+        return _extract_xiaohongshu_assets(html)
+
     try:
-        html = _render_with_httpx(url, timeout=12.0, max_read_seconds=8.0,
-                                  max_body_bytes=2_000_000)
+        assets = render_httpx(
+            url,
+            timeout=12.0,
+            max_read_seconds=8.0,
+            max_body_bytes=2_000_000,
+        )
+        if assets:
+            return assets
+        should_try_canonical = blocked_reason is not None
+    except httpx.TimeoutException:
+        log.warning("xiaohongshu direct fetch timed out; checking canonical url")
+        should_try_canonical = True
+    except httpx.HTTPError as e:
+        log.warning("xiaohongshu direct fetch failed, falling back to render: %s", e)
+
+    canonical = _canonical_url(url)
+    if should_try_canonical and canonical != url:
+        try:
+            assets = render_httpx(
+                canonical,
+                timeout=8.0,
+                max_read_seconds=4.0,
+                max_body_bytes=1_000_000,
+            )
+            if assets:
+                return assets
+        except httpx.TimeoutException as e:
+            log.warning("xiaohongshu canonical fetch timed out: %s", e)
+        except httpx.HTTPError as e:
+            log.warning("xiaohongshu canonical fetch failed: %s", e)
+
+    for candidate in (url, canonical) if canonical != url else (url,):
+        html = _render_with_playwright(candidate)
+        if html is None:
+            continue
+        rendered_empty = True
         assets = _extract_xiaohongshu_assets(html)
         if assets:
             return assets
-    except httpx.TimeoutException:
-        log.warning("xiaohongshu direct fetch timed out; checking canonical url")
-        canonical = _canonical_url(url)
-        if canonical != url:
-            try:
-                html = _render_with_httpx(canonical, timeout=8.0,
-                                          max_read_seconds=4.0,
-                                          max_body_bytes=1_000_000)
-                assets = _extract_xiaohongshu_assets(html)
-                if assets:
-                    return assets
-            except ValueError:
-                # a security-check ValueError (e.g. 安全校验) must propagate as-is,
-                # not be downgraded to a generic timeout/HTTP hint.
-                raise
-            except httpx.HTTPError as e:
-                log.warning("xiaohongshu canonical fetch failed after timeout: %s", e)
-    html = _render_with_playwright(url)
-    if html is None:
-        raise ValueError(_timeout_hint("小红书"))
-    return _extract_xiaohongshu_assets(html)
+
+    if blocked_reason:
+        raise ValueError(_xhs_security_hint(blocked_reason))
+    if rendered_empty:
+        return []
+    raise ValueError(_timeout_hint("小红书"))
+
 
 
 def _run_douyin(url: str) -> list[dict]:
