@@ -5,6 +5,8 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from datetime import datetime, timezone
+from urllib.parse import urlparse
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy import select
@@ -15,11 +17,12 @@ from ..config import settings
 from ..db import get_db
 from ..deps import get_client_ip, get_current_user
 from ..models import GenAsset, GenTask, UploadedAsset, User
-from ..redis_client import redis_client
 from ..schemas import GenerateIn, TaskOut
 from ..services import asset_refs, audit, credits, generation, locks
 from ..services.config_store import get_model_config, get_setting
+from ..services.content_safety import assert_text_allowed
 from ..services.generation import assert_model_snapshot_compatible, model_snapshot
+from ..services.rate_limit import incr_window
 from ..services.ssrf import (
     SsrfError,
     assert_safe_user_asset_url,
@@ -54,6 +57,14 @@ _VIDEO_PARAM_KEYS = _COMMON_PARAM_KEYS | {
     "preview_resolution",
     "preview_duration",
 }
+_SOURCE_META_URL_KEYS = {
+    "original_url",
+    "original_thumb",
+    "source_page_url",
+    "selected_url",
+    "selected_thumb",
+}
+_SOURCE_META_TEXT_KEYS = {"source_captured_at", "selected_type"}
 
 
 def _normalise_reference_dimensions(params: dict) -> None:
@@ -150,11 +161,66 @@ def _validate_prompt_payload(prompt: dict, instruction: str | None) -> None:
                 raise HTTPException(400, f"{key} 过长")
 
 
+def _clean_source_meta_url(value) -> str | None:
+    if not isinstance(value, str):
+        return None
+    url = value.strip()
+    if not url or len(url) > 2048:
+        return None
+    parsed = urlparse(url)
+    if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
+        return None
+    return url
+
+
+def _clean_source_meta_text(value, *, max_len: int = 128) -> str | None:
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text:
+        return None
+    return text[:max_len]
+
+
+def _source_trace(
+    *,
+    source_asset_url: str | None,
+    source_type: str | None,
+    meta: dict | None,
+) -> dict:
+    """Store bounded provenance metadata for compliance/audit only.
+
+    The trace is written under ``params._source_trace`` and ignored by request
+    fingerprinting, so it cannot alter generation idempotency.
+    """
+    source_meta = meta if isinstance(meta, dict) else {}
+    try:
+        raw_size = len(json.dumps(source_meta, ensure_ascii=False))
+    except (TypeError, ValueError):
+        source_meta = {}
+        raw_size = 0
+    if raw_size > 8192:
+        source_meta = {}
+
+    trace: dict = {
+        "recorded_at": datetime.now(timezone.utc).isoformat(),
+        "source_asset_url": _clean_source_meta_url(source_asset_url),
+        "source_type": source_type if source_type in {"image", "video"} else None,
+    }
+    for key in _SOURCE_META_URL_KEYS:
+        cleaned = _clean_source_meta_url(source_meta.get(key))
+        if cleaned:
+            trace[key] = cleaned
+    for key in _SOURCE_META_TEXT_KEYS:
+        cleaned = _clean_source_meta_text(source_meta.get(key))
+        if cleaned:
+            trace[key] = cleaned
+    return {k: v for k, v in trace.items() if v is not None}
+
+
 def _rate_limit(user_id: int) -> None:
     key = f"gen:rate:{user_id}"
-    n = redis_client.incr(key)
-    if n == 1:
-        redis_client.expire(key, 3600)
+    n = incr_window(key, 3600)
     if n > settings.user_gen_rate_per_hour:
         raise HTTPException(429, "生成过于频繁,请稍后再试")
 
@@ -200,7 +266,7 @@ def _assert_reference_access(db: Session, user_id: int, *urls: str | None) -> No
             if row.user_id != user_id:
                 raise HTTPException(404, "上传素材不存在")
             continue
-        if key.startswith(("upload/", "upload_preview/")):
+        if key.startswith(("upload/", "upload_preview/", "upload_video/", "upload_video_preview/")):
             raise HTTPException(404, "上传素材不存在")
         try:
             asset_refs.generated_asset_reference_path(db, user_id, key)
@@ -222,6 +288,17 @@ def _is_local_user_asset(db: Session, user_id: int, url: str | None) -> bool:
         return False
 
 
+def _is_local_user_video_asset(db: Session, user_id: int, url: str | None) -> bool:
+    key = local_storage_key_from_user_asset_url(url)
+    if not key:
+        return False
+    try:
+        asset_refs.generated_video_reference_path(db, user_id, key)
+        return True
+    except asset_refs.AssetRefError:
+        return False
+
+
 def _video_reference_is_actionable(
     db: Session,
     user_id: int,
@@ -232,23 +309,26 @@ def _video_reference_is_actionable(
 ) -> bool:
     if source_type != "video":
         return True
-    if prompt and (prompt.get("final_text") or len(prompt.keys()) > 1):
-        return True
+    has_reverse_prompt = bool(prompt and (prompt.get("final_text") or len(prompt.keys()) > 1))
+    has_local_first_frame = False
     for key in ("first_frame_image", "reference_image_url"):
         value = params.get(key)
         if not value:
             continue
         if _is_local_user_asset(db, user_id, value):
+            has_local_first_frame = True
             return True
         try:
             assert_safe_user_asset_url(value)
             return True
         except SsrfError:
             continue
+    if has_local_first_frame:
+        return True
     # A local generated video can be sampled by the reverse flow, but generation
     # gateways currently need an image first frame; avoid pretending the raw video
     # URL itself will be used as model context.
-    if _is_local_user_asset(db, user_id, source_asset_url) and prompt.get("final_text"):
+    if _is_local_user_video_asset(db, user_id, source_asset_url) and has_reverse_prompt:
         return True
     return False
 
@@ -416,26 +496,17 @@ def generate(body: GenerateIn, request: Request,
         source_asset_url = body.source_asset_url
         source_type = body.source_type
         task_params = params
-
-    request_fingerprint = _request_fingerprint(
-        category=body.category,
-        stage=body.stage,
-        source_asset_url=source_asset_url,
-        source_type=source_type,
-        prompt=prompt,
-        params=task_params,
-        parent_task_id=body.parent_task_id,
+    assert_text_allowed(
+        db,
+        prompt,
+        task_params.get("negative_prompt"),
+        task_params.get("negative"),
     )
-    if existing_client_task is not None:
-        _assert_client_request_replay(existing_client_task, request_fingerprint)
-        return build_task_out(db, existing_client_task)
 
     if body.category == "video" and body.stage == "final" and parent:
         existing_final = _existing_active_final(db, user.id, parent.id)
         if existing_final is not None:
             return build_task_out(db, existing_final)
-
-    _rate_limit(user.id)
 
     model_use = body.category  # image/video
     model = get_model_config(db, model_use)
@@ -474,6 +545,19 @@ def generate(body: GenerateIn, request: Request,
     # agree — otherwise a defaulted n freezes base*4 but settles base*1 (~75% undercharge).
     if body.category == "image":
         task_params["n"] = n_images
+    request_fingerprint = _request_fingerprint(
+        category=body.category,
+        stage=body.stage,
+        source_asset_url=source_asset_url,
+        source_type=source_type,
+        prompt=prompt,
+        params=task_params,
+        parent_task_id=body.parent_task_id,
+    )
+    if existing_client_task is not None:
+        _assert_client_request_replay(existing_client_task, request_fingerprint)
+        return build_task_out(db, existing_client_task)
+    _rate_limit(user.id)
     if body.stage == "final" and parent:
         inherited_snapshot = (dict(parent.params or {}).get("_model_snapshot") or {})
         if inherited_snapshot:
@@ -484,6 +568,16 @@ def generate(body: GenerateIn, request: Request,
         snapshot = inherited_snapshot or model_snapshot(model)
     else:
         snapshot = model_snapshot(model)
+    if body.stage != "final":
+        task_params["_source_trace"] = _source_trace(
+            source_asset_url=source_asset_url,
+            source_type=source_type,
+            meta=body.source_asset_meta,
+        )
+    elif "_source_trace" not in task_params and parent is not None:
+        parent_trace = (parent.params or {}).get("_source_trace")
+        if isinstance(parent_trace, dict):
+            task_params["_source_trace"] = parent_trace
     task_params["_model_snapshot"] = snapshot
     task_params["_client_request_fingerprint"] = request_fingerprint
     cost = _estimate_cost_from_snapshot(snapshot, body.category, body.stage, n_images)

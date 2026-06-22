@@ -32,8 +32,6 @@ def _validate_configured_egress_url(name: str, url: str, *, require_https: bool 
     trusted = host in settings.trusted_egress_host_list
     if require_https and parsed.scheme != "https" and not trusted:
         raise RuntimeError(f"{name} 必须使用 HTTPS,或将主机加入 TRUSTED_EGRESS_HOSTS")
-    if trusted:
-        return
     try:
         assert_safe_url(url)
     except SsrfError as e:

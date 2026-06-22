@@ -16,14 +16,15 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from urllib.parse import quote_plus, urlparse
 
-import httpx
 from sqlalchemy import func, select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from ..config import settings
 from ..models import PaymentOrder, User
 from . import credits, locks, payment_config
 from .config_store import get_bool_setting
+from .ssrf import pinned_client
 
 PAYMENT_PACKAGES = payment_config.DEFAULT_PAYMENT_PACKAGES
 log = logging.getLogger("payments")
@@ -120,6 +121,14 @@ def _aware(dt: datetime | None) -> datetime | None:
     if dt is None:
         return None
     return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
+def _provider_trade_no_conflict_message(exc: IntegrityError) -> str | None:
+    detail = str(getattr(exc, "orig", exc))
+    lowered = detail.lower()
+    if "provider_trade_no" not in lowered and "uq_payment_orders_provider_trade_no" not in lowered:
+        return None
+    return "支付流水号已入账到其他订单"
 
 
 def make_order_no(provider: str) -> str:
@@ -249,8 +258,9 @@ def _alipay_precreate(order: PaymentOrder, cfg: payment_config.ProviderRuntimeCo
     }
     sign_src = "&".join(f"{k}={params[k]}" for k in sorted(params))
     params["sign"] = _rsa_sha256_sign(sign_src, cfg.secret.get("private_key") or "")
-    with httpx.Client(timeout=settings.gateway_timeout_seconds) as client:
-        resp = client.post(cfg.public.get("gateway_url") or settings.alipay_gateway_url, data=params)
+    url = cfg.public.get("gateway_url") or settings.alipay_gateway_url
+    with pinned_client(url, timeout=settings.gateway_timeout_seconds, follow_redirects=False) as client:
+        resp = client.post(url, data=params)
     if resp.status_code >= 400:
         raise PaymentError(f"支付宝下单失败:{resp.status_code}")
     data = resp.json()
@@ -300,9 +310,9 @@ def _wechat_native(order: PaymentOrder, cfg: payment_config.ProviderRuntimeConfi
         "Accept": "application/json",
         "Content-Type": "application/json",
     }
-    with httpx.Client(timeout=settings.gateway_timeout_seconds) as client:
-        resp = client.post((cfg.public.get("gateway_url") or settings.wechat_pay_gateway_url).rstrip("/") + path,
-                           headers=headers, content=body)
+    url = (cfg.public.get("gateway_url") or settings.wechat_pay_gateway_url).rstrip("/") + path
+    with pinned_client(url, timeout=settings.gateway_timeout_seconds, follow_redirects=False) as client:
+        resp = client.post(url, headers=headers, content=body)
     if resp.status_code >= 400:
         raise PaymentError(f"微信支付下单失败:{resp.status_code} {resp.text[:160]}")
     data = resp.json()
@@ -337,6 +347,197 @@ def _provider_code_url(order: PaymentOrder, db: Session) -> tuple[str, dict]:
         raise PaymentError("支付渠道非法")
 
     raise PaymentError(f"{order.provider} 商户参数未配置")
+
+
+def _provider_raw_subset(data: dict | None, keys: tuple[str, ...]) -> dict:
+    if not isinstance(data, dict):
+        return {}
+    return {key: data.get(key) for key in keys if data.get(key) not in (None, "")}
+
+
+def _alipay_query(order: PaymentOrder, cfg: payment_config.ProviderRuntimeConfig) -> dict:
+    biz_content = {"out_trade_no": order.order_no}
+    params = {
+        "app_id": cfg.public.get("app_id"),
+        "method": "alipay.trade.query",
+        "format": "JSON",
+        "charset": "utf-8",
+        "sign_type": "RSA2",
+        "timestamp": _now().strftime("%Y-%m-%d %H:%M:%S"),
+        "version": "1.0",
+        "biz_content": json.dumps(biz_content, ensure_ascii=False, separators=(",", ":")),
+    }
+    sign_src = "&".join(f"{k}={params[k]}" for k in sorted(params))
+    params["sign"] = _rsa_sha256_sign(sign_src, cfg.secret.get("private_key") or "")
+    url = cfg.public.get("gateway_url") or settings.alipay_gateway_url
+    with pinned_client(url, timeout=settings.gateway_timeout_seconds, follow_redirects=False) as client:
+        resp = client.post(url, data=params)
+    if resp.status_code >= 400:
+        raise PaymentError(f"支付宝查单失败:{resp.status_code}")
+    data = resp.json()
+    body = data.get("alipay_trade_query_response") or {}
+    code = str(body.get("code") or "")
+    if code != "10000":
+        sub_code = str(body.get("sub_code") or "")
+        if sub_code == "ACQ.TRADE_NOT_EXIST":
+            return {"status": "unknown", "raw": {"code": code, "sub_code": sub_code}}
+        raise PaymentError(body.get("sub_msg") or body.get("msg") or "支付宝查单失败")
+    if body.get("out_trade_no") and str(body.get("out_trade_no")) != order.order_no:
+        raise PaymentError("支付宝查单订单号不匹配")
+    if body.get("total_amount"):
+        ensure_amount_matches(str(body.get("total_amount")), order.amount_cents, "支付宝查单")
+    trade_status = str(body.get("trade_status") or "")
+    raw = _provider_raw_subset(
+        body,
+        ("out_trade_no", "trade_no", "trade_status", "total_amount", "buyer_pay_amount", "send_pay_date"),
+    )
+    if trade_status in {"TRADE_SUCCESS", "TRADE_FINISHED"}:
+        return {"status": PAID, "provider_trade_no": body.get("trade_no"), "raw": raw}
+    if trade_status == "TRADE_CLOSED":
+        return {"status": CLOSED, "provider_trade_no": body.get("trade_no"), "raw": raw}
+    return {"status": PENDING if trade_status else "unknown", "raw": raw}
+
+
+def _wechat_query(order: PaymentOrder, cfg: payment_config.ProviderRuntimeConfig) -> dict:
+    mchid = str(cfg.public.get("mchid") or "").strip()
+    path = f"/v3/pay/transactions/out-trade-no/{quote_plus(order.order_no)}?mchid={quote_plus(mchid)}"
+    headers = {
+        "Authorization": _wechat_authorization("GET", path, "", cfg),
+        "Accept": "application/json",
+    }
+    url = (cfg.public.get("gateway_url") or settings.wechat_pay_gateway_url).rstrip("/") + path
+    with pinned_client(url, timeout=settings.gateway_timeout_seconds, follow_redirects=False) as client:
+        resp = client.get(url, headers=headers)
+    if resp.status_code == 404:
+        return {"status": "unknown", "raw": {"status_code": 404}}
+    if resp.status_code >= 400:
+        raise PaymentError(f"微信支付查单失败:{resp.status_code} {resp.text[:160]}")
+    data = resp.json()
+    if data.get("out_trade_no") and str(data.get("out_trade_no")) != order.order_no:
+        raise PaymentError("微信查单订单号不匹配")
+    expected_appid = str(cfg.public.get("appid") or "")
+    expected_mchid = str(cfg.public.get("mchid") or "")
+    if expected_appid and data.get("appid") and str(data.get("appid")) != expected_appid:
+        raise PaymentError("微信查单 appid 不匹配")
+    if expected_mchid and data.get("mchid") and str(data.get("mchid")) != expected_mchid:
+        raise PaymentError("微信查单 mchid 不匹配")
+    amount = data.get("amount") or {}
+    if amount.get("total") is not None and int(amount.get("total")) != int(order.amount_cents):
+        raise PaymentError("微信查单金额不匹配")
+    trade_state = str(data.get("trade_state") or "")
+    raw = _provider_raw_subset(
+        data,
+        ("out_trade_no", "transaction_id", "trade_state", "trade_state_desc", "success_time"),
+    )
+    if amount.get("total") is not None:
+        raw["amount"] = {"total": int(amount.get("total")), "currency": amount.get("currency") or "CNY"}
+    if trade_state == "SUCCESS":
+        return {"status": PAID, "provider_trade_no": data.get("transaction_id"), "raw": raw}
+    if trade_state in {"CLOSED", "REVOKED"}:
+        return {"status": CLOSED, "provider_trade_no": data.get("transaction_id"), "raw": raw}
+    if trade_state == "PAYERROR":
+        return {"status": FAILED, "provider_trade_no": data.get("transaction_id"), "raw": raw}
+    return {"status": PENDING if trade_state else "unknown", "raw": raw}
+
+
+def _query_provider_order(db: Session, order: PaymentOrder) -> dict:
+    cfg = payment_config.runtime_or_env(db, order.provider)
+    if not cfg.enabled or cfg.mode != "live":
+        raise PaymentError(f"{order.provider} 支付渠道未启用真实查单")
+    if order.provider == "alipay":
+        if not _alipay_configured(cfg):
+            raise PaymentError("支付宝商户参数未配置")
+        return _alipay_query(order, cfg)
+    if order.provider == "wechat":
+        if not _wechat_configured(cfg):
+            raise PaymentError("微信支付商户参数未配置")
+        return _wechat_query(order, cfg)
+    raise PaymentError("支付渠道非法")
+
+
+def reconcile_pending_orders(db: Session) -> dict:
+    """Query live providers for unpaid local orders and repair callback gaps.
+
+    Provider notifications remain the primary path. This job is a backstop for
+    missed callbacks, late provider success after local expiry, and provider-
+    confirmed terminal failures. Unknown/provider-pending results never mutate
+    local state.
+    """
+    stats = {
+        "checked": 0,
+        "paid": 0,
+        "closed": 0,
+        "failed": 0,
+        "skipped": 0,
+        "errors": 0,
+        "enabled": bool(settings.payment_reconcile_enabled),
+    }
+    if not settings.payment_reconcile_enabled or not get_bool_setting(db, "payment_enabled", False):
+        return stats
+    lookback = max(1, int(settings.payment_reconcile_lookback_hours))
+    limit = max(1, min(int(settings.payment_reconcile_max_orders), 500))
+    cutoff = _now() - timedelta(hours=lookback)
+    orders = list(
+        db.execute(
+            select(PaymentOrder)
+            .where(
+                PaymentOrder.status.in_((PENDING, CLOSED)),
+                PaymentOrder.paid_at.is_(None),
+                PaymentOrder.created_at >= cutoff,
+            )
+            .order_by(PaymentOrder.id.asc())
+            .limit(limit)
+        ).scalars()
+    )
+    for order in orders:
+        try:
+            result = _query_provider_order(db, order)
+            stats["checked"] += 1
+            status = str(result.get("status") or "unknown")
+            raw = {
+                "verified_provider_query": True,
+                "provider": order.provider,
+                "status": status,
+                "query": result.get("raw") or {},
+            }
+            if status == PAID:
+                _paid, credited = mark_paid(
+                    db,
+                    order.order_no,
+                    provider=order.provider,
+                    provider_trade_no=result.get("provider_trade_no"),
+                    raw=raw,
+                    allow_expired=True,
+                )
+                if credited:
+                    stats["paid"] += 1
+                continue
+            if status in {CLOSED, FAILED} and order.status == PENDING:
+                locked = db.execute(
+                    select(PaymentOrder)
+                    .where(PaymentOrder.id == order.id)
+                    .with_for_update()
+                ).scalar_one()
+                if locked.status == PENDING and locked.paid_at is None:
+                    locked.status = status
+                    locked.provider_trade_no = result.get("provider_trade_no") or locked.provider_trade_no
+                    locked.raw = raw
+                    db.commit()
+                    stats[status] += 1
+                else:
+                    db.rollback()
+                continue
+            stats["skipped"] += 1
+        except Exception as e:  # noqa: BLE001
+            db.rollback()
+            stats["errors"] += 1
+            log.warning(
+                "payment reconcile failed order_no=%s provider=%s error=%s",
+                getattr(order, "order_no", None),
+                getattr(order, "provider", None),
+                str(e)[:200],
+            )
+    return stats
 
 
 def create_order(db: Session, user: User, provider: str, package_id: str) -> PaymentOrder:
@@ -458,7 +659,12 @@ def mark_paid(
     if provider and order.provider != provider:
         raise PaymentError("订单支付渠道不匹配")
     _assert_positive_order(order)
+    provider_trade_no = (provider_trade_no or "").strip()
     if order.status == PAID:
+        if not provider_trade_no:
+            raise PaymentError("支付通知缺少第三方流水号")
+        if order.provider_trade_no and order.provider_trade_no != provider_trade_no:
+            raise PaymentError("支付流水号与已入账订单不匹配")
         return order, False
     if provider_trade_no:
         existing = db.execute(
@@ -481,9 +687,11 @@ def mark_paid(
         payable_statuses = (PENDING, CLOSED)
     if order.status not in payable_statuses:
         raise PaymentError("订单状态不可入账")
+    if not provider_trade_no:
+        raise PaymentError("支付通知缺少第三方流水号")
     order.status = PAID
     order.paid_at = _now()
-    order.provider_trade_no = provider_trade_no or order.provider_trade_no
+    order.provider_trade_no = provider_trade_no
     if raw is not None:
         order.raw = raw
     credits.grant(
@@ -495,7 +703,14 @@ def mark_paid(
         biz_ref=order.id,
         commit=False,
     )
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError as e:
+        db.rollback()
+        message = _provider_trade_no_conflict_message(e)
+        if message:
+            raise PaymentError(message) from e
+        raise
     db.refresh(order)
     return order, True
 

@@ -1,10 +1,10 @@
 """Sample keyframes from a reference video for understanding (省带宽).
 
 Instead of feeding a whole video to the vision model, we download it once
-(SSRF-guarded, size-capped) and pull the first frame plus a few evenly-spaced
-frames via the ffmpeg CLI. Frames come back as JPEG bytes so the caller can
-inline them as base64 data-URIs (no public URL needed, so an external gateway
-can still "see" them).
+(SSRF-guarded, size-capped) and pull scene-change frames first, then fill any
+gap with evenly-spaced frames via the ffmpeg CLI. Frames come back as JPEG bytes
+so the caller can inline them as base64 data-URIs (no public URL needed, so an
+external gateway can still "see" them).
 
 Everything is best-effort: if ffmpeg is missing or the video can't be decoded,
 we return an empty list and the caller falls back to the cover image.
@@ -23,6 +23,7 @@ import time
 from ..config import settings
 from .safe_logging import redact_url_for_log
 from .ssrf import MAX_REDIRECTS, assert_safe_url, pinned_client
+from .video_analysis import frame_count_for_duration
 
 log = logging.getLogger("video_frames")
 
@@ -30,6 +31,8 @@ FFMPEG = shutil.which("ffmpeg")
 FFPROBE = shutil.which("ffprobe")
 MAX_VIDEO_BYTES = 80 * 1024 * 1024  # don't pull more than ~80MB to sample frames
 DOWNLOAD_TIMEOUT = 30.0
+SCENE_THRESHOLD = 0.28
+MIN_FRAME_GAP_SECONDS = 0.7
 _SAMPLE_SEMAPHORE = threading.BoundedSemaphore(
     max(1, int(settings.reverse_video_parallelism or 1))
 )
@@ -142,6 +145,16 @@ def probe_media(path: str) -> dict:
     return {"width": width, "height": height, "duration": duration}
 
 
+def acquire_video_slot() -> bool:
+    return _SAMPLE_SEMAPHORE.acquire(
+        timeout=max(0.0, float(settings.reverse_video_acquire_timeout_seconds or 0))
+    )
+
+
+def release_video_slot() -> None:
+    _SAMPLE_SEMAPHORE.release()
+
+
 def _grab_frame(src: str, ts: float, dst: str) -> bool:
     """Extract a single frame at timestamp ``ts`` seconds."""
     try:
@@ -156,13 +169,101 @@ def _grab_frame(src: str, ts: float, dst: str) -> bool:
     return os.path.exists(dst) and os.path.getsize(dst) > 0
 
 
-def _sample_keyframes_from_file(src: str, n: int) -> list[bytes]:
-    frames: list[bytes] = []
-    dur = _duration_seconds(src)
+def _scene_change_timestamps(src: str, limit: int) -> list[float]:
+    """Best-effort ffmpeg scene detection timestamps.
+
+    We prefer cut points because they carry more prompt signal than blind
+    interval sampling. Any failure returns [] and callers fall back to uniform
+    timestamps.
+    """
+    if limit < 1:
+        return []
+    try:
+        out = subprocess.run(
+            [
+                FFMPEG,
+                "-hide_banner",
+                "-i",
+                src,
+                "-vf",
+                f"select='gt(scene,{SCENE_THRESHOLD})',metadata=print:file=-",
+                "-an",
+                "-f",
+                "null",
+                "-",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=45,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+
+    stamps: list[float] = []
+    for line in (out.stdout or "").splitlines():
+        if "pts_time:" not in line:
+            continue
+        try:
+            ts = float(line.split("pts_time:", 1)[1].split()[0])
+        except (IndexError, ValueError):
+            continue
+        if ts < 0:
+            continue
+        if stamps and abs(ts - stamps[-1]) < MIN_FRAME_GAP_SECONDS:
+            continue
+        stamps.append(ts)
+        if len(stamps) >= limit:
+            break
+    return stamps
+
+
+def _uniform_timestamps(dur: float | None, n: int) -> list[float]:
+    if n < 1:
+        return []
     if dur and dur > 0:
-        stamps = [min(dur - 0.05, dur * i / n) for i in range(n)]
-    else:
-        stamps = [0.0, 0.5, 1.0, 1.5][:n]
+        return [min(dur - 0.05, dur * i / n) for i in range(n)]
+    return [0.0, 0.5, 1.0, 1.5][:n]
+
+
+def _merge_timestamps(primary: list[float], fallback: list[float], n: int, dur: float | None) -> list[float]:
+    merged: list[float] = []
+    max_ts = max(0.0, float(dur or 0) - 0.05) if dur else None
+    for ts in [0.0, *primary, *fallback]:
+        if len(merged) >= n:
+            break
+        clean = max(0.0, float(ts))
+        if max_ts is not None:
+            clean = min(clean, max_ts)
+        if any(abs(clean - seen) < MIN_FRAME_GAP_SECONDS for seen in merged):
+            continue
+        merged.append(clean)
+    return sorted(merged)
+
+
+def _target_frame_count(n: int, dur: float | None, preset: str | None = None) -> int:
+    if preset:
+        target = frame_count_for_duration(dur, preset)
+        if n > 0:
+            target = min(target, n)
+        return max(1, target)
+    return max(1, frame_count_for_duration(dur, None) if n < 1 else n)
+
+
+def _sample_keyframes_from_file(
+    src: str,
+    n: int,
+    *,
+    duration: float | None = None,
+    preset: str | None = None,
+) -> list[bytes]:
+    frames: list[bytes] = []
+    dur = duration if duration is not None else _duration_seconds(src)
+    target = _target_frame_count(n, dur, preset)
+    scene_stamps = _scene_change_timestamps(src, max(0, target - 1))
+    stamps = _merge_timestamps(scene_stamps, _uniform_timestamps(dur, target), target, dur)
+    if not stamps:
+        return []
+
     with tempfile.TemporaryDirectory() as td:
         for i, ts in enumerate(stamps):
             dst = os.path.join(td, f"f_{i:02d}.jpg")
@@ -172,7 +273,7 @@ def _sample_keyframes_from_file(src: str, n: int) -> list[bytes]:
     return frames
 
 
-def sample_keyframes_from_path(video_path: str, n: int = 4) -> list[bytes]:
+def sample_keyframes_from_path(video_path: str, n: int = 4, *, preset: str | None = None) -> list[bytes]:
     """Return up to ``n`` JPEG frames from a local, owner-checked video path."""
     if not FFMPEG or n < 1:
         return []
@@ -182,7 +283,7 @@ def sample_keyframes_from_path(video_path: str, n: int = 4) -> list[bytes]:
         log.warning("video keyframe sampler is busy, skipping reverse-video frames")
         return []
     try:
-        frames = _sample_keyframes_from_file(video_path, n)
+        frames = _sample_keyframes_from_file(video_path, n, preset=preset)
         log.info("sampled %s keyframe(s) from local video", len(frames))
         return frames
     except Exception as e:  # noqa: BLE001
@@ -206,7 +307,13 @@ def extract_poster(video_path: str) -> bytes | None:
     return None
 
 
-def sample_keyframes(video_url: str, n: int = 4, referer: str | None = None) -> list[bytes]:
+def sample_keyframes(
+    video_url: str,
+    n: int = 4,
+    referer: str | None = None,
+    *,
+    preset: str | None = None,
+) -> list[bytes]:
     """Return up to ``n`` JPEG frames (first + evenly spaced). [] on any failure."""
     if not FFMPEG or n < 1:
         return []
@@ -231,7 +338,7 @@ def sample_keyframes(video_url: str, n: int = 4, referer: str | None = None) -> 
             src = os.path.join(td, "input")
             with open(src, "wb") as f:
                 f.write(data)
-            frames = _sample_keyframes_from_file(src, n)
+            frames = _sample_keyframes_from_file(src, n, preset=preset)
         log.info("sampled %s keyframe(s) from video", len(frames))
         return frames
     finally:

@@ -185,3 +185,47 @@ def test_generic_video_poll_accepts_data_dict(monkeypatch):
 
     assert res["status"] == "succeeded"
     assert res["url"] == "https://cdn.example.com/video.mp4"
+
+
+def test_generic_video_request_id_lookup(monkeypatch):
+    monkeypatch.setattr(settings, "mock_mode", False)
+    monkeypatch.setattr(settings, "video_gateway_base_url", "https://video.example.com")
+    monkeypatch.setattr(settings, "video_gateway_api_key", "test-key")
+    monkeypatch.setattr(settings, "video_gateway_format", "openai")
+    seen = {}
+
+    def fake_get(path, timeout=30, config=None):
+        seen["path"] = path
+        seen["timeout"] = timeout
+        return {
+            "data": {
+                "task": {
+                    "id": "task-from-request",
+                    "state": "completed",
+                    "result": {"video_url": "https://cdn.example.com/result.mp4"},
+                }
+            }
+        }
+
+    monkeypatch.setattr(gateway, "_video_get", fake_get)
+
+    found = gateway.find_video_by_request_id(
+        "req-1",
+        "video-model",
+        extra={
+            "request_query_path": "/v1/videos/by-request/{request_id}",
+            "request_query_result_path": "data.task",
+            "request_query_id_field": "id",
+            "request_query_status_field": "state",
+            "request_query_timeout_seconds": 12,
+        },
+    )
+
+    assert seen == {"path": "/v1/videos/by-request/req-1", "timeout": 12}
+    assert found["external_task_id"] == "task-from-request"
+    assert found["status"] == "succeeded"
+    assert found["url"] == "https://cdn.example.com/result.mp4"
+
+
+def test_video_request_id_lookup_is_opt_in():
+    assert gateway.find_video_by_request_id("req-1", "video-model", extra={}) is None

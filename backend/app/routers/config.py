@@ -17,6 +17,11 @@ from ..services.config_store import (
 )
 from ..services.image_options import IMAGE_SIZES
 from ..services.model_gateway_config import runtime_config_for_model
+from ..services.video_analysis import (
+    DEFAULT_VIDEO_ANALYSIS_PRESET,
+    max_frame_count,
+    preset_options,
+)
 
 router = APIRouter(prefix="/api", tags=["config"])
 
@@ -54,8 +59,10 @@ def get_config(db: Session = Depends(get_db), _: User = Depends(get_current_user
         "video_duration_max_seconds": settings.max_video_seconds,
         "reverse": {
             "image_cost": vision_cost,
-            "video_frame_count": max(1, int(settings.reverse_video_frames or 1)),
-            "video_max_cost": vision_cost * max(1, int(settings.reverse_video_frames or 1)),
+            "video_default_preset": DEFAULT_VIDEO_ANALYSIS_PRESET,
+            "video_frame_count": max_frame_count(DEFAULT_VIDEO_ANALYSIS_PRESET),
+            "video_max_cost": vision_cost * max_frame_count(DEFAULT_VIDEO_ANALYSIS_PRESET),
+            "video_presets": preset_options(vision_cost),
         },
         "mock_mode": settings.effective_mock_mode,
         "gateways": {

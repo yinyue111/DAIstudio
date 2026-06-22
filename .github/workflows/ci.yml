@@ -5,6 +5,9 @@ on:
     branches: [main, master]
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   secrets:
     name: Secret scan
@@ -31,6 +34,8 @@ jobs:
           cache: pip
       - name: Install deps
         run: pip install -r requirements.txt -r requirements-dev.txt
+      - name: Syntax compile
+        run: python -m compileall -q app tests scripts alembic
       - name: Lint (ruff)
         run: ruff check .
       - name: Test (pytest)
@@ -68,6 +73,8 @@ jobs:
       # migration is caught here instead of at the api container's boot-time upgrade.
       - name: alembic upgrade head
         run: alembic upgrade head
+      - name: alembic schema drift check
+        run: alembic check
       - name: alembic downgrade base
         run: alembic downgrade base
 
@@ -88,6 +95,25 @@ jobs:
         working-directory: frontend
         run: npm audit --omit=dev --audit-level=high --registry=https://registry.npmjs.org
 
+  sbom:
+    name: SBOM
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Generate CycloneDX SBOM
+        uses: anchore/sbom-action@v0
+        with:
+          path: .
+          format: cyclonedx-json
+          output-file: sbom.cdx.json
+      - name: Upload SBOM artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-cyclonedx
+          path: sbom.cdx.json
+
   compose:
     name: Docker Compose config
     runs-on: ubuntu-latest
@@ -101,6 +127,19 @@ jobs:
           PAYMENT_CONFIG_SECRET: ci-payment-config-secret-32-bytes-long
           SMS_PROVIDER: http
           SMS_HTTP_URL: https://sms.example.invalid/send
+
+  release-artifact:
+    name: Release artifact hygiene
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+      - name: Build clean source artifact
+        run: |
+          git archive --format=tar.gz --output=/tmp/ai-studio-source.tar.gz HEAD
+      - name: Reject secrets/runtime files in artifact
+        run: python scripts/check_release_artifact.py /tmp/ai-studio-source.tar.gz
 
   frontend:
     name: Frontend — build
@@ -117,6 +156,8 @@ jobs:
           cache-dependency-path: frontend/package-lock.json
       - name: Install deps
         run: npm ci
+      - name: Unit tests
+        run: npm run test:unit
       - name: Build
         run: npm run build
         env:

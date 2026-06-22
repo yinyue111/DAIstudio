@@ -1,9 +1,18 @@
 """Retention math (expiry / days_left / expired), including tz-naive coercion."""
 from datetime import datetime, timedelta, timezone
 
+from app.config import settings
 from app.db import SessionLocal
 from app.models import GenTask, UploadedAsset
-from app.services import retention, storage
+from app.services import credits, retention, storage
+
+
+def _clear_active_generation_tasks(db):
+    db.query(GenTask).filter(GenTask.status.in_(("queued", "running"))).update(
+        {GenTask.status: "failed"},
+        synchronize_session=False,
+    )
+    db.commit()
 
 
 def test_expiry_and_days_left():
@@ -159,6 +168,132 @@ def test_purge_uploaded_assets_removes_null_filename_upload(client, make_user):
         db.close()
 
 
+def test_purge_uploaded_assets_removes_stale_video_pair(client, make_user):
+    uid = make_user("13900000436", balance=1000)
+    video_key = storage.save_bytes_named(b"video", "upload_video", "retention-video.mp4")
+    poster_key = storage.save_bytes_named(b"poster", "upload_video_preview", "retention-video.jpg")
+    db = SessionLocal()
+    try:
+        old = datetime.now(timezone.utc) - timedelta(days=40)
+        db.add(UploadedAsset(
+            key=video_key,
+            user_id=uid,
+            mime="video/mp4",
+            bytes=5,
+            original_filename="ref.mp4",
+            created_at=old,
+        ))
+        db.add(UploadedAsset(
+            key=poster_key,
+            user_id=uid,
+            mime="image/jpeg",
+            bytes=6,
+            original_filename="poster:ref.mp4",
+            created_at=old,
+        ))
+        db.commit()
+
+        removed = retention.purge_uploaded_assets(
+            db,
+            datetime.now(timezone.utc) - timedelta(days=30),
+        )
+
+        assert removed == 2
+        assert db.get(UploadedAsset, video_key) is None
+        assert db.get(UploadedAsset, poster_key) is None
+        assert not storage.local_path(video_key).exists()
+        assert not storage.local_path(poster_key).exists()
+    finally:
+        db.close()
+
+
+def test_purge_uploaded_assets_keeps_recent_video_reference(client, make_user):
+    uid = make_user("13900000437", balance=1000)
+    video_key = storage.save_bytes_named(b"video", "upload_video", "retention-video-ref.mp4")
+    poster_key = storage.save_bytes_named(b"poster", "upload_video_preview", "retention-video-ref.jpg")
+    db = SessionLocal()
+    try:
+        old = datetime.now(timezone.utc) - timedelta(days=40)
+        cutoff = datetime.now(timezone.utc) - timedelta(days=30)
+        db.add(UploadedAsset(
+            key=video_key,
+            user_id=uid,
+            mime="video/mp4",
+            bytes=5,
+            original_filename="ref.mp4",
+            created_at=old,
+        ))
+        db.add(UploadedAsset(
+            key=poster_key,
+            user_id=uid,
+            mime="image/jpeg",
+            bytes=6,
+            original_filename="poster:ref.mp4",
+            created_at=old,
+        ))
+        db.add(GenTask(
+            user_id=uid,
+            source_asset_url=storage.upload_api_url(video_key),
+            category="video",
+            stage="preview",
+            status="succeeded",
+            created_at=datetime.now(timezone.utc) - timedelta(days=1),
+        ))
+        db.commit()
+
+        assert retention.purge_uploaded_assets(db, cutoff) == 0
+        assert db.get(UploadedAsset, video_key) is not None
+        assert db.get(UploadedAsset, poster_key) is not None
+        assert storage.local_path(video_key).exists()
+        assert storage.local_path(poster_key).exists()
+    finally:
+        db.close()
+
+
+def test_purge_uploaded_assets_keeps_old_needs_review_video_reference(client, make_user):
+    uid = make_user("13900000440", balance=1000)
+    video_key = storage.save_bytes_named(b"video", "upload_video", "retention-review-video.mp4")
+    poster_key = storage.save_bytes_named(b"poster", "upload_video_preview", "retention-review-video.jpg")
+    db = SessionLocal()
+    try:
+        old = datetime.now(timezone.utc) - timedelta(days=60)
+        cutoff = datetime.now(timezone.utc) - timedelta(days=30)
+        db.add(UploadedAsset(
+            key=video_key,
+            user_id=uid,
+            mime="video/mp4",
+            bytes=5,
+            original_filename="review.mp4",
+            created_at=old,
+        ))
+        db.add(UploadedAsset(
+            key=poster_key,
+            user_id=uid,
+            mime="image/jpeg",
+            bytes=6,
+            original_filename="poster:review.mp4",
+            created_at=old,
+        ))
+        db.add(GenTask(
+            user_id=uid,
+            source_asset_url=storage.upload_api_url(video_key),
+            category="video",
+            stage="preview",
+            status="needs_review",
+            created_at=old,
+            params={"first_frame_image": storage.upload_api_url(poster_key)},
+        ))
+        db.commit()
+
+        assert retention.purge_uploaded_assets(db, cutoff) == 0
+        assert db.get(UploadedAsset, video_key) is not None
+        assert db.get(UploadedAsset, poster_key) is not None
+        assert storage.local_path(video_key).exists()
+        assert storage.local_path(poster_key).exists()
+    finally:
+        db.close()
+
+
 def test_purge_all_does_not_delete_generation_tasks(client, make_user, monkeypatch):
     uid = make_user("13900000435", balance=1000)
     db = SessionLocal()
@@ -257,5 +392,64 @@ def test_purge_uploaded_assets_keeps_recent_task_reference(client, make_user):
         assert retention.purge_uploaded_assets(db, cutoff) == 0
         assert db.get(UploadedAsset, upload_key) is not None
         assert storage.local_path(upload_key).exists()
+    finally:
+        db.close()
+
+
+def test_reaper_skips_image_inside_configured_gateway_window(client, make_user, monkeypatch):
+    monkeypatch.setattr(settings, "image_gateway_timeout_seconds", 600)
+    monkeypatch.setattr(settings, "image_download_timeout_seconds", 600)
+    monkeypatch.setattr(settings, "celery_task_time_limit_seconds", 900)
+    uid = make_user("13900000438", balance=1000)
+    db = SessionLocal()
+    try:
+        _clear_active_generation_tasks(db)
+        task = GenTask(
+            user_id=uid,
+            category="image",
+            stage="preview",
+            status="running",
+            cost_frozen=20,
+            cost_settled=0,
+            created_at=datetime.now(timezone.utc) - timedelta(minutes=19),
+        )
+        db.add(task)
+        db.commit()
+        task_id = task.id
+        credits.freeze(db, uid, 20, task_id)
+
+        assert retention.reap_stuck_tasks(db, max_minutes=5) == 0
+        kept = db.get(GenTask, task_id)
+        assert kept.status == "running"
+    finally:
+        db.close()
+
+
+def test_reaper_refunds_image_after_configured_gateway_window(client, make_user, monkeypatch):
+    monkeypatch.setattr(settings, "image_gateway_timeout_seconds", 60)
+    monkeypatch.setattr(settings, "image_download_timeout_seconds", 60)
+    monkeypatch.setattr(settings, "celery_task_time_limit_seconds", 60)
+    uid = make_user("13900000439", balance=1000)
+    db = SessionLocal()
+    try:
+        _clear_active_generation_tasks(db)
+        task = GenTask(
+            user_id=uid,
+            category="image",
+            stage="preview",
+            status="running",
+            cost_frozen=20,
+            cost_settled=0,
+            created_at=datetime.now(timezone.utc) - timedelta(minutes=20),
+        )
+        db.add(task)
+        db.commit()
+        task_id = task.id
+        credits.freeze(db, uid, 20, task_id)
+
+        assert retention.reap_stuck_tasks(db, max_minutes=5) == 1
+        reaped = db.get(GenTask, task_id)
+        assert reaped.status == "failed"
+        assert "任务超时" in reaped.error
     finally:
         db.close()

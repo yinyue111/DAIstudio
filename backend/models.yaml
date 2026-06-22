@@ -15,6 +15,18 @@ models:
     cost_credits: 1
     unlock_cost: 0
     enabled: true
+    extra:
+      official_pricing:
+        source: https://openai.com/api/pricing/
+        checked_at: "2026-06-21"
+        currency: USD
+        unit: per_1m_tokens
+        input_per_1m: 5.0
+        cached_input_per_1m: 0.5
+        output_per_1m: 30.0
+        usd_to_cny: 7.25
+        credit_value_cny: 0.10
+        formula: "ceil(((input_tokens-cached_tokens)*5 + cached_tokens*0.5 + output_tokens*30) / 1000000 * usd_to_cny / credit_value_cny)"
 
   - use: image         # 文生图:词 -> 图          (/v1/images/generations)
     model_id: gpt-image-2
@@ -28,12 +40,30 @@ models:
     #   edit_path: /v1/images/edits
 
   - use: video         # 文生视频 (Volcengine Ark / Doubao Seedance, async)
-    model_id: doubao-seedance-1-5-pro-251215
-    cost_credits: 50     # full render cost (final stage)
+    model_id: doubao-seedance-2-0-pro
+    cost_credits: 60     # full render cost (final stage, usage pricing metadata below)
     unlock_cost: 0
     enabled: true
     extra:
-      preview_cost: 5    # cheap freeze for the preview stage
+      preview_cost: 6    # cheap freeze for the preview stage
+      official_pricing:
+        source: https://www.volcengine.com/docs/82379/1544106
+        checked_at: "2026-06-21"
+        provider: volcengine_ark
+        model_family: Seedance 2.0
+        currency: CNY
+        unit: per_1m_tokens
+        total_per_1m: 31.0
+        credit_value_cny: 0.10
+        formula: "ceil(total_tokens * 31 / 1000000 / credit_value_cny)"
+      # Optional provider-specific recovery hook. Fill these only when the
+      # upstream gateway supports querying a submitted video by request_id; on
+      # submit timeouts the worker can then recover external_task_id and resume
+      # polling instead of leaving the task in manual needs_review.
+      # request_query_path: /v1/videos/by-request/{request_id}
+      # request_query_result_path: data.task
+      # request_query_id_field: id
+      # request_query_status_field: status
     # Video gateway base_url/api_key + format=ark can be configured in the admin
     # UI, or via VIDEO_GATEWAY_BASE_URL / VIDEO_GATEWAY_API_KEY / VIDEO_GATEWAY_FORMAT.
 

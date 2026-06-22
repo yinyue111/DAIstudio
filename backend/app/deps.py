@@ -54,12 +54,17 @@ def resolve_token_user(db: Session, user_id: int, tv: int) -> User | None:
 
 
 def get_current_user(
+    request: Request,
     authorization: str | None = Header(default=None),
     db: Session = Depends(get_db),
 ) -> User:
-    if not authorization or not authorization.lower().startswith("bearer "):
-        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "missing bearer token")
-    token = authorization.split(" ", 1)[1].strip()
+    token = None
+    if authorization and authorization.lower().startswith("bearer "):
+        token = authorization.split(" ", 1)[1].strip()
+    if not token:
+        token = request.cookies.get(settings.auth_cookie_name)
+    if not token:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "missing auth token")
     decoded = decode_access_token(token)
     if not decoded:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "invalid or expired token")

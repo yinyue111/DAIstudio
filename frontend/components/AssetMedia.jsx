@@ -1,10 +1,19 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { api } from "../lib/api";
+import { api, assetDownloadObjectUrl } from "../lib/api";
 
 export function assetPreviewSrc(asset) {
   return asset?.preview_url || asset?.hd_url || "";
+}
+
+export function isAssetTakenDown(asset) {
+  return asset?.moderation_status && asset.moderation_status !== "active";
+}
+
+export function assetUnavailableText(asset) {
+  if (isAssetTakenDown(asset)) return "素材已下架";
+  return "预览暂不可用";
 }
 
 export function assetDisplaySrc(asset, { playbackUrl = "" } = {}) {
@@ -38,13 +47,38 @@ export default function AssetMedia({
   onError,
 }) {
   const [playbackUrl, setPlaybackUrl] = useState("");
+  const [imagePreviewUrl, setImagePreviewUrl] = useState("");
   const [error, setError] = useState("");
 
   useEffect(() => {
     let cancelled = false;
     setPlaybackUrl("");
+    setImagePreviewUrl("");
     setError("");
-    if (!interactive || asset?.type !== "video" || !asset.unlocked) return;
+    if (!interactive || !asset?.unlocked || isAssetTakenDown(asset)) return;
+    if (asset.type === "image" && asset.hd_url) {
+      let objectUrl = "";
+      assetDownloadObjectUrl(asset.id)
+        .then((url) => {
+          if (cancelled) {
+            URL.revokeObjectURL(url);
+            return;
+          }
+          objectUrl = url;
+          setImagePreviewUrl(url);
+        })
+        .catch((e) => {
+          if (!cancelled) {
+            setError(e.message || "高清预览加载失败");
+            if (onError) onError(e);
+          }
+        });
+      return () => {
+        cancelled = true;
+        if (objectUrl) URL.revokeObjectURL(objectUrl);
+      };
+    }
+    if (asset.type !== "video") return;
     api.playbackTicket(asset.id)
       .then((res) => {
         if (!cancelled) setPlaybackUrl(api.playbackUrl(asset.id, res.ticket));
@@ -58,9 +92,9 @@ export default function AssetMedia({
     return () => {
       cancelled = true;
     };
-  }, [asset?.id, asset?.type, asset?.unlocked, interactive]);
+  }, [asset?.id, asset?.type, asset?.unlocked, asset?.hd_url, asset?.moderation_status, interactive]);
 
-  const src = assetDisplaySrc(asset, { playbackUrl });
+  const src = imagePreviewUrl || assetDisplaySrc(asset, { playbackUrl });
   const renderVideo = shouldRenderVideo(asset, { playbackUrl });
   if (error) {
     return (
@@ -72,7 +106,7 @@ export default function AssetMedia({
   if (!src) {
     return (
       <div className={fallbackClassName || className}>
-        预览暂不可用
+        {assetUnavailableText(asset)}
       </div>
     );
   }

@@ -41,11 +41,18 @@ def make_image_preview(
 
 def make_model_reference(
     image_bytes: bytes,
-    max_side: int = 768,
+    max_side: int = 384,
+    min_side: int = 1,
     *,
     max_pixels: int | None = None,
 ) -> tuple[bytes, int, int]:
-    """Return a clean, bounded PNG reference for model inputs."""
+    """Return a clean, bounded JPEG reference for model inputs.
+
+    Vision gateways receive this as a base64 data URI. PNG references from
+    scraped social images can be several hundred KB after resizing, which makes
+    reverse-prompt requests spend most of their timeout uploading the body.
+    JPEG keeps the visual signal while making the gateway call much smaller.
+    """
     img = Image.open(io.BytesIO(image_bytes))
     hd_w, hd_h = img.size
     if max_pixels is not None and hd_w * hd_h > max_pixels:
@@ -54,8 +61,11 @@ def make_model_reference(
     scale = min(1.0, max_side / max(img.size))
     if scale < 1.0:
         img = img.resize((int(img.width * scale), int(img.height * scale)))
+    if min_side > 1 and min(img.size) < min_side:
+        up_scale = min_side / min(img.size)
+        img = img.resize((int(round(img.width * up_scale)), int(round(img.height * up_scale))))
     buf = io.BytesIO()
-    img.save(buf, format="PNG")
+    img.save(buf, format="JPEG", quality=82, optimize=True, progressive=True)
     return buf.getvalue(), hd_w, hd_h
 
 

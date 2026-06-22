@@ -4,33 +4,34 @@ from __future__ import annotations
 
 import csv
 import io
-import re
 from datetime import datetime, timezone
+from urllib.parse import urlparse
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from sqlalchemy import func, select, update
-from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from ..config import settings as app_config
 from ..db import get_db
 from ..deps import get_client_ip, require_admin
 from ..models import (
-    AdminIdempotencyKey,
+    AssetReport,
     AuditLog,
     CreditTransaction,
     GatewayCall,
+    GenAsset,
     GenTask,
     ModelConfig,
     PhoneWhitelist,
     User,
 )
 from ..password_policy import MIN_PASSWORD_LEN
-from ..redis_client import redis_client
 from ..schemas import (
+    AdminAssetReportHandleIn,
     AdminTaskRefundIn,
     AdminTaskSettleIn,
+    AssetReportOut,
     AuditOut,
     ModelConfigIn,
     ModelProbeIn,
@@ -47,12 +48,13 @@ from ..schemas import (
     WhitelistDeleteIn,
     WhitelistIn,
 )
-from ..security import hash_password, verify_password
+from ..security import hash_password
 from ..services import (
     audit,
     credits,
     gateway,
     generation,
+    locks,
     payment_config,
     payments,
     safe_logging,
@@ -63,176 +65,44 @@ from ..services.model_gateway_config import (
     PROVIDER_PRESETS,
     ModelGatewayConfigError,
     apply_model_gateway_update,
-    encrypted_key_present,
     model_to_admin_dict,
     normalise_base_url,
-    normalise_gateway_format,
-    normalise_provider,
     runtime_config_from_probe,
 )
 from ..services.task_output import build_task_out
+from . import admin_helpers as _admin_helpers
+from .admin_helpers import IMAGE_SIZE_RE as _IMAGE_SIZE_RE
+from .admin_helpers import age_minutes as _age_minutes
+from .admin_helpers import assert_no_active_model_tasks as _assert_no_active_model_tasks
+from .admin_helpers import assert_quota_grant_limits as _assert_quota_grant_limits
+from .admin_helpers import csv_cell as _csv_cell
+from .admin_helpers import date_key as _date_key
+from .admin_helpers import gateway_update_changes_runtime as _gateway_update_changes_runtime
+from .admin_helpers import model_audit_snapshot as _model_audit_snapshot
+from .admin_helpers import model_gateway_update_values as _model_gateway_update_values
+from .admin_helpers import page as _page
+from .admin_helpers import parse_date as _parse_date
+from .admin_helpers import payment_provider_audit_snapshot as _payment_provider_audit_snapshot
+from .admin_helpers import remember_quota_grant_fingerprint as _remember_quota_grant_fingerprint
+from .admin_helpers import replay_quota_grant as _replay_quota_grant
+from .admin_helpers import require_admin_rate_limit as _require_admin_rate_limit
+from .admin_helpers import reserve_quota_grant_idempotency as _reserve_quota_grant_idempotency
+from .admin_helpers import setting_int as _setting_int
 
 router = APIRouter(prefix="/api/admin", tags=["admin"])
-_IMAGE_SIZE_RE = re.compile(r"^(\d{2,5})x(\d{2,5})$")
-_CSV_FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r", "\n")
-_ADMIN_CONFIRM_TTL_SECONDS = 300
-_ADMIN_CONFIRM_FAIL_LIMIT = 8
-_ADMIN_CONFIRM_FAIL_IP_LIMIT = 30
-_ADMIN_CONFIRM_FAIL_WINDOW_SECONDS = 15 * 60
-_QUOTA_GRANT_REPLAY_WINDOW_SECONDS = 10 * 60
-_ACTIVE_MODEL_TASK_STATUSES = ("queued", "running", generation.NEEDS_REVIEW)
+router.dependencies.append(Depends(_require_admin_rate_limit))
 
-
-def _model_gateway_update_values(row: ModelConfig, body: ModelConfigIn) -> tuple[
-    str | None,
-    str | None,
-    str | None,
-]:
-    fields = getattr(body, "model_fields_set", set())
-    provider = body.provider if "provider" in fields else row.provider
-    base_url = body.base_url if "base_url" in fields else row.base_url
-    gateway_format = body.gateway_format if "gateway_format" in fields else row.gateway_format
-    return provider, base_url, gateway_format
-
-
-def _page(limit: int, offset: int, cap: int) -> tuple[int, int]:
-    return min(max(int(limit), 1), cap), max(int(offset), 0)
-
-
-def _gateway_update_changes_runtime(row: ModelConfig, body: ModelConfigIn) -> bool:
-    provider, base_url, gateway_format = _model_gateway_update_values(row, body)
-    current_provider = normalise_provider(row.provider)
-    current_base_url = normalise_base_url(row.base_url)
-    current_gateway_format = normalise_gateway_format(row.gateway_format, current_provider, row.use)
-    next_provider = normalise_provider(provider)
-    next_base_url = normalise_base_url(base_url)
-    next_gateway_format = normalise_gateway_format(gateway_format, next_provider, row.use)
-    current_key_present = encrypted_key_present(row)
-    new_key_supplied = body.api_key not in (None, "", "__keep__", "已配置")
-    next_key_present = False if body.api_key_clear else (True if new_key_supplied else current_key_present)
-    return (
-        current_provider != next_provider
-        or current_base_url != next_base_url
-        or current_gateway_format != next_gateway_format
-        or current_key_present != next_key_present
-        or new_key_supplied
-    )
-
-
-def _assert_no_active_model_tasks(db: Session, use: str) -> None:
-    active_id = db.execute(
-        select(GenTask.id)
-        .where(
-            GenTask.model_use == use,
-            GenTask.status.in_(_ACTIVE_MODEL_TASK_STATUSES),
-        )
-        .limit(1)
-    ).scalar_one_or_none()
-    if active_id is not None:
-        raise HTTPException(
-            409,
-            "当前模型仍有排队、运行中或待对账任务,请等待任务结束或处理后再切换网关配置",
-        )
-
-
-def _parse_date(s: str | None, *, end_of_day: bool = False) -> datetime | None:
-    if not s:
-        return None
-    try:
-        dt = datetime.fromisoformat(s)
-    except ValueError:
-        raise HTTPException(400, f"日期格式应为 ISO(YYYY-MM-DD),收到:{s}")
-    if end_of_day and re.fullmatch(r"\d{4}-\d{2}-\d{2}", s):
-        dt = dt.replace(hour=23, minute=59, second=59, microsecond=999999)
-    # gen_tasks.finished_at / created_at are tz-aware; a naive bound would raise
-    # on PostgreSQL ("can't compare offset-naive and offset-aware"). Assume UTC.
-    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
-
-
-def _csv_cell(value):
-    if value is None:
-        return ""
-    text = str(value)
-    if text.lstrip(" \t\r\n").startswith(_CSV_FORMULA_PREFIXES):
-        return "'" + text
-    return text
-
-
-def _date_key(dt: datetime | None) -> str | None:
-    if not dt:
-        return None
-    return dt.date().isoformat()
+_ADMIN_CONFIRM_FAIL_LIMIT = _admin_helpers.ADMIN_CONFIRM_FAIL_LIMIT
+_ADMIN_CONFIRM_FAIL_IP_LIMIT = _admin_helpers.ADMIN_CONFIRM_FAIL_IP_LIMIT
+_ADMIN_CONFIRM_FAIL_WINDOW_SECONDS = _admin_helpers.ADMIN_CONFIRM_FAIL_WINDOW_SECONDS
 
 
 def _require_admin_password(admin: User, password: str | None, request: Request | None = None) -> None:
-    ip = get_client_ip(request) if request else "unknown"
-    fail_key = f"admin:confirm:fail:{admin.id}"
-    ip_key = f"admin:confirm:failip:{ip}"
-    if int(redis_client.get(fail_key) or 0) >= _ADMIN_CONFIRM_FAIL_LIMIT:
-        raise HTTPException(429, "管理员密码确认失败次数过多,请稍后再试")
-    if int(redis_client.get(ip_key) or 0) >= _ADMIN_CONFIRM_FAIL_IP_LIMIT:
-        raise HTTPException(429, "管理员密码确认失败次数过多,请稍后再试")
-    if not password or not verify_password(password, admin.password_hash):
-        for key in (fail_key, ip_key):
-            n = redis_client.incr(key)
-            if n == 1:
-                redis_client.expire(key, _ADMIN_CONFIRM_FAIL_WINDOW_SECONDS)
-        raise HTTPException(403, "请重新输入管理员密码确认该高危操作")
-    redis_client.delete(fail_key)
-
-
-def _quota_grant_idempotency_raw(body: QuotaGrantIn) -> str:
-    raw = (body.idempotency_key or "").strip()
-    if not raw:
-        raise HTTPException(400, "idempotency_key 必填")
-    if not re.fullmatch(r"[A-Za-z0-9_.:-]{8,128}", raw):
-        raise HTTPException(400, "idempotency_key 格式非法")
-    return raw
-
-
-def _reserve_quota_grant_idempotency(
-    db: Session,
-    *,
-    admin_id: int,
-    body: QuotaGrantIn,
-    note: str,
-) -> tuple[str, bool]:
-    raw = _quota_grant_idempotency_raw(body)
-    try:
-        db.add(
-            AdminIdempotencyKey(
-                admin_id=admin_id,
-                scope="quota_grant",
-                key=raw,
-                target_user_id=body.user_id,
-                amount=body.amount,
-                note=note,
-            )
-        )
-        db.flush()
-    except IntegrityError as e:
-        db.rollback()
-        existing = db.execute(
-            select(AdminIdempotencyKey).where(
-                AdminIdempotencyKey.admin_id == admin_id,
-                AdminIdempotencyKey.scope == "quota_grant",
-                AdminIdempotencyKey.key == raw,
-            )
-        ).scalar_one_or_none()
-        if not existing:
-            raise HTTPException(409, "重复的额度发放请求已拦截,请更换幂等键") from e
-        if (
-            int(existing.target_user_id or 0) == int(body.user_id)
-            and int(existing.amount or 0) == int(body.amount)
-            and (existing.note or "") == note
-        ):
-            return raw, False
-        raise HTTPException(409, "幂等键已用于不同额度发放请求") from e
-    return raw, True
-
-
-def _quota_grant_fingerprint(admin_id: int, body: QuotaGrantIn, note: str) -> str:
-    return f"admin:quota:fingerprint:{admin_id}:{body.user_id}:{body.amount}:{note}"
+    """Compatibility bridge for tests/operators monkeypatching admin module constants."""
+    _admin_helpers.ADMIN_CONFIRM_FAIL_LIMIT = _ADMIN_CONFIRM_FAIL_LIMIT
+    _admin_helpers.ADMIN_CONFIRM_FAIL_IP_LIMIT = _ADMIN_CONFIRM_FAIL_IP_LIMIT
+    _admin_helpers.ADMIN_CONFIRM_FAIL_WINDOW_SECONDS = _ADMIN_CONFIRM_FAIL_WINDOW_SECONDS
+    _admin_helpers.require_admin_password(admin, password, request)
 
 
 # ----------------------------------------------------------------- whitelist
@@ -325,10 +195,10 @@ def settle_needs_review_task(
         return build_task_out(db, task)
     db.refresh(task)
     try:
-        generation.admin_settle_needs_review_video(
+        generation.admin_settle_needs_review_task(
             db,
             task,
-            result_url=body.result_url.strip(),
+            result_url=(body.result_url or "").strip() or None,
             external_task_id=(body.external_task_id or "").strip() or None,
         )
     except ValueError as e:
@@ -343,7 +213,7 @@ def settle_needs_review_task(
               biz_id=task.id, ip=get_client_ip(request) if request else None,
               detail={
                   "target_user_id": task.user_id,
-                  "result_url": safe_logging.redact_url_for_log(body.result_url),
+                  "result_url": safe_logging.redact_url_for_log(body.result_url or ""),
                   "external_task_id": body.external_task_id,
                   "note": note,
               })
@@ -379,6 +249,20 @@ def set_user_status(user_id: int, body: UserStatusIn, db: Session = Depends(get_
     user = db.get(User, user_id)
     if not user:
         raise HTTPException(404, "用户不存在")
+    if body.status == "disabled" and user.is_admin:
+        if user.id == admin.id:
+            raise HTTPException(400, "不能禁用当前管理员账号")
+        active_admin_count = db.execute(
+            select(func.count())
+            .select_from(User)
+            .where(
+                User.is_admin.is_(True),
+                User.status == "active",
+                User.id != user.id,
+            )
+        ).scalar_one()
+        if int(active_admin_count or 0) < 1:
+            raise HTTPException(400, "至少需要保留一个可用管理员账号")
     if user.status != body.status:
         user.status = body.status
         user.token_version += 1
@@ -415,47 +299,41 @@ def grant_quota(body: QuotaGrantIn, db: Session = Depends(get_db),
     note = (body.note or "").strip()
     if not note:
         raise HTTPException(400, "请填写额度发放原因")
-    if body.amount > 100000:
-        raise HTTPException(400, "单次发放额度不能超过 100000")
+    replay = _replay_quota_grant(db, admin_id=admin.id, body=body, note=note)
+    if replay is not None:
+        return replay
     if not db.get(User, body.user_id):
         raise HTTPException(404, "用户不存在")
-    fingerprint_key = _quota_grant_fingerprint(admin.id, body, note)
-    previous_key = redis_client.get(fingerprint_key)
-    if previous_key and previous_key != (body.idempotency_key or "").strip():
-        existing = db.execute(
-            select(AdminIdempotencyKey).where(
-                AdminIdempotencyKey.admin_id == admin.id,
-                AdminIdempotencyKey.scope == "quota_grant",
-                AdminIdempotencyKey.key == str(previous_key),
-                AdminIdempotencyKey.target_user_id == body.user_id,
-                AdminIdempotencyKey.amount == body.amount,
-                AdminIdempotencyKey.note == note,
-            )
-        ).scalar_one_or_none()
-        if existing:
+    lock_key = f"admin:quota:grant:{admin.id}"
+    lock_token = locks.acquire(lock_key, ttl=30)
+    if not lock_token:
+        raise HTTPException(409, "额度发放正在处理中,请稍后重试")
+    try:
+        replay = _replay_quota_grant(db, admin_id=admin.id, body=body, note=note)
+        if replay is not None:
+            return replay
+        _assert_quota_grant_limits(db, admin, body.amount)
+        idem_key, created_idem = _reserve_quota_grant_idempotency(
+            db,
+            admin_id=admin.id,
+            body=body,
+            note=note,
+        )
+        if not created_idem:
             user = db.get(User, body.user_id)
             if not user:
                 raise HTTPException(404, "用户不存在")
             return user
-    idem_key, created_idem = _reserve_quota_grant_idempotency(
-        db,
-        admin_id=admin.id,
-        body=body,
-        note=note,
-    )
-    if not created_idem:
-        user = db.get(User, body.user_id)
-        if not user:
-            raise HTTPException(404, "用户不存在")
-        return user
-    try:
-        user = credits.grant(db, body.user_id, body.amount, note=note, commit=False)
-        db.commit()
-        db.refresh(user)
-    except ValueError as e:
-        db.rollback()
-        raise HTTPException(400, str(e))
-    redis_client.setex(fingerprint_key, _QUOTA_GRANT_REPLAY_WINDOW_SECONDS, idem_key)
+        try:
+            user = credits.grant(db, body.user_id, body.amount, note=note, commit=False)
+            db.commit()
+            db.refresh(user)
+        except ValueError as e:
+            db.rollback()
+            raise HTTPException(400, str(e))
+    finally:
+        locks.release(lock_key, lock_token)
+    _remember_quota_grant_fingerprint(admin.id, body, note, idem_key)
     audit.log(db, user_id=admin.id, action="grant_quota", biz_type="admin",
               biz_id=body.user_id, ip=get_client_ip(request) if request else None,
               detail={"amount": body.amount, "note": note, "idempotency_key": idem_key})
@@ -470,6 +348,7 @@ def list_review_tasks(
     offset: int = 0,
 ):
     limit, offset = _page(limit, offset, 200)
+    sla_minutes = max(1, _setting_int(db, "review_task_sla_minutes", 30))
     rows = list(
         db.execute(
             select(GenTask)
@@ -482,15 +361,81 @@ def list_review_tasks(
     out = []
     for row in rows:
         item = build_task_out(db, row).model_dump()
+        age_minutes = _age_minutes(row.created_at)
         item.update({
             "user_id": row.user_id,
             "phase": row.phase,
             "external_task_id": row.external_task_id,
             "external_submitted_at": row.external_submitted_at,
             "video_request_id": (row.params or {}).get("_video_request_id"),
+            "age_minutes": age_minutes,
+            "review_sla_minutes": sla_minutes,
+            "review_overdue": age_minutes is not None and age_minutes >= sla_minutes,
         })
         out.append(item)
     return out
+
+
+# --------------------------------------------------------------- asset reports
+@router.get("/asset-reports", response_model=list[AssetReportOut])
+def list_asset_reports(
+    db: Session = Depends(get_db),
+    _: User = Depends(require_admin),
+    status: str = "open",
+    limit: int = 50,
+    offset: int = 0,
+):
+    if status not in {"open", "dismissed", "takedown", "all"}:
+        raise HTTPException(400, "举报状态非法")
+    limit, offset = _page(limit, offset, 200)
+    q = select(AssetReport).order_by(AssetReport.id.desc())
+    if status != "all":
+        q = q.where(AssetReport.status == status)
+    return list(db.execute(q.limit(limit).offset(offset)).scalars())
+
+
+@router.post("/asset-reports/{report_id}/handle", response_model=AssetReportOut)
+def handle_asset_report(
+    report_id: int,
+    body: AdminAssetReportHandleIn,
+    db: Session = Depends(get_db),
+    admin: User = Depends(require_admin),
+    request: Request = None,
+):
+    _require_admin_password(admin, body.admin_password, request)
+    report = db.get(AssetReport, report_id)
+    if not report:
+        raise HTTPException(404, "举报不存在")
+    if report.status != "open":
+        return report
+    note = (body.note or "").strip()
+    if body.action == "takedown":
+        asset = db.get(GenAsset, report.asset_id) if report.asset_id else None
+        if asset:
+            asset.moderation_status = "takedown"
+        report.status = "takedown"
+    else:
+        report.status = "dismissed"
+    report.handled_by = admin.id
+    report.handle_note = note or None
+    report.handled_at = datetime.now(timezone.utc)
+    db.commit()
+    db.refresh(report)
+    audit.log(
+        db,
+        user_id=admin.id,
+        action="handle_asset_report",
+        biz_type="asset_report",
+        biz_id=report.id,
+        ip=get_client_ip(request) if request else None,
+        detail={
+            "asset_id": report.asset_id,
+            "action": body.action,
+            "status": report.status,
+            "note": note,
+        },
+    )
+    return report
 
 
 # -------------------------------------------------------------- usage report
@@ -647,6 +592,7 @@ def upsert_model(body: ModelConfigIn, db: Session = Depends(get_db),
                  admin: User = Depends(require_admin), request: Request = None):
     _require_admin_password(admin, body.admin_password, request)
     row = db.execute(select(ModelConfig).where(ModelConfig.use == body.use)).scalar_one_or_none()
+    before = _model_audit_snapshot(row)
     if row is None:
         row = ModelConfig(use=body.use)
         db.add(row)
@@ -670,15 +616,16 @@ def upsert_model(body: ModelConfigIn, db: Session = Depends(get_db),
     row.enabled = body.enabled
     row.extra = body.extra
     db.commit()
+    db.refresh(row)
+    after = _model_audit_snapshot(row)
     audit.log(db, user_id=admin.id, action="update_model", biz_type="admin",
               ip=get_client_ip(request) if request else None,
-              detail={"use": body.use, "model_id": body.model_id,
-                      "provider": body.provider, "base_url": body.base_url,
-                      "gateway_format": body.gateway_format,
-                      "api_key_changed": bool(body.api_key or body.api_key_clear),
-                      "cost_credits": body.cost_credits,
-                      "unlock_cost": body.unlock_cost,
-                      "enabled": body.enabled})
+              detail={
+                  "use": body.use,
+                  "before": before,
+                  "after": after,
+                  "api_key_changed": bool(body.api_key or body.api_key_clear),
+              })
     return {"ok": True}
 
 
@@ -688,7 +635,17 @@ def probe_models(body: ModelProbeIn, db: Session = Depends(get_db),
     fallback = None
     if body.use:
         fallback = db.execute(select(ModelConfig).where(ModelConfig.use == body.use)).scalar_one_or_none()
-    if fallback is not None and fallback.api_key_encrypted and not body.api_key:
+    supplied_key = bool((body.api_key or "").strip())
+    requested_base = normalise_base_url(body.base_url)
+    requested_host = (urlparse(requested_base).hostname or "").lower() if requested_base else ""
+    requires_password = supplied_key
+    if requested_host and requested_host in app_config.trusted_egress_host_list:
+        requires_password = True
+    if requested_base and requested_base.lower().startswith("http://"):
+        requires_password = True
+    if fallback is not None and fallback.api_key_encrypted and not supplied_key:
+        requires_password = True
+    if requires_password:
         _require_admin_password(admin, body.admin_password, request)
     try:
         cfg = runtime_config_from_probe(
@@ -874,6 +831,7 @@ def admin_save_payment_provider(
         raise HTTPException(400, "路径支付渠道与请求体不一致")
     if body.mode == "mock" and not app_config.debug and body.enabled:
         raise HTTPException(400, "生产环境不允许启用 mock 支付")
+    before = _payment_provider_audit_snapshot(payment_config.get_provider(db, provider))
     try:
         row = payment_config.save_provider(
             db,
@@ -885,7 +843,6 @@ def admin_save_payment_provider(
         )
     except payment_config.PaymentConfigError as e:
         raise HTTPException(400, str(e))
-    safe_public_config = payment_config.public_config_for_provider(provider, body.public_config)
     audit.log(
         db,
         user_id=admin.id,
@@ -894,13 +851,14 @@ def admin_save_payment_provider(
         ip=get_client_ip(request) if request else None,
         detail={
             "provider": provider,
-            "enabled": body.enabled,
-            "mode": body.mode,
-            "public_config": safe_public_config,
-            "secret_keys": sorted(
+            "before": before,
+            "after": _payment_provider_audit_snapshot(row),
+            "secret_keys_changed": sorted(
                 key
-                for key in (body.secret_config or {})
+                for key, value in (body.secret_config or {}).items()
                 if key in payment_config.SECRET_FIELDS.get(provider, set())
+                and str(value or "").strip()
+                and str(value).strip() not in {"__keep__", "已配置"}
             ),
         },
     )

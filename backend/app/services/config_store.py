@@ -11,10 +11,16 @@ DEFAULT_SETTINGS = {
     "reverse_prompt_enabled": True,
     "sms_auth_enabled": False,
     "payment_enabled": False,
+    "content_safety_enabled": False,
+    "content_safety_banned_terms": "",
     "image_n": 4,
     "image_size": "1024x1024",
     "asset_retention_days": 30,
     "audit_retention_days": 90,
+    "admin_api_rate_per_hour": 600,
+    "admin_quota_grant_single_limit": 100000,
+    "admin_quota_grant_daily_limit": 500000,
+    "review_task_sla_minutes": 30,
 }
 
 
@@ -77,6 +83,16 @@ def seed_from_yaml(db: Session) -> None:
             continue
         existing = get_model_config(db, use)
         if existing:
+            yaml_extra = m.get("extra")
+            if yaml_extra:
+                current_extra = dict(existing.extra or {})
+                changed = False
+                for key, value in dict(yaml_extra).items():
+                    if key == "official_pricing" and current_extra.get(key) != value:
+                        current_extra[key] = value
+                        changed = True
+                if changed:
+                    existing.extra = current_extra
             continue
         db.add(
             ModelConfig(

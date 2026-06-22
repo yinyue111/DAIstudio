@@ -2,9 +2,9 @@
 
 import { useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
-import { api, clearToken, downloadBlob, getToken } from "../../lib/api";
+import { api, clearToken, downloadBlob } from "../../lib/api";
 import Nav from "../../components/Nav";
-import AssetMedia, { assetPreviewSrc } from "../../components/AssetMedia";
+import AssetMedia, { assetPreviewSrc, assetUnavailableText, isAssetTakenDown } from "../../components/AssetMedia";
 
 const PAGE = 30;
 function srcOf(a) {
@@ -40,7 +40,6 @@ export default function ProfilePage() {
   const [pwMsg, setPwMsg] = useState("");
 
   useEffect(() => {
-    if (!getToken()) return router.push("/login");
     api.me().then(setMe).catch(() => router.push("/login"));
     api.config().then(setCfg).catch(() => {});
     api.profile().then(setData).catch((e) => setMsg(e.message));
@@ -102,6 +101,10 @@ export default function ProfilePage() {
   }
 
   async function unlock(asset) {
+    if (isAssetTakenDown(asset)) {
+      setMsg("素材已下架，不能继续解锁。");
+      return;
+    }
     if (!unlockConfirm(asset, me, cfg)) return;
     await withAssetBusy(asset.id, async () => {
       try {
@@ -113,6 +116,10 @@ export default function ProfilePage() {
   }
 
   async function toggleFav(asset) {
+    if (isAssetTakenDown(asset)) {
+      setMsg("素材已下架，不能继续收藏。");
+      return;
+    }
     await withAssetBusy(asset.id, async () => {
       try { patchAsset(await api.favoriteAsset(asset.id)); }
       catch (e) { setMsg(e.message); }
@@ -133,8 +140,12 @@ export default function ProfilePage() {
   }
 
   async function download(asset) {
+    if (isAssetTakenDown(asset)) {
+      setMsg("素材已下架，不能继续下载。");
+      return;
+    }
     try {
-      await downloadBlob(`/api/assets/${asset.id}/download`, `asset-${asset.id}`);
+      await downloadBlob(`/api/assets/${asset.id}/download`);
     } catch (e) { setMsg(e.message); }
   }
 
@@ -237,12 +248,13 @@ export default function ProfilePage() {
               {assets.map((a) => {
                 const src = srcOf(a);
                 const busy = busyAssetIds.has(a.id);
+                const takenDown = isAssetTakenDown(a);
                 return (
                   <div key={a.id} className="group overflow-hidden rounded-xl2 border border-line bg-base2">
                     <button onClick={() => setLightbox(a)} className="relative block w-full cursor-zoom-in bg-black/20" style={mediaAspectStyle(a)}>
                       {!src ? (
                         <div className="flex h-full w-full items-center justify-center px-3 text-center text-xs text-fog">
-                          预览暂不可用
+                          {assetUnavailableText(a)}
                         </div>
                       ) : (
                         <AssetMedia
@@ -254,21 +266,24 @@ export default function ProfilePage() {
                       <span className="badge absolute left-2 top-2 bg-black/60 text-white">
                         {a.type === "video" ? "视频" : "图片"}
                       </span>
-                      {a.unlocked && <span className="badge absolute right-2 top-2 bg-brand text-white">HD</span>}
+                      {takenDown && <span className="badge absolute right-2 top-2 bg-bad/80 text-white">已下架</span>}
+                      {!takenDown && a.unlocked && <span className="badge absolute right-2 top-2 bg-brand text-white">HD</span>}
                       {a.days_left != null && (
                         <span className="badge absolute bottom-2 left-2 bg-black/60 text-fog">{a.days_left} 天后过期</span>
                       )}
                     </button>
                     <div className="flex items-center justify-between gap-1 p-2">
                       <div className="flex items-center gap-2">
-                        <button onClick={() => toggleFav(a)} disabled={busy} title="收藏"
+                        <button onClick={() => toggleFav(a)} disabled={busy || takenDown} title={takenDown ? "素材已下架" : "收藏"}
                           className={`text-base leading-none transition disabled:opacity-50 ${a.favorite ? "text-rose" : "text-fog hover:text-snow"}`}>
                           {a.favorite ? "★" : "☆"}
                         </button>
                         <button onClick={() => del(a)} disabled={busy} title="删除"
                           className="text-fog transition hover:text-bad disabled:opacity-50">🗑</button>
                       </div>
-                      {a.unlocked ? (
+                      {takenDown ? (
+                        <span className="btn-secondary btn-sm cursor-not-allowed opacity-60">已下架</span>
+                      ) : a.unlocked ? (
                         <button onClick={() => download(a)} disabled={busy} className="btn-primary btn-sm">下载</button>
                       ) : (
                         <button onClick={() => unlock(a)} disabled={busy} className="btn-secondary btn-sm">解锁</button>
@@ -294,7 +309,11 @@ export default function ProfilePage() {
           <div className="panel max-h-[92vh] max-w-3xl overflow-auto p-3" onClick={(e) => e.stopPropagation()}>
             {!srcOf(lightbox) ? (
               <div className="flex min-h-64 items-center justify-center rounded-xl2 bg-black/30 px-6 text-sm text-fog">
-                {lightbox.unlocked ? "预览暂不可用，请稍后重试。" : "预览暂不可用，请先解锁后再下载高清。"}
+                {isAssetTakenDown(lightbox)
+                  ? "素材已下架，不能继续预览、解锁或下载。"
+                  : lightbox.unlocked
+                    ? "预览暂不可用，请稍后重试。"
+                    : "预览暂不可用，请先解锁后再下载高清。"}
               </div>
             ) : (
               <AssetMedia
@@ -310,15 +329,17 @@ export default function ProfilePage() {
             )}
             <div className="mt-3 flex items-center justify-between gap-2 text-sm">
               <span className="text-fog">
-                {lightbox.unlocked ? "预览 · 已解锁，可下载高清" : "预览 · 带水印"}
+                {isAssetTakenDown(lightbox) ? "素材已下架" : lightbox.unlocked ? "预览 · 已解锁，可下载高清" : "预览 · 带水印"}
                 {lightbox.days_left != null ? ` · ${lightbox.days_left} 天后过期` : ""}
               </span>
               <div className="flex gap-2">
+                {!isAssetTakenDown(lightbox) && (
                 <button onClick={() => toggleFav(lightbox)} disabled={busyAssetIds.has(lightbox.id)} className="btn-ghost btn-sm">
                   {lightbox.favorite ? "★ 已收藏" : "☆ 收藏"}
                 </button>
-                {!lightbox.unlocked && <button onClick={() => unlock(lightbox)} disabled={busyAssetIds.has(lightbox.id)} className="btn-primary btn-sm">解锁高清</button>}
-                {lightbox.unlocked && <button onClick={() => download(lightbox)} disabled={busyAssetIds.has(lightbox.id)} className="btn-primary btn-sm">下载</button>}
+                )}
+                {!isAssetTakenDown(lightbox) && !lightbox.unlocked && <button onClick={() => unlock(lightbox)} disabled={busyAssetIds.has(lightbox.id)} className="btn-primary btn-sm">解锁高清</button>}
+                {!isAssetTakenDown(lightbox) && lightbox.unlocked && <button onClick={() => download(lightbox)} disabled={busyAssetIds.has(lightbox.id)} className="btn-primary btn-sm">下载</button>}
                 <button onClick={() => setLightbox(null)} className="btn-secondary btn-sm">关闭</button>
               </div>
             </div>

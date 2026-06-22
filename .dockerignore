@@ -1,10 +1,16 @@
 # VCS / local tooling
 .git
 .github
+.agents
+.codex
 .claude
 .pytest_cache
 .ruff_cache
+.mypy_cache
+.tox
+.nox
 .DS_Store
+__MACOSX__
 
 # Secrets and local environment
 backend/.env
@@ -33,6 +39,13 @@ node_modules
 # Runtime data
 backend/storage
 backend/backups
+dist
+htmlcov
+coverage
+playwright-report
+test-results
+logs
+.coverage
 backend/celerybeat-schedule*
 *.db
 *.sqlite

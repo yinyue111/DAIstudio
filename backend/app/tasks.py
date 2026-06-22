@@ -36,6 +36,11 @@ def poll_video_task(self, task_id: int) -> None:
     generation.poll_video_once(task_id)
 
 
+@celery_app.task(name="download.video", bind=True, max_retries=0)
+def download_video_task(self, task_id: int) -> None:
+    generation.run_video_download_task(task_id)
+
+
 @celery_app.task(name="cleanup.resume_videos")
 def resume_stuck_videos_task() -> int:
     """Re-attach polling to in-flight video renders whose poll chain died (worker
@@ -75,3 +80,37 @@ def reap_stuck_tasks_task() -> int:
         return retention.reap_stuck_tasks(db)
     finally:
         db.close()
+
+
+@celery_app.task(name="cleanup.reap_parse")
+def reap_stuck_parse_records_task() -> int:
+    """Fail queued parse records whose worker task disappeared."""
+    from .db import SessionLocal
+    from .services import retention
+
+    db = SessionLocal()
+    try:
+        return retention.reap_stuck_parse_records(db)
+    finally:
+        db.close()
+
+
+@celery_app.task(name="payments.reconcile")
+def payment_reconcile_task() -> dict:
+    """Backstop missed/late payment notifications by querying live providers."""
+    from .db import SessionLocal
+    from .services import payments
+
+    db = SessionLocal()
+    try:
+        return payments.reconcile_pending_orders(db)
+    finally:
+        db.close()
+
+
+@celery_app.task(name="parse.url")
+def parse_url_task(parse_id: int) -> None:
+    """Fetch and localize link assets outside the API request path."""
+    from .routers import parse
+
+    parse.run_parse_record(parse_id)

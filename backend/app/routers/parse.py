@@ -1,5 +1,4 @@
-"""Link parsing. Runs inline (fast) with a short-lived cache so the demo works
-even when no Celery worker is running; SSRF-guarded inside the fetcher."""
+"""Link parsing. Submit quickly, then fetch/localize in a Celery worker."""
 from __future__ import annotations
 
 import hashlib
@@ -9,6 +8,7 @@ from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from PIL import Image, UnidentifiedImageError
+from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session
 
 from ..config import settings
@@ -19,8 +19,10 @@ from ..redis_client import redis_client
 from ..schemas import ParseIn, ParseOut
 from ..services import audit, gateway, storage
 from ..services.fetcher import parse_url
+from ..services.rate_limit import incr_window
 from ..services.safe_logging import redact_url_for_log
 from ..services.ssrf import SsrfError
+from ..services.upload_quota import ensure_user_media_quota
 from ..services.watermark import make_image_preview, make_model_reference
 
 router = APIRouter(prefix="/api", tags=["parse"])
@@ -35,11 +37,41 @@ def _cache_key(url: str, user_id: int) -> str:
 
 def _rate_limit(user_id: int) -> None:
     key = f"parse:rate:{user_id}"
-    n = redis_client.incr(key)
-    if n == 1:
-        redis_client.expire(key, 3600)
+    n = incr_window(key, 3600)
     if n > settings.user_parse_rate_per_hour:
         raise HTTPException(429, "抓取过于频繁,请稍后再试")
+
+
+def _pending_cutoff() -> datetime:
+    return datetime.now(timezone.utc) - timedelta(minutes=max(1, int(settings.parse_pending_max_age_minutes)))
+
+
+def _existing_active_parse(db: Session, user_id: int, url: str) -> ParseRecord | None:
+    return db.execute(
+        select(ParseRecord)
+        .where(
+            ParseRecord.user_id == user_id,
+            ParseRecord.url == url,
+            ParseRecord.status.in_(("queued", "running")),
+            ParseRecord.created_at >= _pending_cutoff(),
+        )
+        .order_by(ParseRecord.id.desc())
+        .limit(1)
+    ).scalar_one_or_none()
+
+
+def _assert_parse_capacity(db: Session, user_id: int) -> None:
+    pending = db.execute(
+        select(func.count())
+        .select_from(ParseRecord)
+        .where(
+            ParseRecord.user_id == user_id,
+            ParseRecord.status.in_(("queued", "running")),
+            ParseRecord.created_at >= _pending_cutoff(),
+        )
+    ).scalar_one()
+    if int(pending or 0) >= int(settings.parse_pending_limit):
+        raise HTTPException(429, "抓取任务过多,请稍后再试")
 
 
 def _localize_media_url(url: str | None, db: Session | None = None, user_id: int | None = None) -> str | None:
@@ -66,15 +98,17 @@ def _localize_media_url(url: str | None, db: Session | None = None, user_id: int
             raw,
             max_pixels=int(settings.parse_localize_image_max_pixels),
         )
-        model_ref_png, _, _ = make_model_reference(
+        model_ref_jpeg, _, _ = make_model_reference(
             raw,
             max_pixels=int(settings.parse_localize_image_max_pixels),
         )
+        if db is not None and user_id is not None:
+            ensure_user_media_quota(db, user_id, len(preview_png) + len(model_ref_jpeg))
         key = storage.save_bytes(preview_png, "preview", "png")
         model_ref_key = storage.save_bytes_named(
-            model_ref_png,
+            model_ref_jpeg,
             "model_ref",
-            key.split("/", 1)[1],
+            key.split("/", 1)[1].rsplit(".", 1)[0] + ".jpg",
         )
         if db is not None and user_id is not None:
             db.merge(
@@ -92,11 +126,11 @@ def _localize_media_url(url: str | None, db: Session | None = None, user_id: int
                 UploadedAsset(
                     key=model_ref_key,
                     user_id=user_id,
-                    mime="image/png",
+                    mime="image/jpeg",
                     width=preview_w,
                     height=preview_h,
-                    bytes=len(model_ref_png),
-                    original_filename="parsed-model-ref.png",
+                    bytes=len(model_ref_jpeg),
+                    original_filename="parsed-model-ref.jpg",
                 )
             )
         return storage.public_url(key)
@@ -105,12 +139,21 @@ def _localize_media_url(url: str | None, db: Session | None = None, user_id: int
         return None
 
 
-def _localize_assets(assets: list[dict], db: Session | None = None,
-                     user_id: int | None = None) -> list[dict]:
+def _localize_assets(
+    assets: list[dict],
+    db: Session | None = None,
+    user_id: int | None = None,
+    *,
+    source_page_url: str | None = None,
+    captured_at: datetime | None = None,
+) -> list[dict]:
     out: list[dict] = []
     localized_count = 0
+    captured_iso = (captured_at or datetime.now(timezone.utc)).isoformat()
     for asset in assets:
         item = dict(asset)
+        item["source_page_url"] = source_page_url
+        item["source_captured_at"] = captured_iso
         if localized_count < _LOCALIZE_IMAGE_LIMIT and item.get("type") == "image":
             local = _localize_media_url(item.get("url"), db=db, user_id=user_id)
             if local:
@@ -133,6 +176,55 @@ def _localize_assets(assets: list[dict], db: Session | None = None,
     return out
 
 
+def run_parse_record(parse_id: int) -> None:
+    from ..db import SessionLocal
+
+    db = SessionLocal()
+    try:
+        claimed = db.execute(
+            update(ParseRecord)
+            .where(ParseRecord.id == parse_id, ParseRecord.status == "queued")
+            .values(status="running")
+        ).rowcount
+        if (claimed or 0) != 1:
+            db.rollback()
+            return
+        db.commit()
+        rec = db.get(ParseRecord, parse_id)
+        if not rec:
+            return
+        try:
+            assets = _localize_assets(
+                parse_url(rec.url),
+                db=db,
+                user_id=rec.user_id,
+                source_page_url=rec.url,
+                captured_at=datetime.now(timezone.utc),
+            )
+            rec.assets = assets
+            rec.status = "done"
+            rec.cached_until = datetime.now(timezone.utc) + timedelta(
+                minutes=settings.parse_cache_minutes
+            )
+            db.commit()
+            redis_client.setex(_cache_key(rec.url, rec.user_id), settings.parse_cache_minutes * 60, str(rec.id))
+        except SsrfError as e:
+            rec.status = "failed"
+            rec.error = f"链接被安全策略拦截:{e}"
+            db.commit()
+        except ValueError as e:
+            rec.status = "failed"
+            rec.error = f"抓取失败:{e}"
+            db.commit()
+        except Exception:  # noqa: BLE001
+            log.exception("parse failed for url=%s", redact_url_for_log(rec.url))
+            rec.status = "failed"
+            rec.error = "抓取失败,请稍后重试或更换链接"
+            db.commit()
+    finally:
+        db.close()
+
+
 @router.post("/parse", response_model=ParseOut)
 def submit_parse(body: ParseIn, request: Request,
                  db: Session = Depends(get_db),
@@ -148,8 +240,13 @@ def submit_parse(body: ParseIn, request: Request,
         if rec and rec.status == "done" and rec.user_id == user.id:
             return ParseOut(id=rec.id, status=rec.status, url=rec.url, assets=rec.assets)
 
+    active = _existing_active_parse(db, user.id, url)
+    if active:
+        return ParseOut(id=active.id, status=active.status, url=active.url, assets=active.assets, error=active.error)
+
     # only count real fetches against the rate limit (cache hits are free)
     _rate_limit(user.id)
+    _assert_parse_capacity(db, user.id)
 
     rec = ParseRecord(user_id=user.id, url=url, status="queued")
     db.add(rec)
@@ -157,36 +254,24 @@ def submit_parse(body: ParseIn, request: Request,
     db.refresh(rec)
 
     try:
-        assets = _localize_assets(parse_url(url), db=db, user_id=user.id)
-        rec.assets = assets
-        rec.status = "done"
-        rec.cached_until = datetime.now(timezone.utc) + timedelta(
-            minutes=settings.parse_cache_minutes
-        )
-        db.commit()
-        redis_client.setex(_cache_key(url, user.id), settings.parse_cache_minutes * 60, str(rec.id))
-        audit.log(db, user_id=user.id, action="parse", biz_type="parse",
-                  biz_id=rec.id, ip=get_client_ip(request),
-                  detail={"url": redact_url_for_log(url), "n": len(assets)})
-    except SsrfError as e:
-        rec.status = "failed"
-        rec.error = str(e)
-        db.commit()
-        raise HTTPException(400, f"链接被安全策略拦截:{e}")
-    except ValueError as e:
-        # fetcher normalises network/empty-result failures to clean ValueErrors
-        rec.status = "failed"
-        rec.error = str(e)
-        db.commit()
-        raise HTTPException(422, f"抓取失败:{e}")
-    except Exception as e:  # noqa: BLE001
-        # unexpected error: keep details server-side, give the user a clean hint
-        log.exception("parse failed for url=%s", redact_url_for_log(url))
-        rec.status = "failed"
-        rec.error = str(e)[:500]
-        db.commit()
-        raise HTTPException(422, "抓取失败,请稍后重试或更换链接")
+        from ..tasks import parse_url_task
 
+        parse_url_task.delay(rec.id)
+        db.refresh(rec)
+    except Exception as e:  # noqa: BLE001
+        log.exception("failed to enqueue parse for url=%s", redact_url_for_log(url))
+        rec.status = "failed"
+        rec.error = f"抓取任务入队失败:{e}"
+        db.commit()
+        raise HTTPException(503, "抓取任务入队失败,请确认 Worker/Redis 运行中")
+
+    if rec.status == "done":
+        asset_count = len(rec.assets or [])
+    else:
+        asset_count = 0
+    audit.log(db, user_id=user.id, action="parse", biz_type="parse",
+              biz_id=rec.id, ip=get_client_ip(request),
+              detail={"url": redact_url_for_log(url), "status": rec.status, "n": asset_count})
     return ParseOut(id=rec.id, status=rec.status, url=rec.url, assets=rec.assets)
 
 

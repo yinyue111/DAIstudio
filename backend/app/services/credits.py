@@ -35,6 +35,8 @@ def _lock_user(db: Session, user_id: int) -> User:
 
 
 def _settled_reserved_amount(tx: CreditTransaction) -> int:
+    if tx.reserved_amount is not None:
+        return max(0, int(tx.reserved_amount or 0))
     note = tx.note or ""
     match = _SETTLE_RESERVED_RE.search(note)
     if match:
@@ -57,12 +59,41 @@ def _outstanding_reserved_for_biz(db: Session, user_id: int, biz_ref: int | None
     ).scalars()
     outstanding = 0
     for tx in rows:
+        if tx.frozen_delta is not None:
+            outstanding += int(tx.frozen_delta or 0)
+            continue
         if tx.type == "freeze":
             outstanding += max(0, -int(tx.change or 0))
         elif tx.type == "refund":
             outstanding -= max(0, int(tx.change or 0))
         elif tx.type == "settle":
             outstanding -= _settled_reserved_amount(tx)
+    return max(0, outstanding)
+
+
+def _outstanding_consumed_for_biz(
+    db: Session,
+    user_id: int,
+    biz_type: str,
+    biz_ref: int | None,
+) -> int | None:
+    if biz_ref is None:
+        return None
+    rows = db.execute(
+        select(CreditTransaction).where(
+            CreditTransaction.user_id == user_id,
+            CreditTransaction.biz_type == biz_type,
+            CreditTransaction.biz_ref == biz_ref,
+            CreditTransaction.type.in_(("consume", "refund")),
+        )
+    ).scalars()
+    outstanding = 0
+    for tx in rows:
+        balance_delta = int(tx.balance_delta if tx.balance_delta is not None else (tx.change or 0))
+        if tx.type == "consume":
+            outstanding += max(0, -balance_delta)
+        elif tx.type == "refund":
+            outstanding -= max(0, balance_delta)
     return max(0, outstanding)
 
 
@@ -76,14 +107,46 @@ def _assert_biz_reserved(db: Session, user_id: int, biz_ref: int | None, amount:
         )
 
 
-def _record(db: Session, user: User, type_: str, change: int, biz_type: str | None,
-            biz_ref: int | None, note: str | None = None) -> None:
+def _assert_biz_consumed(
+    db: Session,
+    user_id: int,
+    biz_type: str,
+    biz_ref: int | None,
+    amount: int,
+) -> None:
+    outstanding = _outstanding_consumed_for_biz(db, user_id, biz_type, biz_ref)
+    if outstanding is None:
+        return
+    if amount > outstanding:
+        raise InsufficientCredits(
+            f"同步扣费额度不足:{biz_type}#{biz_ref} 需要退回 {amount},当前未退 {outstanding}"
+        )
+
+
+def _record(
+    db: Session,
+    user: User,
+    type_: str,
+    balance_delta: int,
+    biz_type: str | None,
+    biz_ref: int | None,
+    note: str | None = None,
+    *,
+    frozen_delta: int = 0,
+    reserved_amount: int | None = None,
+    real_cost: int | None = None,
+) -> None:
     db.add(
         CreditTransaction(
             user_id=user.id,
             type=type_,
-            change=change,
+            change=balance_delta,
+            balance_delta=balance_delta,
+            frozen_delta=frozen_delta,
             balance_after=user.balance_credits,
+            frozen_after=user.frozen_credits,
+            reserved_amount=reserved_amount,
+            real_cost=real_cost,
             biz_type=biz_type,
             biz_ref=biz_ref,
             note=note,
@@ -129,7 +192,7 @@ def freeze(db: Session, user_id: int, amount: int, biz_ref: int | None,
         )
     user.balance_credits -= amount
     user.frozen_credits += amount
-    _record(db, user, "freeze", -amount, "gen_task", biz_ref)
+    _record(db, user, "freeze", -amount, "gen_task", biz_ref, frozen_delta=amount)
     return _finish(db, user, commit)
 
 
@@ -159,8 +222,18 @@ def settle(db: Session, user_id: int, reserved: int, real_cost: int,
     # `change` is the delta applied to *balance* in this op (the unused part
     # returned); the real cost stays spent (already removed at freeze). This
     # keeps sum(change) == balance. Real consumption is recorded in `note`.
-    _record(db, user, "settle", refund_part, "gen_task", biz_ref,
-            note=f"reserved={reserved} real={real_cost}")
+    _record(
+        db,
+        user,
+        "settle",
+        refund_part,
+        "gen_task",
+        biz_ref,
+        note=f"reserved={reserved} real={real_cost}",
+        frozen_delta=-reserved,
+        reserved_amount=reserved,
+        real_cost=real_cost,
+    )
     return _finish(db, user, commit)
 
 
@@ -182,7 +255,7 @@ def refund(db: Session, user_id: int, amount: int, biz_ref: int | None,
         raise
     user.frozen_credits -= amount
     user.balance_credits += amount
-    _record(db, user, "refund", amount, "gen_task", biz_ref)
+    _record(db, user, "refund", amount, "gen_task", biz_ref, frozen_delta=-amount)
     return _finish(db, user, commit)
 
 
@@ -232,6 +305,11 @@ def refund_consumed(db: Session, user_id: int, amount: int, *,
     if amount == 0:
         return _lock_user(db, user_id)
     user = _lock_user(db, user_id)
+    try:
+        _assert_biz_consumed(db, user_id, biz_type, biz_ref, amount)
+    except InsufficientCredits:
+        db.rollback()
+        raise
     user.balance_credits += amount
     _record(db, user, "refund", amount, biz_type, biz_ref, note)
     return _finish(db, user, commit)

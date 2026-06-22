@@ -2,9 +2,9 @@
 
 import { useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
-import { api, downloadBlob, getToken } from "../../lib/api";
+import { api, downloadBlob } from "../../lib/api";
 import Nav from "../../components/Nav";
-import AssetMedia, { assetPreviewSrc } from "../../components/AssetMedia";
+import AssetMedia, { assetPreviewSrc, assetUnavailableText, isAssetTakenDown } from "../../components/AssetMedia";
 
 function srcOf(a) {
   return assetPreviewSrc(a);
@@ -35,9 +35,13 @@ export default function HistoryPage() {
   const [msg, setMsg] = useState("");
   const [finalizingId, setFinalizingId] = useState(null);
   const trackersRef = useRef(new Map());
+  const loadingRef = useRef(false);
+  const loadSeqRef = useRef(0);
+  const tasksRef = useRef([]);
+  const [busyAssetIds, setBusyAssetIds] = useState(() => new Set());
+  const busyAssetIdsRef = useRef(new Set());
 
   useEffect(() => {
-    if (!getToken()) return router.push("/login");
     api.me().then(setMe).catch(() => router.push("/login"));
     api.config().then(setCfg).catch(() => {});
     load(true);
@@ -61,18 +65,31 @@ export default function HistoryPage() {
   }
 
   async function load(reset) {
-    if (loading) return;  // guard against double-click duplicate pages
+    if (loadingRef.current) return;  // guard against double-click duplicate pages
+    loadingRef.current = true;
+    const seq = ++loadSeqRef.current;
     setLoading(true);
-    const off = reset ? 0 : (tasks?.length || 0);  // derive offset from list, not stale state
+    const currentTasks = reset ? [] : (tasksRef.current || []);
+    const off = reset ? 0 : currentTasks.length;
     try {
       const list = await api.tasks(PAGE, off);
-      const nextTasks = reset ? list : [...(tasks || []), ...list];
+      if (seq !== loadSeqRef.current) return;
+      const seen = new Set(currentTasks.map((t) => t.id));
+      const nextTasks = [...currentTasks];
+      for (const item of list) {
+        if (!seen.has(item.id)) {
+          seen.add(item.id);
+          nextTasks.push(item);
+        }
+      }
+      tasksRef.current = nextTasks;
       setTasks(nextTasks);
       syncTaskTracking(nextTasks);
       setHasMore(list.length === PAGE);
     } catch (e) {
-      setMsg(e.message);
+      if (seq === loadSeqRef.current) setMsg(e.message);
     } finally {
+      if (seq === loadSeqRef.current) loadingRef.current = false;
       setLoading(false);
     }
   }
@@ -91,8 +108,9 @@ export default function HistoryPage() {
     setTasks((current) => {
       const list = current || [];
       const exists = list.some((t) => t.id === next.id);
-      if (exists) return list.map((t) => (t.id === next.id ? next : t));
-      return [next, ...list];
+      const updated = exists ? list.map((t) => (t.id === next.id ? next : t)) : [next, ...list];
+      tasksRef.current = updated;
+      return updated;
     });
   }
 
@@ -155,21 +173,43 @@ export default function HistoryPage() {
     }
   }
 
-  async function unlock(asset) {
-    if (!unlockConfirm(asset, me, cfg)) return;
+  async function withAssetBusy(assetId, fn) {
+    if (busyAssetIdsRef.current.has(assetId)) return;
+    busyAssetIdsRef.current.add(assetId);
+    setBusyAssetIds(new Set(busyAssetIdsRef.current));
     try {
-      const updated = await api.unlock(asset.id);
-      if (lightbox && lightbox.id === asset.id) setLightbox(updated);
-      load(true);
-      api.me().then(setMe).catch(() => {});
-    } catch (e) {
-      setMsg(e.message);
+      await fn();
+    } finally {
+      busyAssetIdsRef.current.delete(assetId);
+      setBusyAssetIds(new Set(busyAssetIdsRef.current));
     }
   }
 
+  async function unlock(asset) {
+    if (isAssetTakenDown(asset)) {
+      setMsg("素材已下架，不能继续解锁。");
+      return;
+    }
+    if (!unlockConfirm(asset, me, cfg)) return;
+    await withAssetBusy(asset.id, async () => {
+      try {
+        const updated = await api.unlock(asset.id);
+        if (lightbox && lightbox.id === asset.id) setLightbox(updated);
+        load(true);
+        api.me().then(setMe).catch(() => {});
+      } catch (e) {
+        setMsg(e.message);
+      }
+    });
+  }
+
   async function download(asset) {
+    if (isAssetTakenDown(asset)) {
+      setMsg("素材已下架，不能继续下载。");
+      return;
+    }
     try {
-      await downloadBlob(`/api/assets/${asset.id}/download`, `asset-${asset.id}`);
+      await downloadBlob(`/api/assets/${asset.id}/download`);
     } catch (e) {
       setMsg(e.message);
     }
@@ -225,9 +265,12 @@ export default function HistoryPage() {
                   </span>
                 </div>
                 {t.partial && (
-                  <p className="mb-3 rounded-lg bg-warn/10 px-3 py-2 text-xs text-warn">
-                    批量生成完成 {t.saved_count || t.assets?.length || 0}/{t.requested_count || "?"} 张，失败部分已退回积分。
-                  </p>
+                  <div className="mb-3 rounded-lg bg-warn/10 px-3 py-2 text-xs text-warn">
+                    <p>批量生成完成 {t.saved_count || t.assets?.length || 0}/{t.requested_count || "?"} 张，失败部分已退回积分。</p>
+                    {t.partial_errors?.length > 0 && (
+                      <p className="mt-1 text-warn/80">失败原因：{t.partial_errors.join("；")}</p>
+                    )}
+                  </div>
                 )}
 
                 {t.assets?.length > 0 ? (
@@ -300,7 +343,11 @@ export default function HistoryPage() {
           >
             {!srcOf(lightbox) ? (
               <div className="flex min-h-64 items-center justify-center rounded-xl2 bg-black/30 px-6 text-sm text-fog">
-                {lightbox.unlocked ? "预览暂不可用，请稍后重试。" : "预览暂不可用，请先解锁后再下载高清。"}
+                {isAssetTakenDown(lightbox)
+                  ? "素材已下架，不能继续预览、解锁或下载。"
+                  : lightbox.unlocked
+                    ? "预览暂不可用，请稍后重试。"
+                    : "预览暂不可用，请先解锁后再下载高清。"}
               </div>
             ) : (
               <AssetMedia
@@ -316,15 +363,27 @@ export default function HistoryPage() {
             )}
             <div className="mt-3 flex items-center justify-between gap-2 text-sm">
               <span className="text-fog">
-                {lightbox.unlocked ? "预览 · 已解锁，可下载高清" : "预览 · 带水印"}
+                {isAssetTakenDown(lightbox) ? "素材已下架" : lightbox.unlocked ? "预览 · 已解锁，可下载高清" : "预览 · 带水印"}
                 {lightbox.width ? ` · ${lightbox.width}×${lightbox.height}` : ""}
               </span>
               <div className="flex gap-2">
-                {!lightbox.unlocked && (
-                  <button onClick={() => unlock(lightbox)} className="btn-primary btn-sm">解锁高清</button>
+                {!isAssetTakenDown(lightbox) && !lightbox.unlocked && (
+                  <button
+                    onClick={() => unlock(lightbox)}
+                    disabled={busyAssetIds.has(lightbox.id)}
+                    className="btn-primary btn-sm"
+                  >
+                    {busyAssetIds.has(lightbox.id) ? "解锁中…" : "解锁高清"}
+                  </button>
                 )}
-                {lightbox.unlocked && (
-                  <button onClick={() => download(lightbox)} className="btn-primary btn-sm">下载</button>
+                {!isAssetTakenDown(lightbox) && lightbox.unlocked && (
+                  <button
+                    onClick={() => download(lightbox)}
+                    disabled={busyAssetIds.has(lightbox.id)}
+                    className="btn-primary btn-sm"
+                  >
+                    下载
+                  </button>
                 )}
                 <button onClick={() => setLightbox(null)} className="btn-secondary btn-sm">关闭</button>
               </div>
@@ -338,6 +397,7 @@ export default function HistoryPage() {
 
 function HistoryAssetButton({ asset, onOpen }) {
   const src = srcOf(asset);
+  const takenDown = isAssetTakenDown(asset);
   return (
     <button
       onClick={onOpen}
@@ -346,7 +406,7 @@ function HistoryAssetButton({ asset, onOpen }) {
     >
       {!src ? (
         <div className="flex h-full w-full items-center justify-center px-3 text-center text-xs text-fog">
-          预览暂不可用
+          {assetUnavailableText(asset)}
         </div>
       ) : (
         <AssetMedia
@@ -355,7 +415,10 @@ function HistoryAssetButton({ asset, onOpen }) {
           fallbackClassName="flex h-full w-full items-center justify-center px-3 text-center text-xs text-fog"
         />
       )}
-      {asset.unlocked && (
+      {takenDown && (
+        <span className="badge absolute left-1 top-1 bg-bad/80 text-white">已下架</span>
+      )}
+      {!takenDown && asset.unlocked && (
         <span className="badge absolute right-1 top-1 bg-brand text-white">HD</span>
       )}
     </button>

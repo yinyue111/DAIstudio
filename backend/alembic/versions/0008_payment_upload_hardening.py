@@ -5,6 +5,7 @@ Revises: 0007_payment_config
 Create Date: 2026-06-18
 """
 import sqlalchemy as sa
+
 from alembic import op
 
 revision = "0008_payment_upload_hardening"
@@ -21,6 +22,47 @@ def _add_check_if_missing(insp, table, name, condition):
     if name in _constraint_names(insp, table):
         return
     op.create_check_constraint(name, table, condition)
+
+
+PAYMENT_CHECKS = {
+    "payment_orders": (
+        ("ck_payment_orders_amount_cents_positive", "amount_cents > 0"),
+        ("ck_payment_orders_credits_positive", "credits > 0"),
+        ("ck_payment_orders_provider_valid", "provider in ('alipay', 'wechat')"),
+        (
+            "ck_payment_orders_status_valid",
+            "status in ('pending', 'paid', 'closed', 'failed')",
+        ),
+    ),
+    "payment_packages": (
+        ("ck_payment_packages_amount_cents_positive", "amount_cents > 0"),
+        ("ck_payment_packages_credits_positive", "credits > 0"),
+    ),
+    "payment_provider_configs": (
+        (
+            "ck_payment_provider_configs_provider_valid",
+            "provider in ('alipay', 'wechat')",
+        ),
+        ("ck_payment_provider_configs_mode_valid", "mode in ('mock', 'live')"),
+    ),
+}
+
+
+def _add_payment_checks(insp, tables) -> None:
+    for table, checks in PAYMENT_CHECKS.items():
+        if table not in tables:
+            continue
+        existing = _constraint_names(insp, table)
+        missing = [(name, condition) for name, condition in checks if name not in existing]
+        if not missing:
+            continue
+        if op.get_bind().dialect.name == "sqlite":
+            with op.batch_alter_table(table, recreate="always") as batch:
+                for name, condition in missing:
+                    batch.create_check_constraint(name, condition)
+        else:
+            for name, condition in missing:
+                _add_check_if_missing(insp, table, name, condition)
 
 
 def upgrade() -> None:
@@ -41,61 +83,7 @@ def upgrade() -> None:
         )
         op.create_index("ix_uploaded_assets_user_id", "uploaded_assets", ["user_id"])
 
-    # SQLite cannot add check constraints to existing tables. Test databases
-    # get the same constraints through Base.metadata.create_all().
-    if bind.dialect.name == "sqlite":
-        return
-    if "payment_orders" in tables:
-        _add_check_if_missing(
-            insp,
-            "payment_orders",
-            "ck_payment_orders_amount_cents_positive",
-            "amount_cents > 0",
-        )
-        _add_check_if_missing(
-            insp,
-            "payment_orders",
-            "ck_payment_orders_credits_positive",
-            "credits > 0",
-        )
-        _add_check_if_missing(
-            insp,
-            "payment_orders",
-            "ck_payment_orders_provider_valid",
-            "provider in ('alipay', 'wechat')",
-        )
-        _add_check_if_missing(
-            insp,
-            "payment_orders",
-            "ck_payment_orders_status_valid",
-            "status in ('pending', 'paid', 'closed', 'failed')",
-        )
-    if "payment_packages" in tables:
-        _add_check_if_missing(
-            insp,
-            "payment_packages",
-            "ck_payment_packages_amount_cents_positive",
-            "amount_cents > 0",
-        )
-        _add_check_if_missing(
-            insp,
-            "payment_packages",
-            "ck_payment_packages_credits_positive",
-            "credits > 0",
-        )
-    if "payment_provider_configs" in tables:
-        _add_check_if_missing(
-            insp,
-            "payment_provider_configs",
-            "ck_payment_provider_configs_provider_valid",
-            "provider in ('alipay', 'wechat')",
-        )
-        _add_check_if_missing(
-            insp,
-            "payment_provider_configs",
-            "ck_payment_provider_configs_mode_valid",
-            "mode in ('mock', 'live')",
-        )
+    _add_payment_checks(insp, tables)
 
 
 def downgrade() -> None:

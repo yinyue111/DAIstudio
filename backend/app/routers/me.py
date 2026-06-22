@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from sqlalchemy.orm import Session
 
+from ..config import settings
 from ..db import get_db
 from ..deps import get_client_ip, get_current_user
 from ..models import User
@@ -11,6 +12,7 @@ from ..redis_client import redis_client
 from ..schemas import ChangePasswordIn, UserOut
 from ..security import hash_password, verify_password
 from ..services import audit
+from ..services.rate_limit import incr_window
 
 router = APIRouter(prefix="/api", tags=["me"])
 
@@ -34,9 +36,7 @@ def change_password(body: ChangePasswordIn, request: Request, db: Session = Depe
         raise HTTPException(429, "密码错误次数过多,请稍后再试")
     if not verify_password(body.old_password, user.password_hash):
         for key in (fail_key, ip_key):
-            n = redis_client.incr(key)
-            if n == 1:
-                redis_client.expire(key, PASSWORD_FAIL_WINDOW)
+            incr_window(key, PASSWORD_FAIL_WINDOW)
         audit.log(db, user_id=user.id, action="change_password_failed",
                   ip=get_client_ip(request))
         raise HTTPException(400, "原密码不正确")
@@ -51,8 +51,9 @@ def change_password(body: ChangePasswordIn, request: Request, db: Session = Depe
 
 
 @router.post("/me/logout")
-def logout(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+def logout(response: Response, db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     """Server-side logout: invalidates every issued token for this user."""
     user.token_version += 1
     db.commit()
+    response.delete_cookie(settings.auth_cookie_name, path="/", samesite="lax")
     return {"ok": True}

@@ -210,7 +210,7 @@ def validate_base_url(name: str, url: str | None) -> None:
     trusted = host in settings.trusted_egress_host_list
     if not settings.debug and parsed.scheme != "https" and not trusted:
         raise ModelGatewayConfigError(f"{name} 必须使用 HTTPS,或将主机加入 TRUSTED_EGRESS_HOSTS")
-    if trusted or settings.debug:
+    if settings.debug:
         return
     try:
         assert_safe_url(url)

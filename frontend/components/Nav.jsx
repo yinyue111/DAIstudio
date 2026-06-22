@@ -87,10 +87,15 @@ export default function Nav({ me, active }) {
           </div>
 
           {me && (
-            <span className="hidden items-center gap-1.5 rounded-full border border-iris/30 bg-iris/10 px-3 py-1.5 text-xs sm:inline-flex">
+            <span
+              className="hidden items-center gap-1.5 rounded-full border border-iris/30 bg-iris/10 px-3 py-1.5 text-xs sm:inline-flex"
+              aria-label={`可用积分 ${me.balance_credits}${me.frozen_credits ? `，冻结积分 ${me.frozen_credits}` : ""}`}
+              title={`可用积分 ${me.balance_credits}${me.frozen_credits ? ` · 冻结积分 ${me.frozen_credits}` : ""}`}
+            >
               <svg viewBox="0 0 24 24" className="h-3.5 w-3.5 text-iris-400" fill="currentColor" aria-hidden>
                 <path d="M12 2l2.4 6.3L21 9l-5 4.3L17.5 21 12 17.2 6.5 21 8 13.3 3 9l6.6-.7L12 2z" />
               </svg>
+              <span className="text-fog">可用</span>
               <b className="text-snow">{me.balance_credits}</b>
               {me.frozen_credits ? <span className="text-fog">冻结 {me.frozen_credits}</span> : null}
             </span>

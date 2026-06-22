@@ -32,6 +32,11 @@ BigIntPK = BigInteger().with_variant(Integer, "sqlite")
 
 class User(Base):
     __tablename__ = "users"
+    __table_args__ = (
+        CheckConstraint("status in ('active', 'pending', 'disabled')", name="ck_users_status_valid"),
+        CheckConstraint("balance_credits >= 0", name="ck_users_balance_nonnegative"),
+        CheckConstraint("frozen_credits >= 0", name="ck_users_frozen_nonnegative"),
+    )
 
     id: Mapped[int] = mapped_column(BigIntPK, primary_key=True, autoincrement=True)
     phone: Mapped[str] = mapped_column(String(20), unique=True, nullable=False, index=True)
@@ -61,16 +66,51 @@ class PhoneWhitelist(Base):
 
 class CreditTransaction(Base):
     __tablename__ = "credit_transactions"
+    __table_args__ = (
+        CheckConstraint(
+            "type in ('grant', 'freeze', 'settle', 'refund', 'unlock', 'consume')",
+            name="ck_credit_transactions_type_valid",
+        ),
+        CheckConstraint("balance_after >= 0", name="ck_credit_transactions_balance_after_nonnegative"),
+        CheckConstraint(
+            "frozen_after IS NULL OR frozen_after >= 0",
+            name="ck_credit_transactions_frozen_after_nonnegative",
+        ),
+        CheckConstraint(
+            "reserved_amount IS NULL OR reserved_amount >= 0",
+            name="ck_credit_transactions_reserved_amount_nonnegative",
+        ),
+        CheckConstraint(
+            "real_cost IS NULL OR real_cost >= 0",
+            name="ck_credit_transactions_real_cost_nonnegative",
+        ),
+    )
 
     id: Mapped[int] = mapped_column(BigIntPK, primary_key=True, autoincrement=True)
     user_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("users.id"), index=True)
-    type: Mapped[str] = mapped_column(String(16), nullable=False)  # grant/freeze/settle/refund/unlock
+    type: Mapped[str] = mapped_column(String(16), nullable=False)  # grant/freeze/settle/refund/unlock/consume
     change: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    balance_delta: Mapped[int | None] = mapped_column(BigInteger)
+    frozen_delta: Mapped[int | None] = mapped_column(BigInteger)
     balance_after: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    frozen_after: Mapped[int | None] = mapped_column(BigInteger)
+    reserved_amount: Mapped[int | None] = mapped_column(BigInteger)
+    real_cost: Mapped[int | None] = mapped_column(BigInteger)
     biz_type: Mapped[str | None] = mapped_column(String(32))  # gen_task / unlock / admin
     biz_ref: Mapped[int | None] = mapped_column(BigInteger)
     note: Mapped[str | None] = mapped_column(String(255))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+Index(
+    "uq_credit_transactions_payment_grant",
+    CreditTransaction.biz_type,
+    CreditTransaction.biz_ref,
+    CreditTransaction.type,
+    unique=True,
+    postgresql_where=text("biz_type = 'payment' AND type = 'grant' AND biz_ref IS NOT NULL"),
+    sqlite_where=text("biz_type = 'payment' AND type = 'grant' AND biz_ref IS NOT NULL"),
+)
 
 
 class AdminIdempotencyKey(Base):
@@ -173,6 +213,9 @@ class PaymentProviderConfig(Base):
 
 class UploadedAsset(Base):
     __tablename__ = "uploaded_assets"
+    __table_args__ = (
+        CheckConstraint("bytes IS NULL OR bytes >= 0", name="ck_uploaded_assets_bytes_nonnegative"),
+    )
 
     key: Mapped[str] = mapped_column(String(255), primary_key=True)
     user_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("users.id"), index=True)
@@ -186,12 +229,15 @@ class UploadedAsset(Base):
 
 class ParseRecord(Base):
     __tablename__ = "parse_records"
+    __table_args__ = (
+        CheckConstraint("status in ('queued', 'running', 'done', 'failed')", name="ck_parse_records_status_valid"),
+    )
 
     id: Mapped[int] = mapped_column(BigIntPK, primary_key=True, autoincrement=True)
     user_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("users.id"), index=True)
     url: Mapped[str] = mapped_column(Text, nullable=False)
     assets: Mapped[list | None] = mapped_column(JSONType)  # [{type,url,thumb}]
-    status: Mapped[str] = mapped_column(String(16), default="queued")  # queued/done/failed
+    status: Mapped[str] = mapped_column(String(16), default="queued")  # queued/running/done/failed
     error: Mapped[str | None] = mapped_column(Text)
     cached_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
@@ -199,6 +245,24 @@ class ParseRecord(Base):
 
 class GenTask(Base):
     __tablename__ = "gen_tasks"
+    __table_args__ = (
+        CheckConstraint(
+            "source_type IS NULL OR source_type in ('image', 'video')",
+            name="ck_gen_tasks_source_type_valid",
+        ),
+        CheckConstraint("category in ('image', 'video')", name="ck_gen_tasks_category_valid"),
+        CheckConstraint("stage in ('preview', 'final')", name="ck_gen_tasks_stage_valid"),
+        CheckConstraint(
+            "status in ('queued', 'running', 'succeeded', 'failed', 'needs_review')",
+            name="ck_gen_tasks_status_valid",
+        ),
+        CheckConstraint(
+            "phase IS NULL OR phase in ('submitting', 'polling', 'downloading', 'reconciling')",
+            name="ck_gen_tasks_phase_valid",
+        ),
+        CheckConstraint("cost_frozen >= 0", name="ck_gen_tasks_cost_frozen_nonnegative"),
+        CheckConstraint("cost_settled >= 0", name="ck_gen_tasks_cost_settled_nonnegative"),
+    )
 
     id: Mapped[int] = mapped_column(BigIntPK, primary_key=True, autoincrement=True)
     user_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("users.id"), index=True)
@@ -252,6 +316,16 @@ Index(
 
 class GenAsset(Base):
     __tablename__ = "gen_assets"
+    __table_args__ = (
+        CheckConstraint("type in ('image', 'video')", name="ck_gen_assets_type_valid"),
+        CheckConstraint(
+            "moderation_status in ('active', 'takedown')",
+            name="ck_gen_assets_moderation_status_valid",
+        ),
+        CheckConstraint("width IS NULL OR width > 0", name="ck_gen_assets_width_positive"),
+        CheckConstraint("height IS NULL OR height > 0", name="ck_gen_assets_height_positive"),
+        CheckConstraint("duration IS NULL OR duration >= 0", name="ck_gen_assets_duration_nonnegative"),
+    )
 
     id: Mapped[int] = mapped_column(BigIntPK, primary_key=True, autoincrement=True)
     task_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("gen_tasks.id"), index=True)
@@ -262,9 +336,37 @@ class GenAsset(Base):
     watermarked: Mapped[bool] = mapped_column(Boolean, default=True)
     unlocked: Mapped[bool] = mapped_column(Boolean, default=False)
     favorite: Mapped[bool] = mapped_column(Boolean, default=False)
+    moderation_status: Mapped[str] = mapped_column(String(16), default="active", nullable=False)
     width: Mapped[int | None] = mapped_column(Integer)
     height: Mapped[int | None] = mapped_column(Integer)
     duration: Mapped[int | None] = mapped_column(Integer)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class AssetReport(Base):
+    __tablename__ = "asset_reports"
+    __table_args__ = (
+        CheckConstraint(
+            "status in ('open', 'dismissed', 'takedown')",
+            name="ck_asset_reports_status_valid",
+        ),
+        CheckConstraint(
+            "reason in ('copyright', 'sensitive', 'illegal', 'privacy', 'other')",
+            name="ck_asset_reports_reason_valid",
+        ),
+        Index("ix_asset_reports_status_created", "status", "created_at"),
+    )
+
+    id: Mapped[int] = mapped_column(BigIntPK, primary_key=True, autoincrement=True)
+    asset_id: Mapped[int | None] = mapped_column(BigInteger, ForeignKey("gen_assets.id"), index=True)
+    reporter_user_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("users.id"), index=True)
+    owner_user_id: Mapped[int | None] = mapped_column(BigInteger, ForeignKey("users.id"), index=True)
+    reason: Mapped[str] = mapped_column(String(16), nullable=False)
+    note: Mapped[str | None] = mapped_column(String(500))
+    status: Mapped[str] = mapped_column(String(16), default="open", nullable=False)
+    handled_by: Mapped[int | None] = mapped_column(BigInteger, ForeignKey("users.id"))
+    handle_note: Mapped[str | None] = mapped_column(String(500))
+    handled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
@@ -276,6 +378,20 @@ class GatewayCall(Base):
     not just the internal credit estimate."""
 
     __tablename__ = "gateway_calls"
+    __table_args__ = (
+        CheckConstraint(
+            "kind in ('reverse', 'image', 'video_submit', 'video_poll', 'video_download')",
+            name="ck_gateway_calls_kind_valid",
+        ),
+        CheckConstraint("status IS NULL OR status in ('ok', 'failed')", name="ck_gateway_calls_status_valid"),
+        CheckConstraint("latency_ms IS NULL OR latency_ms >= 0", name="ck_gateway_calls_latency_nonnegative"),
+        CheckConstraint("prompt_tokens IS NULL OR prompt_tokens >= 0", name="ck_gateway_calls_prompt_tokens_nonnegative"),
+        CheckConstraint(
+            "completion_tokens IS NULL OR completion_tokens >= 0",
+            name="ck_gateway_calls_completion_tokens_nonnegative",
+        ),
+        CheckConstraint("total_tokens IS NULL OR total_tokens >= 0", name="ck_gateway_calls_total_tokens_nonnegative"),
+    )
 
     id: Mapped[int] = mapped_column(BigIntPK, primary_key=True, autoincrement=True)
     user_id: Mapped[int | None] = mapped_column(BigInteger, index=True)
@@ -309,9 +425,19 @@ class AuditLog(Base):
 
 class ModelConfig(Base):
     __tablename__ = "model_configs"
+    __table_args__ = (
+        Index("ix_model_configs_use", "use", unique=True),
+        CheckConstraint("use in ('vision', 'image', 'video')", name="ck_model_configs_use_valid"),
+        CheckConstraint(
+            "gateway_format IS NULL OR gateway_format in ('openai', 'ark')",
+            name="ck_model_configs_gateway_format_valid",
+        ),
+        CheckConstraint("cost_credits >= 0", name="ck_model_configs_cost_credits_nonnegative"),
+        CheckConstraint("unlock_cost >= 0", name="ck_model_configs_unlock_cost_nonnegative"),
+    )
 
     id: Mapped[int] = mapped_column(BigIntPK, primary_key=True, autoincrement=True)
-    use: Mapped[str] = mapped_column(String(16), unique=True, nullable=False)  # vision/image/video
+    use: Mapped[str] = mapped_column(String(16), nullable=False)  # vision/image/video
     model_id: Mapped[str] = mapped_column(String(128), nullable=False)
     provider: Mapped[str | None] = mapped_column(String(32))
     base_url: Mapped[str | None] = mapped_column(String(512))

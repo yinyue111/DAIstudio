@@ -54,6 +54,11 @@ def upgrade() -> None:
     dialect = bind.dialect.name
     if dialect not in {"postgresql", "sqlite"}:
         return
+    bind.execute(sa.text("""
+        UPDATE payment_orders
+        SET provider_trade_no = NULL
+        WHERE provider_trade_no = ''
+    """))
     _fail_on_duplicate_trade_no(bind, dialect)
     if INDEX_NAME in _index_names(insp, "payment_orders"):
         return

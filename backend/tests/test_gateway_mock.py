@@ -129,7 +129,7 @@ def test_download_error_does_not_leak_signed_url(monkeypatch):
         def stream(self, *_args, **_kwargs):
             return FakeStream()
 
-    monkeypatch.setattr(gateway.httpx, "Client", FakeClient)
+    monkeypatch.setattr(gateway, "pinned_client", lambda *_args, **_kwargs: FakeClient())
     signed = "https://cdn.example.com/video.mp4?token=secret-token"
     try:
         gateway.download_bytes(signed)
@@ -191,6 +191,48 @@ def test_download_to_path_rejects_explicit_non_video_type(monkeypatch, tmp_path)
         raise AssertionError("download should reject text/html")
 
     assert seen["timeout"] == 123
+    assert not out.exists()
+
+
+def test_download_to_path_rejects_missing_content_type_when_required(monkeypatch, tmp_path):
+    class FakeStream:
+        is_redirect = False
+        status_code = 200
+        headers = {}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def iter_raw(self):
+            yield b"not typed"
+
+    class FakeClient:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def stream(self, *_args, **_kwargs):
+            return FakeStream()
+
+    monkeypatch.setattr(gateway.httpx, "Client", lambda *_args, **_kwargs: FakeClient())
+    out = Path(tmp_path) / "missing-type.mp4"
+
+    try:
+        gateway.download_to_path(
+            "https://cdn.example.com/rendered",
+            out,
+            allowed_content_types=("video/", "application/octet-stream"),
+        )
+    except gateway.GatewayError as e:
+        assert "类型" in str(e)
+    else:
+        raise AssertionError("download should reject missing content-type")
+
     assert not out.exists()
 
 
@@ -334,11 +376,12 @@ def test_reverse_uses_per_model_gateway_config(monkeypatch):
         gateway_format="openai",
     )
 
-    def fake_post(path, payload, timeout=None, config=None):
+    def fake_post(path, payload, timeout=None, config=None, retries=None):
         seen["path"] = path
         seen["payload"] = payload
         seen["timeout"] = timeout
         seen["config"] = config
+        seen["retries"] = retries
         return {
             "choices": [{
                 "message": {"content": '{"final_text":"same style","主体":"cat"}'},
@@ -351,7 +394,9 @@ def test_reverse_uses_per_model_gateway_config(monkeypatch):
 
     assert res["final_text"] == "same style"
     assert seen["path"] == "/chat/completions"
+    assert seen["timeout"] == settings.reverse_gateway_timeout_seconds
     assert seen["config"] is cfg
+    assert seen["retries"] == 0
     assert seen["payload"]["model"] == "vision-model"
 
 
@@ -384,6 +429,7 @@ def test_text_to_image_returns_partial_successes(monkeypatch):
     monkeypatch.setattr(settings, "gateway_base_url", "http://gateway.test")
     monkeypatch.setattr(settings, "gateway_api_key", "test-key")
     monkeypatch.setattr(settings, "image_gateway_parallelism", 4)
+    monkeypatch.setattr(settings, "image_gateway_max_retries", 0)
     raw = base64.b64encode(gateway._mock_image("x", "256x256", 0)).decode()
     calls = {"n": 0}
 
@@ -398,6 +444,28 @@ def test_text_to_image_returns_partial_successes(monkeypatch):
 
     assert len(imgs) == 3
     assert calls["n"] == 4
+
+
+def test_text_to_image_batch_rejects_total_size_over_budget(monkeypatch):
+    monkeypatch.setattr(settings, "mock_mode", False)
+    monkeypatch.setattr(settings, "gateway_base_url", "http://gateway.test")
+    monkeypatch.setattr(settings, "gateway_api_key", "test-key")
+    monkeypatch.setattr(settings, "image_gateway_parallelism", 1)
+    monkeypatch.setattr(settings, "image_gateway_max_retries", 0)
+    monkeypatch.setattr(settings, "generated_image_max_bytes", 1)
+    monkeypatch.setattr(settings, "generated_image_batch_max_bytes", 8)
+    raw = base64.b64encode(gateway._mock_image("x", "256x256", 0)).decode()
+
+    def fake_request_json(method, url, *, headers, payload, timeout, retries):
+        return {"data": [{"b64_json": raw}]}
+
+    monkeypatch.setattr(gateway, "_request_json", fake_request_json)
+    try:
+        gateway.gen_image("a cat", "gpt-image-2", n=2, size="256x256")
+    except gateway.GatewayError as e:
+        assert "未返回任何结果" in str(e)
+    else:
+        raise AssertionError("oversized batch should fail")
 
 
 def test_text_to_image_retries_transient_gateway_status(monkeypatch):
@@ -420,3 +488,53 @@ def test_text_to_image_retries_transient_gateway_status(monkeypatch):
 
     assert len(imgs) == 4
     assert calls["n"] == 5
+
+
+def test_text_to_image_does_not_retry_unknown_submit_state(monkeypatch):
+    monkeypatch.setattr(settings, "mock_mode", False)
+    monkeypatch.setattr(settings, "gateway_base_url", "http://gateway.test")
+    monkeypatch.setattr(settings, "gateway_api_key", "test-key")
+    monkeypatch.setattr(settings, "image_gateway_parallelism", 1)
+    monkeypatch.setattr(settings, "image_gateway_max_retries", 1)
+    raw = base64.b64encode(gateway._mock_image("x", "256x256", 0)).decode()
+    calls = {"n": 0}
+
+    def flaky_request_json(method, url, *, headers, payload, timeout, retries):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise gateway.GatewayError("read timed out", transient=True)
+        return {"data": [{"b64_json": raw}]}
+
+    monkeypatch.setattr(gateway, "_request_json", flaky_request_json)
+    try:
+        gateway.gen_image("a cat", "gpt-image-2", n=1, size="256x256")
+    except gateway.GatewayError as e:
+        assert "未返回任何结果" in str(e)
+        assert "read timed out" in str(e)
+    else:
+        raise AssertionError("unknown submit state should not be retried")
+
+    assert calls["n"] == 1
+
+
+def test_download_to_storage_streams_even_when_effective_mock_mode(monkeypatch, tmp_path):
+    monkeypatch.setattr(settings, "mock_mode", False)
+    monkeypatch.setattr(settings, "gateway_base_url", "")
+    monkeypatch.setattr(settings, "gateway_api_key", "")
+    calls = []
+
+    def fail_bytes(*_args, **_kwargs):
+        raise AssertionError("download_bytes_limited should not be used for storage downloads")
+
+    def fake_download_to_path(url, path, **kwargs):
+        calls.append((url, path, kwargs))
+        path.write_bytes(b"video")
+        return 5
+
+    monkeypatch.setattr(gateway, "download_bytes_limited", fail_bytes)
+    monkeypatch.setattr(gateway, "download_to_path", fake_download_to_path)
+
+    key = gateway.download_to_storage("https://cdn.example.com/out.mp4", "video_preview", "mp4")
+
+    assert key.startswith("video_preview/")
+    assert calls and calls[0][0] == "https://cdn.example.com/out.mp4"

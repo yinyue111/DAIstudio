@@ -26,6 +26,9 @@ def _decorate_partial(out: TaskOut, task: GenTask) -> None:
     out.requested_count = params.get("_requested_n")
     out.saved_count = params.get("_saved_n")
     out.skipped_count = params.get("_skipped_n")
+    errors = params.get("_partial_errors")
+    if isinstance(errors, list):
+        out.partial_errors = [str(e)[:160] for e in errors[:5] if str(e).strip()]
 
 
 def _set_final_summary(out: TaskOut, final_task: GenTask | None, asset_count: int = 0) -> None:

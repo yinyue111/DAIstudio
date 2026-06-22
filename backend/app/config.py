@@ -41,6 +41,10 @@ class Settings(BaseSettings):
     jwt_secret: str = "change-me-in-production"
     jwt_algorithm: str = "HS256"
     jwt_expire_minutes: int = 60 * 24 * 7  # 7 days
+    auth_cookie_name: str = "ai_studio_token"
+    # Browser auth uses the HttpOnly cookie. Keep bearer tokens out of login
+    # responses in production unless an API-client deployment explicitly opts in.
+    auth_bearer_response_enabled: bool = False
     sms_code_ttl_seconds: int = 300  # 5 minutes
     sms_send_cooldown_seconds: int = 60  # min gap between two codes
     sms_send_hourly_limit: int = 5  # max codes / phone / hour
@@ -51,17 +55,23 @@ class Settings(BaseSettings):
     gateway_api_key: str = ""
     gateway_timeout_seconds: int = 120
     gateway_max_retries: int = 2
+    # Vision reverse-prompt calls can include multiple keyframes and may take
+    # longer than normal chat calls, but should remain shorter than rendering.
+    reverse_gateway_timeout_seconds: int = 150
     # Image generation can legitimately take several minutes for large outputs.
     # Keep it separate from normal gateway calls so prompt/reverse endpoints do
     # not wait as long as render endpoints.
     image_gateway_timeout_seconds: int = 600
     image_download_timeout_seconds: int = 600
     generated_image_max_bytes: int = 80 * 1024 * 1024
+    generated_image_batch_max_bytes: int = 160 * 1024 * 1024
     # Batch image generation is implemented as repeated single-image requests
     # because the current gateway rejects n/tool-count parameters. Run those
     # repeated requests concurrently so n=4/8 does not become a serial queue.
     image_gateway_parallelism: int = 8
-    image_gateway_max_retries: int = 1
+    # Image render POSTs are non-idempotent for most providers. Do not retry by
+    # default after a timeout/5xx: the upstream may have already accepted work.
+    image_gateway_max_retries: int = 0
     # When true (or when gateway_api_key is empty) the gateway client returns
     # locally generated placeholder media so the whole flow runs offline.
     mock_mode: bool = False
@@ -117,6 +127,8 @@ class Settings(BaseSettings):
     # the render-html cap bounds the serialized DOM Playwright hands back.
     parse_playwright_parallelism: int = 2
     parse_playwright_acquire_timeout_seconds: int = 8
+    parse_pending_limit: int = 3
+    parse_pending_max_age_minutes: int = 30
     parse_max_raw_body_bytes: int = 3_000_000
     parse_max_render_html_bytes: int = 8_000_000
     parse_max_assets: int = 80
@@ -131,6 +143,8 @@ class Settings(BaseSettings):
     max_image_dim: int = 4096  # max width/height for a requested image size
     max_upload_image_bytes: int = 20 * 1024 * 1024
     max_upload_image_pixels: int = 24_000_000
+    max_upload_video_bytes: int = 512 * 1024 * 1024
+    user_upload_storage_quota_bytes: int = 2 * 1024 * 1024 * 1024
     payment_notify_max_body_bytes: int = 64 * 1024
     payment_order_rate_limit_per_hour: int = 20
     payment_order_pending_limit: int = 5
@@ -157,6 +171,10 @@ class Settings(BaseSettings):
     # merchant accounts. Set PAYMENT_MOCK_ENABLED=false in production.
     payment_mock_enabled: bool = False
     payment_order_expire_minutes: int = 30
+    payment_reconcile_enabled: bool = True
+    payment_reconcile_interval_minutes: int = 10
+    payment_reconcile_lookback_hours: int = 24
+    payment_reconcile_max_orders: int = 50
     payment_frontend_base_url: str = "http://localhost:3000"
     payment_subject_prefix: str = "造梦 Studio 积分充值"
     # Used to encrypt payment merchant secrets stored from the admin UI. In

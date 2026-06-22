@@ -17,6 +17,18 @@ def _set_payment_enabled(enabled: bool = True):
         db.close()
 
 
+def _clear_unpaid_payment_orders():
+    db = SessionLocal()
+    try:
+        db.query(PaymentOrder).filter(PaymentOrder.paid_at.is_(None)).update(
+            {PaymentOrder.status: payments.FAILED},
+            synchronize_session=False,
+        )
+        db.commit()
+    finally:
+        db.close()
+
+
 def test_mock_payments_only_allowed_on_local_urls(monkeypatch):
     monkeypatch.setattr(settings, "debug", True)
     monkeypatch.setattr(settings, "payment_mock_enabled", True)
@@ -93,6 +105,35 @@ def test_mock_payment_marks_paid_and_grants_once(client, make_user, auth):
     paid2 = client.post(f"/api/payments/orders/{order['order_no']}/mock-pay", headers=h)
     assert paid2.status_code == 200, paid2.text
     assert client.get("/api/me", headers=h).json()["balance_credits"] == before + 420
+
+
+def test_paid_order_rejects_mismatched_provider_trade_no(client, make_user, auth):
+    _set_payment_enabled(True)
+    make_user("13900000242", balance=100)
+    h = auth("13900000242")
+    order = client.post("/api/payments/orders", json={
+        "provider": "alipay",
+        "package_id": "starter",
+    }, headers=h).json()
+    db = SessionLocal()
+    try:
+        payments.mark_paid(
+            db,
+            order["order_no"],
+            provider="alipay",
+            provider_trade_no="ali-original",
+            allow_expired=True,
+        )
+        with pytest.raises(payments.PaymentError, match="流水号.*不匹配"):
+            payments.mark_paid(
+                db,
+                order["order_no"],
+                provider="alipay",
+                provider_trade_no="ali-other",
+                allow_expired=True,
+            )
+    finally:
+        db.close()
 
 
 def test_payment_order_requires_owner(client, make_user, auth):
@@ -297,6 +338,65 @@ def test_wechat_notify_rejects_non_success_even_with_valid_signature(client, mak
     assert client.get(f"/api/payments/orders/{order['order_no']}", headers=h).json()["status"] == "pending"
 
 
+def test_alipay_notify_requires_trade_no_after_verified_signature(client, make_user, auth, monkeypatch):
+    _set_payment_enabled(True)
+    make_user("13900000236", balance=100)
+    h = auth("13900000236")
+    order = client.post("/api/payments/orders", json={
+        "provider": "alipay",
+        "package_id": "starter",
+    }, headers=h).json()
+    before = client.get("/api/me", headers=h).json()["balance_credits"]
+    monkeypatch.setattr("app.services.payments._rsa_sha256_verify", lambda *args: True)
+    monkeypatch.setattr(
+        "app.services.payment_config.runtime_or_env",
+        lambda db, provider: payment_config.ProviderRuntimeConfig(
+            provider="alipay",
+            enabled=True,
+            mode="live",
+            public={},
+            secret={"public_key": "public"},
+        ),
+    )
+
+    r = client.post("/api/payments/alipay/notify", data={
+        "out_trade_no": order["order_no"],
+        "trade_status": "TRADE_SUCCESS",
+        "total_amount": "9.90",
+        "sign": "verified",
+    })
+    assert r.status_code == 200
+    assert r.text == "fail"
+    assert client.get("/api/me", headers=h).json()["balance_credits"] == before
+    assert client.get(f"/api/payments/orders/{order['order_no']}", headers=h).json()["status"] == "pending"
+
+
+def test_wechat_notify_requires_transaction_id_after_verified_signature(client, make_user, auth, monkeypatch):
+    _set_payment_enabled(True)
+    make_user("13900000237", balance=100)
+    h = auth("13900000237")
+    order = client.post("/api/payments/orders", json={
+        "provider": "wechat",
+        "package_id": "creator",
+    }, headers=h).json()
+    before = client.get("/api/me", headers=h).json()["balance_credits"]
+    monkeypatch.setattr("app.services.payments.wechat_signature_valid", lambda db, headers, body: True)
+
+    r = client.post("/api/payments/wechat/notify", json={
+        "event_type": "TRANSACTION.SUCCESS",
+        "resource": {
+            "out_trade_no": order["order_no"],
+            "trade_state": "SUCCESS",
+            "success_time": "2026-06-18T12:00:00+08:00",
+            "amount": {"total": 2990, "currency": "CNY"},
+        },
+    })
+    assert r.status_code == 400
+    assert "第三方流水号" in r.text
+    assert client.get("/api/me", headers=h).json()["balance_credits"] == before
+    assert client.get(f"/api/payments/orders/{order['order_no']}", headers=h).json()["status"] == "pending"
+
+
 def test_wechat_signature_requires_configured_platform_serial(monkeypatch):
     db = SessionLocal()
     try:
@@ -421,6 +521,30 @@ def test_env_provider_fallback_requires_callback_credentials(client, monkeypatch
         db.close()
 
 
+def test_admin_payment_providers_expose_env_runtime_without_empty_form(client, make_user, auth, monkeypatch):
+    make_user("13900000221", balance=100, admin=True)
+    h = auth("13900000221")
+    monkeypatch.setattr(settings, "public_base_url", "https://dream.aiwuq.cn")
+    monkeypatch.setattr(settings, "alipay_app_id", "ali-app")
+    monkeypatch.setattr(settings, "alipay_seller_id", "seller-1")
+    monkeypatch.setattr(settings, "alipay_gateway_url", "https://openapi.alipay.com/gateway.do")
+    monkeypatch.setattr(settings, "alipay_notify_url", "")
+    monkeypatch.setattr(settings, "alipay_private_key", "private")
+    monkeypatch.setattr(settings, "alipay_public_key", "public")
+
+    r = client.get("/api/admin/payments/providers", headers=h)
+
+    assert r.status_code == 200, r.text
+    providers = {p["provider"]: p for p in r.json()}
+    alipay = providers["alipay"]
+    assert alipay["source"] == "env"
+    assert alipay["ready"] is True
+    assert alipay["public_config"]["app_id"] == "ali-app"
+    assert alipay["public_config"]["seller_id"] == "seller-1"
+    assert alipay["secret_config_masked"]["private_key"] == "已配置"
+    assert alipay["secret_config_masked"]["public_key"] == "已配置"
+
+
 def test_live_provider_requires_effective_https_notify_url(client, monkeypatch):
     monkeypatch.setattr(settings, "public_base_url", "http://localhost:8000")
     issues = payment_config.validate_provider(
@@ -463,6 +587,75 @@ def test_mark_paid_rejects_wrong_provider_and_expired_orders(client, make_user, 
         db.close()
 
     assert client.get("/api/me", headers=h).json()["balance_credits"] == 100
+
+
+def test_mark_paid_requires_provider_trade_no_before_crediting(client, make_user, auth):
+    _set_payment_enabled(True)
+    make_user("13900000235", balance=100)
+    h = auth("13900000235")
+    order = client.post("/api/payments/orders", json={
+        "provider": "alipay",
+        "package_id": "starter",
+    }, headers=h).json()
+
+    db = SessionLocal()
+    try:
+        with pytest.raises(payments.PaymentError, match="第三方流水号"):
+            payments.mark_paid(
+                db,
+                order["order_no"],
+                provider="alipay",
+                provider_trade_no="  ",
+                allow_expired=True,
+            )
+        row = db.query(PaymentOrder).filter(PaymentOrder.order_no == order["order_no"]).one()
+        assert row.status == payments.PENDING
+        assert row.provider_trade_no is None
+    finally:
+        db.close()
+
+    assert client.get("/api/me", headers=h).json()["balance_credits"] == 100
+
+
+def test_mark_paid_translates_duplicate_provider_trade_no_integrity_error(client, make_user, auth):
+    _set_payment_enabled(True)
+    make_user("13900000240", balance=100)
+    h = auth("13900000240")
+    order = client.post("/api/payments/orders", json={
+        "provider": "alipay",
+        "package_id": "starter",
+    }, headers=h).json()
+
+    db = SessionLocal()
+    original_commit = db.commit
+    calls = {"n": 0}
+
+    def flaky_commit():
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise payments.IntegrityError(
+                "INSERT",
+                {},
+                Exception("UNIQUE constraint failed: uq_payment_orders_provider_trade_no"),
+            )
+        return original_commit()
+
+    try:
+        db.commit = flaky_commit
+        with pytest.raises(payments.PaymentError, match="流水号已入账"):
+            payments.mark_paid(
+                db,
+                order["order_no"],
+                provider="alipay",
+                provider_trade_no="ali_duplicate_race",
+                allow_expired=True,
+            )
+        db.commit = original_commit
+        row = db.query(PaymentOrder).filter(PaymentOrder.order_no == order["order_no"]).one()
+        assert row.status == payments.PENDING
+    finally:
+        db.commit = original_commit
+        db.close()
 
 
 def test_verified_provider_notify_can_credit_expired_order(client, make_user, auth):
@@ -622,6 +815,31 @@ def test_admin_payment_package_requires_admin_password(client, make_user, auth):
     assert disabled.status_code == 200, disabled.text
 
 
+def test_admin_payment_package_rejects_extreme_values(client, make_user, auth):
+    make_user("13900000239", balance=100, admin=True)
+    h = auth("13900000239")
+
+    huge_ratio = client.post("/api/admin/payments/packages", json={
+        "id": "too_generous",
+        "title": "异常比例",
+        "amount_cents": 1,
+        "credits": 100_001,
+        "enabled": True,
+        "admin_password": "pass123456",
+    }, headers=h)
+    assert huge_ratio.status_code == 422
+
+    huge_amount = client.post("/api/admin/payments/packages", json={
+        "id": "too_expensive",
+        "title": "异常金额",
+        "amount_cents": 100_000_001,
+        "credits": 1,
+        "enabled": True,
+        "admin_password": "pass123456",
+    }, headers=h)
+    assert huge_amount.status_code == 422
+
+
 def test_admin_payment_provider_config_is_masked_and_validated(client, make_user, auth):
     make_user("13900000210", balance=100, admin=True)
     h = auth("13900000210")
@@ -653,6 +871,50 @@ def test_admin_payment_provider_config_is_masked_and_validated(client, make_user
     cfg = client.get("/api/admin/payments/config", headers=h)
     assert cfg.status_code == 200
     assert "secret-private" not in cfg.text
+
+
+def test_admin_payment_provider_audit_records_before_after_without_secret(client, make_user, auth):
+    make_user("13900009211", balance=100, admin=True)
+    h = auth("13900009211")
+    first = client.put("/api/admin/payments/providers/alipay", json={
+        "provider": "alipay",
+        "enabled": False,
+        "mode": "mock",
+        "public_config": {"app_id": "ali-old"},
+        "secret_config": {"private_key": "old-private", "public_key": "old-public"},
+        "admin_password": "pass123456",
+    }, headers=h)
+    assert first.status_code == 200, first.text
+
+    changed = client.put("/api/admin/payments/providers/alipay", json={
+        "provider": "alipay",
+        "enabled": True,
+        "mode": "mock",
+        "public_config": {"app_id": "ali-new"},
+        "secret_config": {"private_key": "new-private", "public_key": "__keep__"},
+        "admin_password": "pass123456",
+    }, headers=h)
+    assert changed.status_code == 200, changed.text
+
+    audit_log = client.get("/api/admin/audit?action=update_payment_provider", headers=h)
+    assert audit_log.status_code == 200, audit_log.text
+    for secret in ("old-private", "old-public", "new-private"):
+        assert secret not in audit_log.text
+    detail = audit_log.json()[0]["detail"]
+    assert detail["provider"] == "alipay"
+    assert detail["secret_keys_changed"] == ["private_key"]
+    assert detail["before"]["enabled"] is False
+    assert detail["before"]["public_config"]["app_id"] == "ali-old"
+    assert detail["before"]["secret_configured"] == {
+        "private_key": True,
+        "public_key": True,
+    }
+    assert detail["after"]["enabled"] is True
+    assert detail["after"]["public_config"]["app_id"] == "ali-new"
+    assert detail["after"]["secret_configured"] == {
+        "private_key": True,
+        "public_key": True,
+    }
 
 
 def test_admin_payment_provider_rejects_secret_in_public_config(client, make_user, auth):
@@ -823,6 +1085,129 @@ def test_mark_paid_rejects_duplicate_provider_trade_no(client, make_user, auth):
                 provider_trade_no="same-trade-no",
                 allow_expired=True,
             )
+    finally:
+        db.close()
+
+
+def test_payment_reconcile_marks_paid_pending_order(client, make_user, auth, monkeypatch):
+    _set_payment_enabled(True)
+    _clear_unpaid_payment_orders()
+    make_user("13900000231", balance=100)
+    h = auth("13900000231")
+    order = client.post("/api/payments/orders", json={
+        "provider": "alipay",
+        "package_id": "starter",
+    }, headers=h).json()
+
+    monkeypatch.setattr("app.services.payments._query_provider_order", lambda db, row: {
+        "status": payments.PAID,
+        "provider_trade_no": "ali_reconcile_paid",
+        "raw": {"trade_status": "TRADE_SUCCESS"},
+    })
+    db = SessionLocal()
+    try:
+        stats = payments.reconcile_pending_orders(db)
+        assert stats["checked"] == 1
+        assert stats["paid"] == 1
+        row = db.query(PaymentOrder).filter(PaymentOrder.order_no == order["order_no"]).one()
+        assert row.status == payments.PAID
+        assert row.provider_trade_no == "ali_reconcile_paid"
+        assert row.raw["verified_provider_query"] is True
+
+        stats2 = payments.reconcile_pending_orders(db)
+        assert stats2["paid"] == 0
+    finally:
+        db.close()
+
+    assert client.get("/api/me", headers=h).json()["balance_credits"] == 220
+
+
+def test_payment_reconcile_can_credit_locally_closed_order(client, make_user, auth, monkeypatch):
+    _set_payment_enabled(True)
+    _clear_unpaid_payment_orders()
+    make_user("13900000232", balance=100)
+    h = auth("13900000232")
+    order = client.post("/api/payments/orders", json={
+        "provider": "wechat",
+        "package_id": "creator",
+    }, headers=h).json()
+    db = SessionLocal()
+    try:
+        row = db.query(PaymentOrder).filter(PaymentOrder.order_no == order["order_no"]).one()
+        row.expires_at = datetime.now(timezone.utc) - timedelta(minutes=1)
+        db.commit()
+    finally:
+        db.close()
+
+    assert client.get(f"/api/payments/orders/{order['order_no']}", headers=h).json()["status"] == payments.CLOSED
+
+    monkeypatch.setattr("app.services.payments._query_provider_order", lambda db, row: {
+        "status": payments.PAID,
+        "provider_trade_no": "wx_reconcile_late_success",
+        "raw": {"trade_state": "SUCCESS"},
+    })
+    db = SessionLocal()
+    try:
+        stats = payments.reconcile_pending_orders(db)
+        assert stats["checked"] == 1
+        assert stats["paid"] == 1
+        row = db.query(PaymentOrder).filter(PaymentOrder.order_no == order["order_no"]).one()
+        assert row.status == payments.PAID
+    finally:
+        db.close()
+
+    assert client.get("/api/me", headers=h).json()["balance_credits"] == 520
+
+
+def test_payment_reconcile_closes_provider_closed_pending_order(client, make_user, auth, monkeypatch):
+    _set_payment_enabled(True)
+    _clear_unpaid_payment_orders()
+    make_user("13900000233", balance=100)
+    h = auth("13900000233")
+    order = client.post("/api/payments/orders", json={
+        "provider": "alipay",
+        "package_id": "starter",
+    }, headers=h).json()
+    monkeypatch.setattr("app.services.payments._query_provider_order", lambda db, row: {
+        "status": payments.CLOSED,
+        "raw": {"trade_status": "TRADE_CLOSED"},
+    })
+
+    db = SessionLocal()
+    try:
+        stats = payments.reconcile_pending_orders(db)
+        assert stats["checked"] == 1
+        assert stats["closed"] == 1
+        row = db.query(PaymentOrder).filter(PaymentOrder.order_no == order["order_no"]).one()
+        assert row.status == payments.CLOSED
+        assert row.raw["query"]["trade_status"] == "TRADE_CLOSED"
+    finally:
+        db.close()
+
+    assert client.get("/api/me", headers=h).json()["balance_credits"] == 100
+
+
+def test_payment_reconcile_records_errors_without_crashing(client, make_user, auth, monkeypatch):
+    _set_payment_enabled(True)
+    _clear_unpaid_payment_orders()
+    make_user("13900000234", balance=100)
+    h = auth("13900000234")
+    order = client.post("/api/payments/orders", json={
+        "provider": "alipay",
+        "package_id": "starter",
+    }, headers=h).json()
+
+    def _boom(db, row):
+        raise payments.PaymentError("provider unavailable")
+
+    monkeypatch.setattr("app.services.payments._query_provider_order", _boom)
+    db = SessionLocal()
+    try:
+        stats = payments.reconcile_pending_orders(db)
+        assert stats["checked"] == 0
+        assert stats["errors"] == 1
+        row = db.query(PaymentOrder).filter(PaymentOrder.order_no == order["order_no"]).one()
+        assert row.status == payments.PENDING
     finally:
         db.close()
 

@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
-import { api, setToken } from "../../lib/api";
+import { api } from "../../lib/api";
 
 function Logo({ className = "" }) {
   return (
@@ -74,10 +74,11 @@ export default function LoginPage() {
     if (isRegister && smsAuthEnabled && !smsCode.trim()) return setMsg("请输入短信验证码");
     setLoading(true);
     try {
-      const r = isRegister
-        ? await api.register(phone, password, smsAuthEnabled ? smsCode.trim() : undefined, nickname || undefined)
-        : await api.login(phone, password);
-      setToken(r.access_token);
+      if (isRegister) {
+        await api.register(phone, password, smsAuthEnabled ? smsCode.trim() : undefined, nickname || undefined);
+      } else {
+        await api.login(phone, password);
+      }
       router.push("/");
     } catch (e) {
       setMsg(e.message);
@@ -131,6 +132,7 @@ export default function LoginPage() {
             {[["login", "登录"], ["register", "注册"]].map(([k, label]) => (
               <button
                 key={k}
+                type="button"
                 onClick={() => { setMode(k); setMsg(""); }}
                 className={`flex-1 rounded-full px-3 py-1.5 font-display font-medium transition-all ${
                   mode === k ? "bg-brand text-white shadow-glow-sm" : "text-mist hover:text-snow"
@@ -204,7 +206,7 @@ export default function LoginPage() {
             onKeyDown={(e) => e.key === "Enter" && submit()}
           />
 
-          <button onClick={submit} disabled={loading || (isRegister && (!featuresLoaded || !!featuresError || !registrationEnabled))} className="btn-primary btn-lg w-full">
+          <button type="button" onClick={submit} disabled={loading || (isRegister && (!featuresLoaded || !!featuresError || !registrationEnabled))} className="btn-primary btn-lg w-full">
             {loading ? "请稍候…" : isRegister ? "注册并登录" : "登录"}
           </button>
 

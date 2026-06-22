@@ -2,57 +2,37 @@
 
 import { useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
-import { api, authenticatedObjectUrl, downloadBlob, getToken, wsUrl } from "../lib/api";
+import { api, downloadBlob, wsUrl } from "../lib/api";
 import Nav from "../components/Nav";
 import PromptLibraryBrowser, { STUDIO_DRAFT_PROMPT_KEY } from "../components/PromptLibraryBrowser";
-import AssetMedia, { assetPreviewSrc } from "../components/AssetMedia";
-
-const RATIOS = [
-  { key: "1:1", label: "1:1", hint: "头像 / 方图", w: 1, h: 1 },
-  { key: "4:5", label: "4:5", hint: "社媒竖图", w: 4, h: 5 },
-  { key: "5:4", label: "5:4", hint: "商品横图", w: 5, h: 4 },
-  { key: "3:4", label: "3:4", hint: "竖版海报", w: 3, h: 4 },
-  { key: "4:3", label: "4:3", hint: "横版构图", w: 4, h: 3 },
-  { key: "2:3", label: "2:3", hint: "封面 / 写真", w: 2, h: 3 },
-  { key: "3:2", label: "3:2", hint: "摄影横图", w: 3, h: 2 },
-  { key: "9:16", label: "9:16", hint: "手机竖屏", w: 9, h: 16 },
-  { key: "16:9", label: "16:9", hint: "宽屏视频封面", w: 16, h: 9 },
-  { key: "21:9", label: "21:9", hint: "超宽横幅", w: 21, h: 9 },
-  { key: "9:21", label: "9:21", hint: "长竖海报", w: 9, h: 21 },
-];
-const VIDEO_RATIO_KEYS = new Set(["1:1", "3:4", "4:3", "9:16", "16:9"]);
-
-const IMAGE_QUALITY_PRESETS = [
-  { key: "1k", label: "1K", hint: "快速预览", maxSide: 1024 },
-  { key: "2k", label: "2K", hint: "均衡清晰", maxSide: 2048 },
-  { key: "4k", label: "4K", hint: "最高质量", maxSide: 4096 },
-];
-
-const VIDEO_QUALITIES = [
-  { key: "480p", label: "480p", hint: "快速预览" },
-  { key: "720p", label: "720p", hint: "标准" },
-  { key: "1080p", label: "1080p", hint: "高清" },
-];
-const VIDEO_DURATION_PRESETS = [
-  { seconds: 5, label: "5s", hint: "短镜头预览" },
-  { seconds: 8, label: "8s", hint: "平台常用短片" },
-  { seconds: 10, label: "10s", hint: "完整短镜头" },
-  { seconds: 15, label: "15s", hint: "广告片段" },
-  { seconds: 30, label: "30s", hint: "短广告" },
-  { seconds: 60, label: "1min", hint: "完整广告" },
-  { seconds: 180, label: "3min", hint: "口播/种草" },
-  { seconds: 300, label: "5min", hint: "长内容" },
-  { seconds: 600, label: "10min", hint: "长视频" },
-  { seconds: 900, label: "15min", hint: "最长" },
-];
-const TERMINAL_TASK_STATUSES = new Set(["succeeded", "failed", "needs_review"]);
-
-const EXAMPLES = [
-  "赛博朋克城市夜景，霓虹灯反射在湿漉漉的街道上，电影感，超广角",
-  "一只穿宇航服的柴犬漂浮在太空，背景是绚丽星云，3D 渲染，皮克斯风格",
-  "极简北欧风咖啡馆，晨光透过落地窗，暖色调，柔和景深",
-  "国潮水墨山水，仙鹤掠过云海，金箔点缀，高级感海报",
-];
+import {
+  EXAMPLES,
+  IMAGE_QUALITY_PRESETS,
+  PARSE_POLL_INTERVAL_MS,
+  PARSE_POLL_TIMEOUT_MS,
+  RATIOS,
+  VIDEO_DURATION_PRESETS,
+  VIDEO_QUALITIES,
+  VIDEO_RATIO_KEYS,
+} from "./studio/constants";
+import StudioReferencePanel from "./studio/StudioReferencePanel";
+import StudioResults from "./studio/StudioResults";
+import {
+  assetDims,
+  assetSignature,
+  boundedImageCount,
+  boundedVideoDuration,
+  buildSourceAssetMeta,
+  composePromptFromStructured,
+  formatDuration,
+  imageSizeFor,
+  isRequestTimeoutError,
+  isTerminalTaskStatus,
+  nearestRatio,
+  qualityKeyForSize,
+  ratioKeyForSize,
+  videoRatioOptions,
+} from "./studio/helpers";
 
 export default function Home() {
   const router = useRouter();
@@ -71,6 +51,7 @@ export default function Home() {
   const [vDuration, setVDuration] = useState(5);
   const [vResolution, setVResolution] = useState("720p");
   const [promptLibraryOpen, setPromptLibraryOpen] = useState(false);
+  const [videoAnalysisPreset, setVideoAnalysisPreset] = useState("standard");
 
   // reference (paste link -> reverse) state
   const [refOpen, setRefOpen] = useState(false);
@@ -107,11 +88,12 @@ export default function Home() {
   const uploadRequestRef = useRef(0);
   const reverseRequestRef = useRef(0);
   const pendingGenerateRequestRef = useRef(null);
-  const uploadInputRef = useRef(null);
+  const imageUploadInputRef = useRef(null);
+  const videoUploadInputRef = useRef(null);
   const objectUrlsRef = useRef(new Set());
+  const PENDING_GENERATE_STORAGE_KEY = "studio_pending_generate_request_v1";
 
   useEffect(() => {
-    if (!getToken()) return router.push("/login");
     api.me().then(setMe).catch(() => router.push("/login"));
     api.config().then((c) => {
       setCfg(c);
@@ -193,6 +175,25 @@ export default function Home() {
     }
   }
 
+  function sleep(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  async function waitForParseResult(initial, refVersion) {
+    let current = initial;
+    const startedAt = Date.now();
+    while (current?.status === "queued" || current?.status === "running") {
+      if (refVersion !== refVersionRef.current) return null;
+      if (Date.now() - startedAt > PARSE_POLL_TIMEOUT_MS) {
+        throw new Error("抓取仍在处理中，请稍后重试");
+      }
+      await sleep(PARSE_POLL_INTERVAL_MS);
+      if (refVersion !== refVersionRef.current) return null;
+      current = await api.parseStatus(current.id);
+    }
+    return current;
+  }
+
   async function doParse() {
     if (!url.trim() || parsing) return;
     const reqId = ++parseRequestRef.current;
@@ -202,8 +203,12 @@ export default function Home() {
     setMsg(""); setAssets([]); setSelected(null); clearReverseState(); setParsing(true);
     setRefOpen(true);
     try {
-      const r = await api.parse(url.trim());
+      const first = await api.parse(url.trim());
+      const r = await waitForParseResult(first, refVersion);
       if (refVersion !== refVersionRef.current) return;
+      if (!r) return;
+      if (r.status === "failed") throw new Error(r.error || "抓取失败，请稍后重试或更换链接");
+      if (r.status !== "done") throw new Error("抓取状态异常，请稍后重试");
       setAssets(r.assets || []);
       if (!r.assets?.length) setMsg("未在该页面发现可用素材");
     } catch (e) {
@@ -217,7 +222,7 @@ export default function Home() {
     if (!file || uploading) return;
     if (!file.type?.startsWith("image/")) {
       setMsg("请选择图片文件");
-      if (uploadInputRef.current) uploadInputRef.current.value = "";
+      if (imageUploadInputRef.current) imageUploadInputRef.current.value = "";
       return;
     }
     const reqId = ++uploadRequestRef.current;
@@ -245,7 +250,44 @@ export default function Home() {
     } finally {
       if (reqId === uploadRequestRef.current) {
         setUploading(false);
-        if (uploadInputRef.current) uploadInputRef.current.value = "";
+        if (imageUploadInputRef.current) imageUploadInputRef.current.value = "";
+      }
+    }
+  }
+
+  async function doUploadVideo(file) {
+    if (!file || uploading) return;
+    if (!file.type?.startsWith("video/")) {
+      setMsg("请选择视频文件");
+      if (videoUploadInputRef.current) videoUploadInputRef.current.value = "";
+      return;
+    }
+    const reqId = ++uploadRequestRef.current;
+    const refVersion = ++refVersionRef.current;
+    reverseRequestRef.current += 1;
+    setMsg("");
+    setUploading(true);
+    try {
+      const uploaded = await api.uploadVideo(file);
+      if (refVersion !== refVersionRef.current) return;
+      const previewUrl = URL.createObjectURL(file);
+      objectUrlsRef.current.add(previewUrl);
+      const displayAsset = {
+        ...uploaded,
+        display_url: previewUrl,
+        display_thumb: uploaded.thumb || previewUrl,
+      };
+      setAssets((current) => [displayAsset, ...current]);
+      pickAsset(displayAsset);
+      setCategory("video");
+      clearReverseState();
+      setRefOpen(true);
+    } catch (e) {
+      if (refVersion === refVersionRef.current) setMsg(e.message);
+    } finally {
+      if (reqId === uploadRequestRef.current) {
+        setUploading(false);
+        if (videoUploadInputRef.current) videoUploadInputRef.current.value = "";
       }
     }
   }
@@ -282,7 +324,13 @@ export default function Home() {
       const isVideo = target.type === "video";
       const refUrl = isVideo ? target.url || target.thumb : target.url;
       const reverseTarget = isVideo ? "video" : category;
-      const r = await api.reverse(refUrl, reverseTarget, isVideo ? target.thumb : null, target.type);
+      const r = await api.reverse(
+        refUrl,
+        reverseTarget,
+        isVideo ? target.thumb : null,
+        target.type,
+        isVideo ? videoAnalysisPreset : null,
+      );
       if (!isCurrent()) return;
       const s = r.structured || {};
       setStructured(s);
@@ -315,7 +363,8 @@ export default function Home() {
     setParsing(false);
     setUploading(false);
     setReversing(false);
-    if (uploadInputRef.current) uploadInputRef.current.value = "";
+    if (imageUploadInputRef.current) imageUploadInputRef.current.value = "";
+    if (videoUploadInputRef.current) videoUploadInputRef.current.value = "";
     setSelected(null); clearReverseState(); setAssets([]); setUrl("");
   }
 
@@ -339,20 +388,55 @@ export default function Home() {
   function generateClientRequestId(stage, signature) {
     const existing = pendingGenerateRequestRef.current;
     if (existing?.stage === stage && existing?.signature === signature && existing?.id) return existing.id;
+    try {
+      const stored = JSON.parse(window.sessionStorage.getItem(PENDING_GENERATE_STORAGE_KEY) || "null");
+      const ageMs = Date.now() - Number(stored?.createdAt || 0);
+      if (
+        stored?.stage === stage
+        && stored?.signature === signature
+        && stored?.id
+        && ageMs >= 0
+        && ageMs <= 2 * 60 * 60 * 1000
+      ) {
+        pendingGenerateRequestRef.current = stored;
+        return stored.id;
+      }
+    } catch (e) {}
     const random = (
       typeof window !== "undefined" && window.crypto?.randomUUID
         ? window.crypto.randomUUID()
         : `${Date.now()}-${Math.random().toString(16).slice(2)}`
     );
     const id = `studio-${stage}-${random}`;
-    pendingGenerateRequestRef.current = { stage, signature, id };
+    const record = { stage, signature, id, createdAt: Date.now() };
+    pendingGenerateRequestRef.current = record;
+    try {
+      window.sessionStorage.setItem(PENDING_GENERATE_STORAGE_KEY, JSON.stringify(record));
+    } catch (e) {}
     return id;
+  }
+
+  function clearPendingGenerateRequest(id = null) {
+    if (!id || pendingGenerateRequestRef.current?.id === id) {
+      pendingGenerateRequestRef.current = null;
+    }
+    try {
+      const stored = JSON.parse(window.sessionStorage.getItem(PENDING_GENERATE_STORAGE_KEY) || "null");
+      if (!id || stored?.id === id) window.sessionStorage.removeItem(PENDING_GENERATE_STORAGE_KEY);
+    } catch (e) {
+      try { window.sessionStorage.removeItem(PENDING_GENERATE_STORAGE_KEY); } catch (_e) {}
+    }
   }
 
   async function submit(stage = "preview") {
     if (submitting) return;  // reentrancy guard: protects every caller incl. double-clicks + Ctrl+Enter
+    if (task && !isTerminalTaskStatus(task.status)) {
+      setMsg("当前任务仍在生成中，请等待完成后再发起新的生成。");
+      return;
+    }
     if (!prompt.trim() && !selected) { setMsg("请输入提示词，或从参考反推"); return; }
     setSubmitting(true); setMsg("");
+    let requestId = null;
     try {
       // a final render belongs to its preview task — use ITS category, not the
       // current tab (the user may have switched tabs after the preview).
@@ -382,9 +466,12 @@ export default function Home() {
       // worker actually feeds the reference image to the edit endpoint (图+指令→图),
       // instead of a plain text-to-image that ignores it.
       const useRefImage = !isFinal && selected && selected.type === "image" && Object.keys(effectiveStructured).length === 0;
+      const useRefVideo = !isFinal && selected && selected.type === "video" && Object.keys(effectiveStructured).length === 0;
+      const sourceAssetMeta = selected ? buildSourceAssetMeta(selected) : null;
       const payload = {
         source_asset_url: selected ? selected.url : null,
         source_type: selected ? selected.type : "image",
+        source_asset_meta: sourceAssetMeta,
         category: effCategory,
         stage,
         parent_task_id: isFinal ? task.id : null,
@@ -392,6 +479,7 @@ export default function Home() {
           ...(Object.keys(effectiveStructured).length ? effectiveStructured : {}),
           final_text: finalText,
           ...(useRefImage ? { instruction: prompt.trim() || "参考所选图生成同款风格的新素材" } : {}),
+          ...(useRefVideo ? { instruction: prompt.trim() || "参考所选视频的主体、动作和镜头节奏生成同款视频" } : {}),
         },
         params:
           effCategory === "image"
@@ -412,8 +500,9 @@ export default function Home() {
               },
       };
       payload.client_request_id = generateClientRequestId(stage, JSON.stringify(payload));
+      requestId = payload.client_request_id;
       const t = await api.generate(payload);
-      pendingGenerateRequestRef.current = null;
+      clearPendingGenerateRequest(requestId);
       setTask(t);
       if (stage === "preview") setFinalTaskId(null);
       if (isFinal) setFinalTaskId(t.id);
@@ -428,7 +517,7 @@ export default function Home() {
       if (isRequestTimeoutError(e)) {
         setMsg(`${e.message}。任务可能已提交，重新点击会复用同一次请求，避免重复扣费。`);
       } else {
-        pendingGenerateRequestRef.current = null;
+        clearPendingGenerateRequest(requestId);
         setMsg(e.message);
       }
     } finally { setSubmitting(false); }
@@ -531,7 +620,22 @@ export default function Home() {
 
   async function download(asset) {
     try {
-      await downloadBlob(`/api/assets/${asset.id}/download`, `asset-${asset.id}`);
+      await downloadBlob(`/api/assets/${asset.id}/download`);
+    } catch (e) { setMsg(e.message); }
+  }
+
+  async function report(asset) {
+    const reason = window.prompt("举报原因: copyright / sensitive / illegal / privacy / other", "copyright");
+    if (!reason) return;
+    const normalized = reason.trim();
+    if (!["copyright", "sensitive", "illegal", "privacy", "other"].includes(normalized)) {
+      setMsg("举报原因只支持 copyright / sensitive / illegal / privacy / other");
+      return;
+    }
+    const note = window.prompt("补充说明（可选）", "") || "";
+    try {
+      await api.reportAsset(asset.id, { reason: normalized, note });
+      setMsg("举报已提交，管理员会在后台处理。");
     } catch (e) { setMsg(e.message); }
   }
 
@@ -557,8 +661,10 @@ export default function Home() {
   const videoFinalCost = cfg?.models?.video?.final_cost ?? cfg?.models?.video?.cost_credits ?? 0;
   const reverseCost = cfg?.models?.vision?.cost_credits || 0;
   const reverseImageCost = cfg?.reverse?.image_cost ?? reverseCost;
-  const reverseVideoFrameCount = Number(cfg?.reverse?.video_frame_count || 1);
-  const reverseVideoMaxCost = cfg?.reverse?.video_max_cost ?? (reverseCost * reverseVideoFrameCount);
+  const reverseVideoPresets = Array.isArray(cfg?.reverse?.video_presets) ? cfg.reverse.video_presets : [];
+  const reverseVideoPreset = reverseVideoPresets.find((p) => p.key === videoAnalysisPreset) || reverseVideoPresets[0] || null;
+  const reverseVideoFrameCount = Number(reverseVideoPreset?.max_frames || cfg?.reverse?.video_frame_count || 1);
+  const reverseVideoMaxCost = reverseVideoPreset?.max_cost ?? cfg?.reverse?.video_max_cost ?? (reverseCost * reverseVideoFrameCount);
   const selectedReverseCost = selected?.type === "video" ? reverseVideoMaxCost : reverseImageCost;
   const selectedReverseCostLabel = selected?.type === "video" && reverseVideoFrameCount > 1
     ? `${selectedReverseCost}积分(最多${reverseVideoFrameCount}帧)`
@@ -602,7 +708,7 @@ export default function Home() {
         </section>
 
         {/* creation console */}
-        <section className="mx-auto max-w-3xl animate-fadeup">
+        <section className="mx-auto max-w-5xl animate-fadeup">
           <div className="panel p-2.5">
             {/* image / video tabs */}
             <div className="mb-2.5 flex items-center gap-1 rounded-full border border-line bg-base2/50 p-1 text-sm">
@@ -631,65 +737,60 @@ export default function Home() {
               </p>
             )}
 
-            {/* prompt */}
-            <div className="rounded-xl3 border border-line bg-base2/40 p-3">
-              <textarea
-                className="textarea h-28 resize-none border-0 bg-transparent px-1 text-[15px] focus:ring-0"
-                placeholder="描述你想要的画面，越具体越好（主体 / 风格 / 光线 / 色调 / 构图）… ⌘/Ctrl + Enter 生成"
-                value={prompt}
-                onChange={(e) => { setPrompt(e.target.value); setPromptDirty(true); }}
-                onKeyDown={(e) => {
-                  if ((e.metaKey || e.ctrlKey) && e.key === "Enter") { e.preventDefault(); submit("preview"); }
-                }}
-              />
-              {/* example chips */}
-              <div className="mt-1 flex flex-wrap gap-1.5">
-                {EXAMPLES.map((ex, i) => (
-                  <button key={i} onClick={() => { setPrompt(ex); setPromptDirty(true); }} className="chip" title={ex}>
-                    ✦ {ex.slice(0, 12)}…
-                  </button>
-                ))}
-                <button
-                  onClick={() => setPromptLibraryOpen((open) => !open)}
-                  className={`chip ${promptLibraryOpen ? "chip-active" : ""}`}
-                >
-                  提示词库
-                </button>
-              </div>
-              <div className="mt-3 flex flex-col gap-2 border-t border-line pt-3 sm:flex-row sm:items-center sm:justify-between">
-                <div className="flex flex-wrap gap-2">
+            {/* prompt + reference */}
+            <div className="grid gap-3 lg:grid-cols-[minmax(0,1fr)_320px]">
+              <div className="rounded-xl3 border border-line bg-base2/40 p-3">
+                <textarea
+                  className="textarea h-44 resize-none border-0 bg-transparent px-1 text-[15px] focus:ring-0 lg:h-56"
+                  placeholder="描述你想要的画面，越具体越好（主体 / 风格 / 光线 / 色调 / 构图）… ⌘/Ctrl + Enter 生成"
+                  value={prompt}
+                  onChange={(e) => { setPrompt(e.target.value); setPromptDirty(true); }}
+                  onKeyDown={(e) => {
+                    if ((e.metaKey || e.ctrlKey) && e.key === "Enter") { e.preventDefault(); submit("preview"); }
+                  }}
+                />
+                {/* example chips */}
+                <div className="mt-2 flex flex-wrap gap-1.5 border-t border-line pt-3">
+                  {EXAMPLES.map((ex, i) => (
+                    <button key={i} onClick={() => { setPrompt(ex); setPromptDirty(true); }} className="chip" title={ex}>
+                      ✦ {ex.slice(0, 12)}…
+                    </button>
+                  ))}
                   <button
-                    type="button"
-                    onClick={() => setRefOpen((v) => !v)}
-                    className={`btn-secondary btn-sm border-iris/50 bg-iris/10 text-snow shadow-glow-sm hover:bg-iris/20 ${
-                      selected ? "border-transparent bg-brand text-white" : ""
-                    }`}
+                    onClick={() => setPromptLibraryOpen((open) => !open)}
+                    className={`chip ${promptLibraryOpen ? "chip-active" : ""}`}
                   >
-                    {selected ? "已选参考素材" : "参考链接反推"}
+                    提示词库
                   </button>
-                  <button
-                    type="button"
-                    onClick={() => uploadInputRef.current?.click()}
-                    disabled={uploading}
-                    className="btn-secondary btn-sm"
-                  >
-                    {uploading ? "上传中…" : "上传图片参考 / 编辑源"}
-                  </button>
-                  <input
-                    ref={uploadInputRef}
-                    type="file"
-                    accept="image/jpeg,image/png,image/webp,image/gif"
-                    className="hidden"
-                    onChange={(e) => doUploadImage(e.target.files?.[0])}
-                  />
                 </div>
-                {selected && (
-                  <div className="flex min-w-0 items-center gap-2 rounded-full border border-line bg-white/5 px-2 py-1 text-xs text-fog">
-                    <span className="badge bg-iris/20 text-iris-400">{selected.type === "video" ? "视频参考" : "图片参考"}</span>
-                    <span className="truncate">{selectedLabel(selected)}</span>
-                  </div>
-                )}
               </div>
+
+              <StudioReferencePanel
+                category={category}
+                selected={selected}
+                url={url}
+                setUrl={setUrl}
+                parsing={parsing}
+                uploading={uploading}
+                assets={assets}
+                refOpen={refOpen}
+                setRefOpen={setRefOpen}
+                reversing={reversing}
+                reverseEnabled={reverseEnabled}
+                selectedReverseCost={selectedReverseCost}
+                selectedReverseCostLabel={selectedReverseCostLabel}
+                videoAnalysisPreset={videoAnalysisPreset}
+                videoAnalysisPresets={reverseVideoPresets}
+                setVideoAnalysisPreset={setVideoAnalysisPreset}
+                imageUploadInputRef={imageUploadInputRef}
+                videoUploadInputRef={videoUploadInputRef}
+                onClear={clearRef}
+                onParse={doParse}
+                onUploadImage={doUploadImage}
+                onUploadVideo={doUploadVideo}
+                onPickAsset={pickAsset}
+                onReverse={doReverse}
+              />
             </div>
 
             {promptLibraryOpen && (
@@ -857,54 +958,6 @@ export default function Home() {
               </button>
             </div>
 
-            {/* reference expander */}
-            {refOpen && (
-              <div className="mt-3 rounded-xl3 border border-line bg-base2/40 p-3 animate-fadeup">
-                <div className="grid gap-2 sm:grid-cols-[1fr_auto]">
-                  <input className="input" placeholder="粘贴小红书 / 抖音 / 公众号 / 网页链接，抓取参考图或视频…" value={url}
-                    onChange={(e) => setUrl(e.target.value)} onKeyDown={(e) => e.key === "Enter" && doParse()} />
-                  <div className="flex gap-2">
-                    <button onClick={doParse} disabled={parsing} className="btn-secondary whitespace-nowrap">
-                      {parsing ? "抓取中…" : "抓取"}
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => uploadInputRef.current?.click()}
-                      disabled={uploading}
-                      className="btn-secondary whitespace-nowrap"
-                    >
-                      {uploading ? "上传中…" : "上传图片"}
-                    </button>
-                  </div>
-                </div>
-                {selected?.type === "image" && selected?.url?.includes("/api/uploads/upload/") && (
-                  <p className="mt-2 text-xs text-fog">
-                    已选上传图片作为参考;不反推也可以直接用当前提示词进行参考编辑生成。
-                  </p>
-                )}
-                {assets.length > 0 && (
-                  <div className="mt-3 grid grid-cols-4 gap-2 sm:grid-cols-6">
-                    {assets.map((a, i) => (
-                      <button key={i} onClick={() => pickAsset(a)}
-                        className={`relative aspect-square overflow-hidden rounded-lg border transition ${
-                          selected === a ? "border-iris ring-2 ring-iris/40" : "border-line hover:border-line2"
-                        }`}>
-                        <ReferenceAssetPreview asset={a} />
-                        <span className="badge absolute left-1 top-1 bg-black/60 text-[10px] text-white">{a.type}</span>
-                      </button>
-                    ))}
-                  </div>
-                )}
-                {selected && reverseEnabled && (
-                  <button onClick={doReverse} disabled={reversing} className="btn-secondary btn-sm mt-3">
-                    {reversing ? "反推中…" : `✦ 反推所选${selected.type === "video" ? "视频" : "图片"}为提示词${selectedReverseCost ? ` · ${selectedReverseCostLabel}` : ""}`}
-                  </button>
-                )}
-                {selected && !reverseEnabled && (
-                  <p className="mt-3 text-xs text-fog">反推功能已被管理员关闭;已选为参考首帧/同款依据。</p>
-                )}
-              </div>
-            )}
           </div>
 
           {msg && (
@@ -912,417 +965,24 @@ export default function Home() {
           )}
         </section>
 
-        {/* live result */}
-        {task && (
-          <section className="mx-auto mt-8 max-w-3xl animate-fadeup">
-            <div className="card p-4">
-              <div className="mb-3 flex items-center justify-between">
-                <span className="text-sm font-display font-semibold">{taskResultTitle(task, runningSnapshot)}</span>
-                <span className={`badge ${statusStyle(task.status)}`}>{statusZh(task.status)}</span>
-              </div>
-              {showRunningProgress && (
-                <div className="mb-4">
-                  <div className="mb-2 h-1.5 w-full overflow-hidden rounded-full bg-white/8">
-                    <div className="h-full rounded-full bg-brand transition-all duration-500" style={{ width: `${task.progress || 8}%` }} />
-                  </div>
-                  <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
-                    {Array.from({
-                      length: runningSnapshot?.category === "image" ? Number(runningSnapshot.n || 1) : 1,
-                    }).map((_, i) => (
-                      <div
-                        key={i}
-                        className="skeleton"
-                        style={runningSnapshot?.ratio ? { aspectRatio: `${runningSnapshot.ratio.w} / ${runningSnapshot.ratio.h}` } : { aspectRatio: "1 / 1" }}
-                      />
-                    ))}
-                  </div>
-                </div>
-              )}
-              {trackingLost && !isTerminalTaskStatus(task?.status) && (
-                <div className="mb-4 rounded-lg border border-warn/30 bg-warn/10 px-3 py-2 text-sm text-warn">
-                  <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
-                    <span>前端已停止等待该任务，后端可能仍在生成。</span>
-                    <div className="flex gap-2">
-                      <button type="button" onClick={refreshActiveTask} className="btn-secondary btn-sm">刷新任务状态</button>
-                      <a href="/history" className="btn-secondary btn-sm">去历史查看</a>
-                    </div>
-                  </div>
-                </div>
-              )}
-              {task.error && <p className="mb-3 rounded-lg bg-bad/10 px-3 py-2 text-sm text-bad">{task.error}</p>}
-              {task.partial && (
-                <p className="mb-3 rounded-lg bg-warn/10 px-3 py-2 text-sm text-warn">
-                  本次批量生成完成 {task.saved_count || task.assets?.length || 0}/{task.requested_count || "?"} 张，失败部分已自动退回积分。
-                </p>
-              )}
-              {task.assets?.length > 0 && (
-                <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
-                  {task.assets.map((a) => (
-                    <ResultCard key={a.id} a={a} onOpen={() => setLightbox(a)} onUnlock={() => unlock(a)} onDownload={() => download(a)} />
-                  ))}
-                </div>
-              )}
-              {task.category === "video" && task.stage === "preview" && task.status === "succeeded" && finalTaskId && (
-                <a href="/history" className="btn-secondary mt-4 block w-full text-center">
-                  完整视频已提交 · 去历史查看
-                </a>
-              )}
-              {task.category === "video" && task.stage === "preview" && task.status === "succeeded" && !finalTaskId && (
-                <button onClick={() => submit("final")} disabled={submitting} className="btn-primary mt-4 w-full">
-                  {submitting ? "提交中…" : `方向满意 → 渲染完整视频 · ${videoFinalCost}积分`}
-                </button>
-              )}
-            </div>
-          </section>
-        )}
-
-        {/* gallery / works wall */}
-        <section className="mx-auto mt-14 max-w-7xl">
-          <div className="mb-5 flex items-end justify-between">
-            <div>
-              <h2 className="text-xl font-bold">我的作品墙</h2>
-              <p className="mt-1 text-sm text-fog">最近生成的创作，点击查看 / 解锁 / 下载。</p>
-            </div>
-            <a href="/profile" className="btn-secondary btn-sm">查看全部</a>
-          </div>
-          {works === null ? (
-            <div className="masonry">
-              {Array.from({ length: 8 }).map((_, i) => (
-                <div key={i} className="skeleton" style={{ height: 160 + (i % 4) * 60 }} />
-              ))}
-            </div>
-          ) : works.length === 0 ? (
-            <div className="card flex flex-col items-center justify-center gap-2 p-16 text-center">
-              <span className="text-3xl">🪄</span>
-              <p className="text-sm text-mist">还没有作品，输入提示词开始你的第一次创作。</p>
-            </div>
-          ) : (
-            <div className="masonry">
-              {works.map((a) => (
-                <MasonryItem key={a.id} a={a} onOpen={() => setLightbox(a)} />
-              ))}
-            </div>
-          )}
-        </section>
-      </main>
-
-      {lightbox && (
-        <Lightbox a={lightbox} onClose={() => setLightbox(null)} onUnlock={() => unlock(lightbox)} onDownload={() => download(lightbox)} />
-      )}
-    </div>
-  );
-}
-
-/* ---------- sub-components ---------- */
-
-function srcOf(a) {
-  return assetPreviewSrc(a);
-}
-
-function taskResultTitle(task, runningSnapshot) {
-  if (!task) return "本次生成";
-  if (task.category === "image") {
-    const assetsCount = Number(task.assets?.length || 0);
-    const saved = Number(task.saved_count ?? assetsCount);
-    const snapshotCount = runningSnapshot?.category === "image" ? runningSnapshot.n : null;
-    const requestedValue = task.requested_count ?? snapshotCount ?? assetsCount;
-    const requested = Number(requestedValue || 1);
-    if (task.partial) return `本次生成 · ${saved}/${requested} 张`;
-    if (!isTerminalTaskStatus(task.status)) return `本次生成 · ${requested} 张`;
-    return `本次生成 · ${saved || requested} 张`;
-  }
-  if (task.category === "video") {
-    return task.stage === "final" ? "本次生成 · 完整视频" : "本次生成 · 视频预览";
-  }
-  return "本次生成";
-}
-
-function ResultCard({ a, onOpen, onUnlock, onDownload }) {
-  const src = srcOf(a);
-  const ratioStyle = mediaAspectStyle(a);
-  return (
-    <div className="group overflow-hidden rounded-xl2 border border-line bg-base2">
-      <div className="relative cursor-zoom-in bg-black/20" style={ratioStyle} onClick={onOpen}>
-        {!src ? (
-          <div className="flex h-full w-full items-center justify-center px-3 text-center text-xs text-fog">
-            预览暂不可用
-          </div>
-        ) : (
-          <AssetMedia
-            asset={a}
-            className="h-full w-full object-contain transition group-hover:scale-105"
-            fallbackClassName="flex h-full w-full items-center justify-center px-3 text-center text-xs text-fog"
-          />
-        )}
-        {a.unlocked && <span className="badge absolute right-1.5 top-1.5 bg-brand text-white">HD</span>}
-      </div>
-      <div className="p-1.5">
-        {a.unlocked ? (
-          <button onClick={onDownload} className="btn-primary btn-sm w-full">下载高清</button>
-        ) : (
-          <div className="flex gap-1.5">
-            <button onClick={onOpen} className="btn-secondary btn-sm flex-1">预览</button>
-            <button onClick={onUnlock} className="btn-primary btn-sm flex-1">解锁</button>
-          </div>
-        )}
-      </div>
-    </div>
-  );
-}
-
-function MasonryItem({ a, onOpen }) {
-  const src = srcOf(a);
-  const ratioStyle = mediaAspectStyle(a);
-  return (
-    <button onClick={onOpen} className="group relative block w-full overflow-hidden rounded-xl2 border border-line bg-base2" style={ratioStyle}>
-      {!src ? (
-        <div className="flex h-full w-full items-center justify-center px-3 text-center text-xs text-fog">
-          预览暂不可用
-        </div>
-      ) : (
-        <AssetMedia
-          asset={a}
-          className="h-full w-full object-contain transition duration-300 group-hover:scale-[1.04]"
-          fallbackClassName="flex h-full w-full items-center justify-center px-3 text-center text-xs text-fog"
+        <StudioResults
+          task={task}
+          runningSnapshot={runningSnapshot}
+          showRunningProgress={showRunningProgress}
+          trackingLost={trackingLost}
+          finalTaskId={finalTaskId}
+          submitting={submitting}
+          videoFinalCost={videoFinalCost}
+          works={works}
+          lightbox={lightbox}
+          setLightbox={setLightbox}
+          onRefreshActiveTask={refreshActiveTask}
+          onUnlock={unlock}
+          onDownload={download}
+          onReport={report}
+          onSubmitFinal={() => submit("final")}
         />
-      )}
-      <div className="pointer-events-none absolute inset-0 flex items-end bg-gradient-to-t from-black/60 via-transparent to-transparent opacity-0 transition group-hover:opacity-100">
-        <span className="m-2 flex items-center gap-1 text-xs text-white/90">
-          {a.unlocked ? "已解锁 · HD" : "点击预览 / 解锁"}
-        </span>
-      </div>
-      {a.unlocked && <span className="badge absolute right-2 top-2 bg-brand text-white">HD</span>}
-    </button>
-  );
-}
-
-function Lightbox({ a, onClose, onUnlock, onDownload }) {
-  const src = srcOf(a);
-  return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 p-4 backdrop-blur-sm" role="dialog" aria-modal="true" onClick={onClose}>
-      <div className="panel max-h-[92vh] max-w-3xl overflow-auto p-3" onClick={(e) => e.stopPropagation()}>
-        {!src ? (
-          <div className="flex min-h-64 items-center justify-center rounded-xl2 bg-black/30 px-6 text-sm text-fog">
-            {a.unlocked ? "预览暂不可用，请稍后重试。" : "预览暂不可用，请先解锁后再下载高清。"}
-          </div>
-        ) : (
-          <AssetMedia
-            asset={a}
-            interactive
-            controls
-            autoPlay
-            muted={false}
-            className="mx-auto max-h-[76vh] w-auto rounded-xl2"
-            fallbackClassName="flex min-h-64 items-center justify-center rounded-xl2 bg-black/30 px-6 text-sm text-fog"
-          />
-        )}
-        <div className="mt-3 flex items-center justify-between gap-2 text-sm">
-          <span className="text-fog">
-            {a.unlocked ? "预览 · 已解锁，可下载高清" : "预览 · 带水印"}
-            {a.width ? ` · ${a.width}×${a.height}` : ""}
-          </span>
-          <div className="flex gap-2">
-            {!a.unlocked && <button onClick={onUnlock} className="btn-primary btn-sm">解锁高清</button>}
-            {a.unlocked && <button onClick={onDownload} className="btn-primary btn-sm">下载</button>}
-            <button onClick={onClose} className="btn-secondary btn-sm">关闭</button>
-          </div>
-        </div>
-      </div>
+      </main>
     </div>
   );
-}
-
-/* ---------- helpers ---------- */
-
-function assetDims(a) {
-  if (!a) return null;
-  // take width+height as a PAIR — never mix original width with thumb height,
-  // which would fabricate a wrong ratio (e.g. portrait ref -> landscape output).
-  let w = Number(a.width), h = Number(a.height);
-  if (!w || !h) { w = Number(a.thumb_width); h = Number(a.thumb_height); }
-  if (!w || !h) return null;
-  return { width: w, height: h };
-}
-
-function selectedLabel(a) {
-  if (!a) return "";
-  const dims = assetDims(a);
-  const dimText = dims ? `${dims.width}x${dims.height}` : "未识别尺寸";
-  if (a.original_url) return `已本地化 · ${dimText}`;
-  if (a.original_thumb) return `视频封面 · ${dimText}`;
-  if (a.url?.includes("/api/uploads/upload/")) return `上传图片 · ${dimText}`;
-  return `链接素材 · ${dimText}`;
-}
-
-function mediaThumbSrc(a) {
-  return a?.display_thumb || a?.display_url || a?.thumb || a?.url || "";
-}
-
-function ReferenceAssetPreview({ asset }) {
-  const [failed, setFailed] = useState(false);
-  const [secureSrc, setSecureSrc] = useState("");
-  const rawSrc = mediaThumbSrc(asset);
-  useEffect(() => {
-    setFailed(false);
-    setSecureSrc("");
-    if (!rawSrc || !rawSrc.includes("/api/uploads/")) return;
-    let cancelled = false;
-    let objectUrl = "";
-    authenticatedObjectUrl(rawSrc)
-      .then((url) => {
-        if (cancelled) {
-          URL.revokeObjectURL(url);
-          return;
-        }
-        objectUrl = url;
-        setSecureSrc(url);
-      })
-      .catch(() => {
-        if (!cancelled) setFailed(true);
-      });
-    return () => {
-      cancelled = true;
-      if (objectUrl) URL.revokeObjectURL(objectUrl);
-    };
-  }, [rawSrc]);
-  if (failed) {
-    return (
-      <div className="flex h-full w-full flex-col items-center justify-center gap-1 bg-base2 text-[10px] text-fog">
-        <span>{asset?.type === "video" ? "🎬" : "图片"}</span>
-        <span>预览不可用</span>
-      </div>
-    );
-  }
-  if (asset?.type === "video") {
-    if (asset.thumb) {
-      return <img src={secureSrc || rawSrc} alt="" className="h-full w-full object-cover" onError={() => setFailed(true)} />;
-    }
-    if (asset.url) {
-      return <video src={asset.url} muted preload="metadata" className="h-full w-full object-cover" onError={() => setFailed(true)} />;
-    }
-    return <div className="flex h-full w-full items-center justify-center text-fog">🎬</div>;
-  }
-  const src = secureSrc || rawSrc;
-  if (!src) return <div className="flex h-full w-full items-center justify-center bg-base2 text-xs text-fog">无预览</div>;
-  return <img src={src} alt="" className="h-full w-full object-cover" onError={() => setFailed(true)} />;
-}
-
-function assetSignature(a) {
-  if (!a) return "";
-  return [a.type || "", a.url || "", a.thumb || ""].join("|");
-}
-
-function composePromptFromStructured(structured, fallbackText = "") {
-  const fallback = String(fallbackText || "").trim();
-  if (!structured || !Object.keys(structured).length) return fallback;
-  const finalText = String(structured.final_text || structured["final_text"] || fallbackText || "").trim();
-  const order = [
-    "主体", "商品服装", "细节特征", "场景背景", "广告目标", "风格", "景别", "构图",
-    "视角镜头", "视角构图", "主体动作", "镜头运动", "运动节奏", "剪辑节奏", "时序分镜",
-    "字幕卖点", "光线", "色调配色", "材质纹理", "氛围情绪", "后期质感", "转场", "一致性约束",
-  ];
-  const skip = new Set(["负向", "标签", "文字水印", "时长建议", "final_text"]);
-  const parts = [];
-  for (const k of order) if (structured[k] && !skip.has(k)) parts.push(structured[k]);
-  for (const k of Object.keys(structured))
-    if (!order.includes(k) && !skip.has(k) && structured[k]) parts.push(structured[k]);
-  let text = parts.join(", ");
-  if (structured["标签"]) text += (text ? ", " : "") + structured["标签"];
-  return text.trim() || finalText;
-}
-
-function ratioKeyForSize(size) {
-  const m = /^(\d+)x(\d+)$/.exec(String(size || ""));
-  if (!m) return null;
-  return nearestRatio(Number(m[1]), Number(m[2]));
-}
-
-function qualityKeyForSize(size) {
-  const m = /^(\d+)x(\d+)$/.exec(String(size || ""));
-  if (!m) return "1k";
-  const maxSide = Math.max(Number(m[1]), Number(m[2]));
-  if (maxSide >= 3500) return "4k";
-  if (maxSide >= 1500) return "2k";
-  return "1k";
-}
-
-function imageSizeFor(ratio, quality, maxDim = 4096) {
-  const preset = IMAGE_QUALITY_PRESETS.find((q) => q.key === quality) || IMAGE_QUALITY_PRESETS[0];
-  const maxSide = Math.min(Number(maxDim) || 4096, preset.maxSide);
-  if (ratio.w >= ratio.h) {
-    const width = maxSide;
-    const height = roundImageDim((maxSide * ratio.h) / ratio.w, maxDim);
-    return `${width}x${height}`;
-  }
-  const height = maxSide;
-  const width = roundImageDim((maxSide * ratio.w) / ratio.h, maxDim);
-  return `${width}x${height}`;
-}
-
-function roundImageDim(value, maxDim = 4096) {
-  const capped = Math.max(64, Math.min(Number(maxDim) || 4096, Math.round(value)));
-  return Math.max(64, Math.min(Number(maxDim) || 4096, Math.round(capped / 8) * 8));
-}
-
-function boundedImageCount(value, max = 8) {
-  const limit = Math.max(1, Number(max) || 8);
-  const parsed = Number.parseInt(value, 10);
-  if (!Number.isFinite(parsed)) return 1;
-  return Math.max(1, Math.min(limit, parsed));
-}
-
-function boundedVideoDuration(value, max = 900) {
-  const limit = Math.max(1, Number(max) || 900);
-  const parsed = Number.parseInt(value, 10);
-  if (!Number.isFinite(parsed)) return 5;
-  return Math.max(1, Math.min(limit, parsed));
-}
-
-function formatDuration(seconds) {
-  const s = Math.max(1, Number.parseInt(seconds, 10) || 1);
-  if (s < 60) return `${s}s`;
-  const minutes = Math.floor(s / 60);
-  const rest = s % 60;
-  return rest ? `${minutes}m${rest}s` : `${minutes}min`;
-}
-
-function videoRatioOptions() {
-  return RATIOS.filter((r) => VIDEO_RATIO_KEYS.has(r.key));
-}
-
-function nearestRatio(w, h, options = RATIOS) {
-  const r = w / h;
-  let best = options[0] || RATIOS[0], diff = Infinity;
-  for (const x of options) {
-    const d = Math.abs(r - x.w / x.h);
-    if (d < diff) { diff = d; best = x; }
-  }
-  return best.key;
-}
-
-function mediaAspectStyle(a, fallback = "1 / 1") {
-  const dims = assetDims(a);
-  if (!dims) return fallback ? { aspectRatio: fallback } : null;
-  return { aspectRatio: `${dims.width} / ${dims.height}` };
-}
-
-function isTerminalTaskStatus(s) {
-  return TERMINAL_TASK_STATUSES.has(s);
-}
-
-function statusZh(s) {
-  return { queued: "排队中", running: "生成中", succeeded: "已完成", failed: "失败", needs_review: "待人工对账" }[s] || s;
-}
-function statusStyle(s) {
-  return {
-    queued: "bg-white/10 text-mist",
-    running: "bg-aqua/15 text-aqua",
-    succeeded: "bg-ok/15 text-ok",
-    failed: "bg-bad/15 text-bad",
-    needs_review: "bg-warn/15 text-warn",
-  }[s] || "bg-white/10 text-mist";
-}
-
-function isRequestTimeoutError(e) {
-  return String(e?.message || "").includes("请求超时");
 }

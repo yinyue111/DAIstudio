@@ -125,8 +125,7 @@ def auth(client):
 
 @pytest.fixture(scope="session")
 def tiny_mp4():
-    """A real (tiny) mp4 so video content-validation passes. Falls back to a
-    sentinel when ffmpeg is absent (validation is skipped without ffprobe)."""
+    """A real (tiny) mp4 so video content-validation passes."""
     import os  # noqa: E402
     import shutil  # noqa: E402
     import subprocess  # noqa: E402

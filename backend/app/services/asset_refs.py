@@ -4,6 +4,7 @@ from __future__ import annotations
 import base64
 import io
 import mimetypes
+from pathlib import Path
 
 from PIL import Image, UnidentifiedImageError
 from sqlalchemy import or_
@@ -13,13 +14,21 @@ from ..config import settings
 from ..models import GenAsset, UploadedAsset
 from . import gateway, storage
 from .ssrf import local_storage_key_from_user_asset_url
+from .watermark import make_model_reference
 
 
 class AssetRefError(Exception):
     pass
 
 
-def gateway_ref_for_user_asset(db: Session, user_id: int, url: str | None) -> str | None:
+def gateway_ref_for_user_asset(
+    db: Session,
+    user_id: int,
+    url: str | None,
+    *,
+    min_side: int = 1,
+    max_side: int = 384,
+) -> str | None:
     """Return a gateway-readable ref for a user-controlled asset URL.
 
     Never forward user-controlled external URLs directly to a model gateway.
@@ -43,11 +52,13 @@ def gateway_ref_for_user_asset(db: Session, user_id: int, url: str | None) -> st
                 path = _gateway_image_path(key)
             elif key.startswith("upload_preview/"):
                 path = _upload_preview_model_ref_path(key)
+            elif key.startswith("upload_video_preview/"):
+                path = storage.local_path(key)
             elif key.startswith("preview/"):
                 path = _preview_model_ref_path(key)
             else:
                 path = storage.local_path(key)
-        elif key.startswith(("upload/", "upload_preview/")):
+        elif key.startswith(("upload/", "upload_preview/", "upload_video/", "upload_video_preview/")):
             raise AssetRefError("上传素材不存在")
         else:
             path = generated_asset_reference_path(db, user_id, key)
@@ -55,7 +66,13 @@ def gateway_ref_for_user_asset(db: Session, user_id: int, url: str | None) -> st
             raise AssetRefError("素材文件不存在")
         raw = path.read_bytes()
         mime = mimetypes.guess_type(path.name)[0] or row_mime
-        return _image_data_uri(raw, fallback_mime=mime)
+        return _image_data_uri(
+            raw,
+            fallback_mime=mime,
+            compress_for_gateway=True,
+            min_side=min_side,
+            max_side=max_side,
+        )
 
     try:
         raw = gateway.download_bytes_limited(
@@ -65,10 +82,17 @@ def gateway_ref_for_user_asset(db: Session, user_id: int, url: str | None) -> st
         )
     except gateway.GatewayError as e:
         raise AssetRefError(f"素材下载失败:{e}") from e
-    return _image_data_uri(raw)
+    return _image_data_uri(raw, compress_for_gateway=True, min_side=min_side, max_side=max_side)
 
 
-def _image_data_uri(raw: bytes, fallback_mime: str | None = None) -> str:
+def _image_data_uri(
+    raw: bytes,
+    fallback_mime: str | None = None,
+    *,
+    compress_for_gateway: bool = False,
+    min_side: int = 1,
+    max_side: int = 384,
+) -> str:
     try:
         img = Image.open(io.BytesIO(raw))
         width, height = img.size
@@ -82,6 +106,13 @@ def _image_data_uri(raw: bytes, fallback_mime: str | None = None) -> str:
         raise
     except (UnidentifiedImageError, OSError, ValueError) as e:
         raise AssetRefError("素材不是有效图片") from e
+
+    if compress_for_gateway:
+        try:
+            raw, _, _ = make_model_reference(raw, max_side=max_side, min_side=min_side)
+            fmt = "JPEG"
+        except Exception:  # noqa: BLE001 - keep original validation result
+            pass
 
     mime = {
         "JPEG": "image/jpeg",
@@ -103,24 +134,35 @@ def _gateway_image_path(upload_key: str):
     watermarked.
     """
     original = storage.local_path(upload_key)
+    model_ref_jpg = storage.local_path(upload_key.replace("upload/", "upload_model_ref/", 1).rsplit(".", 1)[0] + ".jpg")
     model_ref = storage.local_path(upload_key.replace("upload/", "upload_model_ref/", 1).rsplit(".", 1)[0] + ".png")
     preview = storage.local_path(upload_key.replace("upload/", "upload_preview/", 1))
+    if model_ref_jpg.exists():
+        return model_ref_jpg
     if model_ref.exists():
         return model_ref
     return preview if preview.exists() else original
 
 
 def _upload_preview_model_ref_path(preview_key: str):
+    model_ref_jpg = storage.local_path(
+        preview_key.replace("upload_preview/", "upload_model_ref/", 1).rsplit(".", 1)[0] + ".jpg"
+    )
     model_ref = storage.local_path(
         preview_key.replace("upload_preview/", "upload_model_ref/", 1)
     )
     preview = storage.local_path(preview_key)
+    if model_ref_jpg.exists():
+        return model_ref_jpg
     return model_ref if model_ref.exists() else preview
 
 
 def _preview_model_ref_path(preview_key: str):
+    model_ref_jpg = storage.local_path(preview_key.replace("preview/", "model_ref/", 1).rsplit(".", 1)[0] + ".jpg")
     model_ref = storage.local_path(preview_key.replace("preview/", "model_ref/", 1))
     preview = storage.local_path(preview_key)
+    if model_ref_jpg.exists():
+        return model_ref_jpg
     return model_ref if model_ref.exists() else preview
 
 
@@ -145,6 +187,10 @@ def generated_asset_reference_path(db: Session, user_id: int, key: str):
     if is_hd and not asset.unlocked:
         raise AssetRefError("请先解锁该素材后再作为参考")
     if key.startswith("preview/"):
+        model_ref_jpg_key = key.replace("preview/", "model_ref/", 1).rsplit(".", 1)[0] + ".jpg"
+        model_ref_jpg_path = storage.local_path(model_ref_jpg_key)
+        if model_ref_jpg_path.exists() and model_ref_jpg_path.is_file():
+            return model_ref_jpg_path
         model_ref_key = key.replace("preview/", "model_ref/", 1)
         model_ref_path = storage.local_path(model_ref_key)
         if model_ref_path.exists() and model_ref_path.is_file():
@@ -153,6 +199,10 @@ def generated_asset_reference_path(db: Session, user_id: int, key: str):
         preview_key = storage.key_from_url(asset.preview_url)
         if preview_key and preview_key.startswith(("preview/", "video_preview/")):
             if preview_key.startswith("preview/"):
+                model_ref_jpg_key = preview_key.replace("preview/", "model_ref/", 1).rsplit(".", 1)[0] + ".jpg"
+                model_ref_jpg_path = storage.local_path(model_ref_jpg_key)
+                if model_ref_jpg_path.exists() and model_ref_jpg_path.is_file():
+                    return model_ref_jpg_path
                 model_ref_key = preview_key.replace("preview/", "model_ref/", 1)
                 model_ref_path = storage.local_path(model_ref_key)
                 if model_ref_path.exists() and model_ref_path.is_file():
@@ -165,6 +215,15 @@ def generated_asset_reference_path(db: Session, user_id: int, key: str):
 
 def generated_video_reference_path(db: Session, user_id: int, key: str):
     """Owner-gated local video path for reverse-video keyframe sampling."""
+    if key.startswith("upload_video/"):
+        row = db.get(UploadedAsset, key)
+        if not row or row.user_id != user_id:
+            raise AssetRefError("上传视频不存在")
+        path = storage.local_path(key)
+        if not path.exists() or not path.is_file():
+            raise AssetRefError("视频文件不存在")
+        return path
+
     asset = db.query(GenAsset).filter(
         or_(
             GenAsset.preview_url == storage.public_url(key),
@@ -182,3 +241,12 @@ def generated_video_reference_path(db: Session, user_id: int, key: str):
     if not path.exists() or not path.is_file():
         raise AssetRefError("视频文件不存在")
     return path
+
+
+def upload_video_poster_key(video_key: str) -> str | None:
+    if not video_key.startswith("upload_video/"):
+        return None
+    stem = Path(video_key.split("/", 1)[1]).stem
+    poster_key = f"upload_video_preview/{stem}.jpg"
+    poster_path = storage.local_path(poster_key)
+    return poster_key if poster_path.exists() and poster_path.is_file() else None

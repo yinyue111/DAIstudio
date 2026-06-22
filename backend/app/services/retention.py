@@ -16,6 +16,7 @@ from ..models import AuditLog, GenAsset, GenTask, ParseRecord, UploadedAsset
 from ..redis_client import redis_client
 from . import credits, generation, storage
 from .config_store import get_setting
+from .media_sidecars import keys_for_asset_urls, unlink_keys
 
 log = logging.getLogger("retention")
 
@@ -28,6 +29,30 @@ def _video_poll_alive(task_id: int) -> bool:
         )
     except Exception:  # noqa: BLE001
         return False
+
+
+def _video_waiting_for_download(task: GenTask) -> bool:
+    params = task.params or {}
+    return task.phase == "downloading" and bool(
+        params.get("_video_result_url") or params.get("_video_result_mock")
+    )
+
+
+def _image_reap_window() -> timedelta:
+    # Image renders are synchronous gateway calls. Give slow 4K/batch renders and
+    # Celery lock retries a window tied to the configured task time limit before
+    # treating them as orphaned and refunding frozen credits.
+    seconds = max(
+        int(settings.image_gateway_timeout_seconds or 0),
+        int(settings.image_download_timeout_seconds or 0),
+        int(settings.celery_task_time_limit_seconds or 0),
+    )
+    return timedelta(seconds=seconds + 300)
+
+
+def _image_inside_reap_window(task: GenTask, now: datetime) -> bool:
+    anchor = _aware(task.created_at)
+    return bool(anchor and now - anchor < _image_reap_window())
 
 
 def get_retention_days(db: Session) -> int:
@@ -63,12 +88,9 @@ def is_expired(created_at: datetime | None, days: int) -> bool:
 
 
 def _delete_files(asset: GenAsset) -> None:
-    for url in (asset.preview_url, asset.hd_url):
-        key = storage.key_from_url(url or "")
-        if not key:
-            continue
+    for key in keys_for_asset_urls(asset.preview_url, asset.hd_url):
         try:
-            storage.local_path(key).unlink(missing_ok=True)
+            unlink_keys([key])
         except Exception:  # noqa: BLE001
             log.warning("failed to delete file for asset %s", asset.id)
 
@@ -117,9 +139,10 @@ def purge_parsed_previews(db: Session, cutoff: datetime, limit: int = 1000) -> i
         if _delete_uploaded_asset_row(db, row.key):
             removed += 1
         if row.key.startswith("preview/"):
-            model_ref_key = row.key.replace("preview/", "model_ref/", 1)
-            if _delete_uploaded_asset_row(db, model_ref_key):
-                removed += 1
+            model_ref_png_key = row.key.replace("preview/", "model_ref/", 1)
+            for model_ref_key in (model_ref_png_key.rsplit(".", 1)[0] + ".jpg", model_ref_png_key):
+                if _delete_uploaded_asset_row(db, model_ref_key):
+                    removed += 1
     if removed:
         db.commit()
     return removed
@@ -128,7 +151,12 @@ def purge_parsed_previews(db: Session, cutoff: datetime, limit: int = 1000) -> i
 def _referenced_upload_urls(db: Session, cutoff: datetime) -> set[str]:
     refs: set[str] = set()
     rows = db.execute(
-        select(GenTask.source_asset_url, GenTask.params).where(GenTask.created_at >= cutoff)
+        select(GenTask.source_asset_url, GenTask.params).where(
+            or_(
+                GenTask.created_at >= cutoff,
+                GenTask.status.in_(("queued", "running", generation.NEEDS_REVIEW)),
+            )
+        )
     ).all()
     for source_asset_url, params in rows:
         if source_asset_url:
@@ -149,10 +177,22 @@ def _upload_preview_key(upload_key: str) -> str | None:
     return "upload_preview/" + upload_key.split("/", 1)[1].rsplit(".", 1)[0] + ".png"
 
 
-def _upload_model_ref_key(upload_key: str) -> str | None:
+def _upload_model_ref_keys(upload_key: str) -> list[str]:
     if not upload_key.startswith("upload/"):
+        return []
+    stem = upload_key.split("/", 1)[1].rsplit(".", 1)[0]
+    return [f"upload_model_ref/{stem}.jpg", f"upload_model_ref/{stem}.png"]
+
+
+def _upload_model_ref_key(upload_key: str) -> str | None:
+    keys = _upload_model_ref_keys(upload_key)
+    return keys[0] if keys else None
+
+
+def _upload_video_preview_key(upload_key: str) -> str | None:
+    if not upload_key.startswith("upload_video/"):
         return None
-    return "upload_model_ref/" + upload_key.split("/", 1)[1].rsplit(".", 1)[0] + ".png"
+    return "upload_video_preview/" + upload_key.split("/", 1)[1].rsplit(".", 1)[0] + ".jpg"
 
 
 def _delete_uploaded_asset_row(db: Session, key: str) -> bool:
@@ -174,7 +214,10 @@ def purge_uploaded_assets(db: Session, cutoff: datetime, limit: int = 1000) -> i
             select(UploadedAsset)
             .where(
                 UploadedAsset.created_at < cutoff,
-                UploadedAsset.key.like("upload/%"),
+                or_(
+                    UploadedAsset.key.like("upload/%"),
+                    UploadedAsset.key.like("upload_video/%"),
+                ),
                 or_(
                     UploadedAsset.original_filename.is_(None),
                     UploadedAsset.original_filename != "parsed-preview.png",
@@ -193,8 +236,11 @@ def purge_uploaded_assets(db: Session, cutoff: datetime, limit: int = 1000) -> i
         preview_key = _upload_preview_key(row.key)
         if preview_key and _delete_uploaded_asset_row(db, preview_key):
             removed += 1
-        model_ref_key = _upload_model_ref_key(row.key)
-        if model_ref_key and _delete_uploaded_asset_row(db, model_ref_key):
+        for model_ref_key in _upload_model_ref_keys(row.key):
+            if _delete_uploaded_asset_row(db, model_ref_key):
+                removed += 1
+        video_preview_key = _upload_video_preview_key(row.key)
+        if video_preview_key and _delete_uploaded_asset_row(db, video_preview_key):
             removed += 1
     if removed:
         db.commit()
@@ -228,6 +274,28 @@ def purge_all(db: Session) -> dict:
     return result
 
 
+def reap_stuck_parse_records(db: Session, max_minutes: int | None = None) -> int:
+    """Fail queued parse jobs that outlived the pending window.
+
+    Parse jobs are fire-and-forget Celery tasks. If a worker dies or the broker
+    drops a message, the API would otherwise keep reusing a stale queued row and
+    count it against the user's pending limit until retention purges it.
+    """
+    minutes = max(1, int(max_minutes or settings.parse_pending_max_age_minutes))
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(minutes=minutes)
+    res = db.execute(
+        update(ParseRecord)
+        .where(ParseRecord.status == "queued", ParseRecord.created_at < cutoff)
+        .values(status="failed", error="抓取任务超时,请重新提交链接")
+    )
+    count = res.rowcount or 0
+    if count:
+        db.commit()
+        log.info("reaped %s stuck parse record(s)", count)
+    return count
+
+
 def reap_stuck_tasks(db: Session, max_minutes: int = 60) -> int:
     """Fail tasks stuck in queued/running past max_minutes (worker crash etc.)
     and refund their frozen credits. Run frequently (e.g. every 10 min)."""
@@ -244,6 +312,7 @@ def reap_stuck_tasks(db: Session, max_minutes: int = 60) -> int:
     reaped = 0
     video_window = timedelta(seconds=int(settings.video_poll_max_seconds))
     for t in rows:
+        task_id = t.id
         # Don't reap a video still inside its valid poll window or actively being
         # polled — its lifecycle uses external_submitted_at, not created_at.
         if t.category == "video":
@@ -256,8 +325,23 @@ def reap_stuck_tasks(db: Session, max_minutes: int = 60) -> int:
                 reaped += 1
                 continue
             sub = _aware(t.external_submitted_at)
-            if (sub and (now - sub) < video_window) or _video_poll_alive(t.id):
+            if (
+                (sub and (now - sub) < video_window)
+                or _video_poll_alive(t.id)
+                or _video_waiting_for_download(t)
+            ):
                 continue
+            if t.external_task_id:
+                generation._hold_video_timeout_for_reconciliation(
+                    db,
+                    t.id,
+                    f"视频渲染超过 {int(settings.video_poll_max_seconds)} 秒后回收器接管; "
+                    f"external_task_id={t.external_task_id or 'unknown'}",
+                )
+                reaped += 1
+                continue
+        elif t.category == "image" and _image_inside_reap_window(t, now):
+            continue
         # Atomic claim: skip if a worker finalized the task between our SELECT
         # and now, so the reaper can't double-refund alongside the worker.
         res = db.execute(
@@ -275,8 +359,25 @@ def reap_stuck_tasks(db: Session, max_minutes: int = 60) -> int:
             try:
                 credits.refund(db, t.user_id, t.cost_frozen,
                                biz_ref=t.id, commit=False)
-            except Exception:  # noqa: BLE001
-                log.exception("refund failed reaping task %s", t.id)
+            except Exception as e:  # noqa: BLE001
+                db.rollback()
+                log.exception("refund failed reaping task %s", task_id)
+                review_res = db.execute(
+                    update(GenTask)
+                    .where(
+                        GenTask.id == task_id,
+                        GenTask.status.not_in(("succeeded", "failed", generation.NEEDS_REVIEW)),
+                    )
+                    .values(
+                        status=generation.NEEDS_REVIEW,
+                        phase="reconciling",
+                        error=f"任务超时但自动退款失败,需人工对账:{str(e)[:300]}",
+                        finished_at=now,
+                    )
+                )
+                if review_res.rowcount or 0:
+                    reaped += 1
+                continue
         reaped += 1
     if reaped:
         db.commit()

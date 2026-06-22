@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 from app.db import SessionLocal
 from app.models import AuditLog, CreditTransaction, GatewayCall, GenTask, User
-from app.services import audit, credits, gateway, usage, video_frames
+from app.services import audit, credits, gateway, usage, video_analysis, video_frames
 
 
 def test_reverse_logs_gateway_call(client, make_user, auth):
@@ -233,6 +233,7 @@ def test_image_generation_logs_gateway_call(client, make_user, auth):
     h = auth("13900000031")
     r = client.post("/api/generate", json={
         "source_asset_url": "http://x/y.png", "source_type": "image",
+        "source_asset_meta": {"user_confirmed_rights": True},
         "category": "image", "stage": "preview", "instruction": "x",
         "params": {"n": 1, "size": "256x256"},
     }, headers=h)
@@ -294,6 +295,7 @@ def test_failed_image_generation_logs_gateway_call(client, make_user, auth, monk
     monkeypatch.setattr("app.services.gateway.gen_image", fail)
     r = client.post("/api/generate", json={
         "source_asset_url": "http://x/y.png", "source_type": "image",
+        "source_asset_meta": {"user_confirmed_rights": True},
         "category": "image", "stage": "preview", "instruction": "x",
         "params": {"n": 1, "size": "256x256"},
     }, headers=h)
@@ -339,7 +341,14 @@ def test_video_reverse_charges_per_reference_frame(client, make_user, auth, monk
     monkeypatch.setattr("app.config.settings.gateway_base_url", "https://gateway.test")
     monkeypatch.setattr("app.config.settings.gateway_api_key", "sk-test")
     monkeypatch.setattr(video_frames, "available", lambda: True)
-    monkeypatch.setattr(video_frames, "sample_keyframes", lambda *_a, **_k: [b"a", b"b", b"c"])
+    seen = {}
+
+    def fake_sample(*_a, **kwargs):
+        seen["n"] = kwargs.get("n")
+        seen["preset"] = kwargs.get("preset")
+        return [b"a", b"b", b"c"]
+
+    monkeypatch.setattr(video_frames, "sample_keyframes", fake_sample)
     monkeypatch.setattr(
         gateway,
         "reverse_prompt",
@@ -355,7 +364,21 @@ def test_video_reverse_charges_per_reference_frame(client, make_user, auth, monk
         "asset_url": "http://x/clip.mp4", "target": "video",
     }, headers=h)
     assert r.status_code == 200, r.text
+    assert seen["n"] == 24
+    assert seen["preset"] == "standard"
     assert client.get("/api/me", headers=h).json()["balance_credits"] == 979
+
+
+def test_video_analysis_presets_match_product_frame_ranges():
+    assert video_analysis.frame_count_for_duration(10, "fast") == 4
+    assert video_analysis.frame_count_for_duration(10, "standard") == 7
+    assert video_analysis.frame_count_for_duration(10, "fine") == 11
+    assert video_analysis.frame_count_for_duration(120, "fast") == 8
+    assert video_analysis.frame_count_for_duration(120, "standard") == 16
+    assert video_analysis.frame_count_for_duration(120, "fine") == 24
+    assert video_analysis.frame_count_for_duration(300, "fast") == 12
+    assert video_analysis.frame_count_for_duration(300, "standard") == 24
+    assert video_analysis.frame_count_for_duration(300, "fine") == 36
 
 
 def test_video_reverse_rejects_video_url_for_image_target(client, make_user, auth):
@@ -395,6 +418,44 @@ def test_keyframe_sampling_uses_full_duration_for_long_video(monkeypatch):
 
     assert video_frames.sample_keyframes("http://x/long.mp4", n=3) == [b"jpg", b"jpg", b"jpg"]
     assert stamps == [0.0, 300.0, 600.0]
+
+
+def test_keyframe_sampling_preset_uses_downloaded_duration(monkeypatch):
+    monkeypatch.setattr(video_frames, "FFMPEG", "/usr/bin/ffmpeg")
+    monkeypatch.setattr(video_frames, "_download_capped", lambda *_a, **_k: b"\x00\x00\x00\x18ftypmp42")
+    monkeypatch.setattr(video_frames, "_duration_seconds", lambda _path: 10.0)
+    monkeypatch.setattr(video_frames, "_scene_change_timestamps", lambda *_a, **_k: [])
+    stamps = []
+
+    def fake_grab(_src, ts, dst):
+        stamps.append(ts)
+        with open(dst, "wb") as f:
+            f.write(b"jpg")
+        return True
+
+    monkeypatch.setattr(video_frames, "_grab_frame", fake_grab)
+
+    assert video_frames.sample_keyframes("http://x/short.mp4", n=36, preset="fine") == [b"jpg"] * 11
+    assert len(stamps) == 11
+
+
+def test_keyframe_sampling_prefers_scene_changes_then_uniform_fill(monkeypatch):
+    monkeypatch.setattr(video_frames, "FFMPEG", "/usr/bin/ffmpeg")
+    monkeypatch.setattr(video_frames, "_download_capped", lambda *_a, **_k: b"\x00\x00\x00\x18ftypmp42")
+    monkeypatch.setattr(video_frames, "_duration_seconds", lambda _path: 20.0)
+    monkeypatch.setattr(video_frames, "_scene_change_timestamps", lambda *_a, **_k: [2.0, 9.0])
+    stamps = []
+
+    def fake_grab(_src, ts, dst):
+        stamps.append(ts)
+        with open(dst, "wb") as f:
+            f.write(b"jpg")
+        return True
+
+    monkeypatch.setattr(video_frames, "_grab_frame", fake_grab)
+
+    assert video_frames.sample_keyframes("http://x/cuts.mp4", n=4) == [b"jpg"] * 4
+    assert stamps == [0.0, 2.0, 5.0, 9.0]
 
 
 def test_keyframe_sampling_busy_returns_empty(monkeypatch):

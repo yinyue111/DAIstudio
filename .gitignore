@@ -17,6 +17,12 @@ backend/.venv/
 venv/
 .pytest_cache/
 .ruff_cache/
+.mypy_cache/
+.tox/
+.nox/
+.codex-run/
+.codex/
+.agents/
 
 # celery beat runtime schedule
 backend/celerybeat-schedule*
@@ -24,6 +30,13 @@ backend/celerybeat-schedule*
 # storage / media
 backend/storage/
 backend/backups/
+dist/
+htmlcov/
+coverage/
+playwright-report/
+test-results/
+logs/
+.coverage
 *.sqlite
 *.sqlite3
 *.db
@@ -37,3 +50,4 @@ frontend/.next/
 # os
 .DS_Store
 .claude/
+__MACOSX/

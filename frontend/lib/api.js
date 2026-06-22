@@ -5,10 +5,10 @@ export const API_BASE =
 
 const DEFAULT_TIMEOUT_MS = 30_000;
 const PARSE_TIMEOUT_MS = 90_000;
-const REVERSE_TIMEOUT_MS = 120_000;
-const UPLOAD_TIMEOUT_MS = 120_000;
+const REVERSE_TIMEOUT_MS = 240_000;
+const UPLOAD_TIMEOUT_MS = 600_000;
 const DOWNLOAD_TIMEOUT_MS = 300_000;
-const GENERATE_TIMEOUT_MS = 180_000;
+const GENERATE_TIMEOUT_MS = 600_000;
 
 export function wsUrl(path) {
   const base = API_BASE || (typeof window !== "undefined" ? window.location.origin : "");
@@ -17,11 +17,14 @@ export function wsUrl(path) {
 
 export function getToken() {
   if (typeof window === "undefined") return null;
-  return window.localStorage.getItem("token");
+  // Auth moved to an HttpOnly cookie. Clear any legacy bearer token so an XSS
+  // cannot keep using an old localStorage credential.
+  window.localStorage.removeItem("token");
+  return null;
 }
 
 export function setToken(t) {
-  window.localStorage.setItem("token", t);
+  window.localStorage.removeItem("token");
 }
 
 export function clearToken() {
@@ -42,13 +45,27 @@ export class ApiError extends Error {
 
 // Authenticated file download that reuses the same 401 -> clear-token + redirect
 // handling as request(), so CSV/asset downloads don't drift from the REST path.
+function filenameFromContentDisposition(value) {
+  if (!value) return "";
+  const encoded = /filename\*=UTF-8''([^;]+)/i.exec(value);
+  if (encoded) {
+    try {
+      return decodeURIComponent(encoded[1].replace(/^"|"$/g, ""));
+    } catch (e) {
+      return encoded[1].replace(/^"|"$/g, "");
+    }
+  }
+  const plain = /filename="?([^";]+)"?/i.exec(value);
+  return plain ? plain[1] : "";
+}
+
 export async function downloadBlob(path, filename) {
   const headers = {};
   const t = getToken();
   if (t) headers["Authorization"] = `Bearer ${t}`;
   const { res, blob, errorText } = await fetchBlobWithTimeout(
     `${API_BASE}${path}`,
-    { headers },
+    { headers, credentials: "include" },
     DOWNLOAD_TIMEOUT_MS,
   );
   if (res.status === 401) {
@@ -60,9 +77,11 @@ export async function downloadBlob(path, filename) {
   const u = URL.createObjectURL(blob);
   const a = document.createElement("a");
   a.href = u;
-  if (filename) a.download = filename;
+  const responseFilename = filenameFromContentDisposition(res.headers.get("content-disposition"));
+  const finalFilename = responseFilename || filename;
+  if (finalFilename) a.download = finalFilename;
   a.click();
-  URL.revokeObjectURL(u);
+  setTimeout(() => URL.revokeObjectURL(u), 0);
 }
 
 export async function authenticatedObjectUrl(pathOrUrl) {
@@ -76,13 +95,36 @@ export async function authenticatedObjectUrl(pathOrUrl) {
   const headers = {};
   const t = getToken();
   if (t) headers["Authorization"] = `Bearer ${t}`;
-  const { res, blob, errorText } = await fetchBlobWithTimeout(url, { headers }, DOWNLOAD_TIMEOUT_MS);
+  const { res, blob, errorText } = await fetchBlobWithTimeout(
+    url,
+    { headers, credentials: "include" },
+    DOWNLOAD_TIMEOUT_MS,
+  );
   if (res.status === 401) {
     clearToken();
     if (typeof window !== "undefined") window.location.href = "/login";
     throw new Error("登录已过期，请重新登录");
   }
   if (!res.ok) throw new Error(errorTextToMessage(errorText, res.status, "预览加载失败"));
+  return URL.createObjectURL(blob);
+}
+
+export async function assetDownloadObjectUrl(assetId) {
+  if (!assetId) return "";
+  const headers = {};
+  const t = getToken();
+  if (t) headers["Authorization"] = `Bearer ${t}`;
+  const { res, blob, errorText } = await fetchBlobWithTimeout(
+    `${API_BASE}/api/assets/${assetId}/download`,
+    { headers, credentials: "include" },
+    DOWNLOAD_TIMEOUT_MS,
+  );
+  if (res.status === 401) {
+    clearToken();
+    if (typeof window !== "undefined") window.location.href = "/login";
+    throw new Error("登录已过期，请重新登录");
+  }
+  if (!res.ok) throw new Error(errorTextToMessage(errorText, res.status, "高清预览加载失败"));
   return URL.createObjectURL(blob);
 }
 
@@ -159,6 +201,7 @@ async function request(path, { method = "GET", body, auth = true, timeoutMs = DE
       method,
       headers,
       body: body ? JSON.stringify(body) : undefined,
+      credentials: "include",
     },
     timeoutMs,
   );
@@ -201,6 +244,7 @@ async function upload(path, formData, { auth = true } = {}) {
       method: "POST",
       headers,
       body: formData,
+      credentials: "include",
     },
     UPLOAD_TIMEOUT_MS,
   );
@@ -255,15 +299,22 @@ export const api = {
   logout: () => request("/api/me/logout", { method: "POST" }),
   parse: (url) =>
     request("/api/parse", { method: "POST", body: { url }, timeoutMs: PARSE_TIMEOUT_MS }),
+  parseStatus: (id) =>
+    request(`/api/parse/${id}`, { timeoutMs: DEFAULT_TIMEOUT_MS }),
   uploadImage: (file) => {
     const form = new FormData();
     form.append("file", file);
     return upload("/api/uploads/image", form);
   },
-  reverse: (asset_url, target = "image", fallback_image = null, source_type = null) =>
+  uploadVideo: (file) => {
+    const form = new FormData();
+    form.append("file", file);
+    return upload("/api/uploads/video", form);
+  },
+  reverse: (asset_url, target = "image", fallback_image = null, source_type = null, video_analysis_preset = null) =>
     request("/api/prompt/reverse", {
       method: "POST",
-      body: { asset_url, target, fallback_image, source_type },
+      body: { asset_url, target, fallback_image, source_type, video_analysis_preset },
       timeoutMs: REVERSE_TIMEOUT_MS,
     }),
   generate: (payload) =>
@@ -276,6 +327,8 @@ export const api = {
   playbackUrl: (assetId, ticket) =>
     `${API_BASE}/api/assets/${assetId}/stream?ticket=${encodeURIComponent(ticket)}`,
   favoriteAsset: (assetId) => request(`/api/assets/${assetId}/favorite`, { method: "POST" }),
+  reportAsset: (assetId, body) =>
+    request(`/api/assets/${assetId}/report`, { method: "POST", body }),
   deleteAsset: (assetId) => request(`/api/assets/${assetId}`, { method: "DELETE" }),
   retryTask: (taskId) => request(`/api/tasks/${taskId}/retry`, { method: "POST" }),
   downloadUrl: (assetId) => `${API_BASE}/api/assets/${assetId}/download`,
@@ -299,6 +352,10 @@ export const api = {
   adminAudit: (qs = "") => request(`/api/admin/audit${qs}`),
   adminReviewTasks: (limit = 50, offset = 0) =>
     request(`/api/admin/tasks/review?limit=${limit}&offset=${offset}`),
+  adminAssetReports: ({ status = "open", limit = 50, offset = 0 } = {}) =>
+    request(`/api/admin/asset-reports?status=${encodeURIComponent(status)}&limit=${limit}&offset=${offset}`),
+  adminHandleAssetReport: (reportId, body) =>
+    request(`/api/admin/asset-reports/${reportId}/handle`, { method: "POST", body }),
   adminRefundReviewTask: (taskId, body) =>
     request(`/api/admin/tasks/${taskId}/refund_review`, { method: "POST", body }),
   adminSettleReviewTask: (taskId, body) =>

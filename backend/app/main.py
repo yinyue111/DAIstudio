@@ -4,6 +4,7 @@ from __future__ import annotations
 import logging
 import os
 from contextlib import asynccontextmanager
+from urllib.parse import urlparse
 
 from fastapi import FastAPI, Header, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -45,6 +46,86 @@ class BodyTooLargeError(Exception):
     pass
 
 
+_SAFE_HTTP_METHODS = {"GET", "HEAD", "OPTIONS", "TRACE"}
+
+
+def _header_value(scope: Scope, name: bytes) -> str:
+    for key, value in scope.get("headers") or []:
+        if key.lower() == name:
+            return value.decode("latin1")
+    return ""
+
+
+def _normalise_origin(value: str) -> str | None:
+    if not value:
+        return None
+    parsed = urlparse(value.strip())
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return None
+    return f"{parsed.scheme}://{parsed.netloc}".lower()
+
+
+def _csrf_allowed_origins() -> set[str]:
+    origins = set()
+    for raw in [
+        *settings.cors_origin_list,
+        settings.public_base_url,
+        settings.payment_frontend_base_url,
+    ]:
+        origin = _normalise_origin(raw)
+        if origin:
+            origins.add(origin)
+    return origins
+
+
+class CsrfOriginMiddleware:
+    """Origin-check cookie-authenticated state-changing requests.
+
+    The frontend now uses an HttpOnly cookie, so a cross-site form/fetch could
+    otherwise ride the browser's cookie. Bearer API clients are unaffected.
+    """
+
+    def __init__(self, app: ASGIApp):
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope.get("type") != "http":
+            await self.app(scope, receive, send)
+            return
+        method = str(scope.get("method") or "GET").upper()
+        if method in _SAFE_HTTP_METHODS:
+            await self.app(scope, receive, send)
+            return
+        path = str(scope.get("path") or "")
+        if path in {"/api/payments/alipay/notify", "/api/payments/wechat/notify"}:
+            await self.app(scope, receive, send)
+            return
+        origin = _normalise_origin(_header_value(scope, b"origin"))
+        if not origin:
+            origin = _normalise_origin(_header_value(scope, b"referer"))
+        if path in {"/api/auth/login", "/api/auth/register"}:
+            if origin and origin not in _csrf_allowed_origins():
+                await BodySizeLimitMiddleware._send_plain(send, 403, "CSRF origin check failed")
+                return
+            await self.app(scope, receive, send)
+            return
+        cookie = _header_value(scope, b"cookie")
+        if f"{settings.auth_cookie_name}=" not in cookie:
+            await self.app(scope, receive, send)
+            return
+        authorization = _header_value(scope, b"authorization").strip().lower()
+        if authorization.startswith("bearer "):
+            await self.app(scope, receive, send)
+            return
+        if origin and origin not in _csrf_allowed_origins():
+            await BodySizeLimitMiddleware._send_plain(send, 403, "CSRF origin check failed")
+            return
+        if not origin:
+            await BodySizeLimitMiddleware._send_plain(send, 403, "CSRF origin required")
+            return
+        await self.app(scope, receive, send)
+
+
 class BodySizeLimitMiddleware:
     """Count bytes actually read from selected public endpoints.
 
@@ -59,6 +140,8 @@ class BodySizeLimitMiddleware:
     def _limit_for_path(self, path: str) -> int | None:
         if path == "/api/uploads/image":
             return int(settings.max_upload_image_bytes) + 1024 * 1024
+        if path == "/api/uploads/video":
+            return int(settings.max_upload_video_bytes) + 16 * 1024 * 1024
         if path in {"/api/payments/alipay/notify", "/api/payments/wechat/notify"}:
             return int(settings.payment_notify_max_body_bytes)
         if path == "/api/payments/orders":
@@ -157,6 +240,7 @@ app = FastAPI(
 )
 
 app.add_middleware(BodySizeLimitMiddleware)
+app.add_middleware(CsrfOriginMiddleware)
 app.add_middleware(RequestContextMiddleware)
 app.add_middleware(
     CORSMiddleware,

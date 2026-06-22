@@ -12,10 +12,10 @@ from ..config import settings
 from ..db import get_db
 from ..deps import get_client_ip, get_current_user
 from ..models import User
-from ..redis_client import redis_client
 from ..schemas import PaymentCreateIn, PaymentOrderOut, PaymentPackageOut
 from ..services import audit, payments
 from ..services.config_store import get_bool_setting
+from ..services.rate_limit import incr_window
 from ..services.request_limits import read_limited_body
 
 router = APIRouter(prefix="/api/payments", tags=["payments"])
@@ -60,9 +60,7 @@ def _rate_limit_order(user_id: int, ip: str) -> None:
         (f"payment:order:user:{user_id}", int(settings.payment_order_rate_limit_per_hour)),
         (f"payment:order:ip:{ip}", int(settings.payment_order_rate_limit_per_hour) * 3),
     ):
-        n = redis_client.incr(key)
-        if n == 1:
-            redis_client.expire(key, _ORDER_RATE_WINDOW_SECONDS)
+        n = incr_window(key, _ORDER_RATE_WINDOW_SECONDS)
         if n > limit:
             raise HTTPException(429, "支付下单过于频繁,请稍后再试")
 

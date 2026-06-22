@@ -11,12 +11,16 @@ import httpx
 import pytest
 from PIL import Image
 
+from app.celery_app import celery_app
 from app.config import settings
 from app.db import SessionLocal
 from app.deps import get_client_ip
 from app.main import BodySizeLimitMiddleware, validate_model_gateway_rows, validate_runtime_config
 from app.models import (
     AdminIdempotencyKey,
+    AppSetting,
+    AssetReport,
+    AuditLog,
     GenAsset,
     GenTask,
     ModelConfig,
@@ -27,6 +31,12 @@ from app.models import (
 from app.redis_client import redis_client
 from app.services import asset_refs, credits, gateway, generation, locks, ssrf, storage
 from app.services.ssrf import SsrfError, assert_safe_user_asset_url
+
+
+def _png_bytes(size=(32, 48), color=(20, 120, 200)):
+    buf = io.BytesIO()
+    Image.new("RGB", size, color).save(buf, format="PNG")
+    return buf.getvalue()
 
 
 # ---------------------------------------------------------------- refund idempotency
@@ -369,6 +379,49 @@ def test_body_size_limit_rejects_chunked_body_without_content_length(monkeypatch
     assert sent[0]["status"] == 413
 
 
+def test_video_upload_body_size_limit_applies_to_chunked_body(monkeypatch):
+    monkeypatch.setattr(settings, "max_upload_video_bytes", 3)
+    app_started = {"value": False}
+
+    async def consuming_app(scope, receive, send):
+        app_started["value"] = True
+        while True:
+            message = await receive()
+            if message["type"] == "http.request" and not message.get("more_body"):
+                break
+        await send({"type": "http.response.start", "status": 204, "headers": []})
+        await send({"type": "http.response.body", "body": b""})
+
+    messages = iter([
+        {"type": "http.request", "body": b"x" * (10 * 1024 * 1024), "more_body": True},
+        {"type": "http.request", "body": b"x" * (7 * 1024 * 1024), "more_body": False},
+    ])
+    sent = []
+
+    async def receive():
+        return next(messages)
+
+    async def send(message):
+        sent.append(message)
+
+    asyncio.run(
+        BodySizeLimitMiddleware(consuming_app)(
+            {
+                "type": "http",
+                "method": "POST",
+                "path": "/api/uploads/video",
+                "headers": [],
+            },
+            receive,
+            send,
+        )
+    )
+
+    assert app_started["value"] is True
+    assert sent[0]["type"] == "http.response.start"
+    assert sent[0]["status"] == 413
+
+
 def test_auth_body_size_limit_applies_to_login():
     app_started = {"value": False}
 
@@ -404,6 +457,107 @@ def test_auth_body_size_limit_applies_to_login():
 
     assert app_started["value"] is True
     assert sent[0]["status"] == 413
+
+
+def test_auth_cookie_can_access_me_and_logout_clears_cookie(client, make_user):
+    make_user("13900000198", password="pass123456")
+    login = client.post(
+        "/api/auth/login",
+        json={"phone": "13900000198", "password": "pass123456"},
+    )
+    assert login.status_code == 200, login.text
+    set_cookie = login.headers.get("set-cookie", "")
+    assert "ai_studio_token=" in set_cookie
+    assert "HttpOnly" in set_cookie
+
+    me = client.get("/api/me")
+    assert me.status_code == 200, me.text
+    assert me.json()["phone"] == "13900000198"
+
+    logout = client.post("/api/me/logout", headers={"Origin": "http://localhost:3000"})
+    assert logout.status_code == 200, logout.text
+    cleared = logout.headers.get("set-cookie", "")
+    assert "ai_studio_token=" in cleared
+    assert "Max-Age=0" in cleared
+
+
+def test_cookie_auth_post_rejects_cross_site_origin(client, make_user):
+    make_user("13900000197", password="pass123456")
+    login = client.post(
+        "/api/auth/login",
+        json={"phone": "13900000197", "password": "pass123456"},
+    )
+    assert login.status_code == 200, login.text
+
+    blocked = client.post("/api/me/logout", headers={"Origin": "https://evil.example"})
+    assert blocked.status_code == 403
+    assert "CSRF origin check failed" in blocked.text
+
+
+def test_cookie_auth_post_rejects_missing_origin_and_referer(client, make_user):
+    make_user("13900000399", password="pass123456")
+    login = client.post(
+        "/api/auth/login",
+        json={"phone": "13900000399", "password": "pass123456"},
+    )
+    assert login.status_code == 200, login.text
+
+    blocked = client.post("/api/me/logout")
+    assert blocked.status_code == 403
+    assert "CSRF origin required" in blocked.text
+
+
+def test_cookie_auth_post_allows_configured_frontend_origin(client, make_user):
+    make_user("13900000196", password="pass123456")
+    login = client.post(
+        "/api/auth/login",
+        json={"phone": "13900000196", "password": "pass123456"},
+    )
+    assert login.status_code == 200, login.text
+
+    ok = client.post("/api/me/logout", headers={"Origin": "http://localhost:3000"})
+    assert ok.status_code == 200, ok.text
+
+
+def test_bearer_post_with_cookie_is_not_csrf_blocked(client, make_user, auth):
+    make_user("13900000195", password="pass123456")
+    h = auth("13900000195")
+
+    ok = client.post("/api/me/logout", headers=h)
+    assert ok.status_code == 200, ok.text
+
+
+def test_auth_login_rejects_cross_site_origin(client, make_user):
+    make_user("13900000194", password="pass123456")
+    first = client.post(
+        "/api/auth/login",
+        json={"phone": "13900000194", "password": "pass123456"},
+    )
+    assert first.status_code == 200, first.text
+
+    second = client.post(
+        "/api/auth/login",
+        json={"phone": "13900000194", "password": "pass123456"},
+        headers={"Origin": "https://evil.example"},
+    )
+    assert second.status_code == 403
+    assert "CSRF origin check failed" in second.text
+
+
+def test_payment_notify_endpoints_skip_csrf_cookie_origin_check(client, make_user):
+    make_user("13900000193", password="pass123456")
+    login = client.post(
+        "/api/auth/login",
+        json={"phone": "13900000193", "password": "pass123456"},
+    )
+    assert login.status_code == 200, login.text
+
+    notify = client.post(
+        "/api/payments/wechat/notify",
+        json={"resource": {}},
+        headers={"Origin": "https://evil.example"},
+    )
+    assert notify.status_code != 403
 
 
 def test_payment_order_body_size_limit_applies_to_chunked_body():
@@ -730,7 +884,7 @@ def test_external_gateway_asset_ref_is_localized_to_data_uri(
     finally:
         db.close()
 
-    assert ref.startswith("data:image/png;base64,")
+    assert ref.startswith("data:image/jpeg;base64,")
     assert "cdn.example.com" not in ref
 
 
@@ -801,7 +955,7 @@ def test_video_params_localizes_client_reference_url_before_gateway(
     finally:
         db.close()
 
-    assert params["first_frame_image"].startswith("data:image/png;base64,")
+    assert params["first_frame_image"].startswith("data:image/jpeg;base64,")
     assert params["reference_image_url"] == params["first_frame_image"]
     assert "cdn.example.com" not in params["first_frame_image"]
 
@@ -857,6 +1011,206 @@ def test_parse_localized_image_thumb_uses_local_preview(client, make_user, auth,
     assert asset["thumb"] == "http://localhost:8000/media/preview/localized.png"
     assert asset["original_url"] == "https://cdn.example.com/full.jpg"
     assert asset["original_thumb"] == "https://cdn.example.com/thumb.jpg"
+    assert asset["source_page_url"] == "https://www.xiaohongshu.com/explore/img"
+    assert asset["source_captured_at"]
+
+
+def test_generate_records_source_trace_for_parsed_reference(client, make_user, auth, monkeypatch):
+    make_user("13900000188", balance=1000)
+    h = auth("13900000188")
+    monkeypatch.setattr(
+        "app.routers.parse.parse_url",
+        lambda _url: [
+            {
+                "type": "image",
+                "url": "https://cdn.example.com/full.jpg",
+                "thumb": "https://cdn.example.com/thumb.jpg",
+                "width": 1024,
+                "height": 1536,
+            }
+        ],
+    )
+
+    parsed = client.post(
+        "/api/parse",
+        json={"url": "https://www.xiaohongshu.com/explore/source-trace"},
+        headers=h,
+    )
+    assert parsed.status_code == 200, parsed.text
+    asset = parsed.json()["assets"][0]
+
+    generated = client.post(
+        "/api/generate",
+        json={
+            "source_asset_url": asset["url"],
+            "source_type": "image",
+            "source_asset_meta": {
+                "selected_type": asset["type"],
+                "selected_url": asset["url"],
+                "selected_thumb": asset["thumb"],
+                "original_url": asset["original_url"],
+                "original_thumb": asset["original_thumb"],
+                "source_page_url": asset["source_page_url"],
+                "source_captured_at": asset["source_captured_at"],
+                "ignored": {"x": "y"},
+            },
+            "category": "image",
+            "stage": "preview",
+            "instruction": "trace this reference",
+            "params": {"n": 1, "size": "256x256"},
+        },
+        headers=h,
+    )
+    assert generated.status_code == 200, generated.text
+
+    db = SessionLocal()
+    try:
+        task = db.get(GenTask, generated.json()["id"])
+        trace = task.params["_source_trace"]
+    finally:
+        db.close()
+
+    assert trace["source_asset_url"] == asset["url"]
+    assert trace["selected_url"] == asset["url"]
+    assert trace["original_url"] == "https://cdn.example.com/full.jpg"
+    assert trace["original_thumb"] == "https://cdn.example.com/thumb.jpg"
+    assert trace["source_page_url"] == "https://www.xiaohongshu.com/explore/source-trace"
+    assert trace["source_captured_at"] == asset["source_captured_at"]
+    assert trace["source_type"] == "image"
+    assert "ignored" not in trace
+
+
+def test_generate_allows_external_reference_without_rights_confirmation(client, make_user, auth, monkeypatch):
+    make_user("13900001185", balance=1000)
+    h = auth("13900001185")
+    monkeypatch.setattr("app.routers.generate.assert_safe_user_asset_url", lambda *_a, **_k: None)
+
+    r = client.post(
+        "/api/generate",
+        json={
+            "source_asset_url": "https://cdn.example.com/full.jpg",
+            "source_type": "image",
+            "source_asset_meta": {
+                "selected_type": "image",
+                "selected_url": "https://cdn.example.com/full.jpg",
+                "user_confirmed_rights": False,
+            },
+            "category": "image",
+            "stage": "preview",
+            "instruction": "use external reference",
+            "params": {"n": 1, "size": "256x256"},
+        },
+        headers=h,
+    )
+
+    assert r.status_code == 200, r.text
+
+
+def test_generate_allows_confirmed_external_reference(client, make_user, auth, monkeypatch):
+    make_user("13900001184", balance=1000)
+    h = auth("13900001184")
+    monkeypatch.setattr("app.routers.generate.assert_safe_user_asset_url", lambda *_a, **_k: None)
+    monkeypatch.setattr("app.services.gateway.download_bytes_limited", lambda *_a, **_k: _png_bytes())
+
+    r = client.post(
+        "/api/generate",
+        json={
+            "source_asset_url": "https://cdn.example.com/full.jpg",
+            "source_type": "image",
+            "source_asset_meta": {
+                "selected_type": "image",
+                "selected_url": "https://cdn.example.com/full.jpg",
+            },
+            "category": "image",
+            "stage": "preview",
+            "instruction": "use external reference",
+            "params": {"n": 1, "size": "256x256"},
+        },
+        headers=h,
+    )
+
+    assert r.status_code == 200, r.text
+
+
+def test_parse_localize_respects_user_storage_quota(client, make_user, auth, monkeypatch):
+    uid = make_user("13900000187", balance=1000)
+    h = auth("13900000187")
+    monkeypatch.setattr("app.services.upload_quota.settings.user_upload_storage_quota_bytes", 512)
+    monkeypatch.setattr(
+        "app.routers.parse.parse_url",
+        lambda _url: [
+            {
+                "type": "image",
+                "url": "https://cdn.example.com/full.jpg",
+                "thumb": "https://cdn.example.com/thumb.jpg",
+            }
+        ],
+    )
+    db = SessionLocal()
+    try:
+        db.add(UploadedAsset(
+            key="upload/quota-existing-parse.png",
+            user_id=uid,
+            mime="image/png",
+            width=1,
+            height=1,
+            bytes=500,
+            original_filename="existing.png",
+        ))
+        db.commit()
+    finally:
+        db.close()
+    before = {str(p) for p in Path(settings.storage_dir).rglob("*") if p.is_file()}
+
+    r = client.post("/api/parse", json={"url": "https://www.xiaohongshu.com/explore/quota"}, headers=h)
+    after = {str(p) for p in Path(settings.storage_dir).rglob("*") if p.is_file()}
+
+    assert r.status_code == 200, r.text
+    asset = r.json()["assets"][0]
+    assert asset["url"] == "https://cdn.example.com/full.jpg"
+    assert asset.get("original_url") is None
+    assert after == before
+    db = SessionLocal()
+    try:
+        assert db.query(UploadedAsset).filter(
+            UploadedAsset.user_id == uid,
+            UploadedAsset.key != "upload/quota-existing-parse.png",
+        ).count() == 0
+    finally:
+        db.close()
+
+
+def test_parse_submit_returns_queued_when_worker_is_async(client, make_user, auth, monkeypatch):
+    make_user("13900000186", balance=1000)
+    h = auth("13900000186")
+    queued_ids = []
+
+    class _Delay:
+        @staticmethod
+        def delay(parse_id):
+            queued_ids.append(parse_id)
+
+    monkeypatch.setattr("app.tasks.parse_url_task", _Delay)
+    old_eager = celery_app.conf.task_always_eager
+    celery_app.conf.task_always_eager = False
+    try:
+        r = client.post(
+            "/api/parse",
+            json={"url": "https://www.xiaohongshu.com/explore/queued"},
+            headers=h,
+        )
+    finally:
+        celery_app.conf.task_always_eager = old_eager
+
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["status"] == "queued"
+    assert body["assets"] is None
+    assert queued_ids == [body["id"]]
+
+    status = client.get(f"/api/parse/{body['id']}", headers=h)
+    assert status.status_code == 200, status.text
+    assert status.json()["status"] == "queued"
 
 
 def test_parsed_preview_reference_is_owner_bound(client, make_user, auth, monkeypatch):
@@ -920,8 +1274,9 @@ def test_parsed_preview_reference_prefers_clean_model_ref(client, make_user, aut
     db = SessionLocal()
     try:
         ref = asset_refs.gateway_ref_for_user_asset(db, user_id, ref_url)
-        assert ref.startswith("data:image/png;base64,")
-        assert storage.local_path(preview_key.replace("preview/", "model_ref/", 1)).exists()
+        assert ref.startswith("data:image/jpeg;base64,")
+        model_ref_path = storage.local_path(preview_key.replace("preview/", "model_ref/", 1).rsplit(".", 1)[0] + ".jpg")
+        assert model_ref_path.exists()
     finally:
         db.close()
 
@@ -963,6 +1318,128 @@ def test_orphaned_parsed_preview_file_cannot_drive_reference_generation(
     }, headers=h)
     assert blocked.status_code == 404
     assert "生成素材不存在" in blocked.text or "上传素材不存在" in blocked.text
+
+
+def test_asset_report_takedown_soft_blocks_reported_asset(client, make_user, auth):
+    make_user("13900000189", balance=1000)
+    make_user("13900000190", balance=1000, admin=True)
+    user_h = auth("13900000189")
+    admin_h = auth("13900000190")
+
+    created = client.post(
+        "/api/generate",
+        json={
+            "category": "image",
+            "stage": "preview",
+            "prompt": {"final_text": "reportable asset"},
+            "params": {"n": 1, "size": "256x256"},
+        },
+        headers=user_h,
+    )
+    assert created.status_code == 200, created.text
+    task = client.get(f"/api/tasks/{created.json()['id']}", headers=user_h).json()
+    asset_id = task["assets"][0]["id"]
+
+    report = client.post(
+        f"/api/assets/{asset_id}/report",
+        json={"reason": "copyright", "note": "疑似未授权素材"},
+        headers=user_h,
+    )
+    assert report.status_code == 200, report.text
+    report_id = report.json()["id"]
+    assert report.json()["status"] == "open"
+
+    reports = client.get("/api/admin/asset-reports", headers=admin_h)
+    assert reports.status_code == 200, reports.text
+    assert any(r["id"] == report_id and r["asset_id"] == asset_id for r in reports.json())
+    duplicate = client.post(
+        f"/api/assets/{asset_id}/report",
+        json={"reason": "copyright", "note": "重复举报"},
+        headers=user_h,
+    )
+    assert duplicate.status_code == 200, duplicate.text
+    assert duplicate.json()["id"] == report_id
+
+    handled = client.post(
+        f"/api/admin/asset-reports/{report_id}/handle",
+        json={
+            "action": "takedown",
+            "note": "确认下架",
+            "admin_password": "pass123456",
+        },
+        headers=admin_h,
+    )
+    assert handled.status_code == 200, handled.text
+    assert handled.json()["status"] == "takedown"
+
+    refreshed = client.get(f"/api/tasks/{created.json()['id']}", headers=user_h)
+    assert refreshed.status_code == 200, refreshed.text
+    asset_out = next(a for a in refreshed.json()["assets"] if a["id"] == asset_id)
+    assert asset_out["moderation_status"] == "takedown"
+    assert asset_out["preview_url"] is None
+    assert asset_out["hd_url"] is None
+    gallery = client.get("/api/profile/assets", headers=user_h)
+    assert gallery.status_code == 200, gallery.text
+    gallery_asset = next(a for a in gallery.json() if a["id"] == asset_id)
+    assert gallery_asset["moderation_status"] == "takedown"
+    assert gallery_asset["preview_url"] is None
+    assert gallery_asset["hd_url"] is None
+    assert gallery_asset["unlock_cost"] == 0
+    assert client.post(f"/api/assets/{asset_id}/unlock", headers=user_h).status_code == 410
+    assert client.get(f"/api/assets/{asset_id}/download", headers=user_h).status_code == 410
+    db = SessionLocal()
+    try:
+        row = db.get(AssetReport, report_id)
+        assert row is not None
+        assert row.status == "takedown"
+        assert row.handled_by is not None
+        asset = db.get(GenAsset, asset_id)
+        assert asset is not None
+        assert asset.moderation_status == "takedown"
+    finally:
+        db.close()
+
+
+def test_asset_report_requires_asset_owner(client, make_user, auth):
+    owner_id = make_user("13900000158", balance=1000)
+    make_user("13900000159", balance=1000)
+    other_h = auth("13900000159")
+    db = SessionLocal()
+    try:
+        task = GenTask(
+            user_id=owner_id,
+            category="image",
+            stage="preview",
+            status="succeeded",
+            cost_frozen=0,
+            cost_settled=0,
+        )
+        db.add(task)
+        db.flush()
+        asset = GenAsset(
+            task_id=task.id,
+            user_id=owner_id,
+            type="image",
+            preview_url="/storage/generated/owner-only.png",
+            moderation_status="active",
+        )
+        db.add(asset)
+        db.commit()
+        asset_id = asset.id
+    finally:
+        db.close()
+
+    r = client.post(
+        f"/api/assets/{asset_id}/report",
+        json={"reason": "privacy", "note": "not mine"},
+        headers=other_h,
+    )
+    assert r.status_code == 404
+    db = SessionLocal()
+    try:
+        assert db.query(AssetReport).filter(AssetReport.asset_id == asset_id).count() == 0
+    finally:
+        db.close()
 
 
 def test_orphaned_generated_preview_file_cannot_drive_reference_generation(
@@ -1049,6 +1526,18 @@ def test_unlocked_final_video_stream_uses_short_lived_ticket(client, make_user, 
     assert stream.status_code == 200, stream.text
     assert stream.headers["content-type"].startswith("video/mp4")
     assert stream.content == tiny_mp4
+    db = SessionLocal()
+    try:
+        actions = {
+            row.action
+            for row in db.query(AuditLog).filter(
+                AuditLog.biz_type == "asset",
+                AuditLog.biz_id == asset_id,
+            )
+        }
+        assert {"create_playback_ticket", "stream_asset"} <= actions
+    finally:
+        db.close()
 
 
 # ---------------------------------------------------------------- media traversal
@@ -1137,6 +1626,33 @@ def test_admin_status_change_revokes_old_token_even_after_reactivate(client, mak
 
     fresh_h = auth("13900000078")
     assert client.get("/api/me", headers=fresh_h).status_code == 200
+
+
+def test_admin_cannot_disable_self_but_can_disable_other_admin(client, make_user, auth):
+    self_id = make_user("13900000152", balance=1000, admin=True)
+    other_id = make_user("13900000153", balance=1000, admin=True)
+    h = auth("13900000152")
+
+    self_disable = client.patch(
+        f"/api/admin/users/{self_id}/status",
+        json={"status": "disabled", "admin_password": "pass123456"},
+        headers=h,
+    )
+    assert self_disable.status_code == 400
+    assert "当前管理员" in self_disable.text
+
+    other_disable = client.patch(
+        f"/api/admin/users/{other_id}/status",
+        json={"status": "disabled", "admin_password": "pass123456"},
+        headers=h,
+    )
+    assert other_disable.status_code == 200, other_disable.text
+    db = SessionLocal()
+    try:
+        assert db.get(User, self_id).status == "active"
+        assert db.get(User, other_id).status == "disabled"
+    finally:
+        db.close()
 
 
 def test_admin_dangerous_actions_require_admin_password(client, make_user, auth):
@@ -1250,6 +1766,7 @@ def test_mock_mode_external_reference_does_not_download(client, make_user, auth,
     r = client.post("/api/generate", json={
         "source_asset_url": "https://example.com/mock-ref.png",
         "source_type": "image",
+        "source_asset_meta": {},
         "category": "image",
         "stage": "preview",
         "instruction": "mock reference",
@@ -1258,7 +1775,7 @@ def test_mock_mode_external_reference_does_not_download(client, make_user, auth,
     assert r.status_code == 200, r.text
 
 
-def test_image_finalize_cleans_written_files_when_settle_fails(client, make_user, auth, monkeypatch):
+def test_image_finalize_holds_for_review_when_settle_fails(client, make_user, auth, monkeypatch):
     make_user("13900000094", balance=1000)
     h = auth("13900000094")
     buf = io.BytesIO()
@@ -1284,14 +1801,17 @@ def test_image_finalize_cleans_written_files_when_settle_fails(client, make_user
 
     assert r.status_code == 200, r.text
     task = client.get(f"/api/tasks/{r.json()['id']}", headers=h).json()
-    assert task["status"] == "failed"
+    assert task["status"] == "needs_review"
+    assert "本地落账失败" in task["error"]
     after = {
         str(p)
         for p in Path(settings.storage_dir).rglob("*")
         if p.is_file()
     }
-    assert after - before == set()
-    assert client.get("/api/me", headers=h).json()["balance_credits"] == 1000
+    assert after - before
+    me = client.get("/api/me", headers=h).json()
+    assert me["balance_credits"] == 995
+    assert me["frozen_credits"] == 5
 
 
 def test_admin_quota_grant_idempotency_replays_duplicate(client, make_user, auth):
@@ -1320,9 +1840,9 @@ def test_admin_quota_grant_idempotency_replays_duplicate(client, make_user, auth
 
 
 def test_admin_quota_grant_idempotency_rejects_key_reuse_with_different_body(client, make_user, auth):
-    make_user("13900000147", balance=1000, admin=True)
-    target = make_user("13900000148", balance=1000)
-    h = auth("13900000147")
+    make_user("13900000847", balance=1000, admin=True)
+    target = make_user("13900000848", balance=1000)
+    h = auth("13900000847")
     body = {
         "user_id": target,
         "amount": 10,
@@ -1337,9 +1857,9 @@ def test_admin_quota_grant_idempotency_rejects_key_reuse_with_different_body(cli
 
 
 def test_admin_quota_grant_replays_same_business_fingerprint_with_new_key(client, make_user, auth):
-    make_user("13900000159", balance=1000, admin=True)
-    target = make_user("13900000160", balance=1000)
-    h = auth("13900000159")
+    make_user("13900000859", balance=1000, admin=True)
+    target = make_user("13900000860", balance=1000)
+    h = auth("13900000859")
     body = {
         "user_id": target,
         "amount": 10,
@@ -1370,6 +1890,151 @@ def test_admin_quota_grant_requires_persistent_idempotency_key(client, make_user
         "admin_password": "pass123456",
     }, headers=h)
     assert r.status_code == 422
+
+
+def test_admin_quota_grant_respects_configured_single_and_daily_limits(client, make_user, auth):
+    make_user("13900000191", balance=1000, admin=True)
+    target = make_user("13900000192", balance=1000)
+    h = auth("13900000191")
+    settings_resp = client.put(
+        "/api/admin/settings",
+        json={
+            "admin_quota_grant_single_limit": 50,
+            "admin_quota_grant_daily_limit": 80,
+            "admin_password": "pass123456",
+        },
+        headers=h,
+    )
+    assert settings_resp.status_code == 200, settings_resp.text
+
+    too_large = client.post(
+        "/api/admin/quota/grant",
+        json={
+            "user_id": target,
+            "amount": 51,
+            "note": "single limit",
+            "admin_password": "pass123456",
+            "idempotency_key": "grant-limit-001",
+        },
+        headers=h,
+    )
+    assert too_large.status_code == 400
+    assert "单次发放额度不能超过 50" in too_large.text
+
+    first = client.post(
+        "/api/admin/quota/grant",
+        json={
+            "user_id": target,
+            "amount": 50,
+            "note": "daily limit first",
+            "admin_password": "pass123456",
+            "idempotency_key": "grant-limit-002",
+        },
+        headers=h,
+    )
+    assert first.status_code == 200, first.text
+    second = client.post(
+        "/api/admin/quota/grant",
+        json={
+            "user_id": target,
+            "amount": 31,
+            "note": "daily limit second",
+            "admin_password": "pass123456",
+            "idempotency_key": "grant-limit-003",
+        },
+        headers=h,
+    )
+    assert second.status_code == 400
+    assert "今日额度发放累计不能超过 80" in second.text
+
+
+def test_admin_quota_grant_replay_is_not_blocked_by_daily_limit(client, make_user, auth):
+    make_user("13900000281", balance=1000, admin=True)
+    target = make_user("13900000282", balance=1000)
+    h = auth("13900000281")
+    settings_resp = client.put(
+        "/api/admin/settings",
+        json={
+            "admin_quota_grant_single_limit": 50,
+            "admin_quota_grant_daily_limit": 50,
+            "admin_password": "pass123456",
+        },
+        headers=h,
+    )
+    assert settings_resp.status_code == 200, settings_resp.text
+    body = {
+        "user_id": target,
+        "amount": 50,
+        "note": "daily replay",
+        "admin_password": "pass123456",
+        "idempotency_key": "grant-replay-limit-001",
+    }
+    first = client.post("/api/admin/quota/grant", json=body, headers=h)
+    assert first.status_code == 200, first.text
+    replay = client.post("/api/admin/quota/grant", json=body, headers=h)
+    assert replay.status_code == 200, replay.text
+    assert replay.json()["balance_credits"] == 1050
+    db = SessionLocal()
+    try:
+        assert db.get(User, target).balance_credits == 1050
+    finally:
+        db.close()
+
+
+def test_admin_quota_grant_returns_conflict_when_admin_grant_lock_is_held(client, make_user, auth):
+    admin_id = make_user("13900000183", balance=1000, admin=True)
+    target = make_user("13900000184", balance=1000)
+    h = auth("13900000183")
+    token = locks.acquire(f"admin:quota:grant:{admin_id}", ttl=30)
+    assert token
+    try:
+        r = client.post(
+            "/api/admin/quota/grant",
+            json={
+                "user_id": target,
+                "amount": 10,
+                "note": "locked grant",
+                "admin_password": "pass123456",
+                "idempotency_key": "grant-locked-001",
+            },
+            headers=h,
+        )
+    finally:
+        locks.release(f"admin:quota:grant:{admin_id}", token)
+    assert r.status_code == 409
+    assert "额度发放正在处理中" in r.text
+
+
+def test_admin_api_has_independent_rate_limit(client, make_user, auth):
+    admin_id = make_user("13900000185", balance=1000, admin=True)
+    h = auth("13900000185")
+    rate_keys = [f"admin:rate:user:{admin_id}", "admin:rate:ip:testclient"]
+    for key in rate_keys:
+        redis_client.delete(key)
+    try:
+        r = client.put(
+            "/api/admin/settings",
+            json={"admin_api_rate_per_hour": 10, "admin_password": "pass123456"},
+            headers=h,
+        )
+        assert r.status_code == 200, r.text
+        for _ in range(9):
+            ok = client.get("/api/admin/users", headers=h)
+            assert ok.status_code == 200, ok.text
+        limited = client.get("/api/admin/users", headers=h)
+        assert limited.status_code == 429
+        assert "管理操作过于频繁" in limited.text
+    finally:
+        for key in rate_keys:
+            redis_client.delete(key)
+        db = SessionLocal()
+        try:
+            row = db.get(AppSetting, "admin_api_rate_per_hour")
+            if row:
+                db.delete(row)
+                db.commit()
+        finally:
+            db.close()
 
 
 def test_usage_report_csv_escapes_formula_cells(client, make_user, auth):
@@ -1433,6 +2098,42 @@ def test_admin_password_confirmation_is_rate_limited(client, make_user, auth, mo
         headers=h,
     )
     assert ok.status_code == 200, ok.text
+    assert redis_client.get("admin:confirm:failip:testclient") is None
+
+
+def test_admin_password_confirmation_success_clears_ip_fail_counter(client, make_user, auth):
+    make_user("13900000847", balance=1000, admin=True)
+    target_phone = "13900000849"
+    h = auth("13900000847")
+
+    wrong = client.post(
+        "/api/admin/whitelist",
+        json={"phone": target_phone, "admin_password": "wrong-password"},
+        headers=h,
+    )
+    assert wrong.status_code == 403
+
+    db = SessionLocal()
+    try:
+        row = db.get(PhoneWhitelist, target_phone)
+        if row:
+            db.delete(row)
+            db.commit()
+        admin = db.query(User).filter(User.phone == "13900000847").first()
+        fail_key = f"admin:confirm:fail:{admin.id}"
+        assert redis_client.get(fail_key) is not None
+        assert redis_client.get("admin:confirm:failip:testclient") is not None
+    finally:
+        db.close()
+
+    ok = client.post(
+        "/api/admin/whitelist",
+        json={"phone": target_phone, "admin_password": "pass123456"},
+        headers=h,
+    )
+    assert ok.status_code == 200, ok.text
+    assert redis_client.get(fail_key) is None
+    assert redis_client.get("admin:confirm:failip:testclient") is None
 
 
 def test_production_requires_real_gateway(client, monkeypatch):
@@ -1482,6 +2183,25 @@ def test_production_rejects_internal_gateway_without_allowlist(monkeypatch):
         assert "GATEWAY_BASE_URL" in str(e)
     else:
         raise AssertionError("production internal gateway must require allowlist")
+
+
+def test_trusted_egress_host_does_not_bypass_internal_ip_guard(monkeypatch):
+    monkeypatch.setattr(settings, "debug", False)
+    monkeypatch.setattr(settings, "mock_mode", False)
+    monkeypatch.setattr(settings, "gateway_base_url", "http://127.0.0.1:9000")
+    monkeypatch.setattr(settings, "gateway_api_key", "sk-test")
+    monkeypatch.setattr(settings, "video_gateway_format", "openai")
+    monkeypatch.setattr(settings, "video_gateway_base_url", "")
+    monkeypatch.setattr(settings, "video_gateway_api_key", "")
+    monkeypatch.setattr(settings, "sms_provider", "mock")
+    monkeypatch.setattr(settings, "jwt_secret", "x" * 48)
+    monkeypatch.setattr(settings, "metrics_token", "strong-metrics-token-123")
+    monkeypatch.setattr(settings, "payment_mock_enabled", False)
+    monkeypatch.setattr(settings, "payment_config_secret", "x" * 48)
+    monkeypatch.setattr(settings, "trusted_egress_hosts", "127.0.0.1")
+
+    with pytest.raises(RuntimeError, match="非公网地址|内网"):
+        validate_runtime_config()
 
 
 def test_production_rejects_missing_admin_secret_encryption_key(monkeypatch):

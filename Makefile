@@ -2,8 +2,8 @@
 VENV := backend/.venv
 PY := $(VENV)/bin
 
-.PHONY: help install install-frontend test lint fmt typecheck migrate audit \
-        run-api run-worker run-frontend build-frontend docker-up docker-down clean
+.PHONY: help install install-frontend test test-frontend lint fmt compile migrate alembic-check audit \
+        run-api run-worker run-beat run-frontend build-frontend docker-up docker-down release-check release-check-worktree release-source clean
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | \
@@ -20,14 +20,23 @@ install-frontend: ## Install frontend deps
 test: ## Run backend tests
 	cd backend && .venv/bin/pytest
 
+test-frontend: ## Run frontend unit tests
+	cd frontend && npm run test:unit
+
 lint: ## Lint backend (ruff)
 	cd backend && .venv/bin/ruff check .
 
 fmt: ## Auto-fix + format backend (ruff)
 	cd backend && .venv/bin/ruff check --fix . && .venv/bin/ruff format .
 
+compile: ## Compile backend Python sources (syntax/import smoke)
+	cd backend && .venv/bin/python -m compileall -q app tests scripts alembic
+
 migrate: ## Apply DB migrations (alembic upgrade head)
 	cd backend && .venv/bin/alembic upgrade head
+
+alembic-check: ## Check Alembic migration drift against models
+	cd backend && .venv/bin/alembic check
 
 audit: ## Audit dependencies for known vulnerabilities (backend + frontend)
 	cd backend && .venv/bin/pip install -q pip-audit && .venv/bin/pip-audit
@@ -38,6 +47,9 @@ run-api: ## Run the API (reload)
 
 run-worker: ## Run the Celery worker (+ beat for cleanup)
 	./scripts/run_worker.sh
+
+run-beat: ## Run the Celery beat scheduler (single instance)
+	./scripts/run_beat.sh
 
 run-frontend: ## Run the frontend dev server
 	cd frontend && npm run dev
@@ -51,6 +63,29 @@ docker-up: ## Build & start the full stack (postgres+redis+api+worker+web)
 docker-down: ## Stop the stack
 	docker compose down
 
+release-check: compile lint test test-frontend ## Run local release gates against the same clean HEAD artifact as CI
+	tmp="$$(mktemp -d)" && \
+		git archive --format=tar.gz --output="$$tmp/ai-studio-source.tar.gz" HEAD && \
+		python3 scripts/check_release_artifact.py "$$tmp/ai-studio-source.tar.gz" && \
+		rm -rf "$$tmp"
+	find . -maxdepth 3 \( -name .venv -o -name .next -o -name node_modules \) -type d -print | sort
+
+release-check-worktree: compile lint test test-frontend ## Run release gates against tracked + untracked worktree files
+	tmp="$$(mktemp -d)" && \
+		git ls-files -z --cached --others --exclude-standard | \
+		tar --null -czf "$$tmp/ai-studio-source.tar.gz" --files-from - && \
+		python3 scripts/check_release_artifact.py "$$tmp/ai-studio-source.tar.gz" && \
+		rm -rf "$$tmp"
+	find . -maxdepth 3 \( -name .venv -o -name .next -o -name node_modules \) -type d -print | sort
+
+release-source: ## Build a clean source tarball from git and verify artifact hygiene
+	@test -z "$$(git status --porcelain)" || \
+		(echo "working tree is dirty; commit or stash changes before building a release artifact" >&2; exit 1)
+	mkdir -p dist
+	git archive --format=tar.gz --output=dist/ai-studio-source.tar.gz HEAD
+	python3 scripts/check_release_artifact.py dist/ai-studio-source.tar.gz
+
 clean: ## Remove caches & build artifacts
 	find . -type d -name __pycache__ -prune -exec rm -rf {} + 2>/dev/null || true
-	rm -rf backend/.pytest_cache frontend/.next backend/celerybeat-schedule*
+	rm -rf .venv dist .pytest_cache .ruff_cache backend/.pytest_cache backend/.ruff_cache \
+		frontend/.next backend/celerybeat-schedule*

@@ -1,8 +1,8 @@
 """Hardening: input validation on generate params + server-side reverse switch."""
 
 from app.db import SessionLocal
-from app.models import GenTask
-from app.services import gateway
+from app.models import GenTask, ParseRecord
+from app.services import gateway, generation
 from app.services.progress import set_progress
 
 
@@ -103,6 +103,64 @@ def test_generated_image_over_pixel_limit_is_rejected(client, make_user, auth, m
     assert task["status"] == "failed"
     assert task["error"] == "图片生成失败，已退回冻结积分，请稍后重试"
     assert client.get("/api/me", headers=h).json()["balance_credits"] == 1000
+
+
+def test_partial_image_generation_exposes_skip_reason(client, make_user, auth, monkeypatch):
+    make_user("13900000048", balance=1000)
+    h = auth("13900000048")
+    monkeypatch.setattr(
+        "app.services.gateway.gen_image",
+        lambda *_a, **_k: [gateway._mock_image("ok", "256x256", 0), b"not-an-image"],
+    )
+
+    r = client.post("/api/generate", json={
+        "category": "image",
+        "stage": "preview",
+        "prompt": {"final_text": "partial"},
+        "params": {"n": 2, "size": "256x256"},
+    }, headers=h)
+
+    assert r.status_code == 200, r.text
+    task = client.get(f"/api/tasks/{r.json()['id']}", headers=h).json()
+    assert task["status"] == "succeeded"
+    assert task["partial"] is True
+    assert task["requested_count"] == 2
+    assert task["saved_count"] == 1
+    assert task["skipped_count"] == 1
+    assert task["partial_errors"]
+    assert len(task["assets"]) == 1
+
+
+def test_needs_review_image_task_is_not_reprocessed(client, make_user, monkeypatch):
+    uid = make_user("13900000047", balance=1000)
+    db = SessionLocal()
+    try:
+        task = GenTask(
+            user_id=uid,
+            category="image",
+            stage="preview",
+            status="needs_review",
+            cost_frozen=10,
+            prompt={"final_text": "held"},
+            params={"n": 1, "size": "256x256"},
+        )
+        db.add(task)
+        db.commit()
+        tid = task.id
+    finally:
+        db.close()
+
+    monkeypatch.setattr(
+        "app.services.gateway.gen_image",
+        lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("needs_review reran")),
+    )
+
+    generation.run_image_task(tid)
+    db = SessionLocal()
+    try:
+        assert db.get(GenTask, tid).status == "needs_review"
+    finally:
+        db.close()
 
 
 def test_task_list_batched_keeps_assets_per_task(client, make_user, auth):
@@ -241,6 +299,32 @@ def test_generate_rejects_bad_size(client, make_user, auth):
         assert r.status_code == 400, f"size={bad} should be rejected"
 
 
+def test_video_reference_rejects_external_video_without_cover(client, make_user, auth):
+    make_user("13900000393", balance=1000, admin=True)
+    h = auth("13900000393")
+    client.put("/api/admin/models", json={
+        "use": "video",
+        "model_id": "mock-video",
+        "cost_credits": 50,
+        "unlock_cost": 0,
+        "enabled": True,
+        "admin_password": "pass123456",
+        "extra": {"preview_cost": 5},
+    }, headers=h)
+
+    r = client.post("/api/generate", json={
+        "source_asset_url": "https://cdn.example.com/source.mp4",
+        "source_type": "video",
+        "source_asset_meta": {"user_confirmed_rights": True},
+        "category": "video",
+        "stage": "preview",
+        "prompt": {"final_text": "looks like the source video"},
+        "params": {"duration": 5, "resolution": "480p"},
+    }, headers=h)
+    assert r.status_code == 400
+    assert "视频参考缺少可用封面" in r.text
+
+
 def test_generate_accepts_4k_size(client, make_user, auth, monkeypatch):
     make_user("13900000029", balance=1000)
     h = auth("13900000029")
@@ -257,6 +341,7 @@ def test_generate_accepts_4k_size(client, make_user, auth, monkeypatch):
 
     r = client.post("/api/generate", json={
         "source_asset_url": "http://x/y.png", "source_type": "image",
+        "source_asset_meta": {"user_confirmed_rights": True},
         "category": "image", "stage": "preview", "instruction": "x",
         "params": {"n": 1, "size": "4096x4096"},
     }, headers=h)
@@ -325,6 +410,35 @@ def test_admin_rejects_negative_model_cost(client, make_user, auth):
     assert r2.status_code == 422
 
 
+def test_admin_rejects_zero_or_extreme_model_cost(client, make_user, auth):
+    make_user("13900000026", balance=1000, admin=True)
+    h = auth("13900000026")
+    base = {
+        "use": "video",
+        "model_id": "mock-video",
+        "unlock_cost": 0,
+        "enabled": True,
+        "admin_password": "pass123456",
+    }
+
+    zero = client.put("/api/admin/models", json={**base, "cost_credits": 0}, headers=h)
+    assert zero.status_code == 422
+
+    huge = client.put(
+        "/api/admin/models",
+        json={**base, "cost_credits": 1_000_001, "extra": {"preview_cost": 1}},
+        headers=h,
+    )
+    assert huge.status_code == 422
+
+    huge_preview = client.put(
+        "/api/admin/models",
+        json={**base, "cost_credits": 50, "extra": {"preview_cost": 1_000_001}},
+        headers=h,
+    )
+    assert huge_preview.status_code == 422
+
+
 def test_admin_settings_rejects_oversized_default_image_n(client, make_user, auth):
     make_user("13900000025", balance=1000, admin=True)
     h = auth("13900000025")
@@ -356,3 +470,83 @@ def test_reverse_switch_enforced_server_side(client, make_user, auth):
         "reverse_prompt_enabled": True,
         "admin_password": "pass123456",
     }, headers=h)
+
+
+def test_content_safety_blocks_configured_prompt_terms(client, make_user, auth):
+    make_user("13900000196", balance=1000, admin=True)
+    h = auth("13900000196")
+    s = client.put(
+        "/api/admin/settings",
+        json={
+            "content_safety_enabled": True,
+            "content_safety_banned_terms": "forbidden-word\nanother-term",
+            "admin_password": "pass123456",
+        },
+        headers=h,
+    )
+    assert s.status_code == 200, s.text
+    assert s.json()["content_safety_enabled"] is True
+
+    blocked = client.post("/api/generate", json={
+        "category": "image",
+        "stage": "preview",
+        "prompt": {"final_text": "a calm forbidden-word poster"},
+        "params": {"n": 1, "size": "256x256"},
+    }, headers=h)
+    assert blocked.status_code == 400
+    assert "内容安全拦截" in blocked.text
+
+    # Restore the global default for the shared integration-test DB.
+    client.put(
+        "/api/admin/settings",
+        json={
+            "content_safety_enabled": False,
+            "content_safety_banned_terms": "",
+            "admin_password": "pass123456",
+        },
+        headers=h,
+    )
+
+
+def test_content_safety_disabled_by_default(client, make_user, auth):
+    make_user("13900000197", balance=1000)
+    h = auth("13900000197")
+    r = client.post("/api/generate", json={
+        "category": "image",
+        "stage": "preview",
+        "prompt": {"final_text": "forbidden-word is allowed while safety is off"},
+        "params": {"n": 1, "size": "256x256"},
+    }, headers=h)
+    assert r.status_code == 200, r.text
+
+
+def test_parse_record_is_atomically_claimed(client, make_user, monkeypatch):
+    uid = make_user("13900000199", balance=1000)
+    db = SessionLocal()
+    try:
+        rec = ParseRecord(user_id=uid, url="https://example.com/xhs/1", status="queued")
+        db.add(rec)
+        db.commit()
+        parse_id = rec.id
+    finally:
+        db.close()
+
+    calls = {"n": 0}
+
+    def fake_parse_url(_url):
+        calls["n"] += 1
+        return [{"type": "image", "url": "https://cdn.example.com/a.png"}]
+
+    monkeypatch.setattr("app.routers.parse.parse_url", fake_parse_url)
+    from app.routers.parse import run_parse_record
+
+    run_parse_record(parse_id)
+    run_parse_record(parse_id)
+
+    assert calls["n"] == 1
+    db = SessionLocal()
+    try:
+        rec = db.get(ParseRecord, parse_id)
+        assert rec.status == "done"
+    finally:
+        db.close()

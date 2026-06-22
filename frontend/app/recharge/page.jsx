@@ -4,7 +4,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import QRCode from "qrcode";
 import Nav from "../../components/Nav";
-import { api, getToken } from "../../lib/api";
+import { api } from "../../lib/api";
 
 const PROVIDERS = [
   ["alipay", "支付宝"],
@@ -32,7 +32,6 @@ export default function RechargePage() {
   const packageIdRef = useRef(packageId);
 
   useEffect(() => {
-    if (!getToken()) return router.push("/login");
     Promise.all([api.me(), api.paymentConfig(), api.paymentOrders(12)])
       .then(([u, paymentCfg, rows]) => {
         const enabled = paymentCfg.enabled !== false;

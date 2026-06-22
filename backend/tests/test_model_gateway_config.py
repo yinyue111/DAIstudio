@@ -72,6 +72,56 @@ def test_admin_model_config_empty_key_keeps_existing_secret(client, make_user, a
         db.close()
 
 
+def test_admin_model_config_audit_records_before_after_without_secret(client, make_user, auth):
+    make_user("13900001008", balance=1000, admin=True)
+    h = auth("13900001008")
+    body = {
+        "use": "image",
+        "provider": "openai",
+        "base_url": "https://audit-old.example.com/v1",
+        "gateway_format": "openai",
+        "api_key": "audit-old-secret",
+        "model_id": "model-old",
+        "cost_credits": 5,
+        "unlock_cost": 2,
+        "enabled": True,
+        "admin_password": "pass123456",
+    }
+    first = client.put("/api/admin/models", json=body, headers=h)
+    assert first.status_code == 200, first.text
+
+    changed = client.put(
+        "/api/admin/models",
+        json={
+            **body,
+            "base_url": "https://audit-new.example.com/v1",
+            "api_key": "audit-new-secret",
+            "model_id": "model-new",
+            "cost_credits": 8,
+            "enabled": False,
+            "extra": {"internal_note": "sensitive-extra-value"},
+        },
+        headers=h,
+    )
+    assert changed.status_code == 200, changed.text
+
+    audit_log = client.get("/api/admin/audit?action=update_model", headers=h)
+    assert audit_log.status_code == 200, audit_log.text
+    assert "audit-old-secret" not in audit_log.text
+    assert "audit-new-secret" not in audit_log.text
+    assert "sensitive-extra-value" not in audit_log.text
+    detail = audit_log.json()[0]["detail"]
+    assert detail["api_key_changed"] is True
+    assert detail["before"]["model_id"] == "model-old"
+    assert detail["before"]["base_url"] == "https://audit-old.example.com/v1"
+    assert detail["before"]["api_key_configured"] is True
+    assert detail["after"]["model_id"] == "model-new"
+    assert detail["after"]["base_url"] == "https://audit-new.example.com/v1"
+    assert detail["after"]["cost_credits"] == 8
+    assert detail["after"]["enabled"] is False
+    assert detail["after"]["extra_keys"] == ["internal_note"]
+
+
 def test_admin_model_config_rejects_gateway_identity_change_without_new_key(client, make_user, auth):
     make_user("13900001005", balance=1000, admin=True)
     h = auth("13900001005")
@@ -231,6 +281,7 @@ def test_admin_probe_models_uses_unsaved_or_saved_key(client, make_user, auth, m
             "base_url": "https://probe.example.com/v1",
             "api_key": "probe-key",
             "gateway_format": "openai",
+            "admin_password": "pass123456",
         },
         headers=h,
     )
@@ -262,6 +313,33 @@ def test_admin_probe_models_uses_unsaved_or_saved_key(client, make_user, auth, m
     )
     assert r.status_code == 200, r.text
     assert seen[-1] == ("https://saved.example.com/v1", "saved-key", "openai")
+
+
+def test_admin_probe_models_requires_password_for_new_api_key(client, make_user, auth, monkeypatch):
+    make_user("13900001008", balance=1000, admin=True)
+    h = auth("13900001008")
+    called = False
+
+    def fake_list_models(cfg):
+        nonlocal called
+        called = True
+        return [{"id": "model-a"}]
+
+    monkeypatch.setattr(gateway, "list_models", fake_list_models)
+    r = client.post(
+        "/api/admin/models/probe",
+        json={
+            "use": "image",
+            "provider": "openai",
+            "base_url": "https://probe.example.com/v1",
+            "api_key": "probe-key",
+            "gateway_format": "openai",
+        },
+        headers=h,
+    )
+
+    assert r.status_code == 403
+    assert called is False
 
 
 def test_admin_probe_rejects_saved_key_with_temporary_base_url(client, make_user, auth, monkeypatch):

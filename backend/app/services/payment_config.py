@@ -161,6 +161,14 @@ def mask_secret_config(provider: str, secret_config: dict | None) -> dict[str, s
     return out
 
 
+def mask_runtime_secret_config(provider: str, secret: dict | None) -> dict[str, str]:
+    out: dict[str, str] = {}
+    secret = secret or {}
+    for key in SECRET_FIELDS.get(provider, set()):
+        out[key] = "已配置" if str(secret.get(key) or "").strip() else ""
+    return out
+
+
 def seed_defaults(db: Session) -> None:
     for item in DEFAULT_PAYMENT_PACKAGES:
         if db.get(PaymentPackage, item["id"]):
@@ -502,6 +510,8 @@ def list_providers_with_runtime(db: Session) -> list[dict]:
             current.update({
                 "enabled": True,
                 "mode": runtime.mode,
+                "public_config": public_config_for_provider(provider, runtime.public),
+                "secret_config_masked": mask_runtime_secret_config(provider, runtime.secret),
                 "configured": True,
                 "ready": True,
                 "issues": [],

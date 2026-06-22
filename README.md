@@ -50,16 +50,26 @@ createdb ai_studio        # 或: psql -c "CREATE DATABASE ai_studio;"
 ```bash
 make install          # 建 venv + 装后端运行/开发依赖(含 ruff)
 make install-frontend # 装前端依赖
+make compile          # Python 语法编译检查
 make lint             # ruff 静态检查(CI 同款)
 make fmt              # ruff 自动修复 + 格式化
 make test             # pytest(sqlite + fakeredis + eager Celery + mock 网关,无需外部服务)
+make test-frontend    # 前端安全/鉴权等轻量单测
+make release-check    # 本地发布门禁:compile/lint/test/frontend unit + 源码包污染检查
 make migrate          # alembic upgrade head
+make alembic-check    # 检查 ORM 与迁移产物是否漂移(需可连接目标 DB)
 make run-api / run-worker / run-beat / run-frontend
 make docker-up        # 一键起全栈
 ```
 
-CI(`.github/workflows/ci.yml`)在每次 push / PR 上跑:**后端 `ruff check` + `pytest`,前端 `next build`**。
+CI(`.github/workflows/ci.yml`)在每次 push / PR 上跑:**secret scan、Python compileall、后端 `ruff check` + `pytest`、
+Alembic upgrade/check/downgrade、依赖审计、CycloneDX SBOM、Docker Compose config、发布包污染检查、前端 unit + `next build`**。
 后端测试自带隔离(SQLite + fakeredis + eager Celery + mock 网关),不依赖真实 Postgres/Redis/网关,本地与 CI 一致可复现。
+发布源码包必须通过 `scripts/check_release_artifact.py`:禁止 `.env`、`.git`、`.codex/.agents`、`.venv`、`node_modules`、
+`.next`、`storage`、coverage/report/log/runtime DB 等本地文件进入交付物。
+上线前按 `docs/security/release-security-runbook.md` 执行密钥轮换、Git 历史清理和 release 包验收；
+代码门禁能证明交付物不夹带本地文件，但真实密钥是否已失效必须以供应商控制台轮换/撤销记录为准。
+容器镜像漏洞扫描建议放在 release/nightly 流水线执行；后端镜像会安装 Playwright Chromium,不适合拖慢每个 PR 的主检查。
 
 ---
 
@@ -73,8 +83,8 @@ ADMIN_PHONE=13800000000 ./scripts/setup.sh
 `setup.sh` 会:建 venv 并装后端依赖 → (可选)装 Playwright Chromium → 显式执行本地开发建表 + 写入种子模型配置 +
 创建管理员(并发放 1000 额度)→ 前端 `npm install`。生产初始化不要走开发建表，必须先跑 Alembic 迁移。
 
-> 网关密钥已写入 `backend/.env`(`GATEWAY_BASE_URL` / `GATEWAY_API_KEY`)。该文件已被 `.gitignore`,
-> 不要提交。模型 `model_id` 请按你网关 `/v1/models` 的真实值在「管理后台 → 模型配置」里改。
+> 真实网关密钥只允许放在本机私有 `backend/.env` 或部署环境变量中，release 包/源码包严禁包含 `.env`。
+> 模型 `model_id` 请按你网关 `/v1/models` 的真实值在「管理后台 → 模型配置」里改。
 
 ---
 
@@ -85,6 +95,16 @@ ADMIN_PHONE=13800000000 ./scripts/setup.sh
 ./scripts/run_worker.sh      # Celery 生成 worker
 ./scripts/run_beat.sh        # Celery Beat:卡死任务回收 / 视频轮询恢复 / 清理任务
 ./scripts/run_frontend.sh    # http://localhost:3000  (Web)
+```
+
+`run_worker.sh` 默认消费全部队列(`default,image,video_submit,video_poll,video_download,parse,cleanup,payment`)。
+生产需要隔离大视频下载/轮询时，可按队列拆 worker，例如:
+
+```bash
+WORKER_QUEUES=image ./scripts/run_worker.sh
+WORKER_QUEUES=video_submit,video_poll ./scripts/run_worker.sh
+WORKER_QUEUES=video_download ./scripts/run_worker.sh
+WORKER_QUEUES=parse,cleanup,payment ./scripts/run_worker.sh
 ```
 
 打开 http://localhost:3000,用管理员账号登录:**手机号 `13800000000`**。管理员密码不再有固定默认值——
@@ -111,7 +131,7 @@ ADMIN_PASSWORD='<强随机密码>' docker compose run --rm -e ADMIN_PASSWORD api
 
 起 Postgres + Redis + 迁移任务 + API + Worker + Beat + 前端；生产迁移由独立 `migrate` 服务执行
 `alembic upgrade head`，API 容器只在迁移成功后启动。`init_db` 在生产只做 seed/admin，不会隐式建表。
-网关密钥仍从 `backend/.env` 读;`DATABASE_URL/REDIS_URL` 由 compose 注入。生产默认同域部署:
+网关密钥从部署环境或私有 `backend/.env` 注入;`DATABASE_URL/REDIS_URL` 由 compose 注入。生产默认同域部署:
 `https://dream.aiwuq.cn` 访问前端,`/api`、`/media`、`/ws` 反代到后端。Nginx 模板见
 `deploy/nginx/dream.aiwuq.cn.conf`。
 Compose 默认只把 API/前端绑定到 `127.0.0.1:${API_PORT:-8000}` 和
@@ -180,7 +200,8 @@ alembic revision --autogenerate -m "add xxx"      # 改了 models 后生成新�
   在入口 clamp/拒绝,挡住资源耗尽。
 - 密码:PBKDF2-SHA256 加盐哈希存储;登录失败防爆破**按手机号 + 按 IP** 双维度限流。
 - **JWT**:`DEBUG=false` 且仍为默认密钥时拒绝启动(防伪造 token)。
-- 密钥:网关 key 放 `.env`,不入库、不入日志;`.env` 已 gitignore;后台只读视图掩码展示。
+- 密钥:网关 key 只能由 Secret Manager/宿主环境或私有 `.env` 注入,不入库、不入日志、不进 release 包;后台只读视图掩码展示。
+- 密钥轮换 / Git 历史清理 / release 包污染检查的执行清单见 `docs/security/release-security-runbook.md`。
 - 高清不外泄:未解锁时接口不返回 `hd_url`,下载接口校验登录 + 解锁状态。
 - 幂等:已到终态的生成任务再次执行会被跳过,避免重复扣费。
 
@@ -213,7 +234,13 @@ alembic revision --autogenerate -m "add xxx"      # 改了 models 后生成新�
   `external_task_id`/`external_submitted_at`/`phase`),再由自我续期的 `poll.video` 任务轮询到完成,
   worker 不再被长渲染占用;`cleanup.resume_videos` beat(每 2 分钟)通过 Redis 存活键发现「轮询链已死」
   (worker 崩溃)的在途任务并用 `external_task_id` **续查恢复**,避免外部任务丢结果。
+  若模型 `extra` 配置了供应商支持的 `request_query_path`,submit 超时/读超时时会先按 `_video_request_id`
+  找回 `external_task_id` 并恢复轮询;未配置或未命中时仍进入 `needs_review` 人工对账,不自动退款。
   迁移:`alembic upgrade head`(`0005_video_lifecycle`)。
+- **任务队列隔离**:Celery 已按 `image`、`video_submit`、`video_poll`、`video_download`、`parse`、`cleanup`、`payment`
+  路由;默认 worker 消费全部队列,生产可用 `WORKER_QUEUES=...` 拆分 worker,避免视频轮询/下载拖慢图片生成。
+- **支付主动对账**:`payments.reconcile` beat 周期性查询真实支付渠道,修复“回调丢失/本地已关闭但供应商后续成功”的订单,
+  只在供应商明确返回 paid/closed/failed 时改变本地状态。
 
 ---
 
@@ -341,18 +368,24 @@ scripts/               setup / run_backend / run_worker / run_frontend
 ## 备注 / 待办
 
 - 视频网关已接入 **火山方舟 Volcengine Ark / 豆包 Seedance**(异步任务接口):
-  - 凭据在 `backend/.env`:`VIDEO_GATEWAY_BASE_URL=https://ark.cn-beijing.volces.com/api/v3`、
-    `VIDEO_GATEWAY_API_KEY=ark-...`、`VIDEO_GATEWAY_FORMAT=ark`(视频网关独立于图片/视觉网关)。
+  - 凭据由私有 `backend/.env` 或部署环境注入:`VIDEO_GATEWAY_BASE_URL=https://ark.cn-beijing.volces.com/api/v3`、
+    `VIDEO_GATEWAY_API_KEY=<secret>`、`VIDEO_GATEWAY_FORMAT=ark`(视频网关独立于图片/视觉网关)。
   - 适配器:`submit` → `POST /contents/generations/tasks`(content 数组,参数以 `--resolution/--duration/--ratio` 等
     flag 附在文本上;选了图片素材时作为首帧做图生视频),`poll` → `GET /contents/generations/tasks/{id}`,取 `content.video_url`。
   - 两段式:预览=480p 短片(免费观看),定稿=1080p 完整视频(解锁后下载);生成后**自动下载并本地落盘**(Ark 链接约 24h 过期)。
-  - **已有数据库需在「管理后台 → 模型配置」把 video 的 model_id 设为 `doubao-seedance-1-5-pro-251215` 并启用**
-    (`models.yaml` 仅对全新初始化生效;种子不会覆盖已存在的行)。
+  - **已有数据库需在「管理后台 → 模型配置」把 video 的 model_id 设为网关实际支持的 Seedance 模型并启用**；
+    全新库默认种子使用 `doubao-seedance-2-0-pro`，并带官方价格元数据用于按使用量估算成本。
+  - 若你的网关支持按 `request_id` 查询任务,可在 video 模型 `extra` 配置 `request_query_path`、
+    `request_query_id_field`、`request_query_status_field` 等字段;提交状态未知时平台会自动找回任务继续轮询。
   - 其它视频网关:把 `VIDEO_GATEWAY_FORMAT=openai` 走通用适配(路径见 `models.yaml` 的 `video.extra`)。
 - 短信:`services/sms.py` 内置本地 mock 和通用 HTTP 短信网关适配器。短信验证码注册默认关闭；生产开启前设置
   `SMS_PROVIDER=http`、`SMS_HTTP_URL=<短信服务 HTTPS 地址>`、可选 `SMS_HTTP_API_KEY`，
   并在管理后台打开“短信验证码注册”。该网关会收到 `{phone, code, sign_name, template_code}` JSON。
   直连阿里云/腾讯云 SDK 还未启用，需要新增 provider 实现、签名/模板报备和测试后再开放生产配置。
-- 存储:`services/storage.py` 为本地实现,换 MinIO/OSS 只需替换 `save_bytes/public_url`。
+- 存储:`services/storage.py` 为本地实现,换 MinIO/OSS 只需替换 `save_bytes/public_url`。用户媒体默认按账号限制总占用
+  `USER_UPLOAD_STORAGE_QUOTA_BYTES=2147483648`(包含手动上传、抓取本地化预览和模型参考图),生产公网建议保持有限值。
+- 图片上传会先由 Pillow 解码并重新编码为 PNG 后保存,以去除 EXIF/GPS 等原始元数据；视频上传仍保留原格式,
+  由 ffprobe 做有效性与时长校验。
+- 上传图片/视频前必须确认拥有素材合法使用权或已获得授权；服务端会拒绝未确认的上传,并在审计日志记录确认结果。
 - 生产部署:Compose 是单机/MVP 支持路径(API 用单进程 uvicorn,前置 nginx/HTTPS);高并发场景再切到
   PostgreSQL/Redis 独立实例、前端 `next build && next start`、后端 gunicorn+uvicorn 多 worker,并同步健康检查和超时参数。

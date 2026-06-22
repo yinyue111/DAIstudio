@@ -51,6 +51,20 @@ def test_credit_lifecycle():
     total = db.execute(select(func.coalesce(func.sum(CreditTransaction.change), 0))).scalar()
     assert total == u.balance_credits == 72
 
+    rows = db.execute(
+        select(CreditTransaction).where(CreditTransaction.user_id == u.id).order_by(CreditTransaction.id)
+    ).scalars().all()
+    assert [(r.type, r.balance_delta, r.frozen_delta, r.balance_after, r.frozen_after) for r in rows] == [
+        ("grant", 100, 0, 100, 0),
+        ("freeze", -30, 30, 70, 30),
+        ("settle", 10, -30, 80, 0),
+        ("unlock", -5, 0, 75, 0),
+        ("consume", -3, 0, 72, 0),
+    ]
+    settle = next(r for r in rows if r.type == "settle")
+    assert settle.reserved_amount == 30
+    assert settle.real_cost == 20
+
 
 def test_refund_and_insufficient():
     db = make_session()
@@ -79,6 +93,33 @@ def test_refund_and_insufficient():
     credits.refund_consumed(db, u.id, 10, biz_type="reverse", biz_ref=3)
     db.refresh(u)
     assert (u.balance_credits, u.frozen_credits) == (50, 0)
+
+    with pytest.raises(credits.InsufficientCredits):
+        credits.refund_consumed(db, u.id, 1, biz_type="reverse", biz_ref=3)
+    db.refresh(u)
+    assert (u.balance_credits, u.frozen_credits) == (50, 0)
+
+
+def test_refund_consumed_cannot_exceed_same_biz_consumption():
+    db = make_session()
+    u = User(phone="13900000004", status="active", balance_credits=50, frozen_credits=0)
+    db.add(u)
+    db.commit()
+    db.refresh(u)
+
+    credits.consume(db, u.id, 10, biz_type="reverse", biz_ref=7)
+    credits.consume(db, u.id, 5, biz_type="reverse", biz_ref=8)
+    db.refresh(u)
+    assert u.balance_credits == 35
+
+    with pytest.raises(credits.InsufficientCredits):
+        credits.refund_consumed(db, u.id, 11, biz_type="reverse", biz_ref=7)
+    db.refresh(u)
+    assert u.balance_credits == 35
+
+    credits.refund_consumed(db, u.id, 10, biz_type="reverse", biz_ref=7)
+    db.refresh(u)
+    assert u.balance_credits == 45
 
 
 def test_settle_and_refund_cannot_exceed_frozen_balance():
@@ -122,6 +163,39 @@ def test_refund_cannot_spend_another_task_reservation():
     credits.refund(db, u.id, 20, biz_ref=1)
     db.refresh(u)
     assert (u.balance_credits, u.frozen_credits) == (100, 0)
+
+
+def test_legacy_settle_note_still_counts_reserved_amount():
+    db = make_session()
+    u = User(phone="13900000005", status="active", balance_credits=85, frozen_credits=0)
+    db.add(u)
+    db.commit()
+    db.refresh(u)
+    db.add_all([
+        CreditTransaction(
+            user_id=u.id,
+            type="freeze",
+            change=-20,
+            balance_after=80,
+            biz_type="gen_task",
+            biz_ref=11,
+        ),
+        CreditTransaction(
+            user_id=u.id,
+            type="settle",
+            change=5,
+            balance_after=85,
+            biz_type="gen_task",
+            biz_ref=11,
+            note="reserved=20 real=15",
+        ),
+    ])
+    db.commit()
+
+    with pytest.raises(credits.InsufficientCredits):
+        credits.refund(db, u.id, 1, biz_ref=11)
+    db.refresh(u)
+    assert (u.balance_credits, u.frozen_credits) == (85, 0)
 
 
 def test_negative_credit_amounts_are_rejected():

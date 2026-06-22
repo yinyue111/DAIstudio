@@ -16,6 +16,7 @@ import httpx
 
 from ..config import settings
 from ..redis_client import redis_client
+from .rate_limit import incr_window
 from .ssrf import pinned_client
 
 log = logging.getLogger("sms")
@@ -72,9 +73,7 @@ def _reserve_send_slot(phone: str) -> int:
         raise SmsError(f"请稍后再试({max(0, int(ttl or 0))}s 后可重新发送)")
 
     hourly_key = _k("hourly", phone)
-    sent = int(redis_client.incr(hourly_key) or 0)
-    if sent == 1:
-        redis_client.expire(hourly_key, 3600)
+    sent = incr_window(hourly_key, 3600)
     if sent > settings.sms_send_hourly_limit:
         redis_client.delete(cooldown_key)
         redis_client.decr(hourly_key)
@@ -153,8 +152,7 @@ def verify_code(phone: str, code: str) -> bool:
         raise SmsError("尝试次数过多,请重新获取验证码")
 
     if code != real:
-        redis_client.incr(fail_key)
-        redis_client.expire(fail_key, settings.sms_code_ttl_seconds)
+        incr_window(fail_key, settings.sms_code_ttl_seconds)
         raise SmsError("验证码错误")
 
     # success -> burn the code

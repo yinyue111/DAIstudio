@@ -22,6 +22,11 @@ def unlock_cost_for_asset(db: Session, asset: GenAsset, task: GenTask | None = N
 
 def to_asset_out(db: Session, asset: GenAsset, task: GenTask | None = None) -> AssetOut:
     out = AssetOut.model_validate(asset)
+    if asset.moderation_status != "active":
+        out.preview_url = None
+        out.hd_url = None
+        out.unlock_cost = 0
+        return out
     if not asset.unlocked:
         out.hd_url = None
         out.unlock_cost = unlock_cost_for_asset(db, asset, task=task)

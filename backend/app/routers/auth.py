@@ -9,7 +9,7 @@ from __future__ import annotations
 import re
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from sqlalchemy.orm import Session
 
 from ..config import settings
@@ -22,6 +22,7 @@ from ..schemas import LoginIn, RegisterIn, SmsCodeIn, TokenOut
 from ..security import create_access_token, dummy_password_hash, hash_password, verify_password
 from ..services import audit, sms
 from ..services.config_store import get_bool_setting
+from ..services.rate_limit import incr_window
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
 
@@ -44,9 +45,7 @@ def _whitelisted(db: Session, phone: str) -> PhoneWhitelist | None:
 
 def _check_sms_ip_rate(ip: str) -> None:
     key = f"sms:sendip:{ip}"
-    n = redis_client.incr(key)
-    if n == 1:
-        redis_client.expire(key, SMS_IP_SEND_WINDOW)
+    n = incr_window(key, SMS_IP_SEND_WINDOW)
     if n > SMS_IP_SEND_LIMIT:
         raise HTTPException(429, "验证码发送过于频繁,请稍后再试")
 
@@ -66,8 +65,24 @@ def _registration_allowed_without_sms() -> bool:
     return settings.debug
 
 
+def _issue_login_response(response: Response, user: User) -> TokenOut:
+    token = create_access_token(user.id, user.token_version)
+    response.set_cookie(
+        settings.auth_cookie_name,
+        token,
+        max_age=settings.jwt_expire_minutes * 60,
+        httponly=True,
+        secure=not settings.debug,
+        samesite="lax",
+        path="/",
+    )
+    if settings.debug or settings.auth_bearer_response_enabled:
+        return TokenOut(access_token=token)
+    return TokenOut()
+
+
 @router.post("/register", response_model=TokenOut)
-def register(body: RegisterIn, request: Request, db: Session = Depends(get_db)):
+def register(body: RegisterIn, request: Request, response: Response, db: Session = Depends(get_db)):
     phone = body.phone.strip()
     if not _valid_phone(phone):
         raise HTTPException(400, "手机号格式不正确")
@@ -108,7 +123,7 @@ def register(body: RegisterIn, request: Request, db: Session = Depends(get_db)):
     db.refresh(user)
 
     audit.log(db, user_id=user.id, action="register", ip=get_client_ip(request))
-    return TokenOut(access_token=create_access_token(user.id, user.token_version))
+    return _issue_login_response(response, user)
 
 
 @router.get("/features")
@@ -159,7 +174,7 @@ def send_sms_code(body: SmsCodeIn, request: Request, db: Session = Depends(get_d
 
 
 @router.post("/login", response_model=TokenOut)
-def login(body: LoginIn, request: Request, db: Session = Depends(get_db)):
+def login(body: LoginIn, request: Request, response: Response, db: Session = Depends(get_db)):
     phone = body.phone.strip()
     if not _valid_phone(phone):
         raise HTTPException(400, "手机号格式不正确")
@@ -179,9 +194,7 @@ def login(body: LoginIn, request: Request, db: Session = Depends(get_db)):
     )
     if not user or not password_ok:
         for key in (fail_key, ip_key):
-            n = redis_client.incr(key)
-            if n == 1:
-                redis_client.expire(key, LOGIN_FAIL_WINDOW)
+            incr_window(key, LOGIN_FAIL_WINDOW)
         raise HTTPException(401, "手机号或密码错误")
 
     if user.status != "active":
@@ -192,4 +205,4 @@ def login(body: LoginIn, request: Request, db: Session = Depends(get_db)):
     db.commit()
 
     audit.log(db, user_id=user.id, action="login", ip=get_client_ip(request))
-    return TokenOut(access_token=create_access_token(user.id, user.token_version))
+    return _issue_login_response(response, user)
