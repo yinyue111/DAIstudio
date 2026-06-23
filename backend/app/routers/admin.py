@@ -35,6 +35,9 @@ from ..schemas import (
     AuditOut,
     ModelConfigIn,
     ModelProbeIn,
+    OnlineUpdateRunIn,
+    OnlineUpdateRunOut,
+    OnlineUpdateStatusOut,
     PaymentPackageDisableIn,
     PaymentPackageIn,
     PaymentPackageOut,
@@ -55,6 +58,7 @@ from ..services import (
     gateway,
     generation,
     locks,
+    online_update,
     payment_config,
     payments,
     safe_logging,
@@ -590,7 +594,6 @@ def get_models(db: Session = Depends(get_db), _: User = Depends(require_admin)):
 @router.put("/models")
 def upsert_model(body: ModelConfigIn, db: Session = Depends(get_db),
                  admin: User = Depends(require_admin), request: Request = None):
-    _require_admin_password(admin, body.admin_password, request)
     row = db.execute(select(ModelConfig).where(ModelConfig.use == body.use)).scalar_one_or_none()
     before = _model_audit_snapshot(row)
     if row is None:
@@ -635,18 +638,12 @@ def probe_models(body: ModelProbeIn, db: Session = Depends(get_db),
     fallback = None
     if body.use:
         fallback = db.execute(select(ModelConfig).where(ModelConfig.use == body.use)).scalar_one_or_none()
-    supplied_key = bool((body.api_key or "").strip())
     requested_base = normalise_base_url(body.base_url)
     requested_host = (urlparse(requested_base).hostname or "").lower() if requested_base else ""
-    requires_password = supplied_key
     if requested_host and requested_host in app_config.trusted_egress_host_list:
-        requires_password = True
+        raise HTTPException(400, "不能临时探测受信任内网网关,请保存配置后再探测")
     if requested_base and requested_base.lower().startswith("http://"):
-        requires_password = True
-    if fallback is not None and fallback.api_key_encrypted and not supplied_key:
-        requires_password = True
-    if requires_password:
-        _require_admin_password(admin, body.admin_password, request)
+        raise HTTPException(400, "不能临时探测非 HTTPS 网关,请使用 HTTPS Base URL")
     try:
         cfg = runtime_config_from_probe(
             use=body.use,
@@ -676,7 +673,6 @@ def get_settings(db: Session = Depends(get_db), _: User = Depends(require_admin)
 @router.put("/settings")
 def put_settings(body: SettingsIn, db: Session = Depends(get_db),
                  admin: User = Depends(require_admin), request: Request = None):
-    _require_admin_password(admin, body.admin_password, request)
     changed = {}
     for key in DEFAULT_SETTINGS:
         val = getattr(body, key, None)
@@ -759,6 +755,50 @@ def gateway_status(_: User = Depends(require_admin)):
     }
 
 
+# --------------------------------------------------------------- online update
+@router.get("/update/status", response_model=OnlineUpdateStatusOut)
+def online_update_status(check_remote: bool = False, _: User = Depends(require_admin)):
+    return online_update.status(check_remote=check_remote)
+
+
+@router.post("/update/run", response_model=OnlineUpdateRunOut)
+def online_update_run(
+    body: OnlineUpdateRunIn,
+    db: Session = Depends(get_db),
+    admin: User = Depends(require_admin),
+    request: Request = None,
+):
+    try:
+        result = online_update.run_update(apply=body.apply)
+    except online_update.OnlineUpdateError as e:
+        audit.log(
+            db,
+            user_id=admin.id,
+            action="online_update_failed",
+            biz_type="admin",
+            ip=get_client_ip(request) if request else None,
+            detail={"error": str(e)},
+        )
+        raise HTTPException(400, str(e)) from e
+    audit.log(
+        db,
+        user_id=admin.id,
+        action="online_update_run",
+        biz_type="admin",
+        ip=get_client_ip(request) if request else None,
+        detail={
+            "changed": result.get("changed"),
+            "applied": result.get("applied"),
+            "partial_failure": result.get("partial_failure"),
+            "error": result.get("error"),
+            "before": result.get("before"),
+            "after": result.get("after"),
+            "remote_head": result.get("remote_head"),
+        },
+    )
+    return result
+
+
 # --------------------------------------------------------------- payment config
 @router.get("/payments/packages", response_model=list[PaymentPackageOut])
 def admin_payment_packages(db: Session = Depends(get_db), _: User = Depends(require_admin)):
@@ -776,7 +816,6 @@ def admin_upsert_payment_package(
     admin: User = Depends(require_admin),
     request: Request = None,
 ):
-    _require_admin_password(admin, body.admin_password, request)
     row = payment_config.upsert_package(db, body.model_dump())
     audit.log(
         db,
@@ -797,7 +836,6 @@ def admin_disable_payment_package(
     admin: User = Depends(require_admin),
     request: Request = None,
 ):
-    _require_admin_password(admin, body.admin_password, request)
     try:
         payment_config.delete_package(db, package_id)
     except payment_config.PaymentConfigError as e:
@@ -826,7 +864,6 @@ def admin_save_payment_provider(
     admin: User = Depends(require_admin),
     request: Request = None,
 ):
-    _require_admin_password(admin, body.admin_password, request)
     if body.provider != provider:
         raise HTTPException(400, "路径支付渠道与请求体不一致")
     if body.mode == "mock" and not app_config.debug and body.enabled:

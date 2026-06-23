@@ -58,6 +58,17 @@ services:
       TRUSTED_PROXY_IPS: ${TRUSTED_PROXY_IPS:-127.0.0.1,172.16.0.0/12}
       METRICS_TOKEN: ${METRICS_TOKEN:?set METRICS_TOKEN to protect /metrics}
       PAYMENT_CONFIG_SECRET: ${PAYMENT_CONFIG_SECRET:?set PAYMENT_CONFIG_SECRET to encrypt admin-saved secrets}
+      ONLINE_UPDATE_ENABLED: ${ONLINE_UPDATE_ENABLED:-false}
+      # The image build excludes .git, so enabling online update in Docker
+      # requires mounting a real checkout as ONLINE_UPDATE_REPO_DIR and using a
+      # fixed host/operator script for rebuild + restart. Keep disabled by
+      # default for normal compose deployments.
+      ONLINE_UPDATE_REPO_DIR: ${ONLINE_UPDATE_REPO_DIR:-/app}
+      ONLINE_UPDATE_REMOTE: ${ONLINE_UPDATE_REMOTE:-origin}
+      ONLINE_UPDATE_BRANCH: ${ONLINE_UPDATE_BRANCH:-main}
+      ONLINE_UPDATE_APPLY_COMMAND: ${ONLINE_UPDATE_APPLY_COMMAND:-}
+      ONLINE_UPDATE_TIMEOUT_SECONDS: ${ONLINE_UPDATE_TIMEOUT_SECONDS:-600}
+      ONLINE_UPDATE_ALLOW_DIRTY: ${ONLINE_UPDATE_ALLOW_DIRTY:-false}
       SMS_PROVIDER: ${SMS_PROVIDER:-mock}
       SMS_HTTP_URL: ${SMS_HTTP_URL:-}
       SMS_HTTP_API_KEY: ${SMS_HTTP_API_KEY:-}
@@ -88,6 +99,17 @@ services:
       TRUSTED_PROXY_IPS: ${TRUSTED_PROXY_IPS:-127.0.0.1,172.16.0.0/12}
       METRICS_TOKEN: ${METRICS_TOKEN:?set METRICS_TOKEN to protect /metrics}
       PAYMENT_CONFIG_SECRET: ${PAYMENT_CONFIG_SECRET:?set PAYMENT_CONFIG_SECRET to encrypt admin-saved secrets}
+      ONLINE_UPDATE_ENABLED: ${ONLINE_UPDATE_ENABLED:-false}
+      # The image build excludes .git, so enabling online update in Docker
+      # requires mounting a real checkout as ONLINE_UPDATE_REPO_DIR and using a
+      # fixed host/operator script for rebuild + restart. Keep disabled by
+      # default for normal compose deployments.
+      ONLINE_UPDATE_REPO_DIR: ${ONLINE_UPDATE_REPO_DIR:-/app}
+      ONLINE_UPDATE_REMOTE: ${ONLINE_UPDATE_REMOTE:-origin}
+      ONLINE_UPDATE_BRANCH: ${ONLINE_UPDATE_BRANCH:-main}
+      ONLINE_UPDATE_APPLY_COMMAND: ${ONLINE_UPDATE_APPLY_COMMAND:-}
+      ONLINE_UPDATE_TIMEOUT_SECONDS: ${ONLINE_UPDATE_TIMEOUT_SECONDS:-600}
+      ONLINE_UPDATE_ALLOW_DIRTY: ${ONLINE_UPDATE_ALLOW_DIRTY:-false}
       SMS_PROVIDER: ${SMS_PROVIDER:-mock}
       SMS_HTTP_URL: ${SMS_HTTP_URL:-}
       SMS_HTTP_API_KEY: ${SMS_HTTP_API_KEY:-}
@@ -175,6 +197,11 @@ services:
         NEXT_PUBLIC_API_BASE: ${NEXT_PUBLIC_API_BASE:-}
     ports:
       - "127.0.0.1:${FRONTEND_PORT:-3000}:3000"
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:3000').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
     depends_on:
       api:
         condition: service_healthy

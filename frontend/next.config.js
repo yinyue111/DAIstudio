@@ -35,7 +35,7 @@ const nextConfig = {
   // Internal tool: allow loading remote reference / result images without the
   // next/image optimizer (we use plain <img>).
   async headers() {
-    const scriptSrc = isProd ? "script-src 'self'" : "script-src 'self' 'unsafe-eval' 'unsafe-inline'";
+    const scriptSrc = isProd ? "script-src 'self' 'unsafe-inline'" : "script-src 'self' 'unsafe-eval' 'unsafe-inline'";
     const apiOrigin = originSource(process.env.NEXT_PUBLIC_API_BASE);
     const apiWsOrigin = websocketOrigin(process.env.NEXT_PUBLIC_API_BASE);
     const localApi = isProd ? [] : ["http://localhost:8000", "http://127.0.0.1:8000"];

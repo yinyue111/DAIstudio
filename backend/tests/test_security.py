@@ -1682,7 +1682,7 @@ def test_admin_dangerous_actions_require_admin_password(client, make_user, auth)
     assert r.status_code == 403
 
 
-def test_admin_config_and_whitelist_require_admin_password(client, make_user, auth):
+def test_admin_config_allows_logged_in_admin_without_second_password(client, make_user, auth):
     make_user("13900000089", balance=1000, admin=True)
     h = auth("13900000089")
 
@@ -1713,19 +1713,6 @@ def test_admin_config_and_whitelist_require_admin_password(client, make_user, au
     )
     assert bad_delete.status_code == 403
 
-    no_model_pw = client.put(
-        "/api/admin/models",
-        json={
-            "use": "image",
-            "model_id": "mock-image",
-            "cost_credits": 5,
-            "unlock_cost": 5,
-            "enabled": True,
-        },
-        headers=h,
-    )
-    assert no_model_pw.status_code == 403
-
     model_ok = client.put(
         "/api/admin/models",
         json={
@@ -1734,22 +1721,14 @@ def test_admin_config_and_whitelist_require_admin_password(client, make_user, au
             "cost_credits": 5,
             "unlock_cost": 5,
             "enabled": True,
-            "admin_password": "pass123456",
         },
         headers=h,
     )
     assert model_ok.status_code == 200, model_ok.text
 
-    no_settings_pw = client.put(
-        "/api/admin/settings",
-        json={"image_n": 2},
-        headers=h,
-    )
-    assert no_settings_pw.status_code == 403
-
     settings_ok = client.put(
         "/api/admin/settings",
-        json={"image_n": 2, "admin_password": "pass123456"},
+        json={"image_n": 2},
         headers=h,
     )
     assert settings_ok.status_code == 200, settings_ok.text

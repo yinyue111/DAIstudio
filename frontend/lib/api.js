@@ -9,6 +9,7 @@ const REVERSE_TIMEOUT_MS = 240_000;
 const UPLOAD_TIMEOUT_MS = 600_000;
 const DOWNLOAD_TIMEOUT_MS = 300_000;
 const GENERATE_TIMEOUT_MS = 600_000;
+const ONLINE_UPDATE_TIMEOUT_MS = 600_000;
 
 export function wsUrl(path) {
   const base = API_BASE || (typeof window !== "undefined" ? window.location.origin : "");
@@ -363,6 +364,12 @@ export const api = {
   adminSettings: () => request("/api/admin/settings"),
   adminSaveSettings: (body) => request("/api/admin/settings", { method: "PUT", body }),
   adminGateway: () => request("/api/admin/gateway"),
+  adminUpdateStatus: (checkRemote = false) =>
+    request(`/api/admin/update/status${checkRemote ? "?check_remote=true" : ""}`, {
+      timeoutMs: ONLINE_UPDATE_TIMEOUT_MS,
+    }),
+  adminRunUpdate: (body) =>
+    request("/api/admin/update/run", { method: "POST", body, timeoutMs: ONLINE_UPDATE_TIMEOUT_MS }),
   adminPaymentConfig: () => request("/api/admin/payments/config"),
   adminPaymentPackages: () => request("/api/admin/payments/packages"),
   adminSavePaymentPackage: (body) =>

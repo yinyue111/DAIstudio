@@ -18,8 +18,13 @@ assert.doesNotMatch(
 );
 assert.match(
   previewSource,
-  /const\s+videoSrc\s*=\s*secureSrc\s*\|\|\s*""/,
-  "reference video preview should only use authenticated local object URLs",
+  /startsWith\("blob:"\)\s*\?\s*rawSrc\s*:\s*""/,
+  "reference video preview may use local upload blob URLs",
+);
+assert.match(
+  previewSource,
+  /const\s+videoSrc\s*=\s*secureSrc\s*\|\|\s*localPreviewSrc/,
+  "reference video preview should only use authenticated or local-upload object URLs",
 );
 assert.match(
   previewSource,

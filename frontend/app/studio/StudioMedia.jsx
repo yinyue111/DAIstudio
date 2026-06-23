@@ -63,7 +63,8 @@ export function ReferenceAssetPreview({ asset }) {
     if (asset.thumb && src) {
       return <img src={src} alt="" className="h-full w-full object-cover" onError={() => setFailed(true)} />;
     }
-    const videoSrc = secureSrc || "";
+    const localPreviewSrc = String(rawSrc || "").startsWith("blob:") ? rawSrc : "";
+    const videoSrc = secureSrc || localPreviewSrc;
     if (videoSrc) {
       return <video src={videoSrc} muted playsInline preload="metadata" className="h-full w-full object-cover" onError={() => setFailed(true)} />;
     }
@@ -84,13 +85,19 @@ function assetQualityLabel(a) {
   return a?.unlocked ? "HD" : "";
 }
 
-export function ResultCard({ a, onOpen, onUnlock, onDownload, onReport }) {
+export function ResultCard({ a, onOpen, onUnlock, onDownload, onReport, unlocking = false }) {
   const src = srcOf(a);
   const ratioStyle = mediaAspectStyle(a);
   const takenDown = isAssetTakenDown(a);
   return (
     <div className="group overflow-hidden rounded-xl2 border border-line bg-base2">
-      <div className="relative cursor-zoom-in bg-black/20" style={ratioStyle} onClick={onOpen}>
+      <button
+        type="button"
+        aria-label={takenDown ? "查看素材状态" : "预览素材"}
+        className="relative block w-full cursor-zoom-in bg-black/20 text-left"
+        style={ratioStyle}
+        onClick={onOpen}
+      >
         {!src ? (
           <div className="flex h-full w-full items-center justify-center px-3 text-center text-xs text-fog">
             {assetUnavailableText(a)}
@@ -104,7 +111,7 @@ export function ResultCard({ a, onOpen, onUnlock, onDownload, onReport }) {
         )}
         {assetQualityLabel(a) && <span className="badge absolute right-1.5 top-1.5 bg-brand text-white">{assetQualityLabel(a)}</span>}
         {takenDown && <span className="badge absolute left-1.5 top-1.5 bg-bad/80 text-white">已下架</span>}
-      </div>
+      </button>
       <div className="p-1.5">
         {takenDown ? (
           <div className="flex gap-1.5">
@@ -113,6 +120,7 @@ export function ResultCard({ a, onOpen, onUnlock, onDownload, onReport }) {
           </div>
         ) : a.unlocked ? (
           <div className="flex gap-1.5">
+            <button onClick={onOpen} className="btn-secondary btn-sm">预览</button>
             <button onClick={onDownload} className="btn-primary btn-sm flex-1">
               {isPreviewVideoAsset(a) ? "下载预览" : "下载高清"}
             </button>
@@ -121,7 +129,9 @@ export function ResultCard({ a, onOpen, onUnlock, onDownload, onReport }) {
         ) : (
           <div className="flex gap-1.5">
             <button onClick={onOpen} className="btn-secondary btn-sm flex-1">预览</button>
-            <button onClick={onUnlock} className="btn-primary btn-sm flex-1">解锁</button>
+            <button onClick={onUnlock} disabled={unlocking} className="btn-primary btn-sm flex-1">
+              {unlocking ? "解锁中…" : "解锁"}
+            </button>
             <button onClick={onReport} className="btn-secondary btn-sm">举报</button>
           </div>
         )}
@@ -158,12 +168,25 @@ export function MasonryItem({ a, onOpen }) {
   );
 }
 
-export function Lightbox({ a, onClose, onUnlock, onDownload, onReport }) {
+export function Lightbox({ a, onClose, onUnlock, onDownload, onReport, unlocking = false }) {
   const src = srcOf(a);
   const takenDown = isAssetTakenDown(a);
   const dims = assetDims(a);
+  useEffect(() => {
+    const onKeyDown = (event) => {
+      if (event.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [onClose]);
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 p-4 backdrop-blur-sm" role="dialog" aria-modal="true" onClick={onClose}>
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 p-4 backdrop-blur-sm"
+      role="dialog"
+      aria-modal="true"
+      aria-label="素材预览"
+      onClick={onClose}
+    >
       <div className="panel max-h-[92vh] max-w-3xl overflow-auto p-3" onClick={(e) => e.stopPropagation()}>
         {!src ? (
           <div className="flex min-h-64 items-center justify-center rounded-xl2 bg-black/30 px-6 text-sm text-fog">
@@ -186,7 +209,11 @@ export function Lightbox({ a, onClose, onUnlock, onDownload, onReport }) {
             {dims ? ` · ${dims.width}×${dims.height}` : ""}
           </span>
           <div className="flex gap-2">
-            {!takenDown && !a.unlocked && <button onClick={onUnlock} className="btn-primary btn-sm">解锁高清</button>}
+            {!takenDown && !a.unlocked && (
+              <button onClick={onUnlock} disabled={unlocking} className="btn-primary btn-sm">
+                {unlocking ? "解锁中…" : "解锁高清"}
+              </button>
+            )}
             {!takenDown && a.unlocked && <button onClick={onDownload} className="btn-primary btn-sm">下载</button>}
             <button onClick={onReport} className="btn-secondary btn-sm">举报</button>
             <button onClick={onClose} className="btn-secondary btn-sm">关闭</button>

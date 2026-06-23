@@ -315,7 +315,7 @@ def test_admin_probe_models_uses_unsaved_or_saved_key(client, make_user, auth, m
     assert seen[-1] == ("https://saved.example.com/v1", "saved-key", "openai")
 
 
-def test_admin_probe_models_requires_password_for_new_api_key(client, make_user, auth, monkeypatch):
+def test_admin_probe_models_allows_logged_in_admin_with_new_api_key(client, make_user, auth, monkeypatch):
     make_user("13900001008", balance=1000, admin=True)
     h = auth("13900001008")
     called = False
@@ -338,8 +338,9 @@ def test_admin_probe_models_requires_password_for_new_api_key(client, make_user,
         headers=h,
     )
 
-    assert r.status_code == 403
-    assert called is False
+    assert r.status_code == 200, r.text
+    assert called is True
+    assert [m["id"] for m in r.json()["models"]] == ["model-a"]
 
 
 def test_admin_probe_rejects_saved_key_with_temporary_base_url(client, make_user, auth, monkeypatch):
@@ -371,15 +372,16 @@ def test_admin_probe_rejects_saved_key_with_temporary_base_url(client, make_user
     )
     assert save.status_code == 200, save.text
 
-    no_password = client.post("/api/admin/models/probe", json={"use": "image"}, headers=h)
-    assert no_password.status_code == 403
+    saved = client.post("/api/admin/models/probe", json={"use": "image"}, headers=h)
+    assert saved.status_code == 200, saved.text
+    assert called is True
+    called = False
 
     leaked = client.post(
         "/api/admin/models/probe",
         json={
             "use": "image",
             "base_url": "https://attacker.example.com/v1",
-            "admin_password": "pass123456",
         },
         headers=h,
     )

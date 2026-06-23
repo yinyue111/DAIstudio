@@ -783,7 +783,7 @@ def test_admin_can_customize_payment_package(client, make_user, auth):
     assert order.json()["credits"] == 567
 
 
-def test_admin_payment_package_requires_admin_password(client, make_user, auth):
+def test_admin_payment_package_allows_logged_in_admin_without_second_password(client, make_user, auth):
     make_user("13900000218", balance=100, admin=True)
     h = auth("13900000218")
 
@@ -794,22 +794,12 @@ def test_admin_payment_package_requires_admin_password(client, make_user, auth):
         "credits": 567,
         "enabled": True,
     }, headers=h)
-    assert r.status_code == 403
-
-    ok = client.post("/api/admin/payments/packages", json={
-        "id": "custom_with_password",
-        "title": "有二次校验包",
-        "amount_cents": 1234,
-        "credits": 567,
-        "enabled": True,
-        "admin_password": "pass123456",
-    }, headers=h)
-    assert ok.status_code == 200, ok.text
+    assert r.status_code == 200, r.text
 
     disabled = client.request(
         "DELETE",
-        "/api/admin/payments/packages/custom_with_password",
-        json={"admin_password": "pass123456"},
+        "/api/admin/payments/packages/custom_no_password",
+        json={},
         headers=h,
     )
     assert disabled.status_code == 200, disabled.text
@@ -1253,9 +1243,9 @@ def test_admin_payment_provider_rejects_external_notify_url(client, make_user, a
     assert "同域" in r.text
 
 
-def test_admin_payment_provider_requires_admin_password(client, make_user, auth):
-    make_user("13900000217", balance=100, admin=True)
-    h = auth("13900000217")
+def test_admin_payment_provider_allows_logged_in_admin_without_second_password(client, make_user, auth):
+    make_user("13900000243", balance=100, admin=True)
+    h = auth("13900000243")
 
     r = client.put("/api/admin/payments/providers/alipay", json={
         "provider": "alipay",
@@ -1264,7 +1254,7 @@ def test_admin_payment_provider_requires_admin_password(client, make_user, auth)
         "public_config": {"app_id": "ali-app"},
         "secret_config": {"private_key": "secret-private", "public_key": "secret-public"},
     }, headers=h)
-    assert r.status_code == 403
+    assert r.status_code == 200, r.text
 
 
 def test_alipay_live_provider_requires_seller_id():

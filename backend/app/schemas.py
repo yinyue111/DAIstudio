@@ -452,6 +452,37 @@ class PaymentProviderConfigOut(BaseModel):
     issues: list[str] = Field(default_factory=list)
 
 
+class OnlineUpdateStatusOut(BaseModel):
+    enabled: bool
+    repo_dir: str
+    remote: str
+    branch: str
+    current_branch: str = ""
+    current_head: str = ""
+    remote_head: str = ""
+    dirty: bool = False
+    dirty_status: str = ""
+    apply_command_configured: bool = False
+    allow_dirty: bool = False
+    error: str | None = None
+
+
+class OnlineUpdateRunIn(BaseModel):
+    apply: bool = True
+
+
+class OnlineUpdateRunOut(BaseModel):
+    ok: bool
+    changed: bool
+    applied: bool
+    partial_failure: bool = False
+    before: str
+    after: str
+    remote_head: str = ""
+    output: str = ""
+    error: str = ""
+
+
 class AuditOut(BaseModel):
     id: int
     user_id: int | None = None

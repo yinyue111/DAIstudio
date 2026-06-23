@@ -75,6 +75,7 @@ export default function Home() {
   const [trackingLost, setTrackingLost] = useState(false);
   const [lightbox, setLightbox] = useState(null);
   const [finalTaskId, setFinalTaskId] = useState(null);
+  const [busyAssetIds, setBusyAssetIds] = useState(() => new Set());
 
   // gallery
   const [works, setWorks] = useState(null);
@@ -88,6 +89,7 @@ export default function Home() {
   const uploadRequestRef = useRef(0);
   const reverseRequestRef = useRef(0);
   const pendingGenerateRequestRef = useRef(null);
+  const busyAssetIdsRef = useRef(new Set());
   const imageUploadInputRef = useRef(null);
   const videoUploadInputRef = useRef(null);
   const objectUrlsRef = useRef(new Set());
@@ -607,15 +609,23 @@ export default function Home() {
   }
 
   async function unlock(asset) {
+    if (busyAssetIdsRef.current.has(asset.id)) return;
     const cost = Number(asset.unlock_cost ?? cfg?.models?.[asset.type]?.unlock_cost ?? 0);
     const balance = Number(me?.balance_credits ?? 0);
     if (!window.confirm(`解锁${asset.type === "video" ? "视频" : "图片"}高清将扣除 ${cost} 积分，当前余额 ${balance}，确认继续？`)) return;
+    busyAssetIdsRef.current.add(asset.id);
+    setBusyAssetIds(new Set(busyAssetIdsRef.current));
     try {
       const updated = await api.unlock(asset.id);
       if (task) api.task(task.id).then(setTask).catch(() => {});
       if (lightbox && lightbox.id === asset.id) setLightbox(updated);
       refreshMe(); loadWorks();
-    } catch (e) { setMsg(e.message); }
+    } catch (e) {
+      setMsg(e.message);
+    } finally {
+      busyAssetIdsRef.current.delete(asset.id);
+      setBusyAssetIds(new Set(busyAssetIdsRef.current));
+    }
   }
 
   async function download(asset) {
@@ -976,6 +986,7 @@ export default function Home() {
           works={works}
           lightbox={lightbox}
           setLightbox={setLightbox}
+          busyAssetIds={busyAssetIds}
           onRefreshActiveTask={refreshActiveTask}
           onUnlock={unlock}
           onDownload={download}

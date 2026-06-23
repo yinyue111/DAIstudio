@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { api } from "../../../lib/api";
-import { paymentPackageDiff, promptAdminPassword, providerLabel } from "./admin-helpers";
+import { paymentPackageDiff, providerLabel } from "./admin-helpers";
 import { Card, PayInput, PaySecret, Th } from "./admin-ui";
 
 const MAX_PAYMENT_AMOUNT_CENTS = 100000000;
@@ -111,16 +111,11 @@ export function Payments() {
         return;
       }
     }
-    const adminPassword = await promptAdminPassword("保存支付套餐");
-    if (!adminPassword) return;
     setMsg("");
     setMsgKind("ok");
     setSaving("package");
     try {
-      await api.adminSavePaymentPackage({
-        ...normalizedPackage,
-        admin_password: adminPassword,
-      });
+      await api.adminSavePaymentPackage(normalizedPackage);
       setPkg(emptyPackage);
       setEditingPackageId("");
       load();
@@ -136,12 +131,10 @@ export function Payments() {
 
   async function disablePackage(id) {
     if (!window.confirm("确认停用该套餐？历史订单不受影响。")) return;
-    const adminPassword = await promptAdminPassword("停用支付套餐");
-    if (!adminPassword) return;
     setMsg("");
     setMsgKind("ok");
     try {
-      await api.adminDisablePaymentPackage(id, { admin_password: adminPassword });
+      await api.adminDisablePaymentPackage(id, {});
       load();
       setMsg("套餐已停用");
       setMsgKind("ok");
@@ -169,11 +162,8 @@ export function Payments() {
       const notifyUrl = body.public_config?.notify_url || "默认 PUBLIC_BASE_URL 回调";
       if (!window.confirm(`${providerLabel(provider)} 将保存为 ${body.enabled ? "启用" : "停用"} / ${body.mode}。\n回调地址：${notifyUrl}\n该配置会影响真实收款，确认继续？`)) return;
     }
-    const adminPassword = await promptAdminPassword(`保存${providerLabel(provider)}配置`);
-    if (!adminPassword) return;
     const cleaned = {
       ...body,
-      admin_password: adminPassword,
       secret_config: Object.fromEntries(
         Object.entries(body.secret_config || {}).filter(([, value]) => String(value || "").trim()),
       ),
@@ -199,8 +189,6 @@ export function Payments() {
     const current = providers.find((p) => p.provider === provider);
     if (!current || current.source !== "env") return;
     if (!window.confirm(`${providerLabel(provider)} 当前由环境变量启用。\n确认写入后台停用覆盖吗？该操作会立即停止前台使用该支付渠道。`)) return;
-    const adminPassword = await promptAdminPassword(`停用${providerLabel(provider)}环境变量渠道`);
-    if (!adminPassword) return;
     setMsg("");
     setMsgKind("ok");
     setSaving(provider);
@@ -211,7 +199,6 @@ export function Payments() {
         mode: "mock",
         public_config: {},
         secret_config: {},
-        admin_password: adminPassword,
       });
       load();
       setMsg(`${providerLabel(provider)} 已写入后台停用覆盖`);
@@ -428,8 +415,6 @@ export function Settings() {
   }, []);
 
   async function save() {
-    const adminPassword = await promptAdminPassword("保存平台设置");
-    if (!adminPassword) return;
     setMsg("");
     setMsgKind("ok");
     try {
@@ -447,7 +432,6 @@ export function Settings() {
         admin_quota_grant_single_limit: Number(s.admin_quota_grant_single_limit),
         admin_quota_grant_daily_limit: Number(s.admin_quota_grant_daily_limit),
         review_task_sla_minutes: Number(s.review_task_sla_minutes),
-        admin_password: adminPassword,
       });
       setS(r);
       setMsg("已保存");

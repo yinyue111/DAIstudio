@@ -14,6 +14,11 @@ assert.ok(root, "global security header route is missing");
 
 const headers = new Map(root.headers.map((item) => [item.key.toLowerCase(), item.value]));
 assert.match(headers.get("content-security-policy") || "", /default-src 'self'/);
+assert.match(
+  headers.get("content-security-policy") || "",
+  /script-src[^;]*unsafe-inline/,
+  "production CSP must allow Next hydration inline scripts",
+);
 assert.doesNotMatch(
   headers.get("content-security-policy") || "",
   /script-src[^;]*unsafe-eval/,

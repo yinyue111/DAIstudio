@@ -7,6 +7,7 @@ import Nav from "../../components/Nav";
 import { AssetReports, Models, ReviewTasks } from "./components/model-review-moderation";
 import { Payments, Settings } from "./components/payments-settings";
 import { Audit, Report } from "./components/reports-audit";
+import { VersionUpgrade } from "./components/version-upgrade";
 import { Users, Whitelist } from "./components/whitelist-users";
 
 const TABS = [
@@ -18,6 +19,7 @@ const TABS = [
   ["report", "用量报表"],
   ["payments", "支付设置"],
   ["settings", "平台设置"],
+  ["version", "版本升级"],
   ["audit", "审计日志"],
 ];
 
@@ -30,6 +32,7 @@ const TAB_COMPONENTS = {
   report: Report,
   payments: Payments,
   settings: Settings,
+  version: VersionUpgrade,
   audit: Audit,
 };
 

@@ -14,6 +14,7 @@ export default function StudioResults({
   works,
   lightbox,
   setLightbox,
+  busyAssetIds,
   onRefreshActiveTask,
   onUnlock,
   onDownload,
@@ -85,6 +86,7 @@ export default function StudioResults({
                   <ResultCard
                     key={asset.id}
                     a={asset}
+                    unlocking={busyAssetIds?.has(asset.id)}
                     onOpen={() => setLightbox(asset)}
                     onUnlock={() => onUnlock(asset)}
                     onDownload={() => onDownload(asset)}
@@ -138,6 +140,7 @@ export default function StudioResults({
       {lightbox && (
         <Lightbox
           a={lightbox}
+          unlocking={busyAssetIds?.has(lightbox.id)}
           onClose={() => setLightbox(null)}
           onUnlock={() => onUnlock(lightbox)}
           onDownload={() => onDownload(lightbox)}

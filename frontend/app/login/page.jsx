@@ -118,7 +118,11 @@ export default function LoginPage() {
             </span>
           </a>
           <h1 className="text-3xl font-extrabold leading-tight sm:text-4xl">
-            欢迎<span className="text-grad">回来</span>
+            {isRegister ? (
+              <>创建<span className="text-grad">账号</span></>
+            ) : (
+              <>欢迎<span className="text-grad">回来</span></>
+            )}
           </h1>
           <p className="mt-2 text-[15px] text-mist">
             {isRegister

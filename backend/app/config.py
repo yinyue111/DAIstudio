@@ -211,6 +211,17 @@ class Settings(BaseSettings):
     # endpoint isn't world-readable on a published API port). Empty = open (dev).
     metrics_token: str = ""
 
+    # --- Online update ---
+    # Disabled by default: this runs git and an optional fixed deploy command
+    # from the server process, so production operators must opt in explicitly.
+    online_update_enabled: bool = False
+    online_update_repo_dir: str = str(BASE_DIR.parent)
+    online_update_remote: str = "origin"
+    online_update_branch: str = "main"
+    online_update_apply_command: str = ""
+    online_update_timeout_seconds: int = 600
+    online_update_allow_dirty: bool = False
+
     @field_validator("cors_origins")
     @classmethod
     def _strip(cls, v: str) -> str:

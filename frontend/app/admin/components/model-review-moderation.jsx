@@ -6,9 +6,9 @@ import {
   confirmReviewTaskAction,
   formatMinutes,
   modelUseLabel,
-  promptAdminPassword,
   reportReasonLabel,
   reportStatusLabel,
+  promptAdminPassword,
 } from "./admin-helpers";
 import { Card, Th } from "./admin-ui";
 
@@ -97,8 +97,6 @@ export function Models() {
         setMsg("模型探测仍在进行，请等待探测完成后再保存。");
         return;
       }
-      const adminPassword = await promptAdminPassword(`保存 ${r.use} 模型配置`);
-      if (!adminPassword) return;
       const cost = Number(r.cost_credits);
       const unlockCost = Number(r.unlock_cost);
       const summary = [
@@ -122,7 +120,7 @@ export function Models() {
         api_key: r.api_key || null,
         api_key_clear: !!r.api_key_clear,
         cost_credits: cost, unlock_cost: unlockCost,
-        enabled: !!r.enabled, extra, admin_password: adminPassword,
+        enabled: !!r.enabled, extra,
       });
       setMsgType("ok");
       setMsg(`${r.use} 已保存`);
@@ -140,21 +138,12 @@ export function Models() {
     probeSeqRef.current.set(r.use, signature);
     setProbing((prev) => ({ ...prev, [r.use]: signature }));
     try {
-      let adminPassword = null;
-      const hasNewKey = !!(r.api_key || "").trim();
-      const usesSavedKey = r.api_key_configured && !hasNewKey;
-      const usesHttpGateway = String(r.base_url || "").trim().toLowerCase().startsWith("http://");
-      if (hasNewKey || usesSavedKey || usesHttpGateway) {
-        adminPassword = await promptAdminPassword(`探测 ${modelUseLabel(r.use)} 模型网关`);
-        if (!adminPassword) return;
-      }
       const res = await api.adminProbeModels({
         use: r.use,
         provider: r.provider || null,
         base_url: r.base_url || null,
         gateway_format: r.gateway_format || null,
         api_key: r.api_key || null,
-        admin_password: adminPassword,
       });
       if (probeSeqRef.current.get(r.use) !== signature) {
         setMsgType("bad");
@@ -430,6 +419,17 @@ export function AssetReports() {
     const label = action === "takedown" ? "下架素材" : "驳回举报";
     const note = window.prompt(`${label}说明`, action === "takedown" ? "确认违规下架" : "未发现违规");
     if (note == null) return;
+    const lines = [
+      `确认${label}？`,
+      `举报：#${row.id}`,
+      `素材：${row.asset_id ? `#${row.asset_id}` : "已删除"}`,
+      `举报人：${row.reporter_user_id}`,
+      `原因：${reportReasonLabel(row.reason)}`,
+    ];
+    if (row.note) lines.push(`用户说明：${row.note}`);
+    if (note) lines.push(`处理说明：${note}`);
+    if (action === "takedown") lines.push("下架后该素材将不能继续预览、解锁或下载。");
+    if (!window.confirm(lines.join("\n"))) return;
     const adminPassword = await promptAdminPassword(label);
     if (!adminPassword) return;
     setBusyId(row.id);

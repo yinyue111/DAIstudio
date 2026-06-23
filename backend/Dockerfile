@@ -7,10 +7,11 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /app
 
-# Minimal system deps (libpq for psycopg, curl for healthcheck, ffmpeg for
+# Minimal system deps (libpq for psycopg, curl for healthcheck, git for optional
+# admin online updates, ffmpeg for
 # sampling keyframes from reference videos in the reverse-prompt step).
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential libpq-dev curl ffmpeg \
+    build-essential libpq-dev curl git ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
