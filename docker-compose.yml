@@ -58,11 +58,11 @@ services:
       TRUSTED_PROXY_IPS: ${TRUSTED_PROXY_IPS:-127.0.0.1,172.16.0.0/12}
       METRICS_TOKEN: ${METRICS_TOKEN:?set METRICS_TOKEN to protect /metrics}
       PAYMENT_CONFIG_SECRET: ${PAYMENT_CONFIG_SECRET:?set PAYMENT_CONFIG_SECRET to encrypt admin-saved secrets}
-      ONLINE_UPDATE_ENABLED: ${ONLINE_UPDATE_ENABLED:-false}
+      ONLINE_UPDATE_ENABLED: ${ONLINE_UPDATE_ENABLED:-true}
       # The image build excludes .git, so enabling online update in Docker
       # requires mounting a real checkout as ONLINE_UPDATE_REPO_DIR and using a
-      # fixed host/operator script for rebuild + restart. Keep disabled by
-      # default for normal compose deployments.
+      # fixed host/operator script for rebuild + restart. Set
+      # ONLINE_UPDATE_ENABLED=false for image-only compose deployments.
       ONLINE_UPDATE_REPO_DIR: ${ONLINE_UPDATE_REPO_DIR:-/app}
       ONLINE_UPDATE_REMOTE: ${ONLINE_UPDATE_REMOTE:-origin}
       ONLINE_UPDATE_BRANCH: ${ONLINE_UPDATE_BRANCH:-main}
@@ -99,11 +99,11 @@ services:
       TRUSTED_PROXY_IPS: ${TRUSTED_PROXY_IPS:-127.0.0.1,172.16.0.0/12}
       METRICS_TOKEN: ${METRICS_TOKEN:?set METRICS_TOKEN to protect /metrics}
       PAYMENT_CONFIG_SECRET: ${PAYMENT_CONFIG_SECRET:?set PAYMENT_CONFIG_SECRET to encrypt admin-saved secrets}
-      ONLINE_UPDATE_ENABLED: ${ONLINE_UPDATE_ENABLED:-false}
+      ONLINE_UPDATE_ENABLED: ${ONLINE_UPDATE_ENABLED:-true}
       # The image build excludes .git, so enabling online update in Docker
       # requires mounting a real checkout as ONLINE_UPDATE_REPO_DIR and using a
-      # fixed host/operator script for rebuild + restart. Keep disabled by
-      # default for normal compose deployments.
+      # fixed host/operator script for rebuild + restart. Set
+      # ONLINE_UPDATE_ENABLED=false for image-only compose deployments.
       ONLINE_UPDATE_REPO_DIR: ${ONLINE_UPDATE_REPO_DIR:-/app}
       ONLINE_UPDATE_REMOTE: ${ONLINE_UPDATE_REMOTE:-origin}
       ONLINE_UPDATE_BRANCH: ${ONLINE_UPDATE_BRANCH:-main}

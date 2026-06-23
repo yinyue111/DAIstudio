@@ -212,9 +212,10 @@ class Settings(BaseSettings):
     metrics_token: str = ""
 
     # --- Online update ---
-    # Disabled by default: this runs git and an optional fixed deploy command
-    # from the server process, so production operators must opt in explicitly.
-    online_update_enabled: bool = False
+    # Enabled by default for this single-operator admin console. The operation is
+    # still constrained to a fixed Git remote/branch and an optional fixed apply
+    # command; set ONLINE_UPDATE_ENABLED=false to disable the admin tab action.
+    online_update_enabled: bool = True
     online_update_repo_dir: str = str(BASE_DIR.parent)
     online_update_remote: str = "origin"
     online_update_branch: str = "main"

@@ -301,11 +301,11 @@ PAYMENT_FRONTEND_BASE_URL=https://dream.aiwuq.cn
 
 ## 在线版本升级
 
-管理后台提供“版本升级”页，可以从服务端配置的 Git remote/branch 拉取新代码并执行固定生效命令。该功能默认关闭，生产启用前需要确认 API 进程运行在真实 Git checkout 中，并且该 checkout 有读取 GitHub 的权限。Docker 镜像默认不包含 `.git`，所以普通 Compose 镜像内 `/app` 不能直接在线升级。
+管理后台提供“版本升级”页，可以从服务端配置的 Git remote/branch 拉取新代码并执行固定生效命令。该功能默认开启，生产启用前需要确认 API 进程运行在真实 Git checkout 中，并且该 checkout 有读取 GitHub 的权限。Docker 镜像默认不包含 `.git`，所以普通 Compose 镜像内 `/app` 不能直接在线升级；如果使用镜像内 `/app` 运行且没有挂载真实仓库，请显式设置 `ONLINE_UPDATE_ENABLED=false`。
 
 安全边界：
 
-- 默认 `ONLINE_UPDATE_ENABLED=false`
+- 默认 `ONLINE_UPDATE_ENABLED=true`
 - 只更新服务端配置的 `ONLINE_UPDATE_REMOTE` / `ONLINE_UPDATE_BRANCH`
 - 只允许 `git merge --ff-only`，不会执行 `reset --hard`
 - 工作区有未提交改动时默认拒绝升级
@@ -374,7 +374,7 @@ SMS_TEMPLATE_CODE=<your-template-code>
 | `PAYMENT_CONFIG_SECRET` | 加密后台保存的支付密钥 |
 | `PAYMENT_MOCK_ENABLED` | 支付 mock 开关，生产必须 `false` |
 | `METRICS_TOKEN` | `/metrics` 访问令牌 |
-| `ONLINE_UPDATE_ENABLED` | 管理后台版本升级开关，默认关闭 |
+| `ONLINE_UPDATE_ENABLED` | 管理后台版本升级开关，默认开启；无真实 Git checkout 时请设为 `false` |
 | `ONLINE_UPDATE_REPO_DIR` | 在线升级使用的 Git checkout 绝对路径 |
 | `ONLINE_UPDATE_APPLY_COMMAND` | 代码更新后执行的固定生效命令 |
 | `MAX_IMAGE_N` | 单次图片生成最大张数，默认 8 |
