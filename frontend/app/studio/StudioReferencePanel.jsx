@@ -5,7 +5,10 @@ import { selectedLabel } from "./helpers";
 
 export default function StudioReferencePanel({
   category,
+  creationMode,
+  isEditMode = false,
   selected,
+  productAsset,
   url,
   setUrl,
   parsing,
@@ -21,14 +24,29 @@ export default function StudioReferencePanel({
   videoAnalysisPresets = [],
   setVideoAnalysisPreset,
   imageUploadInputRef,
+  productUploadInputRef,
   videoUploadInputRef,
   onClear,
+  onClearProductAsset,
   onParse,
   onUploadImage,
+  onUploadProductImage,
   onUploadVideo,
   onPickAsset,
   onReverse,
 }) {
+  const modeTitle = isEditMode
+    ? (creationMode === "video_edit" ? "视频编辑" : "图片编辑")
+    : (category === "video" ? "视频参考" : "链接反推");
+  const styleTitle = isEditMode ? "风格参考" : "参考素材";
+  const styleDescription = isEditMode
+    ? "用于反推场景、构图、光线和广告质感"
+    : (category === "video" ? "上传视频或粘贴链接做反推" : "上传图片或粘贴链接做反推");
+  const emptyStyleTitle = category === "video" ? "上传视频 / 图片参考" : "上传图片参考";
+  const emptyStyleHint = isEditMode
+    ? "也可粘贴小红书、抖音或网页链接抓取素材"
+    : (category === "video" ? "点击上传视频，下方也可改传图片或粘贴链接" : "点击上传图片，下方也可粘贴链接抓取素材");
+
   return (
     <aside className="relative overflow-hidden rounded-xl3 border border-iris/35 bg-gradient-to-b from-iris/20 via-base2/80 to-rose/10 p-3 shadow-glow-sm">
       <div className="pointer-events-none absolute -right-16 -top-16 h-32 w-32 rounded-full bg-rose/25 blur-3xl" />
@@ -37,56 +55,129 @@ export default function StudioReferencePanel({
           <div>
             <p className="text-xs font-display font-semibold text-iris-400">参考素材</p>
             <h3 className="mt-1 text-lg font-display font-semibold text-snow">
-              {category === "video" ? "视频参考 / 视频编辑" : "链接反推 / 图片编辑"}
+              {modeTitle}
             </h3>
           </div>
           {selected && (
             <button type="button" onClick={onClear} className="chip px-2 py-1">
-              清除
+              清除参考
             </button>
           )}
         </div>
 
-        <div className={`mb-3 overflow-hidden rounded-xl2 border bg-black/20 ${
-          selected ? "border-iris/60" : "border-dashed border-line2"
-        }`}>
-          <div className="relative aspect-video">
-            {selected ? (
-              <>
-                <ReferenceAssetPreview asset={selected} />
-                <span className="badge absolute left-2 top-2 bg-black/70 text-white">
-                  {selected.type === "video" ? "视频参考" : "图片参考"}
-                </span>
-              </>
-            ) : (
-              <button
-                type="button"
-                onClick={() => (category === "video" ? videoUploadInputRef : imageUploadInputRef).current?.click()}
-                className="flex h-full w-full flex-col items-center justify-center gap-3 px-4 text-center transition hover:bg-white/[0.03]"
-              >
-                <span className="flex h-11 w-11 items-center justify-center rounded-full bg-brand text-lg text-white shadow-glow-sm">+</span>
-                <div>
-                  <span className="text-sm font-display font-medium text-snow">
-                    {category === "video" ? "上传视频或首帧图" : "上传参考图片"}
-                  </span>
-                  <span className="mt-1 block text-xs text-fog">
-                    {category === "video" ? "点击上传视频，下方也可改传首帧图" : "点击上传图片，下方也可粘贴链接抓取素材"}
-                  </span>
-                </div>
-              </button>
+        <div className="mb-3 rounded-xl2 border border-line bg-black/15 p-2">
+          <div className="mb-2 flex items-center justify-between gap-2">
+            <div>
+              <p className="text-sm font-display font-semibold text-snow">{styleTitle}</p>
+              <p className="mt-0.5 text-[11px] text-fog">{styleDescription}</p>
+            </div>
+            {selected && (
+              <span className="badge bg-iris/25 text-mist">
+                {selected.type === "video" ? "视频" : "图片"}
+              </span>
             )}
           </div>
+          <div className={`overflow-hidden rounded-xl2 border bg-black/20 ${
+            selected ? "border-iris/60" : "border-dashed border-line2"
+          }`}>
+            <div className="relative aspect-video">
+              {selected ? (
+                <>
+                  <ReferenceAssetPreview asset={selected} />
+                  <span className="badge absolute left-2 top-2 bg-black/70 text-white">
+                    {selected.type === "video" ? "视频参考" : "图片参考"}
+                  </span>
+                </>
+              ) : (
+                <button
+                  type="button"
+                  onClick={() => (category === "video" ? videoUploadInputRef : imageUploadInputRef).current?.click()}
+                  className="flex h-full w-full flex-col items-center justify-center gap-3 px-4 text-center transition hover:bg-white/[0.03]"
+                >
+                  <span className="flex h-11 w-11 items-center justify-center rounded-full bg-brand text-lg text-white shadow-glow-sm">+</span>
+                  <div>
+                    <span className="text-sm font-display font-medium text-snow">
+                      {emptyStyleTitle}
+                    </span>
+                    <span className="mt-1 block text-xs text-fog">
+                      {emptyStyleHint}
+                    </span>
+                  </div>
+                </button>
+              )}
+            </div>
+          </div>
+
+          {selected && (
+            <div className="mt-2 min-w-0 rounded-xl border border-line bg-white/5 px-3 py-2 text-xs text-fog">
+              <div className="truncate text-mist">{selectedLabel(selected)}</div>
+              {selected?.type === "image" && selected?.url?.includes("/api/uploads/upload/") && (
+                <div className="mt-1 text-fog">{isEditMode ? "作为风格参考，不会覆盖产品主体。" : "可直接作为编辑源生成。"}</div>
+              )}
+              {selected?.type === "video" && selected?.url?.includes("/api/uploads/upload_video/") && (
+                <div className="mt-1 text-fog">会抽取关键帧理解内容，并提取镜头节奏和画面风格。</div>
+              )}
+            </div>
+          )}
         </div>
 
-        {selected && (
-          <div className="mb-3 min-w-0 rounded-xl border border-line bg-white/5 px-3 py-2 text-xs text-fog">
-            <div className="truncate text-mist">{selectedLabel(selected)}</div>
-            {selected?.type === "image" && selected?.url?.includes("/api/uploads/upload/") && (
-              <div className="mt-1 text-fog">可直接作为编辑源生成。</div>
+        {isEditMode && (
+          <div className="mb-3 rounded-xl2 border border-aqua/30 bg-aqua/10 p-2">
+            <div className="mb-2 flex items-start justify-between gap-2">
+              <div>
+                <p className="text-sm font-display font-semibold text-snow">产品主体</p>
+                <p className="mt-0.5 text-[11px] text-fog">保留产品、Logo、包装、颜色、形状和文字标识</p>
+              </div>
+              {productAsset && (
+                <button type="button" onClick={onClearProductAsset} className="chip px-2 py-1">
+                  清除
+                </button>
+              )}
+            </div>
+            <div className={`overflow-hidden rounded-xl2 border bg-black/20 ${
+              productAsset ? "border-aqua/60" : "border-dashed border-aqua/30"
+            }`}>
+              <div className="relative aspect-video">
+                {productAsset ? (
+                  <>
+                    <ReferenceAssetPreview asset={productAsset} />
+                    <span className="badge absolute left-2 top-2 bg-aqua/90 text-black">
+                      产品主体
+                    </span>
+                  </>
+                ) : (
+                  <button
+                    type="button"
+                    onClick={() => productUploadInputRef.current?.click()}
+                    className="flex h-full w-full flex-col items-center justify-center gap-3 px-4 text-center transition hover:bg-white/[0.03]"
+                  >
+                    <span className="flex h-11 w-11 items-center justify-center rounded-full bg-aqua text-lg text-black shadow-glow-sm">+</span>
+                    <div>
+                      <span className="text-sm font-display font-medium text-snow">上传产品图片</span>
+                      <span className="mt-1 block text-xs text-fog">
+                        {creationMode === "video_edit" ? "作为视频首帧和主体身份参考" : "作为图片编辑源"}
+                      </span>
+                    </div>
+                  </button>
+                )}
+              </div>
+            </div>
+            {productAsset && (
+              <div className="mt-2 min-w-0 rounded-xl border border-line bg-white/5 px-3 py-2 text-xs text-fog">
+                <div className="truncate text-mist">{selectedLabel(productAsset)}</div>
+                <div className="mt-1 text-fog">
+                  生成时只迁移风格参考的场景、光线、构图和广告质感。
+                </div>
+              </div>
             )}
-            {selected?.type === "video" && selected?.url?.includes("/api/uploads/upload_video/") && (
-              <div className="mt-1 text-fog">会抽取关键帧理解内容，并以首帧驱动视频生成。</div>
-            )}
+            <button
+              type="button"
+              onClick={() => productUploadInputRef.current?.click()}
+              disabled={uploading}
+              className="btn-secondary btn-sm mt-2 w-full justify-center border-aqua/30 bg-aqua/10 text-snow"
+            >
+              {uploading ? "上传中…" : productAsset ? "替换产品图片" : "上传产品图片"}
+            </button>
           </div>
         )}
 
@@ -180,6 +271,15 @@ export default function StudioReferencePanel({
             className="hidden"
             onChange={(e) => onUploadVideo(e.target.files?.[0])}
           />
+          {isEditMode && (
+            <input
+              ref={productUploadInputRef}
+              type="file"
+              accept="image/jpeg,image/png,image/webp,image/gif"
+              className="hidden"
+              onChange={(e) => onUploadProductImage(e.target.files?.[0])}
+            />
+          )}
         </div>
 
         {selected && !reverseEnabled && (

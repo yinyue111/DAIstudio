@@ -14,7 +14,6 @@ from ..deps import get_client_ip, require_admin
 from ..models import AdminIdempotencyKey, GenTask, ModelConfig, User
 from ..redis_client import redis_client
 from ..schemas import ModelConfigIn, QuotaGrantIn
-from ..security import verify_password
 from ..services import generation, payment_config
 from ..services.config_store import get_setting
 from ..services.model_gateway_config import (
@@ -154,18 +153,13 @@ def date_key(dt: datetime | None) -> str | None:
 
 
 def require_admin_password(admin: User, password: str | None, request: Request | None = None) -> None:
-    ip = get_client_ip(request) if request else "unknown"
-    fail_key = f"admin:confirm:fail:{admin.id}"
-    ip_key = f"admin:confirm:failip:{ip}"
-    if int(redis_client.get(fail_key) or 0) >= ADMIN_CONFIRM_FAIL_LIMIT:
-        raise HTTPException(429, "管理员密码确认失败次数过多,请稍后再试")
-    if int(redis_client.get(ip_key) or 0) >= ADMIN_CONFIRM_FAIL_IP_LIMIT:
-        raise HTTPException(429, "管理员密码确认失败次数过多,请稍后再试")
-    if not password or not verify_password(password, admin.password_hash):
-        for key in (fail_key, ip_key):
-            incr_window(key, ADMIN_CONFIRM_FAIL_WINDOW_SECONDS)
-        raise HTTPException(403, "请重新输入管理员密码确认该高危操作")
-    redis_client.delete(fail_key, ip_key)
+    """Backward-compatible no-op.
+
+    Admin APIs are already protected by the authenticated admin dependency. The
+    product now intentionally avoids a second password challenge inside the
+    admin console, while keeping request schemas and old clients compatible.
+    """
+    return None
 
 
 def quota_grant_idempotency_raw(body: QuotaGrantIn) -> str:

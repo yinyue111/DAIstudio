@@ -20,6 +20,7 @@ import random
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
+from dataclasses import dataclass
 from urllib.parse import urljoin, urlparse
 
 import httpx
@@ -63,6 +64,26 @@ class GatewayError(Exception):
         self.status_code = status_code
         self.transient = transient
         self.submit_state_unknown = submit_state_unknown
+
+
+@dataclass(frozen=True)
+class ImageSubrequestFailure:
+    index: int
+    message: str
+    submit_state_unknown: bool
+    retryable_refill: bool
+
+
+class ImageBatchResult(list[bytes]):
+    """Image bytes with diagnostics for failed batch slots."""
+
+    def __init__(
+        self,
+        images: list[bytes],
+        failures: list[ImageSubrequestFailure] | None = None,
+    ) -> None:
+        super().__init__(images)
+        self.failures = failures or []
 
 
 def _gateway_error_message(status_code: int, text: str) -> tuple[str, str]:
@@ -334,8 +355,48 @@ def _retryable_image_error(exc: Exception) -> bool:
     )
 
 
+def _image_submit_state_unknown(exc: Exception) -> bool:
+    if isinstance(exc, GatewayError):
+        explicit = getattr(exc, "submit_state_unknown", None)
+        if explicit is not None:
+            return bool(explicit)
+        status_code = getattr(exc, "status_code", None)
+        if status_code is not None and status_code < 500 and status_code != 429:
+            return False
+        return bool(getattr(exc, "transient", False) or status_code is None or status_code >= 500)
+    return True
+
+
+def _image_subrequest_failure(index: int, exc: Exception) -> ImageSubrequestFailure:
+    unknown = _image_submit_state_unknown(exc)
+    retryable_refill = bool(
+        isinstance(exc, GatewayError)
+        and getattr(exc, "transient", False)
+        and not unknown
+    )
+    return ImageSubrequestFailure(
+        index=index + 1,
+        message=(str(exc) or exc.__class__.__name__)[:300],
+        submit_state_unknown=unknown,
+        retryable_refill=retryable_refill,
+    )
+
+
+def _raise_image_batch_empty(failures: list[ImageSubrequestFailure]) -> None:
+    if not failures:
+        raise GatewayError("图像网关未返回任何结果", transient=True, submit_state_unknown=False)
+    last = failures[-1]
+    unknown = any(f.submit_state_unknown for f in failures)
+    transient = unknown or any(f.retryable_refill for f in failures)
+    raise GatewayError(
+        f"图像网关未返回任何结果: {last.message}",
+        transient=transient,
+        submit_state_unknown=unknown,
+    )
+
+
 def _post_single_image_repeated(path: str, payload: dict, n: int,
-                                config: RuntimeGatewayConfig | None = None) -> list[bytes]:
+                                config: RuntimeGatewayConfig | None = None) -> ImageBatchResult:
     """Run repeated one-image calls concurrently and return exactly n images.
 
     The current gateway rejects batch/tool-count params such as ``tools[0].n``.
@@ -379,7 +440,14 @@ def _post_single_image_repeated(path: str, payload: dict, n: int,
                         timeout=timeout,
                         retries=0,
                     )
-                return _decode_image_response(data)
+                images = _decode_image_response(data)
+                if not images:
+                    raise GatewayError(
+                        "图像子请求未返回结果",
+                        transient=True,
+                        submit_state_unknown=False,
+                    )
+                return images
             except Exception as e:  # noqa: BLE001
                 last = e
                 if attempt >= max_retries or not _retryable_image_error(e):
@@ -393,44 +461,67 @@ def _post_single_image_repeated(path: str, payload: dict, n: int,
                 time.sleep(1.0 * (attempt + 1))
         raise last or GatewayError("图像子请求失败")
 
-    failures: list[str] = []
+    failures: list[ImageSubrequestFailure] = []
+    max_refills = max(0, int(getattr(settings, "image_gateway_refill_attempts", 0) or 0))
 
     if workers == 1:
         out: list[bytes] = []
         total_bytes = 0
-        for _ in range(n):
+        idx = 0
+        while idx < n + max_refills and len(out) < n:
             try:
                 total_bytes = append_with_budget(out, one(), total_bytes)
             except Exception as e:  # noqa: BLE001
                 log.warning("single image sub-request failed: %s", e)
-                failures.append(str(e))
-            if len(out) >= n:
-                break
-        if not out and failures:
-            raise GatewayError(f"图像网关未返回任何结果: {failures[-1]}")
-        return out[:n]
+                failure = _image_subrequest_failure(idx, e)
+                failures.append(failure)
+                if not failure.retryable_refill:
+                    idx = n + max_refills
+                    break
+            idx += 1
+        if not out:
+            _raise_image_batch_empty(failures)
+        return ImageBatchResult(out[:n], failures=failures)
 
     out_by_index: dict[int, list[bytes]] = {}
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = {pool.submit(one): i for i in range(n)}
-        for fut in as_completed(futures):
-            idx = futures[fut]
-            try:
-                out_by_index[idx] = fut.result()
-            except Exception as e:  # noqa: BLE001
-                log.warning("image sub-request %s/%s failed: %s", idx + 1, n, e)
-                failures.append(str(e))
-                out_by_index[idx] = []
+    pending = list(range(n))
+    next_index = n
+    while pending:
+        wave_failures: list[ImageSubrequestFailure] = []
+        with ThreadPoolExecutor(max_workers=max(1, min(workers, len(pending)))) as pool:
+            futures = {pool.submit(one): i for i in pending}
+            for fut in as_completed(futures):
+                idx = futures[fut]
+                try:
+                    out_by_index[idx] = fut.result()
+                except Exception as e:  # noqa: BLE001
+                    failure = _image_subrequest_failure(idx, e)
+                    log.warning("image sub-request %s failed: %s", failure.index, e)
+                    failures.append(failure)
+                    wave_failures.append(failure)
+                    out_by_index[idx] = []
+        produced = sum(len(images) for images in out_by_index.values())
+        missing = max(0, n - produced)
+        refill_count = min(
+            missing,
+            max_refills,
+            sum(1 for failure in wave_failures if failure.retryable_refill),
+        )
+        if refill_count <= 0:
+            break
+        max_refills -= refill_count
+        pending = list(range(next_index, next_index + refill_count))
+        next_index += refill_count
 
     out: list[bytes] = []
     total_bytes = 0
-    for i in range(n):
+    for i in sorted(out_by_index):
         total_bytes = append_with_budget(out, out_by_index.get(i, []), total_bytes)
         if len(out) >= n:
             break
-    if not out and failures:
-        raise GatewayError(f"图像网关未返回任何结果: {failures[-1]}")
-    return out[:n]
+    if not out:
+        _raise_image_batch_empty(failures)
+    return ImageBatchResult(out[:n], failures=failures)
 
 
 # ----------------------------------------------------------------- text -> image
@@ -457,7 +548,7 @@ def gen_image(prompt: str, image_model_id: str, n: int = 4,
         # Preserve the user's requested count by issuing single-image edits.
         payload = {
             "model": image_model_id,
-            "image": reference_image_url,
+            "images": [{"image_url": reference_image_url}],
             "prompt": prompt,
             "size": size,
             **extra,

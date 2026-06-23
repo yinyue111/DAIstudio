@@ -571,7 +571,7 @@ export function Settings() {
               <li>后端环境配置 <code className="font-mono text-snow">SMS_PROVIDER=http</code>、<code className="font-mono text-snow">SMS_HTTP_URL</code>、可选 <code className="font-mono text-snow">SMS_HTTP_API_KEY</code>。</li>
               <li>按供应商模板配置 <code className="font-mono text-snow">SMS_SIGN_NAME</code> 和 <code className="font-mono text-snow">SMS_TEMPLATE_CODE</code>。</li>
               <li>短信 HTTP 网关需接收 <code className="font-mono text-snow">phone</code>、<code className="font-mono text-snow">code</code>、<code className="font-mono text-snow">sign_name</code>、<code className="font-mono text-snow">template_code</code> 并返回 2xx。</li>
-              <li>重启后端服务，先添加手机号白名单，再打开“短信验证码注册”，用白名单手机号测试发送和注册。</li>
+              <li>重启后端服务，打开“短信验证码注册”，用新手机号测试发送验证码和注册。</li>
             </ol>
           </div>
           <div className="space-y-3 text-sm text-mist">

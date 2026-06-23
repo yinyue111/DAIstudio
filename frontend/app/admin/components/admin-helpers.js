@@ -63,10 +63,6 @@ export function confirmReviewTaskAction(task, action, note = "", resultUrl = "")
   return window.confirm(lines.join("\n"));
 }
 
-export function promptAdminPassword(action) {
-  return promptPassword(`${action}需要管理员密码确认`, "管理员密码");
-}
-
 export function promptPassword(title, placeholder = "密码") {
   if (typeof document === "undefined") return Promise.resolve("");
   return new Promise((resolve) => {

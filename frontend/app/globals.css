@@ -25,6 +25,13 @@
     background: rgba(123, 97, 255, 0.35);
   }
 
+  /* visible keyboard focus for interactive elements (mouse clicks unaffected) */
+  :where(a, button, [role="button"], summary):focus-visible {
+    outline: 2px solid #9d86ff;
+    outline-offset: 2px;
+    border-radius: 0.75rem;
+  }
+
   /* slim, on-brand scrollbars */
   ::-webkit-scrollbar { width: 10px; height: 10px; }
   ::-webkit-scrollbar-track { background: transparent; }
@@ -121,4 +128,17 @@
     @apply absolute inset-0 -translate-x-full animate-shimmer;
     background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.08), transparent);
   }
+}
+
+@layer utilities {
+  /* clean horizontal scroll rows (chips/ratios) on touch */
+  .no-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
+  .no-scrollbar::-webkit-scrollbar { display: none; }
+}
+
+/* comfortable tap targets on touch devices — no effect on mouse/desktop */
+@media (pointer: coarse) {
+  .btn-sm,
+  .chip { min-height: 38px; }
+  .btn { min-height: 42px; }
 }

@@ -151,6 +151,11 @@ def _public_image_error(exc: Exception) -> str:
             "图片网关当前没有可用账号支持该模型/参数组合，已退回冻结积分。"
             "请稍后重试或在后台切换图像模型/网关账号。"
         )
+    if "images[].image_url" in message or "unknown parameter" in lowered or "invalid_request_error" in lowered:
+        return (
+            "图片网关参数不匹配，已退回冻结积分。"
+            "请检查后台图像模型配置或联系管理员处理。"
+        )
     return "图片生成失败，已退回冻结积分，请稍后重试"
 
 
@@ -242,10 +247,27 @@ def run_image_task(task_id: int) -> None:
                 _hold_image_submit_for_reconciliation(db, task_id, str(e))
                 return
             raise
+        gateway_failure_items = list(getattr(images, "failures", []) or [])
+        gateway_unknown_failures = [
+            failure
+            for failure in gateway_failure_items
+            if getattr(failure, "submit_state_unknown", False)
+        ]
+        gateway_failures = [
+            failure.message
+            for failure in gateway_failure_items
+            if getattr(failure, "message", "")
+        ]
         usage.record_call(db, kind="image", model_id=model.model_id,
                           user_id=task.user_id, task_id=task.id, status="ok",
                           latency_ms=int((time.time() - t0) * 1000),
-                          detail={"n": n, "actual_n": len(images), "size": size, "mode": mode})
+                          detail={
+                              "n": n,
+                              "actual_n": len(images),
+                              "size": size,
+                              "mode": mode,
+                              **({"errors": gateway_failures[:5]} if gateway_failures else {}),
+                          })
 
         set_progress(task_id, 70, "running")
         written_keys: list[str] = []
@@ -288,17 +310,28 @@ def run_image_task(task_id: int) -> None:
                 log.warning("image task %s skipped one invalid image: %s", task_id, e)
         if saved_count <= 0:
             raise RuntimeError("图片网关返回结果均无法解析")
+        if saved_count < n and gateway_unknown_failures:
+            _hold_image_success_for_reconciliation(
+                db,
+                task_id,
+                "图片批量生成部分槽位提交状态未知:"
+                + "; ".join(f.message for f in gateway_unknown_failures[:3]),
+                written_keys=written_keys,
+                saved_count=saved_count,
+            )
+            return
 
         # finalize atomically: only the runner that claims the terminal status
         # settles, so a duplicate/raced run can't double-charge or double-credit.
         real_cost = _settlement_cost(task, model, image_count=saved_count)
         skipped_n = max(0, n - saved_count)
+        partial_errors = (gateway_failures if saved_count < n else []) + image_errors
         partial_detail = (
             {
                 "requested_n": n,
                 "saved_n": saved_count,
                 "skipped_n": skipped_n,
-                "errors": image_errors[:5],
+                "errors": partial_errors[:5],
             }
             if saved_count < n or image_errors else None
         )
@@ -309,7 +342,7 @@ def run_image_task(task_id: int) -> None:
                 "_requested_n": n,
                 "_saved_n": saved_count,
                 "_skipped_n": skipped_n,
-                "_partial_errors": image_errors[:5],
+                "_partial_errors": partial_errors[:5],
             }
         if not claim_terminal(db, task_id, "succeeded", cost_settled=real_cost):
             db.rollback()  # another runner finalized -> discard our row + files

@@ -3,26 +3,7 @@
 import { useState } from "react";
 import { useRouter } from "next/navigation";
 import { api, clearToken } from "../lib/api";
-
-function Logo({ className = "" }) {
-  return (
-    <svg viewBox="0 0 32 32" className={className} aria-hidden>
-      <defs>
-        <linearGradient id="navlogo" x1="0" y1="0" x2="1" y2="1">
-          <stop offset="0%" stopColor="#7b61ff" />
-          <stop offset="50%" stopColor="#b65cff" />
-          <stop offset="100%" stopColor="#ff5fa2" />
-        </linearGradient>
-      </defs>
-      <rect x="2" y="2" width="28" height="28" rx="9" fill="url(#navlogo)" />
-      <path
-        d="M16 8l1.9 4.6 4.6 1.9-4.6 1.9L16 21l-1.9-4.6L9.5 14.5l4.6-1.9L16 8z"
-        fill="#fff"
-        fillOpacity="0.95"
-      />
-    </svg>
-  );
-}
+import BrandLogo from "./BrandLogo";
 
 const LINKS = [
   ["studio", "创作", "/"],
@@ -50,7 +31,7 @@ export default function Nav({ me, active }) {
     <header className="sticky top-0 z-40 border-b border-line bg-base/70 backdrop-blur-xl">
       <div className="mx-auto flex max-w-7xl items-center justify-between gap-4 px-4 py-3 sm:px-6">
         <a href="/" className="flex items-center gap-2.5">
-          <Logo className="h-8 w-8 drop-shadow-[0_4px_14px_rgba(123,97,255,0.5)]" />
+          <BrandLogo className="h-8 w-8" />
           <span className="font-display text-[16px] font-bold tracking-tight">
             造梦<span className="text-fog font-medium"> Studio</span>
           </span>

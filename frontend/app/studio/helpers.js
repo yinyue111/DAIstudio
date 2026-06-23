@@ -5,7 +5,7 @@ import {
   RATIOS,
   TERMINAL_TASK_STATUSES,
   VIDEO_RATIO_KEYS,
-} from "./constants";
+} from "./constants.js";
 
 export function assetDims(a) {
   if (!a) return null;
@@ -66,6 +66,27 @@ export function composePromptFromStructured(structured, fallbackText = "") {
   let text = parts.join(", ");
   if (structured["标签"]) text += (text ? ", " : "") + structured["标签"];
   return text.trim() || finalText;
+}
+
+export function composeStyleTransferPrompt(structured, fallbackText = "", { video = false } = {}) {
+  const fallback = String(fallbackText || "").trim();
+  if (!structured || !Object.keys(structured).length) return fallback;
+  const allow = video
+    ? [
+        "场景背景", "广告目标", "风格", "视角构图", "镜头运动", "剪辑节奏",
+        "时序分镜", "字幕卖点", "光线", "色调配色", "材质纹理", "氛围情绪",
+        "转场", "时长建议", "后期质感", "标签",
+      ]
+    : [
+        "场景背景", "广告目标", "风格", "构图", "景别", "视角镜头", "视角构图",
+        "光线", "色调配色", "材质纹理", "氛围情绪", "后期质感", "标签",
+      ];
+  const parts = [];
+  for (const key of allow) {
+    const value = String(structured[key] || "").trim();
+    if (value && value !== "无" && value !== "未见" && value !== "不确定") parts.push(value);
+  }
+  return parts.join(", ").trim() || fallback;
 }
 
 export function ratioKeyForSize(size) {

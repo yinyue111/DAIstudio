@@ -73,10 +73,10 @@ export default function StudioResults({
               <div className="mb-3 rounded-lg bg-warn/10 px-3 py-2 text-sm text-warn">
                 <p>
                   本次批量生成完成 {task.saved_count || task.assets?.length || 0}/{task.requested_count || "?"} 张，
-                  失败部分已自动退回积分。
+                  失败部分已按实际成功张数结算。
                 </p>
                 {task.partial_errors?.length > 0 && (
-                  <p className="mt-1 text-xs text-warn/80">失败原因：{task.partial_errors.join("；")}</p>
+                  <p className="mt-1 text-xs text-warn/80">未完成原因：{task.partial_errors.join("；")}</p>
                 )}
               </div>
             )}

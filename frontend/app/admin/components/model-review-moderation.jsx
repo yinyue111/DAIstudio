@@ -8,7 +8,6 @@ import {
   modelUseLabel,
   reportReasonLabel,
   reportStatusLabel,
-  promptAdminPassword,
 } from "./admin-helpers";
 import { Card, Th } from "./admin-ui";
 
@@ -311,12 +310,10 @@ export function ReviewTasks() {
     const note = window.prompt("退款关闭原因", task.error || "上游状态未知,人工退款");
     if (note == null) return;
     if (!confirmReviewTaskAction(task, "退款关闭", note)) return;
-    const adminPassword = await promptAdminPassword("退款关闭待对账任务");
-    if (!adminPassword) return;
     setBusyId(task.id);
     setMsg("");
     try {
-      await api.adminRefundReviewTask(task.id, { note, admin_password: adminPassword });
+      await api.adminRefundReviewTask(task.id, { note });
       load();
     } catch (e) {
       setMsg(e.message);
@@ -333,8 +330,6 @@ export function ReviewTasks() {
     const externalTaskId = window.prompt("外部任务 ID(可选)", task.external_task_id || "") || null;
     const note = window.prompt("结算备注(可选)", "人工补结果结算") || "";
     if (!confirmReviewTaskAction(task, "补结果结算", note, resultUrl)) return;
-    const adminPassword = await promptAdminPassword("补结果结算待对账任务");
-    if (!adminPassword) return;
     setBusyId(task.id);
     setMsg("");
     try {
@@ -342,7 +337,6 @@ export function ReviewTasks() {
         result_url: resultUrl,
         external_task_id: externalTaskId,
         note,
-        admin_password: adminPassword,
       });
       load();
     } catch (e) {
@@ -430,12 +424,10 @@ export function AssetReports() {
     if (note) lines.push(`处理说明：${note}`);
     if (action === "takedown") lines.push("下架后该素材将不能继续预览、解锁或下载。");
     if (!window.confirm(lines.join("\n"))) return;
-    const adminPassword = await promptAdminPassword(label);
-    if (!adminPassword) return;
     setBusyId(row.id);
     setMsg("");
     try {
-      await api.adminHandleAssetReport(row.id, { action, note, admin_password: adminPassword });
+      await api.adminHandleAssetReport(row.id, { action, note });
       load();
     } catch (e) {
       setMsg(e.message);

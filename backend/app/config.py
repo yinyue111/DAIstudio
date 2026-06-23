@@ -69,6 +69,10 @@ class Settings(BaseSettings):
     # because the current gateway rejects n/tool-count parameters. Run those
     # repeated requests concurrently so n=4/8 does not become a serial queue.
     image_gateway_parallelism: int = 8
+    # Extra replacement slots for batch image generation when a sub-request
+    # failed before the provider accepted work. Unknown-submit failures are not
+    # refilled because that can duplicate upstream renders.
+    image_gateway_refill_attempts: int = 4
     # Image render POSTs are non-idempotent for most providers. Do not retry by
     # default after a timeout/5xx: the upstream may have already accepted work.
     image_gateway_max_retries: int = 0

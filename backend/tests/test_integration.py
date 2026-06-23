@@ -24,7 +24,6 @@ def test_health(client):
 
 def test_register_login_me(client):
     db = SessionLocal()
-    db.add(PhoneWhitelist(phone="13700000002", note="x", department="dev"))
     set_setting(db, "sms_auth_enabled", False)
     db.commit()
     db.close()
@@ -44,13 +43,10 @@ def test_register_login_me(client):
                       json={"phone": "13700000002", "password": "nope"})
     assert bad.status_code == 401
 
-    # not whitelisted: keep a generic 400 so registration cannot be used to
-    # enumerate which phone numbers are authorized.
-    no = client.post("/api/auth/register",
-                     json={"phone": "13700000099", "password": "secret1234",
-                           "sms_code": "000000"})
-    assert no.status_code == 400
-    assert "注册申请无法完成" in no.text
+    public_ok = client.post("/api/auth/register",
+                            json={"phone": "13700000099", "password": "secret1234",
+                                  "sms_code": ""})
+    assert public_ok.status_code == 200, public_ok.text
 
 
 def test_production_login_uses_cookie_without_bearer_body(client, make_user, monkeypatch):
@@ -70,7 +66,6 @@ def test_production_login_uses_cookie_without_bearer_body(client, make_user, mon
 
 def test_sms_register_switch_requires_code_when_enabled(client):
     db = SessionLocal()
-    db.add(PhoneWhitelist(phone="13700000003", note="x", department="dev"))
     set_setting(db, "sms_auth_enabled", True)
     db.commit()
     db.close()
@@ -105,11 +100,10 @@ def test_sms_send_returns_disabled_when_switch_is_off(client):
     assert r.json() == {"ok": False, "disabled": True}
 
 
-def test_production_registration_requires_sms_switch(client, monkeypatch):
+def test_production_registration_allows_public_phone_without_sms(client, monkeypatch):
     monkeypatch.setattr("app.routers.auth.settings.debug", False)
     db = SessionLocal()
     try:
-        db.add(PhoneWhitelist(phone="13700000005", note="x", department="dev"))
         set_setting(db, "sms_auth_enabled", False)
         db.commit()
     finally:
@@ -117,14 +111,13 @@ def test_production_registration_requires_sms_switch(client, monkeypatch):
 
     features = client.get("/api/auth/features")
     assert features.status_code == 200, features.text
-    assert features.json()["registration_enabled"] is False
+    assert features.json()["registration_enabled"] is True
 
     r = client.post(
         "/api/auth/register",
         json={"phone": "13700000005", "password": "secret1234"},
     )
-    assert r.status_code == 400
-    assert "注册暂未开放" in r.text
+    assert r.status_code == 200, r.text
 
 
 def test_generate_unlock_profile(client, make_user, auth):
@@ -826,8 +819,8 @@ def test_video_final_rejects_stale_preview_gateway_key_snapshot(client, make_use
 def test_video_final_can_regenerate_after_succeeded_task_loses_asset(
     client, make_user, auth, monkeypatch, tiny_mp4
 ):
-    make_user("13900000164", balance=1000, admin=True)
-    h = auth("13900000164")
+    make_user("13877777164", balance=1000, admin=True)
+    h = auth("13877777164")
     assert client.put("/api/admin/models", json={
         "use": "video",
         "model_id": "mock-video",
@@ -1155,9 +1148,14 @@ def test_retry_reprices_failed_image_task(client, make_user, auth):
     db = SessionLocal()
     try:
         set_setting(db, "image_n", 4)
+        db.query(GenTask).filter(
+            GenTask.model_use == "image",
+            GenTask.status.in_(["queued", "running", "needs_review"]),
+        ).update({GenTask.status: "failed"}, synchronize_session=False)
+        db.commit()
     finally:
         db.close()
-    admin_phone = "13900000165"
+    admin_phone = "13877777165"
     make_user(admin_phone, balance=1000, admin=True)
     admin_h = auth(admin_phone)
     assert client.put("/api/admin/models", json={
@@ -1166,6 +1164,10 @@ def test_retry_reprices_failed_image_task(client, make_user, auth):
         "cost_credits": 5,
         "unlock_cost": 5,
         "enabled": True,
+        "provider": None,
+        "base_url": None,
+        "gateway_format": "openai",
+        "api_key_clear": True,
         "admin_password": "pass123456",
     }, headers=admin_h).status_code == 200
     db = SessionLocal()
@@ -1269,8 +1271,17 @@ def test_retry_preserves_existing_model_snapshot_price(client, make_user, auth):
 
 
 def test_retry_rejects_stale_gateway_key_snapshot(client, make_user, auth):
-    make_user("13900000179", balance=1000, admin=True)
-    h = auth("13900000179")
+    make_user("13877777179", balance=1000, admin=True)
+    h = auth("13877777179")
+    db = SessionLocal()
+    try:
+        db.query(GenTask).filter(
+            GenTask.model_use == "image",
+            GenTask.status.in_(["queued", "running", "needs_review"]),
+        ).update({GenTask.status: "failed"}, synchronize_session=False)
+        db.commit()
+    finally:
+        db.close()
     body = {
         "use": "image",
         "provider": "custom_openai",

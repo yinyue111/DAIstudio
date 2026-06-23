@@ -163,6 +163,84 @@ def test_needs_review_image_task_is_not_reprocessed(client, make_user, monkeypat
         db.close()
 
 
+def test_partial_image_generation_exposes_gateway_slot_failure(client, make_user, auth, monkeypatch):
+    make_user("13900000049", balance=1000)
+    h = auth("13900000049")
+
+    def partial_with_gateway_failure(prompt, model_id, n=4, size="1024x1024", **_kwargs):
+        return gateway.ImageBatchResult(
+            [gateway._mock_image(prompt, "256x256", 0), gateway._mock_image(prompt, "256x256", 1)],
+            failures=[
+                gateway.ImageSubrequestFailure(
+                    index=3,
+                    message="temporary account unavailable",
+                    submit_state_unknown=False,
+                    retryable_refill=True,
+                )
+            ],
+        )
+
+    monkeypatch.setattr("app.services.gateway.gen_image", partial_with_gateway_failure)
+
+    r = client.post("/api/generate", json={
+        "category": "image",
+        "stage": "preview",
+        "prompt": {"final_text": "partial"},
+        "params": {"n": 4, "size": "256x256"},
+    }, headers=h)
+
+    assert r.status_code == 200, r.text
+    task = client.get(f"/api/tasks/{r.json()['id']}", headers=h).json()
+    assert task["status"] == "succeeded"
+    assert task["partial"] is True
+    assert task["requested_count"] == 4
+    assert task["saved_count"] == 2
+    assert task["skipped_count"] == 2
+    assert task["partial_errors"] == ["temporary account unavailable"]
+    assert task["cost_frozen"] == 20
+    assert task["cost_settled"] == 10
+
+
+def test_partial_image_generation_unknown_slot_holds_for_review(
+    client,
+    make_user,
+    auth,
+    monkeypatch,
+):
+    make_user("13900000050", balance=1000)
+    h = auth("13900000050")
+
+    def partial_with_unknown_failure(prompt, model_id, n=4, size="1024x1024", **_kwargs):
+        return gateway.ImageBatchResult(
+            [gateway._mock_image(prompt, "256x256", 0), gateway._mock_image(prompt, "256x256", 1)],
+            failures=[
+                gateway.ImageSubrequestFailure(
+                    index=3,
+                    message="read timed out",
+                    submit_state_unknown=True,
+                    retryable_refill=False,
+                )
+            ],
+        )
+
+    monkeypatch.setattr("app.services.gateway.gen_image", partial_with_unknown_failure)
+
+    r = client.post("/api/generate", json={
+        "category": "image",
+        "stage": "preview",
+        "prompt": {"final_text": "partial unknown"},
+        "params": {"n": 4, "size": "256x256"},
+    }, headers=h)
+
+    assert r.status_code == 200, r.text
+    task = client.get(f"/api/tasks/{r.json()['id']}", headers=h).json()
+    assert task["status"] == "needs_review"
+    assert "部分槽位提交状态未知" in task["error"]
+    assert task["cost_frozen"] == 20
+    assert task["cost_settled"] == 0
+    assert client.get("/api/me", headers=h).json()["frozen_credits"] == 20
+
+
 def test_task_list_batched_keeps_assets_per_task(client, make_user, auth):
     # guards the batched (no-N+1) task-list builder against cross-task asset mixups
     make_user("13900000041", balance=1000)

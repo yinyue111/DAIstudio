@@ -1,7 +1,7 @@
-"""Phone + password auth with whitelist gate (register = auto login).
+"""Phone + password auth (register = auto login).
 
-Registration is allowed only for phones an admin has added to
-phone_whitelist, and the phone must prove possession with an SMS code.
+Registration is open to valid mobile numbers. When the SMS switch is enabled,
+registration also requires a valid SMS code.
 Login has a per-phone brute-force guard.
 """
 from __future__ import annotations
@@ -32,7 +32,7 @@ LOGIN_IP_FAIL_LIMIT = 50  # per-IP cap: catches phone-spraying without locking o
 LOGIN_FAIL_WINDOW = 15 * 60  # 15 minutes
 SMS_IP_SEND_LIMIT = 30
 SMS_IP_SEND_WINDOW = 60 * 60
-_REGISTER_GATE_ERROR = "注册申请无法完成,请确认手机号已获得授权且未注册"
+_REGISTER_GATE_ERROR = "注册申请无法完成,请确认手机号未注册"
 
 
 def _valid_phone(phone: str) -> bool:
@@ -60,9 +60,9 @@ def _sms_required_for_registration(db: Session) -> bool:
 
 
 def _registration_allowed_without_sms() -> bool:
-    # A whitelist proves the phone is allowed, not that the registrant controls
-    # it. Keep no-SMS self-registration only as a local development convenience.
-    return settings.debug
+    # When SMS auth is disabled by an administrator, users can register with
+    # phone + password only. If SMS is enabled, code verification gates signup.
+    return True
 
 
 def _issue_login_response(response: Response, user: User) -> TokenOut:
@@ -90,10 +90,6 @@ def register(body: RegisterIn, request: Request, response: Response, db: Session
         raise HTTPException(400, f"密码至少 {MIN_PASSWORD_LEN} 位")
 
     wl = _whitelisted(db, phone)
-    if wl is None:
-        audit.log(db, user_id=None, action="register_denied", ip=get_client_ip(request),
-                  detail={"phone": phone, "reason": "not_whitelisted"})
-        raise HTTPException(400, _REGISTER_GATE_ERROR)
     if db.query(User).filter(User.phone == phone).first():
         audit.log(db, user_id=None, action="register_denied", ip=get_client_ip(request),
                   detail={"phone": phone, "reason": "already_registered"})
@@ -113,8 +109,8 @@ def register(body: RegisterIn, request: Request, response: Response, db: Session
     user = User(
         phone=phone,
         password_hash=hash_password(body.password),
-        nickname=body.nickname or wl.note,
-        department=wl.department,
+        nickname=body.nickname or (wl.note if wl else None),
+        department=wl.department if wl else None,
         status="active",
         last_login_at=datetime.now(timezone.utc),
     )
@@ -148,10 +144,6 @@ def send_sms_code(body: SmsCodeIn, request: Request, db: Session = Depends(get_d
         raise HTTPException(503, "; ".join(sms_issues))
     ip = get_client_ip(request)
     _check_sms_ip_rate(ip)
-    if _whitelisted(db, phone) is None:
-        audit.log(db, user_id=None, action="send_sms_code_skipped", ip=ip,
-                  detail={"phone": phone, "reason": "not_whitelisted"})
-        return {"ok": True}
     if db.query(User).filter(User.phone == phone).first():
         audit.log(db, user_id=None, action="send_sms_code_skipped", ip=ip,
                   detail={"phone": phone, "reason": "already_registered"})

@@ -1655,63 +1655,51 @@ def test_admin_cannot_disable_self_but_can_disable_other_admin(client, make_user
         db.close()
 
 
-def test_admin_dangerous_actions_require_admin_password(client, make_user, auth):
-    make_user("13900000079", balance=1000, admin=True)
-    target = make_user("13900000075", balance=1000)
-    h = auth("13900000079")
+def test_admin_sensitive_actions_allow_logged_in_admin_without_second_password(client, make_user, auth):
+    make_user("13888888079", balance=1000, admin=True)
+    target = make_user("13888888075", balance=1000)
+    h = auth("13888888079")
 
     r = client.patch(
         f"/api/admin/users/{target}/status",
         json={"status": "disabled"},
         headers=h,
     )
-    assert r.status_code == 403
+    assert r.status_code == 200, r.text
 
     r = client.post(
         f"/api/admin/users/{target}/reset_password",
         json={"password": "reset12345"},
         headers=h,
     )
-    assert r.status_code == 403
+    assert r.status_code == 200, r.text
 
     r = client.post(
         "/api/admin/quota/grant",
         json={"user_id": target, "amount": 10, "note": "manual", "idempotency_key": "admin-pw-check-1"},
         headers=h,
     )
-    assert r.status_code == 403
+    assert r.status_code == 200, r.text
 
 
 def test_admin_config_allows_logged_in_admin_without_second_password(client, make_user, auth):
     make_user("13900000089", balance=1000, admin=True)
     h = auth("13900000089")
 
-    no_pw = client.post(
+    ok = client.post(
         "/api/admin/whitelist",
         json={"phone": "13900000090", "note": "test", "department": "dev"},
         headers=h,
     )
-    assert no_pw.status_code == 403
-
-    ok = client.post(
-        "/api/admin/whitelist",
-        json={
-            "phone": "13900000090",
-            "note": "test",
-            "department": "dev",
-            "admin_password": "pass123456",
-        },
-        headers=h,
-    )
     assert ok.status_code == 200, ok.text
 
-    bad_delete = client.request(
+    delete_ok = client.request(
         "DELETE",
         "/api/admin/whitelist/13900000090",
         json={},
         headers=h,
     )
-    assert bad_delete.status_code == 403
+    assert delete_ok.status_code == 200, delete_ok.text
 
     model_ok = client.put(
         "/api/admin/models",
@@ -1732,6 +1720,12 @@ def test_admin_config_allows_logged_in_admin_without_second_password(client, mak
         headers=h,
     )
     assert settings_ok.status_code == 200, settings_ok.text
+    restore_ok = client.put(
+        "/api/admin/settings",
+        json={"image_n": 4},
+        headers=h,
+    )
+    assert restore_ok.status_code == 200, restore_ok.text
 
 
 def test_mock_mode_external_reference_does_not_download(client, make_user, auth, monkeypatch):
@@ -2054,65 +2048,26 @@ def test_admin_settings_update_is_atomic(client, make_user, auth):
     assert after["reverse_prompt_enabled"] == before["reverse_prompt_enabled"]
 
 
-def test_admin_password_confirmation_is_rate_limited(client, make_user, auth, monkeypatch):
+def test_admin_password_field_is_ignored_for_authenticated_admin(client, make_user, auth):
     make_user("13900000145", balance=1000, admin=True)
     h = auth("13900000145")
-    monkeypatch.setattr("app.routers.admin._ADMIN_CONFIRM_FAIL_LIMIT", 2)
 
     body = {"phone": "13900000146", "admin_password": "wrong-password"}
-    assert client.post("/api/admin/whitelist", json=body, headers=h).status_code == 403
-    assert client.post("/api/admin/whitelist", json=body, headers=h).status_code == 403
-    limited = client.post("/api/admin/whitelist", json=body, headers=h)
-    assert limited.status_code == 429
-
-    db = SessionLocal()
-    try:
-        admin = db.query(User).filter(User.phone == "13900000145").first()
-        redis_client.delete(f"admin:confirm:fail:{admin.id}")
-    finally:
-        db.close()
-    ok = client.post(
-        "/api/admin/whitelist",
-        json={"phone": "13900000146", "admin_password": "pass123456"},
-        headers=h,
-    )
+    ok = client.post("/api/admin/whitelist", json=body, headers=h)
     assert ok.status_code == 200, ok.text
     assert redis_client.get("admin:confirm:failip:testclient") is None
 
 
-def test_admin_password_confirmation_success_clears_ip_fail_counter(client, make_user, auth):
-    make_user("13900000847", balance=1000, admin=True)
-    target_phone = "13900000849"
-    h = auth("13900000847")
+def test_admin_routes_still_require_admin_role(client, make_user, auth):
+    make_user("13888888847", balance=1000, admin=False)
+    h = auth("13888888847")
 
-    wrong = client.post(
+    denied = client.post(
         "/api/admin/whitelist",
-        json={"phone": target_phone, "admin_password": "wrong-password"},
+        json={"phone": "13888888849"},
         headers=h,
     )
-    assert wrong.status_code == 403
-
-    db = SessionLocal()
-    try:
-        row = db.get(PhoneWhitelist, target_phone)
-        if row:
-            db.delete(row)
-            db.commit()
-        admin = db.query(User).filter(User.phone == "13900000847").first()
-        fail_key = f"admin:confirm:fail:{admin.id}"
-        assert redis_client.get(fail_key) is not None
-        assert redis_client.get("admin:confirm:failip:testclient") is not None
-    finally:
-        db.close()
-
-    ok = client.post(
-        "/api/admin/whitelist",
-        json={"phone": target_phone, "admin_password": "pass123456"},
-        headers=h,
-    )
-    assert ok.status_code == 200, ok.text
-    assert redis_client.get(fail_key) is None
-    assert redis_client.get("admin:confirm:failip:testclient") is None
+    assert denied.status_code == 403
 
 
 def test_production_requires_real_gateway(client, monkeypatch):

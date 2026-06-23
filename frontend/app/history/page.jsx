@@ -266,9 +266,9 @@ export default function HistoryPage() {
                 </div>
                 {t.partial && (
                   <div className="mb-3 rounded-lg bg-warn/10 px-3 py-2 text-xs text-warn">
-                    <p>批量生成完成 {t.saved_count || t.assets?.length || 0}/{t.requested_count || "?"} 张，失败部分已退回积分。</p>
+                    <p>批量生成完成 {t.saved_count || t.assets?.length || 0}/{t.requested_count || "?"} 张，失败部分已按实际成功张数结算。</p>
                     {t.partial_errors?.length > 0 && (
-                      <p className="mt-1 text-warn/80">失败原因：{t.partial_errors.join("；")}</p>
+                      <p className="mt-1 text-warn/80">未完成原因：{t.partial_errors.join("；")}</p>
                     )}
                   </div>
                 )}

@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { api } from "../../../lib/api";
-import { promptAdminPassword, promptPassword } from "./admin-helpers";
+import { promptPassword } from "./admin-helpers";
 import { Card, Th } from "./admin-ui";
 
 export function Whitelist() {
@@ -16,11 +16,9 @@ export function Whitelist() {
   useEffect(() => { load(); }, []);
 
   async function add() {
-    const adminPassword = await promptAdminPassword("添加白名单");
-    if (!adminPassword) return;
     setMsg("");
     try {
-      await api.adminAddWhitelist({ phone, note, department, admin_password: adminPassword });
+      await api.adminAddWhitelist({ phone, note, department });
       setPhone(""); setNote(""); setDept("");
       load();
     } catch (e) { setMsg(e.message); }
@@ -28,11 +26,9 @@ export function Whitelist() {
 
   async function remove(phone) {
     if (!window.confirm(`确认移除白名单 ${phone}？`)) return;
-    const adminPassword = await promptAdminPassword("移除白名单");
-    if (!adminPassword) return;
     setMsg("");
     try {
-      await api.adminRemoveWhitelist(phone, { admin_password: adminPassword });
+      await api.adminRemoveWhitelist(phone, {});
       load();
     } catch (e) { setMsg(e.message); }
   }
@@ -87,11 +83,6 @@ export function Users() {
       setGranting(null);
       return;
     }
-    const adminPassword = await promptAdminPassword("发放积分");
-    if (!adminPassword) {
-      setGranting(null);
-      return;
-    }
     const signature = `${uid}:${amount}:${note}`;
     const existing = grantKeys[uid];
     const idempotencyKey = existing?.signature === signature ? existing.key : crypto.randomUUID();
@@ -102,7 +93,6 @@ export function Users() {
         user_id: uid,
         amount,
         note,
-        admin_password: adminPassword,
         idempotency_key: idempotencyKey,
       });
       setAmounts({ ...amounts, [uid]: "" });
@@ -127,10 +117,8 @@ export function Users() {
       window.alert("新密码至少 6 位");
       return;
     }
-    const adminPassword = await promptAdminPassword("重置用户密码");
-    if (!adminPassword) return;
     try {
-      await api.adminResetPassword(uid, { password: pw, admin_password: adminPassword });
+      await api.adminResetPassword(uid, { password: pw });
       window.alert("已重置");
     } catch (e) {
       window.alert(e.message);
@@ -140,11 +128,9 @@ export function Users() {
   async function setStatus(user, status) {
     const action = status === "disabled" ? "禁用" : status === "active" ? "启用" : "设为待审核";
     if (!window.confirm(`确认${action}用户 ${user.phone}？该操作会使其已登录令牌失效。`)) return;
-    const adminPassword = await promptAdminPassword(`${action}用户`);
-    if (!adminPassword) return;
     setMsg("");
     try {
-      await api.adminSetUserStatus(user.id, { status, admin_password: adminPassword });
+      await api.adminSetUserStatus(user.id, { status });
       load();
     } catch (e) {
       setMsg(e.message);

@@ -309,7 +309,8 @@ def test_image_edit_repeats_without_n(monkeypatch):
     assert len(calls) == 3
     assert all(url.endswith("/v1/images/edits") for _method, url, _payload, _timeout, _retries in calls)
     assert all("n" not in payload for _method, _url, payload, _timeout, _retries in calls)
-    assert all(payload["image"] == "http://example.com/ref.png"
+    assert all("image" not in payload for _method, _url, payload, _timeout, _retries in calls)
+    assert all(payload["images"] == [{"image_url": "http://example.com/ref.png"}]
                for _method, _url, payload, _timeout, _retries in calls)
     assert all(timeout == settings.image_gateway_timeout_seconds
                for _method, _url, _payload, timeout, _retries in calls)
@@ -443,7 +444,31 @@ def test_text_to_image_returns_partial_successes(monkeypatch):
     imgs = gateway.gen_image("a cat", "gpt-image-2", n=4, size="256x256")
 
     assert len(imgs) == 3
+    assert [failure.message for failure in imgs.failures] == ["temporary account unavailable"]
     assert calls["n"] == 4
+
+
+def test_text_to_image_refills_empty_unsubmitted_slots(monkeypatch):
+    monkeypatch.setattr(settings, "mock_mode", False)
+    monkeypatch.setattr(settings, "gateway_base_url", "http://gateway.test")
+    monkeypatch.setattr(settings, "gateway_api_key", "test-key")
+    monkeypatch.setattr(settings, "image_gateway_parallelism", 4)
+    monkeypatch.setattr(settings, "image_gateway_refill_attempts", 2)
+    raw = base64.b64encode(gateway._mock_image("x", "256x256", 0)).decode()
+    calls = {"n": 0}
+
+    def sometimes_empty(method, url, *, headers, payload, timeout, retries):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            return {"data": []}
+        return {"data": [{"b64_json": raw}]}
+
+    monkeypatch.setattr(gateway, "_request_json", sometimes_empty)
+    imgs = gateway.gen_image("a cat", "gpt-image-2", n=4, size="256x256")
+
+    assert len(imgs) == 4
+    assert calls["n"] == 5
+    assert [failure.message for failure in imgs.failures] == ["图像子请求未返回结果"]
 
 
 def test_text_to_image_batch_rejects_total_size_over_budget(monkeypatch):
