@@ -303,13 +303,13 @@ PAYMENT_FRONTEND_BASE_URL=https://dream.aiwuq.cn
 
 ## 在线版本升级
 
-管理后台提供“版本升级”页，可以从服务端配置的 Git remote/branch 拉取新代码并执行固定生效命令。该功能默认开启，默认升级源是私有 GitHub 仓库 `git@github.com:yinyue111/DAIstudio.git`。生产启用前需要确认 API 进程运行在真实 Git checkout 中，并且运行 API 的系统用户已经配置好 GitHub SSH 读取权限。Docker 镜像包含 `git` 和 `openssh-client`，但镜像默认不包含 `.git`、私钥或 `known_hosts`，所以普通 Compose 镜像内 `/app` 不能直接在线升级；如果使用镜像内 `/app` 运行且没有挂载真实仓库，请显式设置 `ONLINE_UPDATE_ENABLED=false`。
+管理后台提供“版本升级”页，可以从服务端配置的 Git remote/branch 拉取新代码并执行固定生效命令。该功能默认开启，默认升级源是私有 GitHub 仓库 `https://github.com/yinyue111/DAIstudio.git`。生产启用前需要确认 API 进程运行在真实 Git checkout 中，并为私有仓库配置 `ONLINE_UPDATE_GITHUB_TOKEN`。Docker 镜像默认不包含 `.git`，所以普通 Compose 镜像内 `/app` 不能直接在线升级；如果使用镜像内 `/app` 运行且没有挂载真实仓库，请显式设置 `ONLINE_UPDATE_ENABLED=false`。
 
 安全边界：
 
 - 默认 `ONLINE_UPDATE_ENABLED=true`
 - 只更新服务端配置的 `ONLINE_UPDATE_REMOTE` / `ONLINE_UPDATE_BRANCH`
-- 私有库建议使用 GitHub Deploy Key 或专用只读 SSH key，不要把 GitHub 密码或 token 写进 URL
+- 私有库使用 GitHub fine-grained PAT，通过 `ONLINE_UPDATE_GITHUB_TOKEN` 注入，不要把 GitHub 密码或 token 写进 URL
 - 只允许 `git merge --ff-only`，不会执行 `reset --hard`
 - 工作区有未提交改动时默认拒绝升级
 - 前端不能传入任意命令；生效命令只能由服务端环境变量固定配置
@@ -319,14 +319,33 @@ PAYMENT_FRONTEND_BASE_URL=https://dream.aiwuq.cn
 ```env
 ONLINE_UPDATE_ENABLED=true
 ONLINE_UPDATE_REPO_DIR=/srv/ai-media-studio
-ONLINE_UPDATE_REMOTE=git@github.com:yinyue111/DAIstudio.git
+ONLINE_UPDATE_REMOTE=https://github.com/yinyue111/DAIstudio.git
 ONLINE_UPDATE_BRANCH=main
+ONLINE_UPDATE_GITHUB_TOKEN=github_pat_xxx
 ONLINE_UPDATE_APPLY_COMMAND=/usr/local/bin/ai-studio-apply-update
 ONLINE_UPDATE_TIMEOUT_SECONDS=600
 ONLINE_UPDATE_ALLOW_DIRTY=false
 ```
 
-私有 GitHub 仓库需要先在服务器上配置 SSH 读取权限。建议做法：
+私有 GitHub 仓库需要创建一个只读 token：
+
+1. 打开 GitHub `Settings -> Developer settings -> Personal access tokens -> Fine-grained tokens`
+2. 选择仓库 `yinyue111/DAIstudio`
+3. `Repository permissions` 里只给 `Contents: Read-only`
+4. 生成 token 后写入后端环境变量 `ONLINE_UPDATE_GITHUB_TOKEN`
+5. 重启后端，让后台“版本升级”页读取新配置
+
+不要写成 `https://token@github.com/...`。后端会拒绝带用户名/密码的 remote，并且会把 token 通过临时 Git 环境配置传给 `ls-remote/fetch`，接口输出和命令日志会做脱敏。
+
+在服务器上用同一个用户验证：
+
+```bash
+export ONLINE_UPDATE_GITHUB_TOKEN=github_pat_xxx
+git -c http.https://github.com/.extraheader="Authorization: Basic $(printf 'x-access-token:%s' "$ONLINE_UPDATE_GITHUB_TOKEN" | base64)" \
+  ls-remote --heads https://github.com/yinyue111/DAIstudio.git main
+```
+
+如果你仍想使用 SSH，也可以把 `ONLINE_UPDATE_REMOTE` 改成 `git@github.com:yinyue111/DAIstudio.git`，并在服务器上配置 SSH 读取权限：
 
 ```bash
 ssh-keygen -t ed25519 -C "ai-studio-online-update" -f ~/.ssh/ai_studio_update
@@ -406,6 +425,9 @@ SMS_TEMPLATE_CODE=<your-template-code>
 | `METRICS_TOKEN` | `/metrics` 访问令牌 |
 | `ONLINE_UPDATE_ENABLED` | 管理后台版本升级开关，默认开启；无真实 Git checkout 时请设为 `false` |
 | `ONLINE_UPDATE_REPO_DIR` | 在线升级使用的 Git checkout 绝对路径 |
+| `ONLINE_UPDATE_REMOTE` | 在线升级 Git 源，默认 `https://github.com/yinyue111/DAIstudio.git` |
+| `ONLINE_UPDATE_BRANCH` | 在线升级分支，默认 `main` |
+| `ONLINE_UPDATE_GITHUB_TOKEN` | 私有 GitHub 仓库只读 token，不要写进 remote URL |
 | `ONLINE_UPDATE_APPLY_COMMAND` | 代码更新后执行的固定生效命令 |
 | `MAX_IMAGE_N` | 单次图片生成最大张数，默认 8 |
 | `MAX_IMAGE_DIM` | 图片最大边长，默认 4096 |

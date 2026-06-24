@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import shlex
 import subprocess
 import sys
@@ -252,6 +253,56 @@ def test_online_update_accepts_github_ssh_scp_remote():
     )
 
 
+def test_online_update_rejects_https_remote_with_embedded_credentials():
+    from app.services import online_update
+
+    with pytest.raises(online_update.OnlineUpdateError, match="不能包含用户名或密码"):
+        online_update._safe_remote("https://github_pat_secret@github.com/yinyue111/DAIstudio.git")
+
+
+def test_online_update_injects_github_https_token_via_env(monkeypatch, git_repos):
+    from app.services import online_update
+
+    captured: dict[str, object] = {}
+    token = "github_pat_1234567890abcdef"
+    remote = "https://github.com/yinyue111/DAIstudio.git"
+    encoded = base64.b64encode(f"x-access-token:{token}".encode()).decode("ascii")
+
+    def fake_run(args, *, cwd, timeout=None, env=None):
+        captured["args"] = args
+        captured["env"] = env
+        return online_update.CommandResult(
+            args=list(args),
+            returncode=0,
+            stdout=f"{'a' * 40}\trefs/heads/main\n",
+            stderr="",
+        )
+
+    monkeypatch.setattr(settings, "online_update_github_token", token)
+    monkeypatch.setattr(online_update, "_run", fake_run)
+
+    assert online_update._remote_head(git_repos["work"], remote, "main") == "a" * 40
+
+    assert captured["args"] == ["git", "ls-remote", "--heads", remote, "main"]
+    assert token not in " ".join(captured["args"])
+    env = captured["env"]
+    assert isinstance(env, dict)
+    assert env["GIT_CONFIG_COUNT"] == "1"
+    assert env["GIT_CONFIG_KEY_0"] == "http.https://github.com/.extraheader"
+    assert env["GIT_CONFIG_VALUE_0"] == f"Authorization: Basic {encoded}"
+    assert token not in online_update._safe_command(captured["args"])
+
+
+def test_online_update_does_not_inject_github_token_for_local_git_commands(monkeypatch):
+    from app.services import online_update
+
+    monkeypatch.setattr(settings, "online_update_github_token", "github_pat_1234567890abcdef")
+
+    assert online_update._git_auth_env(None) == {}
+    assert online_update._git_auth_env("git@github.com:yinyue111/DAIstudio.git") == {}
+    assert online_update._git_auth_env("https://gitlab.example.com/group/repo.git") == {}
+
+
 def test_online_update_reports_missing_ssh_for_ssh_remote(monkeypatch):
     from app.services import online_update
 
@@ -279,10 +330,12 @@ def test_online_update_redacts_secrets_from_command_output():
 
     text = (
         "remote=https://ghp_abcdefghijklmnopqrstuvwxyz012345@example.com/repo.git\n"
-        "api_key=sk-abcdef1234567890 token=ark-abcdef1234567890 password=hunter2"
+        "api_key=sk-abcdef1234567890 token=ark-abcdef1234567890 password=hunter2 "
+        "github_pat_1234567890abcdef"
     )
     redacted = online_update._clip(text)
     assert "ghp_abcdefghijklmnopqrstuvwxyz012345" not in redacted
+    assert "github_pat_1234567890abcdef" not in redacted
     assert "sk-abcdef1234567890" not in redacted
     assert "ark-abcdef1234567890" not in redacted
     assert "hunter2" not in redacted

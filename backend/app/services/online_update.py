@@ -6,6 +6,8 @@ configured apply command. The UI never supplies shell commands.
 """
 from __future__ import annotations
 
+import base64
+import os
 import re
 import shlex
 import shutil
@@ -27,6 +29,7 @@ _KEY_VALUE_SECRET_RE = re.compile(
     re.I,
 )
 _OPENAI_LIKE_KEY_RE = re.compile(r"\b(?P<prefix>sk|ark)-[A-Za-z0-9_-]{8,}\b")
+_GITHUB_TOKEN_RE = re.compile(r"\b(?:gh[opsru]_[A-Za-z0-9_]{8,}|github_pat_[A-Za-z0-9_]{8,})\b")
 _ALLOWED_REMOTE_SCHEMES = {"https", "ssh", "git", "file"}
 _SCP_REMOTE_RE = re.compile(r"^(?P<user>[A-Za-z0-9._-]+)@(?P<host>[A-Za-z0-9._-]+):(?P<path>[A-Za-z0-9._~/-]+)(?:\.git)?$")
 _GITHUB_SSH_REMOTE_RE = re.compile(r"^(?:git@github\.com:|ssh://git@github\.com/)(?P<repo>[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)(?:\.git)?$")
@@ -58,7 +61,14 @@ def _clip(text: str, limit: int = _OUTPUT_LIMIT) -> str:
 def _redact_text(text: str) -> str:
     value = _URL_USERINFO_RE.sub(r"\g<prefix><redacted>@", str(text or ""))
     value = _KEY_VALUE_SECRET_RE.sub(r"\g<key>\g<sep><redacted>", value)
-    return _OPENAI_LIKE_KEY_RE.sub(lambda m: f"{m.group('prefix')}-<redacted>", value)
+    value = _OPENAI_LIKE_KEY_RE.sub(lambda m: f"{m.group('prefix')}-<redacted>", value)
+    value = _GITHUB_TOKEN_RE.sub("<redacted>", value)
+    configured_token = str(getattr(settings, "online_update_github_token", "") or "").strip()
+    if len(configured_token) >= 8:
+        value = value.replace(configured_token, "<redacted>")
+        encoded = base64.b64encode(f"x-access-token:{configured_token}".encode()).decode("ascii")
+        value = value.replace(encoded, "<redacted>")
+    return value
 
 
 def _safe_command(args: list[str]) -> str:
@@ -131,7 +141,39 @@ def _repo_dir() -> Path:
     return repo
 
 
-def _run(args: list[str], *, cwd: Path, timeout: int | None = None) -> CommandResult:
+def _git_auth_env(remote: str | None = None) -> dict[str, str]:
+    token = str(settings.online_update_github_token or "").strip()
+    if not token or remote is None or _remote_uses_ssh(remote):
+        return {}
+    if remote:
+        parsed = urlparse(remote)
+        if parsed.scheme and (
+            parsed.scheme != "https" or (parsed.hostname or "").lower() != "github.com"
+        ):
+            return {}
+    # Keep the token out of the remote URL and command argv. Git applies this
+    # header only to github.com HTTPS remotes, including when the command uses
+    # a remote name such as "origin".
+    auth = base64.b64encode(f"x-access-token:{token}".encode()).decode("ascii")
+    base_count = int(os.environ.get("GIT_CONFIG_COUNT", "0") or "0")
+    return {
+        "GIT_CONFIG_COUNT": str(base_count + 1),
+        f"GIT_CONFIG_KEY_{base_count}": "http.https://github.com/.extraheader",
+        f"GIT_CONFIG_VALUE_{base_count}": f"Authorization: Basic {auth}",
+    }
+
+
+def _run(
+    args: list[str],
+    *,
+    cwd: Path,
+    timeout: int | None = None,
+    env: dict[str, str] | None = None,
+) -> CommandResult:
+    proc_env = None
+    if env:
+        proc_env = os.environ.copy()
+        proc_env.update(env)
     try:
         proc = subprocess.run(
             args,
@@ -140,6 +182,7 @@ def _run(args: list[str], *, cwd: Path, timeout: int | None = None) -> CommandRe
             text=True,
             timeout=timeout or max(1, int(settings.online_update_timeout_seconds)),
             check=False,
+            env=proc_env,
         )
     except subprocess.TimeoutExpired as e:
         output = "\n".join(part for part in [e.stdout or "", e.stderr or ""] if part)
@@ -152,8 +195,8 @@ def _run(args: list[str], *, cwd: Path, timeout: int | None = None) -> CommandRe
     return result
 
 
-def _git(args: list[str], *, cwd: Path) -> CommandResult:
-    return _run(["git", *args], cwd=cwd)
+def _git(args: list[str], *, cwd: Path, remote: str | None = None) -> CommandResult:
+    return _run(["git", *args], cwd=cwd, env=_git_auth_env(remote))
 
 
 def _is_git_repo(repo: Path) -> bool:
@@ -177,7 +220,7 @@ def _dirty_status(repo: Path) -> str:
 
 
 def _remote_head(repo: Path, remote: str, branch: str) -> str:
-    result = _git(["ls-remote", "--heads", remote, branch], cwd=repo)
+    result = _git(["ls-remote", "--heads", remote, branch], cwd=repo, remote=remote)
     for line in result.stdout.splitlines():
         parts = line.strip().split()
         if len(parts) >= 2 and parts[1] == f"refs/heads/{branch}":
@@ -204,7 +247,7 @@ def _ensure_ready(
     if enforce_clean and dirty and not settings.online_update_allow_dirty:
         raise OnlineUpdateError("当前工作区存在未提交改动,请先提交/清理后再在线更新")
     if fetch:
-        _git(["fetch", "--prune", remote, branch], cwd=repo)
+        _git(["fetch", "--prune", remote, branch], cwd=repo, remote=remote)
     current = _head(repo)
     remote_head = ""
     if fetch:
