@@ -303,7 +303,7 @@ PAYMENT_FRONTEND_BASE_URL=https://dream.aiwuq.cn
 
 ## 在线版本升级
 
-管理后台提供“版本升级”页，可以从服务端配置的 Git remote/branch 拉取新代码并执行固定生效命令。该功能默认开启，默认升级源是私有 GitHub 仓库 `git@github.com:yinyue111/DAIstudio.git`。生产启用前需要确认 API 进程运行在真实 Git checkout 中，并且运行 API 的系统用户已经配置好 GitHub SSH 读取权限。Docker 镜像默认不包含 `.git`，所以普通 Compose 镜像内 `/app` 不能直接在线升级；如果使用镜像内 `/app` 运行且没有挂载真实仓库，请显式设置 `ONLINE_UPDATE_ENABLED=false`。
+管理后台提供“版本升级”页，可以从服务端配置的 Git remote/branch 拉取新代码并执行固定生效命令。该功能默认开启，默认升级源是私有 GitHub 仓库 `git@github.com:yinyue111/DAIstudio.git`。生产启用前需要确认 API 进程运行在真实 Git checkout 中，并且运行 API 的系统用户已经配置好 GitHub SSH 读取权限。Docker 镜像包含 `git` 和 `openssh-client`，但镜像默认不包含 `.git`、私钥或 `known_hosts`，所以普通 Compose 镜像内 `/app` 不能直接在线升级；如果使用镜像内 `/app` 运行且没有挂载真实仓库，请显式设置 `ONLINE_UPDATE_ENABLED=false`。
 
 安全边界：
 
@@ -346,9 +346,12 @@ Host github.com
 在服务器上用同一个用户验证：
 
 ```bash
+which ssh
 ssh -T git@github.com
 git ls-remote --heads git@github.com:yinyue111/DAIstudio.git main
 ```
+
+如果后台提示 `cannot run ssh: No such file or directory` 或 `缺少 ssh 客户端`，说明运行后端的环境里没有 SSH 客户端。Docker 部署需要重新构建包含 `openssh-client` 的后端镜像；裸机部署可安装 `openssh-client` 或把 `ONLINE_UPDATE_REMOTE` 改为可访问的 HTTPS Git URL。
 
 `ONLINE_UPDATE_APPLY_COMMAND` 建议指向一个固定脚本。脚本里可以按你的部署方式执行迁移、构建和重启，例如裸机部署可执行 `make migrate`、前端构建、重启 systemd 服务；Docker 部署通常应在宿主机执行 `docker compose up -d --build`。如果一定要在 Docker 部署里开启在线升级，需要把宿主机真实 Git checkout 挂载到 `ONLINE_UPDATE_REPO_DIR`，并让固定脚本在宿主机或受控运维环境中完成 rebuild/restart，不要把宿主机 Docker 权限随意挂进业务容器。
 

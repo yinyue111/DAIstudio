@@ -252,6 +252,20 @@ def test_online_update_accepts_github_ssh_scp_remote():
     )
 
 
+def test_online_update_reports_missing_ssh_for_ssh_remote(monkeypatch):
+    from app.services import online_update
+
+    monkeypatch.setattr(online_update.shutil, "which", lambda name: None if name == "ssh" else "/bin/tool")
+
+    with pytest.raises(online_update.OnlineUpdateError) as exc:
+        online_update._ensure_transport_ready("git@github.com:yinyue111/DAIstudio.git")
+
+    message = str(exc.value)
+    assert "缺少 ssh 客户端" in message
+    assert "openssh-client" in message
+    assert "https://github.com/yinyue111/DAIstudio.git" in message
+
+
 def test_online_update_rejects_inline_apply_command(monkeypatch, git_repos):
     from app.services import online_update
 

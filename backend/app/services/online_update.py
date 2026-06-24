@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import re
 import shlex
+import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -28,6 +29,7 @@ _KEY_VALUE_SECRET_RE = re.compile(
 _OPENAI_LIKE_KEY_RE = re.compile(r"\b(?P<prefix>sk|ark)-[A-Za-z0-9_-]{8,}\b")
 _ALLOWED_REMOTE_SCHEMES = {"https", "ssh", "git", "file"}
 _SCP_REMOTE_RE = re.compile(r"^(?P<user>[A-Za-z0-9._-]+)@(?P<host>[A-Za-z0-9._-]+):(?P<path>[A-Za-z0-9._~/-]+)(?:\.git)?$")
+_GITHUB_SSH_REMOTE_RE = re.compile(r"^(?:git@github\.com:|ssh://git@github\.com/)(?P<repo>[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)(?:\.git)?$")
 
 
 class OnlineUpdateError(RuntimeError):
@@ -90,6 +92,33 @@ def _safe_remote(value: str) -> str:
     if parsed.username or parsed.password:
         raise OnlineUpdateError("ONLINE_UPDATE_REMOTE 不能包含用户名或密码")
     return text
+
+
+def _remote_uses_ssh(remote: str) -> bool:
+    if _SCP_REMOTE_RE.fullmatch(remote):
+        return True
+    return urlparse(remote).scheme == "ssh"
+
+
+def _github_https_equivalent(remote: str) -> str | None:
+    match = _GITHUB_SSH_REMOTE_RE.fullmatch(remote.strip())
+    if not match:
+        return None
+    return f"https://github.com/{match.group('repo')}.git"
+
+
+def _ensure_transport_ready(remote: str) -> None:
+    if not _remote_uses_ssh(remote):
+        return
+    if shutil.which("ssh"):
+        return
+    hint = _github_https_equivalent(remote)
+    fallback = f"；也可以改用 HTTPS remote: {hint}" if hint else ""
+    raise OnlineUpdateError(
+        "当前运行后端的环境缺少 ssh 客户端，无法读取 SSH Git remote。"
+        "请在容器/服务器安装 openssh-client，或把 ONLINE_UPDATE_REMOTE 改为可访问的 HTTPS Git URL"
+        f"{fallback}"
+    )
 
 
 def _repo_dir() -> Path:
@@ -164,6 +193,7 @@ def _ensure_ready(
     enforce_clean: bool = True,
 ) -> dict[str, Any]:
     remote = _safe_remote(settings.online_update_remote)
+    _ensure_transport_ready(remote)
     branch = _safe_ref(settings.online_update_branch, "ONLINE_UPDATE_BRANCH")
     if not _is_git_repo(repo):
         raise OnlineUpdateError("在线更新目录不是 Git 仓库")
