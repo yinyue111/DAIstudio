@@ -4,8 +4,8 @@ Image: gateway returns N images -> we save HD + a watermarked low-res preview
 per image, settle the frozen estimate against real cost.
 Video: submit async job -> poll to completion -> save preview (and HD for final
 stage). Idempotent: a task that already reached a terminal state is skipped.
-Failures refund the frozen credits only when the provider state is known. Video
-submits with an unknown upstream state are held for admin reconciliation.
+Recoverable provider-success/local-persistence failures are held for review;
+ordinary submit, poll, and download failures refund the frozen credits.
 """
 from __future__ import annotations
 
@@ -114,7 +114,7 @@ def _hold_image_success_for_reconciliation(
     written_keys: list[str] | None = None,
     saved_count: int | None = None,
 ) -> None:
-    """Hold provider-success image tasks when only local accounting failed."""
+    """Hold provider-success image tasks when local accounting failed."""
     db.rollback()
     task = db.get(GenTask, task_id)
     if not task:
@@ -125,17 +125,15 @@ def _hold_image_success_for_reconciliation(
     if saved_count is not None:
         params["_saved_n"] = int(saved_count)
     task.params = params
-    task.phase = "reconciling"
-    message = (
-        "图片已由上游生成,但本地落账失败,已冻结额度等待人工对账。"
-        f"saved_n={saved_count if saved_count is not None else 'unknown'}; "
-        f"error={error[:500]}"
+    _mark_needs_review(
+        db,
+        task_id,
+        (
+            "图片已由上游生成,但本地落账失败,需要系统恢复或管理员确认。"
+            f"saved_n={saved_count if saved_count is not None else 'unknown'}; "
+            f"error={error[:500]}"
+        ),
     )
-    if not claim_terminal(db, task_id, NEEDS_REVIEW, error=message):
-        db.rollback()
-        return
-    db.commit()
-    set_progress(task_id, 100, NEEDS_REVIEW)
 
 
 def _public_image_error(exc: Exception) -> str:
@@ -162,7 +160,9 @@ def _public_image_error(exc: Exception) -> str:
 def _image_submit_state_unknown(exc: Exception) -> bool:
     if isinstance(exc, TimeoutError):
         return False
-    return _submit_state_unknown(exc)
+    if isinstance(exc, gateway.GatewayError):
+        return bool(getattr(exc, "submit_state_unknown", False))
+    return False
 
 
 def _settlement_cost(task: GenTask, model, *, image_count: int | None = None) -> int:
@@ -243,16 +243,8 @@ def run_image_task(task_id: int) -> None:
                               latency_ms=int((time.time() - t0) * 1000),
                               detail={"n": n, "size": size, "mode": mode,
                                       "error": str(e)[:300]})
-            if _image_submit_state_unknown(e):
-                _hold_image_submit_for_reconciliation(db, task_id, str(e))
-                return
             raise
         gateway_failure_items = list(getattr(images, "failures", []) or [])
-        gateway_unknown_failures = [
-            failure
-            for failure in gateway_failure_items
-            if getattr(failure, "submit_state_unknown", False)
-        ]
         gateway_failures = [
             failure.message
             for failure in gateway_failure_items
@@ -310,17 +302,6 @@ def run_image_task(task_id: int) -> None:
                 log.warning("image task %s skipped one invalid image: %s", task_id, e)
         if saved_count <= 0:
             raise RuntimeError("图片网关返回结果均无法解析")
-        if saved_count < n and gateway_unknown_failures:
-            _hold_image_success_for_reconciliation(
-                db,
-                task_id,
-                "图片批量生成部分槽位提交状态未知:"
-                + "; ".join(f.message for f in gateway_unknown_failures[:3]),
-                written_keys=written_keys,
-                saved_count=saved_count,
-            )
-            return
-
         # finalize atomically: only the runner that claims the terminal status
         # settles, so a duplicate/raced run can't double-charge or double-credit.
         real_cost = _settlement_cost(task, model, image_count=saved_count)
@@ -507,7 +488,12 @@ def _finalize_or_retry_video_download(db, task: GenTask, model, result: dict) ->
                           user_id=task.user_id, task_id=task.id,
                           status="failed",
                           detail=usage_detail)
-        _hold_video_download_for_reconciliation(db, task.id, str(e))
+        _fail_and_refund(
+            db,
+            task.id,
+            str(e),
+            public_error="视频结果下载失败，已退回冻结积分，请稍后重试",
+        )
         return True
     finally:
         locks.release(lock_key, lock_token)
@@ -661,7 +647,12 @@ def start_video_task(task_id: int) -> None:
                             _mark_poll_alive(task_id)
                             _try_enqueue_poll(task_id)
                         return
-                    _hold_for_reconciliation(db, task_id, str(e))
+                    _fail_and_refund(
+                        db,
+                        task_id,
+                        f"视频提交状态未知:{e}",
+                        public_error="视频提交状态未知，已退回冻结积分，请稍后重试",
+                    )
                     return
                 raise
             usage.record_call(db, kind="video_submit", model_id=model.model_id,
@@ -685,10 +676,16 @@ def start_video_task(task_id: int) -> None:
             submitted = True
     except Exception as e:  # noqa: BLE001
         log.exception("video submit %s failed", task_id)
-        if submitted or _submit_state_unknown(e):
-            _hold_for_reconciliation(db, task_id, str(e))
+        if submitted:
+            _mark_poll_alive(task_id)
+            _try_enqueue_poll(task_id)
             return
-        _fail_and_refund(db, task_id, str(e), public_error="视频提交失败，已退回冻结积分，请稍后重试")
+        public_error = (
+            "视频提交状态未知，已退回冻结积分，请稍后重试"
+            if _submit_state_unknown(e)
+            else "视频提交失败，已退回冻结积分，请稍后重试"
+        )
+        _fail_and_refund(db, task_id, str(e), public_error=public_error)
     finally:
         db.close()
         locks.release(lock_key, lock_token)
@@ -729,11 +726,12 @@ def poll_video_once(task_id: int) -> None:
                               detail={"stage": task.stage,
                                       "external_task_id": task.external_task_id,
                                       "error": "render timeout"})
-            _hold_video_timeout_for_reconciliation(
+            _fail_and_refund(
                 db,
                 task_id,
                 f"视频渲染超过 {VIDEO_POLL_MAX_SECONDS} 秒仍未结束; "
                 f"external_task_id={task.external_task_id or 'unknown'}",
+                public_error="视频渲染超时，已退回冻结积分，请稍后重试",
             )
             return
 
@@ -1126,99 +1124,23 @@ def resume_stuck_videos(db) -> int:
     return resumed
 
 
-def _hold_for_reconciliation(db, task_id: int, error: str) -> None:
-    """Terminal hold for video submits where the provider may already be working.
-
-    The user's reservation stays frozen until an admin/operator checks the
-    provider side and either refunds or settles manually. This avoids turning
-    client-side submit timeouts into free duplicate upstream renders.
-    """
-    try:
-        db.rollback()
-        task = db.get(GenTask, task_id)
-        if not task:
-            return
-        params = dict(task.params or {})
-        request_id = params.get("_video_request_id")
-        message = (
-            "视频提交状态未知,已冻结额度等待人工对账。"
-            f"request_id={request_id or 'unknown'}; error={error[:500]}"
-        )
-        if not claim_terminal(db, task_id, NEEDS_REVIEW, error=message):
-            db.rollback()
-            return
-        db.commit()
-        set_progress(task_id, 100, NEEDS_REVIEW)
-    except Exception:
-        log.exception("reconciliation hold failed for task %s", task_id)
-        db.rollback()
-
-
-def _hold_image_submit_for_reconciliation(db, task_id: int, error: str) -> None:
-    """Hold image submits whose upstream state is unknown instead of refunding.
-
-    Image generation is non-idempotent in the configured gateway. A timeout or
-    5xx can still mean the provider accepted work, so refunding immediately can
-    create free duplicate upstream renders on retry.
-    """
-    try:
-        db.rollback()
-        task = db.get(GenTask, task_id)
-        if not task:
-            return
-        task.phase = "reconciling"
-        message = (
-            "图片提交状态未知,已冻结额度等待人工对账。"
-            f"error={error[:700]}"
-        )
-        if not claim_terminal(db, task_id, NEEDS_REVIEW, error=message):
-            db.rollback()
-            return
-        db.commit()
-        set_progress(task_id, 100, NEEDS_REVIEW)
-    except Exception:
-        log.exception("image reconciliation hold failed for task %s", task_id)
-        db.rollback()
-
-
-def _hold_video_timeout_for_reconciliation(db, task_id: int, error: str) -> None:
-    """Hold long-running submitted videos instead of refunding immediately.
-
-    A provider can still finish after our polling budget expires. Keeping the
-    frozen reservation and requiring admin reconciliation avoids paying the
-    upstream bill while also returning the user's credits.
-    """
-    task = db.get(GenTask, task_id)
-    if not task:
-        return
-    task.phase = "reconciling"
-    message = "视频渲染超时,已冻结额度等待人工对账。" + error[:700]
-    if not claim_terminal(db, task_id, NEEDS_REVIEW, error=message):
-        db.rollback()
-        return
-    db.commit()
-    set_progress(task_id, 100, NEEDS_REVIEW)
-
-
 def _hold_video_download_for_reconciliation(db, task_id: int, error: str) -> None:
-    """Hold provider-success tasks when only local result persistence failed."""
+    """Hold provider-success videos when local persistence failed."""
     db.rollback()
     task = db.get(GenTask, task_id)
     if not task:
         return
     params = dict(task.params or {})
-    message = (
-        "视频已由上游生成,但结果下载落盘失败,已冻结额度等待人工对账。"
-        f"external_task_id={task.external_task_id or 'unknown'}; "
-        f"result_url={'present' if params.get('_video_result_url') else 'missing'}; "
-        f"error={error[:500]}"
+    _mark_needs_review(
+        db,
+        task_id,
+        (
+            "视频已由上游生成,但结果下载落盘失败,需要系统恢复或管理员确认。"
+            f"external_task_id={task.external_task_id or 'unknown'}; "
+            f"result_url={'present' if params.get('_video_result_url') else 'missing'}; "
+            f"error={error[:500]}"
+        ),
     )
-    task.phase = "reconciling"
-    if not claim_terminal(db, task_id, NEEDS_REVIEW, error=message):
-        db.rollback()
-        return
-    db.commit()
-    set_progress(task_id, 100, NEEDS_REVIEW)
 
 
 def _submit_state_unknown(exc: Exception) -> bool:
@@ -1258,4 +1180,23 @@ def _fail_and_refund(db, task_id: int, error: str, *, public_error: str | None =
         set_progress(task_id, 100, "failed")
     except Exception:
         log.exception("fail handler errored for task %s", task_id)
+        db.rollback()
+
+
+def _mark_needs_review(db, task_id: int, error: str) -> None:
+    try:
+        db.rollback()
+        task = db.get(GenTask, task_id)
+        if not task:
+            return
+        if task.status in ("succeeded", "failed"):
+            return
+        task.status = NEEDS_REVIEW
+        task.phase = "reconciling"
+        task.error = error[:1000]
+        task.finished_at = datetime.now(timezone.utc)
+        db.commit()
+        set_progress(task_id, 100, NEEDS_REVIEW)
+    except Exception:
+        log.exception("needs-review handler errored for task %s", task_id)
         db.rollback()

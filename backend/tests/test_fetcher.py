@@ -786,10 +786,64 @@ def test_douyin_detail_business_error_falls_back_to_rendered_state(monkeypatch):
 def test_registry_routes_hosts_to_expected_platforms():
     assert fetcher._select("www.xiaohongshu.com").name == "小红书"
     assert fetcher._select("v.douyin.com").name == "抖音"
+    assert fetcher._select("x.com").name == "X"
+    assert fetcher._select("mobile.twitter.com").name == "X"
     assert fetcher._select("mp.weixin.qq.com").name == "公众号"
     # suffix spoof and arbitrary hosts fall through to the generic catch-all
     assert fetcher._select("evilxiaohongshu.com").name == "网页"
+    assert fetcher._select("notx.com").name == "网页"
     assert fetcher._select("example.com").name == "网页"
+
+
+def test_x_status_falls_back_to_rendered_twitter_image_meta(monkeypatch):
+    calls = {"httpx": 0, "playwright": 0}
+    rendered = """
+    <html><head>
+      <meta name="twitter:image"
+            content="https://pbs.twimg.com/media/GrJQ-demo?format=jpg&name=large">
+    </head><body></body></html>
+    """
+
+    monkeypatch.setattr(fetcher, "assert_safe_url", lambda url: url)
+
+    def fake_httpx(_url, **_kwargs):
+        calls["httpx"] += 1
+        return "<html><head></head><body></body></html>"
+
+    def fake_playwright(_url):
+        calls["playwright"] += 1
+        return rendered
+
+    monkeypatch.setattr(fetcher, "_render_with_httpx", fake_httpx)
+    monkeypatch.setattr(fetcher, "_render_with_playwright", fake_playwright)
+
+    assets = fetcher.parse_url("https://x.com/i/status/2069410454028296307")
+
+    assert calls == {"httpx": 1, "playwright": 1}
+    assert assets[0]["type"] == "image"
+    assert assets[0]["url"] == "https://pbs.twimg.com/media/GrJQ-demo?format=jpg&name=large"
+
+
+def test_x_status_filters_profile_images_and_prioritizes_post_media(monkeypatch):
+    html = """
+    <html><head>
+      <meta name="twitter:image"
+            content="https://pbs.twimg.com/media/post-image?format=jpg&name=large">
+    </head><body>
+      <img src="https://pbs.twimg.com/profile_images/123/avatar_400x400.jpg">
+      <img src="https://pbs.twimg.com/profile_banners/123/banner.jpg">
+    </body></html>
+    """
+
+    monkeypatch.setattr(fetcher, "assert_safe_url", lambda url: url)
+    monkeypatch.setattr(fetcher, "_render_with_httpx", lambda _url, **_kwargs: html)
+    monkeypatch.setattr(fetcher, "_render_with_playwright", lambda _url: None)
+
+    assets = fetcher.parse_url("https://twitter.com/example/status/2069410454028296307")
+
+    assert [asset["url"] for asset in assets] == [
+        "https://pbs.twimg.com/media/post-image?format=jpg&name=large"
+    ]
 
 
 def test_weixin_extracts_data_src_and_upgrades_resolution(monkeypatch):

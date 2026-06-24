@@ -313,33 +313,25 @@ def reap_stuck_tasks(db: Session, max_minutes: int = 60) -> int:
     video_window = timedelta(seconds=int(settings.video_poll_max_seconds))
     for t in rows:
         task_id = t.id
+        error_message = "任务超时,已自动失败并退回额度"
         # Don't reap a video still inside its valid poll window or actively being
         # polled — its lifecycle uses external_submitted_at, not created_at.
         if t.category == "video":
             if t.phase == "submitting" and not t.external_task_id:
-                generation._hold_for_reconciliation(
-                    db,
-                    t.id,
-                    "视频提交进程在写入外部任务号前中断,需人工确认上游是否已接受任务",
-                )
-                reaped += 1
-                continue
-            sub = _aware(t.external_submitted_at)
-            if (
-                (sub and (now - sub) < video_window)
-                or _video_poll_alive(t.id)
-                or _video_waiting_for_download(t)
-            ):
-                continue
-            if t.external_task_id:
-                generation._hold_video_timeout_for_reconciliation(
-                    db,
-                    t.id,
-                    f"视频渲染超过 {int(settings.video_poll_max_seconds)} 秒后回收器接管; "
-                    f"external_task_id={t.external_task_id or 'unknown'}",
-                )
-                reaped += 1
-                continue
+                error_message = "视频提交状态未知,已自动失败并退回额度"
+            else:
+                sub = _aware(t.external_submitted_at)
+                if (
+                    (sub and (now - sub) < video_window)
+                    or _video_poll_alive(t.id)
+                    or _video_waiting_for_download(t)
+                ):
+                    continue
+                if t.external_task_id:
+                    error_message = (
+                        f"视频渲染超时,已自动失败并退回额度; "
+                        f"external_task_id={t.external_task_id or 'unknown'}"
+                    )
         elif t.category == "image" and _image_inside_reap_window(t, now):
             continue
         # Atomic claim: skip if a worker finalized the task between our SELECT
@@ -350,8 +342,7 @@ def reap_stuck_tasks(db: Session, max_minutes: int = 60) -> int:
                 GenTask.id == t.id,
                 GenTask.status.not_in(("succeeded", "failed", generation.NEEDS_REVIEW)),
             )
-            .values(status="failed", error="任务超时,已自动失败并退回额度",
-                    finished_at=now)
+            .values(status="failed", error=error_message, finished_at=now)
         )
         if (res.rowcount or 0) != 1:
             continue
@@ -371,7 +362,7 @@ def reap_stuck_tasks(db: Session, max_minutes: int = 60) -> int:
                     .values(
                         status=generation.NEEDS_REVIEW,
                         phase="reconciling",
-                        error=f"任务超时但自动退款失败,需人工对账:{str(e)[:300]}",
+                        error=f"任务超时且自动退款失败,请联系管理员处理:{str(e)[:300]}",
                         finished_at=now,
                     )
                 )

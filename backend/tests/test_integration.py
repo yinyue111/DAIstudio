@@ -308,6 +308,9 @@ def test_external_asset_download_streams_from_temp_file(client, make_user, auth,
     r = client.get(f"/api/assets/{asset_id}/download", headers=h)
     assert r.status_code == 200, r.text
     assert r.content == b"video-bytes"
+    assert r.headers["content-type"].startswith("video/mp4")
+    assert "attachment;" in r.headers["content-disposition"]
+    assert f"asset-{asset_id}.mp4" in r.headers["content-disposition"]
     assert calls["url"] == "https://cdn.example.com/final.mp4"
     db = SessionLocal()
     try:
@@ -319,6 +322,41 @@ def test_external_asset_download_streams_from_temp_file(client, make_user, auth,
         assert "final.mp4" not in str(log.detail)
     finally:
         db.close()
+
+
+def test_external_image_download_gets_image_filename(client, make_user, auth, monkeypatch):
+    uid = make_user("13900000104", balance=1000)
+    h = auth("13900000104")
+    db = SessionLocal()
+    try:
+        asset = GenAsset(
+            task_id=0,
+            user_id=uid,
+            type="image",
+            preview_url="https://cdn.example.com/preview.jpg",
+            hd_url="https://cdn.example.com/final.jpg",
+            unlocked=True,
+        )
+        db.add(asset)
+        db.commit()
+        asset_id = asset.id
+    finally:
+        db.close()
+
+    image_bytes = b"\xff\xd8\xff\xe0" + b"image-bytes"
+
+    def fake_download_to_path(url, path, **_kwargs):
+        with open(path, "wb") as f:
+            f.write(image_bytes)
+        return len(image_bytes)
+
+    monkeypatch.setattr("app.routers.assets.gateway.download_to_path", fake_download_to_path)
+    r = client.get(f"/api/assets/{asset_id}/download", headers=h)
+    assert r.status_code == 200, r.text
+    assert r.content == image_bytes
+    assert r.headers["content-type"].startswith("image/jpeg")
+    assert "attachment;" in r.headers["content-disposition"]
+    assert f"asset-{asset_id}.jpg" in r.headers["content-disposition"]
 
 
 def test_video_preview_settles_preview_cost(client, make_user, auth):

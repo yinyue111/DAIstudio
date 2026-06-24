@@ -169,7 +169,7 @@ export function isTerminalTaskStatus(s) {
 }
 
 export function statusZh(s) {
-  return { queued: "排队中", running: "生成中", succeeded: "已完成", failed: "失败", needs_review: "待人工对账" }[s] || s;
+  return { queued: "排队中", running: "生成中", succeeded: "已完成", failed: "失败", needs_review: "待确认" }[s] || s;
 }
 
 export function statusStyle(s) {

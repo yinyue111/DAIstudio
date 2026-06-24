@@ -120,6 +120,7 @@ export default function HistoryPage() {
     const tick = async () => {
       try {
         const task = await api.task(taskId);
+        if (stopped) return;
         failures = 0;
         upsertTask(task);
         if (isTerminalStatus(task.status)) {
@@ -132,6 +133,7 @@ export default function HistoryPage() {
           return;
         }
       } catch (e) {
+        if (stopped) return;
         failures += 1;
         if (failures >= 5) {
           setMsg(`连续获取任务状态失败: ${e.message}`);
@@ -208,11 +210,16 @@ export default function HistoryPage() {
       setMsg("素材已下架，不能继续下载。");
       return;
     }
-    try {
-      await downloadBlob(`/api/assets/${asset.id}/download`);
-    } catch (e) {
-      setMsg(e.message);
-    }
+    await withAssetBusy(asset.id, async () => {
+      try {
+        await downloadBlob(
+          `/api/assets/${asset.id}/download`,
+          asset.type === "video" ? `asset-${asset.id}.mp4` : undefined,
+        );
+      } catch (e) {
+        setMsg(e.message);
+      }
+    });
   }
 
   return (
@@ -248,9 +255,12 @@ export default function HistoryPage() {
             {tasks.map((t) => {
               const finalStatus = t.final_status;
               const finalAssetCount = Number(t.final_asset_count || 0);
-              const hasActiveOrSucceededFinal = ["queued", "running", "needs_review"].includes(finalStatus)
-                || (finalStatus === "succeeded" && finalAssetCount > 0);
+              const hasPendingFinal = ["queued", "running"].includes(finalStatus);
+              const hasSucceededFinal = finalStatus === "succeeded" && finalAssetCount > 0;
+              const hasNeedsReviewFinal = finalStatus === "needs_review";
+              const hasActiveOrSucceededFinal = hasPendingFinal || hasSucceededFinal;
               const hasFailedFinal = finalStatus === "failed";
+              const hasBlockingFinal = hasActiveOrSucceededFinal || hasNeedsReviewFinal;
               return (
               <div key={t.id} className="card p-4 animate-fadeup">
                 <div className="mb-3 flex flex-wrap items-center gap-2 text-sm">
@@ -285,12 +295,17 @@ export default function HistoryPage() {
                         已提交完整渲染
                       </p>
                     )}
+                    {t.category === "video" && t.stage === "preview" && t.status === "succeeded" && hasNeedsReviewFinal && (
+                      <p className="mt-3 rounded-lg border border-warn/30 bg-warn/10 px-3 py-2 text-center text-xs text-warn">
+                        完整渲染待确认，请查看最终任务状态
+                      </p>
+                    )}
                     {t.category === "video" && t.stage === "preview" && t.status === "succeeded" && hasFailedFinal && !hasActiveOrSucceededFinal && (
                       <p className="mt-3 rounded-lg border border-warn/30 bg-warn/10 px-3 py-2 text-center text-xs text-warn">
                         完整渲染失败，可重新提交
                       </p>
                     )}
-                    {t.category === "video" && t.stage === "preview" && t.status === "succeeded" && !hasActiveOrSucceededFinal && (
+                    {t.category === "video" && t.stage === "preview" && t.status === "succeeded" && !hasBlockingFinal && (
                       <button
                         onClick={() => renderFinal(t.id)}
                         disabled={finalizingId === t.id}
@@ -308,7 +323,7 @@ export default function HistoryPage() {
                       {t.status === "failed"
                         ? t.error || "生成失败"
                         : t.status === "needs_review"
-                          ? t.error || "提交状态未知，等待管理员对账"
+                          ? t.error || "提交状态未知，等待确认"
                           : "暂无结果素材"}
                     </p>
                     {t.status === "failed" && (
@@ -401,6 +416,7 @@ function HistoryAssetButton({ asset, onOpen }) {
   return (
     <button
       onClick={onOpen}
+      aria-label={`预览${asset.type === "video" ? "视频" : "图片"}素材 #${asset.id}`}
       className="group relative overflow-hidden rounded-xl2 border border-line bg-base2 transition hover:border-line2"
       style={mediaAspectStyle(asset)}
     >
@@ -426,7 +442,7 @@ function HistoryAssetButton({ asset, onOpen }) {
 }
 
 function statusZh(s) {
-  return { queued: "排队中", running: "生成中", succeeded: "已完成", failed: "失败", needs_review: "待人工对账" }[s] || s;
+  return { queued: "排队中", running: "生成中", succeeded: "已完成", failed: "失败", needs_review: "待确认" }[s] || s;
 }
 function statusStyle(s) {
   return {

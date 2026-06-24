@@ -27,6 +27,8 @@ export default function ProfilePage() {
   const [assets, setAssets] = useState(null);
   const [loading, setLoading] = useState(false);
   const reqRef = useRef(0);
+  const loadingRef = useRef(false);
+  const assetsRef = useRef([]);
   const [hasMore, setHasMore] = useState(false);
   const [lightbox, setLightbox] = useState(null);
   const [msg, setMsg] = useState("");
@@ -56,24 +58,39 @@ export default function ProfilePage() {
   }
 
   async function loadAssets(reset) {
-    if (loading && !reset) return;  // block double load-more; a filter reset may interrupt
+    if (loadingRef.current && !reset) return;  // block double load-more; a filter reset may interrupt
+    loadingRef.current = true;
     setLoading(true);
     setMsg("");
     if (reset) {
+      assetsRef.current = [];
       setAssets(null);
       setHasMore(false);
     }
     const myReq = ++reqRef.current;  // newest request wins; stale pages are dropped
-    const off = reset ? 0 : (assets?.length || 0);
+    const currentAssets = reset ? [] : (assetsRef.current || []);
+    const off = reset ? 0 : currentAssets.length;
     try {
       const list = await api.profileAssets({ ...paramsFor(filter), limit: PAGE, offset: off });
       if (myReq !== reqRef.current) return;  // superseded (filter switch / refresh)
-      setAssets(reset ? list : [...(assets || []), ...list]);
+      const seen = new Set(currentAssets.map((asset) => asset.id));
+      const merged = reset ? [] : [...currentAssets];
+      for (const item of list) {
+        if (!seen.has(item.id)) {
+          seen.add(item.id);
+          merged.push(item);
+        }
+      }
+      assetsRef.current = merged;
+      setAssets(merged);
       setHasMore(list.length === PAGE);
     } catch (e) {
       if (myReq === reqRef.current) setMsg(e.message);
     } finally {
-      if (myReq === reqRef.current) setLoading(false);
+      if (myReq === reqRef.current) {
+        loadingRef.current = false;
+        setLoading(false);
+      }
     }
   }
 
@@ -81,9 +98,13 @@ export default function ProfilePage() {
     setAssets((prev) => {
       const list = prev || [];
       if (filter === "fav" && updated.favorite === false) {
-        return list.filter((x) => x.id !== updated.id);
+        const next = list.filter((x) => x.id !== updated.id);
+        assetsRef.current = next;
+        return next;
       }
-      return list.map((x) => (x.id === updated.id ? updated : x));
+      const next = list.map((x) => (x.id === updated.id ? updated : x));
+      assetsRef.current = next;
+      return next;
     });
     if (lightbox && lightbox.id === updated.id) setLightbox(updated);
   }
@@ -132,7 +153,11 @@ export default function ProfilePage() {
     await withAssetBusy(asset.id, async () => {
       try {
         await api.deleteAsset(asset.id);
-        setAssets((prev) => (prev || []).filter((x) => x.id !== asset.id));
+        setAssets((prev) => {
+          const next = (prev || []).filter((x) => x.id !== asset.id);
+          assetsRef.current = next;
+          return next;
+        });
         if (lightbox && lightbox.id === asset.id) setLightbox(null);
         api.profile().then(setData).catch(() => {});
       } catch (e) { setMsg(e.message); }
@@ -144,9 +169,14 @@ export default function ProfilePage() {
       setMsg("素材已下架，不能继续下载。");
       return;
     }
-    try {
-      await downloadBlob(`/api/assets/${asset.id}/download`);
-    } catch (e) { setMsg(e.message); }
+    await withAssetBusy(asset.id, async () => {
+      try {
+        await downloadBlob(
+          `/api/assets/${asset.id}/download`,
+          asset.type === "video" ? `asset-${asset.id}.mp4` : undefined,
+        );
+      } catch (e) { setMsg(e.message); }
+    });
   }
 
   async function changePassword() {
@@ -251,7 +281,12 @@ export default function ProfilePage() {
                 const takenDown = isAssetTakenDown(a);
                 return (
                   <div key={a.id} className="group overflow-hidden rounded-xl2 border border-line bg-base2">
-                    <button onClick={() => setLightbox(a)} className="relative block w-full cursor-zoom-in bg-black/20" style={mediaAspectStyle(a)}>
+                    <button
+                      onClick={() => setLightbox(a)}
+                      aria-label={`预览${a.type === "video" ? "视频" : "图片"}素材 #${a.id}`}
+                      className="relative block w-full cursor-zoom-in bg-black/20"
+                      style={mediaAspectStyle(a)}
+                    >
                       {!src ? (
                         <div className="flex h-full w-full items-center justify-center px-3 text-center text-xs text-fog">
                           {assetUnavailableText(a)}
@@ -274,17 +309,27 @@ export default function ProfilePage() {
                     </button>
                     <div className="flex items-center justify-between gap-1 p-2">
                       <div className="flex items-center gap-2">
-                        <button onClick={() => toggleFav(a)} disabled={busy || takenDown} title={takenDown ? "素材已下架" : "收藏"}
+                        <button
+                          onClick={() => toggleFav(a)}
+                          disabled={busy || takenDown}
+                          title={takenDown ? "素材已下架" : "收藏"}
+                          aria-label={`${a.favorite ? "取消收藏" : "收藏"}素材 #${a.id}`}
                           className={`text-base leading-none transition disabled:opacity-50 ${a.favorite ? "text-rose" : "text-fog hover:text-snow"}`}>
                           {a.favorite ? "★" : "☆"}
                         </button>
-                        <button onClick={() => del(a)} disabled={busy} title="删除"
+                        <button
+                          onClick={() => del(a)}
+                          disabled={busy}
+                          title="删除"
+                          aria-label={`删除${a.type === "video" ? "视频" : "图片"}素材 #${a.id}`}
                           className="text-fog transition hover:text-bad disabled:opacity-50">🗑</button>
                       </div>
                       {takenDown ? (
                         <span className="btn-secondary btn-sm cursor-not-allowed opacity-60">已下架</span>
                       ) : a.unlocked ? (
-                        <button onClick={() => download(a)} disabled={busy} className="btn-primary btn-sm">下载</button>
+                        <button onClick={() => download(a)} disabled={busy} className="btn-primary btn-sm">
+                          {busy ? "处理中…" : "下载"}
+                        </button>
                       ) : (
                         <button onClick={() => unlock(a)} disabled={busy} className="btn-secondary btn-sm">解锁</button>
                       )}

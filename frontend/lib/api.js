@@ -97,6 +97,35 @@ function filenameFromContentDisposition(value) {
   return plain ? plain[1] : "";
 }
 
+function sanitizeDownloadFilename(value) {
+  const cleaned = String(value || "")
+    .trim()
+    .replace(/[\u0000-\u001f<>:"/\\|?*]+/g, "_")
+    .replace(/\s+/g, " ");
+  return cleaned.slice(0, 180);
+}
+
+function extensionFromContentType(value) {
+  const contentType = String(value || "").split(";")[0].trim().toLowerCase();
+  return {
+    "image/jpeg": "jpg",
+    "image/png": "png",
+    "image/gif": "gif",
+    "image/webp": "webp",
+    "video/mp4": "mp4",
+    "video/webm": "webm",
+    "text/csv": "csv",
+    "application/pdf": "pdf",
+    "application/zip": "zip",
+  }[contentType] || "bin";
+}
+
+function fallbackDownloadFilename(path, contentType) {
+  const assetMatch = String(path || "").match(/\/api\/assets\/(\d+)\/download(?:\?|$)/);
+  const stem = assetMatch ? `asset-${assetMatch[1]}` : "download";
+  return `${stem}.${extensionFromContentType(contentType)}`;
+}
+
 export async function downloadBlob(path, filename) {
   const headers = {};
   const t = getToken();
@@ -116,10 +145,17 @@ export async function downloadBlob(path, filename) {
   const a = document.createElement("a");
   a.href = u;
   const responseFilename = filenameFromContentDisposition(res.headers.get("content-disposition"));
-  const finalFilename = responseFilename || filename;
-  if (finalFilename) a.download = finalFilename;
+  const finalFilename = sanitizeDownloadFilename(responseFilename || filename)
+    || fallbackDownloadFilename(path, res.headers.get("content-type"));
+  a.download = finalFilename;
+  a.rel = "noopener";
+  a.style.display = "none";
+  document.body.appendChild(a);
   a.click();
-  setTimeout(() => URL.revokeObjectURL(u), 0);
+  setTimeout(() => {
+    URL.revokeObjectURL(u);
+    a.remove();
+  }, 1000);
 }
 
 export async function authenticatedObjectUrl(pathOrUrl) {

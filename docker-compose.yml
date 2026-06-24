@@ -135,7 +135,7 @@ services:
     restart: unless-stopped
     # No -B here: beat runs in its own service so scaling workers (--scale
     # worker=N) does NOT start N schedulers racing on the same cron jobs.
-    command: celery -A app.celery_app.celery_app worker -l info --concurrency=${WORKER_CONCURRENCY:-1} -Q ${WORKER_QUEUES:-default,image,video_submit,video_poll,video_download,parse,cleanup,payment}
+    command: celery -A app.celery_app.celery_app worker -l info --concurrency=${WORKER_CONCURRENCY:-4} -Q ${WORKER_QUEUES:-default,image,video_submit,video_poll,video_download,parse,cleanup,payment}
     env_file: ./backend/.env
     environment:
       DATABASE_URL: postgresql+psycopg2://postgres:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD to a strong database password}@postgres:5432/ai_studio

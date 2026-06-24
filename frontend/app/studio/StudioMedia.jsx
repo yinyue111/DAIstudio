@@ -118,7 +118,7 @@ export function ResultCard({ a, onOpen, onUnlock, onDownload, onReport, unlockin
     <div className="group overflow-hidden rounded-xl2 border border-line bg-base2">
       <button
         type="button"
-        aria-label={takenDown ? "查看素材状态" : "预览素材"}
+        aria-label={`${takenDown ? "查看素材状态" : "预览素材"} #${a.id}`}
         className="relative block w-full cursor-zoom-in bg-black/20 text-left"
         style={ratioStyle}
         onClick={onOpen}
@@ -146,8 +146,8 @@ export function ResultCard({ a, onOpen, onUnlock, onDownload, onReport, unlockin
         ) : a.unlocked ? (
           <div className="flex gap-1.5">
             <button onClick={onOpen} className="btn-secondary btn-sm">预览</button>
-            <button onClick={onDownload} className="btn-primary btn-sm flex-1">
-              {isPreviewVideoAsset(a) ? "下载预览" : "下载高清"}
+            <button onClick={onDownload} disabled={unlocking} className="btn-primary btn-sm flex-1">
+              {unlocking ? "处理中…" : isPreviewVideoAsset(a) ? "下载预览" : "下载高清"}
             </button>
             <button onClick={onReport} className="btn-secondary btn-sm">举报</button>
           </div>
@@ -170,7 +170,12 @@ export function MasonryItem({ a, onOpen }) {
   const ratioStyle = mediaAspectStyle(a);
   const takenDown = isAssetTakenDown(a);
   return (
-    <button onClick={onOpen} className="group relative block w-full overflow-hidden rounded-xl2 border border-line bg-base2" style={ratioStyle}>
+    <button
+      onClick={onOpen}
+      aria-label={`预览${a.type === "video" ? "视频" : "图片"}素材 #${a.id}`}
+      className="group relative block w-full overflow-hidden rounded-xl2 border border-line bg-base2"
+      style={ratioStyle}
+    >
       {!src ? (
         <div className="flex h-full w-full items-center justify-center px-3 text-center text-xs text-fog">
           {assetUnavailableText(a)}
@@ -239,7 +244,7 @@ export function Lightbox({ a, onClose, onUnlock, onDownload, onReport, unlocking
                 {unlocking ? "解锁中…" : "解锁高清"}
               </button>
             )}
-            {!takenDown && a.unlocked && <button onClick={onDownload} className="btn-primary btn-sm">下载</button>}
+            {!takenDown && a.unlocked && <button onClick={onDownload} disabled={unlocking} className="btn-primary btn-sm">{unlocking ? "处理中…" : "下载"}</button>}
             <button onClick={onReport} className="btn-secondary btn-sm">举报</button>
             <button onClick={onClose} className="btn-secondary btn-sm">关闭</button>
           </div>

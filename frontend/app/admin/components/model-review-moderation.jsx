@@ -350,8 +350,8 @@ export function ReviewTasks() {
     <Card>
       <div className="mb-4 flex flex-wrap items-center justify-between gap-2">
         <div>
-          <div className="text-sm font-display font-semibold text-snow">待人工对账任务</div>
-          <div className="mt-1 text-xs text-fog">视频提交状态未知时会保留冻结额度，超过 SLA 的任务会高亮显示。</div>
+          <div className="text-sm font-display font-semibold text-snow">异常任务处理</div>
+          <div className="mt-1 text-xs text-fog">查看历史异常任务，必要时补结果或退款。</div>
         </div>
         <button onClick={load} className="btn-secondary btn-sm">刷新</button>
       </div>

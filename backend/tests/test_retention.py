@@ -3,7 +3,7 @@ from datetime import datetime, timedelta, timezone
 
 from app.config import settings
 from app.db import SessionLocal
-from app.models import GenTask, UploadedAsset
+from app.models import GenTask, UploadedAsset, User
 from app.services import credits, retention, storage
 
 
@@ -451,5 +451,47 @@ def test_reaper_refunds_image_after_configured_gateway_window(client, make_user,
         reaped = db.get(GenTask, task_id)
         assert reaped.status == "failed"
         assert "任务超时" in reaped.error
+    finally:
+        db.close()
+
+
+def test_reaper_holds_for_review_when_refund_fails(client, make_user, monkeypatch):
+    monkeypatch.setattr(settings, "image_gateway_timeout_seconds", 60)
+    monkeypatch.setattr(settings, "image_download_timeout_seconds", 60)
+    monkeypatch.setattr(settings, "celery_task_time_limit_seconds", 60)
+    uid = make_user("13900000441", balance=1000)
+    db = SessionLocal()
+    try:
+        _clear_active_generation_tasks(db)
+        task = GenTask(
+            user_id=uid,
+            category="image",
+            stage="preview",
+            status="running",
+            cost_frozen=20,
+            cost_settled=0,
+            created_at=datetime.now(timezone.utc) - timedelta(minutes=20),
+        )
+        db.add(task)
+        db.commit()
+        task_id = task.id
+        credits.freeze(db, uid, 20, task_id)
+        user_after_freeze = db.get(User, uid)
+        frozen_after_freeze = user_after_freeze.frozen_credits
+        balance_after_freeze = user_after_freeze.balance_credits
+
+        def fail_refund(*_args, **_kwargs):
+            raise RuntimeError("ledger mismatch")
+
+        monkeypatch.setattr(retention.credits, "refund", fail_refund)
+
+        assert retention.reap_stuck_tasks(db, max_minutes=5) == 1
+        held = db.get(GenTask, task_id)
+        assert held.status == "needs_review"
+        assert held.phase == "reconciling"
+        assert "自动退款失败" in held.error
+        user = db.get(User, uid)
+        assert user.frozen_credits == frozen_after_freeze
+        assert user.balance_credits == balance_after_freeze
     finally:
         db.close()

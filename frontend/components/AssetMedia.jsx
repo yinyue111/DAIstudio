@@ -69,7 +69,7 @@ export default function AssetMedia({
         })
         .catch((e) => {
           if (!cancelled) {
-            setError(e.message || "高清预览加载失败");
+            if (!asset.preview_url) setError(e.message || "高清预览加载失败");
             if (onError) onError(e);
           }
         });

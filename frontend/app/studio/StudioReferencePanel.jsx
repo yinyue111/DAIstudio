@@ -48,11 +48,11 @@ export default function StudioReferencePanel({
     : (category === "video" ? "点击上传视频，下方也可改传图片或粘贴链接" : "点击上传图片，下方也可粘贴链接抓取素材");
 
   return (
-    <aside className="relative overflow-hidden rounded-xl3 border border-iris/35 bg-gradient-to-b from-iris/20 via-base2/80 to-rose/10 p-3 shadow-glow-sm">
+    <aside className="relative min-w-0 overflow-hidden rounded-xl3 border border-iris/35 bg-gradient-to-b from-iris/20 via-base2/80 to-rose/10 p-3 shadow-glow-sm">
       <div className="pointer-events-none absolute -right-16 -top-16 h-32 w-32 rounded-full bg-rose/25 blur-3xl" />
       <div className="relative">
-        <div className="mb-3 flex items-start justify-between gap-3">
-          <div>
+        <div className="mb-3 flex min-w-0 items-start justify-between gap-3">
+          <div className="min-w-0">
             <p className="text-xs font-display font-semibold text-iris-400">参考素材</p>
             <h3 className="mt-1 text-lg font-display font-semibold text-snow">
               {modeTitle}
@@ -65,14 +65,14 @@ export default function StudioReferencePanel({
           )}
         </div>
 
-        <div className="mb-3 rounded-xl2 border border-line bg-black/15 p-2">
-          <div className="mb-2 flex items-center justify-between gap-2">
-            <div>
+        <div className="mb-3 min-w-0 rounded-xl2 border border-line bg-black/15 p-2">
+          <div className="mb-2 flex min-w-0 items-center justify-between gap-2">
+            <div className="min-w-0">
               <p className="text-sm font-display font-semibold text-snow">{styleTitle}</p>
               <p className="mt-0.5 text-[11px] text-fog">{styleDescription}</p>
             </div>
             {selected && (
-              <span className="badge bg-iris/25 text-mist">
+              <span className="badge shrink-0 bg-iris/25 text-mist">
                 {selected.type === "video" ? "视频" : "图片"}
               </span>
             )}
@@ -182,10 +182,10 @@ export default function StudioReferencePanel({
         )}
 
         <div className="space-y-2">
-          <div className="grid grid-cols-[1fr_auto] gap-2">
+          <div className="grid min-w-0 grid-cols-[minmax(0,1fr)_auto] gap-2">
             <input
-              className="input px-3 py-2 text-xs"
-              placeholder="粘贴小红书 / 抖音 / 网页链接…"
+              className="input min-w-0 px-3 py-2 text-xs"
+              placeholder="粘贴小红书 / 抖音 / X / 网页链接…"
               value={url}
               onChange={(e) => setUrl(e.target.value)}
               onKeyDown={(e) => e.key === "Enter" && onParse()}
@@ -297,7 +297,7 @@ export default function StudioReferencePanel({
               </button>
             </div>
             {refOpen && (
-              <div className="grid grid-cols-4 gap-2">
+              <div className="grid grid-cols-3 gap-2 sm:grid-cols-4">
                 {assets.map((asset, i) => (
                   <button
                     key={i}

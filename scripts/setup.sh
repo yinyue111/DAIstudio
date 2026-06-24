@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# One-time setup: python venv + deps, optional Playwright browser, DB init, npm install.
+# One-time setup: python venv + deps, optional Playwright browser, DB init, npm ci.
 set -e
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
@@ -39,9 +39,9 @@ alembic upgrade head
 python -m scripts.init_db --admin-phone "${ADMIN_PHONE:-13800000000}" --credits 1000
 deactivate
 
-echo "==> frontend: npm install"
+echo "==> frontend: npm ci"
 cd "$ROOT/frontend"
-npm install
+npm ci
 [ -f .env.local ] || cp .env.local.example .env.local
 
 echo ""

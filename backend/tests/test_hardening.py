@@ -201,7 +201,7 @@ def test_partial_image_generation_exposes_gateway_slot_failure(client, make_user
     assert task["cost_settled"] == 10
 
 
-def test_partial_image_generation_unknown_slot_holds_for_review(
+def test_partial_image_generation_unknown_slot_settles_saved_results(
     client,
     make_user,
     auth,
@@ -234,11 +234,17 @@ def test_partial_image_generation_unknown_slot_holds_for_review(
 
     assert r.status_code == 200, r.text
     task = client.get(f"/api/tasks/{r.json()['id']}", headers=h).json()
-    assert task["status"] == "needs_review"
-    assert "部分槽位提交状态未知" in task["error"]
+    assert task["status"] == "succeeded"
+    assert task["partial"] is True
+    assert task["requested_count"] == 4
+    assert task["saved_count"] == 2
+    assert task["skipped_count"] == 2
+    assert task["partial_errors"] == ["read timed out"]
     assert task["cost_frozen"] == 20
-    assert task["cost_settled"] == 0
-    assert client.get("/api/me", headers=h).json()["frozen_credits"] == 20
+    assert task["cost_settled"] == 10
+    me = client.get("/api/me", headers=h).json()
+    assert me["balance_credits"] == 990
+    assert me["frozen_credits"] == 0
 
 
 def test_task_list_batched_keeps_assets_per_task(client, make_user, auth):

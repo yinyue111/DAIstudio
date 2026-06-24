@@ -127,7 +127,7 @@ def test_video_rejects_non_video_content(client, make_user, auth, monkeypatch):
     assert client.get("/api/me", headers=h).json()["balance_credits"] == 1000  # refunded
 
 
-def test_video_submit_failure_persists_request_id_for_reconciliation(
+def test_video_submit_unknown_state_fails_and_refunds(
     client,
     make_user,
     auth,
@@ -152,9 +152,12 @@ def test_video_submit_failure_persists_request_id_for_reconciliation(
     db = SessionLocal()
     try:
         task = db.get(GenTask, r.json()["id"])
-        assert task.status == "needs_review"
+        assert task.status == "failed"
         assert (task.params or {}).get("_video_request_id", "").startswith(f"video-{task.id}-")
-        assert "等待人工对账" in (task.error or "")
+        assert "视频提交状态未知" in (task.error or "")
+        user = db.get(User, task.user_id)
+        assert user.balance_credits == 1000
+        assert user.frozen_credits == 0
     finally:
         db.close()
 
@@ -252,7 +255,8 @@ def test_video_unknown_submit_request_id_miss_is_recorded_as_failed_call(
     db = SessionLocal()
     try:
         row = db.get(GenTask, r.json()["id"])
-        assert row.status == "needs_review"
+        assert row.status == "failed"
+        assert "视频提交状态未知" in (row.error or "")
         call = db.query(GatewayCall).filter(
             GatewayCall.task_id == row.id,
             GatewayCall.kind == "video_submit",
@@ -419,7 +423,7 @@ def test_admin_settle_download_failure_keeps_task_in_review(
     assert any(task["id"] == tid and task["status"] == "needs_review" for task in tasks)
 
 
-def test_image_gateway_timeout_enters_review_without_refund(client, make_user, auth, monkeypatch):
+def test_image_gateway_timeout_fails_and_refunds(client, make_user, auth, monkeypatch):
     make_user("13900000984", balance=1000, admin=True)
     h = auth("13900000984")
     monkeypatch.setattr(
@@ -439,11 +443,11 @@ def test_image_gateway_timeout_enters_review_without_refund(client, make_user, a
     tid = r.json()["id"]
 
     body = client.get(f"/api/tasks/{tid}", headers=h).json()
-    assert body["status"] == "needs_review"
-    assert "图片提交状态未知" in body["error"]
+    assert body["status"] == "failed"
+    assert "图片生成等待超时" in body["error"]
     me = client.get("/api/me", headers=h).json()
-    assert me["balance_credits"] == 995
-    assert me["frozen_credits"] == 5
+    assert me["balance_credits"] == 1000
+    assert me["frozen_credits"] == 0
     db = SessionLocal()
     try:
         assert db.query(GenAsset).filter(GenAsset.task_id == tid).count() == 0
@@ -762,7 +766,7 @@ def test_video_download_uses_persisted_provider_usage_for_settlement(
     assert t["cost_settled"] == 4
 
 
-def test_video_download_final_failure_holds_for_review(client, make_user, monkeypatch):
+def test_video_download_final_failure_fails_and_refunds(client, make_user, monkeypatch):
     uid = make_user("13900000088", balance=1000)
     db = SessionLocal()
     try:
@@ -803,11 +807,10 @@ def test_video_download_final_failure_holds_for_review(client, make_user, monkey
     try:
         task = db.get(GenTask, tid)
         user = db.get(User, uid)
-        assert task.status == "needs_review"
-        assert task.phase == "reconciling"
-        assert "等待人工对账" in task.error
-        assert user.balance_credits == 995
-        assert user.frozen_credits == 5
+        assert task.status == "failed"
+        assert "视频结果下载失败" in task.error
+        assert user.balance_credits == 1000
+        assert user.frozen_credits == 0
         row = db.query(GatewayCall).filter(
             GatewayCall.task_id == tid,
             GatewayCall.kind == "video_download",
@@ -1009,7 +1012,7 @@ def test_reaper_skips_pending_video_download_without_alive_key(client, make_user
         db.close()
 
 
-def test_reaper_holds_video_submitting_without_external_id_for_review(client, make_user, auth):
+def test_reaper_refunds_video_submitting_without_external_id(client, make_user, auth):
     uid = make_user("13900000974", balance=1000, admin=True)
     h = auth("13900000974")
     _config_video(client, h)
@@ -1030,19 +1033,23 @@ def test_reaper_holds_video_submitting_without_external_id_for_review(client, ma
         credits.freeze(db, uid, 5, biz_ref=t.id, commit=False)
         db.commit()
         tid = t.id
+        user = db.get(User, uid)
+        balance_after_freeze = user.balance_credits
+        frozen_after_freeze = user.frozen_credits
 
         assert retention.reap_stuck_tasks(db, max_minutes=60) == 1
-        held = db.get(GenTask, tid)
-        assert held.status == "needs_review"
-        assert held.cost_settled == 0
-        assert "人工确认" in (held.error or "")
+        failed = db.get(GenTask, tid)
+        assert failed.status == "failed"
+        assert failed.cost_settled == 0
+        assert "视频提交状态未知" in (failed.error or "")
         user = db.get(User, uid)
-        assert user.frozen_credits == 5
+        assert user.balance_credits == balance_after_freeze + frozen_after_freeze
+        assert user.frozen_credits == 0
     finally:
         db.close()
 
 
-def test_reaper_holds_submitted_video_timeout_for_review(client, make_user, auth, monkeypatch):
+def test_reaper_refunds_submitted_video_timeout(client, make_user, auth, monkeypatch):
     uid = make_user("13900000982", balance=1000, admin=True)
     h = auth("13900000982")
     _config_video(client, h)
@@ -1072,18 +1079,17 @@ def test_reaper_holds_submitted_video_timeout_for_review(client, make_user, auth
         frozen_after_freeze = user.frozen_credits
 
         assert retention.reap_stuck_tasks(db, max_minutes=60) == 1
-        held = db.get(GenTask, tid)
+        failed = db.get(GenTask, tid)
         user = db.get(User, uid)
-        assert held.status == "needs_review"
-        assert held.phase == "reconciling"
-        assert "视频渲染超时" in (held.error or "")
-        assert user.balance_credits == balance_after_freeze
-        assert user.frozen_credits == frozen_after_freeze
+        assert failed.status == "failed"
+        assert "视频渲染超时" in (failed.error or "")
+        assert user.balance_credits == balance_after_freeze + frozen_after_freeze
+        assert user.frozen_credits == 0
     finally:
         db.close()
 
 
-def test_video_render_timeout_holds_for_review_without_refund(client, make_user, auth, monkeypatch):
+def test_video_render_timeout_fails_and_refunds(client, make_user, auth, monkeypatch):
     uid = make_user("13900000976", balance=1000, admin=True)
     h = auth("13900000976")
     _config_video(client, h)
@@ -1117,13 +1123,12 @@ def test_video_render_timeout_holds_for_review_without_refund(client, make_user,
     db = SessionLocal()
     try:
         task = db.get(GenTask, tid)
-        assert task.status == "needs_review"
-        assert task.phase == "reconciling"
+        assert task.status == "failed"
         assert task.cost_settled == 0
         assert "视频渲染超时" in (task.error or "")
         user = db.get(User, uid)
-        assert user.balance_credits == balance_after_freeze
-        assert user.frozen_credits == frozen_after_freeze
+        assert user.balance_credits == balance_after_freeze + frozen_after_freeze
+        assert user.frozen_credits == 0
     finally:
         db.close()
 

@@ -17,6 +17,7 @@ import {
 } from "./studio/constants";
 import StudioReferencePanel from "./studio/StudioReferencePanel";
 import StudioResults from "./studio/StudioResults";
+import { generationSubmitDisabled, shouldBlockNewGeneration } from "./studio/taskConcurrency";
 import {
   assetDims,
   assetSignature,
@@ -108,6 +109,7 @@ export default function Home() {
 
   const pollRef = useRef(null);
   const wsRef = useRef(null);
+  const backgroundTrackersRef = useRef(new Map());
   const activeIdRef = useRef(null); // id of the task currently being tracked
   const selectedRef = useRef(null);
   const refVersionRef = useRef(0);
@@ -150,6 +152,8 @@ export default function Home() {
     return () => {
       if (pollRef.current) clearInterval(pollRef.current);
       if (wsRef.current) try { wsRef.current.close(); } catch (e) {}
+      backgroundTrackersRef.current.forEach((stop) => stop());
+      backgroundTrackersRef.current.clear();
       revokeUploadedObjectUrls();
       revokeProductObjectUrl();
     };
@@ -522,8 +526,8 @@ export default function Home() {
 
   async function submit(stage = "preview") {
     if (submitting) return;  // reentrancy guard: protects every caller incl. double-clicks + Ctrl+Enter
-    if (task && !isTerminalTaskStatus(task.status)) {
-      setMsg("当前任务仍在生成中，请等待完成后再发起新的生成。");
+    if (shouldBlockNewGeneration(task, category)) {
+      setMsg(category === "image" ? "" : "当前视频任务仍在生成中，请等待完成后再发起新的视频生成。");
       return;
     }
     const isFinal = stage === "final" && task;
@@ -618,6 +622,16 @@ export default function Home() {
       requestId = payload.client_request_id;
       const t = await api.generate(payload);
       clearPendingGenerateRequest(requestId);
+      const previousTask = task;
+      if (
+        previousTask
+        && previousTask.id !== t.id
+        && previousTask.category === "image"
+        && !isTerminalTaskStatus(previousTask.status)
+        && !backgroundTrackersRef.current.has(previousTask.id)
+      ) {
+        backgroundTrackersRef.current.set(previousTask.id, startBackgroundTracking(previousTask.id));
+      }
       setTask(t);
       if (stage === "preview") setFinalTaskId(null);
       if (isFinal) setFinalTaskId(t.id);
@@ -684,6 +698,43 @@ export default function Home() {
     } catch (e) { startPolling(id); }
   }
 
+  function startBackgroundTracking(id) {
+    let stopped = false;
+    let timer = null;
+    let failures = 0;
+    const stop = () => {
+      stopped = true;
+      if (timer) clearTimeout(timer);
+    };
+    const schedule = () => {
+      if (!stopped) timer = setTimeout(tick, 3000);
+    };
+    const tick = async () => {
+      try {
+        const t = await api.task(id);
+        if (stopped) return;
+        failures = 0;
+        if (isTerminalTaskStatus(t.status)) {
+          stop();
+          backgroundTrackersRef.current.delete(id);
+          refreshMe();
+          loadWorks();
+          return;
+        }
+      } catch (e) {
+        failures += 1;
+        if (failures >= 5) {
+          stop();
+          backgroundTrackersRef.current.delete(id);
+          return;
+        }
+      }
+      schedule();
+    };
+    schedule();
+    return stop;
+  }
+
   function startPolling(id) {
     if (pollRef.current) clearInterval(pollRef.current);
     let fails = 0;
@@ -742,9 +793,14 @@ export default function Home() {
   }
 
   async function download(asset) {
-    try {
-      await downloadBlob(`/api/assets/${asset.id}/download`);
-    } catch (e) { setMsg(e.message); }
+    await withAssetBusy(asset.id, async () => {
+      try {
+        await downloadBlob(
+          `/api/assets/${asset.id}/download`,
+          asset.type === "video" ? `asset-${asset.id}.mp4` : undefined,
+        );
+      } catch (e) { setMsg(e.message); }
+    });
   }
 
   async function report(asset) {
@@ -777,7 +833,8 @@ export default function Home() {
   }
 
   const activeNonTerminalTask = Boolean(task && !isTerminalTaskStatus(task.status));
-  const running = activeNonTerminalTask;
+  const blockingGeneration = shouldBlockNewGeneration(task, category);
+  const running = blockingGeneration;
   const showRunningProgress = activeNonTerminalTask && !trackingLost;
   const unitCost = cfg?.models?.[category]?.cost_credits || 0;
   const videoPreviewCost = cfg?.models?.video?.preview_cost ?? Math.max(1, Math.floor((cfg?.models?.video?.cost_credits || 0) / 10));
@@ -833,11 +890,39 @@ export default function Home() {
           ? "编辑生成 ✦"
           : "立即生成 ✦";
 
+  function renderSubmitBar(variant = "desktop") {
+    const isMobile = variant === "mobile";
+    return (
+      <div
+        className={isMobile
+          ? "fixed inset-x-0 bottom-0 z-30 flex min-w-0 items-center justify-between gap-3 border-t border-line bg-base/90 px-4 pt-3 pb-[calc(0.75rem+env(safe-area-inset-bottom))] shadow-pop backdrop-blur-xl lg:hidden"
+          : "mt-3 hidden min-w-0 items-center justify-between gap-3 px-1 lg:flex"
+        }
+      >
+        <p className="min-w-0 text-xs leading-snug text-fog">
+          {estCost ? (
+            <>预计消耗 <b className="text-mist">{category === "video" ? `预览 ${videoPreviewCost} · 完整 ${videoFinalCost} · ${formatDuration(videoDuration)} · ${vResolution}` : estCost}</b> 积分{category === "image" ? " · 可连续提交" : ""}</>
+          ) : "提交后冻结预估积分"}
+        </p>
+        <button
+          onClick={() => submit("preview")}
+          disabled={generationSubmitDisabled({ submitting, currentTask: task, nextCategory: category, currentModelEnabled })}
+          className="btn-primary btn-lg min-w-28 shrink-0 px-4 sm:min-w-32 sm:px-6"
+        >
+          {(submitting || running) && (
+            <span className="h-4 w-4 shrink-0 animate-spin rounded-full border-2 border-white/35 border-t-white" aria-hidden />
+          )}
+          {submitLabel}
+        </button>
+      </div>
+    );
+  }
+
   function renderGenerationControls() {
     return (
       <>
-        <div className="flex flex-wrap items-center gap-x-5 gap-y-3 px-1 py-1">
-          <div className="min-w-0 flex-1 basis-full">
+        <div className="grid min-w-0 gap-3 px-1 py-1 lg:flex lg:flex-wrap lg:items-start lg:gap-x-5 lg:gap-y-3">
+          <div className="min-w-0 lg:flex-1 lg:basis-full">
             <span className="text-xs text-fog">比例</span>
             <div className="no-scrollbar mt-1 flex gap-1 overflow-x-auto pb-1">
               {ratioOptions.map((r) => (
@@ -845,7 +930,7 @@ export default function Home() {
                   key={r.key}
                   onClick={() => setRatio(r.key)}
                   title={r.hint}
-                  className={`group flex flex-col items-center gap-1 rounded-lg border px-2 py-1.5 transition ${
+                  className={`group flex shrink-0 flex-col items-center gap-1 rounded-lg border px-2 py-1.5 transition ${
                     ratio === r.key ? "border-iris bg-iris/15" : "border-line hover:border-line2"
                   }`}
                 >
@@ -861,25 +946,25 @@ export default function Home() {
 
           {category === "image" ? (
             <>
-              <div className="flex items-center gap-2">
+              <div className="grid min-w-0 gap-2 rounded-xl border border-line bg-white/[0.03] px-3 py-2 sm:grid-cols-[auto_minmax(0,1fr)_auto] sm:items-center lg:flex lg:flex-none lg:flex-wrap lg:border-0 lg:bg-transparent lg:px-0 lg:py-0">
                 <span className="text-xs text-fog">质量</span>
-                <div className="flex gap-1">
+                <div className="no-scrollbar flex min-w-0 gap-1 overflow-x-auto pb-1 sm:pb-0 lg:overflow-visible">
                   {IMAGE_QUALITY_PRESETS.map((q) => (
                     <button key={q.key} onClick={() => setImageQuality(q.key)} title={q.hint}
-                      className={`chip ${imageQuality === q.key ? "chip-active" : ""}`}>{q.label}</button>
+                      className={`chip shrink-0 ${imageQuality === q.key ? "chip-active" : ""}`}>{q.label}</button>
                   ))}
                 </div>
-                <span className="text-xs text-fog">{currentImageSize}</span>
+                <span className="min-w-0 truncate text-xs text-fog sm:text-right lg:text-left">{currentImageSize}</span>
               </div>
-              <div className="flex items-center gap-2">
+              <div className="grid min-w-0 gap-2 rounded-xl border border-line bg-white/[0.03] px-3 py-2 sm:grid-cols-[auto_minmax(0,1fr)_5rem] sm:items-center lg:flex lg:flex-none lg:flex-wrap lg:border-0 lg:bg-transparent lg:px-0 lg:py-0">
                 <span className="text-xs text-fog">数量</span>
-                <div className="flex gap-1">
+                <div className="no-scrollbar flex min-w-0 gap-1 overflow-x-auto pb-1 sm:pb-0 lg:overflow-visible">
                   {[1, 2, 4, 8].map((v) => (
-                    <button key={v} onClick={() => setN(v)} className={`chip ${imageCount === v ? "chip-active" : ""}`}>{v}</button>
+                    <button key={v} onClick={() => setN(v)} className={`chip shrink-0 ${imageCount === v ? "chip-active" : ""}`}>{v}</button>
                   ))}
                 </div>
                 <input
-                  className="input w-20 px-2 py-1 text-xs"
+                  className="input w-full px-2 py-1 text-xs sm:w-20"
                   type="number"
                   min="1"
                   max={maxImageN}
@@ -892,9 +977,9 @@ export default function Home() {
             </>
           ) : (
             <>
-              <div className="flex items-center gap-2">
+              <div className="grid min-w-0 gap-2 rounded-xl border border-line bg-white/[0.03] px-3 py-2 sm:grid-cols-[auto_minmax(0,1fr)_6rem] sm:items-center lg:flex lg:flex-none lg:flex-wrap lg:border-0 lg:bg-transparent lg:px-0 lg:py-0">
                 <span className="text-xs text-fog">时长</span>
-                <div className="no-scrollbar flex max-w-full gap-1 overflow-x-auto pb-1">
+                <div className="no-scrollbar flex min-w-0 gap-1 overflow-x-auto pb-1 sm:pb-0">
                   {VIDEO_DURATION_PRESETS.filter((p) => p.seconds <= maxVideoDuration).map((p) => (
                     <button
                       key={p.seconds}
@@ -907,7 +992,7 @@ export default function Home() {
                   ))}
                 </div>
                 <input
-                  className="input w-24 px-2 py-1 text-xs"
+                  className="input w-full px-2 py-1 text-xs sm:w-24"
                   type="number"
                   min="1"
                   max={maxVideoDuration}
@@ -917,28 +1002,30 @@ export default function Home() {
                   title={`最长 ${formatDuration(maxVideoDuration)}`}
                 />
               </div>
-              <div className="flex items-center gap-2">
+              <div className="grid min-w-0 gap-2 rounded-xl border border-line bg-white/[0.03] px-3 py-2 sm:grid-cols-[auto_minmax(0,1fr)] sm:items-center lg:flex lg:flex-none lg:border-0 lg:bg-transparent lg:px-0 lg:py-0">
                 <span className="text-xs text-fog">质量</span>
-                <div className="flex gap-1">
+                <div className="no-scrollbar flex min-w-0 gap-1 overflow-x-auto pb-1 sm:pb-0 lg:overflow-visible">
                   {VIDEO_QUALITIES.map((q) => (
                     <button key={q.key} onClick={() => setVResolution(q.key)} title={q.hint}
-                      className={`chip ${vResolution === q.key ? "chip-active" : ""}`}>{q.label}</button>
+                      className={`chip shrink-0 ${vResolution === q.key ? "chip-active" : ""}`}>{q.label}</button>
                   ))}
                 </div>
               </div>
             </>
           )}
 
-          <button onClick={() => setShowNegative((s) => !s)} className={`chip ${showNegative ? "chip-active" : ""}`}>
-            负向词
-          </button>
-          {category === "image" && (
-            <label className="flex items-center gap-1.5 text-xs text-fog">
-              seed
-              <input className="input w-20 px-2 py-1 text-xs" placeholder="随机" value={seed}
-                onChange={(e) => setSeed(e.target.value.replace(/[^0-9]/g, ""))} />
-            </label>
-          )}
+          <div className="grid min-w-0 gap-2 sm:grid-cols-2 lg:flex lg:flex-none lg:items-center">
+            <button onClick={() => setShowNegative((s) => !s)} className={`chip justify-center ${showNegative ? "chip-active" : ""}`}>
+              负向词
+            </button>
+            {category === "image" && (
+              <label className="grid min-w-0 grid-cols-[auto_minmax(0,1fr)] items-center gap-2 text-xs text-fog">
+                seed
+                <input className="input min-w-0 px-2 py-1 text-xs lg:w-20" placeholder="随机" value={seed}
+                  onChange={(e) => setSeed(e.target.value.replace(/[^0-9]/g, ""))} />
+              </label>
+            )}
+          </div>
         </div>
 
         {showNegative && (
@@ -946,19 +1033,7 @@ export default function Home() {
             value={negative} onChange={(e) => { setNegative(e.target.value); setNegativeTouched(true); }} />
         )}
 
-        <div className="mt-3 flex items-center justify-between gap-3 px-1 max-lg:fixed max-lg:inset-x-0 max-lg:bottom-0 max-lg:z-30 max-lg:mt-0 max-lg:gap-4 max-lg:border-t max-lg:border-line max-lg:bg-base/85 max-lg:px-4 max-lg:pt-3 max-lg:pb-[calc(0.75rem+env(safe-area-inset-bottom))] max-lg:backdrop-blur-xl">
-          <p className="min-w-0 text-xs text-fog">
-            {estCost ? (
-              <>预计消耗 <b className="text-mist">{category === "video" ? `预览 ${videoPreviewCost} · 完整 ${videoFinalCost} · ${formatDuration(videoDuration)} · ${vResolution}` : estCost}</b> 积分</>
-            ) : "提交后冻结预估积分"}
-          </p>
-          <button onClick={() => submit("preview")} disabled={submitting || running || !currentModelEnabled} className="btn-primary btn-lg min-w-32 shrink-0">
-            {(submitting || running) && (
-              <span className="h-4 w-4 shrink-0 animate-spin rounded-full border-2 border-white/35 border-t-white" aria-hidden />
-            )}
-            {submitLabel}
-          </button>
-        </div>
+        {renderSubmitBar("desktop")}
       </>
     );
   }
@@ -967,14 +1042,14 @@ export default function Home() {
     <div className="min-h-screen">
       <Nav me={me} active="studio" />
 
-      <main className="mx-auto max-w-7xl px-4 pb-28 pt-7 sm:px-6 sm:pb-24 sm:pt-10">
+      <main className="mx-auto max-w-7xl overflow-x-hidden px-3 pb-28 pt-7 sm:px-6 sm:pb-24 sm:pt-10">
         {/* hero */}
         <section className="mx-auto mb-6 max-w-3xl text-center animate-fadeup sm:mb-8">
           <div className="mb-4 inline-flex items-center gap-2 rounded-full border border-line bg-white/5 px-3 py-1 text-xs text-mist">
             <span className="h-1.5 w-1.5 rounded-full bg-aqua animate-glowpulse" />
             {gatewayStatus}
           </div>
-          <h1 className="text-4xl font-extrabold leading-tight sm:text-5xl">
+          <h1 className="text-3xl font-extrabold leading-tight sm:text-5xl">
             一句话，<span className="text-grad">生成你的画面</span>
           </h1>
           <p className="mt-3 text-[15px] text-mist">
@@ -983,8 +1058,8 @@ export default function Home() {
         </section>
 
         {/* creation console */}
-        <section className="mx-auto max-w-5xl animate-fadeup">
-          <div className="panel p-2.5">
+        <section className="mx-auto max-w-5xl min-w-0 lg:animate-fadeup">
+          <div className="panel min-w-0 p-2.5">
             {/* creation mode tabs */}
             <div className="mb-2.5 grid grid-cols-2 gap-1 rounded-2xl border border-line bg-base2/50 p-1 text-sm sm:grid-cols-4">
               {CREATION_MODES.map(({ key, label, icon }) => {
@@ -1014,8 +1089,8 @@ export default function Home() {
             )}
 
             {/* prompt + reference */}
-            <div className="grid items-start gap-3 lg:grid-cols-[minmax(0,1fr)_320px]">
-              <div className="rounded-xl3 border border-line bg-base2/40 p-3 lg:self-start">
+            <div className="grid min-w-0 items-start gap-3 lg:grid-cols-[minmax(0,1fr)_320px]">
+              <div className="min-w-0 rounded-xl3 border border-line bg-base2/40 p-3 lg:self-start">
                 {isEditMode ? (
                   <div className="grid gap-3">
                     <div className="rounded-2xl border border-line2 bg-gradient-to-br from-iris/15 via-white/[0.055] to-aqua/10 p-4">
@@ -1084,7 +1159,7 @@ export default function Home() {
                       </div>
                     </div>
 
-                    <div className="grid gap-3 xl:grid-cols-[1fr_1.15fr]">
+                    <div className="grid min-w-0 gap-3 xl:grid-cols-[1fr_1.15fr]">
                       <div className="rounded-2xl border border-line bg-white/[0.035] p-3">
                         <p className="text-xs font-display font-medium text-mist">迁移规则</p>
                         <div className="mt-3 space-y-2">
@@ -1275,6 +1350,7 @@ export default function Home() {
           onSubmitFinal={() => submit("final")}
         />
       </main>
+      {renderSubmitBar("mobile")}
     </div>
   );
 }

@@ -13,6 +13,9 @@
 __MACOSX__
 
 # Secrets and local environment
+.env
+.env.*
+!.env.example
 backend/.env
 backend/.env.*
 !backend/.env.example

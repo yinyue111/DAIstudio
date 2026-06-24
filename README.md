@@ -198,13 +198,15 @@ ADMIN_PASSWORD='<strong-admin-password>' docker compose run --rm -e ADMIN_PASSWO
 default,image,video_submit,video_poll,video_download,parse,cleanup,payment
 ```
 
+`make run-worker` 默认使用 `WORKER_CONCURRENCY=4`，可以同时处理多个图片任务；单个多图任务内部还会按 `IMAGE_GATEWAY_PARALLELISM` 并发向图像网关发起子请求。需要兼容特殊 macOS 调试场景时，可显式设置 `WORKER_POOL=solo WORKER_CONCURRENCY=1`，但这会让任务按队列串行执行。
+
 生产流量上来后建议把图片、视频提交、视频轮询、下载、抓取等队列拆到不同 Worker。裸机部署可以用脚本直接拆：
 
 ```bash
-WORKER_QUEUES=image ./scripts/run_worker.sh
-WORKER_QUEUES=video_submit,video_poll ./scripts/run_worker.sh
-WORKER_QUEUES=video_download ./scripts/run_worker.sh
-WORKER_QUEUES=parse,cleanup,payment ./scripts/run_worker.sh
+WORKER_QUEUES=image WORKER_CONCURRENCY=6 ./scripts/run_worker.sh
+WORKER_QUEUES=video_submit,video_poll WORKER_CONCURRENCY=2 ./scripts/run_worker.sh
+WORKER_QUEUES=video_download WORKER_CONCURRENCY=2 ./scripts/run_worker.sh
+WORKER_QUEUES=parse,cleanup,payment WORKER_CONCURRENCY=2 ./scripts/run_worker.sh
 ```
 
 如果使用 Docker Compose 长期拆队列，需要在 override 文件里复制多个 worker service，并分别设置 `WORKER_QUEUES`。同一个 `worker` service 只能使用一组环境变量。`beat` 服务只能保留一个实例，负责支付对账、卡死任务回收、视频轮询恢复和清理任务。
@@ -221,7 +223,7 @@ deploy/nginx/dream.aiwuq.cn.conf
 
 - `/` 和 `/_next/static/` 转发到前端 `127.0.0.1:3000`
 - `/api/`、`/media/`、`/ws/` 转发到后端 `127.0.0.1:8000`
-- `client_max_body_size 512m`，与默认视频上传上限保持一致
+- 默认请求体限制 `2m`；`/api/uploads/image` 为 `32m`；`/api/uploads/video` 为 `528m`
 - `proxy_read_timeout 900s`
 - 强制 HTTPS，并开启 HSTS、nosniff、Referrer-Policy、X-Frame-Options
 

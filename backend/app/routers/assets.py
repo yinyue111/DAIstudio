@@ -23,6 +23,26 @@ from ..services.media_sidecars import keys_for_asset_urls, unlink_keys
 
 router = APIRouter(prefix="/api/assets", tags=["assets"])
 _PLAYBACK_TICKET_TTL_SECONDS = 600
+_IMAGE_SIGNATURES = (
+    (b"\xff\xd8\xff", "image/jpeg", "jpg"),
+    (b"\x89PNG\r\n\x1a\n", "image/png", "png"),
+    (b"GIF87a", "image/gif", "gif"),
+    (b"GIF89a", "image/gif", "gif"),
+    (b"RIFF", "image/webp", "webp"),
+)
+
+
+def _download_media_info(asset: GenAsset, path: Path) -> tuple[str, str]:
+    if asset.type == "video":
+        return "video/mp4", "mp4"
+    try:
+        head = path.read_bytes()[:16]
+    except OSError:
+        head = b""
+    for signature, media_type, ext in _IMAGE_SIGNATURES:
+        if head.startswith(signature) and (ext != "webp" or head[8:12] == b"WEBP"):
+            return media_type, ext
+    return "application/octet-stream", "bin"
 
 
 def _unlocked_owner_asset(db: Session, asset_id: int, user: User) -> GenAsset:
@@ -114,8 +134,6 @@ def download(asset_id: int, request: Request, db: Session = Depends(get_db),
         return FileResponse(str(path), filename=path.name)
     # External (gateway/CDN) result -> proxy through the authenticated backend.
     # Browser fetch(blob) cannot reliably follow cross-origin redirects without CORS.
-    filename = f"asset-{asset_id}.{'mp4' if asset.type == 'video' else 'bin'}"
-    media_type = "video/mp4" if asset.type == "video" else "application/octet-stream"
     suffix = ".mp4" if asset.type == "video" else ".bin"
     tmp_path: Path | None = None
     try:
@@ -130,6 +148,8 @@ def download(asset_id: int, request: Request, db: Session = Depends(get_db),
         if tmp_path is not None:
             tmp_path.unlink(missing_ok=True)
         raise
+    media_type, ext = _download_media_info(asset, tmp_path)
+    filename = f"asset-{asset_id}.{ext}"
     audit.log(
         db,
         user_id=user.id,

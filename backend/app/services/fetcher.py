@@ -7,8 +7,9 @@ selects the matching platform and runs it. **Adding a platform = append one
 registry entry**; nothing else changes.
 
 Current platforms: 小红书 (window.__INITIAL_STATE__ SSR), 抖音 (web detail API +
-RENDER_DATA render fallback), 微信公众号 (SSR data-src on mmbiz.qpic.cn), and a
-generic web fallback for everything else.
+RENDER_DATA render fallback), 微信公众号 (SSR data-src on mmbiz.qpic.cn), X/Twitter
+(render fallback for status cards), and a generic web fallback for everything
+else.
 
 The generic fallback (``extract_assets``) mines: <img> (src + lazy data-* attrs
 + best-resolution srcset), <picture>/<source>, <video>/<source>, JSON-LD
@@ -106,6 +107,22 @@ def _is_douyin_host(host: str | None) -> bool:
     return host == "douyin.com" or host.endswith(".douyin.com")
 
 
+def _is_x_host(host: str | None) -> bool:
+    host = (host or "").rstrip(".").lower()
+    return host in {"x.com", "twitter.com"} or host.endswith(".x.com") or host.endswith(".twitter.com")
+
+
+def _is_x_media_host(host: str | None) -> bool:
+    host = (host or "").rstrip(".").lower()
+    return host == "twimg.com" or host.endswith(".twimg.com")
+
+
+def _is_x_post_media_url(url: str | None) -> bool:
+    parsed = urlparse(url or "")
+    host = (parsed.hostname or "").rstrip(".").lower()
+    return _is_x_media_host(host) and parsed.path.startswith("/media/")
+
+
 def _abs(base: str, src: str | None) -> str | None:
     if not src:
         return None
@@ -177,6 +194,8 @@ def _same_site_or_platform(page_url: str, request_url: str) -> bool:
         return _is_xiaohongshu_host(req_host) or req_host.endswith(".xhscdn.com")
     if _is_douyin_host(page_host):
         return _is_douyin_host(req_host) or req_host.endswith(".douyinpic.com") or req_host.endswith(".snssdk.com")
+    if _is_x_host(page_host):
+        return _is_x_host(req_host) or _is_x_media_host(req_host)
     return False
 
 
@@ -1156,6 +1175,24 @@ def _run_weixin(url: str) -> list[dict]:
     return _extract_weixin_assets(html, url)
 
 
+def _run_x(url: str) -> list[dict]:
+    def post_media_only(assets: list[dict]) -> list[dict]:
+        return [asset for asset in assets if _is_x_post_media_url(asset.get("url"))]
+
+    try:
+        html = _render_with_httpx(url, max_read_seconds=_GENERIC_MAX_READ_SECONDS,
+                                  max_body_bytes=_GENERIC_MAX_BODY_BYTES)
+        assets = post_media_only(extract_assets(html, url))
+        if assets:
+            return assets
+    except httpx.HTTPError as e:
+        log.warning("x/twitter html fetch failed, falling back to render: %s", e)
+    html = _render_with_playwright(url)
+    if html is None:
+        raise ValueError(_timeout_hint("X"))
+    return post_media_only(extract_assets(html, url))
+
+
 def _run_generic(url: str) -> list[dict]:
     html = _render_with_httpx(url, max_read_seconds=_GENERIC_MAX_READ_SECONDS,
                               max_body_bytes=_GENERIC_MAX_BODY_BYTES)
@@ -1181,6 +1218,9 @@ _REGISTRY: list[PlatformExtractor] = [
     PlatformExtractor(
         "公众号", _is_weixin_host, _run_weixin, _timeout_hint("公众号"),
         "未获取到公众号文章素材，可能是图片仅在客户端加载或文章可见性受限"),
+    PlatformExtractor(
+        "X", _is_x_host, _run_x, _timeout_hint("X"),
+        "未获取到 X 帖子素材，可能被登录态、访问频率或帖子可见性限制拦截"),
     # catch-all generic web fallback — must stay last
     PlatformExtractor(
         "网页", lambda _host: True, _run_generic, _timeout_hint(),
