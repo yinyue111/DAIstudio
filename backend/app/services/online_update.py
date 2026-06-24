@@ -277,6 +277,7 @@ def status(*, check_remote: bool = False) -> dict[str, Any]:
         "repo_dir": str(Path(settings.online_update_repo_dir).expanduser()),
         "remote": settings.online_update_remote,
         "branch": settings.online_update_branch,
+        "github_token_configured": bool(str(settings.online_update_github_token or "").strip()),
         "current_branch": "",
         "current_head": "",
         "remote_head": "",

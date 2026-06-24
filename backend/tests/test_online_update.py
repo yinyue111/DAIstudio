@@ -201,6 +201,7 @@ def test_admin_online_update_reports_partial_failure_when_apply_fails(
 
 def test_admin_online_update_status_returns_config_error(client, make_user, auth, monkeypatch, tmp_path):
     _configure(monkeypatch, tmp_path / "missing")
+    monkeypatch.setattr(settings, "online_update_github_token", "github_pat_should_not_leak_123456")
     make_user("15700002005", admin=True)
     h = auth("15700002005")
 
@@ -208,6 +209,8 @@ def test_admin_online_update_status_returns_config_error(client, make_user, auth
     assert status.status_code == 200, status.text
     data = status.json()
     assert data["repo_dir"].endswith("missing")
+    assert data["github_token_configured"] is True
+    assert "github_pat_should_not_leak" not in status.text
     assert "不存在" in data["error"]
 
 
@@ -340,3 +343,17 @@ def test_online_update_redacts_secrets_from_command_output():
     assert "ark-abcdef1234567890" not in redacted
     assert "hunter2" not in redacted
     assert "<redacted>" in redacted
+
+
+def test_compose_preserves_online_update_env_file_values(tmp_path):
+    root = Path(__file__).resolve().parents[2]
+    compose = root / "docker-compose.yml"
+    data = compose.read_text(encoding="utf-8")
+
+    # api/migrate load backend/.env through env_file. If these are repeated in
+    # an explicit environment block with empty defaults, docker compose
+    # overwrites the .env values and private-repo HTTPS upgrades fail after
+    # deployment even when ONLINE_UPDATE_GITHUB_TOKEN is configured correctly.
+    assert "ONLINE_UPDATE_GITHUB_TOKEN:" not in data
+    assert "ONLINE_UPDATE_REMOTE:" not in data
+    assert "ONLINE_UPDATE_REPO_DIR:" not in data

@@ -337,6 +337,8 @@ ONLINE_UPDATE_ALLOW_DIRTY=false
 
 不要写成 `https://token@github.com/...`。后端会拒绝带用户名/密码的 remote，并且会把 token 通过临时 Git 环境配置传给 `ls-remote/fetch`，接口输出和命令日志会做脱敏。
 
+Docker Compose 部署时，在线升级配置同样写在 `backend/.env`。Compose 不会用空默认值覆盖 `backend/.env` 里的 `ONLINE_UPDATE_*`，但镜像内 `/app` 默认不是 Git checkout。要在容器内直接点“从 GitHub 更新并生效”，需要把宿主机真实 checkout 挂载为 `ONLINE_UPDATE_REPO_DIR`，或把 `ONLINE_UPDATE_APPLY_COMMAND` 固定到宿主机/运维脚本完成 rebuild/restart；否则请把 `ONLINE_UPDATE_ENABLED=false`，避免后台显示可升级但实际目录没有 `.git`。
+
 在服务器上用同一个用户验证：
 
 ```bash

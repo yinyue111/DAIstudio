@@ -457,6 +457,7 @@ class OnlineUpdateStatusOut(BaseModel):
     repo_dir: str
     remote: str
     branch: str
+    github_token_configured: bool = False
     current_branch: str = ""
     current_head: str = ""
     remote_head: str = ""

@@ -16,6 +16,10 @@ function StateBadge({ ok, children }) {
   );
 }
 
+function isGithubHttps(remote) {
+  return /^https:\/\/github\.com\//i.test(remote || "");
+}
+
 export function VersionUpgrade() {
   const [status, setStatus] = useState(null);
   const [result, setResult] = useState(null);
@@ -156,7 +160,7 @@ export function VersionUpgrade() {
           </div>
         )}
 
-        <div className="grid gap-3 md:grid-cols-3">
+        <div className="grid gap-3 md:grid-cols-4">
           <div className="rounded-xl border border-line bg-base2/60 p-3">
             <div className="mb-1 text-xs text-fog">功能状态</div>
             <StateBadge ok={status.enabled}>{status.enabled ? "已启用" : "未启用"}</StateBadge>
@@ -169,6 +173,12 @@ export function VersionUpgrade() {
             <div className="mb-1 text-xs text-fog">生效命令</div>
             <StateBadge ok={status.apply_command_configured}>
               {status.apply_command_configured ? "已配置" : "未配置"}
+            </StateBadge>
+          </div>
+          <div className="rounded-xl border border-line bg-base2/60 p-3">
+            <div className="mb-1 text-xs text-fog">GitHub Token</div>
+            <StateBadge ok={!isGithubHttps(status.remote) || status.github_token_configured}>
+              {status.github_token_configured ? "已配置" : isGithubHttps(status.remote) ? "未配置" : "不需要"}
             </StateBadge>
           </div>
         </div>

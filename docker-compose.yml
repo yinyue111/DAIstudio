@@ -46,7 +46,9 @@ services:
 
   migrate:
     build: ./backend
-    env_file: ./backend/.env
+    env_file:
+      - path: ./backend/.env
+        required: false
     environment:
       DATABASE_URL: postgresql+psycopg2://postgres:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD to a strong database password}@postgres:5432/ai_studio
       REDIS_URL: redis://redis:6379/0
@@ -58,18 +60,6 @@ services:
       TRUSTED_PROXY_IPS: ${TRUSTED_PROXY_IPS:-127.0.0.1,172.16.0.0/12}
       METRICS_TOKEN: ${METRICS_TOKEN:?set METRICS_TOKEN to protect /metrics}
       PAYMENT_CONFIG_SECRET: ${PAYMENT_CONFIG_SECRET:?set PAYMENT_CONFIG_SECRET to encrypt admin-saved secrets}
-      ONLINE_UPDATE_ENABLED: ${ONLINE_UPDATE_ENABLED:-true}
-      # The image build excludes .git, so enabling online update in Docker
-      # requires mounting a real checkout as ONLINE_UPDATE_REPO_DIR and using a
-      # fixed host/operator script for rebuild + restart. Set
-      # ONLINE_UPDATE_ENABLED=false for image-only compose deployments.
-      ONLINE_UPDATE_REPO_DIR: ${ONLINE_UPDATE_REPO_DIR:-/app}
-      ONLINE_UPDATE_REMOTE: ${ONLINE_UPDATE_REMOTE:-https://github.com/yinyue111/DAIstudio.git}
-      ONLINE_UPDATE_BRANCH: ${ONLINE_UPDATE_BRANCH:-main}
-      ONLINE_UPDATE_GITHUB_TOKEN: ${ONLINE_UPDATE_GITHUB_TOKEN:-}
-      ONLINE_UPDATE_APPLY_COMMAND: ${ONLINE_UPDATE_APPLY_COMMAND:-}
-      ONLINE_UPDATE_TIMEOUT_SECONDS: ${ONLINE_UPDATE_TIMEOUT_SECONDS:-600}
-      ONLINE_UPDATE_ALLOW_DIRTY: ${ONLINE_UPDATE_ALLOW_DIRTY:-false}
       SMS_PROVIDER: ${SMS_PROVIDER:-mock}
       SMS_HTTP_URL: ${SMS_HTTP_URL:-}
       SMS_HTTP_API_KEY: ${SMS_HTTP_API_KEY:-}
@@ -88,7 +78,9 @@ services:
   api:
     build: ./backend
     restart: unless-stopped
-    env_file: ./backend/.env
+    env_file:
+      - path: ./backend/.env
+        required: false
     environment:
       DATABASE_URL: postgresql+psycopg2://postgres:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD to a strong database password}@postgres:5432/ai_studio
       REDIS_URL: redis://redis:6379/0
@@ -100,18 +92,6 @@ services:
       TRUSTED_PROXY_IPS: ${TRUSTED_PROXY_IPS:-127.0.0.1,172.16.0.0/12}
       METRICS_TOKEN: ${METRICS_TOKEN:?set METRICS_TOKEN to protect /metrics}
       PAYMENT_CONFIG_SECRET: ${PAYMENT_CONFIG_SECRET:?set PAYMENT_CONFIG_SECRET to encrypt admin-saved secrets}
-      ONLINE_UPDATE_ENABLED: ${ONLINE_UPDATE_ENABLED:-true}
-      # The image build excludes .git, so enabling online update in Docker
-      # requires mounting a real checkout as ONLINE_UPDATE_REPO_DIR and using a
-      # fixed host/operator script for rebuild + restart. Set
-      # ONLINE_UPDATE_ENABLED=false for image-only compose deployments.
-      ONLINE_UPDATE_REPO_DIR: ${ONLINE_UPDATE_REPO_DIR:-/app}
-      ONLINE_UPDATE_REMOTE: ${ONLINE_UPDATE_REMOTE:-https://github.com/yinyue111/DAIstudio.git}
-      ONLINE_UPDATE_BRANCH: ${ONLINE_UPDATE_BRANCH:-main}
-      ONLINE_UPDATE_GITHUB_TOKEN: ${ONLINE_UPDATE_GITHUB_TOKEN:-}
-      ONLINE_UPDATE_APPLY_COMMAND: ${ONLINE_UPDATE_APPLY_COMMAND:-}
-      ONLINE_UPDATE_TIMEOUT_SECONDS: ${ONLINE_UPDATE_TIMEOUT_SECONDS:-600}
-      ONLINE_UPDATE_ALLOW_DIRTY: ${ONLINE_UPDATE_ALLOW_DIRTY:-false}
       SMS_PROVIDER: ${SMS_PROVIDER:-mock}
       SMS_HTTP_URL: ${SMS_HTTP_URL:-}
       SMS_HTTP_API_KEY: ${SMS_HTTP_API_KEY:-}
@@ -138,7 +118,9 @@ services:
     # No -B here: beat runs in its own service so scaling workers (--scale
     # worker=N) does NOT start N schedulers racing on the same cron jobs.
     command: celery -A app.celery_app.celery_app worker -l info --concurrency=${WORKER_CONCURRENCY:-4} -Q ${WORKER_QUEUES:-default,image,video_submit,video_poll,video_download,parse,cleanup,payment}
-    env_file: ./backend/.env
+    env_file:
+      - path: ./backend/.env
+        required: false
     environment:
       DATABASE_URL: postgresql+psycopg2://postgres:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD to a strong database password}@postgres:5432/ai_studio
       REDIS_URL: redis://redis:6379/0
@@ -173,7 +155,9 @@ services:
     # Exactly ONE scheduler for the whole stack (retention cleanup, stuck-task
     # reaper, video-resume). Do not scale this service.
     command: celery -A app.celery_app.celery_app beat -l info
-    env_file: ./backend/.env
+    env_file:
+      - path: ./backend/.env
+        required: false
     environment:
       DATABASE_URL: postgresql+psycopg2://postgres:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD to a strong database password}@postgres:5432/ai_studio
       REDIS_URL: redis://redis:6379/0
