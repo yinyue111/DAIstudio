@@ -64,7 +64,7 @@ services:
       # fixed host/operator script for rebuild + restart. Set
       # ONLINE_UPDATE_ENABLED=false for image-only compose deployments.
       ONLINE_UPDATE_REPO_DIR: ${ONLINE_UPDATE_REPO_DIR:-/app}
-      ONLINE_UPDATE_REMOTE: ${ONLINE_UPDATE_REMOTE:-origin}
+      ONLINE_UPDATE_REMOTE: ${ONLINE_UPDATE_REMOTE:-git@github.com:yinyue111/DAIstudio.git}
       ONLINE_UPDATE_BRANCH: ${ONLINE_UPDATE_BRANCH:-main}
       ONLINE_UPDATE_APPLY_COMMAND: ${ONLINE_UPDATE_APPLY_COMMAND:-}
       ONLINE_UPDATE_TIMEOUT_SECONDS: ${ONLINE_UPDATE_TIMEOUT_SECONDS:-600}
@@ -105,7 +105,7 @@ services:
       # fixed host/operator script for rebuild + restart. Set
       # ONLINE_UPDATE_ENABLED=false for image-only compose deployments.
       ONLINE_UPDATE_REPO_DIR: ${ONLINE_UPDATE_REPO_DIR:-/app}
-      ONLINE_UPDATE_REMOTE: ${ONLINE_UPDATE_REMOTE:-origin}
+      ONLINE_UPDATE_REMOTE: ${ONLINE_UPDATE_REMOTE:-git@github.com:yinyue111/DAIstudio.git}
       ONLINE_UPDATE_BRANCH: ${ONLINE_UPDATE_BRANCH:-main}
       ONLINE_UPDATE_APPLY_COMMAND: ${ONLINE_UPDATE_APPLY_COMMAND:-}
       ONLINE_UPDATE_TIMEOUT_SECONDS: ${ONLINE_UPDATE_TIMEOUT_SECONDS:-600}

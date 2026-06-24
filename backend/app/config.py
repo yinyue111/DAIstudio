@@ -221,7 +221,7 @@ class Settings(BaseSettings):
     # command; set ONLINE_UPDATE_ENABLED=false to disable the admin tab action.
     online_update_enabled: bool = True
     online_update_repo_dir: str = str(BASE_DIR.parent)
-    online_update_remote: str = "origin"
+    online_update_remote: str = "git@github.com:yinyue111/DAIstudio.git"
     online_update_branch: str = "main"
     online_update_apply_command: str = ""
     online_update_timeout_seconds: int = 600

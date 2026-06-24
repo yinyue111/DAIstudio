@@ -12,6 +12,7 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from ..config import settings
 from . import locks
@@ -25,6 +26,8 @@ _KEY_VALUE_SECRET_RE = re.compile(
     re.I,
 )
 _OPENAI_LIKE_KEY_RE = re.compile(r"\b(?P<prefix>sk|ark)-[A-Za-z0-9_-]{8,}\b")
+_ALLOWED_REMOTE_SCHEMES = {"https", "ssh", "git", "file"}
+_SCP_REMOTE_RE = re.compile(r"^(?P<user>[A-Za-z0-9._-]+)@(?P<host>[A-Za-z0-9._-]+):(?P<path>[A-Za-z0-9._~/-]+)(?:\.git)?$")
 
 
 class OnlineUpdateError(RuntimeError):
@@ -66,6 +69,26 @@ def _safe_ref(value: str, label: str) -> str:
         raise OnlineUpdateError(f"{label} 不能为空")
     if text.startswith("-") or ".." in text or not _REF_RE.fullmatch(text):
         raise OnlineUpdateError(f"{label} 配置非法")
+    return text
+
+
+def _safe_remote(value: str) -> str:
+    text = (value or "").strip()
+    if not text:
+        raise OnlineUpdateError("ONLINE_UPDATE_REMOTE 不能为空")
+    if text.startswith("-") or ".." in text or any(ch.isspace() for ch in text):
+        raise OnlineUpdateError("ONLINE_UPDATE_REMOTE 配置非法")
+    if _REF_RE.fullmatch(text):
+        return text
+    if _SCP_REMOTE_RE.fullmatch(text):
+        return text
+    parsed = urlparse(text)
+    if parsed.scheme not in _ALLOWED_REMOTE_SCHEMES:
+        raise OnlineUpdateError("ONLINE_UPDATE_REMOTE 只允许 Git remote 名称或安全的 Git URL")
+    if parsed.scheme in {"https", "ssh", "git"} and not parsed.netloc:
+        raise OnlineUpdateError("ONLINE_UPDATE_REMOTE URL 缺少主机")
+    if parsed.username or parsed.password:
+        raise OnlineUpdateError("ONLINE_UPDATE_REMOTE 不能包含用户名或密码")
     return text
 
 
@@ -140,7 +163,7 @@ def _ensure_ready(
     check_remote: bool = False,
     enforce_clean: bool = True,
 ) -> dict[str, Any]:
-    remote = _safe_ref(settings.online_update_remote, "ONLINE_UPDATE_REMOTE")
+    remote = _safe_remote(settings.online_update_remote)
     branch = _safe_ref(settings.online_update_branch, "ONLINE_UPDATE_BRANCH")
     if not _is_git_repo(repo):
         raise OnlineUpdateError("在线更新目录不是 Git 仓库")

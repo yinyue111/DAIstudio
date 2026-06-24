@@ -37,10 +37,17 @@ def git_repos(tmp_path):
     return {"remote": remote, "source": source, "work": work}
 
 
-def _configure(monkeypatch, repo: Path, *, enabled: bool = True, apply_command: str = ""):
+def _configure(
+    monkeypatch,
+    repo: Path,
+    *,
+    enabled: bool = True,
+    remote: str = "origin",
+    apply_command: str = "",
+):
     monkeypatch.setattr(settings, "online_update_enabled", enabled)
     monkeypatch.setattr(settings, "online_update_repo_dir", str(repo))
-    monkeypatch.setattr(settings, "online_update_remote", "origin")
+    monkeypatch.setattr(settings, "online_update_remote", remote)
     monkeypatch.setattr(settings, "online_update_branch", "main")
     monkeypatch.setattr(settings, "online_update_apply_command", apply_command)
     monkeypatch.setattr(settings, "online_update_timeout_seconds", 20)
@@ -220,6 +227,29 @@ def test_admin_online_update_remote_check_uses_ls_remote_without_fetch(monkeypat
     assert status["remote_head"]
     assert status["remote_head"] != status["current_head"]
     assert not before_fetch_head.exists()
+
+
+def test_admin_online_update_uses_configured_repo_url_not_origin(monkeypatch, git_repos):
+    from app.services import online_update
+
+    _git(git_repos["work"], "remote", "set-url", "origin", "https://github.com/private/requires-auth.git")
+    _configure(monkeypatch, git_repos["work"], remote=git_repos["remote"].as_uri())
+
+    status = online_update.status(check_remote=True)
+
+    assert "error" not in status
+    assert status["remote"] == git_repos["remote"].as_uri()
+    assert status["remote_head"]
+    assert status["current_head"] == status["remote_head"]
+
+
+def test_online_update_accepts_github_ssh_scp_remote():
+    from app.services import online_update
+
+    assert (
+        online_update._safe_remote("git@github.com:yinyue111/DAIstudio.git")
+        == "git@github.com:yinyue111/DAIstudio.git"
+    )
 
 
 def test_online_update_rejects_inline_apply_command(monkeypatch, git_repos):

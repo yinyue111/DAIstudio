@@ -301,12 +301,13 @@ PAYMENT_FRONTEND_BASE_URL=https://dream.aiwuq.cn
 
 ## 在线版本升级
 
-管理后台提供“版本升级”页，可以从服务端配置的 Git remote/branch 拉取新代码并执行固定生效命令。该功能默认开启，生产启用前需要确认 API 进程运行在真实 Git checkout 中，并且该 checkout 有读取 GitHub 的权限。Docker 镜像默认不包含 `.git`，所以普通 Compose 镜像内 `/app` 不能直接在线升级；如果使用镜像内 `/app` 运行且没有挂载真实仓库，请显式设置 `ONLINE_UPDATE_ENABLED=false`。
+管理后台提供“版本升级”页，可以从服务端配置的 Git remote/branch 拉取新代码并执行固定生效命令。该功能默认开启，默认升级源是私有 GitHub 仓库 `git@github.com:yinyue111/DAIstudio.git`。生产启用前需要确认 API 进程运行在真实 Git checkout 中，并且运行 API 的系统用户已经配置好 GitHub SSH 读取权限。Docker 镜像默认不包含 `.git`，所以普通 Compose 镜像内 `/app` 不能直接在线升级；如果使用镜像内 `/app` 运行且没有挂载真实仓库，请显式设置 `ONLINE_UPDATE_ENABLED=false`。
 
 安全边界：
 
 - 默认 `ONLINE_UPDATE_ENABLED=true`
 - 只更新服务端配置的 `ONLINE_UPDATE_REMOTE` / `ONLINE_UPDATE_BRANCH`
+- 私有库建议使用 GitHub Deploy Key 或专用只读 SSH key，不要把 GitHub 密码或 token 写进 URL
 - 只允许 `git merge --ff-only`，不会执行 `reset --hard`
 - 工作区有未提交改动时默认拒绝升级
 - 前端不能传入任意命令；生效命令只能由服务端环境变量固定配置
@@ -316,11 +317,35 @@ PAYMENT_FRONTEND_BASE_URL=https://dream.aiwuq.cn
 ```env
 ONLINE_UPDATE_ENABLED=true
 ONLINE_UPDATE_REPO_DIR=/srv/ai-media-studio
-ONLINE_UPDATE_REMOTE=origin
+ONLINE_UPDATE_REMOTE=git@github.com:yinyue111/DAIstudio.git
 ONLINE_UPDATE_BRANCH=main
 ONLINE_UPDATE_APPLY_COMMAND=/usr/local/bin/ai-studio-apply-update
 ONLINE_UPDATE_TIMEOUT_SECONDS=600
 ONLINE_UPDATE_ALLOW_DIRTY=false
+```
+
+私有 GitHub 仓库需要先在服务器上配置 SSH 读取权限。建议做法：
+
+```bash
+ssh-keygen -t ed25519 -C "ai-studio-online-update" -f ~/.ssh/ai_studio_update
+cat ~/.ssh/ai_studio_update.pub
+```
+
+把公钥添加到 GitHub 仓库 `yinyue111/DAIstudio` 的 `Settings -> Deploy keys`，勾选只读即可。然后给运行后端的用户配置 `~/.ssh/config`：
+
+```sshconfig
+Host github.com
+  HostName github.com
+  User git
+  IdentityFile ~/.ssh/ai_studio_update
+  IdentitiesOnly yes
+```
+
+在服务器上用同一个用户验证：
+
+```bash
+ssh -T git@github.com
+git ls-remote --heads git@github.com:yinyue111/DAIstudio.git main
 ```
 
 `ONLINE_UPDATE_APPLY_COMMAND` 建议指向一个固定脚本。脚本里可以按你的部署方式执行迁移、构建和重启，例如裸机部署可执行 `make migrate`、前端构建、重启 systemd 服务；Docker 部署通常应在宿主机执行 `docker compose up -d --build`。如果一定要在 Docker 部署里开启在线升级，需要把宿主机真实 Git checkout 挂载到 `ONLINE_UPDATE_REPO_DIR`，并让固定脚本在宿主机或受控运维环境中完成 rebuild/restart，不要把宿主机 Docker 权限随意挂进业务容器。
