@@ -1,8 +1,8 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
-import { api, clearToken } from "../lib/api";
+import { api, clearToken, loginPath } from "../lib/api";
 import BrandLogo from "./BrandLogo";
 
 const LINKS = [
@@ -16,6 +16,11 @@ const LINKS = [
 export default function Nav({ me, active }) {
   const router = useRouter();
   const [open, setOpen] = useState(false);
+  const [loginHref, setLoginHref] = useState("/login");
+
+  useEffect(() => {
+    setLoginHref(loginPath());
+  }, []);
 
   async function logout() {
     try { await api.logout(); } catch (e) {}
@@ -87,7 +92,11 @@ export default function Nav({ me, active }) {
               {(me.nickname || me.phone || "U").slice(-2)}
             </div>
           )}
-          <button onClick={logout} className="btn-ghost btn-sm ml-0.5">退出</button>
+          {me ? (
+            <button onClick={logout} className="btn-ghost btn-sm ml-0.5">退出</button>
+          ) : (
+            <a href={loginHref} className="btn-ghost btn-sm ml-0.5">登录</a>
+          )}
         </nav>
       </div>
       {open && (
@@ -113,6 +122,13 @@ export default function Nav({ me, active }) {
               {me.frozen_credits ? <span> · 冻结 {me.frozen_credits}</span> : null}
             </div>
           )}
+          <div className="mt-2">
+            {me ? (
+              <button onClick={logout} className="btn-ghost btn-sm w-full">退出</button>
+            ) : (
+              <a href={loginHref} className="btn-ghost btn-sm block w-full text-center">登录</a>
+            )}
+          </div>
         </div>
       )}
     </header>

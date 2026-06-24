@@ -241,6 +241,10 @@ def reverse(body: ReverseIn, db: Session = Depends(get_db),
                                     note=f"usage_adjust target={body.target},refs={len(refs)}")
                     cost = target_cost
                 except credits.InsufficientCredits as e:
+                    if cost:
+                        credits.refund_consumed(db, user.id, cost, biz_type="reverse",
+                                                biz_ref=biz_ref,
+                                                note=f"usage_adjust_failed target={body.target},refs={len(refs)}")
                     usage.record_call(db, kind="reverse", model_id=model.model_id,
                                       user_id=user.id, status="failed",
                                       usage=result.get("usage"),
@@ -250,9 +254,10 @@ def reverse(body: ReverseIn, db: Session = Depends(get_db),
                                           "cost": cost,
                                           "usage_cost": target_cost,
                                           "shortfall": shortfall,
-                                          "settlement": "partial",
+                                          "settlement": "refunded",
                                           "error": str(e)[:200],
                                       })
+                    raise HTTPException(400, str(e))
             elif target_cost < cost:
                 credits.refund_consumed(db, user.id, cost - target_cost, biz_type="reverse",
                                         biz_ref=biz_ref,

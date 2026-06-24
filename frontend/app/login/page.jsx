@@ -70,7 +70,7 @@ export default function LoginPage() {
       } else {
         await api.login(formPhone, formPassword);
       }
-      router.push("/");
+      router.push(currentNextPath() || "/");
     } catch (e) {
       setMsg(e.message);
     } finally {
@@ -215,4 +215,24 @@ export default function LoginPage() {
       </div>
     </div>
   );
+}
+
+function safeNextPath(value) {
+  if (!value || !value.startsWith("/") || value.startsWith("//")) return "";
+  try {
+    const url = new URL(value, "http://local");
+    if (url.origin !== "http://local") return "";
+    return `${url.pathname}${url.search}${url.hash}`;
+  } catch (e) {
+    return "";
+  }
+}
+
+function currentNextPath() {
+  if (typeof window === "undefined") return "";
+  try {
+    return safeNextPath(new URLSearchParams(window.location.search).get("next"));
+  } catch (e) {
+    return "";
+  }
 }

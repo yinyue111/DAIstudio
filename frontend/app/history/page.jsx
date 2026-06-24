@@ -2,7 +2,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
-import { api, downloadBlob } from "../../lib/api";
+import { api, downloadBlob, loginPath } from "../../lib/api";
 import Nav from "../../components/Nav";
 import AssetMedia, { assetPreviewSrc, assetUnavailableText, isAssetTakenDown } from "../../components/AssetMedia";
 
@@ -42,7 +42,7 @@ export default function HistoryPage() {
   const busyAssetIdsRef = useRef(new Set());
 
   useEffect(() => {
-    api.me().then(setMe).catch(() => router.push("/login"));
+    api.me().then(setMe).catch(() => router.push(loginPath()));
     api.config().then(setCfg).catch(() => {});
     load(true);
     return () => {

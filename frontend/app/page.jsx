@@ -2,7 +2,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
-import { api, downloadBlob, wsUrl } from "../lib/api";
+import { api, downloadBlob, loginPath, wsUrl } from "../lib/api";
 import Nav from "../components/Nav";
 import PromptLibraryBrowser, { STUDIO_DRAFT_PROMPT_KEY } from "../components/PromptLibraryBrowser";
 import {
@@ -126,7 +126,7 @@ export default function Home() {
   const isEditMode = creationMode === "image_edit" || creationMode === "video_edit";
 
   useEffect(() => {
-    api.me().then(setMe).catch(() => router.push("/login"));
+    api.me().then(setMe).catch(() => router.push(loginPath()));
     api.config().then((c) => {
       setCfg(c);
       // honour admin defaults so the values we submit match the backend config
@@ -833,6 +833,136 @@ export default function Home() {
           ? "编辑生成 ✦"
           : "立即生成 ✦";
 
+  function renderGenerationControls() {
+    return (
+      <>
+        <div className="flex flex-wrap items-center gap-x-5 gap-y-3 px-1 py-1">
+          <div className="min-w-0 flex-1 basis-full">
+            <span className="text-xs text-fog">比例</span>
+            <div className="no-scrollbar mt-1 flex gap-1 overflow-x-auto pb-1">
+              {ratioOptions.map((r) => (
+                <button
+                  key={r.key}
+                  onClick={() => setRatio(r.key)}
+                  title={r.hint}
+                  className={`group flex flex-col items-center gap-1 rounded-lg border px-2 py-1.5 transition ${
+                    ratio === r.key ? "border-iris bg-iris/15" : "border-line hover:border-line2"
+                  }`}
+                >
+                  <span
+                    className={`block rounded-[3px] ${ratio === r.key ? "bg-iris-400" : "bg-fog"}`}
+                    style={{ width: 18 * (r.w >= r.h ? 1 : r.w / r.h), height: 18 * (r.h >= r.w ? 1 : r.h / r.w) }}
+                  />
+                  <span className={`text-[10px] ${ratio === r.key ? "text-snow" : "text-fog"}`}>{r.label}</span>
+                </button>
+              ))}
+            </div>
+          </div>
+
+          {category === "image" ? (
+            <>
+              <div className="flex items-center gap-2">
+                <span className="text-xs text-fog">质量</span>
+                <div className="flex gap-1">
+                  {IMAGE_QUALITY_PRESETS.map((q) => (
+                    <button key={q.key} onClick={() => setImageQuality(q.key)} title={q.hint}
+                      className={`chip ${imageQuality === q.key ? "chip-active" : ""}`}>{q.label}</button>
+                  ))}
+                </div>
+                <span className="text-xs text-fog">{currentImageSize}</span>
+              </div>
+              <div className="flex items-center gap-2">
+                <span className="text-xs text-fog">数量</span>
+                <div className="flex gap-1">
+                  {[1, 2, 4, 8].map((v) => (
+                    <button key={v} onClick={() => setN(v)} className={`chip ${imageCount === v ? "chip-active" : ""}`}>{v}</button>
+                  ))}
+                </div>
+                <input
+                  className="input w-20 px-2 py-1 text-xs"
+                  type="number"
+                  min="1"
+                  max={maxImageN}
+                  value={n}
+                  onChange={(e) => setN(e.target.value)}
+                  onBlur={() => setN(boundedImageCount(n, maxImageN))}
+                  title={`最多 ${maxImageN} 张`}
+                />
+              </div>
+            </>
+          ) : (
+            <>
+              <div className="flex items-center gap-2">
+                <span className="text-xs text-fog">时长</span>
+                <div className="no-scrollbar flex max-w-full gap-1 overflow-x-auto pb-1">
+                  {VIDEO_DURATION_PRESETS.filter((p) => p.seconds <= maxVideoDuration).map((p) => (
+                    <button
+                      key={p.seconds}
+                      onClick={() => setVDuration(p.seconds)}
+                      title={p.hint}
+                      className={`chip shrink-0 ${videoDuration === p.seconds ? "chip-active" : ""}`}
+                    >
+                      {p.label}
+                    </button>
+                  ))}
+                </div>
+                <input
+                  className="input w-24 px-2 py-1 text-xs"
+                  type="number"
+                  min="1"
+                  max={maxVideoDuration}
+                  value={vDuration}
+                  onChange={(e) => setVDuration(e.target.value)}
+                  onBlur={() => setVDuration(boundedVideoDuration(vDuration, maxVideoDuration))}
+                  title={`最长 ${formatDuration(maxVideoDuration)}`}
+                />
+              </div>
+              <div className="flex items-center gap-2">
+                <span className="text-xs text-fog">质量</span>
+                <div className="flex gap-1">
+                  {VIDEO_QUALITIES.map((q) => (
+                    <button key={q.key} onClick={() => setVResolution(q.key)} title={q.hint}
+                      className={`chip ${vResolution === q.key ? "chip-active" : ""}`}>{q.label}</button>
+                  ))}
+                </div>
+              </div>
+            </>
+          )}
+
+          <button onClick={() => setShowNegative((s) => !s)} className={`chip ${showNegative ? "chip-active" : ""}`}>
+            负向词
+          </button>
+          {category === "image" && (
+            <label className="flex items-center gap-1.5 text-xs text-fog">
+              seed
+              <input className="input w-20 px-2 py-1 text-xs" placeholder="随机" value={seed}
+                onChange={(e) => setSeed(e.target.value.replace(/[^0-9]/g, ""))} />
+            </label>
+          )}
+        </div>
+
+        {showNegative && (
+          <input className="input mt-2" placeholder="不想出现的元素：文字, 水印, 多余手指, 畸变…"
+            value={negative} onChange={(e) => { setNegative(e.target.value); setNegativeTouched(true); }} />
+        )}
+
+        <div className="mt-3 flex items-center justify-between gap-3 px-1 max-lg:fixed max-lg:inset-x-0 max-lg:bottom-0 max-lg:z-30 max-lg:mt-0 max-lg:gap-4 max-lg:border-t max-lg:border-line max-lg:bg-base/85 max-lg:px-4 max-lg:pt-3 max-lg:pb-[calc(0.75rem+env(safe-area-inset-bottom))] max-lg:backdrop-blur-xl">
+          <p className="min-w-0 text-xs text-fog">
+            {estCost ? (
+              <>预计消耗 <b className="text-mist">{category === "video" ? `预览 ${videoPreviewCost} · 完整 ${videoFinalCost} · ${formatDuration(videoDuration)} · ${vResolution}` : estCost}</b> 积分</>
+            ) : "提交后冻结预估积分"}
+          </p>
+          <button onClick={() => submit("preview")} disabled={submitting || running || !currentModelEnabled} className="btn-primary btn-lg min-w-32 shrink-0">
+            {(submitting || running) && (
+              <span className="h-4 w-4 shrink-0 animate-spin rounded-full border-2 border-white/35 border-t-white" aria-hidden />
+            )}
+            {submitLabel}
+          </button>
+        </div>
+      </>
+    );
+  }
+
   return (
     <div className="min-h-screen">
       <Nav me={me} active="studio" />
@@ -884,8 +1014,8 @@ export default function Home() {
             )}
 
             {/* prompt + reference */}
-            <div className="grid gap-3 lg:grid-cols-[minmax(0,1fr)_320px]">
-              <div className="rounded-xl3 border border-line bg-base2/40 p-3">
+            <div className="grid items-start gap-3 lg:grid-cols-[minmax(0,1fr)_320px]">
+              <div className="rounded-xl3 border border-line bg-base2/40 p-3 lg:self-start">
                 {isEditMode ? (
                   <div className="grid gap-3">
                     <div className="rounded-2xl border border-line2 bg-gradient-to-br from-iris/15 via-white/[0.055] to-aqua/10 p-4">
@@ -1005,7 +1135,7 @@ export default function Home() {
                 ) : (
                   <>
                     <textarea
-                      className="textarea h-44 resize-none border-0 bg-transparent px-1 text-[15px] focus:ring-0 lg:h-56"
+                      className="textarea h-36 resize-none border-0 bg-transparent px-1 text-[15px] focus:ring-0 lg:h-40"
                       placeholder={promptPlaceholder}
                       value={prompt}
                       onChange={(e) => { setPrompt(e.target.value); setPromptDirty(true); }}
@@ -1014,7 +1144,7 @@ export default function Home() {
                       }}
                     />
                     {/* example chips */}
-                    <div className="mt-2 flex flex-wrap gap-1.5 border-t border-line pt-3">
+                    <div className="mt-1.5 flex flex-wrap gap-1.5 border-t border-line pt-2.5">
                       {EXAMPLES.map((ex, i) => (
                         <button key={i} onClick={() => { setPrompt(ex); setPromptDirty(true); }} className="chip" title={ex}>
                           ✦ {ex.slice(0, 12)}…
@@ -1039,6 +1169,9 @@ export default function Home() {
                     </div>
                   </>
                 )}
+                <div className="mt-3 border-t border-line pt-3">
+                  {renderGenerationControls()}
+                </div>
               </div>
 
               <StudioReferencePanel
@@ -1115,133 +1248,6 @@ export default function Home() {
                 )}
               </div>
             )}
-
-            {/* controls */}
-            <div className="mt-2.5 flex flex-wrap items-center gap-x-5 gap-y-3 px-1 py-1">
-              {/* ratio */}
-              <div className="min-w-0 flex-1 basis-full">
-                <span className="text-xs text-fog">比例</span>
-                <div className="no-scrollbar mt-1 flex gap-1 overflow-x-auto pb-1">
-                  {ratioOptions.map((r) => (
-                    <button
-                      key={r.key}
-                      onClick={() => setRatio(r.key)}
-                      title={r.hint}
-                      className={`group flex flex-col items-center gap-1 rounded-lg border px-2 py-1.5 transition ${
-                        ratio === r.key ? "border-iris bg-iris/15" : "border-line hover:border-line2"
-                      }`}
-                    >
-                      <span
-                        className={`block rounded-[3px] ${ratio === r.key ? "bg-iris-400" : "bg-fog"}`}
-                        style={{ width: 18 * (r.w >= r.h ? 1 : r.w / r.h), height: 18 * (r.h >= r.w ? 1 : r.h / r.w) }}
-                      />
-                      <span className={`text-[10px] ${ratio === r.key ? "text-snow" : "text-fog"}`}>{r.label}</span>
-                    </button>
-                  ))}
-                </div>
-              </div>
-
-              {category === "image" ? (
-                <>
-                  <div className="flex items-center gap-2">
-                    <span className="text-xs text-fog">质量</span>
-                    <div className="flex gap-1">
-                      {IMAGE_QUALITY_PRESETS.map((q) => (
-                        <button key={q.key} onClick={() => setImageQuality(q.key)} title={q.hint}
-                          className={`chip ${imageQuality === q.key ? "chip-active" : ""}`}>{q.label}</button>
-                      ))}
-                    </div>
-                    <span className="text-xs text-fog">{currentImageSize}</span>
-                  </div>
-                  <div className="flex items-center gap-2">
-                    <span className="text-xs text-fog">数量</span>
-                    <div className="flex gap-1">
-                      {[1, 2, 4, 8].map((v) => (
-                        <button key={v} onClick={() => setN(v)} className={`chip ${imageCount === v ? "chip-active" : ""}`}>{v}</button>
-                      ))}
-                    </div>
-                    <input
-                      className="input w-20 px-2 py-1 text-xs"
-                      type="number"
-                      min="1"
-                      max={maxImageN}
-                      value={n}
-                      onChange={(e) => setN(e.target.value)}
-                      onBlur={() => setN(boundedImageCount(n, maxImageN))}
-                      title={`最多 ${maxImageN} 张`}
-                    />
-                  </div>
-                </>
-              ) : (
-                <>
-                  <div className="flex items-center gap-2">
-                    <span className="text-xs text-fog">时长</span>
-                    <div className="no-scrollbar flex max-w-full gap-1 overflow-x-auto pb-1">
-                      {VIDEO_DURATION_PRESETS.filter((p) => p.seconds <= maxVideoDuration).map((p) => (
-                        <button
-                          key={p.seconds}
-                          onClick={() => setVDuration(p.seconds)}
-                          title={p.hint}
-                          className={`chip shrink-0 ${videoDuration === p.seconds ? "chip-active" : ""}`}
-                        >
-                          {p.label}
-                        </button>
-                      ))}
-                    </div>
-                    <input
-                      className="input w-24 px-2 py-1 text-xs"
-                      type="number"
-                      min="1"
-                      max={maxVideoDuration}
-                      value={vDuration}
-                      onChange={(e) => setVDuration(e.target.value)}
-                      onBlur={() => setVDuration(boundedVideoDuration(vDuration, maxVideoDuration))}
-                      title={`最长 ${formatDuration(maxVideoDuration)}`}
-                    />
-                  </div>
-                  <div className="flex items-center gap-2">
-                    <span className="text-xs text-fog">质量</span>
-                    <div className="flex gap-1">
-                      {VIDEO_QUALITIES.map((q) => (
-                        <button key={q.key} onClick={() => setVResolution(q.key)} title={q.hint}
-                          className={`chip ${vResolution === q.key ? "chip-active" : ""}`}>{q.label}</button>
-                      ))}
-                    </div>
-                  </div>
-                </>
-              )}
-
-              <button onClick={() => setShowNegative((s) => !s)} className={`chip ${showNegative ? "chip-active" : ""}`}>
-                负向词
-              </button>
-              {category === "image" && (
-                <label className="flex items-center gap-1.5 text-xs text-fog">
-                  seed
-                  <input className="input w-20 px-2 py-1 text-xs" placeholder="随机" value={seed}
-                    onChange={(e) => setSeed(e.target.value.replace(/[^0-9]/g, ""))} />
-                </label>
-              )}
-            </div>
-
-            {showNegative && (
-              <input className="input mt-2" placeholder="不想出现的元素：文字, 水印, 多余手指, 畸变…"
-                value={negative} onChange={(e) => { setNegative(e.target.value); setNegativeTouched(true); }} />
-            )}
-
-            {/* generate bar — inline on desktop, pinned action bar on mobile */}
-            <div className="mt-3 flex items-center justify-between gap-3 px-1 max-lg:fixed max-lg:inset-x-0 max-lg:bottom-0 max-lg:z-30 max-lg:mt-0 max-lg:gap-4 max-lg:border-t max-lg:border-line max-lg:bg-base/85 max-lg:px-4 max-lg:pt-3 max-lg:pb-[calc(0.75rem+env(safe-area-inset-bottom))] max-lg:backdrop-blur-xl">
-              <p className="min-w-0 text-xs text-fog">
-                {estCost ? (
-                  <>预计消耗 <b className="text-mist">{category === "video" ? `预览 ${videoPreviewCost} · 完整 ${videoFinalCost} · ${formatDuration(videoDuration)} · ${vResolution}` : estCost}</b> 积分</>
-                ) : "提交后冻结预估积分"}
-              </p>
-              <button onClick={() => submit("preview")} disabled={submitting || running || !currentModelEnabled} className="btn-primary btn-lg min-w-32 shrink-0">
-                {(submitting || running) && (
-                  <span className="h-4 w-4 shrink-0 animate-spin rounded-full border-2 border-white/35 border-t-white" aria-hidden />
-                )}
-                {submitLabel}
-              </button>
-            </div>
 
           </div>
 

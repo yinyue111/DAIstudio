@@ -50,6 +50,15 @@ def test_release_artifact_checker_rejects_runtime_tree_entries(tmp_path):
     assert check_release_artifact.main(["check_release_artifact.py", str(root)]) == 1
 
 
+def test_release_artifact_checker_rejects_tree_symlinks(tmp_path):
+    root = tmp_path / "src"
+    root.mkdir()
+    (root / "README.md").write_text("ok\n", encoding="utf-8")
+    (root / "external-secret").symlink_to("/etc/passwd")
+
+    assert check_release_artifact.main(["check_release_artifact.py", str(root)]) == 1
+
+
 def test_release_artifact_checker_rejects_zip_and_tar_members(tmp_path):
     zip_path = tmp_path / "bad.zip"
     with zipfile.ZipFile(zip_path, "w") as zf:
@@ -63,6 +72,10 @@ def test_release_artifact_checker_rejects_zip_and_tar_members(tmp_path):
     with tarfile.open(tar_path, "w:gz") as tf:
         tf.add(payload, arcname="app/certs/payment.pem")
         tf.add(payload, arcname="/tmp/absolute.pem")
+        link = tarfile.TarInfo("app/safe-link")
+        link.type = tarfile.SYMTYPE
+        link.linkname = "../../backend/.env"
+        tf.addfile(link)
 
     assert check_release_artifact.main(["check_release_artifact.py", str(zip_path)]) == 1
     assert check_release_artifact.main(["check_release_artifact.py", str(tar_path)]) == 1

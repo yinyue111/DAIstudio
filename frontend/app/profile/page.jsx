@@ -2,7 +2,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
-import { api, clearToken, downloadBlob } from "../../lib/api";
+import { api, clearToken, downloadBlob, loginPath } from "../../lib/api";
 import Nav from "../../components/Nav";
 import AssetMedia, { assetPreviewSrc, assetUnavailableText, isAssetTakenDown } from "../../components/AssetMedia";
 
@@ -40,7 +40,7 @@ export default function ProfilePage() {
   const [pwMsg, setPwMsg] = useState("");
 
   useEffect(() => {
-    api.me().then(setMe).catch(() => router.push("/login"));
+    api.me().then(setMe).catch(() => router.push(loginPath()));
     api.config().then(setCfg).catch(() => {});
     api.profile().then(setData).catch((e) => setMsg(e.message));
   }, []);
@@ -155,7 +155,7 @@ export default function ProfilePage() {
     try {
       await api.changePassword(oldPw, newPw);
       clearToken();
-      router.push("/login");
+      router.push(loginPath());
     } catch (e) { setPwMsg(e.message); }
   }
 

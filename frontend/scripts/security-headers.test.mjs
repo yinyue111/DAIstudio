@@ -4,6 +4,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 process.env.NODE_ENV = "production";
+process.env.NEXT_PUBLIC_API_BASE = "http://127.0.0.1:8000";
 const require = createRequire(import.meta.url);
 const config = require(join(dirname(fileURLToPath(import.meta.url)), "../next.config.js"));
 assert.equal(typeof config.headers, "function");
@@ -33,6 +34,16 @@ assert.doesNotMatch(
   headers.get("content-security-policy") || "",
   /(?:img-src|media-src)[^;]*\shttps:/,
   "production CSP must not allow arbitrary HTTPS media sources",
+);
+assert.match(
+  headers.get("content-security-policy") || "",
+  /connect-src[^;]*http:\/\/127\.0\.0\.1:8000[^;]*http:\/\/localhost:8000/,
+  "production CSP must align localhost/127.0.0.1 API aliases with API_BASE rewriting",
+);
+assert.match(
+  headers.get("content-security-policy") || "",
+  /connect-src[^;]*ws:\/\/127\.0\.0\.1:8000[^;]*ws:\/\/localhost:8000/,
+  "production CSP must align websocket localhost/127.0.0.1 aliases",
 );
 assert.equal(headers.get("x-content-type-options"), "nosniff");
 assert.equal(headers.get("x-frame-options"), "DENY");

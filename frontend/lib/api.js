@@ -1,7 +1,31 @@
 "use client";
 
-export const API_BASE =
-  (process.env.NEXT_PUBLIC_API_BASE || "").replace(/\/$/, "");
+function resolveApiBase() {
+  const configured = (process.env.NEXT_PUBLIC_API_BASE || "").replace(/\/$/, "");
+  if (
+    typeof window === "undefined"
+    || !configured
+    || !["localhost", "127.0.0.1"].includes(window.location.hostname)
+  ) {
+    return configured;
+  }
+  try {
+    const url = new URL(configured, window.location.origin);
+    const configuredHost = url.hostname;
+    if (
+      configuredHost !== window.location.hostname
+      && ["localhost", "127.0.0.1"].includes(configuredHost)
+    ) {
+      url.hostname = window.location.hostname;
+      return url.origin;
+    }
+  } catch (e) {
+    return configured;
+  }
+  return configured;
+}
+
+export const API_BASE = resolveApiBase();
 
 const DEFAULT_TIMEOUT_MS = 30_000;
 const PARSE_TIMEOUT_MS = 90_000;
@@ -30,6 +54,19 @@ export function setToken(t) {
 
 export function clearToken() {
   window.localStorage.removeItem("token");
+}
+
+export function loginPath(nextPath = null) {
+  if (typeof window === "undefined" && !nextPath) return "/login";
+  const raw = nextPath ?? `${window.location.pathname}${window.location.search}${window.location.hash}`;
+  if (!raw || !raw.startsWith("/") || raw.startsWith("//") || raw.startsWith("/login")) {
+    return "/login";
+  }
+  return `/login?next=${encodeURIComponent(raw)}`;
+}
+
+function redirectToLogin() {
+  if (typeof window !== "undefined") window.location.href = loginPath();
 }
 
 export class ApiError extends Error {
@@ -71,7 +108,7 @@ export async function downloadBlob(path, filename) {
   );
   if (res.status === 401) {
     clearToken();
-    if (typeof window !== "undefined") window.location.href = "/login";
+    redirectToLogin();
     throw new Error("登录已过期，请重新登录");
   }
   if (!res.ok) throw new Error(errorTextToMessage(errorText, res.status, "下载失败"));
@@ -103,7 +140,7 @@ export async function authenticatedObjectUrl(pathOrUrl) {
   );
   if (res.status === 401) {
     clearToken();
-    if (typeof window !== "undefined") window.location.href = "/login";
+    redirectToLogin();
     throw new Error("登录已过期，请重新登录");
   }
   if (!res.ok) throw new Error(errorTextToMessage(errorText, res.status, "预览加载失败"));
@@ -122,7 +159,7 @@ export async function assetDownloadObjectUrl(assetId) {
   );
   if (res.status === 401) {
     clearToken();
-    if (typeof window !== "undefined") window.location.href = "/login";
+    redirectToLogin();
     throw new Error("登录已过期，请重新登录");
   }
   if (!res.ok) throw new Error(errorTextToMessage(errorText, res.status, "高清预览加载失败"));
@@ -209,7 +246,7 @@ async function request(path, { method = "GET", body, auth = true, timeoutMs = DE
   if (res.status === 401 && auth) {
     clearToken();
     if (typeof window !== "undefined" && !path.startsWith("/api/auth")) {
-      window.location.href = "/login";
+      redirectToLogin();
     }
     throw new ApiError("登录已过期，请重新登录", { status: 401 });
   }
@@ -251,7 +288,7 @@ async function upload(path, formData, { auth = true } = {}) {
   );
   if (res.status === 401 && auth) {
     clearToken();
-    if (typeof window !== "undefined") window.location.href = "/login";
+    redirectToLogin();
     throw new ApiError("登录已过期，请重新登录", { status: 401 });
   }
   let data = null;

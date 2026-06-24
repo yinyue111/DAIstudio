@@ -17,6 +17,7 @@ import sys
 import tarfile
 import zipfile
 from pathlib import Path, PurePosixPath
+from typing import NamedTuple
 
 
 MAX_ARTIFACT_BYTES = 120 * 1024 * 1024
@@ -72,6 +73,13 @@ BLOCKED_SUFFIXES = {
 }
 
 
+class Entry(NamedTuple):
+    name: str
+    size: int
+    kind: str = "file"
+    linkname: str = ""
+
+
 def _normalise(name: str) -> PurePosixPath:
     parts = [p for p in PurePosixPath(name.replace("\\", "/")).parts if p not in ("", ".")]
     if parts and parts[0] == "/":
@@ -111,32 +119,72 @@ def _blocked_reason(name: str) -> str | None:
     return None
 
 
+def _blocked_link_reason(linkname: str) -> str | None:
+    if not linkname:
+        return "empty archive link target"
+    link_path = PurePosixPath(linkname.replace("\\", "/"))
+    if link_path.is_absolute() or ".." in link_path.parts:
+        return "unsafe archive link target"
+    return _blocked_reason(linkname)
+
+
+def _entry_type_reason(entry: Entry) -> str | None:
+    if entry.kind == "file" or entry.kind == "dir":
+        return None
+    if entry.kind in {"symlink", "hardlink"}:
+        return _blocked_link_reason(entry.linkname) or f"blocked {entry.kind}"
+    return f"blocked special file type {entry.kind}"
+
+
 def _iter_tree(root: Path):
     for path in root.rglob("*"):
         rel = path.relative_to(root).as_posix()
-        yield rel, path.stat().st_size if path.is_file() else 0
+        if path.is_symlink():
+            yield Entry(rel, 0, "symlink", path.readlink().as_posix())
+        elif path.is_file():
+            yield Entry(rel, path.stat().st_size)
+        elif path.is_dir():
+            yield Entry(rel, 0, "dir")
+        else:
+            yield Entry(rel, 0, "special")
 
 
 def _iter_archive(path: Path):
     if zipfile.is_zipfile(path):
         with zipfile.ZipFile(path) as zf:
             for info in zf.infolist():
-                yield info.filename, int(info.file_size or 0)
+                mode = (info.external_attr >> 16) & 0o170000
+                kind = "dir" if info.is_dir() else "file"
+                if mode == 0o120000:
+                    kind = "symlink"
+                elif mode not in (0, 0o100000, 0o040000):
+                    kind = "special"
+                yield Entry(info.filename, int(info.file_size or 0), kind)
         return
     if tarfile.is_tarfile(path):
         with tarfile.open(path) as tf:
             for member in tf.getmembers():
-                yield member.name, int(member.size or 0)
+                if member.isdir():
+                    kind = "dir"
+                elif member.isfile():
+                    kind = "file"
+                elif member.issym():
+                    kind = "symlink"
+                elif member.islnk():
+                    kind = "hardlink"
+                else:
+                    kind = member.type.decode("ascii", "ignore") or "special"
+                yield Entry(member.name, int(member.size or 0), kind, member.linkname or "")
         return
     raise SystemExit(f"unsupported artifact type: {path}")
 
 
-def _size_violations(entries: list[tuple[str, int]]) -> list[tuple[str, str]]:
+def _size_violations(entries: list[Entry]) -> list[tuple[str, str]]:
     violations: list[tuple[str, str]] = []
-    total = sum(size for _name, size in entries)
+    total = sum(entry.size for entry in entries)
     public_total = sum(
-        size for name, size in entries
-        if _normalise(name).as_posix().startswith("frontend/public/")
+        entry.size for entry in entries
+        if _normalise(entry.name).as_posix().startswith("frontend/public/")
     )
     if total > MAX_ARTIFACT_BYTES:
         violations.append(("<artifact>", f"artifact size {total} exceeds {MAX_ARTIFACT_BYTES} bytes"))
@@ -145,9 +193,12 @@ def _size_violations(entries: list[tuple[str, int]]) -> list[tuple[str, str]]:
             "frontend/public",
             f"frontend public size {public_total} exceeds {MAX_FRONTEND_PUBLIC_BYTES} bytes",
         ))
-    for name, size in entries:
-        if size > MAX_SINGLE_FILE_BYTES:
-            violations.append((name, f"single file size {size} exceeds {MAX_SINGLE_FILE_BYTES} bytes"))
+    for entry in entries:
+        if entry.size > MAX_SINGLE_FILE_BYTES:
+            violations.append((
+                entry.name,
+                f"single file size {entry.size} exceeds {MAX_SINGLE_FILE_BYTES} bytes",
+            ))
     return violations
 
 
@@ -161,10 +212,10 @@ def main(argv: list[str]) -> int:
         return 2
     entries = list(_iter_tree(target) if target.is_dir() else _iter_archive(target))
     violations: list[tuple[str, str]] = []
-    for name, _size in entries:
-        reason = _blocked_reason(name)
+    for entry in entries:
+        reason = _blocked_reason(entry.name) or _entry_type_reason(entry)
         if reason:
-            violations.append((name, reason))
+            violations.append((entry.name, reason))
     violations.extend(_size_violations(entries))
     if violations:
         print("release artifact contains blocked local/runtime files:", file=sys.stderr)

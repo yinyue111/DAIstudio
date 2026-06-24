@@ -18,18 +18,23 @@ assert.doesNotMatch(
 );
 assert.match(
   previewSource,
-  /startsWith\("blob:"\)\s*\?\s*rawSrc\s*:\s*""/,
+  /String\(src\)\.startsWith\("blob:"\)\s*\|\|\s*protectedSrc\s*\|\|\s*isPlatformSrc\(src\)/,
   "reference video preview may use local upload blob URLs",
 );
 assert.match(
   previewSource,
-  /const\s+videoSrc\s*=\s*secureSrc\s*\|\|\s*localPreviewSrc/,
-  "reference video preview should only use authenticated or local-upload object URLs",
+  /const\s+videoSrc\s*=\s*canRenderVideo\s*\?\s*src\s*:\s*""/,
+  "reference video preview should only use authenticated, local-upload, or same-origin object URLs",
 );
 assert.match(
   previewSource,
   /protectedSrc\s*&&\s*!secureSrc/,
   "protected upload thumbnails should wait for authenticated blob URLs before rendering",
+);
+assert.match(
+  previewSource,
+  /if\s*\(videoPosterSrc\)/,
+  "third-party video references should fall back to poster thumbnails instead of direct playback",
 );
 
 console.log("reference preview security test passed");

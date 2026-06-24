@@ -13,6 +13,18 @@ function isProtectedUploadSrc(src) {
   return String(src || "").includes("/api/uploads/");
 }
 
+function isPlatformSrc(src) {
+  const value = String(src || "");
+  if (!value) return false;
+  if (value.startsWith("blob:") || value.startsWith("/")) return true;
+  if (typeof window === "undefined") return false;
+  try {
+    return new URL(value, window.location.origin).origin === window.location.origin;
+  } catch (e) {
+    return false;
+  }
+}
+
 function PreviewLoading() {
   return (
     <div className="flex h-full w-full items-center justify-center bg-base2 text-[10px] text-fog">
@@ -24,7 +36,9 @@ function PreviewLoading() {
 export function ReferenceAssetPreview({ asset }) {
   const [failed, setFailed] = useState(false);
   const [secureSrc, setSecureSrc] = useState("");
-  const rawSrc = mediaThumbSrc(asset);
+  const videoRawSrc = asset?.type === "video" ? (asset?.display_url || asset?.url || "") : "";
+  const videoPosterSrc = asset?.type === "video" ? (asset?.display_thumb || asset?.thumb || "") : "";
+  const rawSrc = asset?.type === "video" ? (videoRawSrc || videoPosterSrc || mediaThumbSrc(asset)) : mediaThumbSrc(asset);
   const protectedSrc = isProtectedUploadSrc(rawSrc);
   useEffect(() => {
     setFailed(false);
@@ -60,13 +74,24 @@ export function ReferenceAssetPreview({ asset }) {
   if (asset?.type === "video") {
     if (protectedSrc && !secureSrc) return <PreviewLoading />;
     const src = secureSrc || rawSrc;
-    if (asset.thumb && src) {
-      return <img src={src} alt="" className="h-full w-full object-cover" onError={() => setFailed(true)} />;
-    }
-    const localPreviewSrc = String(rawSrc || "").startsWith("blob:") ? rawSrc : "";
-    const videoSrc = secureSrc || localPreviewSrc;
+    const canRenderVideo = Boolean(src && (String(src).startsWith("blob:") || protectedSrc || isPlatformSrc(src)));
+    const videoSrc = canRenderVideo ? src : "";
     if (videoSrc) {
-      return <video src={videoSrc} muted playsInline preload="metadata" className="h-full w-full object-cover" onError={() => setFailed(true)} />;
+      return (
+        <video
+          src={videoSrc}
+          controls
+          muted
+          playsInline
+          preload="metadata"
+          poster={videoPosterSrc || undefined}
+          className="h-full w-full object-cover"
+          onError={() => setFailed(true)}
+        />
+      );
+    }
+    if (videoPosterSrc) {
+      return <img src={videoPosterSrc} alt="" className="h-full w-full object-cover" onError={() => setFailed(true)} />;
     }
     return <div className="flex h-full w-full items-center justify-center text-fog">🎬</div>;
   }

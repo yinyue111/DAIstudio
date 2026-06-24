@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
-import { api } from "../../lib/api";
+import { api, loginPath } from "../../lib/api";
 import Nav from "../../components/Nav";
 import { AssetReports, Models, ReviewTasks } from "./components/model-review-moderation";
 import { Payments, Settings } from "./components/payments-settings";
@@ -46,7 +46,7 @@ export default function AdminPage() {
     api.me().then((u) => {
       if (!u.is_admin) router.push("/");
       else setMe(u);
-    }).catch(() => router.push("/login"));
+    }).catch(() => router.push(loginPath()));
   }, [router]);
 
   if (!me) return <div className="p-10 text-sm text-mist">加载中…</div>;

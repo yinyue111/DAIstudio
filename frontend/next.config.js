@@ -28,6 +28,20 @@ function websocketOrigin(value) {
   return origin.replace(/^http:/, "ws:").replace(/^https:/, "wss:");
 }
 
+function loopbackApiAliases(value) {
+  if (!value) return [];
+  try {
+    const url = new URL(value);
+    if (!["localhost", "127.0.0.1"].includes(url.hostname)) return [];
+    return [
+      `${url.protocol}//localhost${url.port ? `:${url.port}` : ""}`,
+      `${url.protocol}//127.0.0.1${url.port ? `:${url.port}` : ""}`,
+    ];
+  } catch (_err) {
+    return [];
+  }
+}
+
 /** @type {import('next').NextConfig} */
 const nextConfig = {
   reactStrictMode: true,
@@ -38,7 +52,10 @@ const nextConfig = {
     const scriptSrc = isProd ? "script-src 'self' 'unsafe-inline'" : "script-src 'self' 'unsafe-eval' 'unsafe-inline'";
     const apiOrigin = originSource(process.env.NEXT_PUBLIC_API_BASE);
     const apiWsOrigin = websocketOrigin(process.env.NEXT_PUBLIC_API_BASE);
-    const localApi = isProd ? [] : ["http://localhost:8000", "http://127.0.0.1:8000"];
+    const localApi = isProd
+      ? loopbackApiAliases(process.env.NEXT_PUBLIC_API_BASE)
+      : ["http://localhost:8000", "http://127.0.0.1:8000"];
+    const localWsApi = localApi.map((source) => websocketOrigin(source));
     const mediaSources = uniqueSources([
       "'self'",
       "data:",
@@ -52,7 +69,7 @@ const nextConfig = {
       apiOrigin,
       apiWsOrigin,
       ...localApi,
-      ...(isProd ? [] : ["ws://localhost:8000", "ws://127.0.0.1:8000"]),
+      ...localWsApi,
       ...splitSources(process.env.NEXT_PUBLIC_CONNECT_SRC),
     ]);
     const csp = [

@@ -4,7 +4,7 @@ import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import Nav from "../../components/Nav";
 import PromptLibraryBrowser, { STUDIO_DRAFT_PROMPT_KEY } from "../../components/PromptLibraryBrowser";
-import { api } from "../../lib/api";
+import { api, loginPath } from "../../lib/api";
 
 export default function PromptsPage() {
   const router = useRouter();
@@ -12,7 +12,7 @@ export default function PromptsPage() {
   const [msg, setMsg] = useState("");
 
   useEffect(() => {
-    api.me().then(setMe).catch(() => router.push("/login"));
+    api.me().then(setMe).catch(() => router.push(loginPath()));
   }, []);
 
   function usePrompt(item) {

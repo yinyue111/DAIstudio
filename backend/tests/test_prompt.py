@@ -124,7 +124,7 @@ def test_reverse_video_usage_cost_is_not_multiplied_by_frame_count(client, make_
         db.close()
 
 
-def test_reverse_success_keeps_precharge_when_usage_adjust_insufficient(client, make_user, monkeypatch):
+def test_reverse_usage_adjust_insufficient_refunds_and_blocks_result(client, make_user, monkeypatch):
     uid = make_user("13800000003", balance=2)
     db = SessionLocal()
     try:
@@ -160,14 +160,15 @@ def test_reverse_success_keeps_precharge_when_usage_adjust_insufficient(client, 
 
     db = SessionLocal()
     try:
-        out = prompt.reverse(
-            ReverseIn(asset_url="https://cdn.example.com/a.jpg", target="image"),
-            db=db,
-            user=db.get(User, uid),
-        )
+        with pytest.raises(HTTPException) as exc:
+            prompt.reverse(
+                ReverseIn(asset_url="https://cdn.example.com/a.jpg", target="image"),
+                db=db,
+                user=db.get(User, uid),
+            )
         user = db.get(User, uid)
-        assert out.final_text == "x"
-        assert out.charged_credits == 1
-        assert user.balance_credits == 1
+        assert exc.value.status_code == 400
+        assert "额度不足" in exc.value.detail
+        assert user.balance_credits == 2
     finally:
         db.close()

@@ -4,7 +4,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import QRCode from "qrcode";
 import Nav from "../../components/Nav";
-import { api } from "../../lib/api";
+import { api, loginPath } from "../../lib/api";
 
 const PROVIDERS = [
   ["alipay", "支付宝"],
@@ -32,8 +32,9 @@ export default function RechargePage() {
   const packageIdRef = useRef(packageId);
 
   useEffect(() => {
-    Promise.all([api.me(), api.paymentConfig(), api.paymentOrders(12)])
-      .then(([u, paymentCfg, rows]) => {
+    api.me()
+      .then(async (u) => {
+        const [paymentCfg, rows] = await Promise.all([api.paymentConfig(), api.paymentOrders(12)]);
         const enabled = paymentCfg.enabled !== false;
         const pkgs = paymentCfg.packages || [];
         const readyProviders = (paymentCfg.providers || [])
@@ -56,7 +57,13 @@ export default function RechargePage() {
         setPackageId(pkgs[1]?.id || pkgs[0]?.id || "");
         setProvider(readyProviders.includes("alipay") ? "alipay" : readyProviders[0] || "alipay");
       })
-      .catch((e) => setMsg(e.message));
+      .catch((e) => {
+        if (e.status === 401) {
+          router.push(loginPath());
+          return;
+        }
+        setMsg(e.message);
+      });
     return () => {
       if (pollRef.current) clearInterval(pollRef.current);
     };
@@ -94,15 +101,19 @@ export default function RechargePage() {
         }
       } catch (e) {
         pollFailuresRef.current += 1;
-        setMsg(`${e.message}。可稍后手动刷新订单状态。`);
-        if (pollFailuresRef.current >= 5 && pollRef.current) {
-          clearInterval(pollRef.current);
-          pollRef.current = null;
-        }
+        const retryDelay = pollFailuresRef.current >= 5 ? "自动检查会降低频率继续进行。" : "正在继续自动检查。";
+        setMsg(`${e.message}。${retryDelay}`);
       }
     };
     pollFailuresRef.current = 0;
-    pollRef.current = setInterval(poll, 2500);
+    pollRef.current = setInterval(() => {
+      const failures = pollFailuresRef.current;
+      if (failures >= 5 && failures % 6 !== 0) {
+        pollFailuresRef.current += 1;
+        return;
+      }
+      poll();
+    }, 2500);
     return () => {
       stopped = true;
       if (pollRef.current) clearInterval(pollRef.current);
