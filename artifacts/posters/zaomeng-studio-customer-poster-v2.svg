@@ -1,0 +1,190 @@
+<svg width="1080" height="1920" viewBox="0 0 1080 1920" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="pageBg" x1="80" y1="0" x2="980" y2="1920" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#090812"/>
+      <stop offset="0.5" stop-color="#111421"/>
+      <stop offset="1" stop-color="#08130f"/>
+    </linearGradient>
+    <linearGradient id="brandHot" x1="0" y1="0" x2="1" y2="1">
+      <stop stop-color="#8d5cff"/>
+      <stop offset="0.46" stop-color="#f052d2"/>
+      <stop offset="1" stop-color="#29dfb1"/>
+    </linearGradient>
+    <linearGradient id="cream" x1="0" y1="0" x2="1" y2="1">
+      <stop stop-color="#fff7e7"/>
+      <stop offset="1" stop-color="#ded2bd"/>
+    </linearGradient>
+    <linearGradient id="panel" x1="0" y1="0" x2="1" y2="1">
+      <stop stop-color="#171726"/>
+      <stop offset="1" stop-color="#101b18"/>
+    </linearGradient>
+    <linearGradient id="signal" x1="0" y1="0" x2="1" y2="0">
+      <stop stop-color="#fff2cf"/>
+      <stop offset="0.4" stop-color="#ff8bea"/>
+      <stop offset="1" stop-color="#5ff0c6"/>
+    </linearGradient>
+    <linearGradient id="phoneFrame" x1="0" y1="0" x2="1" y2="1">
+      <stop stop-color="#2b2341"/>
+      <stop offset="0.54" stop-color="#11101a"/>
+      <stop offset="1" stop-color="#211933"/>
+    </linearGradient>
+    <pattern id="grid" width="54" height="54" patternUnits="userSpaceOnUse">
+      <path d="M54 0H0V54" stroke="#ffffff" stroke-opacity="0.045" stroke-width="1"/>
+    </pattern>
+    <filter id="deepShadow" x="-25%" y="-20%" width="150%" height="150%">
+      <feDropShadow dx="0" dy="34" stdDeviation="34" flood-color="#000000" flood-opacity="0.46"/>
+    </filter>
+    <filter id="phoneShadow" x="-30%" y="-20%" width="160%" height="155%">
+      <feDropShadow dx="0" dy="42" stdDeviation="34" flood-color="#000000" flood-opacity="0.54"/>
+    </filter>
+    <filter id="softText" x="-10%" y="-10%" width="120%" height="120%">
+      <feDropShadow dx="0" dy="8" stdDeviation="12" flood-color="#000000" flood-opacity="0.3"/>
+    </filter>
+    <clipPath id="phoneClip">
+      <rect x="36" y="36" width="420" height="707" rx="46"/>
+    </clipPath>
+    <clipPath id="logoClip">
+      <rect x="0" y="0" width="76" height="76" rx="20"/>
+    </clipPath>
+    <style>
+      .font { font-family: "PingFang SC", "Hiragino Sans GB", "Noto Sans CJK SC", "Microsoft YaHei", Arial, sans-serif; }
+      .mono { font-family: "SF Mono", "Menlo", "Consolas", monospace; }
+      .title { font-weight: 900; letter-spacing: 0; }
+      .strong { font-weight: 800; letter-spacing: 0; }
+      .medium { font-weight: 600; letter-spacing: 0; }
+      .regular { font-weight: 500; letter-spacing: 0; }
+    </style>
+  </defs>
+
+  <rect width="1080" height="1920" fill="url(#pageBg)"/>
+  <rect width="1080" height="1920" fill="url(#grid)"/>
+  <path d="M-110 346C146 126 349 119 591 227C768 306 896 295 1190 148V454C879 592 662 607 430 498C225 402 72 442 -110 602V346Z" fill="#ffffff" fill-opacity="0.055"/>
+  <path d="M-120 1502C160 1390 356 1441 574 1551C782 1656 915 1619 1190 1462V1920H-120V1502Z" fill="#29dfb1" fill-opacity="0.075"/>
+  <path d="M690 0H1080V1210C966 1128 868 1005 797 842C710 644 677 400 690 0Z" fill="#8d5cff" fill-opacity="0.11"/>
+  <path d="M0 980C158 908 289 910 430 984C541 1042 629 1044 760 985V1120C611 1183 501 1170 380 1111C250 1048 132 1051 0 1114V980Z" fill="#fff7e7" fill-opacity="0.04"/>
+
+  <g transform="translate(72 70)">
+    <rect x="0" y="0" width="936" height="1780" rx="42" fill="#0e1119" fill-opacity="0.64" stroke="#ffffff" stroke-opacity="0.12"/>
+
+    <g transform="translate(48 48)">
+      <image href="zaomeng-logo-mark.jpg" x="0" y="0" width="76" height="76" preserveAspectRatio="xMidYMid slice" clip-path="url(#logoClip)"/>
+      <rect x="0" y="0" width="76" height="76" rx="20" stroke="#ffffff" stroke-opacity="0.18"/>
+      <text x="98" y="31" class="font strong" font-size="31" fill="#fff7e7">造梦 Studio</text>
+      <text x="100" y="63" class="font regular" font-size="18" fill="#a9a4bd">AI 图片 · 视频 · 产品营销素材平台</text>
+      <rect x="686" y="10" width="154" height="56" rx="28" fill="#ffffff" fill-opacity="0.08" stroke="#ffffff" stroke-opacity="0.12"/>
+      <text x="717" y="47" class="font strong" font-size="19" fill="#e8fff7">多比例批量生成</text>
+    </g>
+
+    <g transform="translate(48 190)" filter="url(#softText)">
+      <text x="0" y="0" class="font title" font-size="77" fill="#fff7e7">
+        <tspan x="0" dy="0">把参考素材</tspan>
+      </text>
+      <text x="0" y="91" class="font title" font-size="77" fill="#fff7e7">
+        <tspan>变成</tspan>
+        <tspan fill="#64f1c8">你的产品广告</tspan>
+      </text>
+      <rect x="2" y="121" width="552" height="7" rx="3.5" fill="url(#signal)"/>
+      <text x="0" y="184" class="font regular" font-size="28" fill="#d8d2e3">
+        <tspan x="0" dy="0">粘贴小红书、抖音或网页链接，反推风格、</tspan>
+        <tspan x="0" dy="44">构图与光线；上传产品图，直接生成素材。</tspan>
+      </text>
+    </g>
+
+    <g transform="translate(570 220)" filter="url(#phoneShadow)">
+      <rect x="0" y="0" width="492" height="794" rx="66" fill="url(#phoneFrame)"/>
+      <rect x="18" y="18" width="456" height="758" rx="58" fill="#05050a" stroke="#ffffff" stroke-opacity="0.16"/>
+      <image href="product-mobile-ui-clean.png" x="36" y="36" width="420" height="707" preserveAspectRatio="xMidYMid slice" clip-path="url(#phoneClip)"/>
+      <rect x="36" y="36" width="420" height="707" rx="46" stroke="#ffffff" stroke-opacity="0.16"/>
+      <rect x="173" y="30" width="146" height="22" rx="11" fill="#05050a"/>
+      <rect x="190" y="37" width="112" height="7" rx="3.5" fill="#ffffff" fill-opacity="0.25"/>
+    </g>
+
+    <g transform="translate(458 684)" filter="url(#deepShadow)">
+      <rect x="0" y="0" width="254" height="70" rx="35" fill="#fff7e7"/>
+      <circle cx="37" cy="35" r="18" fill="#8d5cff"/>
+      <path d="M30 35L36 41L46 28" stroke="#fff7e7" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>
+      <text x="68" y="44" class="font strong" font-size="22" fill="#12131b">链接反推提示词</text>
+    </g>
+    <g transform="translate(762 944)" filter="url(#deepShadow)">
+      <rect x="0" y="0" width="216" height="64" rx="32" fill="#151927" stroke="#75ffd7" stroke-opacity="0.36"/>
+      <text x="30" y="41" class="font strong" font-size="21" fill="#e9fff8">图片 + 视频成片</text>
+    </g>
+    <g transform="translate(516 1010)" filter="url(#deepShadow)">
+      <rect x="0" y="0" width="284" height="66" rx="33" fill="#151927" stroke="#ff80df" stroke-opacity="0.36"/>
+      <text x="30" y="42" class="font strong" font-size="21" fill="#fff7fb">产品主体高保真编辑</text>
+    </g>
+
+    <g transform="translate(48 548)">
+      <g transform="translate(0 0)">
+        <rect x="0" y="0" width="410" height="104" rx="26" fill="#171b25" stroke="#ffffff" stroke-opacity="0.10"/>
+        <text x="30" y="41" class="font strong" font-size="25" fill="#fff7e7">参考素材反推</text>
+        <text x="30" y="75" class="font regular" font-size="18" fill="#aeb4c7">风格、构图、光线、镜头语言</text>
+      </g>
+      <g transform="translate(0 130)">
+        <rect x="0" y="0" width="410" height="104" rx="26" fill="#171b25" stroke="#ffffff" stroke-opacity="0.10"/>
+        <text x="30" y="41" class="font strong" font-size="25" fill="#fff7e7">产品图编辑生成</text>
+        <text x="30" y="75" class="font regular" font-size="18" fill="#aeb4c7">保留 Logo、包装、颜色与形状</text>
+      </g>
+      <g transform="translate(0 260)">
+        <rect x="0" y="0" width="410" height="104" rx="26" fill="#171b25" stroke="#ffffff" stroke-opacity="0.10"/>
+        <text x="30" y="41" class="font strong" font-size="25" fill="#fff7e7">批量多比例输出</text>
+        <text x="30" y="75" class="font regular" font-size="18" fill="#aeb4c7">1:1、3:4、9:16、横竖版素材</text>
+      </g>
+    </g>
+
+    <g transform="translate(48 1038)">
+      <rect x="0" y="0" width="840" height="246" rx="34" fill="url(#panel)" stroke="#ffffff" stroke-opacity="0.11"/>
+      <text x="34" y="58" class="font strong" font-size="31" fill="#fff7e7">一套流程，解决素材生产最慢的四件事</text>
+      <g transform="translate(34 94)">
+        <rect x="0" y="0" width="176" height="108" rx="24" fill="#ffffff" fill-opacity="0.07"/>
+        <text x="24" y="42" class="font strong" font-size="23" fill="#73f3cd">找参考</text>
+        <text x="24" y="76" class="font regular" font-size="16" fill="#c5c6d5">链接 / 图片 / 视频</text>
+      </g>
+      <g transform="translate(226 94)">
+        <rect x="0" y="0" width="176" height="108" rx="24" fill="#ffffff" fill-opacity="0.07"/>
+        <text x="24" y="42" class="font strong" font-size="23" fill="#ff9fe8">提提示词</text>
+        <text x="24" y="76" class="font regular" font-size="16" fill="#c5c6d5">结构化反推重组</text>
+      </g>
+      <g transform="translate(418 94)">
+        <rect x="0" y="0" width="176" height="108" rx="24" fill="#ffffff" fill-opacity="0.07"/>
+        <text x="24" y="42" class="font strong" font-size="23" fill="#fff0b0">放产品</text>
+        <text x="24" y="76" class="font regular" font-size="16" fill="#c5c6d5">主体身份锁定</text>
+      </g>
+      <g transform="translate(610 94)">
+        <rect x="0" y="0" width="196" height="108" rx="24" fill="#ffffff" fill-opacity="0.07"/>
+        <text x="24" y="42" class="font strong" font-size="23" fill="#fff7e7">出素材</text>
+        <text x="24" y="76" class="font regular" font-size="16" fill="#c5c6d5">图片、视频、历史管理</text>
+      </g>
+    </g>
+
+    <g transform="translate(48 1346)">
+      <text x="0" y="0" class="font strong" font-size="37" fill="#fff7e7">让每一次上新，都有一组可投放素材</text>
+      <text x="0" y="53" class="font regular" font-size="24" fill="#bbb8ca">
+        <tspan x="0" dy="0">适合电商商家、品牌运营、短视频投放和私域团队。</tspan>
+      </text>
+      <g transform="translate(0 100)">
+        <rect x="0" y="0" width="190" height="70" rx="35" fill="#fff7e7"/>
+        <text x="33" y="44" class="font strong" font-size="22" fill="#12131b">电商商品图</text>
+        <rect x="214" y="0" width="190" height="70" rx="35" fill="#ffffff" fill-opacity="0.08" stroke="#ffffff" stroke-opacity="0.11"/>
+        <text x="247" y="44" class="font strong" font-size="22" fill="#fff7e7">短视频广告</text>
+        <rect x="428" y="0" width="190" height="70" rx="35" fill="#ffffff" fill-opacity="0.08" stroke="#ffffff" stroke-opacity="0.11"/>
+        <text x="461" y="44" class="font strong" font-size="22" fill="#fff7e7">小红书种草</text>
+        <rect x="642" y="0" width="198" height="70" rx="35" fill="#ffffff" fill-opacity="0.08" stroke="#ffffff" stroke-opacity="0.11"/>
+        <text x="683" y="44" class="font strong" font-size="22" fill="#fff7e7">品牌海报</text>
+      </g>
+    </g>
+
+    <g transform="translate(48 1600)">
+      <rect x="0" y="0" width="840" height="118" rx="32" fill="url(#brandHot)"/>
+      <text x="40" y="50" class="font strong" font-size="31" fill="#070912">上传产品图，开始生成品牌素材</text>
+      <text x="40" y="86" class="font regular" font-size="19" fill="#070912" fill-opacity="0.72">从找参考到生成成片，把素材生产压缩到几分钟。</text>
+      <rect x="742" y="29" width="68" height="60" rx="30" fill="#070912" fill-opacity="0.88"/>
+      <path d="M769 47L794 59L769 72V47Z" fill="#fff7e7"/>
+    </g>
+
+    <g transform="translate(48 1752)">
+      <text x="0" y="0" class="mono" font-size="17" fill="#6e7282">ZAOMENG STUDIO · AI PRODUCT CREATIVE WORKFLOW</text>
+      <text x="640" y="0" class="font regular" font-size="17" fill="#7d8392">图片生成 / 图片编辑 / 视频生成 / 链接反推</text>
+    </g>
+  </g>
+</svg>

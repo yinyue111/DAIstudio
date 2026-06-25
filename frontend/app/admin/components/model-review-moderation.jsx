@@ -323,10 +323,19 @@ export function ReviewTasks() {
   }
 
   async function settle(task) {
+    const canUseLocalImageResults = task.category === "image" && task.has_local_results;
     const resultUrl = window.prompt(
-      task.category === "image" ? "填入上游已生成的图片结果 URL" : "填入上游已生成的视频结果 URL"
+      task.category === "image"
+        ? (canUseLocalImageResults
+            ? "填入上游已生成的图片结果 URL；留空则使用本地已保存结果"
+            : "填入上游已生成的图片结果 URL")
+        : "填入上游已生成的视频结果 URL"
     );
-    if (!resultUrl && task.category !== "image") return;
+    if (resultUrl == null) return;
+    if (!resultUrl.trim() && !canUseLocalImageResults) {
+      setMsg("该任务没有可用的本地图片结果，请填写上游结果 URL 后再结算。");
+      return;
+    }
     const externalTaskId = window.prompt("外部任务 ID(可选)", task.external_task_id || "") || null;
     const note = window.prompt("结算备注(可选)", "人工补结果结算") || "";
     if (!confirmReviewTaskAction(task, "补结果结算", note, resultUrl)) return;

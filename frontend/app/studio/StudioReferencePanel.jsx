@@ -6,6 +6,7 @@ import { selectedLabel } from "./helpers";
 export default function StudioReferencePanel({
   category,
   creationMode,
+  imageEditProductMode = false,
   isEditMode = false,
   selected,
   productAsset,
@@ -35,17 +36,29 @@ export default function StudioReferencePanel({
   onPickAsset,
   onReverse,
 }) {
+  const isImageEditMode = creationMode === "image_edit";
+  const productGenerationMode = isImageEditMode && imageEditProductMode;
   const modeTitle = isEditMode
     ? (creationMode === "video_edit" ? "视频编辑" : "图片编辑")
     : (category === "video" ? "视频参考" : "链接反推");
-  const styleTitle = isEditMode ? "风格参考" : "参考素材";
-  const styleDescription = isEditMode
+  const styleTitle = isImageEditMode ? "可选风格参考" : (isEditMode ? "风格参考" : "参考素材");
+  const styleDescription = isImageEditMode
+    ? "可选：反推另一张图的场景、构图、光线和广告质感"
+    : isEditMode
     ? "用于反推场景、构图、光线和广告质感"
     : (category === "video" ? "上传视频或粘贴链接做反推" : "上传图片或粘贴链接做反推");
-  const emptyStyleTitle = category === "video" ? "上传视频 / 图片参考" : "上传图片参考";
-  const emptyStyleHint = isEditMode
+  const emptyStyleTitle = isImageEditMode ? "添加可选风格参考" : (category === "video" ? "上传视频 / 图片参考" : "上传图片参考");
+  const emptyStyleHint = isImageEditMode
+    ? "不加也能编辑；需要同款风格时再上传或粘贴链接"
+    : isEditMode
     ? "也可粘贴小红书、抖音或网页链接抓取素材"
     : (category === "video" ? "点击上传视频，下方也可改传图片或粘贴链接" : "点击上传图片，下方也可粘贴链接抓取素材");
+  const productTitle = productGenerationMode ? "产品图片" : (isImageEditMode ? "编辑源图片" : "产品主体");
+  const productHint = isImageEditMode
+    ? (productGenerationMode
+        ? "上传产品图作为唯一产品身份，生成时强保护Logo、包装和细节"
+        : "上传需要被编辑的图片，未要求修改的内容默认保留")
+    : "保留产品、Logo、包装、颜色、形状和文字标识";
 
   return (
     <aside className="relative min-w-0 overflow-hidden rounded-xl3 border border-iris/35 bg-gradient-to-b from-iris/20 via-base2/80 to-rose/10 p-3 shadow-glow-sm">
@@ -64,6 +77,72 @@ export default function StudioReferencePanel({
             </button>
           )}
         </div>
+
+        {isImageEditMode && (
+          <div className="mb-3 rounded-xl2 border border-aqua/30 bg-aqua/10 p-2">
+            <div className="mb-2 flex items-start justify-between gap-2">
+              <div>
+                <p className="text-sm font-display font-semibold text-snow">{productTitle}</p>
+                <p className="mt-0.5 text-[11px] text-fog">{productHint}</p>
+              </div>
+              {productAsset && (
+                <button type="button" onClick={onClearProductAsset} className="chip px-2 py-1">
+                  清除
+                </button>
+              )}
+            </div>
+            <div className={`overflow-hidden rounded-xl2 border bg-black/20 ${
+              productAsset ? "border-aqua/60" : "border-dashed border-aqua/30"
+            }`}>
+              <div className="relative aspect-video">
+                {productAsset ? (
+                  <>
+                    <ReferenceAssetPreview asset={productAsset} />
+                    <span className="badge absolute left-2 top-2 bg-aqua/90 text-black">
+                      {productGenerationMode ? "产品图" : "编辑源"}
+                    </span>
+                  </>
+                ) : (
+                  <button
+                    type="button"
+                    onClick={() => productUploadInputRef.current?.click()}
+                    className="flex h-full w-full flex-col items-center justify-center gap-3 px-4 text-center transition hover:bg-white/[0.03]"
+                  >
+                    <span className="flex h-11 w-11 items-center justify-center rounded-full bg-aqua text-lg text-black shadow-glow-sm">+</span>
+                    <div>
+                      <span className="text-sm font-display font-medium text-snow">
+                        {productGenerationMode ? "上传产品图片" : "上传要编辑的图片"}
+                      </span>
+                      <span className="mt-1 block text-xs text-fog">
+                        {productGenerationMode ? "作为高保真产品生成源" : "作为图片编辑源"}
+                      </span>
+                    </div>
+                  </button>
+                )}
+              </div>
+            </div>
+            {productAsset && (
+              <div className="mt-2 min-w-0 rounded-xl border border-line bg-white/5 px-3 py-2 text-xs text-fog">
+                <div className="truncate text-mist">{selectedLabel(productAsset)}</div>
+                <div className="mt-1 text-fog">
+                  {productGenerationMode
+                    ? "生成时会锁定产品身份，只迁移或生成广告场景、光线、构图和质感。"
+                    : "生成时会按提示词编辑这张图，未指定修改的部分默认保留。"}
+                </div>
+              </div>
+            )}
+            <button
+              type="button"
+              onClick={() => productUploadInputRef.current?.click()}
+              disabled={uploading}
+              className="btn-secondary btn-sm mt-2 w-full justify-center border-aqua/30 bg-aqua/10 text-snow"
+            >
+              {uploading ? "上传中…" : productAsset
+                ? (productGenerationMode ? "替换产品图片" : "替换编辑源图片")
+                : (productGenerationMode ? "上传产品图片" : "上传编辑源图片")}
+            </button>
+          </div>
+        )}
 
         <div className="mb-3 min-w-0 rounded-xl2 border border-line bg-black/15 p-2">
           <div className="mb-2 flex min-w-0 items-center justify-between gap-2">
@@ -121,12 +200,12 @@ export default function StudioReferencePanel({
           )}
         </div>
 
-        {isEditMode && (
+        {isEditMode && !isImageEditMode && (
           <div className="mb-3 rounded-xl2 border border-aqua/30 bg-aqua/10 p-2">
             <div className="mb-2 flex items-start justify-between gap-2">
               <div>
-                <p className="text-sm font-display font-semibold text-snow">产品主体</p>
-                <p className="mt-0.5 text-[11px] text-fog">保留产品、Logo、包装、颜色、形状和文字标识</p>
+                <p className="text-sm font-display font-semibold text-snow">{productTitle}</p>
+                <p className="mt-0.5 text-[11px] text-fog">{productHint}</p>
               </div>
               {productAsset && (
                 <button type="button" onClick={onClearProductAsset} className="chip px-2 py-1">
@@ -142,7 +221,7 @@ export default function StudioReferencePanel({
                   <>
                     <ReferenceAssetPreview asset={productAsset} />
                     <span className="badge absolute left-2 top-2 bg-aqua/90 text-black">
-                      产品主体
+                      {isImageEditMode ? "编辑源" : "产品主体"}
                     </span>
                   </>
                 ) : (
@@ -153,9 +232,13 @@ export default function StudioReferencePanel({
                   >
                     <span className="flex h-11 w-11 items-center justify-center rounded-full bg-aqua text-lg text-black shadow-glow-sm">+</span>
                     <div>
-                      <span className="text-sm font-display font-medium text-snow">上传产品图片</span>
+                      <span className="text-sm font-display font-medium text-snow">
+                        {isImageEditMode ? "上传要编辑的图片" : "上传产品图片"}
+                      </span>
                       <span className="mt-1 block text-xs text-fog">
-                        {creationMode === "video_edit" ? "作为视频首帧和主体身份参考" : "作为图片编辑源"}
+                        {isImageEditMode
+                          ? "作为图片编辑源"
+                          : creationMode === "video_edit" ? "作为视频首帧和主体身份参考" : "作为图片编辑源"}
                       </span>
                     </div>
                   </button>
@@ -166,7 +249,9 @@ export default function StudioReferencePanel({
               <div className="mt-2 min-w-0 rounded-xl border border-line bg-white/5 px-3 py-2 text-xs text-fog">
                 <div className="truncate text-mist">{selectedLabel(productAsset)}</div>
                 <div className="mt-1 text-fog">
-                  生成时只迁移风格参考的场景、光线、构图和广告质感。
+                  {isImageEditMode
+                    ? "生成时会按提示词编辑这张图，未指定修改的部分默认保留。"
+                    : "生成时只迁移风格参考的场景、光线、构图和广告质感。"}
                 </div>
               </div>
             )}
@@ -176,7 +261,9 @@ export default function StudioReferencePanel({
               disabled={uploading}
               className="btn-secondary btn-sm mt-2 w-full justify-center border-aqua/30 bg-aqua/10 text-snow"
             >
-              {uploading ? "上传中…" : productAsset ? "替换产品图片" : "上传产品图片"}
+              {uploading ? "上传中…" : productAsset
+                ? (isImageEditMode ? "替换编辑源图片" : "替换产品图片")
+                : (isImageEditMode ? "上传编辑源图片" : "上传产品图片")}
             </button>
           </div>
         )}
@@ -185,7 +272,7 @@ export default function StudioReferencePanel({
           <div className="grid min-w-0 grid-cols-[minmax(0,1fr)_auto] gap-2">
             <input
               className="input min-w-0 px-3 py-2 text-xs"
-              placeholder="粘贴小红书 / 抖音 / X / 网页链接…"
+              placeholder={isImageEditMode ? "可选：粘贴风格参考链接…" : "粘贴小红书 / 抖音 / X / 网页链接…"}
               value={url}
               onChange={(e) => setUrl(e.target.value)}
               onKeyDown={(e) => e.key === "Enter" && onParse()}
@@ -254,7 +341,7 @@ export default function StudioReferencePanel({
                   : "cursor-not-allowed border border-line bg-white/5 text-fog"
               }`}
             >
-              {reversing ? "反推中…" : `反推提示词${selected && selectedReverseCost ? ` · ${selectedReverseCostLabel}` : ""}`}
+              {reversing ? "反推中…" : `${isImageEditMode ? "反推可选风格" : "反推提示词"}${selected && selectedReverseCost ? ` · ${selectedReverseCostLabel}` : ""}`}
             </button>
           </div>
           <input

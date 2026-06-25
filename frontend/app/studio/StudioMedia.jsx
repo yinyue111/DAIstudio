@@ -233,12 +233,12 @@ export function Lightbox({ a, onClose, onUnlock, onDownload, onReport, unlocking
             fallbackClassName="flex min-h-64 items-center justify-center rounded-xl2 bg-black/30 px-6 text-sm text-fog"
           />
         )}
-        <div className="mt-3 flex items-center justify-between gap-2 text-sm">
-          <span className="text-fog">
+        <div className="mt-3 flex flex-col gap-2 text-sm sm:flex-row sm:items-center sm:justify-between">
+          <span className="min-w-0 text-fog">
             {takenDown ? "素材已下架" : a.unlocked ? (isPreviewVideoAsset(a) ? "预览 · 可下载低清预览" : "预览 · 已解锁，可下载高清") : "预览 · 带水印"}
             {dims ? ` · ${dims.width}×${dims.height}` : ""}
           </span>
-          <div className="flex gap-2">
+          <div className="flex flex-wrap gap-2 sm:justify-end">
             {!takenDown && !a.unlocked && (
               <button onClick={onUnlock} disabled={unlocking} className="btn-primary btn-sm">
                 {unlocking ? "解锁中…" : "解锁高清"}

@@ -23,7 +23,7 @@ def make_image_preview(
     # downscale for the preview
     scale = min(1.0, max_side / max(img.size))
     if scale < 1.0:
-        img = img.resize((int(img.width * scale), int(img.height * scale)))
+        img = img.resize((max(1, int(img.width * scale)), max(1, int(img.height * scale))))
 
     overlay = img.copy()
     d = ImageDraw.Draw(overlay)
@@ -45,6 +45,8 @@ def make_model_reference(
     min_side: int = 1,
     *,
     max_pixels: int | None = None,
+    quality: int = 82,
+    subsampling: int = 2,
 ) -> tuple[bytes, int, int]:
     """Return a clean, bounded JPEG reference for model inputs.
 
@@ -60,12 +62,25 @@ def make_model_reference(
     img = img.convert("RGB")
     scale = min(1.0, max_side / max(img.size))
     if scale < 1.0:
-        img = img.resize((int(img.width * scale), int(img.height * scale)))
+        img = img.resize((max(1, int(img.width * scale)), max(1, int(img.height * scale))))
     if min_side > 1 and min(img.size) < min_side:
         up_scale = min_side / min(img.size)
-        img = img.resize((int(round(img.width * up_scale)), int(round(img.height * up_scale))))
+        up_width = int(round(img.width * up_scale))
+        up_height = int(round(img.height * up_scale))
+        # Extremely thin images can satisfy min_side only by exploding the long
+        # edge. Cap the upscaled result again so one bad reference cannot exhaust
+        # memory before the model request is built.
+        if max(up_width, up_height) <= max_side:
+            img = img.resize((max(1, up_width), max(1, up_height)))
     buf = io.BytesIO()
-    img.save(buf, format="JPEG", quality=82, optimize=True, progressive=True)
+    img.save(
+        buf,
+        format="JPEG",
+        quality=max(1, min(int(quality), 95)),
+        subsampling=subsampling,
+        optimize=True,
+        progressive=True,
+    )
     return buf.getvalue(), hd_w, hd_h
 
 

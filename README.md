@@ -169,13 +169,13 @@ PAYMENT_FRONTEND_BASE_URL=https://dream.aiwuq.cn
 TRUSTED_PROXY_IPS=127.0.0.1,172.16.0.0/12
 ```
 
-然后在 shell 中设置 Compose 需要的数据库和监控密钥：
+然后在 shell 或根目录 `.env` 中设置 Compose 需要插值的数据库密码：
 
 ```bash
 export POSTGRES_PASSWORD='<strong-postgres-password>'
-export METRICS_TOKEN='<strong-random-token>'
-export PAYMENT_CONFIG_SECRET='<strong-random-secret-at-least-32-chars>'
 ```
+
+`DEBUG`、`PUBLIC_BASE_URL`、`CORS_ORIGINS`、`TRUSTED_PROXY_IPS`、短信、支付、模型网关和在线升级等后端应用配置都只写入 `backend/.env`。Compose 会通过 `env_file` 读取它们；宿主 shell/根目录 `.env` 只用于 `POSTGRES_PASSWORD`、端口和前端构建参数，避免覆盖 `backend/.env`。
 
 ### 2. 启动全栈
 
@@ -449,6 +449,8 @@ make lint
 make test
 make test-frontend
 make build-frontend
+make alembic-check
+make compose-check
 make release-check-worktree
 ```
 

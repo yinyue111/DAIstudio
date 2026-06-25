@@ -108,7 +108,7 @@ def retry_task(task_id: int, db: Session = Depends(get_db),
         raise HTTPException(400, "任务参数非法,无法重试")
     try:
         assert_safe_user_asset_url(task.source_asset_url)
-        for _url_key in ("reference_image_url", "first_frame_image"):
+        for _url_key in ("reference_image_url", "first_frame_image", "last_frame_image", "style_reference_image"):
             assert_safe_user_asset_url(task_params.get(_url_key))
     except SsrfError as e:
         raise HTTPException(400, f"素材链接被安全策略拦截:{e}")
@@ -118,6 +118,8 @@ def retry_task(task_id: int, db: Session = Depends(get_db),
         task.source_asset_url,
         task_params.get("reference_image_url"),
         task_params.get("first_frame_image"),
+        task_params.get("last_frame_image"),
+        task_params.get("style_reference_image"),
     )
     snapshot = (task.params or {}).get("_model_snapshot") or model_snapshot(model)
     try:

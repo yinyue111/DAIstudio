@@ -1,0 +1,158 @@
+<svg width="1080" height="1920" viewBox="0 0 1080 1920" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="bg" x1="120" y1="0" x2="980" y2="1920" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#14181f"/>
+      <stop offset="0.45" stop-color="#20222a"/>
+      <stop offset="1" stop-color="#101513"/>
+    </linearGradient>
+    <linearGradient id="cream" x1="0" y1="0" x2="1" y2="1">
+      <stop stop-color="#f5efe2"/>
+      <stop offset="1" stop-color="#d9cdbb"/>
+    </linearGradient>
+    <linearGradient id="hot" x1="0" y1="0" x2="1" y2="1">
+      <stop stop-color="#ff6a3d"/>
+      <stop offset="0.45" stop-color="#f4c542"/>
+      <stop offset="1" stop-color="#20c997"/>
+    </linearGradient>
+    <linearGradient id="cool" x1="0" y1="0" x2="1" y2="1">
+      <stop stop-color="#66e3c4"/>
+      <stop offset="1" stop-color="#8db7ff"/>
+    </linearGradient>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="150%">
+      <feDropShadow dx="0" dy="24" stdDeviation="28" flood-color="#000000" flood-opacity="0.38"/>
+    </filter>
+    <filter id="soft" x="-20%" y="-20%" width="140%" height="140%">
+      <feGaussianBlur stdDeviation="28"/>
+    </filter>
+    <pattern id="grid" width="48" height="48" patternUnits="userSpaceOnUse">
+      <path d="M48 0H0V48" stroke="#ffffff" stroke-opacity="0.045" stroke-width="1"/>
+    </pattern>
+    <style>
+      .font { font-family: "PingFang SC", "Hiragino Sans GB", "Noto Sans CJK SC", "Microsoft YaHei", Arial, sans-serif; }
+      .mono { font-family: "SF Mono", "Menlo", "Consolas", monospace; }
+      .title { font-weight: 900; letter-spacing: 0; }
+      .strong { font-weight: 800; letter-spacing: 0; }
+      .regular { font-weight: 500; letter-spacing: 0; }
+      .muted { fill: #9da6a2; }
+    </style>
+  </defs>
+
+  <rect width="1080" height="1920" fill="url(#bg)"/>
+  <rect width="1080" height="1920" fill="url(#grid)"/>
+  <path d="M-60 240C140 88 330 80 515 170C712 265 798 205 1160 70V428C858 536 639 555 424 461C257 388 101 412 -60 534V240Z" fill="#f5efe2" fill-opacity="0.08"/>
+  <path d="M-80 1615C190 1494 410 1560 620 1668C795 1758 918 1731 1160 1602V1920H-80V1615Z" fill="#20c997" fill-opacity="0.10"/>
+  <circle cx="930" cy="365" r="180" fill="#ff6a3d" fill-opacity="0.16" filter="url(#soft)"/>
+  <circle cx="185" cy="1480" r="210" fill="#20c997" fill-opacity="0.12" filter="url(#soft)"/>
+
+  <g transform="translate(72 76)">
+    <rect x="0" y="0" width="936" height="1768" rx="36" fill="#11151b" fill-opacity="0.56" stroke="#ffffff" stroke-opacity="0.12"/>
+
+    <g transform="translate(48 46)">
+      <rect x="0" y="0" width="76" height="76" rx="20" fill="url(#hot)"/>
+      <path d="M23 49C34 22 55 20 58 38C62 63 22 65 23 49Z" fill="#11151b" fill-opacity="0.86"/>
+      <path d="M29 48C37 33 50 31 52 40C54 52 30 55 29 48Z" fill="#f5efe2"/>
+      <text x="98" y="31" class="font strong" font-size="30" fill="#f5efe2">造梦 Studio</text>
+      <text x="99" y="62" class="font regular" font-size="18" fill="#9da6a2">AI 图片 · 视频 · 产品素材生成平台</text>
+    </g>
+
+    <g transform="translate(48 176)">
+      <text x="0" y="0" class="font title" font-size="78" fill="#f5efe2">
+        <tspan x="0" dy="0">一条链接</tspan>
+        <tspan fill="#66e3c4">生成</tspan>
+      </text>
+      <text x="0" y="92" class="font title" font-size="78" fill="#f5efe2">品牌图片与视频素材</text>
+      <rect x="0" y="127" width="616" height="7" rx="3.5" fill="url(#hot)"/>
+      <text x="0" y="188" class="font regular" font-size="31" fill="#cfd7d1">
+        <tspan x="0" dy="0">粘贴小红书、抖音或网页链接，上传产品图，</tspan>
+        <tspan x="0" dy="48">自动反推风格提示词，批量生成可用素材。</tspan>
+      </text>
+    </g>
+
+    <g transform="translate(48 444)" filter="url(#shadow)">
+      <rect x="0" y="0" width="840" height="440" rx="30" fill="#f5efe2"/>
+      <rect x="28" y="28" width="312" height="384" rx="24" fill="#1f2630"/>
+      <rect x="48" y="52" width="272" height="168" rx="18" fill="url(#cool)"/>
+      <path d="M62 191C106 139 145 144 178 182C211 221 257 205 306 150V220H62V191Z" fill="#11151b" fill-opacity="0.38"/>
+      <rect x="62" y="246" width="142" height="22" rx="11" fill="#f5efe2" fill-opacity="0.78"/>
+      <rect x="62" y="286" width="212" height="16" rx="8" fill="#f5efe2" fill-opacity="0.34"/>
+      <rect x="62" y="319" width="178" height="16" rx="8" fill="#f5efe2" fill-opacity="0.26"/>
+      <circle cx="278" cy="316" r="32" fill="#ff6a3d"/>
+      <path d="M267 304L294 320L267 336V304Z" fill="#f5efe2"/>
+
+      <g transform="translate(382 48)">
+        <text x="0" y="0" class="font strong" font-size="32" fill="#11151b">从参考到成片，一站完成</text>
+        <text x="0" y="48" class="font regular" font-size="19" fill="#4b534f">
+          <tspan x="0" dy="0">自动识别参考素材的画面风格、构图、光线，</tspan>
+          <tspan x="0" dy="30">提炼场景与广告质感。</tspan>
+        </text>
+        <g transform="translate(0 96)">
+          <rect x="0" y="0" width="392" height="64" rx="18" fill="#11151b"/>
+          <text x="24" y="40" class="font strong" font-size="22" fill="#f5efe2">01 参考链接 / 上传素材</text>
+          <circle cx="348" cy="32" r="16" fill="#66e3c4"/>
+        </g>
+        <g transform="translate(0 178)">
+          <rect x="0" y="0" width="392" height="64" rx="18" fill="#e6ded0"/>
+          <text x="24" y="40" class="font strong" font-size="22" fill="#11151b">02 反推结构化提示词</text>
+          <circle cx="348" cy="32" r="16" fill="#ff6a3d"/>
+        </g>
+        <g transform="translate(0 260)">
+          <rect x="0" y="0" width="392" height="64" rx="18" fill="#20c997"/>
+          <text x="24" y="40" class="font strong" font-size="22" fill="#0f1916">03 批量生成图片 / 视频</text>
+          <circle cx="348" cy="32" r="16" fill="#11151b"/>
+        </g>
+      </g>
+    </g>
+
+    <g transform="translate(48 950)">
+      <text x="0" y="0" class="font strong" font-size="38" fill="#f5efe2">产品图也能直接变广告素材</text>
+      <text x="0" y="52" class="font regular" font-size="24" fill="#aeb8b1">保留产品主体、Logo、包装、颜色和形状，只迁移参考素材的场景与光线。</text>
+
+      <g transform="translate(0 104)">
+        <rect x="0" y="0" width="258" height="258" rx="28" fill="#202731" stroke="#ffffff" stroke-opacity="0.10"/>
+        <rect x="33" y="38" width="192" height="145" rx="24" fill="#f5efe2"/>
+        <rect x="74" y="62" width="110" height="96" rx="18" fill="#ff6a3d"/>
+        <rect x="93" y="82" width="72" height="14" rx="7" fill="#11151b" fill-opacity="0.88"/>
+        <rect x="92" y="111" width="76" height="22" rx="11" fill="#f5efe2"/>
+        <text x="32" y="224" class="font strong" font-size="24" fill="#f5efe2">产品主体</text>
+      </g>
+      <g transform="translate(292 104)">
+        <rect x="0" y="0" width="258" height="258" rx="28" fill="#202731" stroke="#ffffff" stroke-opacity="0.10"/>
+        <rect x="30" y="34" width="198" height="150" rx="24" fill="url(#cool)"/>
+        <path d="M40 163C85 111 126 118 159 152C190 183 206 156 227 130V184H40V163Z" fill="#0d1718" fill-opacity="0.35"/>
+        <circle cx="88" cy="82" r="25" fill="#f4c542"/>
+        <text x="32" y="224" class="font strong" font-size="24" fill="#f5efe2">风格参考</text>
+      </g>
+      <g transform="translate(584 104)">
+        <rect x="0" y="0" width="256" height="258" rx="28" fill="#f5efe2"/>
+        <rect x="28" y="34" width="200" height="150" rx="24" fill="#11151b"/>
+        <rect x="74" y="55" width="110" height="96" rx="18" fill="#ff6a3d"/>
+        <path d="M28 156C72 108 113 118 148 151C177 178 198 157 228 123V184H28V156Z" fill="#66e3c4" fill-opacity="0.52"/>
+        <text x="32" y="224" class="font strong" font-size="24" fill="#11151b">生成素材</text>
+      </g>
+    </g>
+
+    <g transform="translate(48 1374)">
+      <rect x="0" y="0" width="840" height="166" rx="30" fill="#1e252e" stroke="#ffffff" stroke-opacity="0.10"/>
+      <text x="34" y="48" class="font strong" font-size="26" fill="#f5efe2">适合这些团队</text>
+      <g class="font regular" font-size="23" fill="#cfd7d1">
+        <text x="34" y="96">电商商品图</text>
+        <text x="242" y="96">短视频广告</text>
+        <text x="450" y="96">小红书种草</text>
+        <text x="658" y="96">品牌海报</text>
+        <text x="34" y="136">产品换场景</text>
+        <text x="242" y="136">批量多比例</text>
+        <text x="450" y="136">高清下载</text>
+        <text x="658" y="136">历史作品管理</text>
+      </g>
+    </g>
+
+    <g transform="translate(48 1600)">
+      <rect x="0" y="0" width="840" height="112" rx="28" fill="url(#hot)"/>
+      <text x="42" y="49" class="font strong" font-size="30" fill="#11151b">用你的产品图，生成第一组品牌素材</text>
+      <text x="42" y="84" class="font regular" font-size="19" fill="#11151b" fill-opacity="0.72">把找参考、写提示词、做素材的链路压缩到几分钟。</text>
+      <path d="M762 37L800 56L762 75V37Z" fill="#11151b"/>
+    </g>
+
+    <text x="48" y="1742" class="mono" font-size="18" fill="#6f7a75">AI IMAGE · VIDEO · PRODUCT CREATIVE WORKFLOW</text>
+  </g>
+</svg>

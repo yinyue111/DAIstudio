@@ -470,6 +470,7 @@ class OnlineUpdateStatusOut(BaseModel):
 
 class OnlineUpdateRunIn(BaseModel):
     apply: bool = True
+    confirm: str = ""
 
 
 class OnlineUpdateRunOut(BaseModel):

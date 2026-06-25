@@ -527,6 +527,7 @@ def _post_single_image_repeated(path: str, payload: dict, n: int,
 # ----------------------------------------------------------------- text -> image
 def gen_image(prompt: str, image_model_id: str, n: int = 4,
               size: str = "1024x1024", reference_image_url: str | None = None,
+              reference_image_urls: list[str] | None = None,
               edit_path: str | None = None,
               extra_payload: dict | None = None,
               gateway_config: RuntimeGatewayConfig | None = None) -> list[bytes]:
@@ -542,13 +543,16 @@ def gen_image(prompt: str, image_model_id: str, n: int = 4,
 
     n = max(1, int(n))
     extra = {k: v for k, v in (extra_payload or {}).items() if v not in (None, "")}
-    if reference_image_url and edit_path:
+    refs = [str(x) for x in (reference_image_urls or []) if x]
+    if reference_image_url and not refs:
+        refs = [reference_image_url]
+    if refs and edit_path:
         # Current OpenAI-compatible image-edit gateways often implement edits
         # through the Responses image tool, where `tools[0].n` is invalid.
         # Preserve the user's requested count by issuing single-image edits.
         payload = {
             "model": image_model_id,
-            "images": [{"image_url": reference_image_url}],
+            "images": [{"image_url": ref} for ref in refs],
             "prompt": prompt,
             "size": size,
             **extra,

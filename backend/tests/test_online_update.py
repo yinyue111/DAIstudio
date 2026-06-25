@@ -67,7 +67,7 @@ def test_admin_online_update_disabled_rejects_run(client, make_user, auth, monke
     assert status.status_code == 200, status.text
     assert status.json()["enabled"] is False
 
-    run = client.post("/api/admin/update/run", json={"apply": True}, headers=h)
+    run = client.post("/api/admin/update/run", json={"apply": True, "confirm": "UPDATE"}, headers=h)
     assert run.status_code == 400, run.text
     assert "在线更新未启用" in run.text
 
@@ -85,9 +85,20 @@ def test_admin_online_update_refuses_dirty_worktree(client, make_user, auth, mon
     assert status.status_code == 200, status.text
     assert status.json()["dirty"] is True
 
-    run = client.post("/api/admin/update/run", json={"apply": True}, headers=h)
+    run = client.post("/api/admin/update/run", json={"apply": True, "confirm": "UPDATE"}, headers=h)
     assert run.status_code == 400, run.text
     assert "未提交改动" in run.text
+
+
+def test_admin_online_update_requires_explicit_confirmation(client, make_user, auth, monkeypatch, git_repos):
+    _configure(monkeypatch, git_repos["work"])
+    make_user("15700002013", admin=True)
+    h = auth("15700002013")
+
+    run = client.post("/api/admin/update/run", json={"apply": True}, headers=h)
+
+    assert run.status_code == 400, run.text
+    assert "确认码 UPDATE" in run.text
 
 
 def test_admin_online_update_fast_forwards_and_runs_configured_apply_command(
@@ -119,7 +130,7 @@ def test_admin_online_update_fast_forwards_and_runs_configured_apply_command(
     make_user("15700002003", admin=True)
     h = auth("15700002003")
 
-    run = client.post("/api/admin/update/run", json={"apply": True}, headers=h)
+    run = client.post("/api/admin/update/run", json={"apply": True, "confirm": "UPDATE"}, headers=h)
     assert run.status_code == 200, run.text
     data = run.json()
     assert data["changed"] is True
@@ -145,7 +156,7 @@ def test_admin_online_update_noops_when_already_current(client, make_user, auth,
     make_user("15700002004", admin=True)
     h = auth("15700002004")
 
-    run = client.post("/api/admin/update/run", json={"apply": True}, headers=h)
+    run = client.post("/api/admin/update/run", json={"apply": True, "confirm": "UPDATE"}, headers=h)
     assert run.status_code == 200, run.text
     data = run.json()
     assert data["changed"] is False
@@ -182,7 +193,7 @@ def test_admin_online_update_reports_partial_failure_when_apply_fails(
     make_user("15700002006", admin=True)
     h = auth("15700002006")
 
-    run = client.post("/api/admin/update/run", json={"apply": True}, headers=h)
+    run = client.post("/api/admin/update/run", json={"apply": True, "confirm": "UPDATE"}, headers=h)
 
     assert run.status_code == 200, run.text
     data = run.json()
@@ -345,15 +356,29 @@ def test_online_update_redacts_secrets_from_command_output():
     assert "<redacted>" in redacted
 
 
-def test_compose_preserves_online_update_env_file_values(tmp_path):
+def test_compose_preserves_backend_env_file_application_values(tmp_path):
     root = Path(__file__).resolve().parents[2]
     compose = root / "docker-compose.yml"
     data = compose.read_text(encoding="utf-8")
 
-    # api/migrate load backend/.env through env_file. If these are repeated in
-    # an explicit environment block with empty defaults, docker compose
-    # overwrites the .env values and private-repo HTTPS upgrades fail after
-    # deployment even when ONLINE_UPDATE_GITHUB_TOKEN is configured correctly.
-    assert "ONLINE_UPDATE_GITHUB_TOKEN:" not in data
-    assert "ONLINE_UPDATE_REMOTE:" not in data
-    assert "ONLINE_UPDATE_REPO_DIR:" not in data
+    # api/migrate/worker/beat load backend/.env through env_file. If application
+    # settings are repeated in explicit environment blocks with empty/default
+    # values, Compose overwrites the real .env values after deployment.
+    for key in (
+        "ONLINE_UPDATE_GITHUB_TOKEN",
+        "ONLINE_UPDATE_REMOTE",
+        "ONLINE_UPDATE_REPO_DIR",
+        "PUBLIC_BASE_URL",
+        "CORS_ORIGINS",
+        "PAYMENT_FRONTEND_BASE_URL",
+        "TRUSTED_PROXY_IPS",
+        "PAYMENT_MOCK_ENABLED",
+        "SMS_PROVIDER",
+        "SMS_HTTP_URL",
+        "SMS_HTTP_API_KEY",
+        "SMS_HTTP_TIMEOUT_SECONDS",
+        "SMS_SIGN_NAME",
+        "SMS_TEMPLATE_CODE",
+        "DEBUG",
+    ):
+        assert f"{key}:" not in data

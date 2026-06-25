@@ -1166,9 +1166,7 @@ def test_parse_localize_respects_user_storage_quota(client, make_user, auth, mon
     after = {str(p) for p in Path(settings.storage_dir).rglob("*") if p.is_file()}
 
     assert r.status_code == 200, r.text
-    asset = r.json()["assets"][0]
-    assert asset["url"] == "https://cdn.example.com/full.jpg"
-    assert asset.get("original_url") is None
+    assert r.json()["assets"] == []
     assert after == before
     db = SessionLocal()
     try:
@@ -1178,6 +1176,34 @@ def test_parse_localize_respects_user_storage_quota(client, make_user, auth, mon
         ).count() == 0
     finally:
         db.close()
+
+
+def test_parse_localizes_all_images_not_just_first_eight(client, make_user, auth, monkeypatch):
+    make_user("13900000189", balance=1000)
+    h = auth("13900000189")
+    monkeypatch.setattr(
+        "app.routers.parse.parse_url",
+        lambda _url: [
+            {
+                "type": "image",
+                "url": f"https://cdn.example.com/full-{idx}.jpg",
+                "thumb": f"https://cdn.example.com/thumb-{idx}.jpg",
+            }
+            for idx in range(10)
+        ],
+    )
+    monkeypatch.setattr(
+        "app.routers.parse._localize_media_url",
+        lambda url, *_a, **_k: f"http://localhost:8000/media/preview/{url.rsplit('-', 1)[-1].replace('.jpg', '.png')}",
+    )
+
+    r = client.post("/api/parse", json={"url": "https://www.xiaohongshu.com/explore/many"}, headers=h)
+
+    assert r.status_code == 200, r.text
+    assets = r.json()["assets"]
+    assert len(assets) == 10
+    assert all(asset["url"].startswith("http://localhost:8000/media/preview/") for asset in assets)
+    assert assets[-1]["original_url"] == "https://cdn.example.com/full-9.jpg"
 
 
 def test_parse_submit_returns_queued_when_worker_is_async(client, make_user, auth, monkeypatch):
@@ -1264,6 +1290,10 @@ def test_parsed_preview_reference_prefers_clean_model_ref(client, make_user, aut
         "app.routers.parse.parse_url",
         lambda _url: [{"type": "image", "url": "https://cdn.example.com/ref.png"}],
     )
+    monkeypatch.setattr(
+        "app.services.gateway.download_bytes_limited",
+        lambda *_args, **_kwargs: _png_bytes(size=(1600, 900)),
+    )
 
     r = client.post("/api/parse", json={"url": "https://www.xiaohongshu.com/explore/model-ref"}, headers=h)
     assert r.status_code == 200, r.text
@@ -1277,6 +1307,8 @@ def test_parsed_preview_reference_prefers_clean_model_ref(client, make_user, aut
         assert ref.startswith("data:image/jpeg;base64,")
         model_ref_path = storage.local_path(preview_key.replace("preview/", "model_ref/", 1).rsplit(".", 1)[0] + ".jpg")
         assert model_ref_path.exists()
+        model_ref_img = Image.open(model_ref_path)
+        assert max(model_ref_img.size) == 1024
     finally:
         db.close()
 

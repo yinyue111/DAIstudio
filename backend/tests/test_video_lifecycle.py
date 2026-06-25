@@ -127,7 +127,7 @@ def test_video_rejects_non_video_content(client, make_user, auth, monkeypatch):
     assert client.get("/api/me", headers=h).json()["balance_credits"] == 1000  # refunded
 
 
-def test_video_submit_unknown_state_fails_and_refunds(
+def test_video_submit_unknown_state_holds_for_review_without_refund(
     client,
     make_user,
     auth,
@@ -152,12 +152,14 @@ def test_video_submit_unknown_state_fails_and_refunds(
     db = SessionLocal()
     try:
         task = db.get(GenTask, r.json()["id"])
-        assert task.status == "failed"
+        assert task.status == "needs_review"
+        assert task.phase == "reconciling"
         assert (task.params or {}).get("_video_request_id", "").startswith(f"video-{task.id}-")
+        assert (task.params or {}).get("_video_submit_state_unknown") is True
         assert "视频提交状态未知" in (task.error or "")
         user = db.get(User, task.user_id)
-        assert user.balance_credits == 1000
-        assert user.frozen_credits == 0
+        assert user.balance_credits == 995
+        assert user.frozen_credits == 5
     finally:
         db.close()
 
@@ -220,7 +222,7 @@ def test_video_unknown_submit_recovers_by_request_id(
         db.close()
 
 
-def test_video_unknown_submit_request_id_miss_is_recorded_as_failed_call(
+def test_video_unknown_submit_request_id_miss_holds_for_review(
     client,
     make_user,
     auth,
@@ -255,7 +257,9 @@ def test_video_unknown_submit_request_id_miss_is_recorded_as_failed_call(
     db = SessionLocal()
     try:
         row = db.get(GenTask, r.json()["id"])
-        assert row.status == "failed"
+        assert row.status == "needs_review"
+        assert row.phase == "reconciling"
+        assert (row.params or {}).get("_video_submit_state_unknown") is True
         assert "视频提交状态未知" in (row.error or "")
         call = db.query(GatewayCall).filter(
             GatewayCall.task_id == row.id,

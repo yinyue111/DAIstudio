@@ -39,6 +39,8 @@ _VIDEO_EXTS = (".mp4", ".webm", ".mov")
 _UNSUPPORTED_VIDEO_EXTS = (".m3u8",)
 _REVERSE_RATE_LIMIT = 30
 _REVERSE_RATE_WINDOW = 3600
+REVERSE_IMAGE_REFERENCE_MAX_SIDE = 1024
+REVERSE_IMAGE_REFERENCE_QUALITY = 92
 _assert_text_allowed = assert_text_allowed
 
 
@@ -56,7 +58,15 @@ def _is_video_source(body: ReverseIn) -> bool:
 
 def _gateway_ref(db: Session, user: User, url: str | None) -> str | None:
     try:
-        return asset_refs.gateway_ref_for_user_asset(db, user.id, url)
+        return asset_refs.gateway_ref_for_user_asset(
+            db,
+            user.id,
+            url,
+            max_side=REVERSE_IMAGE_REFERENCE_MAX_SIDE,
+            prefer_original_upload=True,
+            quality=REVERSE_IMAGE_REFERENCE_QUALITY,
+            subsampling=0,
+        )
     except asset_refs.AssetRefError as e:
         raise HTTPException(404, str(e))
 

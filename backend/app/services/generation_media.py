@@ -32,6 +32,9 @@ def gateway_reference_image(
     *,
     min_side: int = 1,
     max_side: int = 384,
+    prefer_original_upload: bool = False,
+    quality: int = 82,
+    subsampling: int = 2,
 ) -> str | None:
     if not url:
         return None
@@ -44,6 +47,9 @@ def gateway_reference_image(
             url,
             min_side=min_side,
             max_side=max_side,
+            prefer_original_upload=prefer_original_upload,
+            quality=quality,
+            subsampling=subsampling,
         )
     except asset_refs.AssetRefError as e:
         raise RuntimeError(str(e)) from e

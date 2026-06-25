@@ -6,7 +6,7 @@ from sqlalchemy.orm import sessionmaker
 
 import app.models  # noqa: F401  (register tables)
 from app.celery_app import celery_app
-from app.db import Base
+from app.db import Base, SessionLocal
 from app.routers.generate import _estimate_cost
 from app.services import config_store
 from app.services.model_pricing import estimate_credits_from_usage
@@ -42,6 +42,26 @@ def test_public_config_exposes_video_reverse_presets(client, make_user, auth):
     assert presets[0]["short_range"] == "4帧"
     assert presets[1]["long_range"] == "16-24帧"
     assert presets[2]["max_frames"] == 36
+
+
+def test_public_config_exposes_normalized_feature_flags(client, make_user, auth):
+    make_user("13900000182", balance=100)
+    db = SessionLocal()
+    try:
+        config_store.set_setting(db, "reverse_prompt_enabled", "false")
+    finally:
+        db.close()
+    h = auth("13900000182")
+
+    data = client.get("/api/config", headers=h).json()
+
+    assert data["defaults"]["reverse_prompt_enabled"] == "false"
+    assert data["features"]["reverse_prompt_enabled"] is False
+    db = SessionLocal()
+    try:
+        config_store.set_setting(db, "reverse_prompt_enabled", True)
+    finally:
+        db.close()
 
 
 class _Model:

@@ -95,7 +95,7 @@ export function VersionUpgrade() {
     setMsgKind("ok");
     setResult(null);
     try {
-      const data = await api.adminRunUpdate({ apply: true });
+      const data = await api.adminRunUpdate({ apply: true, confirm: "UPDATE" });
       setResult(data);
       if (!data.ok) {
         setMsg(data.partial_failure
@@ -146,7 +146,7 @@ export function VersionUpgrade() {
             <button onClick={() => load(true)} disabled={loading || running} className="btn-secondary btn-sm">
               {loading ? "刷新中…" : "检查远端版本"}
             </button>
-            <button onClick={runUpgrade} disabled={running || !status.enabled} className="btn-primary btn-sm">
+            <button onClick={runUpgrade} disabled={running || !status.enabled || !!status.error} className="btn-primary btn-sm">
               {running ? "升级中…" : "从 GitHub 更新并生效"}
             </button>
           </div>

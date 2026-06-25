@@ -49,6 +49,7 @@ def get_config(db: Session = Depends(get_db), _: User = Depends(get_current_user
     return {
         "defaults": defaults,
         "features": {
+            "reverse_prompt_enabled": get_bool_setting(db, "reverse_prompt_enabled", True),
             "sms_auth_enabled": get_bool_setting(db, "sms_auth_enabled", False),
             "payment_enabled": get_bool_setting(db, "payment_enabled", False),
         },
@@ -56,6 +57,8 @@ def get_config(db: Session = Depends(get_db), _: User = Depends(get_current_user
         "image_sizes": list(IMAGE_SIZES),
         "image_size_max_dim": settings.max_image_dim,
         "image_n_max": settings.max_image_n,
+        "max_upload_image_bytes": settings.max_upload_image_bytes,
+        "max_upload_video_bytes": settings.max_upload_video_bytes,
         "video_duration_max_seconds": settings.max_video_seconds,
         "reverse": {
             "image_cost": vision_cost,

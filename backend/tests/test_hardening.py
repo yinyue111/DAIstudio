@@ -1,8 +1,8 @@
 """Hardening: input validation on generate params + server-side reverse switch."""
 
 from app.db import SessionLocal
-from app.models import GenTask, ParseRecord
-from app.services import gateway, generation
+from app.models import GenTask, ParseRecord, User
+from app.services import gateway, generation, storage
 from app.services.progress import set_progress
 
 
@@ -201,7 +201,7 @@ def test_partial_image_generation_exposes_gateway_slot_failure(client, make_user
     assert task["cost_settled"] == 10
 
 
-def test_partial_image_generation_unknown_slot_settles_saved_results(
+def test_partial_image_generation_unknown_slot_holds_for_review(
     client,
     make_user,
     auth,
@@ -234,17 +234,61 @@ def test_partial_image_generation_unknown_slot_settles_saved_results(
 
     assert r.status_code == 200, r.text
     task = client.get(f"/api/tasks/{r.json()['id']}", headers=h).json()
-    assert task["status"] == "succeeded"
-    assert task["partial"] is True
-    assert task["requested_count"] == 4
-    assert task["saved_count"] == 2
-    assert task["skipped_count"] == 2
-    assert task["partial_errors"] == ["read timed out"]
+    assert task["status"] == "needs_review"
+    assert "提交状态未知" in task["error"]
     assert task["cost_frozen"] == 20
-    assert task["cost_settled"] == 10
+    assert task["cost_settled"] == 0
     me = client.get("/api/me", headers=h).json()
-    assert me["balance_credits"] == 990
-    assert me["frozen_credits"] == 0
+    assert me["balance_credits"] == 980
+    assert me["frozen_credits"] == 20
+
+    db = SessionLocal()
+    try:
+        db_task = db.get(GenTask, r.json()["id"])
+        assert db_task.params["_image_submit_state_unknown"] is True
+        assert db_task.params["_requested_n"] == 4
+        assert db_task.params["_saved_n"] == 2
+        assert db_task.params["_image_result_keys"]
+    finally:
+        db.close()
+
+
+def test_review_task_list_marks_image_local_results_availability(client, make_user, auth):
+    make_user("13900001951", balance=1000, admin=True)
+    h = auth("13900001951")
+    db = SessionLocal()
+    try:
+        hd_key = storage.save_bytes(gateway._mock_image("held", "256x256", 0), "hd", "png")
+        preview_key = storage.save_bytes(gateway._mock_image("held", "64x64", 0), "preview", "png")
+        ready = GenTask(
+            user_id=db.query(User).filter(User.phone == "13900001951").one().id,
+            category="image",
+            stage="preview",
+            status=generation.NEEDS_REVIEW,
+            cost_frozen=10,
+            prompt={"final_text": "ready"},
+            params={"_image_result_keys": [hd_key, preview_key]},
+        )
+        missing = GenTask(
+            user_id=ready.user_id,
+            category="image",
+            stage="preview",
+            status=generation.NEEDS_REVIEW,
+            cost_frozen=10,
+            prompt={"final_text": "missing"},
+            params={"_image_result_keys": ["hd/missing.png", preview_key]},
+        )
+        db.add_all([ready, missing])
+        db.commit()
+        ready_id = ready.id
+        missing_id = missing.id
+    finally:
+        db.close()
+
+    rows = client.get("/api/admin/tasks/review", headers=h).json()
+    by_id = {row["id"]: row for row in rows}
+    assert by_id[ready_id]["has_local_results"] is True
+    assert by_id[missing_id]["has_local_results"] is False
 
 
 def test_task_list_batched_keeps_assets_per_task(client, make_user, auth):

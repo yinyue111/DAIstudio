@@ -25,6 +25,22 @@ def test_ark_content_image_to_video():
     assert c[0]["type"] == "text"
     assert c[1]["type"] == "image_url"
     assert c[1]["image_url"]["url"] == "http://x/y.png"
+    assert "role" not in c[1]
+
+
+def test_ark_content_image_to_video_with_last_frame():
+    c = gateway._ark_content(
+        "animate",
+        {
+            "first_frame_image": "http://x/first.png",
+            "last_frame_image": "http://x/last.png",
+            "resolution": "720p",
+        },
+    )
+    assert c[1]["image_url"]["url"] == "http://x/first.png"
+    assert c[2]["image_url"]["url"] == "http://x/last.png"
+    assert "role" not in c[1]
+    assert "role" not in c[2]
 
 
 def test_ark_content_text_to_video():
@@ -85,6 +101,37 @@ def test_generic_video_submit_preserves_first_frame(monkeypatch):
     assert task_id == "task-1"
     assert seen["payload"]["image_url"] == "https://example.com/cover.jpg"
     assert "first_frame_image" not in seen["payload"]
+
+
+def test_generic_video_submit_preserves_last_frame(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(settings, "mock_mode", False)
+    monkeypatch.setattr(settings, "video_gateway_base_url", "https://video.example.com")
+    monkeypatch.setattr(settings, "video_gateway_api_key", "test-key")
+    monkeypatch.setattr(settings, "video_gateway_format", "openai")
+
+    def fake_post(path, payload, timeout=120):
+        seen["payload"] = payload
+        return {"id": "task-1"}
+
+    monkeypatch.setattr(gateway, "_video_post", fake_post)
+
+    task_id = gateway.submit_video(
+        "animate",
+        "video-model",
+        {
+            "duration": 5,
+            "first_frame_image": "https://example.com/cover.jpg",
+            "last_frame_image": "https://example.com/end.jpg",
+        },
+        extra={"first_frame_field": "image_url", "last_frame_field": "end_image_url"},
+    )
+
+    assert task_id == "task-1"
+    assert seen["payload"]["image_url"] == "https://example.com/cover.jpg"
+    assert seen["payload"]["end_image_url"] == "https://example.com/end.jpg"
+    assert "first_frame_image" not in seen["payload"]
+    assert "last_frame_image" not in seen["payload"]
 
 
 def test_generic_video_submit_filters_internal_params(monkeypatch):

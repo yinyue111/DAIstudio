@@ -164,7 +164,7 @@ def _referenced_upload_urls(db: Session, cutoff: datetime) -> set[str]:
         task_params = params or {}
         if not isinstance(task_params, dict):
             continue
-        for key in ("reference_image_url", "first_frame_image"):
+        for key in ("reference_image_url", "first_frame_image", "last_frame_image", "style_reference_image"):
             value = task_params.get(key)
             if value:
                 refs.add(value)

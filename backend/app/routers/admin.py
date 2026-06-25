@@ -372,6 +372,7 @@ def list_review_tasks(
             "external_task_id": row.external_task_id,
             "external_submitted_at": row.external_submitted_at,
             "video_request_id": (row.params or {}).get("_video_request_id"),
+            "has_local_results": generation.image_review_has_local_results(row),
             "age_minutes": age_minutes,
             "review_sla_minutes": sla_minutes,
             "review_overdue": age_minutes is not None and age_minutes >= sla_minutes,
@@ -561,20 +562,28 @@ def usage_report(db: Session = Depends(get_db), _: User = Depends(require_admin)
              for d in sorted(daily_by_date)]
 
     if format == "csv":
-        buf = io.StringIO()
-        w = csv.writer(buf)
-        w.writerow(["user_id", "phone", "department", "spend_credits", "balance",
-                    "frozen", "image_tasks", "video_tasks", "real_tokens"])
-        for r in per_user:
-            w.writerow([_csv_cell(r["user_id"]), _csv_cell(r["phone"]),
-                        _csv_cell(r["department"]), _csv_cell(r["spend_credits"]),
-                        _csv_cell(r["balance"]), _csv_cell(r["frozen"]),
-                        _csv_cell(r["tasks"].get("image", 0)),
-                        _csv_cell(r["tasks"].get("video", 0)),
-                        _csv_cell(r["real_tokens"])])
-        buf.seek(0)
+        def iter_csv():
+            buf = io.StringIO()
+            w = csv.writer(buf)
+
+            def emit(row):
+                buf.seek(0)
+                buf.truncate(0)
+                w.writerow(row)
+                return buf.getvalue()
+
+            yield emit(["user_id", "phone", "department", "spend_credits", "balance",
+                        "frozen", "image_tasks", "video_tasks", "real_tokens"])
+            for r in per_user:
+                yield emit([_csv_cell(r["user_id"]), _csv_cell(r["phone"]),
+                            _csv_cell(r["department"]), _csv_cell(r["spend_credits"]),
+                            _csv_cell(r["balance"]), _csv_cell(r["frozen"]),
+                            _csv_cell(r["tasks"].get("image", 0)),
+                            _csv_cell(r["tasks"].get("video", 0)),
+                            _csv_cell(r["real_tokens"])])
+
         return StreamingResponse(
-            iter([buf.getvalue()]), media_type="text/csv",
+            iter_csv(), media_type="text/csv",
             headers={"Content-Disposition": "attachment; filename=usage_report.csv"},
         )
 
@@ -768,6 +777,8 @@ def online_update_run(
     admin: User = Depends(require_admin),
     request: Request = None,
 ):
+    if body.apply and body.confirm != "UPDATE":
+        raise HTTPException(400, "执行在线升级需要确认码 UPDATE")
     try:
         result = online_update.run_update(apply=body.apply)
     except online_update.OnlineUpdateError as e:

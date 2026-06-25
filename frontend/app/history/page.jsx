@@ -376,12 +376,12 @@ export default function HistoryPage() {
                 onError={(e) => setMsg(e?.message || "预览加载失败")}
               />
             )}
-            <div className="mt-3 flex items-center justify-between gap-2 text-sm">
-              <span className="text-fog">
+            <div className="mt-3 flex flex-col gap-2 text-sm sm:flex-row sm:items-center sm:justify-between">
+              <span className="min-w-0 text-fog">
                 {isAssetTakenDown(lightbox) ? "素材已下架" : lightbox.unlocked ? "预览 · 已解锁，可下载高清" : "预览 · 带水印"}
                 {lightbox.width ? ` · ${lightbox.width}×${lightbox.height}` : ""}
               </span>
-              <div className="flex gap-2">
+              <div className="flex flex-wrap gap-2 sm:justify-end">
                 {!isAssetTakenDown(lightbox) && !lightbox.unlocked && (
                   <button
                     onClick={() => unlock(lightbox)}

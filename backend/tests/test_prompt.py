@@ -5,13 +5,24 @@ from app.db import SessionLocal
 from app.models import ModelConfig, User
 from app.routers import prompt
 from app.schemas import ReverseIn
-from app.services import gateway
+from app.services import gateway, gateway_prompting
 
 
 class _Model:
     enabled = True
     model_id = "gpt-5.5"
     cost_credits = 0
+
+
+def test_reverse_image_template_captures_commercial_material_dimensions():
+    template = gateway_prompting.reverse_template("image")
+
+    assert "社媒商业素材复刻" in template
+    assert '"商品服装"' in template
+    assert '"广告目标"' in template
+    assert '"文字版式"' in template
+    assert '"一致性约束"' in template
+    assert "不要写成普通美图描述" in template
 
 
 def test_reverse_rejects_video_url_before_gateway(monkeypatch):

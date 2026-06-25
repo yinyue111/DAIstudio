@@ -183,7 +183,13 @@ async def upload_image(
     normalized_png, width, height = _normalize_image_upload(data)
     try:
         preview_png, _, _ = make_image_preview(normalized_png, max_pixels=settings.max_upload_image_pixels)
-        model_ref_jpeg, _, _ = make_model_reference(normalized_png, max_pixels=settings.max_upload_image_pixels)
+        model_ref_jpeg, _, _ = make_model_reference(
+            normalized_png,
+            max_side=1024,
+            max_pixels=settings.max_upload_image_pixels,
+            quality=92,
+            subsampling=0,
+        )
     except Exception:  # noqa: BLE001
         raise HTTPException(400, "图片内容无法解析,请更换文件")
 

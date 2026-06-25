@@ -28,6 +28,9 @@ def gateway_ref_for_user_asset(
     *,
     min_side: int = 1,
     max_side: int = 384,
+    prefer_original_upload: bool = False,
+    quality: int = 82,
+    subsampling: int = 2,
 ) -> str | None:
     """Return a gateway-readable ref for a user-controlled asset URL.
 
@@ -49,7 +52,7 @@ def gateway_ref_for_user_asset(
                 raise AssetRefError("上传素材不存在")
             row_mime = row.mime
             if key.startswith("upload/"):
-                path = _gateway_image_path(key)
+                path = storage.local_path(key) if prefer_original_upload else _gateway_image_path(key)
             elif key.startswith("upload_preview/"):
                 path = _upload_preview_model_ref_path(key)
             elif key.startswith("upload_video_preview/"):
@@ -72,6 +75,8 @@ def gateway_ref_for_user_asset(
             compress_for_gateway=True,
             min_side=min_side,
             max_side=max_side,
+            quality=quality,
+            subsampling=subsampling,
         )
 
     try:
@@ -82,7 +87,14 @@ def gateway_ref_for_user_asset(
         )
     except gateway.GatewayError as e:
         raise AssetRefError(f"素材下载失败:{e}") from e
-    return _image_data_uri(raw, compress_for_gateway=True, min_side=min_side, max_side=max_side)
+    return _image_data_uri(
+        raw,
+        compress_for_gateway=True,
+        min_side=min_side,
+        max_side=max_side,
+        quality=quality,
+        subsampling=subsampling,
+    )
 
 
 def _image_data_uri(
@@ -92,6 +104,8 @@ def _image_data_uri(
     compress_for_gateway: bool = False,
     min_side: int = 1,
     max_side: int = 384,
+    quality: int = 82,
+    subsampling: int = 2,
 ) -> str:
     try:
         img = Image.open(io.BytesIO(raw))
@@ -109,7 +123,13 @@ def _image_data_uri(
 
     if compress_for_gateway:
         try:
-            raw, _, _ = make_model_reference(raw, max_side=max_side, min_side=min_side)
+            raw, _, _ = make_model_reference(
+                raw,
+                max_side=max_side,
+                min_side=min_side,
+                quality=quality,
+                subsampling=subsampling,
+            )
             fmt = "JPEG"
         except Exception:  # noqa: BLE001 - keep original validation result
             pass

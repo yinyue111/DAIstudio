@@ -20,6 +20,7 @@ GENERIC_VIDEO_ALLOWED_PARAMS = {
     "request_id",
     "negative_prompt",
     "prompt_extend",
+    "last_frame_image",
 }
 
 
@@ -29,12 +30,19 @@ def generic_video_payload_params(params: dict, extra: dict) -> dict:
     payload_params = {
         k: v
         for k, v in dict(params or {}).items()
-        if k in allowed and not str(k).startswith("_") and v not in (None, "")
+        if k in allowed
+        and k != "last_frame_image"
+        and not str(k).startswith("_")
+        and v not in (None, "")
     }
     first_frame = (params or {}).get("first_frame_image")
     first_frame_field = extra.get("first_frame_field", "first_frame_image")
     if first_frame and first_frame_field:
         payload_params[str(first_frame_field)] = first_frame
+    last_frame = (params or {}).get("last_frame_image")
+    last_frame_field = extra.get("last_frame_field", "last_frame_image")
+    if last_frame and last_frame_field:
+        payload_params[str(last_frame_field)] = last_frame
     return payload_params
 
 
@@ -103,4 +111,7 @@ def ark_content(prompt: str, params: dict) -> list:
     img = params.get("first_frame_image")
     if img:
         content.append({"type": "image_url", "image_url": {"url": img}})
+    last = params.get("last_frame_image")
+    if last:
+        content.append({"type": "image_url", "image_url": {"url": last}})
     return content

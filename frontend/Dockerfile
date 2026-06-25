@@ -20,12 +20,10 @@ WORKDIR /app
 ENV NODE_ENV=production
 ENV NEXT_TELEMETRY_DISABLED=1
 
-COPY package.json package-lock.json* ./
-RUN npm ci --omit=dev && npm cache clean --force
-COPY --from=builder /app/.next ./.next
+COPY --from=builder /app/.next/standalone ./
 COPY --from=builder /app/public ./public
-COPY --from=builder /app/next.config.js* ./
+COPY --from=builder /app/.next/static ./.next/static
 
 USER node
 EXPOSE 3000
-CMD ["npm", "run", "start"]
+CMD ["node", "server.js"]

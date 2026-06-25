@@ -84,10 +84,22 @@ def accepts_gateway_config(fn) -> bool:
     )
 
 
+def _accepts_parameter(fn, name: str) -> bool:
+    try:
+        sig = inspect.signature(fn)
+    except (TypeError, ValueError):
+        return True
+    return name in sig.parameters or any(
+        p.kind == inspect.Parameter.VAR_KEYWORD
+        for p in sig.parameters.values()
+    )
+
+
 def gen_image_with_model_config(model, prompt: str, *, n: int, size: str,
                                 reference_image_url: str | None,
                                 edit_path: str | None,
-                                extra_payload: dict | None) -> list[bytes]:
+                                extra_payload: dict | None,
+                                reference_image_urls: list[str] | None = None) -> list[bytes]:
     kwargs = {
         "n": n,
         "size": size,
@@ -95,6 +107,8 @@ def gen_image_with_model_config(model, prompt: str, *, n: int, size: str,
         "edit_path": edit_path,
         "extra_payload": extra_payload,
     }
+    if _accepts_parameter(gateway.gen_image, "reference_image_urls"):
+        kwargs["reference_image_urls"] = reference_image_urls
     if accepts_gateway_config(gateway.gen_image):
         kwargs["gateway_config"] = gateway_config_from_model(model, "image")
     return gateway.gen_image(prompt, model.model_id, **kwargs)

@@ -27,7 +27,8 @@ from ..services.watermark import make_image_preview, make_model_reference
 
 router = APIRouter(prefix="/api", tags=["parse"])
 log = logging.getLogger("parse")
-_LOCALIZE_IMAGE_LIMIT = 8
+_REVERSE_MODEL_REF_MAX_SIDE = 1024
+_REVERSE_MODEL_REF_QUALITY = 92
 
 
 def _cache_key(url: str, user_id: int) -> str:
@@ -100,7 +101,10 @@ def _localize_media_url(url: str | None, db: Session | None = None, user_id: int
         )
         model_ref_jpeg, _, _ = make_model_reference(
             raw,
+            max_side=_REVERSE_MODEL_REF_MAX_SIDE,
             max_pixels=int(settings.parse_localize_image_max_pixels),
+            quality=_REVERSE_MODEL_REF_QUALITY,
+            subsampling=0,
         )
         if db is not None and user_id is not None:
             ensure_user_media_quota(db, user_id, len(preview_png) + len(model_ref_jpeg))
@@ -148,13 +152,12 @@ def _localize_assets(
     captured_at: datetime | None = None,
 ) -> list[dict]:
     out: list[dict] = []
-    localized_count = 0
     captured_iso = (captured_at or datetime.now(timezone.utc)).isoformat()
     for asset in assets:
         item = dict(asset)
         item["source_page_url"] = source_page_url
         item["source_captured_at"] = captured_iso
-        if localized_count < _LOCALIZE_IMAGE_LIMIT and item.get("type") == "image":
+        if item.get("type") == "image":
             local = _localize_media_url(item.get("url"), db=db, user_id=user_id)
             if local:
                 item["original_url"] = item.get("url")
@@ -162,13 +165,19 @@ def _localize_assets(
                     item["original_thumb"] = item.get("thumb")
                 item["url"] = local
                 item["thumb"] = local
-                localized_count += 1
-        elif localized_count < _LOCALIZE_IMAGE_LIMIT and item.get("type") == "video":
+            else:
+                item["original_url"] = item.get("url")
+                if item.get("thumb"):
+                    item["original_thumb"] = item.get("thumb")
+                # Do not hand external image URLs to the browser: production CSP
+                # intentionally only allows platform-owned media origins. If an
+                # image cannot be localized, omit it from the selectable assets.
+                continue
+        elif item.get("type") == "video":
             local_thumb = _localize_media_url(item.get("thumb"), db=db, user_id=user_id)
             if local_thumb:
                 item["original_thumb"] = item.get("thumb")
                 item["thumb"] = local_thumb
-                localized_count += 1
             else:
                 item["original_thumb"] = item.get("thumb")
                 item["thumb"] = None

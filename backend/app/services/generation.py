@@ -79,6 +79,7 @@ from .watermark import image_ext, make_image_preview, make_model_reference
 log = logging.getLogger("generation")
 VIDEO_FIRST_FRAME_MIN_SIDE = 300
 VIDEO_FIRST_FRAME_MAX_SIDE = 768
+IMAGE_EDIT_REFERENCE_MAX_SIDE = 1024
 
 __all__ = ["ModelSnapshotMismatchError", "NEEDS_REVIEW", "TaskLockedError",
            "admin_settle_needs_review_task", "admin_settle_needs_review_video",
@@ -90,6 +91,22 @@ __all__ = ["ModelSnapshotMismatchError", "NEEDS_REVIEW", "TaskLockedError",
 
 class TaskLockedError(RuntimeError):
     pass
+
+
+def image_review_has_local_results(task: GenTask) -> bool:
+    """Whether an image review task can settle from already saved result keys."""
+    if task.category != "image":
+        return False
+    params = task.params or {}
+    keys = list(params.get("_image_result_keys") or [])
+    hd_keys = [key for key in keys if isinstance(key, str) and key.startswith("hd/")]
+    preview_keys = [key for key in keys if isinstance(key, str) and key.startswith("preview/")]
+    if not hd_keys or not preview_keys:
+        return False
+    try:
+        return all(storage.local_path(key).exists() for key in [*hd_keys, *preview_keys])
+    except ValueError:
+        return False
 
 
 def _try_enqueue_poll(task_id: int) -> None:
@@ -124,7 +141,6 @@ def _hold_image_success_for_reconciliation(
         params["_image_result_keys"] = list(written_keys)
     if saved_count is not None:
         params["_saved_n"] = int(saved_count)
-    task.params = params
     _mark_needs_review(
         db,
         task_id,
@@ -133,6 +149,85 @@ def _hold_image_success_for_reconciliation(
             f"saved_n={saved_count if saved_count is not None else 'unknown'}; "
             f"error={error[:500]}"
         ),
+        params_update=params,
+    )
+
+
+def _hold_image_submit_unknown_for_reconciliation(
+    db,
+    task_id: int,
+    error: str,
+    *,
+    written_keys: list[str] | None = None,
+    saved_count: int | None = None,
+    requested_count: int | None = None,
+) -> None:
+    """Hold image batches when at least one upstream submit may still finish.
+
+    If any sub-request timed out or hit a transient provider error after submit,
+    we cannot prove the provider did not accept that render. Refunding/settling
+    the missing slot as a normal partial success can double-spend upstream quota
+    and erase the only signal operators need for reconciliation.
+    """
+    db.rollback()
+    task = db.get(GenTask, task_id)
+    if not task:
+        return
+    params = dict(task.params or {})
+    if written_keys:
+        params["_image_result_keys"] = list(written_keys)
+    if saved_count is not None:
+        params["_saved_n"] = int(saved_count)
+    if requested_count is not None:
+        params["_requested_n"] = int(requested_count)
+    params["_image_submit_state_unknown"] = True
+    _mark_needs_review(
+        db,
+        task_id,
+        (
+            "图片批量生成存在上游提交状态未知的子请求,已生成的结果已本地保存,"
+            "冻结积分暂不结算或退回,需要系统恢复或管理员确认。"
+            f"saved_n={saved_count if saved_count is not None else 'unknown'}; "
+            f"requested_n={requested_count if requested_count is not None else 'unknown'}; "
+            f"error={error[:500]}"
+        ),
+        params_update=params,
+    )
+
+
+def _hold_video_submit_unknown_for_reconciliation(
+    db,
+    task_id: int,
+    error: str,
+    *,
+    params_update: dict | None = None,
+) -> None:
+    """Hold video submits that may already be accepted upstream.
+
+    A timeout/5xx/429 after submit can mean the provider accepted the render but
+    did not return the external id. Refunding immediately lets users resubmit and
+    can create duplicate paid renders upstream. Keep the frozen credits and move
+    the task to review so operators can settle from an external result URL or
+    refund explicitly.
+    """
+    db.rollback()
+    task = db.get(GenTask, task_id)
+    if not task:
+        return
+    params = dict(task.params or {})
+    if params_update:
+        params.update(params_update)
+    params["_video_submit_state_unknown"] = True
+    _mark_needs_review(
+        db,
+        task_id,
+        (
+            "视频提交状态未知,上游可能已接受任务,冻结积分暂不退回。"
+            "请通过外部任务结果补结果结算,或确认未生成后人工退款。"
+            f"request_id={params.get('_video_request_id') or params.get('request_id') or 'unknown'}; "
+            f"error={error[:500]}"
+        ),
+        params_update=params,
     )
 
 
@@ -214,8 +309,31 @@ def run_image_task(task_id: int) -> None:
         # reverse-off (image+instruction -> image): pass the reference image to
         # the edit endpoint if one is configured on the image model.
         ref = None
+        edit_refs: list[str] | None = None
         if (task.prompt or {}).get("instruction") and task.source_type == "image":
-            ref = _gateway_reference_image(db, task, task.source_asset_url)
+            ref = _gateway_reference_image(
+                db,
+                task,
+                task.source_asset_url,
+                max_side=IMAGE_EDIT_REFERENCE_MAX_SIDE,
+                prefer_original_upload=True,
+                quality=92,
+                subsampling=0,
+            )
+            edit_refs = [ref] if ref else None
+            if ref and (model.extra or {}).get("multi_image_edit_enabled"):
+                try:
+                    style_ref = _gateway_reference_image(
+                        db,
+                        task,
+                        params.get("style_reference_image"),
+                        max_side=384,
+                    )
+                except Exception as e:  # noqa: BLE001
+                    log.warning("image task %s style reference skipped: %s", task_id, e)
+                    style_ref = None
+                if style_ref:
+                    edit_refs = [ref, style_ref]
         # reverse-off (图+指令→图): default to the configured edit endpoint so the
         # reference image is actually used; admin can set extra.edit_path="" to off.
         edit_path = (model.extra or {}).get("edit_path", settings.image_edit_path) or None
@@ -232,6 +350,7 @@ def run_image_task(task_id: int) -> None:
                 n=n,
                 size=size,
                 reference_image_url=ref,
+                reference_image_urls=edit_refs,
                 edit_path=edit_path,
                 extra_payload=extra_payload,
             )
@@ -245,6 +364,10 @@ def run_image_task(task_id: int) -> None:
                                       "error": str(e)[:300]})
             raise
         gateway_failure_items = list(getattr(images, "failures", []) or [])
+        has_unknown_gateway_failure = any(
+            bool(getattr(failure, "submit_state_unknown", False))
+            for failure in gateway_failure_items
+        )
         gateway_failures = [
             failure.message
             for failure in gateway_failure_items
@@ -302,6 +425,21 @@ def run_image_task(task_id: int) -> None:
                 log.warning("image task %s skipped one invalid image: %s", task_id, e)
         if saved_count <= 0:
             raise RuntimeError("图片网关返回结果均无法解析")
+        if has_unknown_gateway_failure:
+            unknown_errors = [
+                failure.message
+                for failure in gateway_failure_items
+                if getattr(failure, "submit_state_unknown", False) and getattr(failure, "message", "")
+            ]
+            _hold_image_submit_unknown_for_reconciliation(
+                db,
+                task_id,
+                "; ".join(unknown_errors[:3]) or "上游提交状态未知",
+                written_keys=written_keys,
+                saved_count=saved_count,
+                requested_count=n,
+            )
+            return
         # finalize atomically: only the runner that claims the terminal status
         # settles, so a duplicate/raced run can't double-charge or double-credit.
         real_cost = _settlement_cost(task, model, image_count=saved_count)
@@ -397,6 +535,18 @@ def _video_submit_params(db, task: GenTask) -> dict:
         params["first_frame_image"] = safe_ref
         if params.get("reference_image_url"):
             params["reference_image_url"] = safe_ref
+        last_frame = params.get("last_frame_image")
+        if task.source_type == "image" and not last_frame:
+            params["last_frame_image"] = safe_ref
+            params["_product_locked"] = True
+        elif last_frame:
+            params["last_frame_image"] = _gateway_reference_image(
+                db,
+                task,
+                last_frame,
+                min_side=VIDEO_FIRST_FRAME_MIN_SIDE,
+                max_side=VIDEO_FIRST_FRAME_MAX_SIDE,
+            )
     return params
 
 
@@ -431,6 +581,10 @@ def _video_persisted_params(task: GenTask, original: dict, submitted: dict) -> d
         persisted["first_frame_image"] = original["first_frame_image"]
     elif task.source_type == "image" and task.source_asset_url:
         persisted["first_frame_image"] = task.source_asset_url
+    if original.get("last_frame_image"):
+        persisted["last_frame_image"] = original["last_frame_image"]
+    elif task.source_type == "image" and task.source_asset_url:
+        persisted["last_frame_image"] = task.source_asset_url
     if task.stage != "preview":
         return persisted
     persisted["preview_resolution"] = submitted.get("resolution")
@@ -647,11 +801,11 @@ def start_video_task(task_id: int) -> None:
                             _mark_poll_alive(task_id)
                             _try_enqueue_poll(task_id)
                         return
-                    _fail_and_refund(
+                    _hold_video_submit_unknown_for_reconciliation(
                         db,
                         task_id,
-                        f"视频提交状态未知:{e}",
-                        public_error="视频提交状态未知，已退回冻结积分，请稍后重试",
+                        str(e),
+                        params_update=_video_persisted_params(task, original_params, params),
                     )
                     return
                 raise
@@ -680,11 +834,7 @@ def start_video_task(task_id: int) -> None:
             _mark_poll_alive(task_id)
             _try_enqueue_poll(task_id)
             return
-        public_error = (
-            "视频提交状态未知，已退回冻结积分，请稍后重试"
-            if _submit_state_unknown(e)
-            else "视频提交失败，已退回冻结积分，请稍后重试"
-        )
+        public_error = "视频提交失败，已退回冻结积分，请稍后重试"
         _fail_and_refund(db, task_id, str(e), public_error=public_error)
     finally:
         db.close()
@@ -1183,7 +1333,7 @@ def _fail_and_refund(db, task_id: int, error: str, *, public_error: str | None =
         db.rollback()
 
 
-def _mark_needs_review(db, task_id: int, error: str) -> None:
+def _mark_needs_review(db, task_id: int, error: str, *, params_update: dict | None = None) -> None:
     try:
         db.rollback()
         task = db.get(GenTask, task_id)
@@ -1191,6 +1341,8 @@ def _mark_needs_review(db, task_id: int, error: str) -> None:
             return
         if task.status in ("succeeded", "failed"):
             return
+        if params_update:
+            task.params = {**(task.params or {}), **params_update}
         task.status = NEEDS_REVIEW
         task.phase = "reconciling"
         task.error = error[:1000]

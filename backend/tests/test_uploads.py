@@ -10,8 +10,9 @@ from PIL import Image
 from app.config import settings
 from app.db import SessionLocal
 from app.main import app
-from app.models import AuditLog, GenTask, UploadedAsset
+from app.models import AuditLog, GenTask, ModelConfig, UploadedAsset
 from app.services.gateway import _mock_image
+from app.services.watermark import make_model_reference
 
 
 def _png_bytes(size=(32, 48), color=(20, 120, 200)):
@@ -51,6 +52,20 @@ def _mp4_bytes(tmp_path):
         timeout=10,
     )
     return out.read_bytes()
+
+
+def _enable_multi_image_edit():
+    db = SessionLocal()
+    try:
+        model = db.query(ModelConfig).filter(ModelConfig.use == "image").one()
+        model.extra = {
+            **(model.extra or {}),
+            "edit_path": "/v1/images/edits",
+            "multi_image_edit_enabled": True,
+        }
+        db.commit()
+    finally:
+        db.close()
 
 
 def test_upload_image_returns_reference_asset(client, make_user, auth):
@@ -271,6 +286,141 @@ def test_uploaded_image_can_drive_reference_edit_generation(
     assert seen["size"] == "512x1024"
 
 
+def test_uploaded_large_image_edit_uses_high_resolution_original(
+    client, make_user, auth, monkeypatch
+):
+    make_user("13900001905", balance=1000)
+    h = auth("13900001905")
+
+    up = client.post(
+        "/api/uploads/image",
+        files={"file": ("product.png", _png_bytes(size=(1600, 900)), "image/png")},
+        headers=h,
+    )
+    assert up.status_code == 200, up.text
+    asset = up.json()
+    seen = {}
+
+    def fake_gen_image(prompt, image_model_id, n=4, size="1024x1024",
+                       reference_image_url=None, edit_path=None, extra_payload=None):
+        seen["reference_image_url"] = reference_image_url
+        return [_mock_image(prompt, "256x256", 0)]
+
+    monkeypatch.setattr("app.services.gateway.gen_image", fake_gen_image)
+
+    r = client.post("/api/generate", json={
+        "source_asset_url": asset["url"],
+        "source_type": "image",
+        "category": "image",
+        "stage": "preview",
+        "prompt": {
+            "final_text": "preserve the product and move it into a studio ad",
+            "instruction": "preserve the product and move it into a studio ad",
+        },
+        "params": {"n": 1, "size": "1024x576"},
+    }, headers=h)
+    assert r.status_code == 200, r.text
+
+    ref_bytes = base64.b64decode(seen["reference_image_url"].split(",", 1)[1])
+    ref_img = Image.open(io.BytesIO(ref_bytes))
+    assert ref_img.size == (1024, 576)
+
+
+def test_image_edit_can_send_product_and_style_refs_when_enabled(
+    client, make_user, auth, monkeypatch
+):
+    make_user("13900001907", balance=1000, admin=True)
+    h = auth("13900001907")
+    _enable_multi_image_edit()
+
+    product = client.post(
+        "/api/uploads/image",
+        files={"file": ("product.png", _png_bytes(size=(1600, 900), color=(220, 20, 20)), "image/png")},
+        headers=h,
+    ).json()
+    style = client.post(
+        "/api/uploads/image",
+        files={"file": ("style.png", _png_bytes(size=(500, 800), color=(20, 220, 20)), "image/png")},
+        headers=h,
+    ).json()
+    seen = {}
+
+    def fake_gen_image(prompt, image_model_id, n=4, size="1024x1024",
+                       reference_image_url=None, reference_image_urls=None,
+                       edit_path=None, extra_payload=None):
+        seen["reference_image_url"] = reference_image_url
+        seen["reference_image_urls"] = reference_image_urls
+        return [_mock_image(prompt, "256x256", 0)]
+
+    monkeypatch.setattr("app.services.gateway.gen_image", fake_gen_image)
+
+    r = client.post("/api/generate", json={
+        "source_asset_url": product["url"],
+        "source_type": "image",
+        "category": "image",
+        "stage": "preview",
+        "prompt": {
+            "final_text": "keep product identity and transfer style",
+            "instruction": "keep product identity and transfer style",
+        },
+        "params": {"n": 1, "size": "1024x576", "style_reference_image": style["url"]},
+    }, headers=h)
+    assert r.status_code == 200, r.text
+    assert len(seen["reference_image_urls"]) == 2
+    assert seen["reference_image_urls"][0] == seen["reference_image_url"]
+    product_ref = Image.open(io.BytesIO(base64.b64decode(seen["reference_image_urls"][0].split(",", 1)[1])))
+    style_ref = Image.open(io.BytesIO(base64.b64decode(seen["reference_image_urls"][1].split(",", 1)[1])))
+    assert max(product_ref.size) == 1024
+    assert max(style_ref.size) == 384
+
+
+def test_image_edit_skips_invalid_optional_style_ref_when_multi_image_enabled(
+    client, make_user, auth, monkeypatch
+):
+    make_user("13900001908", balance=1000, admin=True)
+    h = auth("13900001908")
+    monkeypatch.setattr(settings, "mock_mode", False)
+    monkeypatch.setattr(settings, "gateway_base_url", "https://gateway.test")
+    monkeypatch.setattr(settings, "gateway_api_key", "sk-test")
+    _enable_multi_image_edit()
+    product = client.post(
+        "/api/uploads/image",
+        files={"file": ("product.png", _png_bytes(size=(1600, 900)), "image/png")},
+        headers=h,
+    ).json()
+    seen = {}
+
+    def fake_gen_image(prompt, image_model_id, n=4, size="1024x1024",
+                       reference_image_url=None, reference_image_urls=None,
+                       edit_path=None, extra_payload=None):
+        seen["reference_image_urls"] = reference_image_urls
+        return [_mock_image(prompt, "256x256", 0)]
+
+    monkeypatch.setattr("app.services.gateway.gen_image", fake_gen_image)
+    monkeypatch.setattr(
+        "app.services.gateway.download_bytes_limited",
+        lambda *_a, **_k: b"not-an-image",
+    )
+
+    r = client.post("/api/generate", json={
+        "source_asset_url": product["url"],
+        "source_type": "image",
+        "category": "image",
+        "stage": "preview",
+        "prompt": {
+            "final_text": "keep product identity and transfer style",
+            "instruction": "keep product identity and transfer style",
+        },
+        "params": {
+            "n": 1,
+            "size": "1024x576",
+            "style_reference_image": "https://example.com/style.jpg",
+        },
+    }, headers=h)
+    assert r.status_code == 200, r.text
+    assert len(seen["reference_image_urls"]) == 1
+
+
 def test_uploaded_image_requires_owner_for_read_and_generation(client, make_user, auth):
     make_user("13900000103", balance=1000)
     make_user("13900000104", balance=1000)
@@ -325,6 +475,79 @@ def test_uploaded_image_can_drive_reverse_prompt(client, make_user, auth, monkey
     assert seen["refs"][0].startswith("data:image/jpeg;base64,")
 
 
+def test_uploaded_large_image_reverse_prompt_uses_higher_quality_reference(client, make_user, auth, monkeypatch):
+    make_user("13900001909", balance=1000)
+    h = auth("13900001909")
+
+    up = client.post(
+        "/api/uploads/image",
+        files={"file": ("large-ref.png", _png_bytes(size=(1600, 900)), "image/png")},
+        headers=h,
+    )
+    assert up.status_code == 200, up.text
+    asset = up.json()
+    seen = {}
+
+    def fake_reverse(refs, model_id, target="image"):
+        seen["refs"] = refs
+        return {"structured": {"主体": "large uploaded"}, "final_text": "large uploaded prompt"}
+
+    monkeypatch.setattr("app.services.gateway.reverse_prompt", fake_reverse)
+    r = client.post("/api/prompt/reverse", json={
+        "asset_url": asset["url"],
+        "target": "image",
+    }, headers=h)
+    assert r.status_code == 200, r.text
+    ref_bytes = base64.b64decode(seen["refs"][0].split(",", 1)[1])
+    ref_img = Image.open(io.BytesIO(ref_bytes))
+    assert ref_img.size == (1024, 576)
+
+
+def test_model_reference_does_not_explode_extreme_aspect_ratio():
+    ref_bytes, _, _ = make_model_reference(
+        _png_bytes(size=(768, 1)),
+        min_side=300,
+        max_side=768,
+    )
+    ref_img = Image.open(io.BytesIO(ref_bytes))
+    assert max(ref_img.size) <= 768
+    assert ref_img.size[0] == 768
+    assert ref_img.size[1] == 1
+
+
+def test_external_image_reverse_prompt_uses_high_quality_localized_reference(
+    client, make_user, auth, monkeypatch
+):
+    make_user("13900001910", balance=1000)
+    h = auth("13900001910")
+    monkeypatch.setattr(settings, "mock_mode", False)
+    monkeypatch.setattr(settings, "gateway_base_url", "https://gateway.test")
+    monkeypatch.setattr(settings, "gateway_api_key", "sk-test")
+    monkeypatch.setattr(
+        "app.services.gateway.download_bytes_limited",
+        lambda *_args, **_kwargs: _png_bytes(size=(1800, 1200)),
+    )
+    seen = {}
+
+    def fake_reverse(refs, model_id, target="image"):
+        seen["refs"] = refs
+        return {"structured": {"主体": "external"}, "final_text": "external prompt"}
+
+    monkeypatch.setattr("app.services.gateway.reverse_prompt", fake_reverse)
+    r = client.post("/api/prompt/reverse", json={
+        "asset_url": "https://cdn.example.com/social-product.png",
+        "target": "image",
+    }, headers=h)
+    assert r.status_code == 200, r.text
+    ref = seen["refs"][0]
+    assert ref.startswith("data:image/jpeg;base64,")
+    assert "cdn.example.com" not in ref
+    ref_bytes = base64.b64decode(ref.split(",", 1)[1])
+    ref_img = Image.open(io.BytesIO(ref_bytes))
+    assert ref_img.size[0] == 1024
+    assert 680 <= ref_img.size[1] <= 683
+
+
 def test_uploaded_image_can_drive_video_first_frame(client, make_user, auth, monkeypatch):
     make_user("13900000106", balance=1000, admin=True)
     h = auth("13900000106")
@@ -362,6 +585,8 @@ def test_uploaded_image_can_drive_video_first_frame(client, make_user, auth, mon
     }, headers=h)
     assert r.status_code == 200, r.text
     assert seen["first_frame_image"].startswith("data:image/jpeg;base64,")
+    assert seen["last_frame_image"] == seen["first_frame_image"]
+    assert seen["_product_locked"] is True
     ref_bytes = base64.b64decode(seen["first_frame_image"].split(",", 1)[1])
     ref_img = Image.open(io.BytesIO(ref_bytes))
     assert min(ref_img.size) >= 300
@@ -423,6 +648,7 @@ def test_uploaded_image_final_video_uses_data_uri_first_frame(client, make_user,
     assert final.status_code == 200, final.text
     assert len(seen) >= 2
     assert seen[-1]["first_frame_image"].startswith("data:image/jpeg;base64,")
+    assert seen[-1]["last_frame_image"] == seen[-1]["first_frame_image"]
 
 
 def test_upload_video_returns_reference_asset(client, make_user, auth, tmp_path):

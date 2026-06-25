@@ -30,13 +30,17 @@ function websocketOrigin(value) {
 
 function loopbackApiAliases(value) {
   if (!value) return [];
+  const allowLanAlias = !isProd || process.env.NEXT_PUBLIC_ALLOW_LAN_API_ALIAS === "true";
   try {
     const url = new URL(value);
     if (!["localhost", "127.0.0.1"].includes(url.hostname)) return [];
-    return [
-      `${url.protocol}//localhost${url.port ? `:${url.port}` : ""}`,
-      `${url.protocol}//127.0.0.1${url.port ? `:${url.port}` : ""}`,
+    const port = url.port ? `:${url.port}` : "";
+    const aliases = [
+      `${url.protocol}//localhost${port}`,
+      `${url.protocol}//127.0.0.1${port}`,
     ];
+    if (allowLanAlias) aliases.push(`${url.protocol}//*${port}`);
+    return aliases;
   } catch (_err) {
     return [];
   }
@@ -45,6 +49,7 @@ function loopbackApiAliases(value) {
 /** @type {import('next').NextConfig} */
 const nextConfig = {
   reactStrictMode: true,
+  output: "standalone",
   outputFileTracingRoot: path.join(__dirname),
   // Internal tool: allow loading remote reference / result images without the
   // next/image optimizer (we use plain <img>).

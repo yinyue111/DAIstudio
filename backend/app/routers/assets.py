@@ -12,6 +12,7 @@ from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 from starlette.background import BackgroundTask
 
+from ..config import settings
 from ..db import get_db
 from ..deps import get_client_ip, get_current_user
 from ..models import AssetReport, GenAsset, User
@@ -43,6 +44,12 @@ def _download_media_info(asset: GenAsset, path: Path) -> tuple[str, str]:
         if head.startswith(signature) and (ext != "webp" or head[8:12] == b"WEBP"):
             return media_type, ext
     return "application/octet-stream", "bin"
+
+
+def _external_download_policy(asset: GenAsset) -> tuple[int, tuple[str, ...]]:
+    if asset.type == "video":
+        return int(settings.video_download_max_bytes), ("video/", "application/octet-stream")
+    return int(settings.generated_image_max_bytes), ("image/",)
 
 
 def _unlocked_owner_asset(db: Session, asset_id: int, user: User) -> GenAsset:
@@ -139,7 +146,18 @@ def download(asset_id: int, request: Request, db: Session = Depends(get_db),
     try:
         with tempfile.NamedTemporaryFile(prefix=f"asset-{asset_id}-", suffix=suffix, delete=False) as f:
             tmp_path = Path(f.name)
-        gateway.download_to_path(url, tmp_path)
+        max_bytes, allowed_content_types = _external_download_policy(asset)
+        gateway.download_to_path(
+            url,
+            tmp_path,
+            max_bytes=max_bytes,
+            allowed_content_types=allowed_content_types,
+            timeout_seconds=(
+                int(settings.video_download_timeout_seconds)
+                if asset.type == "video"
+                else int(settings.image_download_timeout_seconds)
+            ),
+        )
     except gateway.GatewayError as e:
         if tmp_path is not None:
             tmp_path.unlink(missing_ok=True)

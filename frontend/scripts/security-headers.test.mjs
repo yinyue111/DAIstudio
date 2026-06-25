@@ -40,10 +40,20 @@ assert.match(
   /connect-src[^;]*http:\/\/127\.0\.0\.1:8000[^;]*http:\/\/localhost:8000/,
   "production CSP must align localhost/127.0.0.1 API aliases with API_BASE rewriting",
 );
+assert.doesNotMatch(
+  headers.get("content-security-policy") || "",
+  /connect-src[^;]*http:\/\/\*:8000/,
+  "production CSP must not ship LAN wildcard API rewrites by default",
+);
 assert.match(
   headers.get("content-security-policy") || "",
   /connect-src[^;]*ws:\/\/127\.0\.0\.1:8000[^;]*ws:\/\/localhost:8000/,
   "production CSP must align websocket localhost/127.0.0.1 aliases",
+);
+assert.doesNotMatch(
+  headers.get("content-security-policy") || "",
+  /connect-src[^;]*ws:\/\/\*:8000/,
+  "production CSP must not ship LAN wildcard websocket rewrites by default",
 );
 assert.equal(headers.get("x-content-type-options"), "nosniff");
 assert.equal(headers.get("x-frame-options"), "DENY");

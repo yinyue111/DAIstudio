@@ -298,8 +298,9 @@ def test_external_asset_download_streams_from_temp_file(client, make_user, auth,
 
     calls = {}
 
-    def fake_download_to_path(url, path, **_kwargs):
+    def fake_download_to_path(url, path, **kwargs):
         calls["url"] = url
+        calls["kwargs"] = kwargs
         with open(path, "wb") as f:
             f.write(b"video-bytes")
         return len(b"video-bytes")
@@ -312,6 +313,9 @@ def test_external_asset_download_streams_from_temp_file(client, make_user, auth,
     assert "attachment;" in r.headers["content-disposition"]
     assert f"asset-{asset_id}.mp4" in r.headers["content-disposition"]
     assert calls["url"] == "https://cdn.example.com/final.mp4"
+    assert calls["kwargs"]["allowed_content_types"] == ("video/", "application/octet-stream")
+    assert calls["kwargs"]["max_bytes"] > 100 * 1024 * 1024
+    assert calls["kwargs"]["timeout_seconds"] > 60
     db = SessionLocal()
     try:
         log = db.query(AuditLog).filter(
@@ -345,7 +349,10 @@ def test_external_image_download_gets_image_filename(client, make_user, auth, mo
 
     image_bytes = b"\xff\xd8\xff\xe0" + b"image-bytes"
 
-    def fake_download_to_path(url, path, **_kwargs):
+    calls = {}
+
+    def fake_download_to_path(url, path, **kwargs):
+        calls["kwargs"] = kwargs
         with open(path, "wb") as f:
             f.write(image_bytes)
         return len(image_bytes)
@@ -357,6 +364,9 @@ def test_external_image_download_gets_image_filename(client, make_user, auth, mo
     assert r.headers["content-type"].startswith("image/jpeg")
     assert "attachment;" in r.headers["content-disposition"]
     assert f"asset-{asset_id}.jpg" in r.headers["content-disposition"]
+    assert calls["kwargs"]["allowed_content_types"] == ("image/",)
+    assert calls["kwargs"]["max_bytes"] < 100 * 1024 * 1024
+    assert calls["kwargs"]["timeout_seconds"] <= 600
 
 
 def test_video_preview_settles_preview_cost(client, make_user, auth):

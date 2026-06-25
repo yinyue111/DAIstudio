@@ -2,20 +2,18 @@
 
 function resolveApiBase() {
   const configured = (process.env.NEXT_PUBLIC_API_BASE || "").replace(/\/$/, "");
-  if (
-    typeof window === "undefined"
-    || !configured
-    || !["localhost", "127.0.0.1"].includes(window.location.hostname)
-  ) {
+  if (typeof window === "undefined" || !configured) {
     return configured;
   }
   try {
     const url = new URL(configured, window.location.origin);
     const configuredHost = url.hostname;
-    if (
-      configuredHost !== window.location.hostname
-      && ["localhost", "127.0.0.1"].includes(configuredHost)
-    ) {
+    if (["localhost", "127.0.0.1"].includes(configuredHost)) {
+      const currentHost = window.location.hostname;
+      const currentIsLoopback = ["localhost", "127.0.0.1"].includes(currentHost);
+      const allowLanAlias = process.env.NODE_ENV !== "production"
+        || process.env.NEXT_PUBLIC_ALLOW_LAN_API_ALIAS === "true";
+      if (!currentIsLoopback && !allowLanAlias) return configured;
       url.hostname = window.location.hostname;
       return url.origin;
     }

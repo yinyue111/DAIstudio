@@ -38,8 +38,8 @@ import {
 
 const CREATION_MODES = [
   { key: "image", label: "文生图", icon: "✦" },
-  { key: "video", label: "文生视频", icon: "▶" },
   { key: "image_edit", label: "图片编辑", icon: "◐" },
+  { key: "video", label: "文生视频", icon: "▶" },
   { key: "video_edit", label: "视频编辑", icon: "▣" },
 ];
 
@@ -54,6 +54,34 @@ const EDIT_PROMPT_CHIPS = [
   "产品边缘自然融入场景",
   "干净商业广告质感",
   "小红书种草氛围",
+];
+
+const EDIT_PROTECTION_NEGATIVE = [
+  "logo变形",
+  "文字乱码",
+  "标签不可读",
+  "标签文字不可读",
+  "包装被篡改",
+  "比例失真",
+  "错误品牌文字",
+  "品牌名错误",
+  "产品变形",
+];
+
+const PRODUCT_EDIT_NEGATIVE = [
+  "logo扭曲",
+  "logo丢失",
+  "包装文字乱码",
+  "包装文字被改写",
+  "产品外形改变",
+  "产品颜色漂移",
+  "标签缺失",
+  "贴纸变形",
+  "材质错误",
+  "主体被替换",
+  "多余商品",
+  "低清产品",
+  "边缘糊化",
 ];
 
 function creationModeLabel(mode) {
@@ -78,6 +106,7 @@ export default function Home() {
   const [vResolution, setVResolution] = useState("720p");
   const [promptLibraryOpen, setPromptLibraryOpen] = useState(false);
   const [videoAnalysisPreset, setVideoAnalysisPreset] = useState("standard");
+  const [imageEditProductMode, setImageEditProductMode] = useState(false);
 
   // reference (paste link -> reverse) state
   const [refOpen, setRefOpen] = useState(false);
@@ -126,6 +155,8 @@ export default function Home() {
   const PENDING_GENERATE_STORAGE_KEY = "studio_pending_generate_request_v1";
   const category = creationMode === "video" || creationMode === "video_edit" ? "video" : "image";
   const isEditMode = creationMode === "image_edit" || creationMode === "video_edit";
+  const isImageEditMode = creationMode === "image_edit";
+  const productGenerationMode = isImageEditMode && imageEditProductMode;
 
   useEffect(() => {
     api.me().then(setMe).catch(() => router.push(loginPath()));
@@ -140,7 +171,7 @@ export default function Home() {
         setImageQuality(qualityKeyForSize(d.image_size));
       }
     }).catch(() => {});
-    loadWorks();
+    loadWorks({ restoreActive: true });
     try {
       const draft = window.localStorage.getItem(STUDIO_DRAFT_PROMPT_KEY);
       if (draft) {
@@ -171,6 +202,22 @@ export default function Home() {
 
   function refreshMe() { api.me().then(setMe).catch(() => {}); }
 
+  function formatBytes(bytes) {
+    const n = Number(bytes || 0);
+    if (!Number.isFinite(n) || n <= 0) return "";
+    if (n >= 1024 * 1024 * 1024) return `${(n / 1024 / 1024 / 1024).toFixed(1)}GB`;
+    if (n >= 1024 * 1024) return `${Math.ceil(n / 1024 / 1024)}MB`;
+    if (n >= 1024) return `${Math.ceil(n / 1024)}KB`;
+    return `${n}B`;
+  }
+
+  function uploadLimitExceeded(file, kind) {
+    const limit = Number(kind === "video" ? cfg?.max_upload_video_bytes : cfg?.max_upload_image_bytes);
+    if (!limit || !file?.size || file.size <= limit) return false;
+    setMsg(`${kind === "video" ? "视频" : "图片"}文件过大，当前 ${formatBytes(file.size)}，上限 ${formatBytes(limit)}。请压缩后再上传。`);
+    return true;
+  }
+
   function modelEnabled(kind) {
     if (!cfg) return true;
     const modelUse = kind === "video" || kind === "video_edit" ? "video" : "image";
@@ -186,7 +233,31 @@ export default function Home() {
     setCreationMode(kind);
   }
 
-  async function loadWorks() {
+  function restoreActiveTaskFromList(list) {
+    if (task && !isTerminalTaskStatus(task.status)) return;
+    const active = (list || []).find((item) => (
+      item
+      && !isTerminalTaskStatus(item.status)
+      && item.category === "video"
+    ));
+    if (!active) return;
+    setCreationMode("video");
+    setTask(active);
+    setFinalTaskId(active.stage === "final" ? active.id : null);
+    setTrackingLost(false);
+    const dims = assetDims(active.assets?.[0]);
+    const activeRatio = dims
+      ? ratioOptions.find((r) => r.key === nearestRatio(dims.width, dims.height, ratioOptions))
+      : null;
+    setRunningSnapshot({
+      category: active.category,
+      n: 1,
+      ratio: activeRatio || ratioOptions[0],
+    });
+    startTracking(active.id);
+  }
+
+  async function loadWorks({ restoreActive = false } = {}) {
     try {
       const list = await api.tasks(20, 0);
       const flat = [];
@@ -194,6 +265,7 @@ export default function Home() {
         for (const a of t.assets || []) flat.push({ ...a, _cat: t.category });
       }
       setWorks(flat);
+      if (restoreActive) restoreActiveTaskFromList(list);
     } catch (e) { setWorks([]); }
   }
 
@@ -270,6 +342,10 @@ export default function Home() {
       if (imageUploadInputRef.current) imageUploadInputRef.current.value = "";
       return;
     }
+    if (uploadLimitExceeded(file, "image")) {
+      if (imageUploadInputRef.current) imageUploadInputRef.current.value = "";
+      return;
+    }
     const reqId = ++uploadRequestRef.current;
     const refVersion = ++refVersionRef.current;
     reverseRequestRef.current += 1;
@@ -306,6 +382,10 @@ export default function Home() {
       if (productUploadInputRef.current) productUploadInputRef.current.value = "";
       return;
     }
+    if (uploadLimitExceeded(file, "image")) {
+      if (productUploadInputRef.current) productUploadInputRef.current.value = "";
+      return;
+    }
     const reqId = ++uploadRequestRef.current;
     setMsg("");
     setUploading(true);
@@ -334,6 +414,10 @@ export default function Home() {
     if (!file || uploading) return;
     if (!file.type?.startsWith("video/")) {
       setMsg("请选择视频文件");
+      if (videoUploadInputRef.current) videoUploadInputRef.current.value = "";
+      return;
+    }
+    if (uploadLimitExceeded(file, "video")) {
       if (videoUploadInputRef.current) videoUploadInputRef.current.value = "";
       return;
     }
@@ -459,15 +543,35 @@ export default function Home() {
     setPromptDirty(false);
   }
 
-  function productEditPrompt(baseText, { video = false, hasStyleReference = false } = {}) {
+  function productEditPrompt(baseText, { video = false, hasStyleReference = false, generalEdit = false } = {}) {
     const base = String(baseText || "").trim() || "生成同风格商业素材";
     const styleScope = hasStyleReference
       ? "风格参考只用于迁移场景、构图、镜头语言、光线、色调、材质、广告质感和氛围；不要迁移风格参考里的主体、人物、商品、品牌、Logo、包装、文字水印或促销文案。"
       : "";
+    if (generalEdit) {
+      return `以用户上传的图片作为唯一编辑源，严格按照用户提示词执行局部或整体编辑；保留未被要求修改的主体、构图、Logo、文字、颜色、比例和关键细节，不要无故替换主体或品牌。${styleScope}编辑要求：${base}`;
+    }
     const guard = video
       ? "以用户上传的产品主体图作为视频首帧和唯一产品身份参考，必须完整保留产品主体、Logo、包装、颜色、形状、材质、比例、文字标识和品牌身份，不替换不重绘不改款；"
-      : "以用户上传的产品主体图作为唯一产品身份和编辑源，必须完整保留产品主体、Logo、包装、颜色、形状、材质、比例、文字标识和品牌身份，不替换不重绘不改款；";
-    return `${guard}${styleScope}生成广告级商业素材，产品清晰可识别，边缘自然融入新场景。迁移要求：${base}`;
+      : "以用户上传的产品图作为唯一产品身份和编辑源，必须完整保留同一 SKU 的主体、Logo、包装结构、品牌色、形状轮廓、材质纹理、比例、标签版式、文字标识和可识别细节，不替换、不重绘、不改款、不改品牌；";
+    const fidelity = "产品主体必须清晰锐利，商标和包装文字尽量保持可读，边缘自然融入新场景；只允许迁移或生成背景、台面、道具、光线、构图、广告氛围和画面质感，不得把参考素材里的商品或品牌覆盖到产品上。";
+    return `${guard}${styleScope}${fidelity}生成广告级商业素材。迁移要求：${base}`;
+  }
+
+  function mergedNegativePrompt(value, { productMode = false } = {}) {
+    const parts = String(value || "")
+      .split(/[,，、\n]/)
+      .map((item) => item.trim())
+      .filter(Boolean);
+    if (!isEditMode) return parts.join("，");
+    const seen = new Set(parts.map((item) => item.toLowerCase()));
+    for (const item of [
+      ...EDIT_PROTECTION_NEGATIVE,
+      ...(productMode ? PRODUCT_EDIT_NEGATIVE : []),
+    ]) {
+      if (!seen.has(item.toLowerCase())) parts.push(item);
+    }
+    return parts.join("，");
   }
 
   function applyLibraryPrompt(text, mode = "replace") {
@@ -532,9 +636,12 @@ export default function Home() {
     }
     const isFinal = stage === "final" && task;
     if (!isFinal) {
-      if (isEditMode && !productAsset) { setMsg("请先上传产品主体图片"); return; }
+      if (isEditMode && !productAsset) {
+        setMsg(isImageEditMode ? "请先上传要编辑的图片" : "请先上传产品主体图片");
+        return;
+      }
       if (isEditMode && !prompt.trim() && Object.keys(structured || {}).length === 0) {
-        setMsg("请先反推风格参考或输入希望迁移的风格提示词");
+        setMsg(isImageEditMode ? "请输入图片编辑要求" : "请先反推风格参考或输入希望迁移的风格提示词");
         return;
       }
       if (!isEditMode && !prompt.trim() && !selected) { setMsg("请输入提示词，或从参考反推"); return; }
@@ -555,6 +662,8 @@ export default function Home() {
       const sourceAsset = isFinal ? null : (isEditMode ? productAsset : selected);
       const dims = sourceAsset ? assetDims(sourceAsset) : null;
       const refImage = sourceAsset ? (sourceAsset.type === "video" ? sourceAsset.thumb : sourceAsset.url) : null;
+      const styleReferenceUrl = isEditMode && selected ? (selected.type === "video" ? selected.thumb : selected.url) : null;
+      const editNegative = mergedNegativePrompt(negative, { productMode: productGenerationMode || creationMode === "video_edit" });
       const styleSignature = assetSignature(selected);
       const effectiveStructured = (
         structuredSource && structuredSource !== styleSignature
@@ -572,8 +681,9 @@ export default function Home() {
       ) || "生成同风格的新素材";
       const finalText = isEditMode
         ? productEditPrompt(baseFinalText, {
-            video: effCategory === "video",
-            hasStyleReference: Boolean(selected),
+          video: effCategory === "video",
+          hasStyleReference: Boolean(selected),
+            generalEdit: creationMode === "image_edit" && !productGenerationMode,
           })
         : baseFinalText;
       // image reference chosen but not reversed -> send an instruction so the
@@ -584,6 +694,7 @@ export default function Home() {
       const sourceAssetMeta = sourceAsset ? {
         ...buildSourceAssetMeta(sourceAsset),
         mode: creationMode,
+        product_generation_mode: productGenerationMode || creationMode === "video_edit",
         style_reference: selected ? buildSourceAssetMeta(selected) : null,
         product_subject: productAsset ? buildSourceAssetMeta(productAsset) : null,
       } : null;
@@ -606,7 +717,8 @@ export default function Home() {
                 n: boundedImageCount(n, cfg?.image_n_max || 8), size: imageSize,
                 ...(dims ? { reference_width: dims.width, reference_height: dims.height } : {}),
                 ...(seed !== "" ? { seed: Number(seed) } : {}),
-                ...(negative ? { negative_prompt: negative } : {}),
+                ...(styleReferenceUrl ? { style_reference_image: styleReferenceUrl } : {}),
+                ...(editNegative ? { negative_prompt: editNegative } : {}),
               }
             : {
                 duration: boundedVideoDuration(vDuration, cfg?.video_duration_max_seconds || 900),
@@ -615,7 +727,8 @@ export default function Home() {
                 ratio: rt.key,
                 ...(dims ? { reference_width: dims.width, reference_height: dims.height } : {}),
                 ...(refImage ? { reference_image_url: refImage } : {}),
-                ...(negative ? { negative_prompt: negative } : {}),
+                ...(styleReferenceUrl ? { style_reference_image: styleReferenceUrl } : {}),
+                ...(editNegative ? { negative_prompt: editNegative } : {}),
               },
       };
       payload.client_request_id = generateClientRequestId(stage, JSON.stringify(payload));
@@ -793,14 +906,20 @@ export default function Home() {
   }
 
   async function download(asset) {
-    await withAssetBusy(asset.id, async () => {
-      try {
-        await downloadBlob(
-          `/api/assets/${asset.id}/download`,
-          asset.type === "video" ? `asset-${asset.id}.mp4` : undefined,
-        );
-      } catch (e) { setMsg(e.message); }
-    });
+    if (busyAssetIdsRef.current.has(asset.id)) return;
+    busyAssetIdsRef.current.add(asset.id);
+    setBusyAssetIds(new Set(busyAssetIdsRef.current));
+    try {
+      await downloadBlob(
+        `/api/assets/${asset.id}/download`,
+        asset.type === "video" ? `asset-${asset.id}.mp4` : undefined,
+      );
+    } catch (e) {
+      setMsg(e.message);
+    } finally {
+      busyAssetIdsRef.current.delete(asset.id);
+      setBusyAssetIds(new Set(busyAssetIdsRef.current));
+    }
   }
 
   async function report(asset) {
@@ -849,7 +968,7 @@ export default function Home() {
   const selectedReverseCostLabel = selected?.type === "video" && reverseVideoFrameCount > 1
     ? `${selectedReverseCost}积分(最多${reverseVideoFrameCount}帧)`
     : `${selectedReverseCost}积分`;
-  const reverseEnabled = cfg?.defaults?.reverse_prompt_enabled !== false; // admin switch
+  const reverseEnabled = cfg?.features?.reverse_prompt_enabled !== false; // admin switch
   const ratioOptions = category === "video" ? videoRatioOptions() : RATIOS;
   const rt = ratioOptions.find((r) => r.key === ratio) || ratioOptions[0];
   const maxImageN = Number(cfg?.image_n_max || 8);
@@ -869,25 +988,35 @@ export default function Home() {
         : `${creationModeLabel(creationMode)}网关已连接`;
 
   const promptPlaceholder = isEditMode
-    ? `${creationModeLabel(creationMode)}：先在右侧选择风格参考并反推，再上传产品主体图；这里可补充必须保留或强化的卖点…`
+    ? (isImageEditMode
+        ? (productGenerationMode
+            ? "描述产品图要生成成什么商业素材：电商主图、小红书种草、广告场景、背景光线、卖点氛围… 产品身份会强保护。⌘/Ctrl + Enter 生成"
+            : "描述要如何编辑这张图：替换背景、增加文案、调整光线、改变风格、保留主体细节… ⌘/Ctrl + Enter 生成")
+        : `${creationModeLabel(creationMode)}：先在右侧选择风格参考并反推，再上传产品主体图；这里可补充必须保留或强化的卖点…`)
     : category === "video"
       ? "描述你想要的视频：主体 / 动作 / 镜头运动 / 光线 / 节奏… ⌘/Ctrl + Enter 生成"
       : "描述你想要的画面：主体 / 风格 / 光线 / 色调 / 构图… ⌘/Ctrl + Enter 生成";
   const editStyleKeys = (EDIT_STYLE_KEYS[category] || EDIT_STYLE_KEYS.image)
     .filter((key) => String(structured?.[key] || "").trim());
-  const editReadySteps = [
-    { label: "风格参考", ready: Boolean(selected), readyText: "已选择", pendingText: "待选择" },
-    { label: "产品主体", ready: Boolean(productAsset), readyText: "已上传", pendingText: "待上传" },
-    { label: "风格提示", ready: Boolean(prompt.trim() || editStyleKeys.length), readyText: "已就绪", pendingText: "待补充" },
-  ];
+  const editReadySteps = isImageEditMode
+    ? [
+        { label: productGenerationMode ? "产品图" : "编辑源", ready: Boolean(productAsset), readyText: "已上传", pendingText: "待上传" },
+        { label: productGenerationMode ? "生产要求" : "编辑要求", ready: Boolean(prompt.trim() || editStyleKeys.length), readyText: "已填写", pendingText: "待填写" },
+        { label: "风格参考", ready: Boolean(selected), readyText: "已选择", pendingText: "可选" },
+      ]
+    : [
+        { label: "风格参考", ready: Boolean(selected), readyText: "已选择", pendingText: "待选择" },
+        { label: "产品主体", ready: Boolean(productAsset), readyText: "已上传", pendingText: "待上传" },
+        { label: "风格提示", ready: Boolean(prompt.trim() || editStyleKeys.length), readyText: "已就绪", pendingText: "待补充" },
+      ];
   const submitLabel = submitting || running
     ? "生成中…"
     : creationMode === "video"
       ? "生成预览 ▶"
-      : creationMode === "video_edit"
-        ? "编辑视频 ▶"
+        : creationMode === "video_edit"
+          ? "编辑视频 ▶"
         : creationMode === "image_edit"
-          ? "编辑生成 ✦"
+          ? (productGenerationMode ? "产品生成 ✦" : "编辑生成 ✦")
           : "立即生成 ✦";
 
   function renderSubmitBar(variant = "desktop") {
@@ -919,10 +1048,13 @@ export default function Home() {
   }
 
   function renderGenerationControls() {
+    const controlCardClass = "min-w-0 rounded-xl border border-line bg-white/[0.03] px-3 py-2";
+    const controlLabelClass = "block shrink-0 text-xs leading-none text-fog";
+    const scrollPillRowClass = "no-scrollbar flex min-w-0 gap-1 overflow-x-auto pb-1";
     return (
       <>
-        <div className="grid min-w-0 gap-3 px-1 py-1 lg:flex lg:flex-wrap lg:items-start lg:gap-x-5 lg:gap-y-3">
-          <div className="min-w-0 lg:flex-1 lg:basis-full">
+        <div className="grid min-w-0 gap-3 px-1 py-1">
+          <div className="min-w-0">
             <span className="text-xs text-fog">比例</span>
             <div className="no-scrollbar mt-1 flex gap-1 overflow-x-auto pb-1">
               {ratioOptions.map((r) => (
@@ -946,82 +1078,116 @@ export default function Home() {
 
           {category === "image" ? (
             <>
-              <div className="grid min-w-0 gap-2 rounded-xl border border-line bg-white/[0.03] px-3 py-2 sm:grid-cols-[auto_minmax(0,1fr)_auto] sm:items-center lg:flex lg:flex-none lg:flex-wrap lg:border-0 lg:bg-transparent lg:px-0 lg:py-0">
-                <span className="text-xs text-fog">质量</span>
-                <div className="no-scrollbar flex min-w-0 gap-1 overflow-x-auto pb-1 sm:pb-0 lg:overflow-visible">
-                  {IMAGE_QUALITY_PRESETS.map((q) => (
-                    <button key={q.key} onClick={() => setImageQuality(q.key)} title={q.hint}
-                      className={`chip shrink-0 ${imageQuality === q.key ? "chip-active" : ""}`}>{q.label}</button>
-                  ))}
+              <div className="grid min-w-0 gap-3 sm:grid-cols-2">
+                <div className={controlCardClass}>
+                  <div className="flex min-w-0 items-center justify-between gap-3">
+                    <span className={controlLabelClass}>质量</span>
+                    <span className="min-w-0 truncate text-right text-xs text-fog">{currentImageSize}</span>
+                  </div>
+                  <div className={`${scrollPillRowClass} mt-2`}>
+                    {IMAGE_QUALITY_PRESETS.map((q) => (
+                      <button
+                        key={q.key}
+                        onClick={() => setImageQuality(q.key)}
+                        title={q.hint}
+                        className={`chip shrink-0 ${imageQuality === q.key ? "chip-active" : ""}`}
+                      >
+                        {q.label}
+                      </button>
+                    ))}
+                  </div>
                 </div>
-                <span className="min-w-0 truncate text-xs text-fog sm:text-right lg:text-left">{currentImageSize}</span>
-              </div>
-              <div className="grid min-w-0 gap-2 rounded-xl border border-line bg-white/[0.03] px-3 py-2 sm:grid-cols-[auto_minmax(0,1fr)_5rem] sm:items-center lg:flex lg:flex-none lg:flex-wrap lg:border-0 lg:bg-transparent lg:px-0 lg:py-0">
-                <span className="text-xs text-fog">数量</span>
-                <div className="no-scrollbar flex min-w-0 gap-1 overflow-x-auto pb-1 sm:pb-0 lg:overflow-visible">
-                  {[1, 2, 4, 8].map((v) => (
-                    <button key={v} onClick={() => setN(v)} className={`chip shrink-0 ${imageCount === v ? "chip-active" : ""}`}>{v}</button>
-                  ))}
+                <div className={controlCardClass}>
+                  <div className="flex min-w-0 items-center justify-between gap-3">
+                    <span className={controlLabelClass}>数量</span>
+                    <span className="text-xs text-fog">最多 {maxImageN} 张</span>
+                  </div>
+                  <div className="mt-2 grid min-w-0 grid-cols-[minmax(0,1fr)_4.5rem] items-center gap-2">
+                    <div className={scrollPillRowClass}>
+                      {[1, 2, 4, 8].filter((v) => v <= maxImageN).map((v) => (
+                        <button
+                          key={v}
+                          onClick={() => setN(v)}
+                          className={`chip shrink-0 ${imageCount === v ? "chip-active" : ""}`}
+                        >
+                          {v}
+                        </button>
+                      ))}
+                    </div>
+                    <input
+                      className="input h-[38px] min-w-0 px-2 py-1 text-center text-xs"
+                      type="number"
+                      min="1"
+                      max={maxImageN}
+                      value={n}
+                      onChange={(e) => setN(e.target.value)}
+                      onBlur={() => setN(boundedImageCount(n, maxImageN))}
+                      title={`最多 ${maxImageN} 张`}
+                    />
+                  </div>
                 </div>
-                <input
-                  className="input w-full px-2 py-1 text-xs sm:w-20"
-                  type="number"
-                  min="1"
-                  max={maxImageN}
-                  value={n}
-                  onChange={(e) => setN(e.target.value)}
-                  onBlur={() => setN(boundedImageCount(n, maxImageN))}
-                  title={`最多 ${maxImageN} 张`}
-                />
               </div>
             </>
           ) : (
             <>
-              <div className="grid min-w-0 gap-2 rounded-xl border border-line bg-white/[0.03] px-3 py-2 sm:grid-cols-[auto_minmax(0,1fr)_6rem] sm:items-center lg:flex lg:flex-none lg:flex-wrap lg:border-0 lg:bg-transparent lg:px-0 lg:py-0">
-                <span className="text-xs text-fog">时长</span>
-                <div className="no-scrollbar flex min-w-0 gap-1 overflow-x-auto pb-1 sm:pb-0">
-                  {VIDEO_DURATION_PRESETS.filter((p) => p.seconds <= maxVideoDuration).map((p) => (
-                    <button
-                      key={p.seconds}
-                      onClick={() => setVDuration(p.seconds)}
-                      title={p.hint}
-                      className={`chip shrink-0 ${videoDuration === p.seconds ? "chip-active" : ""}`}
-                    >
-                      {p.label}
-                    </button>
-                  ))}
+              <div className="grid min-w-0 gap-3 sm:grid-cols-[minmax(0,1fr)_minmax(0,0.8fr)]">
+                <div className={controlCardClass}>
+                  <div className="flex min-w-0 items-center justify-between gap-3">
+                    <span className={controlLabelClass}>时长</span>
+                    <span className="text-xs text-fog">最长 {formatDuration(maxVideoDuration)}</span>
+                  </div>
+                  <div className="mt-2 grid min-w-0 grid-cols-[minmax(0,1fr)_5.5rem] items-center gap-2">
+                    <div className={scrollPillRowClass}>
+                      {VIDEO_DURATION_PRESETS.filter((p) => p.seconds <= maxVideoDuration).map((p) => (
+                        <button
+                          key={p.seconds}
+                          onClick={() => setVDuration(p.seconds)}
+                          title={p.hint}
+                          className={`chip shrink-0 ${videoDuration === p.seconds ? "chip-active" : ""}`}
+                        >
+                          {p.label}
+                        </button>
+                      ))}
+                    </div>
+                    <input
+                      className="input h-[38px] min-w-0 px-2 py-1 text-center text-xs"
+                      type="number"
+                      min="1"
+                      max={maxVideoDuration}
+                      value={vDuration}
+                      onChange={(e) => setVDuration(e.target.value)}
+                      onBlur={() => setVDuration(boundedVideoDuration(vDuration, maxVideoDuration))}
+                      title={`最长 ${formatDuration(maxVideoDuration)}`}
+                    />
+                  </div>
                 </div>
-                <input
-                  className="input w-full px-2 py-1 text-xs sm:w-24"
-                  type="number"
-                  min="1"
-                  max={maxVideoDuration}
-                  value={vDuration}
-                  onChange={(e) => setVDuration(e.target.value)}
-                  onBlur={() => setVDuration(boundedVideoDuration(vDuration, maxVideoDuration))}
-                  title={`最长 ${formatDuration(maxVideoDuration)}`}
-                />
-              </div>
-              <div className="grid min-w-0 gap-2 rounded-xl border border-line bg-white/[0.03] px-3 py-2 sm:grid-cols-[auto_minmax(0,1fr)] sm:items-center lg:flex lg:flex-none lg:border-0 lg:bg-transparent lg:px-0 lg:py-0">
-                <span className="text-xs text-fog">质量</span>
-                <div className="no-scrollbar flex min-w-0 gap-1 overflow-x-auto pb-1 sm:pb-0 lg:overflow-visible">
-                  {VIDEO_QUALITIES.map((q) => (
-                    <button key={q.key} onClick={() => setVResolution(q.key)} title={q.hint}
-                      className={`chip shrink-0 ${vResolution === q.key ? "chip-active" : ""}`}>{q.label}</button>
-                  ))}
+                <div className={controlCardClass}>
+                  <span className={controlLabelClass}>质量</span>
+                  <div className={`${scrollPillRowClass} mt-2`}>
+                    {VIDEO_QUALITIES.map((q) => (
+                      <button
+                        key={q.key}
+                        onClick={() => setVResolution(q.key)}
+                        title={q.hint}
+                        className={`chip shrink-0 ${vResolution === q.key ? "chip-active" : ""}`}
+                      >
+                        {q.label}
+                      </button>
+                    ))}
+                  </div>
                 </div>
               </div>
             </>
           )}
 
-          <div className="grid min-w-0 gap-2 sm:grid-cols-2 lg:flex lg:flex-none lg:items-center">
+          <div className="grid min-w-0 gap-2 sm:grid-cols-[auto_minmax(12rem,20rem)]">
             <button onClick={() => setShowNegative((s) => !s)} className={`chip justify-center ${showNegative ? "chip-active" : ""}`}>
               负向词
             </button>
             {category === "image" && (
-              <label className="grid min-w-0 grid-cols-[auto_minmax(0,1fr)] items-center gap-2 text-xs text-fog">
-                seed
-                <input className="input min-w-0 px-2 py-1 text-xs lg:w-20" placeholder="随机" value={seed}
+              <label className="grid min-w-0 grid-cols-[auto_minmax(0,1fr)] items-center gap-2 rounded-full border border-line bg-white/[0.03] px-3 py-1.5 text-xs text-fog">
+                <span className="shrink-0">Seed</span>
+                <input className="input h-[34px] min-w-0 rounded-full px-3 py-1 text-xs" placeholder="随机" value={seed}
                   onChange={(e) => setSeed(e.target.value.replace(/[^0-9]/g, ""))} />
               </label>
             )}
@@ -1098,13 +1264,40 @@ export default function Home() {
                         <div>
                           <p className="text-xs font-display text-fog">编辑 Brief</p>
                           <h2 className="mt-1 text-xl font-display font-semibold text-snow">
-                            {creationModeLabel(creationMode)}素材重构
+                            {isImageEditMode
+                              ? (productGenerationMode ? "上传产品图生成商业素材" : "上传图片后按提示词编辑")
+                              : `${creationModeLabel(creationMode)}素材重构`}
                           </h2>
                         </div>
                         <span className="badge bg-brand-soft text-snow">
-                          {category === "video" ? "视频编辑源" : "图片编辑源"}
+                          {category === "video" ? "视频编辑源" : (productGenerationMode ? "产品高保真" : "图片编辑源")}
                         </span>
                       </div>
+                      {isImageEditMode && (
+                        <div className="mt-4 grid grid-cols-2 gap-2 rounded-xl border border-line bg-base/35 p-1">
+                          {[
+                            { key: "general", label: "普通编辑", desc: "按提示修图" },
+                            { key: "product", label: "产品生产", desc: "强保护Logo和包装" },
+                          ].map((item) => {
+                            const active = item.key === (productGenerationMode ? "product" : "general");
+                            return (
+                              <button
+                                key={item.key}
+                                type="button"
+                                onClick={() => setImageEditProductMode(item.key === "product")}
+                                className={`rounded-lg px-3 py-2 text-left transition ${
+                                  active
+                                    ? "border border-aqua/50 bg-aqua/15 text-snow shadow-glow-sm"
+                                    : "border border-transparent text-fog hover:bg-white/[0.04] hover:text-mist"
+                                }`}
+                              >
+                                <span className="block text-sm font-display font-semibold">{item.label}</span>
+                                <span className="mt-0.5 block text-[11px] leading-snug">{item.desc}</span>
+                              </button>
+                            );
+                          })}
+                        </div>
+                      )}
                       <div className="mt-4 grid gap-2 sm:grid-cols-3">
                         {editReadySteps.map((step) => (
                           <div
@@ -1139,7 +1332,12 @@ export default function Home() {
                         }}
                       />
                       <div className="mt-2 flex flex-wrap gap-1.5">
-                        {EDIT_PROMPT_CHIPS.map((ex) => (
+                        {(isImageEditMode
+                          ? (productGenerationMode
+                              ? ["保留包装和Logo", "生成电商主图", "小红书产品种草图", "替换广告场景", "产品边缘自然融入"]
+                              : ["替换为干净棚拍背景", "保留主体和Logo", "增加商业广告光感", "调整为小红书封面", "去除杂乱背景"])
+                          : EDIT_PROMPT_CHIPS
+                        ).map((ex) => (
                           <button
                             key={ex}
                             type="button"
@@ -1163,11 +1361,24 @@ export default function Home() {
                       <div className="rounded-2xl border border-line bg-white/[0.035] p-3">
                         <p className="text-xs font-display font-medium text-mist">迁移规则</p>
                         <div className="mt-3 space-y-2">
-                          {[
-                            ["保留产品身份", "Logo、包装、颜色和形状不漂移"],
-                            ["迁移参考气质", "只迁移场景、构图、光线和广告质感"],
-                            ["输出商业素材", "产品清晰，边缘自然融入新场景"],
-                          ].map(([title, desc]) => (
+                          {(isImageEditMode
+                            ? (productGenerationMode
+                                ? [
+                                    ["锁定产品身份", "SKU、Logo、包装结构和品牌色不改"],
+                                    ["迁移商业场景", "只生成背景、道具、构图、光线和广告质感"],
+                                    ["高保真输出", "产品清晰锐利，包装文字尽量可读"],
+                                  ]
+                                : [
+                                    ["按提示词编辑", "只改用户明确要求修改的部分"],
+                                    ["保留源图细节", "主体、Logo、文字和比例默认保持"],
+                                    ["可选参考增强", "可用右侧参考图迁移光线、构图和质感"],
+                                  ])
+                            : [
+                                ["保留产品身份", "Logo、包装、颜色和形状不漂移"],
+                                ["迁移参考气质", "只迁移场景、构图、光线和广告质感"],
+                                ["输出商业素材", "产品清晰，边缘自然融入新场景"],
+                              ]
+                          ).map(([title, desc]) => (
                             <div key={title} className="rounded-xl border border-line bg-base/35 px-3 py-2">
                               <p className="text-sm font-display font-medium text-snow">{title}</p>
                               <p className="mt-0.5 text-xs text-fog">{desc}</p>
@@ -1252,6 +1463,7 @@ export default function Home() {
               <StudioReferencePanel
                 category={category}
                 creationMode={creationMode}
+                imageEditProductMode={imageEditProductMode}
                 isEditMode={isEditMode}
                 selected={selected}
                 productAsset={productAsset}

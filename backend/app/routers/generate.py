@@ -45,7 +45,7 @@ _COMMON_PARAM_KEYS = {
     "width",
     "height",
 }
-_IMAGE_PARAM_KEYS = _COMMON_PARAM_KEYS | {"n", "size"}
+_IMAGE_PARAM_KEYS = _COMMON_PARAM_KEYS | {"n", "size", "style_reference_image"}
 _VIDEO_PARAM_KEYS = _COMMON_PARAM_KEYS | {
     "duration",
     "target_duration",
@@ -54,6 +54,8 @@ _VIDEO_PARAM_KEYS = _COMMON_PARAM_KEYS | {
     "ratio",
     "reference_image_url",
     "first_frame_image",
+    "last_frame_image",
+    "style_reference_image",
     "preview_resolution",
     "preview_duration",
 }
@@ -311,7 +313,7 @@ def _video_reference_is_actionable(
         return True
     has_reverse_prompt = bool(prompt and (prompt.get("final_text") or len(prompt.keys()) > 1))
     has_local_first_frame = False
-    for key in ("first_frame_image", "reference_image_url"):
+    for key in ("first_frame_image", "reference_image_url", "last_frame_image"):
         value = params.get(key)
         if not value:
             continue
@@ -518,7 +520,7 @@ def generate(body: GenerateIn, request: Request,
     # params and could carry an unsafe URL written before this guard existed.
     try:
         assert_safe_user_asset_url(source_asset_url)
-        for _url_key in ("reference_image_url", "first_frame_image"):
+        for _url_key in ("reference_image_url", "first_frame_image", "last_frame_image", "style_reference_image"):
             assert_safe_user_asset_url(task_params.get(_url_key))
     except SsrfError as e:
         raise HTTPException(400, f"素材链接被安全策略拦截:{e}")
@@ -528,6 +530,8 @@ def generate(body: GenerateIn, request: Request,
         source_asset_url,
         task_params.get("reference_image_url"),
         task_params.get("first_frame_image"),
+        task_params.get("last_frame_image"),
+        task_params.get("style_reference_image"),
     )
     if body.category == "video" and body.stage == "preview" and not _video_reference_is_actionable(
         db,
