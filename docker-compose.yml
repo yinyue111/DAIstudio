@@ -41,6 +41,9 @@ services:
   redis:
     image: redis:7
     restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec"]
+    volumes:
+      - redisdata:/data
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
@@ -156,5 +159,6 @@ services:
 
 volumes:
   pgdata:
+  redisdata:
   media:
   # miniodata:

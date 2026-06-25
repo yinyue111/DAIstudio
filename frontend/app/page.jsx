@@ -50,6 +50,7 @@ const EDIT_STYLE_KEYS = {
 
 const EDIT_PROMPT_CHIPS = [
   "保留品牌标识",
+  "包装文字逐字保留",
   "强化产品卖点",
   "产品边缘自然融入场景",
   "干净商业广告质感",
@@ -65,14 +66,29 @@ const EDIT_PROTECTION_NEGATIVE = [
   "比例失真",
   "错误品牌文字",
   "品牌名错误",
+  "商标错误",
+  "包装文字变化",
+  "包装文字错字",
+  "包装文字缺失",
+  "文字被翻译",
+  "文字新增",
+  "文字删减",
+  "标签位置改变",
   "产品变形",
 ];
 
 const PRODUCT_EDIT_NEGATIVE = [
   "logo扭曲",
   "logo丢失",
+  "Logo重绘",
+  "Logo字体变化",
   "包装文字乱码",
   "包装文字被改写",
+  "产品正面文字被重排",
+  "顶部文字被改写",
+  "品牌名被替换",
+  "图案变形",
+  "包装纹理丢失",
   "产品外形改变",
   "产品颜色漂移",
   "标签缺失",
@@ -88,6 +104,36 @@ function creationModeLabel(mode) {
   return CREATION_MODES.find((item) => item.key === mode)?.label || "生成";
 }
 
+function createWorkspaceState() {
+  return {
+    prompt: "",
+    negative: "",
+    imageEditProductMode: false,
+    ratio: "1:1",
+    imageQuality: "1k",
+    n: 4,
+    seed: "",
+    vDuration: 5,
+    vResolution: "720p",
+    videoAnalysisPreset: "standard",
+    url: "",
+    parsing: false,
+    uploading: false,
+    reversing: false,
+    assets: [],
+    selected: null,
+    productAsset: null,
+    structured: {},
+    structuredSource: "",
+    negativeTouched: false,
+    promptDirty: false,
+  };
+}
+
+function createModeWorkspaces() {
+  return Object.fromEntries(CREATION_MODES.map(({ key }) => [key, createWorkspaceState()]));
+}
+
 export default function Home() {
   const router = useRouter();
   const [me, setMe] = useState(null);
@@ -95,33 +141,13 @@ export default function Home() {
 
   // creation state
   const [creationMode, setCreationMode] = useState("image"); // image | video | image_edit | video_edit
-  const [prompt, setPrompt] = useState("");
-  const [negative, setNegative] = useState("");
+  const [workspaces, setWorkspaces] = useState(createModeWorkspaces);
   const [showNegative, setShowNegative] = useState(false);
-  const [ratio, setRatio] = useState("1:1");
-  const [imageQuality, setImageQuality] = useState("1k");
-  const [n, setN] = useState(4);
-  const [seed, setSeed] = useState("");
-  const [vDuration, setVDuration] = useState(5);
-  const [vResolution, setVResolution] = useState("720p");
   const [promptLibraryOpen, setPromptLibraryOpen] = useState(false);
-  const [videoAnalysisPreset, setVideoAnalysisPreset] = useState("standard");
-  const [imageEditProductMode, setImageEditProductMode] = useState(false);
 
   // reference (paste link -> reverse) state
   const [refOpen, setRefOpen] = useState(false);
-  const [url, setUrl] = useState("");
-  const [parsing, setParsing] = useState(false);
-  const [uploading, setUploading] = useState(false);
-  const [assets, setAssets] = useState([]);
-  const [selected, setSelected] = useState(null);
-  const [productAsset, setProductAsset] = useState(null);
-  const [reversing, setReversing] = useState(false);
-  const [structured, setStructured] = useState({}); // editable reverse dimensions
-  const [structuredSource, setStructuredSource] = useState("");
   const [structOpen, setStructOpen] = useState(true);
-  const [negativeTouched, setNegativeTouched] = useState(false);
-  const [promptDirty, setPromptDirty] = useState(false);
 
   // run state
   const [task, setTask] = useState(null);
@@ -140,23 +166,94 @@ export default function Home() {
   const wsRef = useRef(null);
   const backgroundTrackersRef = useRef(new Map());
   const activeIdRef = useRef(null); // id of the task currently being tracked
-  const selectedRef = useRef(null);
-  const refVersionRef = useRef(0);
-  const parseRequestRef = useRef(0);
-  const uploadRequestRef = useRef(0);
-  const reverseRequestRef = useRef(0);
+  const selectedByModeRef = useRef({});
+  const refVersionRef = useRef({});
+  const parseRequestRef = useRef({});
+  const uploadRequestRef = useRef({});
+  const productUploadRequestRef = useRef({});
+  const reverseRequestRef = useRef({});
   const pendingGenerateRequestRef = useRef(null);
   const busyAssetIdsRef = useRef(new Set());
   const imageUploadInputRef = useRef(null);
   const productUploadInputRef = useRef(null);
   const videoUploadInputRef = useRef(null);
-  const objectUrlsRef = useRef(new Set());
-  const productObjectUrlRef = useRef("");
+  const objectUrlsByModeRef = useRef({});
+  const productObjectUrlsRef = useRef({});
+  const creationModeRef = useRef("image");
   const PENDING_GENERATE_STORAGE_KEY = "studio_pending_generate_request_v1";
+  const workspace = workspaces[creationMode] || createWorkspaceState();
+  const {
+    prompt,
+    negative,
+    imageEditProductMode,
+    ratio,
+    imageQuality,
+    n,
+    seed,
+    vDuration,
+    vResolution,
+    videoAnalysisPreset,
+    url,
+    parsing,
+    uploading,
+    reversing,
+    assets,
+    selected,
+    productAsset,
+    structured,
+    structuredSource,
+    negativeTouched,
+    promptDirty,
+  } = workspace;
   const category = creationMode === "video" || creationMode === "video_edit" ? "video" : "image";
   const isEditMode = creationMode === "image_edit" || creationMode === "video_edit";
   const isImageEditMode = creationMode === "image_edit";
   const productGenerationMode = isImageEditMode && imageEditProductMode;
+
+  function updateWorkspaceField(field, valueOrUpdater, mode = creationMode) {
+    setWorkspaces((prev) => {
+      const current = prev[mode] || createWorkspaceState();
+      const nextValue = typeof valueOrUpdater === "function"
+        ? valueOrUpdater(current[field])
+        : valueOrUpdater;
+      return {
+        ...prev,
+        [mode]: {
+          ...current,
+          [field]: nextValue,
+        },
+      };
+    });
+  }
+
+  function setWorkspacePatch(patchOrUpdater, mode = creationMode) {
+    setWorkspaces((prev) => {
+      const current = prev[mode] || createWorkspaceState();
+      const patch = typeof patchOrUpdater === "function" ? patchOrUpdater(current) : patchOrUpdater;
+      return {
+        ...prev,
+        [mode]: {
+          ...current,
+          ...patch,
+        },
+      };
+    });
+  }
+
+  const setPrompt = (value) => updateWorkspaceField("prompt", value);
+  const setNegative = (value) => updateWorkspaceField("negative", value);
+  const setImageEditProductMode = (value) => updateWorkspaceField("imageEditProductMode", value);
+  const setRatio = (value) => updateWorkspaceField("ratio", value);
+  const setImageQuality = (value) => updateWorkspaceField("imageQuality", value);
+  const setN = (value) => updateWorkspaceField("n", value);
+  const setSeed = (value) => updateWorkspaceField("seed", value);
+  const setVDuration = (value) => updateWorkspaceField("vDuration", value);
+  const setVResolution = (value) => updateWorkspaceField("vResolution", value);
+  const setVideoAnalysisPreset = (value) => updateWorkspaceField("videoAnalysisPreset", value);
+  const setUrl = (value) => updateWorkspaceField("url", value);
+  const setStructured = (value) => updateWorkspaceField("structured", value);
+  const setNegativeTouched = (value) => updateWorkspaceField("negativeTouched", value);
+  const setPromptDirty = (value) => updateWorkspaceField("promptDirty", value);
 
   useEffect(() => {
     api.me().then(setMe).catch(() => router.push(loginPath()));
@@ -164,19 +261,27 @@ export default function Home() {
       setCfg(c);
       // honour admin defaults so the values we submit match the backend config
       const d = c.defaults || {};
-      if (d.image_n) setN(Number(d.image_n));
+      const patch = {};
+      if (d.image_n) patch.n = Number(d.image_n);
       if (d.image_size) {
         const rk = ratioKeyForSize(d.image_size);
-        if (rk) setRatio(rk);
-        setImageQuality(qualityKeyForSize(d.image_size));
+        if (rk) patch.ratio = rk;
+        patch.imageQuality = qualityKeyForSize(d.image_size);
+      }
+      if (Object.keys(patch).length) {
+        setWorkspaces((prev) => Object.fromEntries(
+          Object.entries(prev).map(([mode, current]) => [
+            mode,
+            mode === "image" || mode === "image_edit" ? { ...current, ...patch } : current,
+          ]),
+        ));
       }
     }).catch(() => {});
     loadWorks({ restoreActive: true });
     try {
       const draft = window.localStorage.getItem(STUDIO_DRAFT_PROMPT_KEY);
       if (draft) {
-        setPrompt(draft);
-        setPromptDirty(true);
+        setWorkspacePatch({ prompt: draft, promptDirty: true }, "image");
         window.localStorage.removeItem(STUDIO_DRAFT_PROMPT_KEY);
       }
     } catch (e) {}
@@ -186,7 +291,7 @@ export default function Home() {
       backgroundTrackersRef.current.forEach((stop) => stop());
       backgroundTrackersRef.current.clear();
       revokeUploadedObjectUrls();
-      revokeProductObjectUrl();
+      revokeProductObjectUrls();
     };
   }, []);
 
@@ -197,8 +302,9 @@ export default function Home() {
   }, [category, ratio]);
 
   useEffect(() => {
-    selectedRef.current = selected;
-  }, [selected]);
+    creationModeRef.current = creationMode;
+    selectedByModeRef.current[creationMode] = selected;
+  }, [creationMode, selected]);
 
   function refreshMe() { api.me().then(setMe).catch(() => {}); }
 
@@ -270,25 +376,86 @@ export default function Home() {
   }
 
   // ---- reference: parse + reverse ----
-  function revokeUploadedObjectUrls() {
-    objectUrlsRef.current.forEach((u) => URL.revokeObjectURL(u));
-    objectUrlsRef.current.clear();
+  function rememberUploadedObjectUrl(mode, url) {
+    if (!objectUrlsByModeRef.current[mode]) objectUrlsByModeRef.current[mode] = new Set();
+    objectUrlsByModeRef.current[mode].add(url);
   }
 
-  function revokeProductObjectUrl() {
-    if (productObjectUrlRef.current) {
-      URL.revokeObjectURL(productObjectUrlRef.current);
-      productObjectUrlRef.current = "";
+  function revokeUploadedObjectUrls(mode = null) {
+    if (mode) {
+      objectUrlsByModeRef.current[mode]?.forEach((url) => URL.revokeObjectURL(url));
+      objectUrlsByModeRef.current[mode]?.clear();
+      return;
+    }
+    Object.values(objectUrlsByModeRef.current).forEach((urls) => {
+      urls?.forEach((url) => URL.revokeObjectURL(url));
+      urls?.clear();
+    });
+    objectUrlsByModeRef.current = {};
+  }
+
+  function revokeProductObjectUrl(mode = creationMode) {
+    const url = productObjectUrlsRef.current[mode];
+    if (url) {
+      URL.revokeObjectURL(url);
+      delete productObjectUrlsRef.current[mode];
     }
   }
 
-  function clearReverseState({ clearPrompt = false } = {}) {
-    setStructured({});
-    setStructuredSource("");
-    if (!negativeTouched) setNegative("");
-    if (clearPrompt) {
-      setPrompt("");
-      setPromptDirty(false);
+  function revokeProductObjectUrls() {
+    Object.values(productObjectUrlsRef.current).forEach((url) => URL.revokeObjectURL(url));
+    productObjectUrlsRef.current = {};
+  }
+
+  function bumpRefVersion(mode = creationMode) {
+    const next = Number(refVersionRef.current[mode] || 0) + 1;
+    refVersionRef.current[mode] = next;
+    return next;
+  }
+
+  function isRefVersionCurrent(mode, version) {
+    return Number(refVersionRef.current[mode] || 0) === version;
+  }
+
+  function isModeVisible(mode) {
+    return creationModeRef.current === mode;
+  }
+
+  function bumpRequest(ref, mode = creationMode) {
+    const next = Number(ref.current[mode] || 0) + 1;
+    ref.current[mode] = next;
+    return next;
+  }
+
+  function isRequestCurrent(ref, mode, id) {
+    return Number(ref.current[mode] || 0) === id;
+  }
+
+  function selectAssetForMode(asset, mode = creationMode) {
+    const targetMode = asset.type === "video" && mode === "image" ? "video" : mode;
+    const previousSignature = assetSignature(selectedByModeRef.current[targetMode]);
+    const nextSignature = assetSignature(asset);
+    selectedByModeRef.current[targetMode] = asset;
+    setWorkspacePatch((current) => ({
+      selected: asset,
+      ...(previousSignature !== nextSignature
+        ? {
+            structured: {},
+            structuredSource: "",
+            ...(current.negativeTouched ? {} : { negative: "" }),
+          }
+        : {}),
+    }), targetMode);
+    if (previousSignature !== nextSignature) {
+      bumpRequest(reverseRequestRef, targetMode);
+      setWorkspacePatch({ reversing: false }, targetMode);
+    }
+    const dims = assetDims(asset);
+    if (targetMode !== mode) setCreationMode(targetMode);
+    if (asset.type === "video" && dims) {
+      updateWorkspaceField("ratio", nearestRatio(dims.width, dims.height, videoRatioOptions()), targetMode);
+    } else if (dims) {
+      updateWorkspaceField("ratio", nearestRatio(dims.width, dims.height), targetMode);
     }
   }
 
@@ -296,16 +463,16 @@ export default function Home() {
     return new Promise((resolve) => setTimeout(resolve, ms));
   }
 
-  async function waitForParseResult(initial, refVersion) {
+  async function waitForParseResult(initial, refVersion, mode) {
     let current = initial;
     const startedAt = Date.now();
     while (current?.status === "queued" || current?.status === "running") {
-      if (refVersion !== refVersionRef.current) return null;
+      if (!isRefVersionCurrent(mode, refVersion)) return null;
       if (Date.now() - startedAt > PARSE_POLL_TIMEOUT_MS) {
         throw new Error("抓取仍在处理中，请稍后重试");
       }
       await sleep(PARSE_POLL_INTERVAL_MS);
-      if (refVersion !== refVersionRef.current) return null;
+      if (!isRefVersionCurrent(mode, refVersion)) return null;
       current = await api.parseStatus(current.id);
     }
     return current;
@@ -313,30 +480,42 @@ export default function Home() {
 
   async function doParse() {
     if (!url.trim() || parsing) return;
-    const reqId = ++parseRequestRef.current;
-    const refVersion = ++refVersionRef.current;
-    reverseRequestRef.current += 1;
-    revokeUploadedObjectUrls();
-    setMsg(""); setAssets([]); setSelected(null); clearReverseState(); setParsing(true);
+    const mode = creationMode;
+    const targetUrl = url.trim();
+    const reqId = bumpRequest(parseRequestRef, mode);
+    const refVersion = bumpRefVersion(mode);
+    bumpRequest(reverseRequestRef, mode);
+    revokeUploadedObjectUrls(mode);
+    selectedByModeRef.current[mode] = null;
+    setMsg("");
+    setWorkspacePatch((current) => ({
+      assets: [],
+      selected: null,
+      structured: {},
+      structuredSource: "",
+      ...(current.negativeTouched ? {} : { negative: "" }),
+    }), mode);
+    setWorkspacePatch({ parsing: true }, mode);
     setRefOpen(true);
     try {
-      const first = await api.parse(url.trim());
-      const r = await waitForParseResult(first, refVersion);
-      if (refVersion !== refVersionRef.current) return;
+      const first = await api.parse(targetUrl);
+      const r = await waitForParseResult(first, refVersion, mode);
+      if (!isRefVersionCurrent(mode, refVersion)) return;
       if (!r) return;
       if (r.status === "failed") throw new Error(r.error || "抓取失败，请稍后重试或更换链接");
       if (r.status !== "done") throw new Error("抓取状态异常，请稍后重试");
-      setAssets(r.assets || []);
-      if (!r.assets?.length) setMsg("未在该页面发现可用素材");
+      setWorkspacePatch({ assets: r.assets || [] }, mode);
+      if (!r.assets?.length && isModeVisible(mode)) setMsg("未在该页面发现可用素材");
     } catch (e) {
-      if (refVersion === refVersionRef.current) setMsg(e.message);
+      if (isRefVersionCurrent(mode, refVersion) && isModeVisible(mode)) setMsg(e.message);
     } finally {
-      if (reqId === parseRequestRef.current) setParsing(false);
+      if (isRequestCurrent(parseRequestRef, mode, reqId)) setWorkspacePatch({ parsing: false }, mode);
     }
   }
 
   async function doUploadImage(file) {
     if (!file || uploading) return;
+    const mode = creationMode;
     if (!file.type?.startsWith("image/")) {
       setMsg("请选择图片文件");
       if (imageUploadInputRef.current) imageUploadInputRef.current.value = "";
@@ -346,30 +525,31 @@ export default function Home() {
       if (imageUploadInputRef.current) imageUploadInputRef.current.value = "";
       return;
     }
-    const reqId = ++uploadRequestRef.current;
-    const refVersion = ++refVersionRef.current;
-    reverseRequestRef.current += 1;
+    const reqId = bumpRequest(uploadRequestRef, mode);
+    const refVersion = bumpRefVersion(mode);
+    bumpRequest(reverseRequestRef, mode);
     setMsg("");
-    setUploading(true);
+    setWorkspacePatch({ uploading: true }, mode);
     try {
       const uploaded = await api.uploadImage(file);
-      if (refVersion !== refVersionRef.current) return;
+      if (!isRefVersionCurrent(mode, refVersion)) return;
       const previewUrl = URL.createObjectURL(file);
-      objectUrlsRef.current.add(previewUrl);
+      rememberUploadedObjectUrl(mode, previewUrl);
       const displayAsset = {
         ...uploaded,
         display_url: previewUrl,
         display_thumb: previewUrl,
       };
-      setAssets((current) => [displayAsset, ...current]);
-      pickAsset(displayAsset);
-      clearReverseState();
+      setWorkspacePatch((current) => ({
+        assets: [displayAsset, ...current.assets],
+      }), mode);
+      selectAssetForMode(displayAsset, mode);
       setRefOpen(true);
     } catch (e) {
-      if (refVersion === refVersionRef.current) setMsg(e.message);
+      if (isRefVersionCurrent(mode, refVersion) && isModeVisible(mode)) setMsg(e.message);
     } finally {
-      if (reqId === uploadRequestRef.current) {
-        setUploading(false);
+      if (isRequestCurrent(uploadRequestRef, mode, reqId)) {
+        setWorkspacePatch({ uploading: false }, mode);
         if (imageUploadInputRef.current) imageUploadInputRef.current.value = "";
       }
     }
@@ -377,6 +557,7 @@ export default function Home() {
 
   async function doUploadProductImage(file) {
     if (!file || uploading) return;
+    const mode = creationMode;
     if (!file.type?.startsWith("image/")) {
       setMsg("请选择产品图片文件");
       if (productUploadInputRef.current) productUploadInputRef.current.value = "";
@@ -386,25 +567,33 @@ export default function Home() {
       if (productUploadInputRef.current) productUploadInputRef.current.value = "";
       return;
     }
-    const reqId = ++uploadRequestRef.current;
+    const reqId = bumpRequest(uploadRequestRef, mode);
+    const productReqId = bumpRequest(productUploadRequestRef, mode);
     setMsg("");
-    setUploading(true);
+    setWorkspacePatch({ uploading: true }, mode);
     try {
       const uploaded = await api.uploadImage(file);
+      if (!isRequestCurrent(productUploadRequestRef, mode, productReqId)) return;
       const previewUrl = URL.createObjectURL(file);
-      revokeProductObjectUrl();
-      productObjectUrlRef.current = previewUrl;
-      setProductAsset({
-        ...uploaded,
-        display_url: previewUrl,
-        display_thumb: previewUrl,
-      });
+      if (!isRequestCurrent(productUploadRequestRef, mode, productReqId)) {
+        URL.revokeObjectURL(previewUrl);
+        return;
+      }
+      revokeProductObjectUrl(mode);
+      productObjectUrlsRef.current[mode] = previewUrl;
+      setWorkspacePatch({
+        productAsset: {
+          ...uploaded,
+          display_url: previewUrl,
+          display_thumb: previewUrl,
+        },
+      }, mode);
       setRefOpen(true);
     } catch (e) {
-      setMsg(e.message);
+      if (isModeVisible(mode)) setMsg(e.message);
     } finally {
-      if (reqId === uploadRequestRef.current) {
-        setUploading(false);
+      if (isRequestCurrent(uploadRequestRef, mode, reqId)) {
+        setWorkspacePatch({ uploading: false }, mode);
         if (productUploadInputRef.current) productUploadInputRef.current.value = "";
       }
     }
@@ -412,6 +601,8 @@ export default function Home() {
 
   async function doUploadVideo(file) {
     if (!file || uploading) return;
+    const mode = creationMode;
+    const targetMode = !isEditMode && category !== "video" ? "video" : mode;
     if (!file.type?.startsWith("video/")) {
       setMsg("请选择视频文件");
       if (videoUploadInputRef.current) videoUploadInputRef.current.value = "";
@@ -421,116 +612,118 @@ export default function Home() {
       if (videoUploadInputRef.current) videoUploadInputRef.current.value = "";
       return;
     }
-    const reqId = ++uploadRequestRef.current;
-    const refVersion = ++refVersionRef.current;
-    reverseRequestRef.current += 1;
+    const reqId = bumpRequest(uploadRequestRef, mode);
+    const refVersion = bumpRefVersion(targetMode);
+    bumpRequest(reverseRequestRef, targetMode);
     setMsg("");
-    setUploading(true);
+    setWorkspacePatch({ uploading: true }, mode);
     try {
       const uploaded = await api.uploadVideo(file);
-      if (refVersion !== refVersionRef.current) return;
+      if (!isRefVersionCurrent(targetMode, refVersion)) return;
       const previewUrl = URL.createObjectURL(file);
-      objectUrlsRef.current.add(previewUrl);
+      rememberUploadedObjectUrl(targetMode, previewUrl);
       const displayAsset = {
         ...uploaded,
         display_url: previewUrl,
         display_thumb: uploaded.thumb || previewUrl,
       };
-      setAssets((current) => [displayAsset, ...current]);
-      pickAsset(displayAsset);
-      if (!isEditMode && category !== "video") setCreationMode("video");
-      clearReverseState();
+      setWorkspacePatch((current) => ({
+        assets: [displayAsset, ...current.assets],
+      }), targetMode);
+      selectAssetForMode(displayAsset, targetMode);
+      if (targetMode !== mode) setCreationMode(targetMode);
       setRefOpen(true);
     } catch (e) {
-      if (refVersion === refVersionRef.current) setMsg(e.message);
+      if (isRefVersionCurrent(targetMode, refVersion) && isModeVisible(mode)) setMsg(e.message);
     } finally {
-      if (reqId === uploadRequestRef.current) {
-        setUploading(false);
+      if (isRequestCurrent(uploadRequestRef, mode, reqId)) {
+        setWorkspacePatch({ uploading: false }, mode);
         if (videoUploadInputRef.current) videoUploadInputRef.current.value = "";
       }
     }
   }
 
   function pickAsset(a) {
-    const previousSignature = assetSignature(selectedRef.current);
-    const nextSignature = assetSignature(a);
-    setSelected(a);
-    if (previousSignature !== nextSignature) {
-      reverseRequestRef.current += 1;
-      setReversing(false);
-      clearReverseState();
-    }
-    const dims = assetDims(a);
-    if (a.type === "video") {
-      if (!isEditMode) setCreationMode("video");
-      if (dims) setRatio(nearestRatio(dims.width, dims.height, videoRatioOptions()));
-    } else if (dims) {
-      setRatio(nearestRatio(dims.width, dims.height));
-    }
+    selectAssetForMode(a, creationMode);
   }
 
   function clearProductAsset() {
-    revokeProductObjectUrl();
-    setProductAsset(null);
+    bumpRequest(productUploadRequestRef, creationMode);
+    revokeProductObjectUrl(creationMode);
+    setWorkspacePatch({ productAsset: null });
     if (productUploadInputRef.current) productUploadInputRef.current.value = "";
   }
 
   async function doReverse() {
     if (!selected) return;
+    const mode = creationMode;
+    const targetCategory = category;
+    const targetVideoPreset = videoAnalysisPreset;
+    const targetNegativeTouched = negativeTouched;
     const target = selected;
     const targetSignature = assetSignature(target);
-    const reqId = ++reverseRequestRef.current;
+    const reqId = bumpRequest(reverseRequestRef, mode);
     const isCurrent = () => (
-      reqId === reverseRequestRef.current
-      && assetSignature(selectedRef.current) === targetSignature
+      isRequestCurrent(reverseRequestRef, mode, reqId)
+      && assetSignature(selectedByModeRef.current[mode]) === targetSignature
     );
-    setReversing(true); setMsg("");
+    setWorkspacePatch({ reversing: true }, mode);
+    setMsg("");
     try {
       const isVideo = target.type === "video";
       const refUrl = isVideo ? target.url || target.thumb : target.url;
-      const reverseTarget = isVideo ? "video" : category;
+      const reverseTarget = isVideo ? "video" : targetCategory;
       const r = await api.reverse(
         refUrl,
         reverseTarget,
         isVideo ? target.thumb : null,
         target.type,
-        isVideo ? videoAnalysisPreset : null,
+        isVideo ? targetVideoPreset : null,
       );
       if (!isCurrent()) return;
       const s = r.structured || {};
-      setStructured(s);
-      setStructuredSource(targetSignature);
-      setPrompt(composePromptFromStructured(s, r.final_text || ""));
-      setPromptDirty(false);
+      setWorkspacePatch({
+        structured: s,
+        structuredSource: targetSignature,
+        prompt: composePromptFromStructured(s, r.final_text || ""),
+        promptDirty: false,
+        ...(s["负向"] && !targetNegativeTouched ? { negative: s["负向"] } : {}),
+      }, mode);
       setStructOpen(true);
-      if (s["负向"] && !negativeTouched) {
-        setNegative(s["负向"]);
-        setShowNegative(true);
-      }
+      if (s["负向"] && !targetNegativeTouched && isModeVisible(mode)) setShowNegative(true);
       if (typeof r.charged_credits === "number") {
         const suffix = r.reference_count > 1 ? `（${r.reference_count} 帧）` : "";
-        setMsg(`反推完成，已扣 ${r.charged_credits} 积分${suffix}`);
+        if (isModeVisible(mode)) setMsg(`反推完成，已扣 ${r.charged_credits} 积分${suffix}`);
       }
       refreshMe();
     } catch (e) {
-      if (isCurrent()) setMsg(e.message);
+      if (isCurrent() && isModeVisible(mode)) setMsg(e.message);
     } finally {
-      if (reqId === reverseRequestRef.current) setReversing(false);
+      if (isRequestCurrent(reverseRequestRef, mode, reqId)) setWorkspacePatch({ reversing: false }, mode);
     }
   }
 
   function clearRef() {
-    refVersionRef.current += 1;
-    parseRequestRef.current += 1;
-    uploadRequestRef.current += 1;
-    reverseRequestRef.current += 1;
-    revokeUploadedObjectUrls();
-    setParsing(false);
-    setUploading(false);
-    setReversing(false);
+    const mode = creationMode;
+    bumpRefVersion(mode);
+    bumpRequest(parseRequestRef, mode);
+    bumpRequest(uploadRequestRef, mode);
+    bumpRequest(reverseRequestRef, mode);
+    revokeUploadedObjectUrls(mode);
     if (imageUploadInputRef.current) imageUploadInputRef.current.value = "";
     if (videoUploadInputRef.current) videoUploadInputRef.current.value = "";
-    setSelected(null); clearReverseState(); setAssets([]); setUrl("");
+    selectedByModeRef.current[mode] = null;
+    setWorkspacePatch({
+      selected: null,
+      assets: [],
+      url: "",
+      parsing: false,
+      uploading: false,
+      reversing: false,
+      structured: {},
+      structuredSource: "",
+      ...(negativeTouched ? {} : { negative: "" }),
+    }, mode);
   }
 
   // rebuild the prompt text from the (possibly edited) reverse dimensions
@@ -552,9 +745,9 @@ export default function Home() {
       return `以用户上传的图片作为唯一编辑源，严格按照用户提示词执行局部或整体编辑；保留未被要求修改的主体、构图、Logo、文字、颜色、比例和关键细节，不要无故替换主体或品牌。${styleScope}编辑要求：${base}`;
     }
     const guard = video
-      ? "以用户上传的产品主体图作为视频首帧和唯一产品身份参考，必须完整保留产品主体、Logo、包装、颜色、形状、材质、比例、文字标识和品牌身份，不替换不重绘不改款；"
-      : "以用户上传的产品图作为唯一产品身份和编辑源，必须完整保留同一 SKU 的主体、Logo、包装结构、品牌色、形状轮廓、材质纹理、比例、标签版式、文字标识和可识别细节，不替换、不重绘、不改款、不改品牌；";
-    const fidelity = "产品主体必须清晰锐利，商标和包装文字尽量保持可读，边缘自然融入新场景；只允许迁移或生成背景、台面、道具、光线、构图、广告氛围和画面质感，不得把参考素材里的商品或品牌覆盖到产品上。";
+      ? "以用户上传的产品主体图作为视频首帧和唯一产品身份参考，必须完整保留产品主体、Logo、包装、颜色、形状、材质、比例、文字标识和品牌身份；产品表面像素视为锁定图层，不替换、不重绘、不改款、不改品牌；"
+      : "以用户上传的产品图作为唯一产品身份和编辑源，必须完整保留同一 SKU 的主体、Logo、包装结构、品牌色、形状轮廓、材质纹理、比例、标签版式、文字标识和可识别细节；产品表面像素视为锁定图层，不替换、不重绘、不改款、不改品牌；";
+    const fidelity = "包装上的品牌名、Logo、中文、英文、韩文、数字、装饰图案、标签位置和排版必须逐字逐形保持原图，不得翻译、改写、补写、删减、重排、风格化、模糊或替换；产品主体必须清晰锐利，边缘自然融入新场景；只允许迁移或生成背景、台面、道具、光线、构图、广告氛围和画面质感，不得把参考素材里的商品或品牌覆盖到产品上。若风格迁移和产品保真冲突，优先保证产品主体与包装文字完全不变。";
     return `${guard}${styleScope}${fidelity}生成广告级商业素材。迁移要求：${base}`;
   }
 
@@ -1334,7 +1527,7 @@ export default function Home() {
                       <div className="mt-2 flex flex-wrap gap-1.5">
                         {(isImageEditMode
                           ? (productGenerationMode
-                              ? ["保留包装和Logo", "生成电商主图", "小红书产品种草图", "替换广告场景", "产品边缘自然融入"]
+                              ? ["包装文字逐字保留", "保留包装和Logo", "生成电商主图", "小红书产品种草图", "替换广告场景", "产品边缘自然融入"]
                               : ["替换为干净棚拍背景", "保留主体和Logo", "增加商业广告光感", "调整为小红书封面", "去除杂乱背景"])
                           : EDIT_PROMPT_CHIPS
                         ).map((ex) => (
@@ -1364,9 +1557,9 @@ export default function Home() {
                           {(isImageEditMode
                             ? (productGenerationMode
                                 ? [
-                                    ["锁定产品身份", "SKU、Logo、包装结构和品牌色不改"],
+                                    ["锁定产品身份", "SKU、Logo、包装结构、品牌色和表面文字不改"],
                                     ["迁移商业场景", "只生成背景、道具、构图、光线和广告质感"],
-                                    ["高保真输出", "产品清晰锐利，包装文字尽量可读"],
+                                    ["高保真输出", "产品清晰锐利，包装文字逐字保留"],
                                   ]
                                 : [
                                     ["按提示词编辑", "只改用户明确要求修改的部分"],

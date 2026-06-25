@@ -2,6 +2,7 @@
 __pycache__/
 *.pyc
 storage/
+build/
 .env
 .env.*
 !.env.example

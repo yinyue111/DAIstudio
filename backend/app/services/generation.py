@@ -80,6 +80,14 @@ log = logging.getLogger("generation")
 VIDEO_FIRST_FRAME_MIN_SIDE = 300
 VIDEO_FIRST_FRAME_MAX_SIDE = 768
 IMAGE_EDIT_REFERENCE_MAX_SIDE = 1024
+IMAGE_PRODUCT_EDIT_REFERENCE_MAX_SIDE = 1536
+PRODUCT_FIDELITY_GUARD = (
+    "产品高保真硬约束：上传产品图是唯一产品身份来源，产品主体、Logo、包装结构、品牌色、形状、"
+    "材质、比例、标签版式、表面纹理和所有可见文字必须完整保留；包装上的品牌名、Logo、中文、"
+    "英文、韩文、数字、装饰图案、标签位置和排版必须逐字逐形保持原图，不得翻译、改写、补写、"
+    "删减、重排、风格化、模糊或替换。只允许改变背景、台面、道具、光线、构图、阴影和广告质感；"
+    "如风格迁移与产品保真冲突，优先保证产品和包装文字不变。"
+)
 
 __all__ = ["ModelSnapshotMismatchError", "NEEDS_REVIEW", "TaskLockedError",
            "admin_settle_needs_review_task", "admin_settle_needs_review_video",
@@ -91,6 +99,22 @@ __all__ = ["ModelSnapshotMismatchError", "NEEDS_REVIEW", "TaskLockedError",
 
 class TaskLockedError(RuntimeError):
     pass
+
+
+def _is_product_generation_task(task: GenTask) -> bool:
+    trace = (task.params or {}).get("_source_trace")
+    if not isinstance(trace, dict):
+        return False
+    return str(trace.get("product_generation_mode")).lower() in {"true", "1", "yes"}
+
+
+def _product_fidelity_prompt(prompt: str, task: GenTask) -> str:
+    if not _is_product_generation_task(task):
+        return prompt
+    text = str(prompt or "")
+    if "产品高保真硬约束" in text:
+        return text
+    return f"{PRODUCT_FIDELITY_GUARD}{text}"
 
 
 def image_review_has_local_results(task: GenTask) -> bool:
@@ -304,6 +328,7 @@ def run_image_task(task_id: int) -> None:
         ref_w, ref_h = _reference_dimensions(task)
         size = params.get("size") or _closest_image_size(ref_w, ref_h, fallback_size)
         prompt = _final_prompt(task)
+        prompt = _product_fidelity_prompt(prompt, task)
 
         set_progress(task_id, 30, "running")
         # reverse-off (image+instruction -> image): pass the reference image to
@@ -311,11 +336,16 @@ def run_image_task(task_id: int) -> None:
         ref = None
         edit_refs: list[str] | None = None
         if (task.prompt or {}).get("instruction") and task.source_type == "image":
+            reference_max_side = (
+                IMAGE_PRODUCT_EDIT_REFERENCE_MAX_SIDE
+                if _is_product_generation_task(task)
+                else IMAGE_EDIT_REFERENCE_MAX_SIDE
+            )
             ref = _gateway_reference_image(
                 db,
                 task,
                 task.source_asset_url,
-                max_side=IMAGE_EDIT_REFERENCE_MAX_SIDE,
+                max_side=reference_max_side,
                 prefer_original_upload=True,
                 quality=92,
                 subsampling=0,

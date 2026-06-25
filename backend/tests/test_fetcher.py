@@ -789,10 +789,133 @@ def test_registry_routes_hosts_to_expected_platforms():
     assert fetcher._select("x.com").name == "X"
     assert fetcher._select("mobile.twitter.com").name == "X"
     assert fetcher._select("mp.weixin.qq.com").name == "公众号"
+    assert fetcher._select("3.cn").name == "京东"
+    assert fetcher._select("item.jd.com").name == "京东"
+    assert fetcher._select("e.tb.cn").name == "淘宝"
+    assert fetcher._select("item.taobao.com").name == "淘宝"
+    assert fetcher._select("detail.tmall.com").name == "淘宝"
     # suffix spoof and arbitrary hosts fall through to the generic catch-all
     assert fetcher._select("evilxiaohongshu.com").name == "网页"
+    assert fetcher._select("eviljd.com").name == "网页"
     assert fetcher._select("notx.com").name == "网页"
     assert fetcher._select("example.com").name == "网页"
+
+
+def test_extract_first_url_from_copied_ecommerce_share_text():
+    text = (
+        "【淘宝】7天无理由退货 https://e.tb.cn/h.RsKuM6YesPztUCt?tk=ZTsRgiCip4j "
+        "CA381 「DAMAH黑魔法一次性洗脸巾」"
+    )
+
+    assert fetcher.extract_first_url(text) == "https://e.tb.cn/h.RsKuM6YesPztUCt?tk=ZTsRgiCip4j"
+
+
+def test_jd_extractor_reads_product_gallery_and_upgrades_size():
+    html = """
+    <html><body>
+      <script>
+        var pageConfig = {
+          src: 'jfs/t20280614/454557/27/9867/153532/main.jpg',
+          imageList: [
+            "jfs/t20280614/454557/27/9867/153532/main.jpg",
+            "jfs/t1/424575/2/13940/68021/detail.jpg"
+          ]
+        };
+      </script>
+      <img id="spec-img"
+           data-origin="//img13.360buyimg.com/n1/s720x720_jfs/t20280614/454557/27/9867/153532/main.jpg"
+           data-url="jfs/t20280614/454557/27/9867/153532/main.jpg">
+    </body></html>
+    """
+
+    assets = fetcher._extract_jd_assets(html, "https://item.jd.com/10210432712118.html")
+
+    assert [a["url"] for a in assets][:2] == [
+        "https://img13.360buyimg.com/n1/jfs/t20280614/454557/27/9867/153532/main.jpg",
+        "https://img13.360buyimg.com/n1/jfs/t1/424575/2/13940/68021/detail.jpg",
+    ]
+    assert all("s720x720" not in a["url"] for a in assets)
+
+
+def test_jd_short_link_falls_back_to_pc_product_page(monkeypatch):
+    calls = []
+
+    def fake_page(url, **_kwargs):
+        calls.append(url)
+        if url.startswith("https://3.cn/"):
+            return fetcher.RenderedPage(
+                html="<title>京东验证</title>",
+                final_url=(
+                    "https://cfe.m.jd.com/privatedomain/risk_handler/03101900/"
+                    "?returnurl=https%3A%2F%2Fitem.m.jd.com%2Fproduct%2F10210432712118.html"
+                ),
+            )
+        return fetcher.RenderedPage(
+            html='<script>var pageConfig={imageList:["jfs/t1/product.jpg"]};</script>',
+            final_url="https://item.jd.com/10210432712118.html",
+        )
+
+    monkeypatch.setattr(fetcher, "_render_page_with_httpx", fake_page)
+
+    assets = fetcher.parse_url("https://3.cn/2Tswk-cG?jkl=@S6Pp90buMlXo@")
+
+    assert calls == [
+        "https://3.cn/2Tswk-cG?jkl=@S6Pp90buMlXo@",
+        "https://item.jd.com/10210432712118.html",
+    ]
+    assert assets[0]["url"] == "https://img13.360buyimg.com/n1/jfs/t1/product.jpg"
+
+
+def test_taobao_short_link_uses_embedded_target_url(monkeypatch):
+    calls = []
+
+    def fake_page(url, **_kwargs):
+        calls.append(url)
+        if url.startswith("https://e.tb.cn/"):
+            return fetcher.RenderedPage(
+                html=(
+                    "<script>var url = 'https://item.taobao.com/item.htm?id=954144213943"
+                    "&shareurl=true';</script>"
+                ),
+                final_url=url,
+            )
+        return fetcher.RenderedPage(
+            html=(
+                "<script>window.__DATA__={auctionImages:["
+                "'//img.alicdn.com/imgextra/i1/abc/O1CN01main.jpg_430x430q90.jpg',"
+                "'//img.alicdn.com/imgextra/i2/abc/O1CN01detail.jpg'"
+                "]};</script>"
+            ),
+            final_url="https://item.taobao.com/item.htm?id=954144213943",
+        )
+
+    monkeypatch.setattr(fetcher, "_render_page_with_httpx", fake_page)
+
+    assets = fetcher.parse_url("https://e.tb.cn/h.RsKuM6YesPztUCt?tk=ZTsRgiCip4j")
+
+    assert calls[:2] == [
+        "https://e.tb.cn/h.RsKuM6YesPztUCt?tk=ZTsRgiCip4j",
+        "https://item.taobao.com/item.htm?id=954144213943&shareurl=true",
+    ]
+    assert assets[0]["url"] == "https://img.alicdn.com/imgextra/i1/abc/O1CN01main.jpg"
+
+
+def test_taobao_security_page_returns_clear_error(monkeypatch):
+    monkeypatch.setattr(
+        fetcher,
+        "_render_page_with_httpx",
+        lambda url, **_kwargs: fetcher.RenderedPage(
+            html='<a href="https://bixi.alicdn.com/punish/foo"></a><script>x5secdata=""</script>',
+            final_url=url,
+        ),
+    )
+
+    try:
+        fetcher.parse_url("https://item.taobao.com/item.htm?id=954144213943")
+    except ValueError as e:
+        assert "淘宝返回安全校验" in str(e)
+    else:
+        raise AssertionError("expected ValueError")
 
 
 def test_x_status_falls_back_to_rendered_twitter_image_meta(monkeypatch):

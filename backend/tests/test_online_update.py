@@ -45,6 +45,7 @@ def _configure(
     enabled: bool = True,
     remote: str = "origin",
     apply_command: str = "",
+    allow_local_remote: bool = True,
 ):
     monkeypatch.setattr(settings, "online_update_enabled", enabled)
     monkeypatch.setattr(settings, "online_update_repo_dir", str(repo))
@@ -53,6 +54,7 @@ def _configure(
     monkeypatch.setattr(settings, "online_update_apply_command", apply_command)
     monkeypatch.setattr(settings, "online_update_timeout_seconds", 20)
     monkeypatch.setattr(settings, "online_update_allow_dirty", False)
+    monkeypatch.setattr(settings, "online_update_allow_local_remote", allow_local_remote)
 
 
 def test_admin_online_update_disabled_rejects_run(client, make_user, auth, monkeypatch, git_repos):
@@ -248,14 +250,31 @@ def test_admin_online_update_uses_configured_repo_url_not_origin(monkeypatch, gi
     from app.services import online_update
 
     _git(git_repos["work"], "remote", "set-url", "origin", "https://github.com/private/requires-auth.git")
-    _configure(monkeypatch, git_repos["work"], remote=git_repos["remote"].as_uri())
+    _git(git_repos["work"], "remote", "add", "release", str(git_repos["remote"]))
+    _configure(monkeypatch, git_repos["work"], remote="release")
 
     status = online_update.status(check_remote=True)
 
     assert "error" not in status
-    assert status["remote"] == git_repos["remote"].as_uri()
+    assert status["remote"] == "release"
     assert status["remote_head"]
     assert status["current_head"] == status["remote_head"]
+
+
+def test_admin_online_update_rejects_named_remote_backed_by_local_path(monkeypatch, git_repos):
+    from app.services import online_update
+
+    _git(git_repos["work"], "remote", "add", "local-release", str(git_repos["remote"]))
+    _configure(
+        monkeypatch,
+        git_repos["work"],
+        remote="local-release",
+        allow_local_remote=False,
+    )
+
+    status = online_update.status(check_remote=True)
+
+    assert "本地路径" in status["error"]
 
 
 def test_online_update_accepts_github_ssh_scp_remote():
@@ -272,6 +291,13 @@ def test_online_update_rejects_https_remote_with_embedded_credentials():
 
     with pytest.raises(online_update.OnlineUpdateError, match="不能包含用户名或密码"):
         online_update._safe_remote("https://github_pat_secret@github.com/yinyue111/DAIstudio.git")
+
+
+def test_online_update_rejects_file_remote():
+    from app.services import online_update
+
+    with pytest.raises(online_update.OnlineUpdateError, match="只允许 Git remote 名称或安全的 Git URL"):
+        online_update._safe_remote("file:///tmp/private-release.git")
 
 
 def test_online_update_injects_github_https_token_via_env(monkeypatch, git_repos):

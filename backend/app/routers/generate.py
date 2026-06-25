@@ -66,7 +66,7 @@ _SOURCE_META_URL_KEYS = {
     "selected_url",
     "selected_thumb",
 }
-_SOURCE_META_TEXT_KEYS = {"source_captured_at", "selected_type"}
+_SOURCE_META_TEXT_KEYS = {"source_captured_at", "selected_type", "mode", "product_generation_mode"}
 
 
 def _normalise_reference_dimensions(params: dict) -> None:
@@ -214,6 +214,9 @@ def _source_trace(
         if cleaned:
             trace[key] = cleaned
     for key in _SOURCE_META_TEXT_KEYS:
+        if key == "product_generation_mode" and isinstance(source_meta.get(key), bool):
+            trace[key] = source_meta[key]
+            continue
         cleaned = _clean_source_meta_text(source_meta.get(key))
         if cleaned:
             trace[key] = cleaned

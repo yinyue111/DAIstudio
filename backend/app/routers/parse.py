@@ -18,7 +18,7 @@ from ..models import ParseRecord, UploadedAsset, User
 from ..redis_client import redis_client
 from ..schemas import ParseIn, ParseOut
 from ..services import audit, gateway, storage
-from ..services.fetcher import parse_url
+from ..services.fetcher import extract_first_url, parse_url
 from ..services.rate_limit import incr_window
 from ..services.safe_logging import redact_url_for_log
 from ..services.ssrf import SsrfError
@@ -238,7 +238,8 @@ def run_parse_record(parse_id: int) -> None:
 def submit_parse(body: ParseIn, request: Request,
                  db: Session = Depends(get_db),
                  user: User = Depends(get_current_user)):
-    url = body.url.strip()
+    raw_url = body.url.strip()
+    url = extract_first_url(raw_url) or raw_url
     if not url:
         raise HTTPException(400, "链接不能为空")
 

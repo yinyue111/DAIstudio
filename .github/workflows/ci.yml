@@ -115,7 +115,7 @@ jobs:
           path: sbom.cdx.json
 
   compose:
-    name: Docker Compose config
+    name: Docker Compose config & build
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -127,6 +127,11 @@ jobs:
           PAYMENT_CONFIG_SECRET: ci-payment-config-secret-32-bytes-long
           SMS_PROVIDER: http
           SMS_HTTP_URL: https://sms.example.invalid/send
+      - name: Build production images
+        run: docker compose build api frontend
+        env:
+          POSTGRES_PASSWORD: ci-postgres-password
+          NEXT_TELEMETRY_DISABLED: "1"
 
   release-artifact:
     name: Release artifact hygiene

@@ -230,6 +230,9 @@ class Settings(BaseSettings):
     online_update_apply_command: str = ""
     online_update_timeout_seconds: int = 600
     online_update_allow_dirty: bool = False
+    # Development/test escape hatch for local bare repositories. Production
+    # should keep this false so a named remote cannot hide a local file path.
+    online_update_allow_local_remote: bool = False
 
     @field_validator("cors_origins")
     @classmethod

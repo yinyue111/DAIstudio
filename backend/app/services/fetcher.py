@@ -8,8 +8,8 @@ registry entry**; nothing else changes.
 
 Current platforms: 小红书 (window.__INITIAL_STATE__ SSR), 抖音 (web detail API +
 RENDER_DATA render fallback), 微信公众号 (SSR data-src on mmbiz.qpic.cn), X/Twitter
-(render fallback for status cards), and a generic web fallback for everything
-else.
+(render fallback for status cards), 京东/淘宝商品页, and a generic web fallback
+for everything else.
 
 The generic fallback (``extract_assets``) mines: <img> (src + lazy data-* attrs
 + best-resolution srcset), <picture>/<source>, <video>/<source>, JSON-LD
@@ -37,6 +37,7 @@ import time
 import zlib
 from collections.abc import Callable
 from dataclasses import dataclass
+from html import unescape as html_unescape
 from urllib.parse import parse_qs, unquote, urlencode, urljoin, urlparse
 
 import httpx
@@ -71,6 +72,11 @@ _DOUYIN_RENDER_RE = re.compile(
     r"<script[^>]+id=[\"']RENDER_DATA[\"'][^>]*>(.*?)</script>", re.S
 )
 _DOUYIN_ID_RE = re.compile(r"(?:video|note|modal_id|aweme_id)[=/](\d{16,25})")
+_JD_SKU_RE = re.compile(
+    r"(?:item\.jd\.com/|item\.m\.jd\.com/product/)(\d{6,20})\.html|[?&]skuId=(\d{6,20})",
+    re.I,
+)
+_TAOBAO_ITEM_ID_RE = re.compile(r"[?&](?:id|itemId)=(\d{6,20})", re.I)
 _IMG_EXT = (".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".avif")
 _VID_EXT = (".mp4", ".webm", ".mov", ".m3u8")
 _AUDIO_EXT = (".mp3", ".m4a", ".aac", ".wav", ".flac")
@@ -88,6 +94,8 @@ _NOISE_RE = re.compile(
 )
 # http(s) URL inside a JSON/JS blob; tolerates escaped slashes (https:\/\/a\/b).
 _URL_IN_JSON_RE = re.compile(r"https?:(?:\\?/){2}(?:[^\s\"'<>\\]|\\/)+", re.I)
+_URL_IN_TEXT_RE = re.compile(r"https?://[^\s\"'<>，。；、]+", re.I)
+_JS_STRING_RE = r"""(?:"([^"\\]*(?:\\.[^"\\]*)*)"|'([^'\\]*(?:\\.[^'\\]*)*)')"""
 # <img> lazy-load attribute variants that carry the real URL.
 _LAZY_IMG_ATTRS = (
     "src", "data-src", "data-original", "data-lazy-src", "data-actualsrc",
@@ -95,6 +103,12 @@ _LAZY_IMG_ATTRS = (
 )
 # JSON-LD keys whose (string / list / nested-object) values are media URLs.
 _LD_MEDIA_KEYS = ("image", "thumbnailurl", "contenturl", "poster")
+
+
+@dataclass(frozen=True)
+class RenderedPage:
+    html: str
+    final_url: str
 
 
 def _is_xiaohongshu_host(host: str | None) -> bool:
@@ -110,6 +124,31 @@ def _is_douyin_host(host: str | None) -> bool:
 def _is_x_host(host: str | None) -> bool:
     host = (host or "").rstrip(".").lower()
     return host in {"x.com", "twitter.com"} or host.endswith(".x.com") or host.endswith(".twitter.com")
+
+
+def _is_jd_host(host: str | None) -> bool:
+    host = (host or "").rstrip(".").lower()
+    return (
+        host in {"3.cn", "jd.com", "jd.hk", "360buy.com"}
+        or host.endswith(".jd.com")
+        or host.endswith(".jd.hk")
+        or host.endswith(".360buy.com")
+    )
+
+
+def _is_taobao_host(host: str | None) -> bool:
+    host = (host or "").rstrip(".").lower()
+    return (
+        host in {"tb.cn", "e.tb.cn", "m.tb.cn", "taobao.com", "tmall.com", "tmall.hk"}
+        or host.endswith(".tb.cn")
+        or host.endswith(".taobao.com")
+        or host.endswith(".tmall.com")
+        or host.endswith(".tmall.hk")
+    )
+
+
+def _is_ecommerce_host(host: str | None) -> bool:
+    return _is_jd_host(host) or _is_taobao_host(host)
 
 
 def _is_x_media_host(host: str | None) -> bool:
@@ -172,6 +211,38 @@ def _normalise_asset_url(url: str | None) -> str | None:
     return url
 
 
+def _strip_ecommerce_img_variant(url: str) -> str:
+    """Upgrade common e-commerce CDN thumbnails to larger product images."""
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower()
+    path = parsed.path
+    if "360buyimg.com" in host:
+        # n1/s720x720_jfs/... -> n1/jfs/...; n7/jfs... is already fine.
+        path = re.sub(r"/s\d+x\d+_(jfs/)", r"/\1", path)
+        return parsed._replace(path=path).geturl()
+    if "alicdn.com" in host or "taobaocdn.com" in host:
+        # //img.alicdn.com/imgextra/...jpg_430x430q90.jpg -> original jpg
+        path = re.sub(r"_(?:\d+x\d+|[\dx]+q\d+|q\d+|sum|webp)[^/]*$", "", path, flags=re.I)
+        return parsed._replace(path=path).geturl()
+    return url
+
+
+def _normalise_product_image_url(url: str | None, *, platform: str) -> str | None:
+    url = _normalise_asset_url(url)
+    if not url:
+        return None
+    if platform == "jd" and url.startswith("jfs/"):
+        return "https://img13.360buyimg.com/n1/" + url
+    if platform == "taobao" and url.startswith(("imgextra/", "bao/uploaded/")):
+        return "https://img.alicdn.com/" + url
+    parsed = urlparse(url)
+    if platform == "jd" and parsed.netloc == "" and parsed.path.startswith("/jfs/"):
+        url = "https://img13.360buyimg.com/n1" + parsed.path
+    elif platform == "taobao" and parsed.netloc == "" and parsed.path.startswith(("/imgextra/", "/bao/uploaded/")):
+        url = "https://img.alicdn.com" + parsed.path
+    return _strip_ecommerce_img_variant(url)
+
+
 def _safe_asset_url(url: str | None) -> str | None:
     url = _normalise_asset_url(url)
     if not url:
@@ -196,6 +267,10 @@ def _same_site_or_platform(page_url: str, request_url: str) -> bool:
         return _is_douyin_host(req_host) or req_host.endswith(".douyinpic.com") or req_host.endswith(".snssdk.com")
     if _is_x_host(page_host):
         return _is_x_host(req_host) or _is_x_media_host(req_host)
+    if _is_jd_host(page_host):
+        return _is_jd_host(req_host) or req_host.endswith(".360buyimg.com")
+    if _is_taobao_host(page_host):
+        return _is_taobao_host(req_host) or req_host.endswith(".alicdn.com") or req_host.endswith(".taobaocdn.com")
     return False
 
 
@@ -214,6 +289,17 @@ def _filter_safe_assets(assets: list[dict]) -> list[dict]:
         if len(out) >= cap:
             break
     return out
+
+
+def extract_first_url(text: str) -> str | None:
+    """Return the first http(s) URL from copied share text."""
+    for match in _URL_IN_TEXT_RE.finditer(text or ""):
+        candidate = match.group(0).rstrip(")）]】.,，。;；")
+        try:
+            return assert_safe_url(candidate)
+        except SsrfError:
+            continue
+    return None
 
 
 def _install_ssrf_route(page, page_url: str) -> None:
@@ -409,6 +495,38 @@ def _render_with_httpx(url: str, timeout: float = 20.0,
                     continue
                 r.raise_for_status()
                 return _read_body_capped(r, max_body_bytes, max_read_seconds, max_raw_bytes)
+    raise ValueError("重定向次数过多")
+
+
+def _render_page_with_httpx(url: str, timeout: float = 20.0,
+                            max_read_seconds: float | None = None,
+                            max_body_bytes: int | None = None,
+                            max_raw_bytes: int | None = None) -> RenderedPage:
+    """Like _render_with_httpx, but returns the last validated URL as well."""
+    origin = "{0.scheme}://{0.netloc}".format(urlparse(url))
+    headers = {
+        "User-Agent": UA,
+        "Referer": origin,
+        "Accept": "text/html,*/*",
+        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.6",
+        "Accept-Encoding": "gzip, deflate",
+    }
+    assert_safe_url(url)
+    for _ in range(MAX_REDIRECTS + 1):
+        with pinned_client(url, follow_redirects=False, timeout=timeout, headers=headers) as c:
+            with c.stream("GET", url) as r:
+                if r.is_redirect and r.headers.get("location"):
+                    url = urljoin(url, r.headers["location"])
+                    blocked = _xhs_block_message(url)
+                    if blocked:
+                        raise ValueError(blocked)
+                    assert_safe_url(url)
+                    continue
+                r.raise_for_status()
+                return RenderedPage(
+                    html=_read_body_capped(r, max_body_bytes, max_read_seconds, max_raw_bytes),
+                    final_url=str(r.url),
+                )
     raise ValueError("重定向次数过多")
 
 
@@ -1055,6 +1173,246 @@ def _extract_weixin_assets(html: str, base_url: str) -> list[dict]:
     return _filter_safe_assets(out)
 
 
+# --- E-commerce product pages (JD / Taobao / Tmall) -------------------------
+def _ecommerce_security_message(platform: str, html: str, final_url: str = "") -> str | None:
+    text = (html or "")[:20_000]
+    joined = f"{final_url}\n{text}".lower()
+    if platform == "jd" and ("京东验证" in text or "risk_handler" in joined or "jdr_shields" in joined):
+        return "京东返回安全校验，当前环境无法直接浏览该商品页；请换 PC 端公开商品详情页链接，或保存商品主图后使用「上传图片参考」"
+    if platform == "taobao" and (
+        "x5secdata" in joined
+        or "punish" in joined
+        or "bixi.alicdn.com" in joined
+        or "login.taobao.com" in joined
+        or "login.m.taobao.com" in joined
+    ):
+        return "淘宝返回安全校验，当前环境无法直接浏览该商品页；请换 PC 端公开商品详情页链接，或保存商品主图后使用「上传图片参考」"
+    return None
+
+
+def _js_unquote(raw: str | None) -> str | None:
+    if raw is None:
+        return None
+    try:
+        return bytes(raw, "utf-8").decode("unicode_escape")
+    except UnicodeDecodeError:
+        return raw
+
+
+def _extract_js_string_assignment(html: str, name: str) -> str | None:
+    m = re.search(rf"\b{re.escape(name)}\s*=\s*{_JS_STRING_RE}", html)
+    if not m:
+        return None
+    return _js_unquote(m.group(1) or m.group(2))
+
+
+def _jd_sku_from_url(url: str | None) -> str | None:
+    if not url:
+        return None
+    m = _JD_SKU_RE.search(url)
+    if not m:
+        return None
+    return m.group(1) or m.group(2)
+
+
+def _taobao_item_id_from_url(url: str | None) -> str | None:
+    if not url:
+        return None
+    m = _TAOBAO_ITEM_ID_RE.search(url)
+    return m.group(1) if m else None
+
+
+def _jd_return_url(page: RenderedPage) -> str | None:
+    parsed = urlparse(page.final_url)
+    qs = parse_qs(parsed.query)
+    ret = (qs.get("returnurl") or qs.get("returnUrl") or [""])[0]
+    if ret:
+        return assert_safe_url(unquote(ret))
+    return None
+
+
+def _taobao_target_url(page: RenderedPage) -> str | None:
+    target = _extract_js_string_assignment(page.html, "url")
+    if target and _is_taobao_host(urlparse(target).hostname):
+        return assert_safe_url(html_unescape(target))
+    for match in _URL_IN_TEXT_RE.finditer(page.html[:20_000]):
+        candidate = html_unescape(match.group(0).replace("\\/", "/"))
+        if _is_taobao_host(urlparse(candidate).hostname):
+            return assert_safe_url(candidate)
+    return None
+
+
+def _push_product_asset(
+    out: list[dict],
+    seen: set[str],
+    raw_url: str | None,
+    *,
+    platform: str,
+    width: int | None = None,
+    height: int | None = None,
+) -> None:
+    normalised = _normalise_product_image_url(raw_url, platform=platform)
+    safe = _safe_asset_url(normalised)
+    if not safe or safe in seen:
+        return
+    host = (urlparse(safe).hostname or "").lower()
+    if platform == "jd" and "360buyimg.com" not in host:
+        return
+    if platform == "taobao" and not ("alicdn.com" in host or "taobaocdn.com" in host):
+        return
+    path = urlparse(safe).path.lower()
+    if platform == "taobao" and (
+        "/tfs/" in path
+        or "apple-touch-icon" in path
+        or path.endswith(".ico")
+        or re.search(r"-\d{2,3}-\d{2,3}\.(?:png|jpg|jpeg|webp)$", path)
+    ):
+        return
+    if _is_noise_url(safe):
+        return
+    seen.add(safe)
+    out.append({
+        "type": "image",
+        "url": safe,
+        "thumb": safe,
+        "width": width,
+        "height": height,
+    })
+
+
+def _extract_jd_assets(html: str, base_url: str) -> list[dict]:
+    soup = BeautifulSoup(html, "lxml")
+    out: list[dict] = []
+    seen: set[str] = set()
+
+    # Preferred: product gallery emitted as imageList: ["jfs/...", ...].
+    m = re.search(r"\bimageList\s*:\s*\[(.*?)\]", html, flags=re.S)
+    if m:
+        for item in re.finditer(_JS_STRING_RE, m.group(1)):
+            _push_product_asset(out, seen, item.group(1) or item.group(2), platform="jd")
+
+    # Main product image in the PC detail DOM.
+    for img in soup.find_all("img"):
+        width, height = _html_media_size(img)
+        for attr in ("data-origin", "data-url", "src"):
+            _push_product_asset(out, seen, img.get(attr), platform="jd", width=width, height=height)
+
+    # Last-resort structured URLs from scripts, but only on JD image CDN.
+    for match in re.finditer(r"(?:(?:https?:)?//img\d{2}\.360buyimg\.com/[^\s\"'<>]+|jfs/[A-Za-z0-9_./-]+)", html):
+        _push_product_asset(out, seen, match.group(0), platform="jd")
+
+    return _filter_safe_assets(out)
+
+
+def _extract_taobao_assets(html: str, base_url: str) -> list[dict]:
+    soup = BeautifulSoup(html, "lxml")
+    out: list[dict] = []
+    seen: set[str] = set()
+
+    # Common SSR fields: auctionImages:["//img.alicdn..."], images:[...],
+    # picUrl/mainPic. Keep regex-based extraction broad but CDN-restricted.
+    for marker in ("auctionImages", "images", "imageList", "picUrl", "mainPic", "itemPic"):
+        for mm in re.finditer(rf"\b{marker}\b\s*[:=]\s*(\[[^\]]+\]|{_JS_STRING_RE})", html, flags=re.S):
+            blob = mm.group(1)
+            for item in re.finditer(_JS_STRING_RE, blob):
+                _push_product_asset(out, seen, item.group(1) or item.group(2), platform="taobao")
+
+    for img in soup.find_all("img"):
+        width, height = _html_media_size(img)
+        for attr in _LAZY_IMG_ATTRS + ("data-ks-lazyload", "data-imgurl"):
+            _push_product_asset(out, seen, img.get(attr), platform="taobao", width=width, height=height)
+        srcset = img.get("srcset") or img.get("data-srcset")
+        if srcset:
+            _push_product_asset(out, seen, _best_srcset_url(srcset), platform="taobao", width=width, height=height)
+
+    for match in re.finditer(r"(?:(?:https?:)?//)?(?:img|gw|g-search\d*)\.alicdn\.com/[^\s\"'<>]+", html):
+        _push_product_asset(out, seen, match.group(0), platform="taobao")
+
+    return _filter_safe_assets(out)
+
+
+def _run_jd(url: str) -> list[dict]:
+    first = _render_page_with_httpx(
+        url,
+        timeout=12.0,
+        max_read_seconds=_GENERIC_MAX_READ_SECONDS,
+        max_body_bytes=_GENERIC_MAX_BODY_BYTES,
+    )
+    pages: list[RenderedPage] = [first]
+
+    candidate_url = _jd_return_url(first)
+    sku = _jd_sku_from_url(candidate_url or first.final_url or url)
+    if sku:
+        pc_url = f"https://item.jd.com/{sku}.html"
+        if pc_url not in {p.final_url for p in pages}:
+            try:
+                pages.append(_render_page_with_httpx(
+                    pc_url,
+                    timeout=12.0,
+                    max_read_seconds=_GENERIC_MAX_READ_SECONDS,
+                    max_body_bytes=_GENERIC_MAX_BODY_BYTES,
+                ))
+            except httpx.HTTPError as e:
+                log.warning("jd pc fallback failed: %s", e)
+
+    blocked: str | None = None
+    for page in pages:
+        assets = _extract_jd_assets(page.html, page.final_url)
+        if assets:
+            return assets
+        if msg := _ecommerce_security_message("jd", page.html, page.final_url):
+            blocked = msg
+    if blocked:
+        raise ValueError(blocked)
+    return []
+
+
+def _run_taobao(url: str) -> list[dict]:
+    first = _render_page_with_httpx(
+        url,
+        timeout=12.0,
+        max_read_seconds=_GENERIC_MAX_READ_SECONDS,
+        max_body_bytes=_GENERIC_MAX_BODY_BYTES,
+    )
+    pages: list[RenderedPage] = [first]
+
+    target = _taobao_target_url(first)
+    item_id = _taobao_item_id_from_url(target or first.final_url or url)
+    for candidate in (
+        target,
+        f"https://item.taobao.com/item.htm?id={item_id}" if item_id else None,
+        f"https://h5.m.taobao.com/awp/core/detail.htm?id={item_id}" if item_id else None,
+    ):
+        if not candidate or candidate in {p.final_url for p in pages}:
+            continue
+        try:
+            pages.append(_render_page_with_httpx(
+                candidate,
+                timeout=12.0,
+                max_read_seconds=_GENERIC_MAX_READ_SECONDS,
+                max_body_bytes=_GENERIC_MAX_BODY_BYTES,
+            ))
+        except httpx.HTTPError as e:
+            log.warning("taobao fallback failed: %s", e)
+
+    blocked: str | None = None
+    for page in pages:
+        productish = (
+            _taobao_item_id_from_url(page.final_url)
+            or "auctionImages" in page.html
+            or "picUrl" in page.html
+            or "imgextra" in page.html
+        )
+        assets = _extract_taobao_assets(page.html, page.final_url)
+        if productish and assets:
+            return assets
+        if msg := _ecommerce_security_message("taobao", page.html, page.final_url):
+            blocked = msg
+    if blocked:
+        raise ValueError(blocked)
+    return []
+
+
 # --- Platform registry ------------------------------------------------------
 # Each platform is one self-contained unit: a host matcher, a ``run`` that
 # fetches + extracts (encapsulating any httpx→render fallback), a timeout hint,
@@ -1221,6 +1579,12 @@ _REGISTRY: list[PlatformExtractor] = [
     PlatformExtractor(
         "X", _is_x_host, _run_x, _timeout_hint("X"),
         "未获取到 X 帖子素材，可能被登录态、访问频率或帖子可见性限制拦截"),
+    PlatformExtractor(
+        "京东", _is_jd_host, _run_jd, _timeout_hint("京东"),
+        "未获取到京东商品图片，可能被安全校验、登录态或商品可见性限制拦截"),
+    PlatformExtractor(
+        "淘宝", _is_taobao_host, _run_taobao, _timeout_hint("淘宝"),
+        "未获取到淘宝商品图片，可能被安全校验、登录态或商品可见性限制拦截"),
     # catch-all generic web fallback — must stay last
     PlatformExtractor(
         "网页", lambda _host: True, _run_generic, _timeout_hint(),

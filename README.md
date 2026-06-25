@@ -310,6 +310,7 @@ PAYMENT_FRONTEND_BASE_URL=https://dream.aiwuq.cn
 - 默认 `ONLINE_UPDATE_ENABLED=true`
 - 只更新服务端配置的 `ONLINE_UPDATE_REMOTE` / `ONLINE_UPDATE_BRANCH`
 - 私有库使用 GitHub fine-grained PAT，通过 `ONLINE_UPDATE_GITHUB_TOKEN` 注入，不要把 GitHub 密码或 token 写进 URL
+- `ONLINE_UPDATE_REMOTE` 可以是 HTTPS/SSH Git URL 或 remote 名称；remote 名称解析后的真实 URL 也会校验，默认拒绝 `file://`、绝对路径、相对路径等本地仓库来源
 - 只允许 `git merge --ff-only`，不会执行 `reset --hard`
 - 工作区有未提交改动时默认拒绝升级
 - 前端不能传入任意命令；生效命令只能由服务端环境变量固定配置
@@ -325,6 +326,7 @@ ONLINE_UPDATE_GITHUB_TOKEN=github_pat_xxx
 ONLINE_UPDATE_APPLY_COMMAND=/usr/local/bin/ai-studio-apply-update
 ONLINE_UPDATE_TIMEOUT_SECONDS=600
 ONLINE_UPDATE_ALLOW_DIRTY=false
+ONLINE_UPDATE_ALLOW_LOCAL_REMOTE=false
 ```
 
 私有 GitHub 仓库需要创建一个只读 token：
@@ -431,6 +433,7 @@ SMS_TEMPLATE_CODE=<your-template-code>
 | `ONLINE_UPDATE_BRANCH` | 在线升级分支，默认 `main` |
 | `ONLINE_UPDATE_GITHUB_TOKEN` | 私有 GitHub 仓库只读 token，不要写进 remote URL |
 | `ONLINE_UPDATE_APPLY_COMMAND` | 代码更新后执行的固定生效命令 |
+| `ONLINE_UPDATE_ALLOW_LOCAL_REMOTE` | 是否允许在线升级使用本地 Git remote，默认 `false`，仅建议测试环境开启 |
 | `MAX_IMAGE_N` | 单次图片生成最大张数，默认 8 |
 | `MAX_IMAGE_DIM` | 图片最大边长，默认 4096 |
 | `MAX_VIDEO_SECONDS` | 视频最大时长，默认 900 秒 |

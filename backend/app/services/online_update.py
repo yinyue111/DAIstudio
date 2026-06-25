@@ -30,7 +30,7 @@ _KEY_VALUE_SECRET_RE = re.compile(
 )
 _OPENAI_LIKE_KEY_RE = re.compile(r"\b(?P<prefix>sk|ark)-[A-Za-z0-9_-]{8,}\b")
 _GITHUB_TOKEN_RE = re.compile(r"\b(?:gh[opsru]_[A-Za-z0-9_]{8,}|github_pat_[A-Za-z0-9_]{8,})\b")
-_ALLOWED_REMOTE_SCHEMES = {"https", "ssh", "git", "file"}
+_ALLOWED_REMOTE_SCHEMES = {"https", "ssh", "git"}
 _SCP_REMOTE_RE = re.compile(r"^(?P<user>[A-Za-z0-9._-]+)@(?P<host>[A-Za-z0-9._-]+):(?P<path>[A-Za-z0-9._~/-]+)(?:\.git)?$")
 _GITHUB_SSH_REMOTE_RE = re.compile(r"^(?:git@github\.com:|ssh://git@github\.com/)(?P<repo>[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)(?:\.git)?$")
 
@@ -104,6 +104,40 @@ def _safe_remote(value: str) -> str:
     return text
 
 
+def _is_remote_name(remote: str) -> bool:
+    return bool(_REF_RE.fullmatch((remote or "").strip()))
+
+
+def _validate_remote_url(value: str, *, label: str = "Git remote") -> str:
+    text = (value or "").strip()
+    if not text:
+        raise OnlineUpdateError(f"{label} 不能为空")
+    if settings.online_update_allow_local_remote:
+        return text
+    if text.startswith("-") or any(ch.isspace() for ch in text):
+        raise OnlineUpdateError(f"{label} 配置非法")
+    if _SCP_REMOTE_RE.fullmatch(text):
+        return text
+    parsed = urlparse(text)
+    if parsed.scheme not in _ALLOWED_REMOTE_SCHEMES:
+        raise OnlineUpdateError(f"{label} 只允许安全的 Git URL，不能指向本地路径")
+    if not parsed.netloc:
+        raise OnlineUpdateError(f"{label} URL 缺少主机")
+    if parsed.username or parsed.password:
+        raise OnlineUpdateError(f"{label} 不能包含用户名或密码")
+    return text
+
+
+def _resolve_remote_for_validation(repo: Path, remote: str) -> str:
+    if not _is_remote_name(remote):
+        return _validate_remote_url(remote)
+    try:
+        resolved = _git(["remote", "get-url", remote], cwd=repo).stdout.strip()
+    except OnlineUpdateError as e:
+        raise OnlineUpdateError(f"Git remote 名称不存在或无法读取: {remote}") from e
+    return _validate_remote_url(resolved, label=f"Git remote {remote}")
+
+
 def _remote_uses_ssh(remote: str) -> bool:
     if _SCP_REMOTE_RE.fullmatch(remote):
         return True
@@ -145,11 +179,9 @@ def _git_auth_env(remote: str | None = None) -> dict[str, str]:
     token = str(settings.online_update_github_token or "").strip()
     if not token or remote is None or _remote_uses_ssh(remote):
         return {}
-    if remote:
+    if remote and not _is_remote_name(remote):
         parsed = urlparse(remote)
-        if parsed.scheme and (
-            parsed.scheme != "https" or (parsed.hostname or "").lower() != "github.com"
-        ):
+        if parsed.scheme and (parsed.scheme != "https" or (parsed.hostname or "").lower() != "github.com"):
             return {}
     # Keep the token out of the remote URL and command argv. Git applies this
     # header only to github.com HTTPS remotes, including when the command uses
@@ -236,10 +268,11 @@ def _ensure_ready(
     enforce_clean: bool = True,
 ) -> dict[str, Any]:
     remote = _safe_remote(settings.online_update_remote)
-    _ensure_transport_ready(remote)
     branch = _safe_ref(settings.online_update_branch, "ONLINE_UPDATE_BRANCH")
     if not _is_git_repo(repo):
         raise OnlineUpdateError("在线更新目录不是 Git 仓库")
+    resolved_remote = _resolve_remote_for_validation(repo, remote)
+    _ensure_transport_ready(resolved_remote)
     branch_now = _current_branch(repo)
     if branch_now != branch:
         raise OnlineUpdateError(f"当前分支是 {branch_now}, 配置分支是 {branch}, 为避免误更新已拒绝")
@@ -262,6 +295,7 @@ def _ensure_ready(
             remote_head = ""
     return {
         "remote": remote,
+        "remote_url": resolved_remote,
         "branch": branch,
         "current_branch": branch_now,
         "current_head": current,

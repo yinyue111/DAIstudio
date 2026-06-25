@@ -2,7 +2,7 @@
 VENV := backend/.venv
 PY := $(VENV)/bin
 
-.PHONY: help install install-frontend test test-frontend lint fmt compile migrate alembic-check audit compose-check \
+.PHONY: help install install-frontend test test-frontend lint fmt compile migrate alembic-check audit compose-check docker-build-check \
         run-api run-worker run-beat run-frontend build-frontend docker-up docker-down release-check release-check-worktree release-source clean
 
 help: ## Show this help
@@ -67,14 +67,18 @@ compose-check: ## Validate docker compose rendering with required placeholders
 	POSTGRES_PASSWORD="$${POSTGRES_PASSWORD:-release-check-postgres-password}" \
 		docker compose config --quiet
 
-release-check: compile lint alembic-check test test-frontend build-frontend compose-check ## Run local release gates against the same clean HEAD artifact as CI
+docker-build-check: ## Build backend/frontend Docker images without starting services
+	POSTGRES_PASSWORD="$${POSTGRES_PASSWORD:-release-check-postgres-password}" \
+		docker compose build api frontend
+
+release-check: compile lint alembic-check test test-frontend build-frontend compose-check docker-build-check ## Run local release gates against the same clean HEAD artifact as CI
 	tmp="$$(mktemp -d)" && \
 		git archive --format=tar.gz --output="$$tmp/ai-studio-source.tar.gz" HEAD && \
 		python3 scripts/check_release_artifact.py "$$tmp/ai-studio-source.tar.gz" && \
 		rm -rf "$$tmp"
 	find . -maxdepth 3 \( -name .venv -o -name .next -o -name node_modules \) -type d -print | sort
 
-release-check-worktree: compile lint alembic-check test test-frontend build-frontend compose-check ## Run release gates against tracked + untracked worktree files
+release-check-worktree: compile lint alembic-check test test-frontend build-frontend compose-check docker-build-check ## Run release gates against tracked + untracked worktree files
 	tmp="$$(mktemp -d)" && \
 		git ls-files -z --cached --others --exclude-standard | \
 		tar --null -czf "$$tmp/ai-studio-source.tar.gz" --files-from - && \

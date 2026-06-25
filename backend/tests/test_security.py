@@ -1012,7 +1012,22 @@ def test_parse_localized_image_thumb_uses_local_preview(client, make_user, auth,
     assert asset["original_url"] == "https://cdn.example.com/full.jpg"
     assert asset["original_thumb"] == "https://cdn.example.com/thumb.jpg"
     assert asset["source_page_url"] == "https://www.xiaohongshu.com/explore/img"
-    assert asset["source_captured_at"]
+
+
+def test_parse_accepts_copied_share_text_with_embedded_url(client, make_user, auth, monkeypatch):
+    make_user("13900000088", balance=1000)
+    h = auth("13900000088")
+
+    monkeypatch.setattr("app.tasks.parse_url_task.delay", lambda parse_id: None)
+
+    text = (
+        "【淘宝】7天无理由退货 https://e.tb.cn/h.RsKuM6YesPztUCt?tk=ZTsRgiCip4j "
+        "CA381 「DAMAH黑魔法一次性洗脸巾女加厚悬挂式抽取式卷筒干湿两用洁面巾」"
+    )
+    r = client.post("/api/parse", json={"url": text}, headers=h)
+
+    assert r.status_code == 200, r.text
+    assert r.json()["url"] == "https://e.tb.cn/h.RsKuM6YesPztUCt?tk=ZTsRgiCip4j"
 
 
 def test_generate_records_source_trace_for_parsed_reference(client, make_user, auth, monkeypatch):

@@ -42,7 +42,12 @@ node_modules
 # Runtime data
 backend/storage
 backend/backups
+artifacts/posters
 dist
+build
+backend/build
+frontend/build
+frontend/out
 htmlcov
 coverage
 playwright-report

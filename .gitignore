@@ -33,7 +33,11 @@ backend/celerybeat-schedule*
 # storage / media
 backend/storage/
 backend/backups/
+artifacts/posters/
 dist/
+build/
+backend/build/
+frontend/build/
 htmlcov/
 coverage/
 playwright-report/
@@ -49,6 +53,7 @@ node_modules/
 .next/
 frontend/node_modules/
 frontend/.next/
+frontend/out/
 
 # os
 .DS_Store

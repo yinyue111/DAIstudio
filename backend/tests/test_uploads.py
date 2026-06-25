@@ -326,6 +326,55 @@ def test_uploaded_large_image_edit_uses_high_resolution_original(
     assert ref_img.size == (1024, 576)
 
 
+def test_product_image_edit_uses_larger_reference_and_server_fidelity_guard(
+    client, make_user, auth, monkeypatch
+):
+    make_user("13900001966", balance=1000)
+    h = auth("13900001966")
+
+    up = client.post(
+        "/api/uploads/image",
+        files={"file": ("product.png", _png_bytes(size=(2000, 1200)), "image/png")},
+        headers=h,
+    )
+    assert up.status_code == 200, up.text
+    asset = up.json()
+    seen = {}
+
+    def fake_gen_image(prompt, image_model_id, n=4, size="1024x1024",
+                       reference_image_url=None, edit_path=None, extra_payload=None):
+        seen["prompt"] = prompt
+        seen["reference_image_url"] = reference_image_url
+        return [_mock_image(prompt, "256x256", 0)]
+
+    monkeypatch.setattr("app.services.gateway.gen_image", fake_gen_image)
+
+    r = client.post("/api/generate", json={
+        "source_asset_url": asset["url"],
+        "source_type": "image",
+        "source_asset_meta": {
+            "selected_type": "image",
+            "mode": "image_edit",
+            "product_generation_mode": True,
+        },
+        "category": "image",
+        "stage": "preview",
+        "prompt": {
+            "final_text": "move this product into a premium studio ad",
+            "instruction": "move this product into a premium studio ad",
+        },
+        "params": {"n": 1, "size": "1024x1024"},
+    }, headers=h)
+    assert r.status_code == 200, r.text
+
+    assert "产品高保真硬约束" in seen["prompt"]
+    assert "包装文字" in seen["prompt"]
+    assert "逐字逐形保持原图" in seen["prompt"]
+    ref_bytes = base64.b64decode(seen["reference_image_url"].split(",", 1)[1])
+    ref_img = Image.open(io.BytesIO(ref_bytes))
+    assert max(ref_img.size) == 1536
+
+
 def test_image_edit_can_send_product_and_style_refs_when_enabled(
     client, make_user, auth, monkeypatch
 ):
