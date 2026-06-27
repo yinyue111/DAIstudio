@@ -214,7 +214,7 @@ def test_partial_image_generation_exposes_gateway_slot_failure(client, make_user
     assert task["cost_settled"] == 30
 
 
-def test_partial_image_generation_unknown_slot_holds_for_review(
+def test_partial_image_generation_unknown_slot_returns_saved_images(
     client,
     make_user,
     auth,
@@ -247,18 +247,18 @@ def test_partial_image_generation_unknown_slot_holds_for_review(
 
     assert r.status_code == 200, r.text
     task = client.get(f"/api/tasks/{r.json()['id']}", headers=h).json()
-    assert task["status"] == "needs_review"
+    assert task["status"] == "succeeded"
     assert task["partial"] is True
     assert task["requested_count"] == 4
     assert task["saved_count"] == 2
     assert task["skipped_count"] == 2
     assert task["partial_errors"] == ["read timed out"]
-    assert len(task["assets"]) == 0
+    assert len(task["assets"]) == 2
     assert task["cost_frozen"] == 60
-    assert task["cost_settled"] == 0
+    assert task["cost_settled"] == 30
     me = client.get("/api/me", headers=h).json()
-    assert me["balance_credits"] == 940
-    assert me["frozen_credits"] == 60
+    assert me["balance_credits"] == 970
+    assert me["frozen_credits"] == 0
 
     db = SessionLocal()
     try:
@@ -267,6 +267,7 @@ def test_partial_image_generation_unknown_slot_holds_for_review(
         assert db_task.params["_requested_n"] == 4
         assert db_task.params["_saved_n"] == 2
         assert db_task.params["_image_result_keys"]
+        assert db_task.status == "succeeded"
     finally:
         db.close()
 

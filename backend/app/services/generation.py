@@ -721,19 +721,7 @@ def run_image_task(task_id: int) -> None:
             }
             if saved_count < n or image_errors else None
         )
-        if has_unknown_gateway_failure:
-            if partial_detail:
-                task.params = {
-                    **(task.params or {}),
-                    "_partial": True,
-                    "_requested_n": n,
-                    "_saved_n": saved_count,
-                    "_skipped_n": skipped_n,
-                    "_partial_errors": partial_errors[:5],
-                    "_image_result_keys": list(written_keys),
-                    "_image_submit_state_unknown": True,
-                    **({"_unknown_submit_errors": unknown_errors[:5]} if unknown_errors else {}),
-                }
+        if has_unknown_gateway_failure and saved_count <= 0:
             _hold_image_submit_unknown_for_reconciliation(
                 db,
                 task_id,
