@@ -1,6 +1,6 @@
 "use client";
 
-import { Lightbox, MasonryItem, ResultCard } from "./StudioMedia";
+import { Lightbox, ResultCard } from "./StudioMedia";
 import { isTerminalTaskStatus, statusStyle, statusZh, taskResultTitle } from "./helpers";
 
 export default function StudioResults({
@@ -21,6 +21,15 @@ export default function StudioResults({
   onReport,
   onSubmitFinal,
 }) {
+  const finalStatus = task?.final_status || null;
+  const finalAssetCount = Number(task?.final_asset_count || 0);
+  const hasPendingFinal = ["queued", "running"].includes(finalStatus);
+  const hasSucceededFinal = finalStatus === "succeeded" && finalAssetCount > 0;
+  const hasNeedsReviewFinal = finalStatus === "needs_review";
+  const hasFailedFinal = finalStatus === "failed";
+  const hasBlockingFinal = hasPendingFinal || hasSucceededFinal || hasNeedsReviewFinal;
+  const hasSubmittedFinal = Boolean(task?.final_task_id || finalTaskId);
+
   return (
     <>
       {task && (
@@ -95,14 +104,31 @@ export default function StudioResults({
                 ))}
               </div>
             )}
-            {task.category === "video" && task.stage === "preview" && task.status === "succeeded" && finalTaskId && (
+            {task.category === "video" && task.stage === "preview" && task.status === "succeeded" && hasPendingFinal && (
+              <div className="mt-4 rounded-lg border border-line bg-white/5 px-3 py-2 text-center text-sm text-fog">
+                完整视频正在渲染 · <a href="/history" className="text-brand hover:text-brand-2">去历史查看</a>
+              </div>
+            )}
+            {task.category === "video" && task.stage === "preview" && task.status === "succeeded" && hasSucceededFinal && (
               <a href="/history" className="btn-secondary mt-4 block w-full text-center">
-                完整视频已提交 · 去历史查看
+                完整视频已完成 · 去历史查看
               </a>
             )}
-            {task.category === "video" && task.stage === "preview" && task.status === "succeeded" && !finalTaskId && (
+            {task.category === "video" && task.stage === "preview" && task.status === "succeeded" && hasNeedsReviewFinal && (
+              <div className="mt-4 rounded-lg border border-warn/30 bg-warn/10 px-3 py-2 text-center text-sm text-warn">
+                完整视频待确认 · <a href="/history" className="underline underline-offset-2">去历史查看</a>
+              </div>
+            )}
+            {task.category === "video" && task.stage === "preview" && task.status === "succeeded" && hasFailedFinal && (
+              <p className="mt-4 rounded-lg border border-warn/30 bg-warn/10 px-3 py-2 text-center text-sm text-warn">
+                完整视频渲染失败，可重新提交
+              </p>
+            )}
+            {task.category === "video" && task.stage === "preview" && task.status === "succeeded" && !hasBlockingFinal && (
               <button onClick={onSubmitFinal} disabled={submitting} className="btn-primary mt-4 w-full">
-                {submitting ? "提交中…" : `方向满意 → 渲染完整视频 · ${videoFinalCost}积分`}
+                {submitting
+                  ? "提交中…"
+                  : `${hasSubmittedFinal ? "重新渲染完整视频" : "方向满意 → 渲染完整视频"} · ${videoFinalCost}积分`}
               </button>
             )}
           </div>
@@ -129,9 +155,17 @@ export default function StudioResults({
             <p className="text-sm text-mist">还没有作品，输入提示词开始你的第一次创作。</p>
           </div>
         ) : (
-          <div className="masonry">
+          <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-4">
             {works.map((asset) => (
-              <MasonryItem key={asset.id} a={asset} onOpen={() => setLightbox(asset)} />
+              <ResultCard
+                key={asset.id}
+                a={asset}
+                unlocking={busyAssetIds?.has(asset.id)}
+                onOpen={() => setLightbox(asset)}
+                onUnlock={() => onUnlock(asset)}
+                onDownload={() => onDownload(asset)}
+                onReport={() => onReport(asset)}
+              />
             ))}
           </div>
         )}

@@ -575,6 +575,13 @@ def _max_b64_len(max_bytes: int) -> int:
     return ((max_bytes + 2) // 3) * 4 + 8
 
 
+def _remaining_download_timeout(deadline: float) -> float:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise GatewayError("下载结果超时")
+    return remaining
+
+
 def _download(
     url: str,
     *,
@@ -595,13 +602,12 @@ def _download(
         deadline = time.monotonic() + timeout
         with httpx.Client(follow_redirects=False, timeout=timeout) as c:
             for _ in range(MAX_REDIRECTS + 1):
-                if time.monotonic() > deadline:
-                    raise GatewayError("下载结果超时")
+                remaining = _remaining_download_timeout(deadline)
                 with _guarded_stream(
                     c,
                     "GET",
                     url,
-                    timeout=timeout,
+                    timeout=remaining,
                     headers=_DOWNLOAD_HEADERS,
                 ) as r:
                     if r.is_redirect and r.headers.get("location"):
@@ -671,13 +677,12 @@ def download_to_path(
         deadline = time.monotonic() + timeout
         with httpx.Client(follow_redirects=False, timeout=timeout) as c:
             for _ in range(MAX_REDIRECTS + 1):
-                if time.monotonic() > deadline:
-                    raise GatewayError("下载结果超时")
+                remaining = _remaining_download_timeout(deadline)
                 with _guarded_stream(
                     c,
                     "GET",
                     url,
-                    timeout=timeout,
+                    timeout=remaining,
                     headers=_DOWNLOAD_HEADERS,
                 ) as r:
                     if r.is_redirect and r.headers.get("location"):

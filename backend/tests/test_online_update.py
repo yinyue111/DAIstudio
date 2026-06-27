@@ -144,16 +144,11 @@ def test_admin_online_update_fast_forwards_and_runs_configured_apply_command(
 
 
 def test_admin_online_update_noops_when_already_current(client, make_user, auth, monkeypatch, git_repos):
-    apply_script = git_repos["work"].parent / "apply-current.py"
     apply_marker = git_repos["work"] / "applied-current.txt"
-    apply_script.write_text(
-        "from pathlib import Path\nPath('applied-current.txt').write_text('ok\\n', encoding='utf-8')\n",
-        encoding="utf-8",
-    )
     _configure(
         monkeypatch,
         git_repos["work"],
-        apply_command=f"{shlex.quote(sys.executable)} {shlex.quote(str(apply_script))}",
+        apply_command=f"{shlex.quote(sys.executable)} -V",
     )
     make_user("15700002004", admin=True)
     h = auth("15700002004")
@@ -162,9 +157,9 @@ def test_admin_online_update_noops_when_already_current(client, make_user, auth,
     assert run.status_code == 200, run.text
     data = run.json()
     assert data["changed"] is False
-    assert data["applied"] is True
+    assert data["applied"] is False
     assert data["before"] == data["after"]
-    assert apply_marker.read_text(encoding="utf-8") == "ok\n"
+    assert not apply_marker.exists()
 
 
 def test_admin_online_update_reports_partial_failure_when_apply_fails(
@@ -300,6 +295,18 @@ def test_online_update_rejects_file_remote():
         online_update._safe_remote("file:///tmp/private-release.git")
 
 
+def test_online_update_rejects_plain_git_remote():
+    from app.services import online_update
+
+    with pytest.raises(online_update.OnlineUpdateError, match="只允许 Git remote 名称或安全的 Git URL"):
+        online_update._safe_remote("git://github.com/yinyue111/DAIstudio.git")
+    with pytest.raises(online_update.OnlineUpdateError, match="只允许安全的 Git URL"):
+        online_update._validate_remote_url(
+            "git://github.com/yinyue111/DAIstudio.git",
+            label="Git remote origin",
+        )
+
+
 def test_online_update_injects_github_https_token_via_env(monkeypatch, git_repos):
     from app.services import online_update
 
@@ -371,7 +378,10 @@ def test_online_update_redacts_secrets_from_command_output():
     text = (
         "remote=https://ghp_abcdefghijklmnopqrstuvwxyz012345@example.com/repo.git\n"
         "api_key=sk-abcdef1234567890 token=ark-abcdef1234567890 password=hunter2 "
-        "github_pat_1234567890abcdef"
+        "github_pat_1234567890abcdef\n"
+        "ALIPAY_PRIVATE_KEY=-----BEGIN PRIVATE KEY-----abc123-----END PRIVATE KEY-----\n"
+        "WECHAT_PAY_PRIVATE_KEY=wx-secret\n"
+        "ALIYUN_ACCESS_KEY_SECRET=aliyun-secret"
     )
     redacted = online_update._clip(text)
     assert "ghp_abcdefghijklmnopqrstuvwxyz012345" not in redacted
@@ -379,6 +389,9 @@ def test_online_update_redacts_secrets_from_command_output():
     assert "sk-abcdef1234567890" not in redacted
     assert "ark-abcdef1234567890" not in redacted
     assert "hunter2" not in redacted
+    assert "abc123" not in redacted
+    assert "wx-secret" not in redacted
+    assert "aliyun-secret" not in redacted
     assert "<redacted>" in redacted
 
 

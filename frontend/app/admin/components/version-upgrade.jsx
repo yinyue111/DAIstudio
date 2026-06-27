@@ -80,6 +80,18 @@ export function VersionUpgrade() {
       setMsgKind("bad");
       return;
     }
+    if (!freshStatus.remote_head) {
+      setRunning(false);
+      setMsg("远端版本未检查成功，不能执行升级。请先确认 GitHub Token 和网络配置。");
+      setMsgKind("bad");
+      return;
+    }
+    if (freshStatus.current_head && freshStatus.current_head === freshStatus.remote_head) {
+      setRunning(false);
+      setMsg("当前已经是最新版本，无需执行升级。");
+      setMsgKind("ok");
+      return;
+    }
     const applyText = freshStatus.apply_command_configured
       ? "升级完成后会执行服务端配置的生效命令。"
       : "当前没有配置生效命令，代码更新后可能仍需手动重启服务。";
@@ -131,6 +143,7 @@ export function VersionUpgrade() {
   }
 
   const currentIsRemote = status.current_head && status.remote_head && status.current_head === status.remote_head;
+  const upgradeDisabled = running || !status.enabled || !!status.error || !status.remote_head || currentIsRemote;
 
   return (
     <div className="space-y-4">
@@ -146,7 +159,7 @@ export function VersionUpgrade() {
             <button onClick={() => load(true)} disabled={loading || running} className="btn-secondary btn-sm">
               {loading ? "刷新中…" : "检查远端版本"}
             </button>
-            <button onClick={runUpgrade} disabled={running || !status.enabled || !!status.error} className="btn-primary btn-sm">
+            <button onClick={runUpgrade} disabled={upgradeDisabled} className="btn-primary btn-sm">
               {running ? "升级中…" : "从 GitHub 更新并生效"}
             </button>
           </div>

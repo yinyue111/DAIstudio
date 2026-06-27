@@ -12,7 +12,7 @@
 models:
   - use: vision        # 反推:图 -> 结构化提示词  (/v1/chat/completions)
     model_id: gpt-5.5
-    cost_credits: 1
+    cost_credits: 2
     unlock_cost: 0
     enabled: true
     extra:
@@ -30,8 +30,8 @@ models:
 
   - use: image         # 文生图:词 -> 图          (/v1/images/generations)
     model_id: gpt-image-2
-    cost_credits: 5     # frozen on submit (produces N watermarked previews)
-    unlock_cost: 5      # charged when the user unlocks one HD image
+    cost_credits: 15    # fallback/admin display; runtime pricing is size-based
+    unlock_cost: 0      # generated assets are visible in history without HD unlock fee
     enabled: true
     # Optional: enable true 图+指令->图 (reverse-off). When set, an instruction
     # with an image source is sent to this image-to-image endpoint instead of
@@ -41,11 +41,11 @@ models:
 
   - use: video         # 文生视频 (Volcengine Ark / Doubao Seedance, async)
     model_id: doubao-seedance-2-0-pro
-    cost_credits: 60     # full render cost (final stage, usage pricing metadata below)
+    cost_credits: 16     # fallback/admin display; final runtime pricing is per-second
     unlock_cost: 0
     enabled: true
     extra:
-      preview_cost: 6    # cheap freeze for the preview stage
+      preview_cost: 15   # cheap freeze for the preview stage
       official_pricing:
         source: https://www.volcengine.com/docs/82379/1544106
         checked_at: "2026-06-21"

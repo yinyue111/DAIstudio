@@ -15,12 +15,14 @@ from ..config import settings
 from ..models import PaymentPackage, PaymentProviderConfig
 
 DEFAULT_PAYMENT_PACKAGES = [
-    {"id": "starter", "title": "轻量包", "amount_cents": 990, "credits": 120,
+    {"id": "starter", "title": "体验包", "amount_cents": 990, "credits": 100,
      "badge": None, "enabled": True, "sort_order": 10},
-    {"id": "creator", "title": "创作包", "amount_cents": 2990, "credits": 420,
+    {"id": "creator", "title": "创作包", "amount_cents": 2990, "credits": 330,
      "badge": "常用", "enabled": True, "sort_order": 20},
-    {"id": "pro", "title": "专业包", "amount_cents": 9990, "credits": 1600,
+    {"id": "pro", "title": "专业包", "amount_cents": 9990, "credits": 1200,
      "badge": "更划算", "enabled": True, "sort_order": 30},
+    {"id": "team", "title": "团队包", "amount_cents": 29900, "credits": 3800,
+     "badge": "团队推荐", "enabled": True, "sort_order": 40},
 ]
 
 VALID_PROVIDERS = {"alipay", "wechat"}

@@ -23,8 +23,8 @@ from ..schemas import ReverseIn, ReverseOut
 from ..services import asset_refs, credits, gateway, storage, usage, video_frames
 from ..services.config_store import get_model_config, get_setting
 from ..services.content_safety import assert_text_allowed
+from ..services.generation_pricing import reverse_cost
 from ..services.model_gateway_config import runtime_config_for_model
-from ..services.model_pricing import estimate_credits_from_usage
 from ..services.rate_limit import incr_window
 from ..services.ssrf import SsrfError, assert_safe_user_asset_url
 from ..services.video_analysis import (
@@ -188,21 +188,21 @@ def reverse(body: ReverseIn, db: Session = Depends(get_db),
     if not model or not model.enabled:
         raise HTTPException(400, "未配置可用的视觉模型")
 
-    unit_cost = max(0, int(model.cost_credits or 0))
     precharged = 0
     biz_ref = _reverse_biz_ref()
     video_preset = normalize_video_analysis_preset(body.video_analysis_preset)
+    expected_cost = reverse_cost(body.target, preset=video_preset)
     requested_frame_budget = 1
     if is_video_source and body.target == "video":
         duration = _video_duration_for_reverse(body, db, user)
         requested_frame_budget = frame_count_for_duration(duration, video_preset)
         precharge_frames = max(max_frame_count(video_preset), requested_frame_budget)
-        precharged = unit_cost * precharge_frames
+        precharged = expected_cost
         if precharged:
             try:
                 credits.consume(db, user.id, precharged, biz_type="reverse",
                                 biz_ref=biz_ref,
-                                note=f"preauth target={body.target},preset={video_preset},refs={precharge_frames}")
+                                note=f"preauth target={body.target},preset={video_preset},max_refs={precharge_frames}")
             except credits.InsufficientCredits as e:
                 raise HTTPException(400, str(e))
     try:
@@ -219,7 +219,7 @@ def reverse(body: ReverseIn, db: Session = Depends(get_db),
                                     biz_ref=biz_ref,
                                     note=f"preauth_refund target={body.target}")
         raise
-    cost = unit_cost * max(1, len(refs))
+    cost = expected_cost
     if precharged > cost:
         credits.refund_consumed(db, user.id, precharged - cost, biz_type="reverse",
                                 biz_ref=biz_ref,
@@ -240,39 +240,6 @@ def reverse(body: ReverseIn, db: Session = Depends(get_db),
         if _accepts_gateway_config(gateway.reverse_prompt):
             kwargs["gateway_config"] = runtime_config_for_model(model, "vision")
         result = gateway.reverse_prompt(refs, model.model_id, **kwargs)
-        usage_cost = estimate_credits_from_usage(getattr(model, "extra", None), result.get("usage"))
-        if usage_cost is not None:
-            target_cost = usage_cost
-            if target_cost > cost:
-                shortfall = target_cost - cost
-                try:
-                    credits.consume(db, user.id, shortfall, biz_type="reverse",
-                                    biz_ref=biz_ref,
-                                    note=f"usage_adjust target={body.target},refs={len(refs)}")
-                    cost = target_cost
-                except credits.InsufficientCredits as e:
-                    if cost:
-                        credits.refund_consumed(db, user.id, cost, biz_type="reverse",
-                                                biz_ref=biz_ref,
-                                                note=f"usage_adjust_failed target={body.target},refs={len(refs)}")
-                    usage.record_call(db, kind="reverse", model_id=model.model_id,
-                                      user_id=user.id, status="failed",
-                                      usage=result.get("usage"),
-                                      detail={
-                                          "target": body.target,
-                                          "preset": video_preset,
-                                          "cost": cost,
-                                          "usage_cost": target_cost,
-                                          "shortfall": shortfall,
-                                          "settlement": "refunded",
-                                          "error": str(e)[:200],
-                                      })
-                    raise HTTPException(400, str(e))
-            elif target_cost < cost:
-                credits.refund_consumed(db, user.id, cost - target_cost, biz_type="reverse",
-                                        biz_ref=biz_ref,
-                                        note=f"usage_adjust target={body.target},refs={len(refs)}")
-                cost = target_cost
     except HTTPException:
         raise
     except gateway.GatewayError as e:

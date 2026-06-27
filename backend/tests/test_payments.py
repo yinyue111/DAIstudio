@@ -77,7 +77,7 @@ def test_payment_packages_and_create_order(client, make_user, auth):
     assert r.status_code == 200, r.text
     order = r.json()
     assert order["status"] == "pending"
-    assert order["credits"] == 120
+    assert order["credits"] == 100
     assert order["amount_cents"] == 990
     assert order["code_url"]
 
@@ -100,11 +100,11 @@ def test_mock_payment_marks_paid_and_grants_once(client, make_user, auth):
     paid1 = client.post(f"/api/payments/orders/{order['order_no']}/mock-pay", headers=h)
     assert paid1.status_code == 200, paid1.text
     assert paid1.json()["status"] == "paid"
-    assert client.get("/api/me", headers=h).json()["balance_credits"] == before + 420
+    assert client.get("/api/me", headers=h).json()["balance_credits"] == before + 330
 
     paid2 = client.post(f"/api/payments/orders/{order['order_no']}/mock-pay", headers=h)
     assert paid2.status_code == 200, paid2.text
-    assert client.get("/api/me", headers=h).json()["balance_credits"] == before + 420
+    assert client.get("/api/me", headers=h).json()["balance_credits"] == before + 330
 
 
 def test_paid_order_rejects_mismatched_provider_trade_no(client, make_user, auth):
@@ -687,7 +687,7 @@ def test_verified_provider_notify_can_credit_expired_order(client, make_user, au
     finally:
         db.close()
 
-    assert client.get("/api/me", headers=h).json()["balance_credits"] == 220
+    assert client.get("/api/me", headers=h).json()["balance_credits"] == 200
 
 
 def test_verified_provider_notify_can_credit_locally_closed_order(client, make_user, auth):
@@ -726,7 +726,7 @@ def test_verified_provider_notify_can_credit_locally_closed_order(client, make_u
     finally:
         db.close()
 
-    assert client.get("/api/me", headers=h).json()["balance_credits"] == 220
+    assert client.get("/api/me", headers=h).json()["balance_credits"] == 200
 
 
 def test_list_orders_closes_expired_pending_order(client, make_user, auth):
@@ -1109,7 +1109,7 @@ def test_payment_reconcile_marks_paid_pending_order(client, make_user, auth, mon
     finally:
         db.close()
 
-    assert client.get("/api/me", headers=h).json()["balance_credits"] == 220
+    assert client.get("/api/me", headers=h).json()["balance_credits"] == 200
 
 
 def test_payment_reconcile_can_credit_locally_closed_order(client, make_user, auth, monkeypatch):
@@ -1146,7 +1146,7 @@ def test_payment_reconcile_can_credit_locally_closed_order(client, make_user, au
     finally:
         db.close()
 
-    assert client.get("/api/me", headers=h).json()["balance_credits"] == 520
+    assert client.get("/api/me", headers=h).json()["balance_credits"] == 430
 
 
 def test_payment_reconcile_closes_provider_closed_pending_order(client, make_user, auth, monkeypatch):

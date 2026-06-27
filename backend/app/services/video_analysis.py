@@ -99,8 +99,9 @@ def frame_count_for_duration(duration_seconds: float | None, preset_key: str | N
     return preset.long_max_frames
 
 
-def preset_options(vision_cost: int = 0) -> list[dict]:
+def preset_options(vision_cost: int = 0, preset_costs: dict[str, int] | None = None) -> list[dict]:
     cost = max(0, int(vision_cost or 0))
+    preset_costs = preset_costs or {}
     return [
         {
             "key": preset.key,
@@ -117,7 +118,7 @@ def preset_options(vision_cost: int = 0) -> list[dict]:
                 else f"{preset.long_min_frames}-{preset.long_max_frames}帧"
             ),
             "max_frames": preset.max_frames,
-            "max_cost": cost * preset.max_frames,
+            "max_cost": int(preset_costs.get(preset.key, cost * preset.max_frames)),
         }
         for preset in VIDEO_ANALYSIS_PRESETS.values()
     ]

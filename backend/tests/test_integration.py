@@ -143,9 +143,9 @@ def test_generate_unlock_profile(client, make_user, auth):
     assert a0["preview_url"]
     assert client.get(urlparse(a0["preview_url"]).path).status_code == 200
 
-    # balance frozen then settled: image cost 5 * n(2) = 10 -> 1000-10 = 990
+    # balance frozen then settled: 1K image cost 15 * n(2) = 30 -> 1000-30 = 970
     me = client.get("/api/me", headers=h).json()
-    assert me["balance_credits"] == 990
+    assert me["balance_credits"] == 970
     db = SessionLocal()
     try:
         txs = db.query(CreditTransaction).filter(
@@ -153,21 +153,21 @@ def test_generate_unlock_profile(client, make_user, auth):
             CreditTransaction.biz_ref == tid,
         ).order_by(CreditTransaction.id).all()
         assert [(tx.type, tx.balance_delta, tx.frozen_delta, tx.reserved_amount, tx.real_cost) for tx in txs] == [
-            ("freeze", -10, 10, None, None),
-            ("settle", 0, -10, 10, 10),
+            ("freeze", -30, 30, None, None),
+            ("settle", 0, -30, 30, 30),
         ]
         assert txs[-1].frozen_after == 0
     finally:
         db.close()
 
-    # unlock -> charges unlock_cost (5) and reveals HD -> 985
+    # unlock is free for generated assets and reveals HD -> balance unchanged
     u = client.post(f"/api/assets/{a0['id']}/unlock", headers=h)
     assert u.status_code == 200
     assert u.json()["unlocked"] is True
     assert u.json()["hd_url"]
     assert client.get(urlparse(u.json()["hd_url"]).path).status_code == 404
     assert client.get(f"/api/assets/{a0['id']}/download", headers=h).status_code == 200
-    assert client.get("/api/me", headers=h).json()["balance_credits"] == 985
+    assert client.get("/api/me", headers=h).json()["balance_credits"] == 970
 
     # appears in personal gallery with expiry info
     g = client.get("/api/profile/assets", headers=h).json()
@@ -203,7 +203,7 @@ def test_generate_client_request_id_replays_existing_task(client, make_user, aut
         assert len(tasks) == 1
     finally:
         db.close()
-    assert client.get("/api/me", headers=h).json()["balance_credits"] == 990
+    assert client.get("/api/me", headers=h).json()["balance_credits"] == 970
 
 
 def test_generate_client_request_id_normalizes_default_image_n_before_fingerprint(client, make_user, auth):
@@ -239,12 +239,12 @@ def test_generate_client_request_id_normalizes_default_image_n_before_fingerprin
         assert tasks[0].params["n"] == 4
     finally:
         db.close()
-    assert client.get("/api/me", headers=h).json()["balance_credits"] == 980
+    assert client.get("/api/me", headers=h).json()["balance_credits"] == 940
 
 
 def test_generate_client_request_id_rejects_different_payload(client, make_user, auth):
-    make_user("13900000168", balance=1000)
-    h = auth("13900000168")
+    make_user("13900000169", balance=1000)
+    h = auth("13900000169")
     payload = {
         "client_request_id": "studio-retry-002",
         "source_asset_url": "http://example.com/retry.png",
@@ -274,7 +274,7 @@ def test_generate_client_request_id_rejects_different_payload(client, make_user,
         assert len(tasks) == 1
     finally:
         db.close()
-    assert client.get("/api/me", headers=h).json()["balance_credits"] == 995
+    assert client.get("/api/me", headers=h).json()["balance_credits"] == 985
 
 
 def test_external_asset_download_streams_from_temp_file(client, make_user, auth, monkeypatch):
@@ -398,9 +398,9 @@ def test_video_preview_settles_preview_cost(client, make_user, auth):
 
     t = client.get(f"/api/tasks/{tid}", headers=h).json()
     assert t["status"] == "succeeded", t
-    assert t["cost_frozen"] == 5
-    assert t["cost_settled"] == 5
-    assert client.get("/api/me", headers=h).json()["balance_credits"] == 995
+    assert t["cost_frozen"] == 15
+    assert t["cost_settled"] == 15
+    assert client.get("/api/me", headers=h).json()["balance_credits"] == 985
 
 
 def test_video_preview_adapts_ratio_and_cover_from_reference(
@@ -638,7 +638,7 @@ def test_video_final_is_idempotent_for_same_preview(client, make_user, auth, mon
         assert len(finals) == 1
     finally:
         db.close()
-    assert client.get("/api/me", headers=h).json()["balance_credits"] == 945
+    assert client.get("/api/me", headers=h).json()["balance_credits"] == 761
 
 
 def test_db_rejects_duplicate_active_final_for_same_preview(client, make_user):
@@ -820,8 +820,8 @@ def test_video_final_uses_preview_model_snapshot_price(client, make_user, auth, 
     }, headers=h)
     assert final.status_code == 200, final.text
     task = client.get(f"/api/tasks/{final.json()['id']}", headers=h).json()
-    assert task["cost_frozen"] == 50
-    assert task["cost_settled"] == 50
+    assert task["cost_frozen"] == 32
+    assert task["cost_settled"] == 32
     assert seen["model_id"] == "mock-video-old"
 
 
@@ -1240,7 +1240,7 @@ def test_retry_reprices_failed_image_task(client, make_user, auth):
     r = client.post(f"/api/tasks/{tid}/retry", headers=h)
     assert r.status_code == 200, r.text
     task = client.get(f"/api/tasks/{tid}", headers=h).json()
-    assert task["cost_frozen"] == 20
+    assert task["cost_frozen"] == 60
     assert len(task["assets"]) == 4
     db = SessionLocal()
     try:

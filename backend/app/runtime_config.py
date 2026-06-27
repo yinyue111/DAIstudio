@@ -18,7 +18,14 @@ _INSECURE_JWT_SECRETS = {
 }
 _MIN_JWT_SECRET_LEN = 32
 _MIN_METRICS_TOKEN_LEN = 16
-_INSECURE_METRICS_TOKENS = {"", "metrics-token", "change-me", "change-me-in-production"}
+_INSECURE_METRICS_TOKENS = {
+    "",
+    "metrics-token",
+    "change-me",
+    "change-me-in-production",
+    "please-change-me-to-a-long-random-metrics-token",
+}
+_INSECURE_SECRET_PREFIXES = ("please-change-me", "replace-with", "changeme")
 _ALLOWED_JWT_ALGORITHMS = {"HS256", "HS384", "HS512"}
 
 
@@ -62,12 +69,14 @@ def validate_runtime_config() -> None:
             f"请设置长度 >= {_MIN_JWT_SECRET_LEN} 的强随机密钥"
             "(如 python -c \"import secrets;print(secrets.token_urlsafe(48))\")。"
         )
+    metrics_token = str(settings.metrics_token or "")
     if (
         not settings.debug
         and (observability.metrics_enabled or settings.metrics_token)
         and (
-            settings.metrics_token in _INSECURE_METRICS_TOKENS
-            or len(settings.metrics_token) < _MIN_METRICS_TOKEN_LEN
+            metrics_token in _INSECURE_METRICS_TOKENS
+            or metrics_token.lower().startswith(_INSECURE_SECRET_PREFIXES)
+            or len(metrics_token) < _MIN_METRICS_TOKEN_LEN
         )
     ):
         raise RuntimeError(

@@ -11,6 +11,7 @@ from app.services import (
     generation,
     generation_video_flow,
     retention,
+    storage,
     video_frames,
 )
 from app.services.config_store import set_setting
@@ -158,8 +159,8 @@ def test_video_submit_unknown_state_holds_for_review_without_refund(
         assert (task.params or {}).get("_video_submit_state_unknown") is True
         assert "视频提交状态未知" in (task.error or "")
         user = db.get(User, task.user_id)
-        assert user.balance_credits == 995
-        assert user.frozen_credits == 5
+        assert user.balance_credits == 985
+        assert user.frozen_credits == 15
     finally:
         db.close()
 
@@ -767,7 +768,7 @@ def test_video_download_uses_persisted_provider_usage_for_settlement(
 
     t = client.get(f"/api/tasks/{tid}", headers=h).json()
     assert t["status"] == "succeeded", t
-    assert t["cost_settled"] == 4
+    assert t["cost_settled"] == 5
 
 
 def test_video_download_final_failure_fails_and_refunds(client, make_user, monkeypatch):
@@ -1016,7 +1017,7 @@ def test_reaper_skips_pending_video_download_without_alive_key(client, make_user
         db.close()
 
 
-def test_reaper_refunds_video_submitting_without_external_id(client, make_user, auth):
+def test_reaper_holds_video_submitting_with_request_id_for_review(client, make_user, auth):
     uid = make_user("13900000974", balance=1000, admin=True)
     h = auth("13900000974")
     _config_video(client, h)
@@ -1042,13 +1043,14 @@ def test_reaper_refunds_video_submitting_without_external_id(client, make_user, 
         frozen_after_freeze = user.frozen_credits
 
         assert retention.reap_stuck_tasks(db, max_minutes=60) == 1
-        failed = db.get(GenTask, tid)
-        assert failed.status == "failed"
-        assert failed.cost_settled == 0
-        assert "视频提交状态未知" in (failed.error or "")
+        held = db.get(GenTask, tid)
+        assert held.status == "needs_review"
+        assert held.phase == "reconciling"
+        assert held.cost_settled == 0
+        assert "视频提交状态未知" in (held.error or "")
         user = db.get(User, uid)
-        assert user.balance_credits == balance_after_freeze + frozen_after_freeze
-        assert user.frozen_credits == 0
+        assert user.balance_credits == balance_after_freeze
+        assert user.frozen_credits == frozen_after_freeze
     finally:
         db.close()
 
@@ -1133,6 +1135,93 @@ def test_video_render_timeout_fails_and_refunds(client, make_user, auth, monkeyp
         user = db.get(User, uid)
         assert user.balance_credits == balance_after_freeze + frozen_after_freeze
         assert user.frozen_credits == 0
+    finally:
+        db.close()
+
+
+def test_poll_video_snapshot_mismatch_holds_for_review(client, make_user, auth):
+    uid = make_user("13900000987", balance=1000, admin=True)
+    h = auth("13900000987")
+    _config_video(client, h)
+    tid = _stranded_video(uid, "ext-snapshot-drift")
+    db = SessionLocal()
+    try:
+        task = db.get(GenTask, tid)
+        task.params = {
+            **(task.params or {}),
+            "_model_snapshot": {
+                "model_id": "mock-video",
+                "gateway_key_fingerprint": "old-fingerprint",
+                "base_url": "",
+                "provider": "mock",
+                "gateway_format": "mock",
+                "cost_credits": 50,
+                "unlock_cost": 0,
+                "extra": {"preview_cost": 5},
+            },
+        }
+        db.commit()
+        user = db.get(User, uid)
+        balance_after_freeze = user.balance_credits
+        frozen_after_freeze = user.frozen_credits
+    finally:
+        db.close()
+
+    generation.poll_video_once(tid)
+
+    db = SessionLocal()
+    try:
+        task = db.get(GenTask, tid)
+        user = db.get(User, uid)
+        assert task.status == "needs_review"
+        assert task.phase == "reconciling"
+        assert "模型网关配置已变更" in (task.error or "")
+        assert user.balance_credits == balance_after_freeze
+        assert user.frozen_credits == frozen_after_freeze
+    finally:
+        db.close()
+
+
+def test_video_download_local_settlement_failure_holds_for_review(
+    client,
+    make_user,
+    auth,
+    monkeypatch,
+    tiny_mp4,
+):
+    uid = make_user("13900000986", balance=1000, admin=True)
+    h = auth("13900000986")
+    _config_video(client, h)
+    tid = _stranded_video(uid, "ext-settle-fail")
+    monkeypatch.setattr(generation, "_enqueue_video_download", lambda _task_id, **_kw: None)
+    monkeypatch.setattr(
+        "app.services.gateway.poll_video",
+        lambda *_a, **_k: {"status": "succeeded", "url": "https://cdn.example.com/ok.mp4"},
+    )
+    monkeypatch.setattr(
+        "app.services.gateway.download_to_storage",
+        lambda _url, subdir, ext, **_kwargs: storage.save_bytes(tiny_mp4, subdir, ext),
+    )
+    original_settle = credits.settle
+
+    def fail_settle(*args, **kwargs):
+        raise RuntimeError("ledger unavailable")
+
+    generation.poll_video_once(tid)
+    monkeypatch.setattr(credits, "settle", fail_settle)
+    generation.run_video_download_task(tid)
+    monkeypatch.setattr(credits, "settle", original_settle)
+
+    db = SessionLocal()
+    try:
+        task = db.get(GenTask, tid)
+        user = db.get(User, uid)
+        assert task.status == "needs_review"
+        assert task.phase == "reconciling"
+        assert "上游生成" in (task.error or "")
+        assert task.cost_settled == 0
+        assert user.balance_credits == 995
+        assert user.frozen_credits == 5
     finally:
         db.close()
 

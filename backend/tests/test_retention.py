@@ -3,7 +3,7 @@ from datetime import datetime, timedelta, timezone
 
 from app.config import settings
 from app.db import SessionLocal
-from app.models import GenTask, UploadedAsset, User
+from app.models import GenTask, ParseRecord, UploadedAsset, User
 from app.services import credits, retention, storage
 
 
@@ -396,6 +396,56 @@ def test_purge_uploaded_assets_keeps_recent_task_reference(client, make_user):
         db.close()
 
 
+def test_reap_stuck_parse_records_fails_queued_and_running(client, make_user):
+    uid = make_user("13900000442", balance=1000)
+    db = SessionLocal()
+    try:
+        old = datetime.now(timezone.utc) - timedelta(minutes=40)
+        recent = datetime.now(timezone.utc) - timedelta(minutes=1)
+        queued = ParseRecord(
+            user_id=uid,
+            url="https://example.com/queued",
+            status="queued",
+            created_at=old,
+        )
+        running = ParseRecord(
+            user_id=uid,
+            url="https://example.com/running",
+            status="running",
+            created_at=old,
+        )
+        recent_running = ParseRecord(
+            user_id=uid,
+            url="https://example.com/recent",
+            status="running",
+            created_at=recent,
+        )
+        done = ParseRecord(
+            user_id=uid,
+            url="https://example.com/done",
+            status="done",
+            created_at=old,
+        )
+        db.add_all([queued, running, recent_running, done])
+        db.commit()
+        ids = {
+            "queued": queued.id,
+            "running": running.id,
+            "recent_running": recent_running.id,
+            "done": done.id,
+        }
+
+        assert retention.reap_stuck_parse_records(db, max_minutes=30) == 2
+
+        db.expire_all()
+        assert db.get(ParseRecord, ids["queued"]).status == "failed"
+        assert db.get(ParseRecord, ids["running"]).status == "failed"
+        assert db.get(ParseRecord, ids["recent_running"]).status == "running"
+        assert db.get(ParseRecord, ids["done"]).status == "done"
+    finally:
+        db.close()
+
+
 def test_reaper_skips_image_inside_configured_gateway_window(client, make_user, monkeypatch):
     monkeypatch.setattr(settings, "image_gateway_timeout_seconds", 600)
     monkeypatch.setattr(settings, "image_download_timeout_seconds", 600)
@@ -453,6 +503,44 @@ def test_reaper_refunds_image_after_configured_gateway_window(client, make_user,
         assert "任务超时" in reaped.error
     finally:
         db.close()
+
+
+def test_reaper_skips_image_reconciling_task(client, make_user, monkeypatch):
+    monkeypatch.setattr(settings, "image_gateway_timeout_seconds", 60)
+    monkeypatch.setattr(settings, "image_download_timeout_seconds", 60)
+    uid = make_user("13900000442", balance=1000)
+    db = SessionLocal()
+    try:
+        _clear_active_generation_tasks(db)
+        task = GenTask(
+            user_id=uid,
+            category="image",
+            stage="preview",
+            status="running",
+            phase="reconciling",
+            cost_frozen=20,
+            cost_settled=0,
+            created_at=datetime.now(timezone.utc) - timedelta(minutes=20),
+        )
+        db.add(task)
+        db.commit()
+        task_id = task.id
+        credits.freeze(db, uid, 20, task_id)
+
+        assert retention.reap_stuck_tasks(db, max_minutes=5) == 0
+        kept = db.get(GenTask, task_id)
+        assert kept.status == "running"
+        assert kept.phase == "reconciling"
+    finally:
+        db.close()
+
+
+def test_image_reaper_window_ignores_global_celery_lifecycle_limit(monkeypatch):
+    monkeypatch.setattr(settings, "image_gateway_timeout_seconds", 60)
+    monkeypatch.setattr(settings, "image_download_timeout_seconds", 90)
+    monkeypatch.setattr(settings, "celery_task_time_limit_seconds", 8100)
+
+    assert retention._image_reap_window() == timedelta(seconds=60 + 90 + 300)
 
 
 def test_reaper_holds_for_review_when_refund_fails(client, make_user, monkeypatch):

@@ -144,6 +144,34 @@ export function formatDuration(seconds) {
   return rest ? `${minutes}m${rest}s` : `${minutes}min`;
 }
 
+export function imageQualityTierForSize(size) {
+  const m = /^(\d+)x(\d+)$/.exec(String(size || ""));
+  if (!m) return "1k";
+  const maxSide = Math.max(Number(m[1]), Number(m[2]));
+  if (maxSide > 2560) return "4k";
+  if (maxSide > 1280) return "2k";
+  return "1k";
+}
+
+export function estimateImageCredits(cfg, { size, count = 1, edit = false } = {}) {
+  const tier = imageQualityTierForSize(size);
+  const pricing = cfg?.pricing?.image || {};
+  const table = edit ? pricing.edit_unit_costs : pricing.unit_costs;
+  const fallback = Number(cfg?.models?.image?.cost_credits || 0);
+  const unit = Number(table?.[tier] ?? fallback);
+  return Math.max(0, unit) * Math.max(1, Number(count) || 1);
+}
+
+export function estimateVideoPreviewCredits(cfg) {
+  return Number(cfg?.pricing?.video?.preview_cost ?? cfg?.models?.video?.preview_cost ?? 0);
+}
+
+export function estimateVideoFinalCredits(cfg, { resolution = "720p", duration = 5 } = {}) {
+  const perSecond = cfg?.pricing?.video?.per_second || {};
+  const unit = Number(perSecond?.[resolution] ?? cfg?.models?.video?.final_cost ?? cfg?.models?.video?.cost_credits ?? 0);
+  return Math.max(0, unit) * Math.max(1, Number(duration) || 1);
+}
+
 export function videoRatioOptions() {
   return RATIOS.filter((r) => VIDEO_RATIO_KEYS.has(r.key));
 }

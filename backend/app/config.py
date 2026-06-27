@@ -61,7 +61,7 @@ class Settings(BaseSettings):
     # Image generation can legitimately take several minutes for large outputs.
     # Keep it separate from normal gateway calls so prompt/reverse endpoints do
     # not wait as long as render endpoints.
-    image_gateway_timeout_seconds: int = 600
+    image_gateway_timeout_seconds: int = 300
     image_download_timeout_seconds: int = 600
     generated_image_max_bytes: int = 80 * 1024 * 1024
     generated_image_batch_max_bytes: int = 160 * 1024 * 1024

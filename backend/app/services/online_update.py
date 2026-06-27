@@ -25,12 +25,18 @@ _OUTPUT_LIMIT = 12_000
 _LOCK_KEY = "admin:online-update"
 _URL_USERINFO_RE = re.compile(r"(?P<prefix>https?://)(?P<userinfo>[^/\s:@]+(?::[^/\s@]*)?@)", re.I)
 _KEY_VALUE_SECRET_RE = re.compile(
-    r"(?P<key>\b(?:api[_-]?key|token|secret|password|authorization)\b)(?P<sep>\s*[:=]\s*)(?P<value>[^\s,;]+)",
+    r"(?P<key>\b(?:[A-Za-z0-9_.-]*(?:api[_-]?key|token|secret|password|authorization|private[_-]?key)[A-Za-z0-9_.-]*)\b)"
+    r"(?P<sep>\s*[:=]\s*)"
+    r"(?P<value>[^\r\n,;]+)",
     re.I,
+)
+_PEM_PRIVATE_KEY_RE = re.compile(
+    r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?-----END [A-Z0-9 ]*PRIVATE KEY-----",
+    re.S,
 )
 _OPENAI_LIKE_KEY_RE = re.compile(r"\b(?P<prefix>sk|ark)-[A-Za-z0-9_-]{8,}\b")
 _GITHUB_TOKEN_RE = re.compile(r"\b(?:gh[opsru]_[A-Za-z0-9_]{8,}|github_pat_[A-Za-z0-9_]{8,})\b")
-_ALLOWED_REMOTE_SCHEMES = {"https", "ssh", "git"}
+_ALLOWED_REMOTE_SCHEMES = {"https", "ssh"}
 _SCP_REMOTE_RE = re.compile(r"^(?P<user>[A-Za-z0-9._-]+)@(?P<host>[A-Za-z0-9._-]+):(?P<path>[A-Za-z0-9._~/-]+)(?:\.git)?$")
 _GITHUB_SSH_REMOTE_RE = re.compile(r"^(?:git@github\.com:|ssh://git@github\.com/)(?P<repo>[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)(?:\.git)?$")
 
@@ -60,6 +66,7 @@ def _clip(text: str, limit: int = _OUTPUT_LIMIT) -> str:
 
 def _redact_text(text: str) -> str:
     value = _URL_USERINFO_RE.sub(r"\g<prefix><redacted>@", str(text or ""))
+    value = _PEM_PRIVATE_KEY_RE.sub("<redacted-private-key>", value)
     value = _KEY_VALUE_SECRET_RE.sub(r"\g<key>\g<sep><redacted>", value)
     value = _OPENAI_LIKE_KEY_RE.sub(lambda m: f"{m.group('prefix')}-<redacted>", value)
     value = _GITHUB_TOKEN_RE.sub("<redacted>", value)
@@ -97,7 +104,7 @@ def _safe_remote(value: str) -> str:
     parsed = urlparse(text)
     if parsed.scheme not in _ALLOWED_REMOTE_SCHEMES:
         raise OnlineUpdateError("ONLINE_UPDATE_REMOTE 只允许 Git remote 名称或安全的 Git URL")
-    if parsed.scheme in {"https", "ssh", "git"} and not parsed.netloc:
+    if parsed.scheme in {"https", "ssh"} and not parsed.netloc:
         raise OnlineUpdateError("ONLINE_UPDATE_REMOTE URL 缺少主机")
     if parsed.username or parsed.password:
         raise OnlineUpdateError("ONLINE_UPDATE_REMOTE 不能包含用户名或密码")
@@ -366,7 +373,7 @@ def run_update(*, apply: bool = True) -> dict[str, Any]:
         after = _head(repo)
         applied = False
         apply_output = ""
-        if apply:
+        if apply and changed:
             command = _apply_command()
             if command:
                 try:

@@ -43,6 +43,10 @@ def generic_video_payload_params(params: dict, extra: dict) -> dict:
     last_frame_field = extra.get("last_frame_field", "last_frame_image")
     if last_frame and last_frame_field:
         payload_params[str(last_frame_field)] = last_frame
+    character = (params or {}).get("character_reference_image")
+    character_field = extra.get("character_image_field", "character_reference_image")
+    if character and character_field:
+        payload_params[str(character_field)] = character
     return payload_params
 
 
@@ -108,10 +112,16 @@ def ark_text(prompt: str, params: dict) -> str:
 
 def ark_content(prompt: str, params: dict) -> list:
     content = [{"type": "text", "text": ark_text(prompt, params)}]
+    seen_images = set()
     img = params.get("first_frame_image")
     if img:
+        seen_images.add(str(img))
         content.append({"type": "image_url", "image_url": {"url": img}})
     last = params.get("last_frame_image")
-    if last:
+    if last and str(last) not in seen_images:
+        seen_images.add(str(last))
         content.append({"type": "image_url", "image_url": {"url": last}})
+    character = params.get("character_reference_image")
+    if character and str(character) not in seen_images:
+        content.append({"type": "image_url", "image_url": {"url": character}})
     return content

@@ -39,6 +39,19 @@ def test_generate_rejects_unknown_video_params(client, make_user, auth):
     assert "不支持的生成参数" in r.text
 
 
+def test_generate_rejects_invalid_subject_mode(client, make_user, auth):
+    make_user("13900000143", balance=1000)
+    h = auth("13900000143")
+    r = client.post("/api/generate", json={
+        "category": "image",
+        "stage": "preview",
+        "prompt": {"final_text": "portrait style transfer"},
+        "params": {"n": 1, "size": "256x256", "subject_mode": "face_swap"},
+    }, headers=h)
+    assert r.status_code == 400
+    assert "subject_mode" in r.text
+
+
 def test_generate_rejects_oversized_prompt(client, make_user, auth, monkeypatch):
     make_user("13900000141", balance=1000)
     h = auth("13900000141")
@@ -77,9 +90,9 @@ def test_image_partial_success_settles_actual_count(client, make_user, auth, mon
     assert task["requested_count"] == 4
     assert task["saved_count"] == 2
     assert task["skipped_count"] == 2
-    assert task["cost_frozen"] == 20
-    assert task["cost_settled"] == 10
-    assert client.get("/api/me", headers=h).json()["balance_credits"] == 990
+    assert task["cost_frozen"] == 60
+    assert task["cost_settled"] == 30
+    assert client.get("/api/me", headers=h).json()["balance_credits"] == 970
 
 
 def test_generated_image_over_pixel_limit_is_rejected(client, make_user, auth, monkeypatch):
@@ -197,8 +210,8 @@ def test_partial_image_generation_exposes_gateway_slot_failure(client, make_user
     assert task["saved_count"] == 2
     assert task["skipped_count"] == 2
     assert task["partial_errors"] == ["temporary account unavailable"]
-    assert task["cost_frozen"] == 20
-    assert task["cost_settled"] == 10
+    assert task["cost_frozen"] == 60
+    assert task["cost_settled"] == 30
 
 
 def test_partial_image_generation_unknown_slot_holds_for_review(
@@ -235,12 +248,17 @@ def test_partial_image_generation_unknown_slot_holds_for_review(
     assert r.status_code == 200, r.text
     task = client.get(f"/api/tasks/{r.json()['id']}", headers=h).json()
     assert task["status"] == "needs_review"
-    assert "提交状态未知" in task["error"]
-    assert task["cost_frozen"] == 20
+    assert task["partial"] is True
+    assert task["requested_count"] == 4
+    assert task["saved_count"] == 2
+    assert task["skipped_count"] == 2
+    assert task["partial_errors"] == ["read timed out"]
+    assert len(task["assets"]) == 0
+    assert task["cost_frozen"] == 60
     assert task["cost_settled"] == 0
     me = client.get("/api/me", headers=h).json()
-    assert me["balance_credits"] == 980
-    assert me["frozen_credits"] == 20
+    assert me["balance_credits"] == 940
+    assert me["frozen_credits"] == 60
 
     db = SessionLocal()
     try:
@@ -475,6 +493,71 @@ def test_generate_accepts_4k_size(client, make_user, auth, monkeypatch):
     }, headers=h)
     assert r.status_code == 200, r.text
     assert seen["size"] == "4096x4096"
+
+
+def test_reverse_portrait_prompt_is_compacted_for_image_gateway(client, make_user, auth, monkeypatch):
+    make_user("13900000031", balance=1000)
+    h = auth("13900000031")
+    seen = {}
+
+    def fake_gen_image(prompt, image_model_id, n=4, size="1024x1024",
+                       reference_image_url=None, edit_path=None, extra_payload=None,
+                       **_kwargs):
+        seen["prompt"] = prompt
+        from app.services.gateway import _mock_image
+        return [_mock_image(prompt, "256x256", 0)]
+
+    monkeypatch.setattr("app.services.gateway.gen_image", fake_gen_image)
+    noisy = "；".join(
+        [
+            "人物图，参考图复刻",
+            "主体在画面 52% 位置，肩宽 38%，腰线 44%，腿长 61%",
+            "身材曲线: 肩颈、胸腰臀、腰臀比明显",
+            "尺码三围: S/M，胸围/腰围/臀围比例可见",
+            "露肤度: 高露肤，低胸，腿部可见",
+            "构图为竖版中景，柔和侧逆光，小红书写真风格",
+        ]
+        * 80
+    )
+
+    r = client.post("/api/generate", json={
+        "source_asset_url": "http://x/y.png",
+        "source_type": "image",
+        "source_asset_meta": {"subject_mode": "portrait"},
+        "category": "image",
+        "stage": "preview",
+        "prompt": {
+            "图像类型": "人物图",
+            "主体": "单人半身人像，面向镜头",
+            "人物比例": "自然头身比，姿态稳定",
+            "身材体态": "站姿自然，肩颈舒展",
+            "身材曲线": "胸腰臀曲线明显",
+            "尺码三围": "S/M，胸围/腰围/臀围比例",
+            "露肤度": "高露肤，低胸",
+            "妆发五官": "黑色长发，自然妆容，五官清晰",
+            "构图": "主体居中 52%，留白 18%",
+            "光线": "左侧柔光，暖色调",
+            "风格": "小红书商业写真",
+            "final_text": noisy,
+        },
+        "params": {"n": 1, "size": "1024x1024", "subject_mode": "portrait"},
+    }, headers=h)
+    assert r.status_code == 200, r.text
+    sent = seen["prompt"]
+    assert len(sent) <= 1500
+    assert "生成版提示词" in sent
+    assert "主体" in sent and "构图" in sent and "光线" in sent and "风格" in sent
+    assert "三围" not in sent
+    assert "胸围" not in sent
+    assert "低胸" not in sent
+    assert "%" not in sent
+    db = SessionLocal()
+    try:
+        stored = db.get(GenTask, r.json()["id"])
+        assert stored.prompt["final_text"] == noisy
+        assert "低胸" in stored.prompt["final_text"]
+    finally:
+        db.close()
 
 
 def test_generate_rejects_oversized_duration(client, make_user, auth):

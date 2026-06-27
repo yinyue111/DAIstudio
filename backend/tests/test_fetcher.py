@@ -969,6 +969,28 @@ def test_x_status_filters_profile_images_and_prioritizes_post_media(monkeypatch)
     ]
 
 
+def test_x_status_dedupes_colon_large_media_variant(monkeypatch):
+    html = """
+    <html><head>
+      <meta name="twitter:image" content="https://pbs.twimg.com/media/HLuuR4Ba4AAgVii.jpg">
+    </head><body>
+      <img src="https://pbs.twimg.com/media/HLuuR4Ba4AAgVii.jpg:large">
+      <img src="https://pbs.twimg.com/media/HLuuSYZbkAA10Kp.jpg:orig">
+    </body></html>
+    """
+
+    monkeypatch.setattr(fetcher, "assert_safe_url", lambda url: url)
+    monkeypatch.setattr(fetcher, "_render_with_httpx", lambda _url, **_kwargs: html)
+    monkeypatch.setattr(fetcher, "_render_with_playwright", lambda _url: None)
+
+    assets = fetcher.parse_url("https://x.com/i/status/2070441131263893801")
+
+    assert [asset["url"] for asset in assets] == [
+        "https://pbs.twimg.com/media/HLuuR4Ba4AAgVii.jpg?format=jpg&name=large",
+        "https://pbs.twimg.com/media/HLuuSYZbkAA10Kp.jpg?format=jpg&name=orig",
+    ]
+
+
 def test_weixin_extracts_data_src_and_upgrades_resolution(monkeypatch):
     html = """
     <html><body>

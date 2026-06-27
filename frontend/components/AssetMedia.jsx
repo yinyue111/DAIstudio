@@ -35,6 +35,25 @@ export function shouldRenderVideo(asset, { playbackUrl = "" } = {}) {
   );
 }
 
+function VideoPoster({ src, className, fallbackClassName, onError }) {
+  return (
+    <div className={`relative ${fallbackClassName || className || ""}`}>
+      <img
+        src={src}
+        alt=""
+        loading="lazy"
+        className="h-full w-full object-cover"
+        onError={onError}
+      />
+      <div className="pointer-events-none absolute inset-0 flex items-center justify-center bg-black/10">
+        <span className="flex h-10 w-10 items-center justify-center rounded-full bg-black/55 text-white shadow-lg ring-1 ring-white/30">
+          <span className="ml-0.5 block h-0 w-0 border-y-[7px] border-l-[11px] border-y-transparent border-l-current" />
+        </span>
+      </div>
+    </div>
+  );
+}
+
 export default function AssetMedia({
   asset,
   interactive = false,
@@ -122,6 +141,19 @@ export default function AssetMedia({
         className={className}
         onError={(e) => {
           setError("视频预览加载失败，请重新打开或下载查看");
+          if (onError) onError(e);
+        }}
+      />
+    );
+  }
+  if (asset?.type === "video" && src) {
+    return (
+      <VideoPoster
+        src={src}
+        className={className}
+        fallbackClassName={fallbackClassName}
+        onError={(e) => {
+          setError("预览加载失败");
           if (onError) onError(e);
         }}
       />

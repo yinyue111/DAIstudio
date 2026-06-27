@@ -5,6 +5,7 @@ import { useRouter } from "next/navigation";
 import { api, downloadBlob, loginPath } from "../../lib/api";
 import Nav from "../../components/Nav";
 import AssetMedia, { assetPreviewSrc, assetUnavailableText, isAssetTakenDown } from "../../components/AssetMedia";
+import { estimateVideoFinalCredits } from "../studio/helpers";
 
 function srcOf(a) {
   return assetPreviewSrc(a);
@@ -16,11 +17,35 @@ function isTerminalStatus(status) {
   return TERMINAL_STATUSES.has(status);
 }
 
+function runningTaskHint(task) {
+  if (task.status === "queued") return "任务已提交，正在等待 Worker 接手。";
+  if (task.status !== "running") return "暂无结果素材";
+  const n = Number(task.requested_count || 0);
+  const isHighRes = String(task.params?.size || "").includes("4096")
+    || String(task.params?.size || "").includes("3072");
+  if (task.category === "image") {
+    return isHighRes && n > 1
+      ? `正在等待图像网关响应，${n} 张 4K 图可能需要数分钟；如果网关超时会自动失败并退回积分。`
+      : "正在等待图像网关响应，完成后会自动出现在历史记录。";
+  }
+  return "正在等待视频网关响应，完成后会自动出现在历史记录。";
+}
+
 function unlockConfirm(asset, me, cfg) {
   const type = asset.type === "video" ? "视频" : "图片";
   const balance = Number(me?.balance_credits ?? 0);
   const cost = Number(asset.unlock_cost ?? cfg?.models?.[asset.type]?.unlock_cost ?? 0);
   return window.confirm(`解锁${type}高清将扣除 ${cost} 积分，当前余额 ${balance}，确认继续？`);
+}
+
+function finalCostForTask(task, cfg) {
+  const estimated = Number(task?.final_cost_estimate ?? 0);
+  if (estimated > 0) return estimated;
+  const params = task?.params || {};
+  return estimateVideoFinalCredits(cfg, {
+    resolution: params.target_resolution || params.resolution,
+    duration: params.target_duration || params.duration,
+  });
 }
 
 export default function HistoryPage() {
@@ -117,7 +142,9 @@ export default function HistoryPage() {
   function trackTask(taskId) {
     let stopped = false;
     let failures = 0;
+    let timer = null;
     const tick = async () => {
+      if (stopped) return;
       try {
         const task = await api.task(taskId);
         if (stopped) return;
@@ -142,15 +169,19 @@ export default function HistoryPage() {
           return;
         }
       }
-      if (!stopped) setTimeout(tick, 3000);
+      if (!stopped) timer = setTimeout(tick, 3000);
     };
     tick();
-    return () => { stopped = true; };
+    return () => {
+      stopped = true;
+      if (timer) clearTimeout(timer);
+    };
   }
 
   async function renderFinal(taskId) {
     if (finalizingId) return;
-    const cost = Number(cfg?.models?.video?.final_cost ?? cfg?.models?.video?.cost_credits ?? 0);
+    const preview = tasksRef.current.find((t) => t.id === taskId);
+    const cost = finalCostForTask(preview, cfg);
     const balance = Number(me?.balance_credits ?? 0);
     if (!window.confirm(`渲染完整视频将冻结 ${cost} 积分，当前余额 ${balance}，确认继续？`)) return;
     setMsg("");
@@ -313,19 +344,22 @@ export default function HistoryPage() {
                       >
                         {finalizingId === t.id
                           ? "提交中…"
-                          : `方向满意 → 渲染完整视频(${Number(cfg?.models?.video?.final_cost ?? cfg?.models?.video?.cost_credits ?? 0)}积分)`}
+                          : `方向满意 → 渲染完整视频(${finalCostForTask(t, cfg)}积分)`}
                       </button>
                     )}
                   </div>
                 ) : (
-                  <div className="flex items-center justify-between gap-2">
+                  <div className="flex flex-col gap-2 rounded-lg border border-line bg-white/[0.03] px-3 py-2 sm:flex-row sm:items-center sm:justify-between">
                     <p className="text-xs text-fog">
                       {t.status === "failed"
                         ? t.error || "生成失败"
                         : t.status === "needs_review"
                           ? t.error || "提交状态未知，等待确认"
-                          : "暂无结果素材"}
+                          : runningTaskHint(t)}
                     </p>
+                    {!isTerminalStatus(t.status) && (
+                      <button onClick={() => load(true)} className="btn-secondary btn-sm">刷新状态</button>
+                    )}
                     {t.status === "failed" && (
                       <button onClick={() => retry(t.id)} className="btn-secondary btn-sm">重试</button>
                     )}

@@ -24,19 +24,28 @@ export default function LoginPage() {
   const isRegister = mode === "register";
 
   useEffect(() => {
+    let cancelled = false;
+    api.me()
+      .then(() => {
+        if (!cancelled) router.replace(currentNextPath() || "/");
+      })
+      .catch(() => {});
     api.authFeatures()
       .then((f) => {
+        if (cancelled) return;
         setSmsAuthEnabled(!!(f.sms_required_for_registration ?? f.sms_auth_enabled));
         setRegistrationEnabled(f.registration_enabled !== false);
         setFeaturesLoaded(true);
         setFeaturesError("");
       })
       .catch(() => {
+        if (cancelled) return;
         setRegistrationEnabled(false);
         setFeaturesLoaded(false);
         setFeaturesError("注册配置加载失败，请刷新重试");
       });
-  }, []);
+    return () => { cancelled = true; };
+  }, [router]);
 
   useEffect(() => {
     if (smsCooldown <= 0) return undefined;
@@ -70,7 +79,9 @@ export default function LoginPage() {
       } else {
         await api.login(formPhone, formPassword);
       }
-      router.push(currentNextPath() || "/");
+      const nextPath = currentNextPath() || "/";
+      router.replace(nextPath);
+      router.refresh();
     } catch (e) {
       setMsg(e.message);
     } finally {

@@ -9,6 +9,8 @@ from app.celery_app import celery_app
 from app.db import Base, SessionLocal
 from app.routers.generate import _estimate_cost
 from app.services import config_store
+from app.services.generation_model_runtime import model_snapshot
+from app.services.generation_pricing import generation_cost_from_snapshot
 from app.services.model_pricing import estimate_credits_from_usage
 
 
@@ -40,8 +42,11 @@ def test_public_config_exposes_video_reverse_presets(client, make_user, auth):
     assert data["reverse"]["video_default_preset"] == "standard"
     assert [p["key"] for p in presets] == ["fast", "standard", "fine"]
     assert presets[0]["short_range"] == "4帧"
+    assert presets[0]["max_cost"] == 8
     assert presets[1]["long_range"] == "16-24帧"
+    assert presets[1]["max_cost"] == 18
     assert presets[2]["max_frames"] == 36
+    assert presets[2]["max_cost"] == 32
 
 
 def test_public_config_exposes_normalized_feature_flags(client, make_user, auth):
@@ -66,20 +71,79 @@ def test_public_config_exposes_normalized_feature_flags(client, make_user, auth)
 
 class _Model:
     def __init__(self, cost, extra):
+        self.model_id = "mock"
         self.cost_credits = cost
+        self.unlock_cost = 0
         self.extra = extra
+        self.enabled = True
+        self.use = "image"
+        self.provider = None
+        self.base_url = None
+        self.api_key_encrypted = None
+        self.gateway_format = None
 
 
 def test_video_cost_estimate():
-    # explicit preview_cost
     m = _Model(50, {"preview_cost": 5})
-    assert _estimate_cost(m, "video", "preview") == 5
-    assert _estimate_cost(m, "video", "final") == 50
-    # no preview_cost -> max(1, base//10)
-    m2 = _Model(50, None)
-    assert _estimate_cost(m2, "video", "preview") == 5
-    # image always full cost
-    assert _estimate_cost(m, "image", "preview") == 50
+    assert _estimate_cost(m, "video", "preview", params={"duration": 5}) == 15
+    assert _estimate_cost(m, "video", "final", params={"target_resolution": "720p", "target_duration": 10}) == 160
+    assert _estimate_cost(m, "video", "final", params={"target_resolution": "1080p", "target_duration": 10}) == 280
+    assert _estimate_cost(m, "image", "preview", 2, params={"size": "1024x1024"}) == 30
+    assert _estimate_cost(
+        m,
+        "image",
+        "preview",
+        2,
+        params={"size": "2048x2048", "subject_mode": "product"},
+        source_type="image",
+    ) == 110
+
+
+def test_generation_model_snapshot_freezes_dynamic_credit_pricing():
+    m = _Model(
+        15,
+        {
+            "credit_pricing": {
+                "image": {"1k": 11, "2k": 22, "4k": 44},
+                "image_edit": {"1k": 13, "2k": 26, "4k": 52},
+                "video_preview_cost": 9,
+                "video_per_second": {"480p": 3, "720p": 6, "1080p": 12},
+            }
+        },
+    )
+    snapshot = model_snapshot(m)
+
+    assert generation_cost_from_snapshot(
+        snapshot,
+        category="image",
+        stage="preview",
+        params={"size": "2048x2048"},
+        n=2,
+    ) == 44
+    assert generation_cost_from_snapshot(
+        snapshot,
+        category="video",
+        stage="final",
+        params={"target_resolution": "1080p", "target_duration": 3},
+    ) == 36
+
+
+def test_legacy_generation_snapshot_preserves_static_price():
+    snapshot = {"cost_credits": 5, "extra": {"preview_cost": 2}}
+
+    assert generation_cost_from_snapshot(
+        snapshot,
+        category="image",
+        stage="preview",
+        params={"size": "256x256"},
+        n=4,
+    ) == 20
+    assert generation_cost_from_snapshot(
+        snapshot,
+        category="video",
+        stage="preview",
+        params={"duration": 5},
+    ) == 2
 
 
 def test_gpt55_official_pricing_usage_estimate():

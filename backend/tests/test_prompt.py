@@ -18,10 +18,26 @@ def test_reverse_image_template_captures_commercial_material_dimensions():
     template = gateway_prompting.reverse_template("image")
 
     assert "社媒商业素材复刻" in template
+    assert '"图像类型"' in template
+    assert '"反推重点"' in template
+    assert "产品图" in template
+    assert "人物图" in template
+    assert "人物+产品混合图" in template
+    assert "按图像类型自动取舍" in template
     assert '"商品服装"' in template
+    assert '"人物比例"' in template
+    assert '"身材体态"' in template
+    assert '"身材曲线"' in template
+    assert '"尺码三围"' in template
+    assert '"露肤度"' in template
+    assert '"妆发五官"' in template
     assert '"广告目标"' in template
     assert '"文字版式"' in template
     assert '"一致性约束"' in template
+    assert "头身比" in template
+    assert "服装覆盖范围" in template
+    assert "腰臀比" in template
+    assert "S/M/L" in template
     assert "不要写成普通美图描述" in template
 
 
@@ -52,6 +68,7 @@ def test_reverse_source_type_video_uses_video_template_without_suffix(monkeypatc
     monkeypatch.setattr(prompt, "get_setting", lambda db, key, default=None: True)
     monkeypatch.setattr(prompt, "_assert_text_allowed", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(prompt, "_gateway_ref", lambda db, user, url: "data:image/png;base64,abc")
+    monkeypatch.setattr(prompt.credits, "consume", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(prompt.usage, "record_call", lambda *_args, **_kwargs: None)
 
     def fake_reverse(refs, model_id, target="image"):
@@ -129,13 +146,13 @@ def test_reverse_video_usage_cost_is_not_multiplied_by_frame_count(client, make_
         )
         user = db.get(User, uid)
         assert out.reference_count == 4
-        assert out.charged_credits == 1
-        assert user.balance_credits == 99
+        assert out.charged_credits == 18
+        assert user.balance_credits == 82
     finally:
         db.close()
 
 
-def test_reverse_usage_adjust_insufficient_refunds_and_blocks_result(client, make_user, monkeypatch):
+def test_reverse_usage_metadata_does_not_override_fixed_image_price(client, make_user, monkeypatch):
     uid = make_user("13800000003", balance=2)
     db = SessionLocal()
     try:
@@ -171,15 +188,13 @@ def test_reverse_usage_adjust_insufficient_refunds_and_blocks_result(client, mak
 
     db = SessionLocal()
     try:
-        with pytest.raises(HTTPException) as exc:
-            prompt.reverse(
-                ReverseIn(asset_url="https://cdn.example.com/a.jpg", target="image"),
-                db=db,
-                user=db.get(User, uid),
-            )
+        out = prompt.reverse(
+            ReverseIn(asset_url="https://cdn.example.com/a.jpg", target="image"),
+            db=db,
+            user=db.get(User, uid),
+        )
         user = db.get(User, uid)
-        assert exc.value.status_code == 400
-        assert "额度不足" in exc.value.detail
-        assert user.balance_credits == 2
+        assert out.charged_credits == 2
+        assert user.balance_credits == 0
     finally:
         db.close()

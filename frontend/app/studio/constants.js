@@ -43,7 +43,7 @@ export const VIDEO_DURATION_PRESETS = [
 
 export const TERMINAL_TASK_STATUSES = new Set(["succeeded", "failed", "needs_review"]);
 export const PARSE_POLL_INTERVAL_MS = 1000;
-export const PARSE_POLL_TIMEOUT_MS = 120_000;
+export const PARSE_POLL_TIMEOUT_MS = 240_000;
 
 export const EXAMPLES = [
   "赛博朋克城市夜景，霓虹灯反射在湿漉漉的街道上，电影感，超广角",

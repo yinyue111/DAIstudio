@@ -38,7 +38,7 @@ import zlib
 from collections.abc import Callable
 from dataclasses import dataclass
 from html import unescape as html_unescape
-from urllib.parse import parse_qs, unquote, urlencode, urljoin, urlparse
+from urllib.parse import parse_qs, unquote, urlencode, urljoin, urlparse, urlunparse
 
 import httpx
 from bs4 import BeautifulSoup
@@ -160,6 +160,55 @@ def _is_x_post_media_url(url: str | None) -> bool:
     parsed = urlparse(url or "")
     host = (parsed.hostname or "").rstrip(".").lower()
     return _is_x_media_host(host) and parsed.path.startswith("/media/")
+
+
+def _normalise_x_media_url(url: str | None) -> str | None:
+    url = _normalise_asset_url(url)
+    if not url or not _is_x_post_media_url(url):
+        return url
+    parsed = urlparse(url)
+    path = parsed.path
+    suffix_format = None
+    if re.search(r"\.(?:jpe?g|png|webp):(?:orig|large|small|medium|thumb)$", path, re.I):
+        path, size_name = path.rsplit(":", 1)
+        ext = path.rsplit(".", 1)[-1].lower()
+        suffix_format = "jpg" if ext == "jpeg" else ext
+        query = urlencode({"format": suffix_format, "name": "orig" if size_name == "orig" else "large"})
+    else:
+        qs = parse_qs(parsed.query)
+        fmt = (qs.get("format") or [""])[0]
+        if not fmt and "." in path.rsplit("/", 1)[-1]:
+            ext = path.rsplit(".", 1)[-1].lower()
+            if ext in {"jpg", "jpeg", "png", "webp"}:
+                fmt = "jpg" if ext == "jpeg" else ext
+        name = (qs.get("name") or [""])[0]
+        if fmt:
+            query = urlencode({"format": fmt, "name": "orig" if name == "orig" else "large"})
+        else:
+            query = parsed.query
+    return urlunparse(parsed._replace(path=path, query=query, fragment=""))
+
+
+def _x_media_dedupe_key(url: str | None) -> str:
+    normalised = _normalise_x_media_url(url) or (url or "")
+    parsed = urlparse(normalised)
+    return f"{(parsed.hostname or '').lower()}{parsed.path}"
+
+
+def _dedupe_x_media_assets(assets: list[dict]) -> list[dict]:
+    out: list[dict] = []
+    seen: set[str] = set()
+    for asset in assets:
+        url = _normalise_x_media_url(asset.get("url"))
+        if not url:
+            continue
+        key = _x_media_dedupe_key(url)
+        if key in seen:
+            continue
+        seen.add(key)
+        thumb = _normalise_x_media_url(asset.get("thumb")) if asset.get("thumb") else url
+        out.append({**asset, "url": url, "thumb": thumb})
+    return out
 
 
 def _abs(base: str, src: str | None) -> str | None:
@@ -1535,7 +1584,9 @@ def _run_weixin(url: str) -> list[dict]:
 
 def _run_x(url: str) -> list[dict]:
     def post_media_only(assets: list[dict]) -> list[dict]:
-        return [asset for asset in assets if _is_x_post_media_url(asset.get("url"))]
+        return _dedupe_x_media_assets([
+            asset for asset in assets if _is_x_post_media_url(asset.get("url"))
+        ])
 
     try:
         html = _render_with_httpx(url, max_read_seconds=_GENERIC_MAX_READ_SECONDS,

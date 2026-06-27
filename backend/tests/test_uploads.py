@@ -375,6 +375,58 @@ def test_product_image_edit_uses_larger_reference_and_server_fidelity_guard(
     assert max(ref_img.size) == 1536
 
 
+def test_portrait_image_edit_accepts_character_reference_and_server_fidelity_guard(
+    client, make_user, auth, monkeypatch
+):
+    make_user("13900001967", balance=1000)
+    h = auth("13900001967")
+
+    up = client.post(
+        "/api/uploads/image",
+        files={"file": ("portrait.png", _png_bytes(size=(1200, 1600)), "image/png")},
+        headers=h,
+    )
+    assert up.status_code == 200, up.text
+    asset = up.json()
+    seen = {}
+
+    def fake_gen_image(prompt, image_model_id, n=4, size="1024x1024",
+                       reference_image_url=None, edit_path=None, extra_payload=None):
+        seen["prompt"] = prompt
+        seen["reference_image_url"] = reference_image_url
+        return [_mock_image(prompt, "256x256", 0)]
+
+    monkeypatch.setattr("app.services.gateway.gen_image", fake_gen_image)
+
+    r = client.post("/api/generate", json={
+        "source_asset_url": asset["url"],
+        "source_type": "image",
+        "source_asset_meta": {
+            "selected_type": "image",
+            "mode": "image_edit",
+            "portrait_generation_mode": True,
+            "subject_mode": "portrait",
+        },
+        "category": "image",
+        "stage": "preview",
+        "prompt": {
+            "final_text": "turn this portrait into a premium xiaohongshu cover",
+            "instruction": "turn this portrait into a premium xiaohongshu cover",
+        },
+        "params": {
+            "n": 1,
+            "size": "1024x1024",
+            "subject_mode": "portrait",
+            "character_reference_image": asset["url"],
+        },
+    }, headers=h)
+    assert r.status_code == 200, r.text
+
+    assert "人像高保真硬约束" in seen["prompt"]
+    assert "上传人像照片是唯一人物身份来源" in seen["prompt"]
+    assert seen["reference_image_url"].startswith("data:image/jpeg;base64,")
+
+
 def test_image_edit_can_send_product_and_style_refs_when_enabled(
     client, make_user, auth, monkeypatch
 ):
@@ -639,6 +691,59 @@ def test_uploaded_image_can_drive_video_first_frame(client, make_user, auth, mon
     ref_bytes = base64.b64decode(seen["first_frame_image"].split(",", 1)[1])
     ref_img = Image.open(io.BytesIO(ref_bytes))
     assert min(ref_img.size) >= 300
+
+
+def test_uploaded_portrait_image_can_drive_video_character_reference(client, make_user, auth, monkeypatch):
+    make_user("13900000179", balance=1000, admin=True)
+    h = auth("13900000179")
+    assert client.put("/api/admin/models", json={
+        "use": "video",
+        "model_id": "mock-video",
+        "cost_credits": 50,
+        "unlock_cost": 0,
+        "enabled": True,
+        "extra": {"preview_cost": 5},
+        "admin_password": "pass123456",
+    }, headers=h).status_code == 200
+
+    up = client.post(
+        "/api/uploads/image",
+        files={"file": ("portrait.png", _png_bytes(size=(1200, 1600)), "image/png")},
+        headers=h,
+    )
+    assert up.status_code == 200, up.text
+    asset = up.json()
+    seen = {}
+
+    def fake_submit(prompt, video_model_id, params, extra=None):
+        seen.update(params)
+        return "mock-portrait-video"
+
+    monkeypatch.setattr("app.services.gateway.submit_video", fake_submit)
+    r = client.post("/api/generate", json={
+        "source_asset_url": asset["url"],
+        "source_type": "image",
+        "source_asset_meta": {
+            "mode": "video_edit",
+            "portrait_generation_mode": True,
+            "subject_mode": "portrait",
+        },
+        "category": "video",
+        "stage": "preview",
+        "prompt": {"final_text": "rebuild target video style with the uploaded person"},
+        "params": {
+            "duration": 5,
+            "resolution": "720p",
+            "ratio": "9:16",
+            "subject_mode": "portrait",
+            "character_reference_image": asset["url"],
+        },
+    }, headers=h)
+    assert r.status_code == 200, r.text
+    assert seen["character_reference_image"].startswith("data:image/jpeg;base64,")
+    assert seen["first_frame_image"].startswith("data:image/jpeg;base64,")
+    assert seen["last_frame_image"] == seen["first_frame_image"]
+    assert seen["_portrait_locked"] is True
 
 
 def test_uploaded_image_final_video_uses_data_uri_first_frame(client, make_user, auth, monkeypatch):

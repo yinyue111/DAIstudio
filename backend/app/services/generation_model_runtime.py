@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 from ..models import GenTask
 from . import gateway
+from .generation_pricing import snapshot_credit_pricing
 from .model_gateway_config import (
     RuntimeGatewayConfig,
     gateway_key_fingerprint,
@@ -19,11 +20,13 @@ class ModelSnapshotMismatchError(RuntimeError):
 
 def model_snapshot(model) -> dict:
     gateway_cfg = runtime_config_for_model(model, getattr(model, "use", None))
+    extra = dict(model.extra or {})
+    extra["credit_pricing"] = snapshot_credit_pricing(extra)
     return {
         "model_id": model.model_id,
         "cost_credits": int(model.cost_credits or 0),
         "unlock_cost": int(model.unlock_cost or 0),
-        "extra": model.extra or {},
+        "extra": extra,
         "provider": gateway_cfg.provider,
         "base_url": gateway_cfg.base_url,
         "gateway_format": gateway_cfg.gateway_format,

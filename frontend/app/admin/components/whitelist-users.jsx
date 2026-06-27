@@ -83,12 +83,13 @@ export function Users() {
       setGranting(null);
       return;
     }
-    const signature = `${uid}:${amount}:${note}`;
-    const existing = grantKeys[uid];
-    const idempotencyKey = existing?.signature === signature ? existing.key : crypto.randomUUID();
-    setGrantKeys((prev) => ({ ...prev, [uid]: { signature, key: idempotencyKey } }));
     setMsg("");
     try {
+      const signature = `${uid}:${amount}:${note}`;
+      const existing = grantKeys[uid];
+      const freshKey = window.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+      const idempotencyKey = existing?.signature === signature ? existing.key : freshKey;
+      setGrantKeys((prev) => ({ ...prev, [uid]: { signature, key: idempotencyKey } }));
       await api.adminGrant({
         user_id: uid,
         amount,

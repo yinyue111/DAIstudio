@@ -239,3 +239,41 @@ def test_0011_reports_needs_review_duplicate_active_final_tasks_before_reindex()
         )
         with pytest.raises(RuntimeError, match="task_ids=201,202"):
             migration._fail_on_duplicate_active_finals(conn, "sqlite")
+
+
+def test_0022_preserves_existing_sqlite_json_string_extra(monkeypatch):
+    path = Path(__file__).resolve().parents[1] / "alembic/versions/0022_credit_pricing_defaults.py"
+    spec = importlib.util.spec_from_file_location("migration_0022", path)
+    migration = importlib.util.module_from_spec(spec)
+    assert spec and spec.loader
+    spec.loader.exec_module(migration)
+
+    engine = sa.create_engine("sqlite:///:memory:")
+    meta = sa.MetaData()
+    model_configs = sa.Table(
+        "model_configs",
+        meta,
+        sa.Column("id", sa.Integer, primary_key=True),
+        sa.Column("use", sa.String, unique=True),
+        sa.Column("model_id", sa.String),
+        sa.Column("cost_credits", sa.Integer),
+        sa.Column("unlock_cost", sa.Integer),
+        sa.Column("extra", sa.Text),
+    )
+    meta.create_all(engine)
+    with engine.begin() as conn:
+        conn.execute(
+            model_configs.insert().values(
+                use="video",
+                model_id="custom-video",
+                cost_credits=99,
+                unlock_cost=7,
+                extra='{"submit_path": "/custom/submit", "preview_cost": 5}',
+            )
+        )
+        monkeypatch.setattr(migration.op, "get_bind", lambda: conn)
+        migration._ensure_model_defaults("video", 16, unlock_cost=0, preview_cost=15)
+        row = conn.execute(sa.text("SELECT cost_credits, unlock_cost, extra FROM model_configs")).first()
+    assert row[0] == 99
+    assert row[1] == 7
+    assert row[2] == '{"submit_path": "/custom/submit", "preview_cost": 5}'

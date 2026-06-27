@@ -15,6 +15,7 @@ from ..services.config_store import (
     get_bool_setting,
     get_setting,
 )
+from ..services.generation_pricing import public_pricing_config
 from ..services.image_options import IMAGE_SIZES
 from ..services.model_gateway_config import runtime_config_for_model
 from ..services.video_analysis import (
@@ -41,6 +42,7 @@ def get_config(db: Session = Depends(get_db), _: User = Depends(get_current_user
         }
         for m in all_models
     }
+    pricing = public_pricing_config()
     vision_cost = int(models.get("vision", {}).get("cost_credits") or 0)
     gateway_modes = {}
     for m in all_models:
@@ -54,6 +56,7 @@ def get_config(db: Session = Depends(get_db), _: User = Depends(get_current_user
             "payment_enabled": get_bool_setting(db, "payment_enabled", False),
         },
         "models": models,
+        "pricing": pricing,
         "image_sizes": list(IMAGE_SIZES),
         "image_size_max_dim": settings.max_image_dim,
         "image_n_max": settings.max_image_n,
@@ -61,11 +64,11 @@ def get_config(db: Session = Depends(get_db), _: User = Depends(get_current_user
         "max_upload_video_bytes": settings.max_upload_video_bytes,
         "video_duration_max_seconds": settings.max_video_seconds,
         "reverse": {
-            "image_cost": vision_cost,
+            "image_cost": pricing["reverse"]["image_cost"],
             "video_default_preset": DEFAULT_VIDEO_ANALYSIS_PRESET,
             "video_frame_count": max_frame_count(DEFAULT_VIDEO_ANALYSIS_PRESET),
-            "video_max_cost": vision_cost * max_frame_count(DEFAULT_VIDEO_ANALYSIS_PRESET),
-            "video_presets": preset_options(vision_cost),
+            "video_max_cost": pricing["reverse"]["video_preset_costs"].get(DEFAULT_VIDEO_ANALYSIS_PRESET, vision_cost),
+            "video_presets": preset_options(vision_cost, pricing["reverse"]["video_preset_costs"]),
         },
         "mock_mode": settings.effective_mock_mode,
         "gateways": {

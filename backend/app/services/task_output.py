@@ -8,7 +8,37 @@ from ..models import GenAsset, GenTask
 from ..schemas import TaskOut
 from .asset_output import to_asset_out
 from .generation import is_terminal_status
+from .generation_pricing import generation_cost_from_snapshot
 from .progress import get_progress
+
+_PUBLIC_PARAM_KEYS = {
+    "n",
+    "size",
+    "duration",
+    "target_duration",
+    "resolution",
+    "target_resolution",
+    "ratio",
+    "reference_width",
+    "reference_height",
+    "subject_mode",
+}
+
+
+def _public_params(task: GenTask) -> dict:
+    params = task.params or {}
+    return {k: v for k, v in params.items() if k in _PUBLIC_PARAM_KEYS}
+
+
+def _task_out_base(task: GenTask) -> TaskOut:
+    original_params = task.params
+    if original_params is not None:
+        return TaskOut.model_validate(task)
+    task.params = {}
+    try:
+        return TaskOut.model_validate(task)
+    finally:
+        task.params = original_params
 
 
 def _progress_for(task: GenTask) -> int:
@@ -39,6 +69,20 @@ def _set_final_summary(out: TaskOut, final_task: GenTask | None, asset_count: in
     out.final_asset_count = int(asset_count or 0)
 
 
+def _set_final_cost_estimate(out: TaskOut, task: GenTask) -> None:
+    if task.category != "video" or task.stage != "preview":
+        return
+    snapshot = (task.params or {}).get("_model_snapshot") or {}
+    out.final_cost_estimate = generation_cost_from_snapshot(
+        snapshot,
+        category="video",
+        stage="final",
+        params=task.params or {},
+        n=1,
+        source_type=task.source_type,
+    )
+
+
 def _prefer_final_task(current: GenTask | None, candidate: GenTask) -> GenTask:
     preferred_statuses = {"queued", "running", "needs_review", "succeeded"}
     if current is None:
@@ -58,10 +102,12 @@ def build_task_out(db: Session, task: GenTask) -> TaskOut:
             select(GenAsset).where(GenAsset.task_id == task.id).order_by(GenAsset.id)
         ).scalars()
     )
-    out = TaskOut.model_validate(task)
-    out.assets = [to_asset_out(db, a) for a in assets]
+    out = _task_out_base(task)
+    out.params = _public_params(task)
+    out.assets = [to_asset_out(db, a, task=task) for a in assets]
     out.progress = _progress_for(task)
     _decorate_partial(out, task)
+    _set_final_cost_estimate(out, task)
     if task.category == "video" and task.stage == "preview":
         final_tasks = list(db.execute(
             select(GenTask)
@@ -133,10 +179,12 @@ def build_task_outs(db: Session, tasks: list[GenTask]) -> list[TaskOut]:
                 final_asset_counts[task_id] = final_asset_counts.get(task_id, 0) + 1
     outs: list[TaskOut] = []
     for t in tasks:
-        out = TaskOut.model_validate(t)
-        out.assets = [to_asset_out(db, a) for a in by_task.get(t.id, [])]
+        out = _task_out_base(t)
+        out.params = _public_params(t)
+        out.assets = [to_asset_out(db, a, task=t) for a in by_task.get(t.id, [])]
         out.progress = _progress_for(t)
         _decorate_partial(out, t)
+        _set_final_cost_estimate(out, t)
         _set_final_summary(
             out,
             final_by_parent.get(t.id),

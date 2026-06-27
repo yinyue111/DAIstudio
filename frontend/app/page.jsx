@@ -26,6 +26,9 @@ import {
   buildSourceAssetMeta,
   composePromptFromStructured,
   composeStyleTransferPrompt,
+  estimateImageCredits,
+  estimateVideoFinalCredits,
+  estimateVideoPreviewCredits,
   formatDuration,
   imageSizeFor,
   isRequestTimeoutError,
@@ -51,6 +54,7 @@ const EDIT_STYLE_KEYS = {
 const EDIT_PROMPT_CHIPS = [
   "保留品牌标识",
   "包装文字逐字保留",
+  "保留人像身份",
   "强化产品卖点",
   "产品边缘自然融入场景",
   "干净商业广告质感",
@@ -100,6 +104,27 @@ const PRODUCT_EDIT_NEGATIVE = [
   "边缘糊化",
 ];
 
+const PORTRAIT_EDIT_NEGATIVE = [
+  "换脸失败",
+  "五官变形",
+  "脸型变化",
+  "身份不一致",
+  "年龄变化",
+  "性别变化",
+  "肤色漂移",
+  "发型错误",
+  "头发边缘糊化",
+  "眼睛不对称",
+  "表情僵硬",
+  "手指畸形",
+  "肢体畸形",
+  "多余人物",
+  "人物消失",
+  "主体被替换",
+  "脸部低清",
+  "面部涂抹感",
+];
+
 function creationModeLabel(mode) {
   return CREATION_MODES.find((item) => item.key === mode)?.label || "生成";
 }
@@ -109,6 +134,7 @@ function createWorkspaceState() {
     prompt: "",
     negative: "",
     imageEditProductMode: false,
+    editSubjectMode: "general",
     ratio: "1:1",
     imageQuality: "1k",
     n: 4,
@@ -186,6 +212,7 @@ export default function Home() {
     prompt,
     negative,
     imageEditProductMode,
+    editSubjectMode,
     ratio,
     imageQuality,
     n,
@@ -208,7 +235,13 @@ export default function Home() {
   const category = creationMode === "video" || creationMode === "video_edit" ? "video" : "image";
   const isEditMode = creationMode === "image_edit" || creationMode === "video_edit";
   const isImageEditMode = creationMode === "image_edit";
-  const productGenerationMode = isImageEditMode && imageEditProductMode;
+  const subjectMode = creationMode === "video_edit"
+    ? (editSubjectMode === "portrait" ? "portrait" : "product")
+    : imageEditProductMode
+      ? (editSubjectMode === "portrait" ? "portrait" : "product")
+      : "general";
+  const productGenerationMode = subjectMode === "product";
+  const portraitGenerationMode = subjectMode === "portrait";
 
   function updateWorkspaceField(field, valueOrUpdater, mode = creationMode) {
     setWorkspaces((prev) => {
@@ -243,6 +276,10 @@ export default function Home() {
   const setPrompt = (value) => updateWorkspaceField("prompt", value);
   const setNegative = (value) => updateWorkspaceField("negative", value);
   const setImageEditProductMode = (value) => updateWorkspaceField("imageEditProductMode", value);
+  const setEditSubjectMode = (value) => {
+    updateWorkspaceField("editSubjectMode", value);
+    if (creationMode === "image_edit") updateWorkspaceField("imageEditProductMode", value !== "general");
+  };
   const setRatio = (value) => updateWorkspaceField("ratio", value);
   const setImageQuality = (value) => updateWorkspaceField("imageQuality", value);
   const setN = (value) => updateWorkspaceField("n", value);
@@ -344,21 +381,22 @@ export default function Home() {
     const active = (list || []).find((item) => (
       item
       && !isTerminalTaskStatus(item.status)
-      && item.category === "video"
+      && (item.category === "video" || item.category === "image")
     ));
     if (!active) return;
-    setCreationMode("video");
+    setCreationMode(active.category === "video" ? "video" : "image");
     setTask(active);
     setFinalTaskId(active.stage === "final" ? active.id : null);
     setTrackingLost(false);
     const dims = assetDims(active.assets?.[0]);
+    const activeRatioOptions = active.category === "video" ? videoRatioOptions() : RATIOS;
     const activeRatio = dims
-      ? ratioOptions.find((r) => r.key === nearestRatio(dims.width, dims.height, ratioOptions))
+      ? activeRatioOptions.find((r) => r.key === nearestRatio(dims.width, dims.height, activeRatioOptions))
       : null;
     setRunningSnapshot({
       category: active.category,
-      n: 1,
-      ratio: activeRatio || ratioOptions[0],
+      n: active.category === "image" ? Number(active.requested_count || active.params?.n || 1) : 1,
+      ratio: activeRatio || activeRatioOptions[0],
     });
     startTracking(active.id);
   }
@@ -469,7 +507,12 @@ export default function Home() {
     while (current?.status === "queued" || current?.status === "running") {
       if (!isRefVersionCurrent(mode, refVersion)) return null;
       if (Date.now() - startedAt > PARSE_POLL_TIMEOUT_MS) {
-        throw new Error("抓取仍在处理中，请稍后重试");
+        return {
+          ...current,
+          status: "running",
+          pending_timeout: true,
+          error: "抓取仍在后台处理中，稍后点击刷新或重新抓取会自动复用同一任务。",
+        };
       }
       await sleep(PARSE_POLL_INTERVAL_MS);
       if (!isRefVersionCurrent(mode, refVersion)) return null;
@@ -502,6 +545,10 @@ export default function Home() {
       const r = await waitForParseResult(first, refVersion, mode);
       if (!isRefVersionCurrent(mode, refVersion)) return;
       if (!r) return;
+      if (r.pending_timeout) {
+        setMsg(r.error || "抓取仍在后台处理中，稍后刷新。");
+        return;
+      }
       if (r.status === "failed") throw new Error(r.error || "抓取失败，请稍后重试或更换链接");
       if (r.status !== "done") throw new Error("抓取状态异常，请稍后重试");
       setWorkspacePatch({ assets: r.assets || [] }, mode);
@@ -612,11 +659,11 @@ export default function Home() {
       if (videoUploadInputRef.current) videoUploadInputRef.current.value = "";
       return;
     }
-    const reqId = bumpRequest(uploadRequestRef, mode);
+    const reqId = bumpRequest(uploadRequestRef, targetMode);
     const refVersion = bumpRefVersion(targetMode);
     bumpRequest(reverseRequestRef, targetMode);
     setMsg("");
-    setWorkspacePatch({ uploading: true }, mode);
+    setWorkspacePatch({ uploading: true }, targetMode);
     try {
       const uploaded = await api.uploadVideo(file);
       if (!isRefVersionCurrent(targetMode, refVersion)) return;
@@ -634,10 +681,10 @@ export default function Home() {
       if (targetMode !== mode) setCreationMode(targetMode);
       setRefOpen(true);
     } catch (e) {
-      if (isRefVersionCurrent(targetMode, refVersion) && isModeVisible(mode)) setMsg(e.message);
+      if (isRefVersionCurrent(targetMode, refVersion) && isModeVisible(targetMode)) setMsg(e.message);
     } finally {
-      if (isRequestCurrent(uploadRequestRef, mode, reqId)) {
-        setWorkspacePatch({ uploading: false }, mode);
+      if (isRequestCurrent(uploadRequestRef, targetMode, reqId)) {
+        setWorkspacePatch({ uploading: false }, targetMode);
         if (videoUploadInputRef.current) videoUploadInputRef.current.value = "";
       }
     }
@@ -736,13 +783,28 @@ export default function Home() {
     setPromptDirty(false);
   }
 
-  function productEditPrompt(baseText, { video = false, hasStyleReference = false, generalEdit = false } = {}) {
+  function productEditPrompt(baseText, {
+    video = false,
+    hasStyleReference = false,
+    generalEdit = false,
+    subject = "product",
+  } = {}) {
     const base = String(baseText || "").trim() || "生成同风格商业素材";
+    const isPortrait = subject === "portrait";
     const styleScope = hasStyleReference
-      ? "风格参考只用于迁移场景、构图、镜头语言、光线、色调、材质、广告质感和氛围；不要迁移风格参考里的主体、人物、商品、品牌、Logo、包装、文字水印或促销文案。"
+      ? (isPortrait
+          ? "风格参考只用于迁移场景、构图、镜头语言、光线、色调、服化道、广告质感、氛围和动作节奏；不要迁移风格参考里的人脸身份、五官、具体人物、品牌、Logo、文字水印或促销文案。"
+          : "风格参考只用于迁移场景、构图、镜头语言、光线、色调、材质、广告质感和氛围；不要迁移风格参考里的主体、人物、商品、品牌、Logo、包装、文字水印或促销文案。")
       : "";
     if (generalEdit) {
       return `以用户上传的图片作为唯一编辑源，严格按照用户提示词执行局部或整体编辑；保留未被要求修改的主体、构图、Logo、文字、颜色、比例和关键细节，不要无故替换主体或品牌。${styleScope}编辑要求：${base}`;
+    }
+    if (isPortrait) {
+      const guard = video
+        ? "以用户上传的人像照片作为唯一人物身份参考和主体身份锁定，目标视频/风格参考只用于迁移镜头语言、动作节奏、场景、服化道、光线、色调和广告质感；必须保持同一个人的脸型、五官比例、发型特征、肤色、年龄感、性别、体态和可识别身份，不替换、不混合、不把参考视频里的人物身份迁移过来；"
+        : "以用户上传的人像照片作为唯一人物身份和编辑源，必须保持同一个人的脸型、五官比例、发型特征、肤色、年龄感、性别、体态和可识别身份；只迁移参考素材的场景、构图、光线、色调、妆造氛围、广告质感和画面风格，不替换、不混合、不重绘成另一个人；";
+      const fidelity = "人脸必须清晰自然，眼睛、鼻子、嘴型、脸型轮廓、发际线和标志性特征保持一致；若风格迁移和人物身份保真冲突，优先保证人物身份、面部结构和自然表情完全稳定。";
+      return `${guard}${styleScope}${fidelity}生成高质量人像/商业视觉素材。迁移要求：${base}`;
     }
     const guard = video
       ? "以用户上传的产品主体图作为视频首帧和唯一产品身份参考，必须完整保留产品主体、Logo、包装、颜色、形状、材质、比例、文字标识和品牌身份；产品表面像素视为锁定图层，不替换、不重绘、不改款、不改品牌；"
@@ -751,7 +813,7 @@ export default function Home() {
     return `${guard}${styleScope}${fidelity}生成广告级商业素材。迁移要求：${base}`;
   }
 
-  function mergedNegativePrompt(value, { productMode = false } = {}) {
+  function mergedNegativePrompt(value, { productMode = false, portraitMode = false } = {}) {
     const parts = String(value || "")
       .split(/[,，、\n]/)
       .map((item) => item.trim())
@@ -761,6 +823,7 @@ export default function Home() {
     for (const item of [
       ...EDIT_PROTECTION_NEGATIVE,
       ...(productMode ? PRODUCT_EDIT_NEGATIVE : []),
+      ...(portraitMode ? PORTRAIT_EDIT_NEGATIVE : []),
     ]) {
       if (!seen.has(item.toLowerCase())) parts.push(item);
     }
@@ -821,6 +884,22 @@ export default function Home() {
     }
   }
 
+  function mergeFinalSummaryIntoPreview(finalTask) {
+    if (!finalTask?.parent_task_id) return false;
+    let merged = false;
+    setTask((current) => {
+      if (!current || current.id !== finalTask.parent_task_id) return current;
+      merged = true;
+      return {
+        ...current,
+        final_task_id: finalTask.id,
+        final_status: finalTask.status,
+        final_asset_count: finalTask.assets?.length || finalTask.final_asset_count || 0,
+      };
+    });
+    return merged;
+  }
+
   async function submit(stage = "preview") {
     if (submitting) return;  // reentrancy guard: protects every caller incl. double-clicks + Ctrl+Enter
     if (shouldBlockNewGeneration(task, category)) {
@@ -849,14 +928,25 @@ export default function Home() {
         setMsg(`${effCategory === "video" ? "视频" : "图片"}模型未启用，请联系管理员配置后再使用。`);
         return;
       }
+      const parentParams = isFinal ? (task?.params || {}) : {};
+      const finalRatioKey = parentParams.target_ratio || parentParams.ratio || ratio;
+      const finalResolution = parentParams.target_resolution || parentParams.resolution || vResolution;
+      const finalDuration = parentParams.target_duration || parentParams.duration || vDuration;
       const ratioPool = effCategory === "video" ? videoRatioOptions() : RATIOS;
-      const rt = ratioPool.find((r) => r.key === ratio) || ratioPool[0];
+      const rt = ratioPool.find((r) => r.key === finalRatioKey) || ratioPool[0];
       const imageSize = imageSizeFor(rt, imageQuality, cfg?.image_size_max_dim || 4096);
       const sourceAsset = isFinal ? null : (isEditMode ? productAsset : selected);
       const dims = sourceAsset ? assetDims(sourceAsset) : null;
       const refImage = sourceAsset ? (sourceAsset.type === "video" ? sourceAsset.thumb : sourceAsset.url) : null;
       const styleReferenceUrl = isEditMode && selected ? (selected.type === "video" ? selected.thumb : selected.url) : null;
-      const editNegative = mergedNegativePrompt(negative, { productMode: productGenerationMode || creationMode === "video_edit" });
+      const effectiveSubjectMode = isEditMode ? subjectMode : "";
+      const effectivePortraitMode = effectiveSubjectMode === "portrait";
+      const effectiveProductMode = effectiveSubjectMode === "product";
+      const subjectModeParam = effectivePortraitMode || effectiveProductMode ? effectiveSubjectMode : "";
+      const editNegative = mergedNegativePrompt(negative, {
+        productMode: effectiveProductMode,
+        portraitMode: effectivePortraitMode,
+      });
       const styleSignature = assetSignature(selected);
       const effectiveStructured = (
         structuredSource && structuredSource !== styleSignature
@@ -876,7 +966,8 @@ export default function Home() {
         ? productEditPrompt(baseFinalText, {
           video: effCategory === "video",
           hasStyleReference: Boolean(selected),
-            generalEdit: creationMode === "image_edit" && !productGenerationMode,
+          generalEdit: creationMode === "image_edit" && !productGenerationMode,
+          subject: effectiveSubjectMode,
           })
         : baseFinalText;
       // image reference chosen but not reversed -> send an instruction so the
@@ -887,7 +978,9 @@ export default function Home() {
       const sourceAssetMeta = sourceAsset ? {
         ...buildSourceAssetMeta(sourceAsset),
         mode: creationMode,
-        product_generation_mode: productGenerationMode || creationMode === "video_edit",
+        product_generation_mode: effectiveProductMode,
+        portrait_generation_mode: effectivePortraitMode,
+        ...(subjectModeParam ? { subject_mode: subjectModeParam } : {}),
         style_reference: selected ? buildSourceAssetMeta(selected) : null,
         product_subject: productAsset ? buildSourceAssetMeta(productAsset) : null,
       } : null;
@@ -911,16 +1004,20 @@ export default function Home() {
                 ...(dims ? { reference_width: dims.width, reference_height: dims.height } : {}),
                 ...(seed !== "" ? { seed: Number(seed) } : {}),
                 ...(styleReferenceUrl ? { style_reference_image: styleReferenceUrl } : {}),
+                ...(effectivePortraitMode && refImage ? { character_reference_image: refImage } : {}),
+                ...(subjectModeParam ? { subject_mode: subjectModeParam } : {}),
                 ...(editNegative ? { negative_prompt: editNegative } : {}),
               }
             : {
-                duration: boundedVideoDuration(vDuration, cfg?.video_duration_max_seconds || 900),
-                resolution: vResolution,
-                target_resolution: vResolution,
+                duration: boundedVideoDuration(finalDuration, cfg?.video_duration_max_seconds || 900),
+                resolution: finalResolution,
+                target_resolution: finalResolution,
                 ratio: rt.key,
                 ...(dims ? { reference_width: dims.width, reference_height: dims.height } : {}),
                 ...(refImage ? { reference_image_url: refImage } : {}),
                 ...(styleReferenceUrl ? { style_reference_image: styleReferenceUrl } : {}),
+                ...(effectivePortraitMode && refImage ? { character_reference_image: refImage } : {}),
+                ...(subjectModeParam ? { subject_mode: subjectModeParam } : {}),
                 ...(editNegative ? { negative_prompt: editNegative } : {}),
               },
       };
@@ -938,9 +1035,19 @@ export default function Home() {
       ) {
         backgroundTrackersRef.current.set(previousTask.id, startBackgroundTracking(previousTask.id));
       }
-      setTask(t);
-      if (stage === "preview") setFinalTaskId(null);
-      if (isFinal) setFinalTaskId(t.id);
+      if (isFinal && previousTask?.id === t.parent_task_id) {
+        setTask({
+          ...previousTask,
+          final_task_id: t.id,
+          final_status: t.status,
+          final_asset_count: t.assets?.length || 0,
+        });
+        setFinalTaskId(t.id);
+      } else {
+        setTask(t);
+        if (stage === "preview") setFinalTaskId(null);
+        if (isFinal) setFinalTaskId(t.id);
+      }
       setTrackingLost(false);
       setRunningSnapshot({
         category: effCategory,
@@ -992,7 +1099,10 @@ export default function Home() {
         if (terminal) {
           setTrackingLost(false);
           done = true;
-          api.task(id).then((t) => { if (activeIdRef.current === id) setTask(t); }).catch(() => {});
+          api.task(id).then((t) => {
+            if (activeIdRef.current !== id) return;
+            if (!mergeFinalSummaryIntoPreview(t)) setTask(t);
+          }).catch(() => {});
           refreshMe(); loadWorks();
           try { ws.close(); } catch (e) {}
         }
@@ -1056,13 +1166,13 @@ export default function Home() {
         fails = 0;
         if (activeIdRef.current !== id) return;
         if (isTerminalTaskStatus(t.status)) {
-          setTask({ ...t, progress: 100 });
+          if (!mergeFinalSummaryIntoPreview(t)) setTask({ ...t, progress: 100 });
           setTrackingLost(false);
           clearInterval(interval);
           if (pollRef.current === interval) pollRef.current = null;
           refreshMe(); loadWorks();
         } else {
-          setTask(t);
+          if (!mergeFinalSummaryIntoPreview(t)) setTask(t);
           setTrackingLost(false);
         }
       } catch (e) {
@@ -1148,9 +1258,7 @@ export default function Home() {
   const blockingGeneration = shouldBlockNewGeneration(task, category);
   const running = blockingGeneration;
   const showRunningProgress = activeNonTerminalTask && !trackingLost;
-  const unitCost = cfg?.models?.[category]?.cost_credits || 0;
-  const videoPreviewCost = cfg?.models?.video?.preview_cost ?? Math.max(1, Math.floor((cfg?.models?.video?.cost_credits || 0) / 10));
-  const videoFinalCost = cfg?.models?.video?.final_cost ?? cfg?.models?.video?.cost_credits ?? 0;
+  const videoPreviewCost = estimateVideoPreviewCredits(cfg);
   const reverseCost = cfg?.models?.vision?.cost_credits || 0;
   const reverseImageCost = cfg?.reverse?.image_cost ?? reverseCost;
   const reverseVideoPresets = Array.isArray(cfg?.reverse?.video_presets) ? cfg.reverse.video_presets : [];
@@ -1169,7 +1277,15 @@ export default function Home() {
   const maxVideoDuration = Number(cfg?.video_duration_max_seconds || 900);
   const videoDuration = boundedVideoDuration(vDuration, maxVideoDuration);
   const currentImageSize = imageSizeFor(rt, imageQuality, cfg?.image_size_max_dim || 4096);
-  const estCost = category === "image" ? unitCost * imageCount : videoPreviewCost;
+  const taskParams = task?.params || {};
+  const videoFinalCost = Number(task?.final_cost_estimate || 0)
+    || estimateVideoFinalCredits(cfg, {
+      resolution: taskParams.target_resolution || taskParams.resolution || vResolution,
+      duration: taskParams.target_duration || taskParams.duration || videoDuration,
+    });
+  const estCost = category === "image"
+    ? estimateImageCredits(cfg, { size: currentImageSize, count: imageCount, edit: isEditMode })
+    : videoPreviewCost;
   const currentModelEnabled = modelEnabled(creationMode);
   const currentGatewayMock = cfg?.gateways?.[category]?.mock_mode ?? cfg?.mock_mode;
   const gatewayStatus = cfg === null
@@ -1182,10 +1298,14 @@ export default function Home() {
 
   const promptPlaceholder = isEditMode
     ? (isImageEditMode
-        ? (productGenerationMode
+        ? (portraitGenerationMode
+            ? "描述要把这张人像生成成什么风格：证件照、写真、职业形象、小红书封面、广告场景、光线和妆造… 人物身份会强保护。⌘/Ctrl + Enter 生成"
+            : productGenerationMode
             ? "描述产品图要生成成什么商业素材：电商主图、小红书种草、广告场景、背景光线、卖点氛围… 产品身份会强保护。⌘/Ctrl + Enter 生成"
             : "描述要如何编辑这张图：替换背景、增加文案、调整光线、改变风格、保留主体细节… ⌘/Ctrl + Enter 生成")
-        : `${creationModeLabel(creationMode)}：先在右侧选择风格参考并反推，再上传产品主体图；这里可补充必须保留或强化的卖点…`)
+        : portraitGenerationMode
+          ? `${creationModeLabel(creationMode)}：先在右侧选择目标视频/风格参考并反推，再上传人物照片；这里可补充服装、动作、镜头和身份保留要求…`
+          : `${creationModeLabel(creationMode)}：先在右侧选择风格参考并反推，再上传产品主体图；这里可补充必须保留或强化的卖点…`)
     : category === "video"
       ? "描述你想要的视频：主体 / 动作 / 镜头运动 / 光线 / 节奏… ⌘/Ctrl + Enter 生成"
       : "描述你想要的画面：主体 / 风格 / 光线 / 色调 / 构图… ⌘/Ctrl + Enter 生成";
@@ -1193,13 +1313,13 @@ export default function Home() {
     .filter((key) => String(structured?.[key] || "").trim());
   const editReadySteps = isImageEditMode
     ? [
-        { label: productGenerationMode ? "产品图" : "编辑源", ready: Boolean(productAsset), readyText: "已上传", pendingText: "待上传" },
-        { label: productGenerationMode ? "生产要求" : "编辑要求", ready: Boolean(prompt.trim() || editStyleKeys.length), readyText: "已填写", pendingText: "待填写" },
+        { label: portraitGenerationMode ? "人像照片" : (productGenerationMode ? "产品图" : "编辑源"), ready: Boolean(productAsset), readyText: "已上传", pendingText: "待上传" },
+        { label: portraitGenerationMode ? "写真要求" : (productGenerationMode ? "生产要求" : "编辑要求"), ready: Boolean(prompt.trim() || editStyleKeys.length), readyText: "已填写", pendingText: "待填写" },
         { label: "风格参考", ready: Boolean(selected), readyText: "已选择", pendingText: "可选" },
       ]
     : [
-        { label: "风格参考", ready: Boolean(selected), readyText: "已选择", pendingText: "待选择" },
-        { label: "产品主体", ready: Boolean(productAsset), readyText: "已上传", pendingText: "待上传" },
+        { label: portraitGenerationMode ? "目标视频/风格" : "风格参考", ready: Boolean(selected), readyText: "已选择", pendingText: "待选择" },
+        { label: portraitGenerationMode ? "人物照片" : "产品主体", ready: Boolean(productAsset), readyText: "已上传", pendingText: "待上传" },
         { label: "风格提示", ready: Boolean(prompt.trim() || editStyleKeys.length), readyText: "已就绪", pendingText: "待补充" },
       ];
   const submitLabel = submitting || running
@@ -1209,7 +1329,7 @@ export default function Home() {
         : creationMode === "video_edit"
           ? "编辑视频 ▶"
         : creationMode === "image_edit"
-          ? (productGenerationMode ? "产品生成 ✦" : "编辑生成 ✦")
+          ? (portraitGenerationMode ? "人像生成 ✦" : productGenerationMode ? "产品生成 ✦" : "编辑生成 ✦")
           : "立即生成 ✦";
 
   function renderSubmitBar(variant = "desktop") {
@@ -1458,26 +1578,52 @@ export default function Home() {
                           <p className="text-xs font-display text-fog">编辑 Brief</p>
                           <h2 className="mt-1 text-xl font-display font-semibold text-snow">
                             {isImageEditMode
-                              ? (productGenerationMode ? "上传产品图生成商业素材" : "上传图片后按提示词编辑")
-                              : `${creationModeLabel(creationMode)}素材重构`}
+                              ? (portraitGenerationMode ? "上传人像生成同款风格写真" : productGenerationMode ? "上传产品图生成商业素材" : "上传图片后按提示词编辑")
+                              : (portraitGenerationMode ? "上传人物生成目标视频风格" : `${creationModeLabel(creationMode)}素材重构`)}
                           </h2>
                         </div>
                         <span className="badge bg-brand-soft text-snow">
-                          {category === "video" ? "视频编辑源" : (productGenerationMode ? "产品高保真" : "图片编辑源")}
+                          {category === "video" ? (portraitGenerationMode ? "人物重构" : "视频编辑源") : (portraitGenerationMode ? "人像高保真" : productGenerationMode ? "产品高保真" : "图片编辑源")}
                         </span>
                       </div>
                       {isImageEditMode && (
-                        <div className="mt-4 grid grid-cols-2 gap-2 rounded-xl border border-line bg-base/35 p-1">
+                        <div className="mt-4 grid grid-cols-3 gap-2 rounded-xl border border-line bg-base/35 p-1">
                           {[
                             { key: "general", label: "普通编辑", desc: "按提示修图" },
                             { key: "product", label: "产品生产", desc: "强保护Logo和包装" },
+                            { key: "portrait", label: "人像写真", desc: "强保护五官和身份" },
                           ].map((item) => {
-                            const active = item.key === (productGenerationMode ? "product" : "general");
+                            const active = item.key === subjectMode;
                             return (
                               <button
                                 key={item.key}
                                 type="button"
-                                onClick={() => setImageEditProductMode(item.key === "product")}
+                                onClick={() => setEditSubjectMode(item.key)}
+                                className={`rounded-lg px-3 py-2 text-left transition ${
+                                  active
+                                    ? "border border-aqua/50 bg-aqua/15 text-snow shadow-glow-sm"
+                                    : "border border-transparent text-fog hover:bg-white/[0.04] hover:text-mist"
+                                }`}
+                              >
+                                <span className="block text-sm font-display font-semibold">{item.label}</span>
+                                <span className="mt-0.5 block text-[11px] leading-snug">{item.desc}</span>
+                              </button>
+                            );
+                          })}
+                        </div>
+                      )}
+                      {!isImageEditMode && (
+                        <div className="mt-4 grid grid-cols-2 gap-2 rounded-xl border border-line bg-base/35 p-1">
+                          {[
+                            { key: "product", label: "产品视频", desc: "上传产品图做主体" },
+                            { key: "portrait", label: "人物重构", desc: "人像参考生成同款视频" },
+                          ].map((item) => {
+                            const active = item.key === subjectMode;
+                            return (
+                              <button
+                                key={item.key}
+                                type="button"
+                                onClick={() => setEditSubjectMode(item.key)}
                                 className={`rounded-lg px-3 py-2 text-left transition ${
                                   active
                                     ? "border border-aqua/50 bg-aqua/15 text-snow shadow-glow-sm"
@@ -1526,10 +1672,14 @@ export default function Home() {
                       />
                       <div className="mt-2 flex flex-wrap gap-1.5">
                         {(isImageEditMode
-                          ? (productGenerationMode
+                          ? (portraitGenerationMode
+                              ? ["保留人像身份", "同款光线和构图", "小红书封面写真", "职业形象照", "自然皮肤质感", "不改变五官"]
+                              : productGenerationMode
                               ? ["包装文字逐字保留", "保留包装和Logo", "生成电商主图", "小红书产品种草图", "替换广告场景", "产品边缘自然融入"]
                               : ["替换为干净棚拍背景", "保留主体和Logo", "增加商业广告光感", "调整为小红书封面", "去除杂乱背景"])
-                          : EDIT_PROMPT_CHIPS
+                          : (portraitGenerationMode
+                              ? ["保留人物身份", "参考视频动作节奏", "同款镜头语言", "保留五官和发型", "自然面部表情", "不迁移参考人物长相"]
+                              : EDIT_PROMPT_CHIPS)
                         ).map((ex) => (
                           <button
                             key={ex}
@@ -1555,7 +1705,13 @@ export default function Home() {
                         <p className="text-xs font-display font-medium text-mist">迁移规则</p>
                         <div className="mt-3 space-y-2">
                           {(isImageEditMode
-                            ? (productGenerationMode
+                            ? (portraitGenerationMode
+                                ? [
+                                    ["锁定人物身份", "五官、脸型、发型、肤色和年龄感不变"],
+                                    ["迁移参考风格", "只迁移场景、构图、光线、妆造和画面质感"],
+                                    ["高保真人像", "脸部清晰自然，避免变成参考图里的人"],
+                                  ]
+                                : productGenerationMode
                                 ? [
                                     ["锁定产品身份", "SKU、Logo、包装结构、品牌色和表面文字不改"],
                                     ["迁移商业场景", "只生成背景、道具、构图、光线和广告质感"],
@@ -1566,11 +1722,17 @@ export default function Home() {
                                     ["保留源图细节", "主体、Logo、文字和比例默认保持"],
                                     ["可选参考增强", "可用右侧参考图迁移光线、构图和质感"],
                                   ])
-                            : [
-                                ["保留产品身份", "Logo、包装、颜色和形状不漂移"],
-                                ["迁移参考气质", "只迁移场景、构图、光线和广告质感"],
-                                ["输出商业素材", "产品清晰，边缘自然融入新场景"],
-                              ]
+                            : (portraitGenerationMode
+                                ? [
+                                    ["人物重构目标", "上传人像作为唯一身份参考"],
+                                    ["迁移视频风格", "参考视频只提供动作、镜头、场景和节奏"],
+                                    ["能力边界", "当前为人物参考驱动重构，非逐帧换脸"],
+                                  ]
+                                : [
+                                    ["保留产品身份", "Logo、包装、颜色和形状不漂移"],
+                                    ["迁移参考气质", "只迁移场景、构图、光线和广告质感"],
+                                    ["输出商业素材", "产品清晰，边缘自然融入新场景"],
+                                  ])
                           ).map(([title, desc]) => (
                             <div key={title} className="rounded-xl border border-line bg-base/35 px-3 py-2">
                               <p className="text-sm font-display font-medium text-snow">{title}</p>
@@ -1657,6 +1819,7 @@ export default function Home() {
                 category={category}
                 creationMode={creationMode}
                 imageEditProductMode={imageEditProductMode}
+                editSubjectMode={subjectMode}
                 isEditMode={isEditMode}
                 selected={selected}
                 productAsset={productAsset}

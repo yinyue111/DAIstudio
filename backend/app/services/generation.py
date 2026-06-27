@@ -10,6 +10,7 @@ ordinary submit, poll, and download failures refund the frozen credits.
 from __future__ import annotations
 
 import logging
+import re
 import time
 from datetime import datetime, timezone
 from uuid import uuid4
@@ -47,8 +48,10 @@ from .generation_model_runtime import poll_video_with_model_config as _poll_vide
 from .generation_model_runtime import (
     submit_video_with_model_config as _submit_video_with_model_config,
 )
+from .generation_pricing import generation_cost_from_snapshot
 from .generation_state import (
     NEEDS_REVIEW,
+    LocalVideoSettlementError,
     VideoResultValidationError,
     claim_terminal,
     is_terminal_status,
@@ -72,7 +75,7 @@ from .generation_video_flow import poll_chain_alive as _poll_chain_alive
 from .generation_video_flow import reset_poll_errors as _reset_poll_errors
 from .generation_video_flow import unlink_keys as _unlink_keys
 from .generation_video_flow import video_download_alive as _video_download_alive
-from .model_pricing import estimate_credits_from_usage, usage_from_response
+from .model_pricing import usage_from_response
 from .progress import set_progress
 from .watermark import image_ext, make_image_preview, make_model_reference
 
@@ -88,10 +91,38 @@ PRODUCT_FIDELITY_GUARD = (
     "删减、重排、风格化、模糊或替换。只允许改变背景、台面、道具、光线、构图、阴影和广告质感；"
     "如风格迁移与产品保真冲突，优先保证产品和包装文字不变。"
 )
+PORTRAIT_FIDELITY_GUARD = (
+    "人像高保真硬约束：上传人像照片是唯一人物身份来源，必须完整保留同一个人的脸型、五官比例、"
+    "眼睛、鼻子、嘴型、发际线、发型特征、肤色、年龄感、性别、体态和可识别身份；不得替换成参考"
+    "素材中的人物，不得混合两个人的长相，不得改变面部结构、年龄、性别或关键身份特征。只允许迁移"
+    "参考素材的场景、构图、光线、色调、服化道、动作节奏、镜头语言和广告质感；如风格迁移与人物"
+    "身份保真冲突，优先保证人物身份、面部结构和自然表情稳定。"
+)
+GENERATION_PROMPT_MIN_CHARS = 1000
+GENERATION_PROMPT_MAX_CHARS = 1500
+_GENERATION_PROMPT_KEEP_KEYS = (
+    "图像类型", "反推重点", "主体", "人物比例", "身材体态", "妆发五官",
+    "商品服装", "细节特征", "场景背景", "广告目标", "风格", "构图", "景别",
+    "视角镜头", "视角构图", "主体动作", "镜头运动", "剪辑节奏", "时序分镜",
+    "光线", "色调配色", "材质纹理", "文字版式", "氛围情绪", "后期质感",
+    "平台质感", "一致性约束", "标签",
+)
+_GENERATION_PROMPT_DROP_KEYS = {"身材曲线", "尺码三围", "露肤度", "负向"}
+_GENERATION_PROMPT_SENSITIVE_PATTERNS = (
+    (re.compile(r"尺码三围[:：]?\s*[^；。,\n]*[；。,\n]?"), ""),
+    (re.compile(r"身材曲线[:：]?\s*[^；。,\n]*[；。,\n]?"), ""),
+    (re.compile(r"露肤度[:：]?\s*[^；。,\n]*[；。,\n]?"), ""),
+    (re.compile(r"胸围/腰围/臀围|胸围|腰围|臀围|三围|罩杯|性感化"), "体态比例"),
+    (re.compile(r"高露肤|大面积露肤|裸露|半裸|暴露|低胸|透视装|性感"), "自然得体"),
+    (re.compile(r"画面百分比坐标|百分比坐标"), "画面位置"),
+    (re.compile(r"\d{1,3}(?:\.\d+)?\s*[%％]"), ""),
+    (re.compile(r"#[0-9A-Fa-f]{6}"), ""),
+    (re.compile(r"\s+"), " "),
+)
 
 __all__ = ["ModelSnapshotMismatchError", "NEEDS_REVIEW", "TaskLockedError",
-           "admin_settle_needs_review_task", "admin_settle_needs_review_video",
-           "assert_model_snapshot_compatible",
+    "admin_settle_needs_review_task", "admin_settle_needs_review_video",
+           "assert_model_snapshot_compatible", "LocalVideoSettlementError",
            "claim_terminal", "is_terminal_status", "model_snapshot", "poll_video_once",
            "resume_stuck_videos", "run_image_task", "run_video_download_task",
            "start_video_task"]
@@ -108,13 +139,162 @@ def _is_product_generation_task(task: GenTask) -> bool:
     return str(trace.get("product_generation_mode")).lower() in {"true", "1", "yes"}
 
 
+def _is_portrait_generation_task(task: GenTask) -> bool:
+    params = task.params or {}
+    if str(params.get("subject_mode") or "").lower() == "portrait":
+        return True
+    trace = params.get("_source_trace")
+    if not isinstance(trace, dict):
+        return False
+    return (
+        str(trace.get("portrait_generation_mode")).lower() in {"true", "1", "yes"}
+        or str(trace.get("subject_mode") or "").lower() == "portrait"
+    )
+
+
 def _product_fidelity_prompt(prompt: str, task: GenTask) -> str:
+    if _is_portrait_generation_task(task):
+        text = str(prompt or "")
+        if "人像高保真硬约束" in text:
+            return text
+        return f"{PORTRAIT_FIDELITY_GUARD}{text}"
     if not _is_product_generation_task(task):
         return prompt
     text = str(prompt or "")
     if "产品高保真硬约束" in text:
         return text
     return f"{PRODUCT_FIDELITY_GUARD}{text}"
+
+
+def _normalise_prompt_fragment(value) -> str:
+    text = str(value or "").strip()
+    if not text or text in {"无", "未见", "不确定", "不适用"}:
+        return ""
+    for pattern, replacement in _GENERATION_PROMPT_SENSITIVE_PATTERNS:
+        text = pattern.sub(replacement, text)
+    return re.sub(r"\s+", " ", text).strip(" ,，;；。")
+
+
+def _structured_generation_prompt(prompt_obj: dict, fallback: str) -> str:
+    parts: list[str] = []
+    for key in _GENERATION_PROMPT_KEEP_KEYS:
+        value = prompt_obj.get(key)
+        fragment = _normalise_prompt_fragment(value)
+        if fragment:
+            parts.append(f"{key}: {fragment}")
+    for key, value in prompt_obj.items():
+        if key in _GENERATION_PROMPT_KEEP_KEYS or key in _GENERATION_PROMPT_DROP_KEYS:
+            continue
+        if key in {"final_text", "instruction", "negative", "negative_prompt"}:
+            continue
+        fragment = _normalise_prompt_fragment(value)
+        if fragment:
+            parts.append(f"{key}: {fragment}")
+    base = "；".join(parts)
+    if not base:
+        base = _normalise_prompt_fragment(fallback)
+    return base
+
+
+def _trim_generation_prompt(text: str, *, max_chars: int = GENERATION_PROMPT_MAX_CHARS) -> str:
+    value = _normalise_prompt_fragment(text)
+    if len(value) <= max_chars:
+        return value
+    sentences = re.split(r"(?<=[。；;.!?！？])", value)
+    out = ""
+    for sentence in sentences:
+        sentence = sentence.strip()
+        if not sentence:
+            continue
+        if len(out) + len(sentence) > max_chars:
+            break
+        out += sentence
+    if len(out) >= GENERATION_PROMPT_MIN_CHARS:
+        return out.strip()
+    return value[:max_chars].rstrip(" ,，;；。")
+
+
+def _is_portrait_prompt(prompt_obj: dict, params: dict | None) -> bool:
+    subject_mode = str((params or {}).get("subject_mode") or "").lower()
+    image_type = str(prompt_obj.get("图像类型") or "")
+    source_trace = (params or {}).get("_source_trace")
+    trace_mode = ""
+    if isinstance(source_trace, dict):
+        trace_mode = str(source_trace.get("subject_mode") or "").lower()
+    return subject_mode == "portrait" or trace_mode == "portrait" or "人物" in image_type
+
+
+def _is_product_prompt(prompt_obj: dict, params: dict | None) -> bool:
+    subject_mode = str((params or {}).get("subject_mode") or "").lower()
+    image_type = str(prompt_obj.get("图像类型") or "")
+    source_trace = (params or {}).get("_source_trace")
+    trace_mode = ""
+    if isinstance(source_trace, dict):
+        trace_mode = str(source_trace.get("subject_mode") or "").lower()
+    return subject_mode == "product" or trace_mode == "product" or "产品" in image_type
+
+
+def _compact_generation_prompt_text(
+    prompt_obj: dict,
+    params: dict | None,
+    fallback: str,
+    *,
+    is_portrait: bool | None = None,
+    is_product: bool | None = None,
+) -> str:
+    source = _structured_generation_prompt(prompt_obj, fallback)
+    if not source:
+        source = str(fallback or "")
+    portrait = _is_portrait_prompt(prompt_obj, params) if is_portrait is None else is_portrait
+    product = _is_product_prompt(prompt_obj, params) if is_product is None else is_product
+    prefix = (
+        "生成版提示词：参考图复刻，保留主体身份、构图关系、光线方向、色调、场景和商业风格；"
+        "使用自然、中性的视觉描述。"
+    )
+    if portrait:
+        prefix += (
+            "人像只保留脸型五官、发型、妆容、姿态、服装、体态比例和镜头氛围；"
+            "避免身体尺寸、三围、裸露或性感化表达。"
+        )
+    elif product:
+        prefix += "产品生成需保持同一商品、Logo、包装结构、品牌色、文字和材质细节稳定。"
+    return _trim_generation_prompt(f"{prefix}{source}")
+
+
+def compact_image_prompt_payload(prompt: dict, params: dict | None = None) -> dict:
+    """Return a copy whose generation text is safe-sized for image gateways."""
+    if not prompt:
+        return prompt
+    out = dict(prompt)
+    fallback = str(out.get("final_text") or out.get("instruction") or "")
+    has_reverse_shape = bool(out.get("final_text")) or any(
+        key in out for key in _GENERATION_PROMPT_KEEP_KEYS + tuple(_GENERATION_PROMPT_DROP_KEYS)
+    )
+    if not has_reverse_shape:
+        return out
+    compact = _compact_generation_prompt_text(out, params or {}, fallback)
+    if compact:
+        out["final_text"] = compact
+        if out.get("instruction"):
+            out["instruction"] = compact
+    return out
+
+
+def _generation_prompt_for_model(prompt: str, task: GenTask) -> str:
+    """Compact reverse-analysis text into a generation-safe image prompt.
+
+    The full structured reverse result remains stored/displayed. This function
+    only changes the prompt sent to the image gateway, avoiding oversized JSON
+    prose, exact coordinate noise, and body-detail phrases that commonly trip
+    provider moderation on portrait references.
+    """
+    return _compact_generation_prompt_text(
+        task.prompt or {},
+        task.params or {},
+        prompt,
+        is_portrait=_is_portrait_generation_task(task),
+        is_product=_is_product_generation_task(task),
+    )
 
 
 def image_review_has_local_results(task: GenTask) -> bool:
@@ -204,6 +384,12 @@ def _hold_image_submit_unknown_for_reconciliation(
         params["_saved_n"] = int(saved_count)
     if requested_count is not None:
         params["_requested_n"] = int(requested_count)
+    if requested_count is not None or saved_count is not None:
+        requested = int(requested_count or 0)
+        saved = int(saved_count or 0)
+        params["_partial"] = True
+        params["_skipped_n"] = max(0, requested - saved)
+        params["_partial_errors"] = [error[:160]] if error else []
     params["_image_submit_state_unknown"] = True
     _mark_needs_review(
         db,
@@ -289,16 +475,22 @@ def _settlement_cost(task: GenTask, model, *, image_count: int | None = None) ->
     the frozen estimate. This is the internal credit price (image scales with n,
     video preview is cheap), NOT the provider's real $ cost; real per-call usage
     is logged separately in gateway_calls."""
-    base = max(0, int(model.cost_credits or 0))
-    if task.category == "video" and task.stage == "preview":
-        try:
-            base = int((model.extra or {}).get("preview_cost", max(1, base // 10)))
-        except (TypeError, ValueError):
-            base = max(1, base // 10)
-    elif task.category == "image":
-        n = int(image_count if image_count is not None else (task.params or {}).get("n") or 1)
-        base = base * max(1, n)
-    return max(0, min(base, int(task.cost_frozen or 0)))
+    n = int(image_count if image_count is not None else (task.params or {}).get("n") or 1)
+    snapshot = (task.params or {}).get("_model_snapshot") or {}
+    if not snapshot:
+        snapshot = {
+            "cost_credits": int(getattr(model, "cost_credits", 0) or 0),
+            "extra": getattr(model, "extra", None) or {},
+        }
+    cost = generation_cost_from_snapshot(
+        snapshot,
+        category=task.category,
+        stage=task.stage,
+        params=task.params or {},
+        n=n,
+        source_type=task.source_type,
+    )
+    return max(0, min(int(cost or 0), int(task.cost_frozen or 0)))
 
 
 
@@ -329,6 +521,7 @@ def run_image_task(task_id: int) -> None:
         size = params.get("size") or _closest_image_size(ref_w, ref_h, fallback_size)
         prompt = _final_prompt(task)
         prompt = _product_fidelity_prompt(prompt, task)
+        prompt = _generation_prompt_for_model(prompt, task)
 
         set_progress(task_id, 30, "running")
         # reverse-off (image+instruction -> image): pass the reference image to
@@ -455,35 +648,48 @@ def run_image_task(task_id: int) -> None:
                 log.warning("image task %s skipped one invalid image: %s", task_id, e)
         if saved_count <= 0:
             raise RuntimeError("图片网关返回结果均无法解析")
-        if has_unknown_gateway_failure:
-            unknown_errors = [
-                failure.message
-                for failure in gateway_failure_items
-                if getattr(failure, "submit_state_unknown", False) and getattr(failure, "message", "")
-            ]
-            _hold_image_submit_unknown_for_reconciliation(
-                db,
-                task_id,
-                "; ".join(unknown_errors[:3]) or "上游提交状态未知",
-                written_keys=written_keys,
-                saved_count=saved_count,
-                requested_count=n,
-            )
-            return
         # finalize atomically: only the runner that claims the terminal status
         # settles, so a duplicate/raced run can't double-charge or double-credit.
         real_cost = _settlement_cost(task, model, image_count=saved_count)
         skipped_n = max(0, n - saved_count)
         partial_errors = (gateway_failures if saved_count < n else []) + image_errors
+        unknown_errors = [
+            failure.message
+            for failure in gateway_failure_items
+            if getattr(failure, "submit_state_unknown", False) and getattr(failure, "message", "")
+        ]
         partial_detail = (
             {
                 "requested_n": n,
                 "saved_n": saved_count,
                 "skipped_n": skipped_n,
                 "errors": partial_errors[:5],
+                **({"submit_state_unknown": True} if has_unknown_gateway_failure else {}),
             }
             if saved_count < n or image_errors else None
         )
+        if has_unknown_gateway_failure:
+            if partial_detail:
+                task.params = {
+                    **(task.params or {}),
+                    "_partial": True,
+                    "_requested_n": n,
+                    "_saved_n": saved_count,
+                    "_skipped_n": skipped_n,
+                    "_partial_errors": partial_errors[:5],
+                    "_image_result_keys": list(written_keys),
+                    "_image_submit_state_unknown": True,
+                    **({"_unknown_submit_errors": unknown_errors[:5]} if unknown_errors else {}),
+                }
+            _hold_image_submit_unknown_for_reconciliation(
+                db,
+                task_id,
+                "; ".join(unknown_errors or gateway_failures or ["图片子请求提交状态未知"]),
+                written_keys=written_keys,
+                saved_count=saved_count,
+                requested_count=n,
+            )
+            return
         if partial_detail:
             task.params = {
                 **(task.params or {}),
@@ -492,6 +698,9 @@ def run_image_task(task_id: int) -> None:
                 "_saved_n": saved_count,
                 "_skipped_n": skipped_n,
                 "_partial_errors": partial_errors[:5],
+                "_image_result_keys": list(written_keys),
+                **({"_image_submit_state_unknown": True} if has_unknown_gateway_failure else {}),
+                **({"_unknown_submit_errors": unknown_errors[:5]} if unknown_errors else {}),
             }
         if not claim_terminal(db, task_id, "succeeded", cost_settled=real_cost):
             db.rollback()  # another runner finalized -> discard our row + files
@@ -568,7 +777,10 @@ def _video_submit_params(db, task: GenTask) -> dict:
         last_frame = params.get("last_frame_image")
         if task.source_type == "image" and not last_frame:
             params["last_frame_image"] = safe_ref
-            params["_product_locked"] = True
+            if str(params.get("subject_mode") or "").lower() == "portrait":
+                params["_portrait_locked"] = True
+            else:
+                params["_product_locked"] = True
         elif last_frame:
             params["last_frame_image"] = _gateway_reference_image(
                 db,
@@ -577,6 +789,21 @@ def _video_submit_params(db, task: GenTask) -> dict:
                 min_side=VIDEO_FIRST_FRAME_MIN_SIDE,
                 max_side=VIDEO_FIRST_FRAME_MAX_SIDE,
             )
+    character_ref = params.get("character_reference_image")
+    if character_ref:
+        safe_character_ref = _gateway_reference_image(
+            db,
+            task,
+            character_ref,
+            min_side=VIDEO_FIRST_FRAME_MIN_SIDE,
+            max_side=VIDEO_FIRST_FRAME_MAX_SIDE,
+        )
+        params["character_reference_image"] = safe_character_ref
+        if str(params.get("subject_mode") or "").lower() == "portrait":
+            params.setdefault("first_frame_image", safe_character_ref)
+            params.setdefault("reference_image_url", safe_character_ref)
+            params.setdefault("last_frame_image", safe_character_ref)
+            params["_portrait_locked"] = True
     return params
 
 
@@ -615,6 +842,11 @@ def _video_persisted_params(task: GenTask, original: dict, submitted: dict) -> d
         persisted["last_frame_image"] = original["last_frame_image"]
     elif task.source_type == "image" and task.source_asset_url:
         persisted["last_frame_image"] = task.source_asset_url
+    if original.get("character_reference_image"):
+        persisted["character_reference_image"] = original["character_reference_image"]
+    for key in ("subject_mode",):
+        if original.get(key):
+            persisted[key] = original[key]
     if task.stage != "preview":
         return persisted
     persisted["preview_resolution"] = submitted.get("resolution")
@@ -642,6 +874,16 @@ def _finalize_or_retry_video_download(db, task: GenTask, model, result: dict) ->
                                   "permanent": True,
                                   "error": str(e)[:300]})
         _fail_and_refund(db, task.id, str(e), public_error="视频结果下载失败，已退回冻结积分，请稍后重试")
+        return True
+    except LocalVideoSettlementError as e:
+        usage.record_call(db, kind="video_download", model_id=model.model_id,
+                          user_id=task.user_id, task_id=task.id,
+                          status="failed",
+                          detail={"stage": task.stage,
+                                  "external_task_id": task.external_task_id,
+                                  "local_settlement": True,
+                                  "error": str(e)[:300]})
+        _hold_video_download_for_reconciliation(db, task.id, str(e))
         return True
     except Exception as e:  # noqa: BLE001
         _mark_video_download_alive(task.id)
@@ -887,9 +1129,13 @@ def poll_video_once(task_id: int) -> None:
             return
         model = get_model_config(db, "video")
         if not model:
-            _fail_and_refund(db, task_id, "视频模型配置缺失")
+            _hold_video_download_for_reconciliation(db, task_id, "视频模型配置缺失")
             return
-        model = _model_from_snapshot(task, model)
+        try:
+            model = _model_from_snapshot(task, model)
+        except ModelSnapshotMismatchError as e:
+            _hold_video_download_for_reconciliation(db, task_id, str(e))
+            return
 
         _mark_poll_alive(task_id)  # tell the recovery beat this chain is alive
 
@@ -1100,8 +1346,7 @@ def _finalize_video_success(db, task: GenTask, model, result: dict) -> None:
         width=media_meta.get("width"), height=media_meta.get("height"),
         duration=media_meta.get("duration"),
     ))
-    usage_cost = estimate_credits_from_usage(getattr(model, "extra", None), usage_from_response(result))
-    real_cost = usage_cost if usage_cost is not None else _settlement_cost(task, model)
+    real_cost = _settlement_cost(task, model)
     real_cost = max(0, min(int(real_cost or 0), int(task.cost_frozen or 0)))
     if not claim_terminal(db, task.id, "succeeded", cost_settled=real_cost):
         db.rollback()  # another runner finalized first -> discard our row + files
@@ -1111,10 +1356,15 @@ def _finalize_video_success(db, task: GenTask, model, result: dict) -> None:
         credits.settle(db, task.user_id, reserved=task.cost_frozen,
                        real_cost=real_cost, biz_ref=task.id, commit=False)
         db.commit()
-    except Exception:
+    except Exception as e:
         db.rollback()
-        _unlink_keys(written_keys)
-        raise
+        params = dict(task.params or {})
+        params["_video_result_keys"] = list(written_keys)
+        task = db.get(GenTask, task.id)
+        if task:
+            task.params = {**(task.params or {}), **params}
+            db.commit()
+        raise LocalVideoSettlementError(f"视频已落盘但本地结算失败:{e}") from e
     set_progress(task.id, 100, "succeeded")
 
 

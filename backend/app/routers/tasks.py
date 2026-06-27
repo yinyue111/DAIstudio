@@ -108,7 +108,13 @@ def retry_task(task_id: int, db: Session = Depends(get_db),
         raise HTTPException(400, "任务参数非法,无法重试")
     try:
         assert_safe_user_asset_url(task.source_asset_url)
-        for _url_key in ("reference_image_url", "first_frame_image", "last_frame_image", "style_reference_image"):
+        for _url_key in (
+            "reference_image_url",
+            "first_frame_image",
+            "last_frame_image",
+            "style_reference_image",
+            "character_reference_image",
+        ):
             assert_safe_user_asset_url(task_params.get(_url_key))
     except SsrfError as e:
         raise HTTPException(400, f"素材链接被安全策略拦截:{e}")
@@ -120,6 +126,7 @@ def retry_task(task_id: int, db: Session = Depends(get_db),
         task_params.get("first_frame_image"),
         task_params.get("last_frame_image"),
         task_params.get("style_reference_image"),
+        task_params.get("character_reference_image"),
     )
     snapshot = (task.params or {}).get("_model_snapshot") or model_snapshot(model)
     try:
@@ -128,9 +135,23 @@ def retry_task(task_id: int, db: Session = Depends(get_db),
         raise HTTPException(409, str(e)) from e
     task_params["_model_snapshot"] = snapshot
     if snapshot:
-        cost = _estimate_cost_from_snapshot(snapshot, task.category, task.stage, n_images)
+        cost = _estimate_cost_from_snapshot(
+            snapshot,
+            task.category,
+            task.stage,
+            n_images,
+            params=task_params,
+            source_type=task.source_type,
+        )
     else:
-        cost = _estimate_cost(model, task.category, task.stage, n_images)
+        cost = _estimate_cost(
+            model,
+            task.category,
+            task.stage,
+            n_images,
+            params=task_params,
+            source_type=task.source_type,
+        )
     if cost < 0:
         raise HTTPException(400, "任务成本配置非法,无法重试")
 

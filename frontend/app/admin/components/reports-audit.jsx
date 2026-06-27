@@ -99,7 +99,7 @@ export function Audit() {
   function load() {
     const p = [];
     if (action) p.push(`action=${encodeURIComponent(action)}`);
-    if (userId) p.push(`user_id=${userId}`);
+    if (userId) p.push(`user_id=${encodeURIComponent(userId)}`);
     const qs = p.length ? `?${p.join("&")}` : "";
     setMsg("");
     api.adminAudit(qs).then(setRows).catch((e) => setMsg(e.message));

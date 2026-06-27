@@ -9,6 +9,8 @@ const pageSource = readFileSync(join(root, "app/page.jsx"), "utf8");
 for (const field of [
   "prompt",
   "negative",
+  "imageEditProductMode",
+  "editSubjectMode",
   "url",
   "assets",
   "selected",
@@ -65,6 +67,16 @@ assert.match(
 );
 assert.match(
   pageSource,
+  /const subjectModeParam = effectivePortraitMode \|\| effectiveProductMode \? effectiveSubjectMode : ""/,
+  "plain image editing should not send subject_mode=general to the backend",
+);
+assert.doesNotMatch(
+  pageSource,
+  /\.\.\.\(effectiveSubjectMode \? \{ subject_mode: effectiveSubjectMode \} : \{\}\)/,
+  "only product/portrait edit modes should include subject_mode in generation params",
+);
+assert.match(
+  pageSource,
   /productUploadRequestRef = useRef\(\{\}\)/,
   "product uploads should have a dedicated stale-response guard",
 );
@@ -97,6 +109,10 @@ for (const phrase of [
   "若风格迁移和产品保真冲突，优先保证产品主体与包装文字完全不变",
   "产品正面文字被重排",
   "顶部文字被改写",
+  "保留人像身份",
+  "人像照片作为唯一人物身份",
+  "人物重构",
+  "当前为人物参考驱动重构，非逐帧换脸",
 ]) {
   assert.match(
     pageSource,

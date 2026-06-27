@@ -100,8 +100,23 @@ def test_default_n_image_charges_for_all_images(client, make_user, auth):
     t = client.get(f"/api/tasks/{r.json()['id']}", headers=h).json()
     assert t["status"] == "succeeded", t
     assert len(t["assets"]) == 4          # seeded image_n default
-    assert t["cost_settled"] == 20        # cost_credits(5) * n(4)
-    assert client.get("/api/me", headers=h).json()["balance_credits"] == 980
+    assert t["cost_settled"] == 60        # 1K image cost 15 * n(4)
+    assert client.get("/api/me", headers=h).json()["balance_credits"] == 940
+
+
+def test_generate_response_exposes_only_public_params(client, make_user, auth):
+    make_user("13900000079", balance=1000)
+    h = auth("13900000079")
+    r = client.post("/api/generate", json={
+        "category": "image",
+        "stage": "preview",
+        "prompt": {"final_text": "public params"},
+        "params": {"n": 1, "size": "256x256"},
+    }, headers=h)
+    assert r.status_code == 200, r.text
+    params = r.json()["params"]
+    assert params == {"n": 1, "size": "256x256"}
+    assert all(not key.startswith("_") for key in params)
 
 
 def test_unlock_is_idempotent(client, make_user, auth):
@@ -115,13 +130,13 @@ def test_unlock_is_idempotent(client, make_user, auth):
     bal0 = client.get("/api/me", headers=h).json()["balance_credits"]
     assert client.post(f"/api/assets/{a['id']}/unlock", headers=h).json()["unlocked"]
     bal1 = client.get("/api/me", headers=h).json()["balance_credits"]
-    assert bal0 - bal1 == 5  # unlock_cost charged once
+    assert bal0 - bal1 == 0  # generated HD unlock is free
     # a repeat unlock (double-click / retry) must NOT charge again
     assert client.post(f"/api/assets/{a['id']}/unlock", headers=h).json()["unlocked"]
     assert client.get("/api/me", headers=h).json()["balance_credits"] == bal1
 
 
-def test_unlock_uses_generation_time_model_snapshot(client, make_user, auth):
+def test_generated_asset_unlock_ignores_model_unlock_cost(client, make_user, auth):
     make_user("13900000072", balance=1000, admin=True)
     h = auth("13900000072")
     assert client.put("/api/admin/models", json={
@@ -153,10 +168,10 @@ def test_unlock_uses_generation_time_model_snapshot(client, make_user, auth):
 
     unlock = client.post(f"/api/assets/{asset['id']}/unlock", headers=h)
     assert unlock.status_code == 200, unlock.text
-    assert before - client.get("/api/me", headers=h).json()["balance_credits"] == 5
+    assert before - client.get("/api/me", headers=h).json()["balance_credits"] == 0
 
 
-def test_asset_response_exposes_generation_time_unlock_cost(client, make_user, auth):
+def test_asset_response_exposes_zero_generated_unlock_cost(client, make_user, auth):
     make_user("13900000150", balance=1000, admin=True)
     h = auth("13900000150")
     assert client.put("/api/admin/models", json={
@@ -188,7 +203,7 @@ def test_asset_response_exposes_generation_time_unlock_cost(client, make_user, a
 
     asset = client.get(f"/api/tasks/{task_id}", headers=h).json()["assets"][0]
     assert asset["id"] == asset_id
-    assert asset["unlock_cost"] == 5
+    assert asset["unlock_cost"] == 0
 
 
 # ---------------------------------------------------------------- final inheritance
@@ -1232,16 +1247,12 @@ def test_parse_submit_returns_queued_when_worker_is_async(client, make_user, aut
             queued_ids.append(parse_id)
 
     monkeypatch.setattr("app.tasks.parse_url_task", _Delay)
-    old_eager = celery_app.conf.task_always_eager
-    celery_app.conf.task_always_eager = False
-    try:
-        r = client.post(
-            "/api/parse",
-            json={"url": "https://www.xiaohongshu.com/explore/queued"},
-            headers=h,
-        )
-    finally:
-        celery_app.conf.task_always_eager = old_eager
+    monkeypatch.setitem(celery_app.conf, "task_always_eager", False)
+    r = client.post(
+        "/api/parse",
+        json={"url": "https://www.xiaohongshu.com/explore/queued"},
+        headers=h,
+    )
 
     assert r.status_code == 200, r.text
     body = r.json()
@@ -1830,8 +1841,8 @@ def test_image_finalize_holds_for_review_when_settle_fails(client, make_user, au
     }
     assert after - before
     me = client.get("/api/me", headers=h).json()
-    assert me["balance_credits"] == 995
-    assert me["frozen_credits"] == 5
+    assert me["balance_credits"] == 985
+    assert me["frozen_credits"] == 15
 
 
 def test_admin_quota_grant_idempotency_replays_duplicate(client, make_user, auth):
@@ -2235,6 +2246,25 @@ def test_production_rejects_placeholder_metrics_token(monkeypatch):
     monkeypatch.setattr(settings, "metrics_token", "metrics-token")
     monkeypatch.setattr(settings, "payment_mock_enabled", False)
     monkeypatch.setattr(settings, "payment_config_secret", "")
+    monkeypatch.setattr(settings, "trusted_egress_hosts", "")
+    with pytest.raises(RuntimeError, match="METRICS_TOKEN"):
+        validate_runtime_config()
+
+
+def test_production_rejects_env_example_metrics_token(monkeypatch):
+    monkeypatch.setattr(settings, "debug", False)
+    monkeypatch.setattr(settings, "mock_mode", False)
+    monkeypatch.setattr(settings, "gateway_base_url", "https://gateway.example.com")
+    monkeypatch.setattr(settings, "gateway_api_key", "sk-test")
+    monkeypatch.setattr(settings, "video_gateway_format", "openai")
+    monkeypatch.setattr(settings, "video_gateway_base_url", "")
+    monkeypatch.setattr(settings, "video_gateway_api_key", "")
+    monkeypatch.setattr(settings, "sms_provider", "mock")
+    monkeypatch.setattr(settings, "jwt_secret", "x" * 48)
+    monkeypatch.setattr(settings, "metrics_token", "please-change-me-to-a-long-random-metrics-token")
+    monkeypatch.setattr(settings, "payment_mock_enabled", False)
+    monkeypatch.setattr(settings, "payment_config_secret", "")
+    monkeypatch.setattr(settings, "model_config_secret", "x" * 48)
     monkeypatch.setattr(settings, "trusted_egress_hosts", "")
     with pytest.raises(RuntimeError, match="METRICS_TOKEN"):
         validate_runtime_config()

@@ -7,6 +7,7 @@ export default function StudioReferencePanel({
   category,
   creationMode,
   imageEditProductMode = false,
+  editSubjectMode = "general",
   isEditMode = false,
   selected,
   productAsset,
@@ -37,28 +38,40 @@ export default function StudioReferencePanel({
   onReverse,
 }) {
   const isImageEditMode = creationMode === "image_edit";
-  const productGenerationMode = isImageEditMode && imageEditProductMode;
+  const subjectMode = creationMode === "video_edit"
+    ? (editSubjectMode === "portrait" ? "portrait" : "product")
+    : imageEditProductMode
+      ? (editSubjectMode === "portrait" ? "portrait" : "product")
+      : "general";
+  const productGenerationMode = subjectMode === "product";
+  const portraitGenerationMode = subjectMode === "portrait";
   const modeTitle = isEditMode
-    ? (creationMode === "video_edit" ? "视频编辑" : "图片编辑")
+    ? (creationMode === "video_edit" ? (portraitGenerationMode ? "视频人物重构" : "视频编辑") : "图片编辑")
     : (category === "video" ? "视频参考" : "链接反推");
   const styleTitle = isImageEditMode ? "可选风格参考" : (isEditMode ? "风格参考" : "参考素材");
   const styleDescription = isImageEditMode
-    ? "可选：反推另一张图的场景、构图、光线和广告质感"
+    ? (portraitGenerationMode ? "可选：反推另一张图/视频的场景、光线、妆造和画面风格" : "可选：反推另一张图的场景、构图、光线和广告质感")
     : isEditMode
-    ? "用于反推场景、构图、光线和广告质感"
+    ? (portraitGenerationMode ? "目标视频/风格参考：只迁移动作、镜头、场景和画面质感，不保证逐帧换脸" : "用于反推场景、构图、光线和广告质感")
     : (category === "video" ? "上传视频或粘贴链接做反推" : "上传图片或粘贴链接做反推");
-  const emptyStyleTitle = isImageEditMode ? "添加可选风格参考" : (category === "video" ? "上传视频 / 图片参考" : "上传图片参考");
+  const emptyStyleTitle = isImageEditMode
+    ? "添加可选风格参考"
+    : (portraitGenerationMode ? "上传目标视频 / 风格参考" : category === "video" ? "上传视频 / 图片参考" : "上传图片参考");
   const emptyStyleHint = isImageEditMode
     ? "不加也能编辑；需要同款风格时再上传或粘贴链接"
     : isEditMode
-    ? "也可粘贴小红书、抖音或网页链接抓取素材"
+    ? (portraitGenerationMode ? "上传目标视频或粘贴链接，先反推镜头和风格，再上传人物照片做重构" : "也可粘贴小红书、抖音或网页链接抓取素材")
     : (category === "video" ? "点击上传视频，下方也可改传图片或粘贴链接" : "点击上传图片，下方也可粘贴链接抓取素材");
-  const productTitle = productGenerationMode ? "产品图片" : (isImageEditMode ? "编辑源图片" : "产品主体");
+  const productTitle = portraitGenerationMode ? "人物照片" : productGenerationMode ? "产品图片" : (isImageEditMode ? "编辑源图片" : "产品主体");
   const productHint = isImageEditMode
-    ? (productGenerationMode
+    ? (portraitGenerationMode
+        ? "上传需要保留身份的人像照片，生成时强保护五官、脸型、发型和人物身份"
+        : productGenerationMode
         ? "上传产品图作为唯一产品身份，生成时强保护Logo、包装和细节"
         : "上传需要被编辑的图片，未要求修改的内容默认保留")
-    : "保留产品、Logo、包装、颜色、形状和文字标识";
+    : (portraitGenerationMode
+        ? "上传要生成进目标视频风格的人物照片，参考视频只提供动作、镜头和风格"
+        : "保留产品、Logo、包装、颜色、形状和文字标识");
 
   return (
     <aside className="relative min-w-0 overflow-hidden rounded-xl3 border border-iris/35 bg-gradient-to-b from-iris/20 via-base2/80 to-rose/10 p-3 shadow-glow-sm">
@@ -99,7 +112,7 @@ export default function StudioReferencePanel({
                   <>
                     <ReferenceAssetPreview asset={productAsset} />
                     <span className="badge absolute left-2 top-2 bg-aqua/90 text-black">
-                      {productGenerationMode ? "产品图" : "编辑源"}
+                      {portraitGenerationMode ? "人像" : productGenerationMode ? "产品图" : "编辑源"}
                     </span>
                   </>
                 ) : (
@@ -111,10 +124,10 @@ export default function StudioReferencePanel({
                     <span className="flex h-11 w-11 items-center justify-center rounded-full bg-aqua text-lg text-black shadow-glow-sm">+</span>
                     <div>
                       <span className="text-sm font-display font-medium text-snow">
-                        {productGenerationMode ? "上传产品图片" : "上传要编辑的图片"}
+                        {portraitGenerationMode ? "上传人物照片" : productGenerationMode ? "上传产品图片" : "上传要编辑的图片"}
                       </span>
                       <span className="mt-1 block text-xs text-fog">
-                        {productGenerationMode ? "作为高保真产品生成源" : "作为图片编辑源"}
+                        {portraitGenerationMode ? "作为人像身份参考" : productGenerationMode ? "作为高保真产品生成源" : "作为图片编辑源"}
                       </span>
                     </div>
                   </button>
@@ -125,7 +138,9 @@ export default function StudioReferencePanel({
               <div className="mt-2 min-w-0 rounded-xl border border-line bg-white/5 px-3 py-2 text-xs text-fog">
                 <div className="truncate text-mist">{selectedLabel(productAsset)}</div>
                 <div className="mt-1 text-fog">
-                  {productGenerationMode
+                  {portraitGenerationMode
+                    ? "生成时会锁定人物身份，只迁移参考素材的场景、光线、构图和风格。"
+                    : productGenerationMode
                     ? "生成时会锁定产品身份，只迁移或生成广告场景、光线、构图和质感。"
                     : "生成时会按提示词编辑这张图，未指定修改的部分默认保留。"}
                 </div>
@@ -138,8 +153,8 @@ export default function StudioReferencePanel({
               className="btn-secondary btn-sm mt-2 w-full justify-center border-aqua/30 bg-aqua/10 text-snow"
             >
               {uploading ? "上传中…" : productAsset
-                ? (productGenerationMode ? "替换产品图片" : "替换编辑源图片")
-                : (productGenerationMode ? "上传产品图片" : "上传编辑源图片")}
+                ? (portraitGenerationMode ? "替换人物照片" : productGenerationMode ? "替换产品图片" : "替换编辑源图片")
+                : (portraitGenerationMode ? "上传人物照片" : productGenerationMode ? "上传产品图片" : "上传编辑源图片")}
             </button>
           </div>
         )}
@@ -221,7 +236,7 @@ export default function StudioReferencePanel({
                   <>
                     <ReferenceAssetPreview asset={productAsset} />
                     <span className="badge absolute left-2 top-2 bg-aqua/90 text-black">
-                      {isImageEditMode ? "编辑源" : "产品主体"}
+                      {portraitGenerationMode ? "人物照片" : isImageEditMode ? "编辑源" : "产品主体"}
                     </span>
                   </>
                 ) : (
@@ -233,10 +248,12 @@ export default function StudioReferencePanel({
                     <span className="flex h-11 w-11 items-center justify-center rounded-full bg-aqua text-lg text-black shadow-glow-sm">+</span>
                     <div>
                       <span className="text-sm font-display font-medium text-snow">
-                        {isImageEditMode ? "上传要编辑的图片" : "上传产品图片"}
+                        {portraitGenerationMode ? "上传人物照片" : isImageEditMode ? "上传要编辑的图片" : "上传产品图片"}
                       </span>
                       <span className="mt-1 block text-xs text-fog">
-                        {isImageEditMode
+                        {portraitGenerationMode
+                          ? "作为视频人物身份参考"
+                          : isImageEditMode
                           ? "作为图片编辑源"
                           : creationMode === "video_edit" ? "作为视频首帧和主体身份参考" : "作为图片编辑源"}
                       </span>
@@ -251,6 +268,8 @@ export default function StudioReferencePanel({
                 <div className="mt-1 text-fog">
                   {isImageEditMode
                     ? "生成时会按提示词编辑这张图，未指定修改的部分默认保留。"
+                    : portraitGenerationMode
+                    ? "生成时保留这张人物照片的身份，目标视频只迁移动作、镜头和风格；当前不是逐帧换脸。"
                     : "生成时只迁移风格参考的场景、光线、构图和广告质感。"}
                 </div>
               </div>
@@ -262,8 +281,8 @@ export default function StudioReferencePanel({
               className="btn-secondary btn-sm mt-2 w-full justify-center border-aqua/30 bg-aqua/10 text-snow"
             >
               {uploading ? "上传中…" : productAsset
-                ? (isImageEditMode ? "替换编辑源图片" : "替换产品图片")
-                : (isImageEditMode ? "上传编辑源图片" : "上传产品图片")}
+                ? (portraitGenerationMode ? "替换人物照片" : isImageEditMode ? "替换编辑源图片" : "替换产品图片")
+                : (portraitGenerationMode ? "上传人物照片" : isImageEditMode ? "上传编辑源图片" : "上传产品图片")}
             </button>
           </div>
         )}
@@ -393,7 +412,7 @@ export default function StudioReferencePanel({
                       selected === asset ? "border-iris ring-2 ring-iris/40" : "border-line hover:border-line2"
                     }`}
                   >
-                    <ReferenceAssetPreview asset={asset} />
+                    <ReferenceAssetPreview asset={asset} compact />
                     <span className="badge absolute left-1 top-1 bg-black/60 text-[10px] text-white">{asset.type}</span>
                   </button>
                 ))}

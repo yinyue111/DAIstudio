@@ -108,6 +108,10 @@ def make_user():
                 db.add(u)
                 db.commit()
                 db.refresh(u)
+            elif admin and not u.is_admin:
+                u.is_admin = True
+                db.commit()
+                db.refresh(u)
             return u.id
         finally:
             db.close()

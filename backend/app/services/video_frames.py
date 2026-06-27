@@ -59,7 +59,7 @@ def _looks_like_video(data: bytes) -> bool:
 
 def _download_capped(url: str, referer: str | None = None) -> bytes | None:
     """SSRF-checked, size-capped, redirect-revalidated streaming download."""
-    headers = {"User-Agent": UA}
+    headers = {"User-Agent": UA, "Accept-Encoding": "identity"}
     if referer:
         headers["Referer"] = referer
     assert_safe_url(url)
@@ -86,6 +86,10 @@ def _download_capped(url: str, referer: str | None = None) -> bytes | None:
                     or content_type in {"application/octet-stream", "binary/octet-stream"}
                 ):
                     log.warning("video sample content-type rejected: %s", content_type[:80])
+                    return None
+                encoding = (r.headers.get("content-encoding") or "").strip().lower()
+                if encoding and encoding != "identity":
+                    log.warning("video sample compressed response rejected: %s", encoding[:40])
                     return None
                 r.raise_for_status()
                 buf = bytearray()

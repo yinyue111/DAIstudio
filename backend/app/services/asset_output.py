@@ -10,6 +10,8 @@ from .config_store import get_model_config
 
 def unlock_cost_for_asset(db: Session, asset: GenAsset, task: GenTask | None = None) -> int:
     task = task or (db.get(GenTask, asset.task_id) if asset.task_id else None)
+    if task is not None and task.category in {"image", "video"}:
+        return 0
     snapshot = ((task.params or {}).get("_model_snapshot") or {}) if task else {}
     if "unlock_cost" in snapshot:
         try:

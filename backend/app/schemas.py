@@ -160,6 +160,8 @@ class TaskOut(BaseModel):
     final_task_id: int | None = None
     final_status: str | None = None
     final_asset_count: int = 0
+    final_cost_estimate: int | None = None
+    params: dict[str, Any] = Field(default_factory=dict)
     created_at: datetime | None = None
     finished_at: datetime | None = None
     assets: list[AssetOut] = Field(default_factory=list)

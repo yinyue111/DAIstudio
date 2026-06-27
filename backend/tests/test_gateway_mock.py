@@ -59,10 +59,12 @@ def test_compose_final_fallback():
 def test_compose_final_uses_reverse_dimension_order():
     r = gateway._parse_structured(
         '{"光线":"soft left key light","主体":"red product bottle",'
+        '"图像类型":"产品图","反推重点":"产品优先",'
         '"场景背景":"white studio","风格":"premium product photo"}'
     )
 
     text = r["final_text"]
+    assert text.index("图像类型") < text.index("反推重点") < text.index("主体")
     assert text.index("主体") < text.index("场景背景") < text.index("风格") < text.index("光线")
 
 
@@ -190,7 +192,7 @@ def test_download_to_path_rejects_explicit_non_video_type(monkeypatch, tmp_path)
     else:
         raise AssertionError("download should reject text/html")
 
-    assert seen["timeout"] == 123
+    assert 0 < seen["timeout"] <= 123
     assert not out.exists()
 
 
@@ -234,6 +236,58 @@ def test_download_to_path_rejects_missing_content_type_when_required(monkeypatch
         raise AssertionError("download should reject missing content-type")
 
     assert not out.exists()
+
+
+def test_download_uses_remaining_deadline_for_each_redirect(monkeypatch):
+    monkeypatch.setattr(settings, "mock_mode", False)
+
+    class FakeStream:
+        def __init__(self, *, redirect=False):
+            self.is_redirect = redirect
+            self.status_code = 302 if redirect else 200
+            self.headers = {"location": "https://cdn.example.com/final"} if redirect else {
+                "content-type": "image/png",
+            }
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def iter_raw(self):
+            yield b"png"
+
+    class FakeClient:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+    calls = []
+    streams = [FakeStream(redirect=True), FakeStream()]
+    now = {"value": 1000.0}
+
+    def fake_monotonic():
+        now["value"] += 3.0
+        return now["value"]
+
+    def fake_guarded_stream(_client, _method, _url, **kwargs):
+        calls.append(kwargs["timeout"])
+        return streams.pop(0)
+
+    monkeypatch.setattr(gateway.time, "monotonic", fake_monotonic)
+    monkeypatch.setattr(gateway.httpx, "Client", lambda *_args, **_kwargs: FakeClient())
+    monkeypatch.setattr(gateway, "_guarded_stream", fake_guarded_stream)
+
+    assert gateway._download(
+        "https://cdn.example.com/start",
+        max_bytes=128,
+        allowed_content_types=("image/",),
+        timeout_seconds=30,
+    ) == b"png"
+    assert calls == [27.0, 24.0]
 
 
 def test_download_rejects_compressed_result_and_uses_identity_header(monkeypatch):

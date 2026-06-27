@@ -1,12 +1,11 @@
 import assert from "node:assert/strict";
-import { createRequire } from "node:module";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 process.env.NODE_ENV = "production";
 process.env.NEXT_PUBLIC_API_BASE = "http://127.0.0.1:8000";
-const require = createRequire(import.meta.url);
-const config = require(join(dirname(fileURLToPath(import.meta.url)), "../next.config.js"));
+const configModule = await import(join(dirname(fileURLToPath(import.meta.url)), "../next.config.js"));
+const config = configModule.default;
 assert.equal(typeof config.headers, "function");
 
 const routes = await config.headers();

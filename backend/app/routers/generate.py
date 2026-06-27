@@ -21,7 +21,12 @@ from ..schemas import GenerateIn, TaskOut
 from ..services import asset_refs, audit, credits, generation, locks
 from ..services.config_store import get_model_config, get_setting
 from ..services.content_safety import assert_text_allowed
-from ..services.generation import assert_model_snapshot_compatible, model_snapshot
+from ..services.generation import (
+    assert_model_snapshot_compatible,
+    compact_image_prompt_payload,
+    model_snapshot,
+)
+from ..services.generation_pricing import generation_cost, generation_cost_from_snapshot
 from ..services.rate_limit import incr_window
 from ..services.ssrf import (
     SsrfError,
@@ -44,8 +49,9 @@ _COMMON_PARAM_KEYS = {
     "reference_height",
     "width",
     "height",
+    "subject_mode",
 }
-_IMAGE_PARAM_KEYS = _COMMON_PARAM_KEYS | {"n", "size", "style_reference_image"}
+_IMAGE_PARAM_KEYS = _COMMON_PARAM_KEYS | {"n", "size", "style_reference_image", "character_reference_image"}
 _VIDEO_PARAM_KEYS = _COMMON_PARAM_KEYS | {
     "duration",
     "target_duration",
@@ -56,9 +62,11 @@ _VIDEO_PARAM_KEYS = _COMMON_PARAM_KEYS | {
     "first_frame_image",
     "last_frame_image",
     "style_reference_image",
+    "character_reference_image",
     "preview_resolution",
     "preview_duration",
 }
+_SUBJECT_MODES = {"general", "product", "portrait"}
 _SOURCE_META_URL_KEYS = {
     "original_url",
     "original_thumb",
@@ -66,7 +74,15 @@ _SOURCE_META_URL_KEYS = {
     "selected_url",
     "selected_thumb",
 }
-_SOURCE_META_TEXT_KEYS = {"source_captured_at", "selected_type", "mode", "product_generation_mode"}
+_SOURCE_META_TEXT_KEYS = {
+    "source_captured_at",
+    "selected_type",
+    "mode",
+    "product_generation_mode",
+    "portrait_generation_mode",
+    "subject_mode",
+}
+_SOURCE_META_BOOL_KEYS = {"product_generation_mode", "portrait_generation_mode"}
 
 
 def _normalise_reference_dimensions(params: dict) -> None:
@@ -97,6 +113,11 @@ def _validate_params(category: str, params: dict) -> dict:
     if unknown:
         raise HTTPException(400, f"不支持的生成参数:{','.join(unknown[:5])}")
     _normalise_reference_dimensions(params)
+    if params.get("subject_mode") not in (None, ""):
+        subject_mode = str(params["subject_mode"]).strip().lower()
+        if subject_mode not in _SUBJECT_MODES:
+            raise HTTPException(400, "subject_mode 不支持")
+        params["subject_mode"] = subject_mode
     if params.get("seed") not in (None, ""):
         try:
             seed = int(params["seed"])
@@ -214,7 +235,7 @@ def _source_trace(
         if cleaned:
             trace[key] = cleaned
     for key in _SOURCE_META_TEXT_KEYS:
-        if key == "product_generation_mode" and isinstance(source_meta.get(key), bool):
+        if key in _SOURCE_META_BOOL_KEYS and isinstance(source_meta.get(key), bool):
             trace[key] = source_meta[key]
             continue
         cleaned = _clean_source_meta_text(source_meta.get(key))
@@ -230,33 +251,42 @@ def _rate_limit(user_id: int) -> None:
         raise HTTPException(429, "生成过于频繁,请稍后再试")
 
 
-def _estimate_cost(model, category: str, stage: str, n: int = 1) -> int:
-    base = max(0, int(model.cost_credits or 0))
-    if category == "video" and stage == "preview":
-        # preview should freeze very little; configurable via extra.preview_cost
-        try:
-            preview_cost = int((model.extra or {}).get("preview_cost", max(1, base // 10)))
-        except (TypeError, ValueError):
-            preview_cost = max(1, base // 10)
-        return max(0, preview_cost)
-    if category == "image":
-        # image cost scales with the number of images requested
-        return base * max(1, n)
-    return base
+def _estimate_cost(
+    model,
+    category: str,
+    stage: str,
+    n: int = 1,
+    *,
+    params: dict | None = None,
+    source_type: str | None = None,
+) -> int:
+    return generation_cost(
+        category=category,
+        stage=stage,
+        params=params or {},
+        n=n,
+        source_type=source_type,
+        model_extra=getattr(model, "extra", None),
+    )
 
 
-def _estimate_cost_from_snapshot(snapshot: dict, category: str, stage: str, n: int = 1) -> int:
-    base = max(0, int(snapshot.get("cost_credits") or 0))
-    extra = snapshot.get("extra") or {}
-    if category == "video" and stage == "preview":
-        try:
-            preview_cost = int(extra.get("preview_cost", max(1, base // 10)))
-        except (TypeError, ValueError):
-            preview_cost = max(1, base // 10)
-        return max(0, preview_cost)
-    if category == "image":
-        return base * max(1, n)
-    return base
+def _estimate_cost_from_snapshot(
+    snapshot: dict,
+    category: str,
+    stage: str,
+    n: int = 1,
+    *,
+    params: dict | None = None,
+    source_type: str | None = None,
+) -> int:
+    return generation_cost_from_snapshot(
+        snapshot,
+        category=category,
+        stage=stage,
+        params=params or {},
+        n=n,
+        source_type=source_type,
+    )
 
 
 def _assert_reference_access(db: Session, user_id: int, *urls: str | None) -> None:
@@ -457,7 +487,22 @@ def generate(body: GenerateIn, request: Request,
     existing_client_task = _existing_client_request_task(db, user.id, client_request_id)
 
     params = _validate_params(body.category, body.params)
-    _validate_prompt_payload(body.prompt or {}, body.instruction)
+    request_prompt = dict(body.prompt or {})
+    if body.instruction:
+        request_prompt["instruction"] = body.instruction
+    request_instruction = request_prompt.get("instruction")
+    validation_prompt = (
+        compact_image_prompt_payload(request_prompt, params)
+        if body.category == "image"
+        else request_prompt
+    )
+    validation_instruction = validation_prompt.get("instruction")
+    _validate_prompt_payload(
+        validation_prompt,
+        str(validation_instruction) if validation_instruction is not None else (
+            str(request_instruction) if request_instruction is not None else None
+        ),
+    )
 
     # two-stage video: a `final` render must reference its own preview task
     parent = None
@@ -491,11 +536,7 @@ def generate(body: GenerateIn, request: Request,
         source_type = parent.source_type
         task_params = dict(parent.params or {})
     else:
-        prompt = {}
-        if body.prompt:
-            prompt = dict(body.prompt)
-        if body.instruction:
-            prompt["instruction"] = body.instruction
+        prompt = dict(request_prompt)
         if not prompt:
             raise HTTPException(400, "请提供 prompt 或 instruction")
         source_asset_url = body.source_asset_url
@@ -523,7 +564,13 @@ def generate(body: GenerateIn, request: Request,
     # params and could carry an unsafe URL written before this guard existed.
     try:
         assert_safe_user_asset_url(source_asset_url)
-        for _url_key in ("reference_image_url", "first_frame_image", "last_frame_image", "style_reference_image"):
+        for _url_key in (
+            "reference_image_url",
+            "first_frame_image",
+            "last_frame_image",
+            "style_reference_image",
+            "character_reference_image",
+        ):
             assert_safe_user_asset_url(task_params.get(_url_key))
     except SsrfError as e:
         raise HTTPException(400, f"素材链接被安全策略拦截:{e}")
@@ -535,6 +582,7 @@ def generate(body: GenerateIn, request: Request,
         task_params.get("first_frame_image"),
         task_params.get("last_frame_image"),
         task_params.get("style_reference_image"),
+        task_params.get("character_reference_image"),
     )
     if body.category == "video" and body.stage == "preview" and not _video_reference_is_actionable(
         db,
@@ -587,7 +635,14 @@ def generate(body: GenerateIn, request: Request,
             task_params["_source_trace"] = parent_trace
     task_params["_model_snapshot"] = snapshot
     task_params["_client_request_fingerprint"] = request_fingerprint
-    cost = _estimate_cost_from_snapshot(snapshot, body.category, body.stage, n_images)
+    cost = _estimate_cost_from_snapshot(
+        snapshot,
+        body.category,
+        body.stage,
+        n_images,
+        params=task_params,
+        source_type=source_type,
+    )
 
     def replay_conflicting_task() -> TaskOut | None:
         existing = _existing_client_request_task(db, user.id, client_request_id)
@@ -659,7 +714,7 @@ def generate(body: GenerateIn, request: Request,
         audit.log(db, user_id=user.id, action="generate", biz_type="gen_task",
                   biz_id=task.id, ip=get_client_ip(request),
                   detail={"category": body.category, "stage": body.stage, "cost": cost})
-        return TaskOut.model_validate(task)
+        return build_task_out(db, task)
 
     if body.category == "video" and body.stage == "final" and parent:
         lock_key = f"gen:final:create:{user.id}:{parent.id}"

@@ -39,7 +39,7 @@ def test_reverse_charges_configured_vision_cost(client, make_user, auth):
                     json={"asset_url": "http://x/y.png", "target": "image"}, headers=h)
     assert r.status_code == 200, r.text
 
-    assert client.get("/api/me", headers=h).json()["balance_credits"] == 993
+    assert client.get("/api/me", headers=h).json()["balance_credits"] == 998
     db = SessionLocal()
     try:
         tx = db.query(CreditTransaction).filter(
@@ -47,7 +47,7 @@ def test_reverse_charges_configured_vision_cost(client, make_user, auth):
             CreditTransaction.type == "consume",
             CreditTransaction.biz_type == "reverse",
         ).one()
-        assert tx.change == -7
+        assert tx.change == -2
     finally:
         db.close()
 
@@ -119,7 +119,7 @@ def test_admin_report_includes_reverse_model_call_spend(client, make_user, auth)
 
     report = client.get("/api/admin/usage/report", headers=h).json()
     row = next(x for x in report["per_user"] if x["phone"] == "13900000037")
-    assert row["spend_credits"] == 7
+    assert row["spend_credits"] == 2
 
 
 def test_usage_report_does_not_count_refunds_as_negative_spend(client, make_user, auth):
@@ -366,7 +366,7 @@ def test_video_reverse_charges_per_reference_frame(client, make_user, auth, monk
     assert r.status_code == 200, r.text
     assert seen["n"] == 24
     assert seen["preset"] == "standard"
-    assert client.get("/api/me", headers=h).json()["balance_credits"] == 979
+    assert client.get("/api/me", headers=h).json()["balance_credits"] == 982
 
 
 def test_video_analysis_presets_match_product_frame_ranges():
@@ -394,6 +394,52 @@ def test_video_reverse_rejects_video_url_for_image_target(client, make_user, aut
 def test_keyframe_sampling_blocked_url_returns_empty():
     # SSRF-blocked / unreachable source must degrade gracefully, never raise
     assert video_frames.sample_keyframes("http://127.0.0.1/x.mp4", n=2) == []
+
+
+def test_video_sample_download_rejects_compressed_response(monkeypatch):
+    class FakeResponse:
+        is_redirect = False
+        headers = {
+            "content-type": "video/mp4",
+            "content-encoding": "gzip",
+        }
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def raise_for_status(self):
+            raise AssertionError("compressed responses should be rejected before status/body handling")
+
+        def iter_bytes(self):
+            yield b"\x00\x00\x00\x18ftypmp42"
+
+    class FakeClient:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def stream(self, method, url):
+            assert method == "GET"
+            assert url == "https://example.com/clip.mp4"
+            return FakeResponse()
+
+    seen = {}
+
+    def fake_pinned_client(url, **kwargs):
+        seen["url"] = url
+        seen["headers"] = kwargs.get("headers")
+        return FakeClient()
+
+    monkeypatch.setattr(video_frames, "assert_safe_url", lambda _url: None)
+    monkeypatch.setattr(video_frames, "pinned_client", fake_pinned_client)
+
+    assert video_frames._download_capped("https://example.com/clip.mp4") is None
+    assert seen["headers"]["Accept-Encoding"] == "identity"
 
 
 def test_keyframe_sampling_rejects_non_video_bytes(monkeypatch):

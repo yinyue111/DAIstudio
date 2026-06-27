@@ -39,13 +39,14 @@ def _video_waiting_for_download(task: GenTask) -> bool:
 
 
 def _image_reap_window() -> timedelta:
-    # Image renders are synchronous gateway calls. Give slow 4K/batch renders and
-    # Celery lock retries a window tied to the configured task time limit before
-    # treating them as orphaned and refunding frozen credits.
-    seconds = max(
-        int(settings.image_gateway_timeout_seconds or 0),
-        int(settings.image_download_timeout_seconds or 0),
-        int(settings.celery_task_time_limit_seconds or 0),
+    # Image renders are synchronous gateway calls. A live worker should either
+    # finalize or fail/refund after the render timeout plus any result download
+    # timeout. Do not key this to the global Celery time limit: that limit also
+    # covers long video lifecycles and would leave orphaned image tasks looking
+    # "generating" for hours after a worker crash.
+    seconds = (
+        int(settings.image_gateway_timeout_seconds or 0)
+        + int(settings.image_download_timeout_seconds or 0)
     )
     return timedelta(seconds=seconds + 300)
 
@@ -164,7 +165,13 @@ def _referenced_upload_urls(db: Session, cutoff: datetime) -> set[str]:
         task_params = params or {}
         if not isinstance(task_params, dict):
             continue
-        for key in ("reference_image_url", "first_frame_image", "last_frame_image", "style_reference_image"):
+        for key in (
+            "reference_image_url",
+            "first_frame_image",
+            "last_frame_image",
+            "style_reference_image",
+            "character_reference_image",
+        ):
             value = task_params.get(key)
             if value:
                 refs.add(value)
@@ -275,10 +282,10 @@ def purge_all(db: Session) -> dict:
 
 
 def reap_stuck_parse_records(db: Session, max_minutes: int | None = None) -> int:
-    """Fail queued parse jobs that outlived the pending window.
+    """Fail queued/running parse jobs that outlived the pending window.
 
     Parse jobs are fire-and-forget Celery tasks. If a worker dies or the broker
-    drops a message, the API would otherwise keep reusing a stale queued row and
+    drops a message, the API would otherwise keep reusing a stale active row and
     count it against the user's pending limit until retention purges it.
     """
     minutes = max(1, int(max_minutes or settings.parse_pending_max_age_minutes))
@@ -286,8 +293,9 @@ def reap_stuck_parse_records(db: Session, max_minutes: int | None = None) -> int
     cutoff = now - timedelta(minutes=minutes)
     res = db.execute(
         update(ParseRecord)
-        .where(ParseRecord.status == "queued", ParseRecord.created_at < cutoff)
+        .where(ParseRecord.status.in_(("queued", "running")), ParseRecord.created_at < cutoff)
         .values(status="failed", error="抓取任务超时,请重新提交链接")
+        .execution_options(synchronize_session=False)
     )
     count = res.rowcount or 0
     if count:
@@ -303,53 +311,95 @@ def reap_stuck_tasks(db: Session, max_minutes: int = 60) -> int:
     cutoff = now - timedelta(minutes=max_minutes)
     rows = list(
         db.execute(
-            select(GenTask).where(
+            select(
+                GenTask.id,
+                GenTask.user_id,
+                GenTask.category,
+                GenTask.phase,
+                GenTask.external_task_id,
+                GenTask.external_submitted_at,
+                GenTask.created_at,
+                GenTask.cost_frozen,
+                GenTask.cost_settled,
+                GenTask.params,
+            ).where(
                 GenTask.status.in_(("queued", "running")),
                 GenTask.created_at < cutoff,
             )
-        ).scalars()
+        ).mappings()
     )
     reaped = 0
     video_window = timedelta(seconds=int(settings.video_poll_max_seconds))
-    for t in rows:
-        task_id = t.id
+    for row in rows:
+        task_id = int(row["id"])
         error_message = "任务超时,已自动失败并退回额度"
+        if row["phase"] == "reconciling":
+            continue
         # Don't reap a video still inside its valid poll window or actively being
         # polled — its lifecycle uses external_submitted_at, not created_at.
-        if t.category == "video":
-            if t.phase == "submitting" and not t.external_task_id:
-                error_message = "视频提交状态未知,已自动失败并退回额度"
+        if row["category"] == "video":
+            params = row["params"] or {}
+            if row["phase"] == "submitting" and not row["external_task_id"]:
+                request_id = params.get("_video_request_id") or params.get("request_id")
+                if request_id:
+                    res = db.execute(
+                        update(GenTask)
+                        .where(
+                            GenTask.id == task_id,
+                            GenTask.status.not_in(("succeeded", "failed", generation.NEEDS_REVIEW)),
+                        )
+                        .values(
+                            status=generation.NEEDS_REVIEW,
+                            phase="reconciling",
+                            error=(
+                                "视频提交状态未知,上游可能已接受任务,冻结积分暂不退回。"
+                                f"request_id={str(request_id)[:120]}"
+                            ),
+                            finished_at=now,
+                        )
+                    )
+                    if res.rowcount or 0:
+                        reaped += 1
+                    continue
+                error_message = "视频提交超时且未记录请求号,已自动失败并退回额度"
             else:
-                sub = _aware(t.external_submitted_at)
+                sub = _aware(row["external_submitted_at"])
                 if (
                     (sub and (now - sub) < video_window)
-                    or _video_poll_alive(t.id)
-                    or _video_waiting_for_download(t)
+                    or _video_poll_alive(task_id)
+                    or (
+                        row["phase"] == "downloading"
+                        and bool(params.get("_video_result_url") or params.get("_video_result_mock"))
+                    )
                 ):
                     continue
-                if t.external_task_id:
+                if row["external_task_id"]:
                     error_message = (
                         f"视频渲染超时,已自动失败并退回额度; "
-                        f"external_task_id={t.external_task_id or 'unknown'}"
+                        f"external_task_id={row['external_task_id'] or 'unknown'}"
                     )
-        elif t.category == "image" and _image_inside_reap_window(t, now):
-            continue
+        elif row["category"] == "image":
+            created_at = _aware(row["created_at"])
+            if not created_at or now - created_at < _image_reap_window():
+                continue
         # Atomic claim: skip if a worker finalized the task between our SELECT
         # and now, so the reaper can't double-refund alongside the worker.
         res = db.execute(
             update(GenTask)
             .where(
-                GenTask.id == t.id,
+                GenTask.id == task_id,
                 GenTask.status.not_in(("succeeded", "failed", generation.NEEDS_REVIEW)),
             )
             .values(status="failed", error=error_message, finished_at=now)
         )
         if (res.rowcount or 0) != 1:
             continue
-        if t.cost_frozen and t.cost_settled == 0:
+        cost_frozen = int(row["cost_frozen"] or 0)
+        cost_settled = int(row["cost_settled"] or 0)
+        if cost_frozen and cost_settled == 0:
             try:
-                credits.refund(db, t.user_id, t.cost_frozen,
-                               biz_ref=t.id, commit=False)
+                credits.refund(db, int(row["user_id"]), cost_frozen,
+                               biz_ref=task_id, commit=False)
             except Exception as e:  # noqa: BLE001
                 db.rollback()
                 log.exception("refund failed reaping task %s", task_id)

@@ -31,6 +31,25 @@ _REVERSE_MODEL_REF_MAX_SIDE = 1024
 _REVERSE_MODEL_REF_QUALITY = 92
 
 
+class LocalizedMedia(dict):
+    url: str
+    width: int | None
+    height: int | None
+
+
+def _localized_url(local: LocalizedMedia | str) -> str:
+    if isinstance(local, str):
+        return local
+    return str(local["url"])
+
+
+def _localized_int(local: LocalizedMedia | str, key: str) -> int | None:
+    if isinstance(local, str):
+        return None
+    value = local.get(key)
+    return int(value) if value else None
+
+
 def _cache_key(url: str, user_id: int) -> str:
     # scope per user so a cache hit never returns another user's ParseRecord id
     return f"parse:{user_id}:" + hashlib.sha256(url.encode()).hexdigest()
@@ -75,11 +94,15 @@ def _assert_parse_capacity(db: Session, user_id: int) -> None:
         raise HTTPException(429, "抓取任务过多,请稍后再试")
 
 
-def _localize_media_url(url: str | None, db: Session | None = None, user_id: int | None = None) -> str | None:
+def _localize_media_url(
+    url: str | None,
+    db: Session | None = None,
+    user_id: int | None = None,
+) -> LocalizedMedia | None:
     if not url:
         return None
     if storage.key_from_url(url):
-        return url
+        return LocalizedMedia(url=url, width=None, height=None)
     try:
         raw = gateway.download_bytes_limited(
             url,
@@ -137,7 +160,7 @@ def _localize_media_url(url: str | None, db: Session | None = None, user_id: int
                     original_filename="parsed-model-ref.jpg",
                 )
             )
-        return storage.public_url(key)
+        return LocalizedMedia(url=storage.public_url(key), width=preview_w, height=preview_h)
     except Exception as e:  # noqa: BLE001
         log.info("parse media localize skipped url=%s error=%s", redact_url_for_log(url), e)
         return None
@@ -163,8 +186,12 @@ def _localize_assets(
                 item["original_url"] = item.get("url")
                 if item.get("thumb"):
                     item["original_thumb"] = item.get("thumb")
-                item["url"] = local
-                item["thumb"] = local
+                item["url"] = _localized_url(local)
+                item["thumb"] = _localized_url(local)
+                if not item.get("width") and _localized_int(local, "width"):
+                    item["width"] = _localized_int(local, "width")
+                if not item.get("height") and _localized_int(local, "height"):
+                    item["height"] = _localized_int(local, "height")
             else:
                 item["original_url"] = item.get("url")
                 if item.get("thumb"):
@@ -177,7 +204,11 @@ def _localize_assets(
             local_thumb = _localize_media_url(item.get("thumb"), db=db, user_id=user_id)
             if local_thumb:
                 item["original_thumb"] = item.get("thumb")
-                item["thumb"] = local_thumb
+                item["thumb"] = _localized_url(local_thumb)
+                if not item.get("thumb_width") and _localized_int(local_thumb, "width"):
+                    item["thumb_width"] = _localized_int(local_thumb, "width")
+                if not item.get("thumb_height") and _localized_int(local_thumb, "height"):
+                    item["thumb_height"] = _localized_int(local_thumb, "height")
             else:
                 item["original_thumb"] = item.get("thumb")
                 item["thumb"] = None

@@ -43,6 +43,21 @@ def test_ark_content_image_to_video_with_last_frame():
     assert "role" not in c[2]
 
 
+def test_ark_content_includes_distinct_character_reference():
+    c = gateway._ark_content(
+        "portrait rebuild",
+        {
+            "first_frame_image": "http://x/first.png",
+            "last_frame_image": "http://x/first.png",
+            "character_reference_image": "http://x/person.png",
+            "resolution": "720p",
+        },
+    )
+    assert [item["type"] for item in c] == ["text", "image_url", "image_url"]
+    assert c[1]["image_url"]["url"] == "http://x/first.png"
+    assert c[2]["image_url"]["url"] == "http://x/person.png"
+
+
 def test_ark_content_text_to_video():
     c = gateway._ark_content("a scene", {"resolution": "720p"})
     assert len(c) == 1 and c[0]["type"] == "text"
@@ -132,6 +147,34 @@ def test_generic_video_submit_preserves_last_frame(monkeypatch):
     assert seen["payload"]["end_image_url"] == "https://example.com/end.jpg"
     assert "first_frame_image" not in seen["payload"]
     assert "last_frame_image" not in seen["payload"]
+
+
+def test_generic_video_submit_preserves_character_reference(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(settings, "mock_mode", False)
+    monkeypatch.setattr(settings, "video_gateway_base_url", "https://video.example.com")
+    monkeypatch.setattr(settings, "video_gateway_api_key", "test-key")
+    monkeypatch.setattr(settings, "video_gateway_format", "openai")
+
+    def fake_post(path, payload, timeout=120):
+        seen["payload"] = payload
+        return {"id": "task-1"}
+
+    monkeypatch.setattr(gateway, "_video_post", fake_post)
+
+    task_id = gateway.submit_video(
+        "portrait rebuild",
+        "video-model",
+        {
+            "duration": 5,
+            "character_reference_image": "https://example.com/person.jpg",
+        },
+        extra={"character_image_field": "person_image_url"},
+    )
+
+    assert task_id == "task-1"
+    assert seen["payload"]["person_image_url"] == "https://example.com/person.jpg"
+    assert "character_reference_image" not in seen["payload"]
 
 
 def test_generic_video_submit_filters_internal_params(monkeypatch):

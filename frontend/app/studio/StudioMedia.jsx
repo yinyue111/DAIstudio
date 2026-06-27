@@ -33,7 +33,7 @@ function PreviewLoading() {
   );
 }
 
-export function ReferenceAssetPreview({ asset }) {
+export function ReferenceAssetPreview({ asset, compact = false }) {
   const [failed, setFailed] = useState(false);
   const [secureSrc, setSecureSrc] = useState("");
   const videoRawSrc = asset?.type === "video" ? (asset?.display_url || asset?.url || "") : "";
@@ -80,7 +80,7 @@ export function ReferenceAssetPreview({ asset }) {
       return (
         <video
           src={videoSrc}
-          controls
+          controls={!compact}
           muted
           playsInline
           preload="metadata"
