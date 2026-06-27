@@ -216,10 +216,10 @@ class Settings(BaseSettings):
     metrics_token: str = ""
 
     # --- Online update ---
-    # Enabled by default for this single-operator admin console. The operation is
-    # still constrained to a fixed Git remote/branch and an optional fixed apply
-    # command; set ONLINE_UPDATE_ENABLED=false to disable the admin tab action.
-    online_update_enabled: bool = True
+    # Disabled by default because Docker/images usually do not run from a real Git
+    # checkout. Enable explicitly on a server with a fixed remote/branch/apply
+    # command.
+    online_update_enabled: bool = False
     online_update_repo_dir: str = str(BASE_DIR.parent)
     online_update_remote: str = "https://github.com/yinyue111/DAIstudio.git"
     online_update_branch: str = "main"

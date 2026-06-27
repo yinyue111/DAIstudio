@@ -25,7 +25,7 @@ export default function LoginPage() {
 
   useEffect(() => {
     let cancelled = false;
-    api.me()
+    api.me({ redirectOn401: false })
       .then(() => {
         if (!cancelled) router.replace(currentNextPath() || "/");
       })

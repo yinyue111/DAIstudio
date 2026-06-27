@@ -100,6 +100,21 @@ assert.doesNotMatch(
   /targetMode === creationMode[\s\S]{0,180}setRatio\(nearestRatio/,
   "asset ratio updates should not depend on the currently rendered tab",
 );
+assert.match(
+  pageSource,
+  /label: "图生视频"/,
+  "video edit tab should describe the actual image-to-video reconstruction capability",
+);
+assert.match(
+  pageSource,
+  /"生成重构视频 ▶"/,
+  "video reconstruction submit button should not promise direct video editing",
+);
+assert.doesNotMatch(
+  pageSource,
+  /label: "视频编辑"/,
+  "video reconstruction mode should not be labeled as direct video editing",
+);
 
 for (const phrase of [
   "包装文字逐字保留",

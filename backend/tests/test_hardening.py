@@ -271,6 +271,56 @@ def test_partial_image_generation_unknown_slot_holds_for_review(
         db.close()
 
 
+def test_full_image_generation_unknown_submit_holds_for_review(
+    client,
+    make_user,
+    auth,
+    monkeypatch,
+):
+    make_user("13900000052", balance=1000)
+    h = auth("13900000052")
+
+    def all_unknown_failure(*_args, **_kwargs):
+        raise gateway.GatewayError(
+            "图像网关未返回任何结果: read timed out",
+            transient=True,
+            submit_state_unknown=True,
+        )
+
+    monkeypatch.setattr("app.services.gateway.gen_image", all_unknown_failure)
+
+    r = client.post("/api/generate", json={
+        "category": "image",
+        "stage": "preview",
+        "prompt": {"final_text": "full unknown"},
+        "params": {"n": 4, "size": "256x256"},
+    }, headers=h)
+
+    assert r.status_code == 200, r.text
+    task = client.get(f"/api/tasks/{r.json()['id']}", headers=h).json()
+    assert task["status"] == "needs_review"
+    assert task["partial"] is True
+    assert task["requested_count"] == 4
+    assert task["saved_count"] == 0
+    assert task["skipped_count"] == 4
+    assert task["cost_frozen"] == 60
+    assert task["cost_settled"] == 0
+    assert len(task["assets"]) == 0
+    me = client.get("/api/me", headers=h).json()
+    assert me["balance_credits"] == 940
+    assert me["frozen_credits"] == 60
+
+    db = SessionLocal()
+    try:
+        db_task = db.get(GenTask, r.json()["id"])
+        assert db_task.params["_image_submit_state_unknown"] is True
+        assert db_task.params["_requested_n"] == 4
+        assert db_task.params["_saved_n"] == 0
+        assert "_image_result_keys" not in db_task.params
+    finally:
+        db.close()
+
+
 def test_review_task_list_marks_image_local_results_availability(client, make_user, auth):
     make_user("13900001951", balance=1000, admin=True)
     h = auth("13900001951")

@@ -585,6 +585,16 @@ def run_image_task(task_id: int) -> None:
                               latency_ms=int((time.time() - t0) * 1000),
                               detail={"n": n, "size": size, "mode": mode,
                                       "error": str(e)[:300]})
+            if _image_submit_state_unknown(e):
+                _hold_image_submit_unknown_for_reconciliation(
+                    db,
+                    task_id,
+                    str(e),
+                    written_keys=[],
+                    saved_count=0,
+                    requested_count=n,
+                )
+                return
             raise
         gateway_failure_items = list(getattr(images, "failures", []) or [])
         has_unknown_gateway_failure = any(

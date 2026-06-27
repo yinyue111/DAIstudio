@@ -261,7 +261,10 @@ function errorTextToMessage(text, status, fallback = "请求失败") {
   return `${fallback} (${status})`;
 }
 
-async function request(path, { method = "GET", body, auth = true, timeoutMs = DEFAULT_TIMEOUT_MS } = {}) {
+async function request(
+  path,
+  { method = "GET", body, auth = true, timeoutMs = DEFAULT_TIMEOUT_MS, redirectOn401 = true } = {},
+) {
   const headers = { "Content-Type": "application/json" };
   if (auth) {
     const t = getToken();
@@ -279,7 +282,7 @@ async function request(path, { method = "GET", body, auth = true, timeoutMs = DE
   );
   if (res.status === 401 && auth) {
     clearToken();
-    if (typeof window !== "undefined" && !path.startsWith("/api/auth")) {
+    if (redirectOn401 && typeof window !== "undefined" && !path.startsWith("/api/auth")) {
       redirectToLogin();
     }
     throw new ApiError("登录已过期，请重新登录", { status: 401 });
@@ -355,7 +358,7 @@ export const api = {
     request("/api/auth/sms/send", { method: "POST", body: { phone }, auth: false }),
   login: (phone, password) =>
     request("/api/auth/login", { method: "POST", body: { phone, password }, auth: false }),
-  me: () => request("/api/me"),
+  me: (options = {}) => request("/api/me", options),
   config: () => request("/api/config"),
   profile: () => request("/api/profile"),
   profileAssets: ({ type = "all", favorite = false, limit = 60, offset = 0 } = {}) =>

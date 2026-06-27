@@ -43,7 +43,7 @@ const CREATION_MODES = [
   { key: "image", label: "文生图", icon: "✦" },
   { key: "image_edit", label: "图片编辑", icon: "◐" },
   { key: "video", label: "文生视频", icon: "▶" },
-  { key: "video_edit", label: "视频编辑", icon: "▣" },
+  { key: "video_edit", label: "图生视频", icon: "▣" },
 ];
 
 const EDIT_STYLE_KEYS = {
@@ -1327,7 +1327,7 @@ export default function Home() {
     : creationMode === "video"
       ? "生成预览 ▶"
         : creationMode === "video_edit"
-          ? "编辑视频 ▶"
+          ? "生成重构视频 ▶"
         : creationMode === "image_edit"
           ? (portraitGenerationMode ? "人像生成 ✦" : productGenerationMode ? "产品生成 ✦" : "编辑生成 ✦")
           : "立即生成 ✦";
@@ -1583,7 +1583,7 @@ export default function Home() {
                           </h2>
                         </div>
                         <span className="badge bg-brand-soft text-snow">
-                          {category === "video" ? (portraitGenerationMode ? "人物重构" : "视频编辑源") : (portraitGenerationMode ? "人像高保真" : productGenerationMode ? "产品高保真" : "图片编辑源")}
+                          {category === "video" ? (portraitGenerationMode ? "人物重构" : "图生视频源") : (portraitGenerationMode ? "人像高保真" : productGenerationMode ? "产品高保真" : "图片编辑源")}
                         </span>
                       </div>
                       {isImageEditMode && (

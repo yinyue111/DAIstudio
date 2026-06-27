@@ -13,6 +13,7 @@ global.window = {
 };
 
 const apiSource = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "../lib/api.js"), "utf8");
+const loginSource = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "../app/login/page.jsx"), "utf8");
 
 function legacyTokenClearingFunction(name) {
   const match = apiSource.match(new RegExp(`export function ${name}\\([^)]*\\) \\{([\\s\\S]*?)\\n\\}`));
@@ -53,5 +54,20 @@ for (const path of pageFiles(appDir)) {
     `${path} must rely on api.me() cookie validation instead of getToken()`,
   );
 }
+assert.match(
+  apiSource,
+  /redirectOn401 = true/,
+  "API request helper should allow callers to opt out of automatic 401 redirects",
+);
+assert.match(
+  apiSource,
+  /redirectOn401 && typeof window !== "undefined" && !path\.startsWith\("\/api\/auth"\)/,
+  "401 redirects should be gated by redirectOn401",
+);
+assert.match(
+  loginSource,
+  /api\.me\(\{\s*redirectOn401:\s*false\s*\}\)/,
+  "login page session probe must not redirect on anonymous 401 responses",
+);
 
 console.log("api auth cookie test passed");

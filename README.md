@@ -303,11 +303,11 @@ PAYMENT_FRONTEND_BASE_URL=https://dream.aiwuq.cn
 
 ## 在线版本升级
 
-管理后台提供“版本升级”页，可以从服务端配置的 Git remote/branch 拉取新代码并执行固定生效命令。该功能默认开启，默认升级源是私有 GitHub 仓库 `https://github.com/yinyue111/DAIstudio.git`。生产启用前需要确认 API 进程运行在真实 Git checkout 中，并为私有仓库配置 `ONLINE_UPDATE_GITHUB_TOKEN`。Docker 镜像默认不包含 `.git`，所以普通 Compose 镜像内 `/app` 不能直接在线升级；如果使用镜像内 `/app` 运行且没有挂载真实仓库，请显式设置 `ONLINE_UPDATE_ENABLED=false`。
+管理后台提供“版本升级”页，可以从服务端配置的 Git remote/branch 拉取新代码并执行固定生效命令。该功能默认关闭，默认升级源是私有 GitHub 仓库 `https://github.com/yinyue111/DAIstudio.git`。生产启用前需要确认 API 进程运行在真实 Git checkout 中，并为私有仓库配置 `ONLINE_UPDATE_GITHUB_TOKEN`。Docker 镜像默认不包含 `.git`，所以普通 Compose 镜像内 `/app` 不能直接在线升级；只有挂载真实仓库并配置固定生效命令后，才建议显式设置 `ONLINE_UPDATE_ENABLED=true`。
 
 安全边界：
 
-- 默认 `ONLINE_UPDATE_ENABLED=true`
+- 默认 `ONLINE_UPDATE_ENABLED=false`，需要真实 Git checkout 和固定生效命令后显式开启
 - 只更新服务端配置的 `ONLINE_UPDATE_REMOTE` / `ONLINE_UPDATE_BRANCH`
 - 私有库使用 GitHub fine-grained PAT，通过 `ONLINE_UPDATE_GITHUB_TOKEN` 注入，不要把 GitHub 密码或 token 写进 URL
 - `ONLINE_UPDATE_REMOTE` 可以是 HTTPS/SSH Git URL 或 remote 名称；remote 名称解析后的真实 URL 也会校验，默认拒绝 `file://`、绝对路径、相对路径等本地仓库来源
@@ -427,7 +427,7 @@ SMS_TEMPLATE_CODE=<your-template-code>
 | `PAYMENT_CONFIG_SECRET` | 加密后台保存的支付密钥 |
 | `PAYMENT_MOCK_ENABLED` | 支付 mock 开关，生产必须 `false` |
 | `METRICS_TOKEN` | `/metrics` 访问令牌 |
-| `ONLINE_UPDATE_ENABLED` | 管理后台版本升级开关，默认开启；无真实 Git checkout 时请设为 `false` |
+| `ONLINE_UPDATE_ENABLED` | 管理后台版本升级开关，默认关闭；仅真实 Git checkout 且配置固定生效命令后设为 `true` |
 | `ONLINE_UPDATE_REPO_DIR` | 在线升级使用的 Git checkout 绝对路径 |
 | `ONLINE_UPDATE_REMOTE` | 在线升级 Git 源，默认 `https://github.com/yinyue111/DAIstudio.git` |
 | `ONLINE_UPDATE_BRANCH` | 在线升级分支，默认 `main` |

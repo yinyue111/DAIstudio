@@ -46,7 +46,7 @@ export default function StudioReferencePanel({
   const productGenerationMode = subjectMode === "product";
   const portraitGenerationMode = subjectMode === "portrait";
   const modeTitle = isEditMode
-    ? (creationMode === "video_edit" ? (portraitGenerationMode ? "视频人物重构" : "视频编辑") : "图片编辑")
+    ? (creationMode === "video_edit" ? (portraitGenerationMode ? "视频人物重构" : "图生视频重构") : "图片编辑")
     : (category === "video" ? "视频参考" : "链接反推");
   const styleTitle = isImageEditMode ? "可选风格参考" : (isEditMode ? "风格参考" : "参考素材");
   const styleDescription = isImageEditMode
@@ -255,7 +255,7 @@ export default function StudioReferencePanel({
                           ? "作为视频人物身份参考"
                           : isImageEditMode
                           ? "作为图片编辑源"
-                          : creationMode === "video_edit" ? "作为视频首帧和主体身份参考" : "作为图片编辑源"}
+                          : creationMode === "video_edit" ? "作为图生视频首帧和主体身份参考" : "作为图片编辑源"}
                       </span>
                     </div>
                   </button>
