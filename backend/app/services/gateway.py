@@ -340,6 +340,19 @@ def _decode_image_response(data: dict) -> list[bytes]:
     return out
 
 
+def _image_quality_for_size(size: str | None) -> str:
+    try:
+        w, h = (int(x) for x in str(size or "").lower().split("x", 1))
+    except (TypeError, ValueError):
+        return "medium"
+    longest = max(w, h)
+    if longest > 2560:
+        return "high"
+    if longest > 1280:
+        return "medium"
+    return "low"
+
+
 def _reject_compressed_download(response: httpx.Response) -> None:
     encoding = (response.headers.get("content-encoding") or "").strip().lower()
     if encoding and encoding != "identity":
@@ -543,6 +556,7 @@ def gen_image(prompt: str, image_model_id: str, n: int = 4,
 
     n = max(1, int(n))
     extra = {k: v for k, v in (extra_payload or {}).items() if v not in (None, "")}
+    extra.setdefault("quality", _image_quality_for_size(size))
     refs = [str(x) for x in (reference_image_urls or []) if x]
     if reference_image_url and not refs:
         refs = [reference_image_url]

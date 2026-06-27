@@ -934,7 +934,7 @@ export default function Home() {
       const finalDuration = parentParams.target_duration || parentParams.duration || vDuration;
       const ratioPool = effCategory === "video" ? videoRatioOptions() : RATIOS;
       const rt = ratioPool.find((r) => r.key === finalRatioKey) || ratioPool[0];
-      const imageSize = imageSizeFor(rt, imageQuality, cfg?.image_size_max_dim || 4096);
+      const imageSize = imageSizeFor(rt, imageQuality, cfg?.image_size_max_dim || 3840);
       const sourceAsset = isFinal ? null : (isEditMode ? productAsset : selected);
       const dims = sourceAsset ? assetDims(sourceAsset) : null;
       const refImage = sourceAsset ? (sourceAsset.type === "video" ? sourceAsset.thumb : sourceAsset.url) : null;
@@ -1276,7 +1276,7 @@ export default function Home() {
   const imageCount = boundedImageCount(n, maxImageN);
   const maxVideoDuration = Number(cfg?.video_duration_max_seconds || 900);
   const videoDuration = boundedVideoDuration(vDuration, maxVideoDuration);
-  const currentImageSize = imageSizeFor(rt, imageQuality, cfg?.image_size_max_dim || 4096);
+  const currentImageSize = imageSizeFor(rt, imageQuality, cfg?.image_size_max_dim || 3840);
   const taskParams = task?.params || {};
   const videoFinalCost = Number(task?.final_cost_estimate || 0)
     || estimateVideoFinalCredits(cfg, {

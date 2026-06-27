@@ -10,7 +10,7 @@
     "dev": "next dev --webpack -p 3000",
     "build": "next build --webpack",
     "start": "next start -p 3000",
-    "test:unit": "node scripts/api-auth-cookie.test.mjs && node scripts/api-base-localhost.test.mjs && node scripts/api-upload-rights.test.mjs && node scripts/reference-preview-security.test.mjs && node scripts/download-blob-navigation.test.mjs && node scripts/admin-payment-env-readonly.test.mjs && node scripts/security-headers.test.mjs && node scripts/style-transfer-prompt.test.mjs && node scripts/studio-concurrency.test.mjs && node scripts/studio-workspace-state.test.mjs"
+    "test:unit": "node scripts/api-auth-cookie.test.mjs && node scripts/api-base-localhost.test.mjs && node scripts/api-upload-rights.test.mjs && node scripts/reference-preview-security.test.mjs && node scripts/download-blob-navigation.test.mjs && node scripts/admin-payment-env-readonly.test.mjs && node scripts/security-headers.test.mjs && node scripts/style-transfer-prompt.test.mjs && node scripts/studio-image-size.test.mjs && node scripts/studio-concurrency.test.mjs && node scripts/studio-workspace-state.test.mjs"
   },
   "dependencies": {
     "next": "16.2.9",

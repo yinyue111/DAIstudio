@@ -144,7 +144,7 @@ class Settings(BaseSettings):
     # Guard rails on user-supplied generation params (reject before hitting the
     # gateway / allocating media, so n=99999 or size=99999x99999 can't OOM us).
     max_image_n: int = 8
-    max_image_dim: int = 4096  # max width/height for a requested image size
+    max_image_dim: int = 3840  # OpenAI-compatible image max edge for gpt-image-2 4K
     max_upload_image_bytes: int = 20 * 1024 * 1024
     max_upload_image_pixels: int = 24_000_000
     max_upload_video_bytes: int = 512 * 1024 * 1024

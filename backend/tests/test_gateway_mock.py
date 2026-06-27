@@ -395,6 +395,25 @@ def test_text_to_image_repeats_without_n(monkeypatch):
     assert all(retries == 0 for _method, _url, _payload, _timeout, retries in calls)
 
 
+def test_text_to_image_sends_quality_for_official_4k(monkeypatch):
+    monkeypatch.setattr(settings, "mock_mode", False)
+    monkeypatch.setattr(settings, "gateway_base_url", "http://gateway.test")
+    monkeypatch.setattr(settings, "gateway_api_key", "test-key")
+    raw = base64.b64encode(gateway._mock_image("x", "256x256", 0)).decode()
+    calls = []
+
+    def fake_request_json(method, url, *, headers, payload, timeout, retries):
+        calls.append(dict(payload))
+        return {"data": [{"b64_json": raw}]}
+
+    monkeypatch.setattr(gateway, "_request_json", fake_request_json)
+    imgs = gateway.gen_image("a cat", "gpt-image-2", n=1, size="2160x3840")
+
+    assert len(imgs) == 1
+    assert calls[0]["size"] == "2160x3840"
+    assert calls[0]["quality"] == "high"
+
+
 def test_text_to_image_uses_per_model_gateway_config(monkeypatch):
     monkeypatch.setattr(settings, "mock_mode", False)
     raw = base64.b64encode(gateway._mock_image("x", "256x256", 0)).decode()

@@ -991,8 +991,9 @@ def test_generated_hd_reference_requires_owner_and_unlock(client, make_user, aut
 
 
 def test_image_generation_adapts_size_from_reference(client, make_user, auth, monkeypatch):
-    make_user("13900000017", balance=1000)
+    make_user("13900000017", balance=1000, admin=True)
     h = auth("13900000017")
+    client.put("/api/admin/settings", json={"image_size": "1024x1024", "admin_password": "pass123456"}, headers=h)
 
     seen = {}
 
@@ -1021,7 +1022,7 @@ def test_image_generation_adapts_size_from_reference(client, make_user, auth, mo
 def test_image_generation_adapts_size_from_reference_at_4k_default(client, make_user, auth, monkeypatch):
     make_user("13900000079", balance=1000, admin=True)
     h = auth("13900000079")
-    client.put("/api/admin/settings", json={"image_size": "4096x4096", "admin_password": "pass123456"}, headers=h)
+    client.put("/api/admin/settings", json={"image_size": "2880x2880", "admin_password": "pass123456"}, headers=h)
 
     seen = {}
 
@@ -1044,7 +1045,7 @@ def test_image_generation_adapts_size_from_reference_at_4k_default(client, make_
     }, headers=h)
     assert r.status_code == 200, r.text
 
-    assert seen["size"] == "2304x4096"
+    assert seen["size"] == "2160x3840"
 
 
 def test_insufficient_credits(client, make_user, auth):

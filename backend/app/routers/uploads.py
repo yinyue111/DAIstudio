@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import io
+import re
 import uuid
 from pathlib import Path
 
@@ -42,6 +43,8 @@ _SUPPORTED_VIDEO_SUFFIXES = {
     ".webm": "webm",
 }
 _UPLOAD_CHUNK_BYTES = 1024 * 1024
+_MAX_ORIGINAL_FILENAME = 180
+_FILENAME_SAFE_RE = re.compile(r"[\x00-\x1f\x7f/\\:]+")
 
 
 def _content_length(request: Request) -> int | None:
@@ -52,6 +55,16 @@ def _content_length(request: Request) -> int | None:
         return int(header)
     except ValueError:
         raise HTTPException(400, "Content-Length 非法") from None
+
+
+def _safe_original_filename(filename: str | None, fallback: str) -> str:
+    name = Path(str(filename or "").replace("\\", "/")).name.strip()
+    if not name:
+        name = Path(fallback).name
+    name = _FILENAME_SAFE_RE.sub("_", name).strip(" .")
+    if not name:
+        name = Path(fallback).name
+    return name[:_MAX_ORIGINAL_FILENAME]
 
 
 def _normalize_image_upload(data: bytes) -> tuple[bytes, int, int]:
@@ -202,7 +215,7 @@ async def upload_image(
         upload_key = storage.save_bytes_named(normalized_png, "upload", f"{stem}.png")
         preview_key = storage.save_bytes_named(preview_png, "upload_preview", f"{stem}.png")
         model_ref_key = storage.save_bytes_named(model_ref_jpeg, "upload_model_ref", f"{stem}.jpg")
-        original_filename = file.filename or upload_key.rsplit("/", 1)[-1]
+        original_filename = _safe_original_filename(file.filename, upload_key.rsplit("/", 1)[-1])
         db.add(
             UploadedAsset(
                 key=upload_key,
@@ -291,7 +304,7 @@ async def upload_video(
         ensure_user_media_quota(db, user.id, bytes_written + (len(poster) if poster else 0))
         if poster:
             preview_key = storage.save_bytes_named(poster, "upload_video_preview", f"{stem}.jpg")
-        original_filename = file.filename or upload_key.rsplit("/", 1)[-1]
+        original_filename = _safe_original_filename(file.filename, upload_key.rsplit("/", 1)[-1])
         db.add(
             UploadedAsset(
                 key=upload_key,

@@ -84,6 +84,8 @@ VIDEO_FIRST_FRAME_MIN_SIDE = 300
 VIDEO_FIRST_FRAME_MAX_SIDE = 768
 IMAGE_EDIT_REFERENCE_MAX_SIDE = 1024
 IMAGE_PRODUCT_EDIT_REFERENCE_MAX_SIDE = 1536
+IMAGE_RESULT_MIN_LONG_EDGE_RATIO = 0.85
+IMAGE_RESULT_MIN_AREA_RATIO = 0.65
 PRODUCT_FIDELITY_GUARD = (
     "产品高保真硬约束：上传产品图是唯一产品身份来源，产品主体、Logo、包装结构、品牌色、形状、"
     "材质、比例、标签版式、表面纹理和所有可见文字必须完整保留；包装上的品牌名、Logo、中文、"
@@ -130,6 +132,39 @@ __all__ = ["ModelSnapshotMismatchError", "NEEDS_REVIEW", "TaskLockedError",
 
 class TaskLockedError(RuntimeError):
     pass
+
+
+def _parse_image_size(value: str | None) -> tuple[int, int] | None:
+    m = re.match(r"^(\d+)x(\d+)$", str(value or "").strip().lower())
+    if not m:
+        return None
+    width = int(m.group(1))
+    height = int(m.group(2))
+    if width <= 0 or height <= 0:
+        return None
+    return width, height
+
+
+def _image_result_dimension_error(requested_size: str | None, width: int, height: int) -> str | None:
+    requested = _parse_image_size(requested_size)
+    if not requested:
+        return None
+    req_w, req_h = requested
+    requested_long = max(req_w, req_h)
+    if requested_long <= 1280:
+        return None
+    actual_long = max(width, height)
+    requested_area = req_w * req_h
+    actual_area = width * height
+    if (
+        actual_long < requested_long * IMAGE_RESULT_MIN_LONG_EDGE_RATIO
+        or actual_area < requested_area * IMAGE_RESULT_MIN_AREA_RATIO
+    ):
+        return (
+            f"网关返回图片分辨率低于请求: 请求 {req_w}x{req_h}, "
+            f"实际 {width}x{height}"
+        )
+    return None
 
 
 def _is_product_generation_task(task: GenTask) -> bool:
@@ -454,6 +489,8 @@ def _public_image_error(exc: Exception) -> str:
             "图片网关当前没有可用账号支持该模型/参数组合，已退回冻结积分。"
             "请稍后重试或在后台切换图像模型/网关账号。"
         )
+    if "分辨率低于请求" in message:
+        return f"{message[:120]}，已退回冻结积分。请检查后台图像模型/网关是否支持该尺寸。"
     if "images[].image_url" in message or "unknown parameter" in lowered or "invalid_request_error" in lowered:
         return (
             "图片网关参数不匹配，已退回冻结积分。"
@@ -621,12 +658,16 @@ def run_image_task(task_id: int) -> None:
         written_keys: list[str] = []
         saved_count = 0
         image_errors: list[str] = []
+        actual_sizes: list[str] = []
         for raw in images:
             try:
                 preview_png, hd_w, hd_h = make_image_preview(
                     raw,
                     max_pixels=int(settings.generated_image_max_pixels),
                 )
+                dim_error = _image_result_dimension_error(size, hd_w, hd_h)
+                if dim_error:
+                    raise ValueError(dim_error)
                 model_ref_jpeg, _, _ = make_model_reference(
                     raw,
                     max_pixels=int(settings.generated_image_max_pixels),
@@ -653,11 +694,12 @@ def run_image_task(task_id: int) -> None:
                     )
                 )
                 saved_count += 1
+                actual_sizes.append(f"{hd_w}x{hd_h}")
             except Exception as e:  # noqa: BLE001
                 image_errors.append(str(e)[:160])
                 log.warning("image task %s skipped one invalid image: %s", task_id, e)
         if saved_count <= 0:
-            raise RuntimeError("图片网关返回结果均无法解析")
+            raise RuntimeError(image_errors[0] if image_errors else "图片网关返回结果均无法解析")
         # finalize atomically: only the runner that claims the terminal status
         # settles, so a duplicate/raced run can't double-charge or double-credit.
         real_cost = _settlement_cost(task, model, image_count=saved_count)
@@ -674,6 +716,7 @@ def run_image_task(task_id: int) -> None:
                 "saved_n": saved_count,
                 "skipped_n": skipped_n,
                 "errors": partial_errors[:5],
+                **({"actual_sizes": actual_sizes[:5]} if actual_sizes else {}),
                 **({"submit_state_unknown": True} if has_unknown_gateway_failure else {}),
             }
             if saved_count < n or image_errors else None
@@ -712,6 +755,8 @@ def run_image_task(task_id: int) -> None:
                 **({"_image_submit_state_unknown": True} if has_unknown_gateway_failure else {}),
                 **({"_unknown_submit_errors": unknown_errors[:5]} if unknown_errors else {}),
             }
+        elif actual_sizes:
+            task.params = {**(task.params or {}), "_actual_sizes": actual_sizes[:20]}
         if not claim_terminal(db, task_id, "succeeded", cost_settled=real_cost):
             db.rollback()  # another runner finalized -> discard our row + files
             _unlink_keys(written_keys)

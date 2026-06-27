@@ -21,8 +21,10 @@ function runningTaskHint(task) {
   if (task.status === "queued") return "任务已提交，正在等待 Worker 接手。";
   if (task.status !== "running") return "暂无结果素材";
   const n = Number(task.requested_count || 0);
-  const isHighRes = String(task.params?.size || "").includes("4096")
-    || String(task.params?.size || "").includes("3072");
+  const sizeMatch = /^(\d+)x(\d+)$/.exec(String(task.params?.size || ""));
+  const width = sizeMatch ? Number(sizeMatch[1]) : 0;
+  const height = sizeMatch ? Number(sizeMatch[2]) : 0;
+  const isHighRes = Math.max(width, height) > 2560 || width * height >= 3840 * 2160 * 0.9;
   if (task.category === "image") {
     return isHighRes && n > 1
       ? `正在等待图像网关响应，${n} 张 4K 图可能需要数分钟；如果网关超时会自动失败并退回积分。`

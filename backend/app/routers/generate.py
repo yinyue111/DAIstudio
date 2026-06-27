@@ -39,6 +39,7 @@ router = APIRouter(prefix="/api", tags=["generate"])
 
 
 _SIZE_RE = re.compile(r"^(\d{2,5})x(\d{2,5})$")
+_OPENAI_COMPAT_4K_MAX_PIXELS = 3840 * 2160
 _VIDEO_RESOLUTIONS = {"480p", "720p", "1080p"}
 _VIDEO_RATIOS = {"1:1", "3:4", "4:3", "9:16", "16:9"}
 _COMMON_PARAM_KEYS = {
@@ -51,6 +52,11 @@ _COMMON_PARAM_KEYS = {
     "height",
     "subject_mode",
 }
+
+
+def _image_max_pixels() -> int:
+    max_dim = max(1, int(settings.max_image_dim or 1))
+    return min(_OPENAI_COMPAT_4K_MAX_PIXELS, max_dim * max_dim)
 _IMAGE_PARAM_KEYS = _COMMON_PARAM_KEYS | {"n", "size", "style_reference_image", "character_reference_image"}
 _VIDEO_PARAM_KEYS = _COMMON_PARAM_KEYS | {
     "duration",
@@ -138,11 +144,23 @@ def _validate_params(category: str, params: dict) -> dict:
         size = params.get("size")
         if size is not None:
             m = _SIZE_RE.match(str(size))
-            if not m or not (
-                0 < int(m.group(1)) <= settings.max_image_dim
-                and 0 < int(m.group(2)) <= settings.max_image_dim
-            ):
+            if not m:
                 raise HTTPException(400, f"尺寸非法(最大 {settings.max_image_dim}px)")
+            width = int(m.group(1))
+            height = int(m.group(2))
+            ratio = width / height if height else 0
+            if not (
+                0 < width <= settings.max_image_dim
+                and 0 < height <= settings.max_image_dim
+                and width % 16 == 0
+                and height % 16 == 0
+                and width * height <= _image_max_pixels()
+                and (1 / 3) <= ratio <= 3
+            ):
+                raise HTTPException(
+                    400,
+                    f"尺寸非法:最大边 {settings.max_image_dim}px，总像素不超过 {_image_max_pixels()}，宽高需为 16 的倍数",
+                )
     else:  # video
         if params.get("duration") is not None:
             try:

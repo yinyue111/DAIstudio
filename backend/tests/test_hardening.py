@@ -539,10 +539,90 @@ def test_generate_accepts_4k_size(client, make_user, auth, monkeypatch):
         "source_asset_url": "http://x/y.png", "source_type": "image",
         "source_asset_meta": {"user_confirmed_rights": True},
         "category": "image", "stage": "preview", "instruction": "x",
-        "params": {"n": 1, "size": "4096x4096"},
+        "params": {"n": 1, "size": "2880x2880"},
     }, headers=h)
     assert r.status_code == 200, r.text
-    assert seen["size"] == "4096x4096"
+    assert seen["size"] == "2880x2880"
+
+
+def test_generate_respects_lower_max_image_dim_area(client, make_user, auth, monkeypatch):
+    make_user("13900000034", balance=1000)
+    h = auth("13900000034")
+    monkeypatch.setattr("app.routers.generate.settings.max_image_dim", 2048)
+
+    r = client.post("/api/generate", json={
+        "category": "image",
+        "stage": "preview",
+        "prompt": {"final_text": "too many pixels for a 2k-limited deployment"},
+        "params": {"n": 1, "size": "2048x2560"},
+    }, headers=h)
+
+    assert r.status_code == 400
+    assert "总像素不超过" in r.text
+
+
+def test_admin_settings_respects_lower_max_image_dim_area(client, make_user, auth, monkeypatch):
+    make_user("13900000035", balance=1000, admin=True)
+    h = auth("13900000035")
+    monkeypatch.setattr("app.routers.admin.app_config.max_image_dim", 2048)
+
+    r = client.put("/api/admin/settings", json={
+        "image_size": "2048x2560",
+        "admin_password": "pass123456",
+    }, headers=h)
+
+    assert r.status_code == 400
+    assert "总像素不超过" in r.text
+
+
+def test_4k_generation_rejects_gateway_downscaled_result(client, make_user, auth, monkeypatch):
+    make_user("13900000032", balance=1000)
+    h = auth("13900000032")
+
+    monkeypatch.setattr(
+        "app.services.gateway.gen_image",
+        lambda prompt, _model, n=1, size="2880x2880", **_kwargs: [
+            gateway._mock_image(prompt, "1024x1024", 0)
+        ],
+    )
+
+    r = client.post("/api/generate", json={
+        "category": "image",
+        "stage": "preview",
+        "prompt": {"final_text": "4k request but gateway downscales"},
+        "params": {"n": 1, "size": "2880x2880"},
+    }, headers=h)
+    assert r.status_code == 200, r.text
+
+    task = client.get(f"/api/tasks/{r.json()['id']}", headers=h).json()
+    assert task["status"] == "failed"
+    assert "分辨率低于请求" in task["error"]
+    assert client.get("/api/me", headers=h).json()["balance_credits"] == 1000
+
+
+def test_4k_generation_keeps_gateway_full_resolution_result(client, make_user, auth, monkeypatch):
+    make_user("13900000033", balance=1000)
+    h = auth("13900000033")
+
+    monkeypatch.setattr(
+        "app.services.gateway.gen_image",
+        lambda prompt, _model, n=1, size="2880x2880", **_kwargs: [
+            gateway._mock_image(prompt, "2880x2880", 0)
+        ],
+    )
+
+    r = client.post("/api/generate", json={
+        "category": "image",
+        "stage": "preview",
+        "prompt": {"final_text": "near full 4k"},
+        "params": {"n": 1, "size": "2880x2880"},
+    }, headers=h)
+    assert r.status_code == 200, r.text
+
+    task = client.get(f"/api/tasks/{r.json()['id']}", headers=h).json()
+    assert task["status"] == "succeeded"
+    assert task["assets"][0]["width"] == 2880
+    assert task["assets"][0]["height"] == 2880
 
 
 def test_reverse_portrait_prompt_is_compacted_for_image_gateway(client, make_user, auth, monkeypatch):

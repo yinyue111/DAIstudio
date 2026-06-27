@@ -96,8 +96,11 @@ def image_quality_tier(size: str | None) -> str:
     match = _SIZE_RE.match(str(size).lower())
     if not match:
         return "1k"
-    longest = max(int(match.group(1)), int(match.group(2)))
-    if longest > 2560:
+    width = int(match.group(1))
+    height = int(match.group(2))
+    longest = max(width, height)
+    area = width * height
+    if longest > 2560 or area >= 3840 * 2160 * 0.9:
         return "4k"
     if longest > 1280:
         return "2k"

@@ -435,7 +435,7 @@ SMS_TEMPLATE_CODE=<your-template-code>
 | `ONLINE_UPDATE_APPLY_COMMAND` | 代码更新后执行的固定生效命令 |
 | `ONLINE_UPDATE_ALLOW_LOCAL_REMOTE` | 是否允许在线升级使用本地 Git remote，默认 `false`，仅建议测试环境开启 |
 | `MAX_IMAGE_N` | 单次图片生成最大张数，默认 8 |
-| `MAX_IMAGE_DIM` | 图片最大边长，默认 4096 |
+| `MAX_IMAGE_DIM` | 图片最大边长，默认 3840；gpt-image-2 官方 4K 建议使用 3840x2160、2160x3840 或同面积内的 16 倍数尺寸 |
 | `MAX_VIDEO_SECONDS` | 视频最大时长，默认 900 秒 |
 | `REVERSE_VIDEO_FRAMES` | 视频反推抽帧数量 |
 | `NEXT_PUBLIC_API_BASE` | 前端访问 API 的跨域地址；同域部署可留空 |

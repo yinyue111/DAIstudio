@@ -108,6 +108,34 @@ def test_upload_image_returns_reference_asset(client, make_user, auth):
     assert client.get(f"/api/uploads/{model_ref_key}", headers=h).status_code == 404
 
 
+def test_upload_image_sanitizes_long_original_filename(client, make_user, auth):
+    make_user("13900000109", balance=1000)
+    h = auth("13900000109")
+    long_name = "../" + ("产品资料" * 120) + ".png"
+
+    r = client.post(
+        "/api/uploads/image",
+        files={"file": (long_name, _png_bytes(), "image/png")},
+        headers=h,
+    )
+    assert r.status_code == 200, r.text
+
+    key = urlparse(r.json()["url"]).path.removeprefix("/api/uploads/")
+    stem = key.split("/", 1)[1].rsplit(".", 1)[0]
+    keys = [
+        key,
+        f"upload_preview/{stem}.png",
+        f"upload_model_ref/{stem}.jpg",
+    ]
+    db = SessionLocal()
+    try:
+        filenames = [db.get(UploadedAsset, asset_key).original_filename for asset_key in keys]
+        assert all(filename and len(filename) <= 255 for filename in filenames)
+        assert all("/" not in filename and "\\" not in filename for filename in filenames)
+    finally:
+        db.close()
+
+
 def test_upload_image_commits_even_when_audit_fails(client, make_user, auth, monkeypatch):
     make_user("13900000108", balance=1000)
     h = auth("13900000108")

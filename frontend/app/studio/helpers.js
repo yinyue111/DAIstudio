@@ -99,27 +99,26 @@ export function qualityKeyForSize(size) {
   const m = /^(\d+)x(\d+)$/.exec(String(size || ""));
   if (!m) return "1k";
   const maxSide = Math.max(Number(m[1]), Number(m[2]));
-  if (maxSide >= 3500) return "4k";
+  const area = Number(m[1]) * Number(m[2]);
+  if (maxSide >= 3500 || area >= 3840 * 2160 * 0.9) return "4k";
   if (maxSide >= 1500) return "2k";
   return "1k";
 }
 
-export function imageSizeFor(ratio, quality, maxDim = 4096) {
+export function imageSizeFor(ratio, quality, maxDim = 3840) {
   const preset = IMAGE_QUALITY_PRESETS.find((q) => q.key === quality) || IMAGE_QUALITY_PRESETS[0];
-  const maxSide = Math.min(Number(maxDim) || 4096, preset.maxSide);
-  if (ratio.w >= ratio.h) {
-    const width = maxSide;
-    const height = roundImageDim((maxSide * ratio.h) / ratio.w, maxDim);
-    return `${width}x${height}`;
-  }
-  const height = maxSide;
-  const width = roundImageDim((maxSide * ratio.w) / ratio.h, maxDim);
+  const maxSide = Math.min(Number(maxDim) || 3840, preset.maxSide);
+  const maxArea = quality === "4k" ? 3840 * 2160 : maxSide * maxSide;
+  const areaSide = Math.sqrt(maxArea / (ratio.w * ratio.h));
+  const scale = Math.min(maxSide / Math.max(ratio.w, ratio.h), areaSide);
+  const width = roundImageDim(ratio.w * scale, maxDim);
+  const height = roundImageDim(ratio.h * scale, maxDim);
   return `${width}x${height}`;
 }
 
-export function roundImageDim(value, maxDim = 4096) {
-  const capped = Math.max(64, Math.min(Number(maxDim) || 4096, Math.round(value)));
-  return Math.max(64, Math.min(Number(maxDim) || 4096, Math.round(capped / 8) * 8));
+export function roundImageDim(value, maxDim = 3840) {
+  const capped = Math.max(64, Math.min(Number(maxDim) || 3840, Math.round(value)));
+  return Math.max(64, Math.min(Number(maxDim) || 3840, Math.floor(capped / 16) * 16));
 }
 
 export function boundedImageCount(value, max = 8) {
@@ -148,7 +147,8 @@ export function imageQualityTierForSize(size) {
   const m = /^(\d+)x(\d+)$/.exec(String(size || ""));
   if (!m) return "1k";
   const maxSide = Math.max(Number(m[1]), Number(m[2]));
-  if (maxSide > 2560) return "4k";
+  const area = Number(m[1]) * Number(m[2]);
+  if (maxSide > 2560 || area >= 3840 * 2160 * 0.9) return "4k";
   if (maxSide > 1280) return "2k";
   return "1k";
 }

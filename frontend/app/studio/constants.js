@@ -19,7 +19,7 @@ export const VIDEO_RATIO_KEYS = new Set(["1:1", "3:4", "4:3", "9:16", "16:9"]);
 export const IMAGE_QUALITY_PRESETS = [
   { key: "1k", label: "1K", hint: "快速预览", maxSide: 1024 },
   { key: "2k", label: "2K", hint: "均衡清晰", maxSide: 2048 },
-  { key: "4k", label: "4K", hint: "最高质量", maxSide: 4096 },
+  { key: "4k", label: "4K", hint: "官方 4K", maxSide: 3840 },
 ];
 
 export const VIDEO_QUALITIES = [

@@ -94,11 +94,17 @@ from .admin_helpers import reserve_quota_grant_idempotency as _reserve_quota_gra
 from .admin_helpers import setting_int as _setting_int
 
 router = APIRouter(prefix="/api/admin", tags=["admin"])
+_OPENAI_COMPAT_4K_MAX_PIXELS = 3840 * 2160
 router.dependencies.append(Depends(_require_admin_rate_limit))
 
 _ADMIN_CONFIRM_FAIL_LIMIT = _admin_helpers.ADMIN_CONFIRM_FAIL_LIMIT
 _ADMIN_CONFIRM_FAIL_IP_LIMIT = _admin_helpers.ADMIN_CONFIRM_FAIL_IP_LIMIT
 _ADMIN_CONFIRM_FAIL_WINDOW_SECONDS = _admin_helpers.ADMIN_CONFIRM_FAIL_WINDOW_SECONDS
+
+
+def _image_max_pixels() -> int:
+    max_dim = max(1, int(app_config.max_image_dim or 1))
+    return min(_OPENAI_COMPAT_4K_MAX_PIXELS, max_dim * max_dim)
 
 
 def _require_admin_password(admin: User, password: str | None, request: Request | None = None) -> None:
@@ -688,11 +694,23 @@ def put_settings(body: SettingsIn, db: Session = Depends(get_db),
         if val is not None:
             if key == "image_size":
                 m = _IMAGE_SIZE_RE.match(str(val))
-                if not m or not (
-                    0 < int(m.group(1)) <= app_config.max_image_dim
-                    and 0 < int(m.group(2)) <= app_config.max_image_dim
-                ):
+                if not m:
                     raise HTTPException(400, f"默认图片尺寸非法(最大 {app_config.max_image_dim}px)")
+                width = int(m.group(1))
+                height = int(m.group(2))
+                ratio = width / height if height else 0
+                if not (
+                    0 < width <= app_config.max_image_dim
+                    and 0 < height <= app_config.max_image_dim
+                    and width % 16 == 0
+                    and height % 16 == 0
+                    and width * height <= _image_max_pixels()
+                    and (1 / 3) <= ratio <= 3
+                ):
+                    raise HTTPException(
+                        400,
+                        f"默认图片尺寸非法:最大边 {app_config.max_image_dim}px，总像素不超过 {_image_max_pixels()}，宽高需为 16 的倍数",
+                    )
             changed[key] = val
     if changed.get("sms_auth_enabled") is True:
         sms_issues = sms.readiness_issues()
