@@ -39,6 +39,12 @@ _GITHUB_TOKEN_RE = re.compile(r"\b(?:gh[opsru]_[A-Za-z0-9_]{8,}|github_pat_[A-Za
 _ALLOWED_REMOTE_SCHEMES = {"https", "ssh"}
 _SCP_REMOTE_RE = re.compile(r"^(?P<user>[A-Za-z0-9._-]+)@(?P<host>[A-Za-z0-9._-]+):(?P<path>[A-Za-z0-9._~/-]+)(?:\.git)?$")
 _GITHUB_SSH_REMOTE_RE = re.compile(r"^(?:git@github\.com:|ssh://git@github\.com/)(?P<repo>[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)(?:\.git)?$")
+_COMPOSE_MUTATION_RE = re.compile(
+    r"\b(?:docker\s+compose|docker-compose)\b[\s\S]{0,240}\b(?:up|restart|down|rm)\b",
+    re.I,
+)
+_COMPOSE_API_SERVICE_RE = re.compile(r"(?:^|\s)(?:api|backend|server)(?:\s|$)", re.I)
+_SCRIPT_SCAN_BYTES = 64_000
 
 
 class OnlineUpdateError(RuntimeError):
@@ -80,6 +86,46 @@ def _redact_text(text: str) -> str:
 
 def _safe_command(args: list[str]) -> str:
     return _redact_text(" ".join(str(part) for part in args))
+
+
+def _read_candidate_apply_file(part: str) -> str:
+    if not part or part.startswith("-"):
+        return ""
+    path = Path(part).expanduser()
+    if not path.is_absolute() and "/" not in part:
+        return ""
+    candidates = [path] if path.is_absolute() else [path, Path(settings.online_update_repo_dir).expanduser() / path]
+    try:
+        readable = next((candidate for candidate in candidates if candidate.is_file()), None)
+        if readable is None:
+            return ""
+        with readable.open("rb") as f:
+            data = f.read(_SCRIPT_SCAN_BYTES)
+    except OSError:
+        return ""
+    return data.decode("utf-8", errors="ignore")
+
+
+def _looks_like_self_restarting_compose(text: str) -> bool:
+    match = _COMPOSE_MUTATION_RE.search(text or "")
+    if not match:
+        return False
+    # `docker compose up` without explicit services can recreate the whole app,
+    # including the API process that is executing the update. If api-like service
+    # names are present, it is definitely unsafe for in-process apply.
+    lines = [line for line in str(text).splitlines() if _COMPOSE_MUTATION_RE.search(line)]
+    return any(_COMPOSE_API_SERVICE_RE.search(line) for line in lines) or bool(lines) or bool(match)
+
+
+def _validate_apply_command_safety(parts: list[str]) -> None:
+    candidates = [" ".join(parts)]
+    candidates.extend(_read_candidate_apply_file(part) for part in parts)
+    if any(_looks_like_self_restarting_compose(candidate) for candidate in candidates if candidate):
+        raise OnlineUpdateError(
+            "ONLINE_UPDATE_APPLY_COMMAND 不能在 API 进程内直接执行会重启 API 的 Docker Compose 命令。"
+            "这会在升级过程中停掉当前后端,导致命令中断、8000 端口消失和登录 502。"
+            "请改为宿主机 systemd oneshot、外部运维队列或后台 supervisor 执行重建/重启。"
+        )
 
 
 def _safe_ref(value: str, label: str) -> str:
@@ -350,6 +396,7 @@ def _apply_command() -> list[str]:
         raise OnlineUpdateError("生效命令不能直接调用 shell,请配置固定脚本路径或安全命令")
     if any(part in {"-c", "-m"} for part in parts[1:]):
         raise OnlineUpdateError("生效命令不能使用解释器内联参数,请配置固定脚本路径")
+    _validate_apply_command_safety(parts)
     return parts
 
 

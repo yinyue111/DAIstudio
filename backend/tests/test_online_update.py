@@ -372,6 +372,31 @@ def test_online_update_rejects_inline_apply_command(monkeypatch, git_repos):
         online_update._apply_command()
 
 
+def test_online_update_rejects_direct_docker_compose_apply_command(monkeypatch, git_repos):
+    from app.services import online_update
+
+    _configure(monkeypatch, git_repos["work"], apply_command="docker compose up -d --build migrate api worker")
+
+    with pytest.raises(online_update.OnlineUpdateError, match="不能在 API 进程内直接执行"):
+        online_update._apply_command()
+
+
+def test_online_update_rejects_script_that_restarts_api_container(monkeypatch, git_repos, tmp_path):
+    from app.services import online_update
+
+    script = tmp_path / "apply-update.sh"
+    script.write_text(
+        "#!/bin/sh\n"
+        "cd /home/drumxian/DAIstudio\n"
+        "docker compose up -d --build migrate api worker beat frontend\n",
+        encoding="utf-8",
+    )
+    _configure(monkeypatch, git_repos["work"], apply_command=str(script))
+
+    with pytest.raises(online_update.OnlineUpdateError, match="登录 502"):
+        online_update._apply_command()
+
+
 def test_online_update_redacts_secrets_from_command_output():
     from app.services import online_update
 

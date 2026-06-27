@@ -339,7 +339,18 @@ ONLINE_UPDATE_ALLOW_LOCAL_REMOTE=false
 
 不要写成 `https://token@github.com/...`。后端会拒绝带用户名/密码的 remote，并且会把 token 通过临时 Git 环境配置传给 `ls-remote/fetch`，接口输出和命令日志会做脱敏。
 
-Docker Compose 部署时，在线升级配置同样写在 `backend/.env`。Compose 不会用空默认值覆盖 `backend/.env` 里的 `ONLINE_UPDATE_*`，但镜像内 `/app` 默认不是 Git checkout。要在容器内直接点“从 GitHub 更新并生效”，需要把宿主机真实 checkout 挂载为 `ONLINE_UPDATE_REPO_DIR`，或把 `ONLINE_UPDATE_APPLY_COMMAND` 固定到宿主机/运维脚本完成 rebuild/restart；否则请把 `ONLINE_UPDATE_ENABLED=false`，避免后台显示可升级但实际目录没有 `.git`。
+Docker Compose 部署时，在线升级配置同样写在 `backend/.env`。Compose 不会用空默认值覆盖 `backend/.env` 里的 `ONLINE_UPDATE_*`，但镜像内 `/app` 默认不是 Git checkout。要在容器内直接点“从 GitHub 更新并生效”，需要把宿主机真实 checkout 挂载为 `ONLINE_UPDATE_REPO_DIR`；否则请把 `ONLINE_UPDATE_ENABLED=false`，避免后台显示可升级但实际目录没有 `.git`。
+
+生效命令不要在 API 进程里直接执行 `docker compose up/restart/down/rm`，尤其不能重启 `api` 服务。否则升级脚本会先停掉正在执行命令的 API 容器，命令中断后可能留下“新容器 Created、8000 端口无人监听”的半升级状态，Caddy 转发 `/api/*` 就会返回 502。后端会拒绝这种高风险命令和脚本内容。
+
+推荐的 Docker 在线升级结构是“API 只拉代码和写状态，宿主机/外部进程完成重启”：
+
+1. `ONLINE_UPDATE_REPO_DIR` 指向宿主机真实 checkout 的挂载目录。
+2. `ONLINE_UPDATE_APPLY_COMMAND` 指向一个不会直接重启 API 的固定命令，例如写入一个队列文件、调用宿主机 systemd oneshot、或通知外部 supervisor。
+3. 宿主机 oneshot/supervisor 再执行 `docker compose up -d --build migrate api worker beat frontend`。
+4. 重启完成后用 `https://dream.aiwuq.cn/api/health`、容器 `healthy` 状态和后台版本页确认生效。
+
+如果暂时没有宿主机执行器，建议把 `ONLINE_UPDATE_APPLY_COMMAND` 留空：后台只完成 Git 快进，之后由运维在宿主机手动执行 Compose 生效。
 
 在服务器上用同一个用户验证：
 
@@ -376,7 +387,7 @@ git ls-remote --heads git@github.com:yinyue111/DAIstudio.git main
 
 如果后台提示 `cannot run ssh: No such file or directory` 或 `缺少 ssh 客户端`，说明运行后端的环境里没有 SSH 客户端。Docker 部署需要重新构建包含 `openssh-client` 的后端镜像；裸机部署可安装 `openssh-client` 或把 `ONLINE_UPDATE_REMOTE` 改为可访问的 HTTPS Git URL。
 
-`ONLINE_UPDATE_APPLY_COMMAND` 建议指向一个固定脚本。脚本里可以按你的部署方式执行迁移、构建和重启，例如裸机部署可执行 `make migrate`、前端构建、重启 systemd 服务；Docker 部署通常应在宿主机执行 `docker compose up -d --build`。如果一定要在 Docker 部署里开启在线升级，需要把宿主机真实 Git checkout 挂载到 `ONLINE_UPDATE_REPO_DIR`，并让固定脚本在宿主机或受控运维环境中完成 rebuild/restart，不要把宿主机 Docker 权限随意挂进业务容器。
+`ONLINE_UPDATE_APPLY_COMMAND` 建议指向一个固定脚本。脚本里可以按你的部署方式执行迁移、构建和重启，例如裸机部署可执行 `make migrate`、前端构建、重启 systemd 服务；Docker 部署的 Compose 重建/重启必须由宿主机或受控运维环境完成，不要把宿主机 Docker 权限随意挂进业务容器，也不要让 API 容器自己重建自己。
 
 如果代码已经快进但生效命令失败，接口会返回 `partial_failure=true`，后台会保留升级前后版本和错误输出。此时不要重复盲点升级，应先查看输出，修复脚本或依赖后重新执行生效命令。
 
