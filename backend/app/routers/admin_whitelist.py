@@ -10,7 +10,6 @@ from ..deps import get_client_ip, require_admin
 from ..models import PhoneWhitelist, User
 from ..schemas import WhitelistDeleteIn, WhitelistIn
 from ..services import audit
-from .admin_helpers import require_admin_password as _require_admin_password
 
 router = APIRouter()
 
@@ -36,7 +35,6 @@ def add_whitelist(
     admin: User = Depends(require_admin),
     request: Request = None,
 ):
-    _require_admin_password(admin, body.admin_password, request)
     if db.get(PhoneWhitelist, body.phone):
         raise HTTPException(409, "该手机号已在白名单")
     db.add(PhoneWhitelist(phone=body.phone, note=body.note, department=body.department, added_by=admin.id))
@@ -61,7 +59,6 @@ def remove_whitelist(
     admin: User = Depends(require_admin),
     request: Request = None,
 ):
-    _require_admin_password(admin, body.admin_password if body else None, request)
     row = db.get(PhoneWhitelist, phone)
     if not row:
         raise HTTPException(404, "不存在")

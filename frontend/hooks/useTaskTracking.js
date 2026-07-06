@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api, wsUrl } from "../lib/api";
+import { reportBackgroundError } from "../lib/errorHandling";
 import { RATIOS } from "../app/studio/constants";
 import { assetDims, isTerminalTaskStatus, nearestRatio, videoRatioOptions } from "../app/studio/helpers";
 
@@ -47,7 +48,7 @@ export default function useTaskTracking({
       pollRef.current = null;
     }
     if (wsRef.current) {
-      try { wsRef.current.close(); } catch (e) {}
+      try { wsRef.current.close(); } catch (e) { reportBackgroundError(e, "close active task websocket"); }
       wsRef.current = null;
     }
   }, []);
@@ -108,7 +109,7 @@ export default function useTaskTracking({
           data = JSON.parse(ev.data);
         } catch (e) {
           if (!done && wsRef.current === ws) startPolling(id);
-          try { ws.close(); } catch (_e) {}
+          try { ws.close(); } catch (_e) { reportBackgroundError(_e, "close malformed task websocket"); }
           return;
         }
         const terminal = isTerminalTaskStatus(data.status);
@@ -123,10 +124,10 @@ export default function useTaskTracking({
           api.task(id).then((nextTask) => {
             if (activeIdRef.current !== id) return;
             setTask(nextTask);
-          }).catch(() => {});
+          }).catch((e) => reportBackgroundError(e, "refresh terminal task after websocket"));
           refreshMe();
           loadWorks();
-          try { ws.close(); } catch (e) {}
+          try { ws.close(); } catch (e) { reportBackgroundError(e, "close malformed task websocket"); }
         }
       };
       ws.onerror = () => { if (!done && wsRef.current === ws) startPolling(id); };

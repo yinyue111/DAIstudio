@@ -270,6 +270,8 @@ class Settings(BaseSettings):
     parse_cache_minutes: int = 30
     user_gen_rate_per_hour: int = 60  # crude per-user generation rate limit
     user_parse_rate_per_hour: int = 60  # crude per-user parse rate limit
+    ws_ticket_rate_per_minute: int = 60
+    ws_connect_rate_per_minute: int = 60
     # Link-scrape resource guards. Playwright spawns a real Chromium per render,
     # so cap how many can run at once process-wide (the rest fail fast rather
     # than pile up browsers / starve the thread pool). The raw-body cap bounds

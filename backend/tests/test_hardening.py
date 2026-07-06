@@ -407,8 +407,9 @@ def test_full_image_generation_unknown_submit_holds_for_review(
     auth,
     monkeypatch,
 ):
-    make_user("13900000052", balance=1000)
-    h = auth("13900000052")
+    phone = "13900000352"
+    make_user(phone, balance=1000)
+    h = auth(phone)
 
     def all_unknown_failure(*_args, **_kwargs):
         raise gateway.GatewayError(
@@ -599,6 +600,77 @@ def test_websocket_ticket_is_owner_scoped_and_one_time(client, make_user):
     except Exception:
         reused = False
     assert not reused
+
+
+def test_websocket_ticket_rate_limit(client, make_user, auth, monkeypatch):
+    uid = make_user("13900000943", balance=1000)
+    h = auth("13900000943")
+    monkeypatch.setattr("app.routers.tasks.settings.ws_ticket_rate_per_minute", 1)
+
+    db = SessionLocal()
+    try:
+        task = GenTask(
+            user_id=uid,
+            category="image",
+            stage="preview",
+            prompt={"final_text": "x"},
+            model_use="image",
+            params={"n": 1, "size": "256x256"},
+            status="running",
+            cost_frozen=5,
+            cost_settled=0,
+        )
+        db.add(task)
+        db.commit()
+        db.refresh(task)
+        task_id = task.id
+    finally:
+        db.close()
+
+    assert client.post(f"/api/tasks/{task_id}/ws-ticket", headers=h).status_code == 200
+    limited = client.post(f"/api/tasks/{task_id}/ws-ticket", headers=h)
+    assert limited.status_code == 429
+    assert "WebSocket" in limited.text
+
+
+def test_websocket_connect_rate_limit(client, make_user, auth, monkeypatch):
+    uid = make_user("13900000944", balance=1000)
+    h = auth("13900000944")
+    monkeypatch.setattr("app.routers.tasks.settings.ws_ticket_rate_per_minute", 10)
+    monkeypatch.setattr("app.routers.ws.settings.ws_connect_rate_per_minute", 1)
+
+    db = SessionLocal()
+    try:
+        task = GenTask(
+            user_id=uid,
+            category="image",
+            stage="preview",
+            prompt={"final_text": "x"},
+            model_use="image",
+            params={"n": 1, "size": "256x256"},
+            status="succeeded",
+            cost_frozen=5,
+            cost_settled=5,
+        )
+        db.add(task)
+        db.commit()
+        db.refresh(task)
+        task_id = task.id
+    finally:
+        db.close()
+
+    first_ticket = client.post(f"/api/tasks/{task_id}/ws-ticket", headers=h).json()["ticket"]
+    second_ticket = client.post(f"/api/tasks/{task_id}/ws-ticket", headers=h).json()["ticket"]
+    with client.websocket_connect(f"/ws/tasks/{task_id}?ticket={first_ticket}") as ws:
+        assert ws.receive_json()["status"] == "succeeded"
+
+    try:
+        with client.websocket_connect(f"/ws/tasks/{task_id}?ticket={second_ticket}") as ws:
+            ws.receive_json()
+        connected = True
+    except Exception:
+        connected = False
+    assert not connected
 
 
 def test_generate_rejects_oversized_n(client, make_user, auth):

@@ -37,6 +37,15 @@ async function middlewareResult(path, cookieValue = "") {
     "unauthenticated protected pages should preserve a safe next path",
   );
 }
+{
+  const result = await middlewareResult("/profile?phone=13800000000&password=secret&filter=image");
+  assert.equal(result.status, 307, "unauthenticated protected page should redirect");
+  assert.equal(
+    result.path,
+    "/login?next=%2Fprofile%3Ffilter%3Dimage",
+    "middleware next path must strip credential-like query params",
+  );
+}
 assert.equal(
   (await middlewareResult("/login")).status,
   200,
@@ -59,7 +68,9 @@ assert.equal(
 );
 
 const originalFetch = globalThis.fetch;
+const originalInternalApiBase = process.env.API_INTERNAL_BASE;
 const calls = [];
+process.env.API_INTERNAL_BASE = "http://api:8000";
 globalThis.fetch = async (url, options) => {
   calls.push({ url: String(url), cookie: options?.headers?.cookie || "" });
   return new Response("{}", { status: 200 });
@@ -77,6 +88,10 @@ assert.equal(
 assert.equal(calls.length, 2, "protected authenticated requests should validate against /api/me");
 assert.ok(calls.every((call) => call.url.endsWith("/api/me")), "session validation must call /api/me");
 assert.ok(
+  calls.every((call) => call.url.startsWith("http://api:8000/api/me")),
+  "server-side session validation should use API_INTERNAL_BASE when configured",
+);
+assert.ok(
   calls.every((call) => call.cookie.includes("ai_studio_token=valid-cookie-shape")),
   "session validation must forward the HttpOnly auth cookie",
 );
@@ -89,6 +104,8 @@ globalThis.fetch = async () => new Response("{}", { status: 401 });
 }
 
 globalThis.fetch = originalFetch;
+if (originalInternalApiBase === undefined) delete process.env.API_INTERNAL_BASE;
+else process.env.API_INTERNAL_BASE = originalInternalApiBase;
 
 assert.equal(
   (await middlewareResult("/prompt-library/thumbs/example.jpg")).status,

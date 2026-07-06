@@ -4,6 +4,7 @@ import { useEffect, useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { api, clearToken, loginPath } from "../lib/api";
+import { reportBackgroundError } from "../lib/errorHandling";
 import BrandLogo from "./BrandLogo";
 
 const LINKS = [
@@ -33,7 +34,7 @@ export default function Nav({ me, active }) {
   }, []);
 
   async function logout() {
-    try { await api.logout(); } catch (e) {}
+    try { await api.logout(); } catch (e) { reportBackgroundError(e, "logout request"); }
     clearToken();
     router.push("/login");
   }

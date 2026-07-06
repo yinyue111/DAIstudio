@@ -1,6 +1,7 @@
 "use client";
 
 import { useDeferredValue, useEffect, useMemo, useState } from "react";
+import { reportBackgroundError } from "../lib/errorHandling";
 
 export const STUDIO_DRAFT_PROMPT_KEY = "studio:draftPrompt";
 
@@ -61,7 +62,9 @@ export default function PromptLibraryBrowser({
       .then((data) => {
         if (alive) setLicense(data);
       })
-      .catch(() => {});
+      .catch((e) => {
+        reportBackgroundError(e, "load prompt library license");
+      });
     return () => { alive = false; };
   }, []);
 

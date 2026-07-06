@@ -4,7 +4,8 @@ import { useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import Nav from "../../components/Nav";
 import PromptLibraryBrowser, { STUDIO_DRAFT_PROMPT_KEY } from "../../components/PromptLibraryBrowser";
-import { api, loginPath } from "../../lib/api";
+import { api } from "../../lib/api";
+import { redirectOnAuthError, reportBackgroundError } from "../../lib/errorHandling";
 
 export default function PromptsPage() {
   const router = useRouter();
@@ -23,7 +24,7 @@ export default function PromptsPage() {
     api.me().then((u) => {
       setMe(u);
       loadHistory();
-    }).catch(() => router.push(loginPath()));
+    }).catch((e) => redirectOnAuthError(e, router, setMsg, "prompts session probe"));
   }, []);
 
   async function loadHistory(overrides = {}) {
@@ -49,8 +50,13 @@ export default function PromptsPage() {
   function usePrompt(item) {
     try {
       window.localStorage.setItem(STUDIO_DRAFT_PROMPT_KEY, item.prompt || "");
-    } catch (e) {}
-    if (item.id) api.updatePromptHistory(item.id, { increment_usage: true }).catch(() => {});
+    } catch (e) {
+      reportBackgroundError(e, "save prompt draft");
+    }
+    if (item.id) {
+      api.updatePromptHistory(item.id, { increment_usage: true })
+        .catch((e) => reportBackgroundError(e, "increment prompt usage"));
+    }
     router.push("/");
   }
 

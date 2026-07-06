@@ -85,6 +85,8 @@ def test_video_preview_completes_via_poll(client, make_user, auth):
     db = SessionLocal()
     try:
         gt = db.get(GenTask, tid)
+        assert gt.status == "succeeded"
+        assert gt.phase is None
         assert gt.external_task_id is not None
         assert gt.external_submitted_at is not None
     finally:

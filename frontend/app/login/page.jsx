@@ -4,6 +4,8 @@ import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import BrandLogo from "../../components/BrandLogo";
 import { api } from "../../lib/api";
+import { reportBackgroundError } from "../../lib/errorHandling";
+import { currentNextPath, scrubCredentialQuery } from "../../lib/navigation";
 
 export default function LoginPage() {
   const router = useRouter();
@@ -30,7 +32,9 @@ export default function LoginPage() {
       .then(() => {
         if (!cancelled) router.replace(currentNextPath() || "/");
       })
-      .catch(() => {});
+      .catch((e) => {
+        if (e?.status !== 401) reportBackgroundError(e, "login page session probe");
+      });
     api.authFeatures()
       .then((f) => {
         if (cancelled) return;
@@ -39,8 +43,9 @@ export default function LoginPage() {
         setFeaturesLoaded(true);
         setFeaturesError("");
       })
-      .catch(() => {
+      .catch((e) => {
         if (cancelled) return;
+        reportBackgroundError(e, "load auth feature flags");
         setRegistrationEnabled(false);
         setFeaturesLoaded(false);
         setFeaturesError("注册配置加载失败，请刷新重试");
@@ -81,8 +86,8 @@ export default function LoginPage() {
         await api.login(formPhone, formPassword);
       }
       const nextPath = currentNextPath() || "/";
-      router.replace(nextPath);
-      router.refresh();
+      await api.me({ redirectOn401: false });
+      navigateAfterLogin(nextPath, router);
     } catch (e) {
       setMsg(e.message);
     } finally {
@@ -233,42 +238,10 @@ export default function LoginPage() {
   );
 }
 
-function safeNextPath(value) {
-  if (!value || !value.startsWith("/") || value.startsWith("//")) return "";
-  try {
-    const url = new URL(value, "http://local");
-    if (url.origin !== "http://local") return "";
-    return `${url.pathname}${url.search}${url.hash}`;
-  } catch (e) {
-    return "";
+function navigateAfterLogin(nextPath, router) {
+  if (typeof window === "undefined") {
+    router.replace(nextPath);
+    return;
   }
-}
-
-function currentNextPath() {
-  if (typeof window === "undefined") return "";
-  try {
-    return safeNextPath(new URLSearchParams(window.location.search).get("next"));
-  } catch (e) {
-    return "";
-  }
-}
-
-function scrubCredentialQuery() {
-  if (typeof window === "undefined") return;
-  try {
-    const url = new URL(window.location.href);
-    let changed = false;
-    for (const key of ["phone", "password", "smsCode", "nickname"]) {
-      if (url.searchParams.has(key)) {
-        url.searchParams.delete(key);
-        changed = true;
-      }
-    }
-    if (changed) {
-      const next = `${url.pathname}${url.search}${url.hash}`;
-      window.history.replaceState(null, "", next);
-    }
-  } catch (e) {
-    // Best-effort privacy cleanup only.
-  }
+  window.location.assign(nextPath);
 }

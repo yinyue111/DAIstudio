@@ -30,6 +30,13 @@ assert.equal(
   "",
   "external media origins must stay blocked unless explicitly allowlisted",
 );
+process.env.NEXT_PUBLIC_MEDIA_SRC = "https://cdn-a.example, https://cdn-b.example";
+assert.equal(
+  safeAssetMediaSrc("https://cdn-b.example/media/preview/example.png"),
+  "https://cdn-b.example/media/preview/example.png",
+  "comma-separated media allowlist origins should match CSP parsing",
+);
+process.env.NEXT_PUBLIC_MEDIA_SRC = "";
 assert.equal(
   safeAssetMediaSrc("//evil.example/media/preview/example.png"),
   "",

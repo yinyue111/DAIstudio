@@ -13,7 +13,6 @@ from ..schemas import ResetPasswordIn, UserOut, UserStatusIn
 from ..security import hash_password
 from ..services import audit
 from .admin_helpers import page as _page
-from .admin_helpers import require_admin_password as _require_admin_password
 
 router = APIRouter()
 
@@ -53,7 +52,6 @@ def set_user_status(
     admin: User = Depends(require_admin),
     request: Request = None,
 ):
-    _require_admin_password(admin, body.admin_password, request)
     user = db.get(User, user_id)
     if not user:
         raise HTTPException(404, "用户不存在")
@@ -95,7 +93,6 @@ def reset_password(
     admin: User = Depends(require_admin),
     request: Request = None,
 ):
-    _require_admin_password(admin, body.admin_password, request)
     if len(body.password) < MIN_PASSWORD_LEN:
         raise HTTPException(400, f"密码至少 {MIN_PASSWORD_LEN} 位")
     user = db.get(User, user_id)

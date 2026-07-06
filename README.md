@@ -314,7 +314,7 @@ PAYMENT_FRONTEND_BASE_URL=https://dream.aiwuq.cn
 - 只更新服务端配置的 `ONLINE_UPDATE_REMOTE` / `ONLINE_UPDATE_BRANCH`
 - 私有库使用 GitHub fine-grained PAT，通过 `ONLINE_UPDATE_GITHUB_TOKEN` 注入，不要把 GitHub 密码或 token 写进 URL
 - `ONLINE_UPDATE_REMOTE` 可以是 HTTPS/SSH Git URL 或 remote 名称；remote 名称解析后的真实 URL 也会校验，默认拒绝 `file://`、绝对路径、相对路径等本地仓库来源
-- 只允许 `git merge --ff-only`，不会执行 `reset --hard`
+- 只允许 `git merge --ff-only`；若生效命令失败且工作区在升级前是干净的，会 `git reset --hard` 回滚到升级前版本，避免半升级代码继续运行
 - 工作区有未提交改动时默认拒绝升级
 - 前端不能传入任意命令；生效命令只能由服务端环境变量固定配置
 
@@ -460,7 +460,10 @@ SMS_TEMPLATE_CODE=<your-template-code>
 | `MAX_VIDEO_SECONDS` | 上传/参考视频源最大时长，默认 900 秒 |
 | `MAX_VIDEO_GENERATION_SECONDS` | 单条生成视频最大时长，默认 15 秒，应用层硬上限 15 秒 |
 | `REVERSE_VIDEO_FRAMES` | 视频反推抽帧数量 |
-| `NEXT_PUBLIC_API_BASE` | 前端访问 API 的跨域地址；同域部署可留空 |
+| `WS_TICKET_RATE_PER_MINUTE` | 单用户 WebSocket ticket 申请频率，默认 60/分钟 |
+| `WS_CONNECT_RATE_PER_MINUTE` | 单用户 WebSocket 连接频率，默认 60/分钟 |
+| `NEXT_PUBLIC_API_BASE` | 浏览器访问 API 的地址；Compose 直连默认 `http://localhost:8000`，同域反代部署可按实际网关设置为空或同源 |
+| `API_INTERNAL_BASE` | 前端服务端/中间件访问 API 的内部地址；Compose 默认 `http://api:8000` |
 
 完整配置见 `backend/.env.example`。
 

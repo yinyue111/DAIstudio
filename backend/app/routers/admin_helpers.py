@@ -28,10 +28,6 @@ from ..services.rate_limit import incr_window
 
 CSV_FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r", "\n")
 IMAGE_SIZE_RE = re.compile(r"^(\d{2,5})x(\d{2,5})$")
-ADMIN_CONFIRM_TTL_SECONDS = 300
-ADMIN_CONFIRM_FAIL_LIMIT = 8
-ADMIN_CONFIRM_FAIL_IP_LIMIT = 30
-ADMIN_CONFIRM_FAIL_WINDOW_SECONDS = 15 * 60
 QUOTA_GRANT_REPLAY_WINDOW_SECONDS = 10 * 60
 ACTIVE_MODEL_TASK_STATUSES = ("queued", "running", generation.NEEDS_REVIEW)
 ADMIN_RATE_WINDOW_SECONDS = 3600
@@ -152,16 +148,6 @@ def date_key(dt: datetime | None) -> str | None:
     if not dt:
         return None
     return dt.date().isoformat()
-
-
-def require_admin_password(admin: User, password: str | None, request: Request | None = None) -> None:
-    """Backward-compatible no-op.
-
-    Admin APIs are already protected by the authenticated admin dependency. The
-    product now intentionally avoids a second password challenge inside the
-    admin console, while keeping request schemas and old clients compatible.
-    """
-    return None
 
 
 def quota_grant_idempotency_raw(body: QuotaGrantIn) -> str:

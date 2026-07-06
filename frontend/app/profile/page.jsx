@@ -3,6 +3,7 @@
 import { useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { api, clearToken, downloadBlob, loginPath } from "../../lib/api";
+import { redirectOnAuthError, reportBackgroundError, showError } from "../../lib/errorHandling";
 import Nav from "../../components/Nav";
 import AssetMedia, {
   assetPreviewSrc,
@@ -12,23 +13,12 @@ import AssetMedia, {
 } from "../../components/AssetMedia";
 import AssetPreviewDialog from "../../components/AssetPreviewDialog";
 import GroupedAssetGallery from "../studio/GroupedAssetGallery";
+import { assetVariationSourceUrl, confirmAssetUnlock } from "../studio/assetActions";
 import { STUDIO_VARIATION_DRAFT_KEY } from "../studio/constants";
 
 const PAGE = 30;
 function srcOf(a) {
   return assetPreviewSrc(a);
-}
-
-function unlockConfirm(asset, me, cfg) {
-  const type = asset.type === "video" ? "视频" : "图片";
-  const balance = Number(me?.balance_credits ?? 0);
-  const cost = Number(asset.unlock_cost ?? cfg?.models?.[asset.type]?.unlock_cost ?? 0);
-  return window.confirm(`解锁${type}将扣除 ${cost} 积分，当前余额 ${balance}，确认继续？`);
-}
-
-function variationSourceUrl(asset) {
-  if (!asset || asset.type !== "image") return "";
-  return asset.hd_url || asset.preview_url || asset.url || "";
 }
 
 export default function ProfilePage() {
@@ -63,8 +53,8 @@ export default function ProfilePage() {
   const [pwMsg, setPwMsg] = useState("");
 
   useEffect(() => {
-    api.me().then(setMe).catch(() => router.push(loginPath()));
-    api.config().then(setCfg).catch(() => {});
+    api.me().then(setMe).catch((e) => redirectOnAuthError(e, router, setMsg, "profile session probe"));
+    api.config().then(setCfg).catch((e) => showError(setMsg, e, "加载素材配置失败"));
     api.profile().then(setData).catch((e) => setMsg(e.message));
   }, []);
 
@@ -167,12 +157,12 @@ export default function ProfilePage() {
       setMsg("素材已下架，不能继续解锁。");
       return;
     }
-    if (!unlockConfirm(asset, me, cfg)) return;
+    if (!confirmAssetUnlock(asset, me, cfg)) return;
     await withAssetBusy(asset.id, async () => {
       try {
         patchAsset(await api.unlock(asset.id));
-        api.me().then(setMe).catch(() => {});
-        api.profile().then(setData).catch(() => {});
+        api.me().then(setMe).catch((e) => reportBackgroundError(e, "refresh current user after unlock"));
+        api.profile().then(setData).catch((e) => reportBackgroundError(e, "refresh profile after unlock"));
       } catch (e) { setMsg(e.message); }
     });
   }
@@ -206,7 +196,7 @@ export default function ProfilePage() {
           return next;
         });
         if (lightbox && lightbox.id === asset.id) setLightbox(null);
-        api.profile().then(setData).catch(() => {});
+        api.profile().then(setData).catch((e) => reportBackgroundError(e, "refresh profile after delete"));
       } catch (e) { setMsg(e.message); }
     });
   }
@@ -232,7 +222,7 @@ export default function ProfilePage() {
   }
 
   function createVariation(asset) {
-    const sourceUrl = variationSourceUrl(asset);
+    const sourceUrl = assetVariationSourceUrl(asset);
     if (!sourceUrl) {
       setMsg("当前图片暂不可作为变体来源，请确认预览可用后再试。");
       return;
@@ -277,7 +267,7 @@ export default function ProfilePage() {
         return next;
       });
       setSelectedIds(new Set());
-      api.profile().then(setData).catch(() => {});
+      api.profile().then(setData).catch((e) => reportBackgroundError(e, "refresh profile after batch action"));
       const failed = res.failed?.length || 0;
       setMsg(failed ? `已删除 ${deleted.size} 个，${failed} 个删除失败。` : `已删除 ${deleted.size} 个素材。`);
     } catch (e) {

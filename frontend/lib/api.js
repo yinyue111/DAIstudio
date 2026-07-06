@@ -1,5 +1,9 @@
 "use client";
 
+import { loginPath } from "./navigation";
+
+export { loginPath } from "./navigation";
+
 function resolveApiBase() {
   const configured = (process.env.NEXT_PUBLIC_API_BASE || "").replace(/\/$/, "");
   if (typeof window === "undefined" || !configured) {
@@ -52,15 +56,6 @@ export function setToken(t) {
 
 export function clearToken() {
   window.localStorage.removeItem("token");
-}
-
-export function loginPath(nextPath = null) {
-  if (typeof window === "undefined" && !nextPath) return "/login";
-  const raw = nextPath ?? `${window.location.pathname}${window.location.search}${window.location.hash}`;
-  if (!raw || !raw.startsWith("/") || raw.startsWith("//") || raw.startsWith("/login")) {
-    return "/login";
-  }
-  return `/login?next=${encodeURIComponent(raw)}`;
 }
 
 function redirectToLogin() {

@@ -2,7 +2,8 @@
 
 import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
-import { api, loginPath } from "../../lib/api";
+import { api } from "../../lib/api";
+import { redirectOnAuthError } from "../../lib/errorHandling";
 import Nav from "../../components/Nav";
 import { AssetReports, Models, ReviewTasks } from "./components/model-review-moderation";
 import { Payments, Settings } from "./components/payments-settings";
@@ -46,7 +47,7 @@ export default function AdminPage() {
     api.me().then((u) => {
       if (!u.is_admin) router.push("/");
       else setMe(u);
-    }).catch(() => router.push(loginPath()));
+    }).catch((e) => redirectOnAuthError(e, router, null, "admin session probe"));
   }, [router]);
 
   useEffect(() => {

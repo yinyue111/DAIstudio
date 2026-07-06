@@ -20,6 +20,18 @@ from app.services import sms, storage
 from app.services.config_store import set_setting
 
 
+def _clear_active_model_tasks(model_use: str) -> None:
+    db = SessionLocal()
+    try:
+        db.query(GenTask).filter(
+            GenTask.model_use == model_use,
+            GenTask.status.in_(["queued", "running", "needs_review"]),
+        ).update({GenTask.status: "failed"}, synchronize_session=False)
+        db.commit()
+    finally:
+        db.close()
+
+
 def test_health(client):
     r = client.get("/api/health").json()
     assert r["ok"] is True
@@ -887,6 +899,7 @@ def test_video_final_uses_preview_model_snapshot_price(client, make_user, auth, 
 def test_video_final_rejects_stale_preview_gateway_key_snapshot(client, make_user, auth):
     make_user("13900000178", balance=1000, admin=True)
     h = auth("13900000178")
+    _clear_active_model_tasks("video")
     body = {
         "use": "video",
         "provider": "custom_openai",
@@ -1579,13 +1592,10 @@ def test_retry_reprices_failed_image_task(client, make_user, auth):
     db = SessionLocal()
     try:
         set_setting(db, "image_n", 4)
-        db.query(GenTask).filter(
-            GenTask.model_use == "image",
-            GenTask.status.in_(["queued", "running", "needs_review"]),
-        ).update({GenTask.status: "failed"}, synchronize_session=False)
         db.commit()
     finally:
         db.close()
+    _clear_active_model_tasks("image")
     admin_phone = "13877777165"
     make_user(admin_phone, balance=1000, admin=True)
     admin_h = auth(admin_phone)
@@ -1704,15 +1714,7 @@ def test_retry_preserves_existing_model_snapshot_price(client, make_user, auth):
 def test_retry_rejects_stale_gateway_key_snapshot(client, make_user, auth):
     make_user("13877777179", balance=1000, admin=True)
     h = auth("13877777179")
-    db = SessionLocal()
-    try:
-        db.query(GenTask).filter(
-            GenTask.model_use == "image",
-            GenTask.status.in_(["queued", "running", "needs_review"]),
-        ).update({GenTask.status: "failed"}, synchronize_session=False)
-        db.commit()
-    finally:
-        db.close()
+    _clear_active_model_tasks("image")
     body = {
         "use": "image",
         "provider": "custom_openai",

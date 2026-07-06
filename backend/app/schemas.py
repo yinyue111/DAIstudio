@@ -42,25 +42,21 @@ class ChangePasswordIn(BaseModel):
 
 class ResetPasswordIn(BaseModel):
     password: str = Field(max_length=128)
-    admin_password: str | None = Field(default=None, max_length=128)
 
 
 class AdminTaskRefundIn(BaseModel):
-    admin_password: str | None = Field(default=None, max_length=128)
     note: str | None = Field(default=None, max_length=255)
 
 
 class AdminTaskSettleIn(BaseModel):
     result_url: str | None = Field(default=None, max_length=2048)
     external_task_id: str | None = Field(default=None, max_length=256)
-    admin_password: str | None = Field(default=None, max_length=128)
     note: str | None = Field(default=None, max_length=255)
 
 
 class AdminAssetReportHandleIn(BaseModel):
     action: Literal["dismiss", "takedown"]
     note: str | None = Field(default=None, max_length=500)
-    admin_password: str | None = Field(default=None, max_length=128)
 
 
 class UserOut(BaseModel):
@@ -359,18 +355,16 @@ class WhitelistIn(BaseModel):
     phone: str
     note: str | None = None
     department: str | None = None
-    admin_password: str | None = Field(default=None, max_length=128)
 
 
 class WhitelistDeleteIn(BaseModel):
-    admin_password: str | None = Field(default=None, max_length=128)
+    pass
 
 
 class QuotaGrantIn(BaseModel):
     user_id: int
     amount: int = Field(gt=0)
     note: str | None = Field(default=None, max_length=255)
-    admin_password: str | None = Field(default=None, max_length=128)
     idempotency_key: str = Field(min_length=8, max_length=128)
 
 
@@ -382,7 +376,6 @@ class QuotaGrantItemIn(BaseModel):
 
 class QuotaBulkGrantIn(BaseModel):
     items: list[QuotaGrantItemIn] = Field(min_length=1, max_length=100)
-    admin_password: str | None = Field(default=None, max_length=128)
     idempotency_key: str = Field(min_length=8, max_length=96)
 
 
@@ -400,7 +393,6 @@ class QuotaBulkGrantOut(BaseModel):
 
 class UserStatusIn(BaseModel):
     status: Literal["active", "pending", "disabled"]
-    admin_password: str | None = Field(default=None, max_length=128)
 
 
 class ModelConfigIn(BaseModel):
@@ -430,7 +422,6 @@ class ModelConfigIn(BaseModel):
     unlock_cost: int = Field(default=0, ge=0, le=MAX_MODEL_COST_CREDITS)
     enabled: bool = True
     extra: dict[str, Any] | None = None
-    admin_password: str | None = Field(default=None, max_length=128)
 
     @field_validator("extra")
     @classmethod
@@ -485,7 +476,6 @@ class ModelProbeIn(BaseModel):
     base_url: str | None = Field(default=None, max_length=512)
     api_key: str | None = Field(default=None, max_length=4096)
     gateway_format: Literal["openai", "ark"] | None = None
-    admin_password: str | None = Field(default=None, max_length=128)
 
     @field_validator("base_url")
     @classmethod
@@ -517,7 +507,6 @@ class SettingsIn(BaseModel):
     admin_quota_grant_single_limit: int | None = Field(default=None, ge=1, le=100000000)
     admin_quota_grant_daily_limit: int | None = Field(default=None, ge=1, le=1000000000)
     review_task_sla_minutes: int | None = Field(default=None, ge=1, le=10080)
-    admin_password: str | None = Field(default=None, max_length=128)
 
 
 class PaymentPackageIn(BaseModel):
@@ -528,7 +517,6 @@ class PaymentPackageIn(BaseModel):
     badge: str | None = Field(default=None, max_length=32)
     enabled: bool = True
     sort_order: int = 0
-    admin_password: str | None = Field(default=None, max_length=128)
 
     @field_validator("id")
     @classmethod
@@ -548,7 +536,7 @@ class PaymentPackageIn(BaseModel):
 
 
 class PaymentPackageDisableIn(BaseModel):
-    admin_password: str | None = Field(default=None, max_length=128)
+    pass
 
 
 class PaymentProviderConfigIn(BaseModel):
@@ -557,7 +545,6 @@ class PaymentProviderConfigIn(BaseModel):
     mode: Literal["mock", "live"] = "mock"
     public_config: dict[str, Any] = Field(default_factory=dict)
     secret_config: dict[str, Any] = Field(default_factory=dict)
-    admin_password: str | None = Field(default=None, max_length=128)
 
     @field_validator("public_config", "secret_config")
     @classmethod

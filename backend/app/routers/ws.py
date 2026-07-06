@@ -10,12 +10,14 @@ import logging
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
+from ..config import settings
 from ..db import SessionLocal
 from ..deps import resolve_token_user
 from ..models import GenTask
 from ..redis_client import redis_client
 from ..services.generation import is_terminal_status
 from ..services.progress import get_progress, wait_progress_event
+from ..services.rate_limit import incr_window
 from ..services.user_events import read_user_events
 
 router = APIRouter(tags=["ws"])
@@ -26,6 +28,13 @@ _DB_STATUS_RECHECK_EVERY = 2  # keep UI close to the committed task state
 _PROGRESS_BLOCK_MS = 5000
 _TICKET_PREFIX = "ws:task-ticket:"
 _EVENT_TICKET_PREFIX = "ws:event-ticket:"
+_CONNECT_RATE_WINDOW_SECONDS = 60
+
+
+def _ws_connect_allowed(user_id: int, scope: str) -> bool:
+    limit = max(1, int(settings.ws_connect_rate_per_minute or 1))
+    n = incr_window(f"ws:connect-rate:{scope}:{user_id}", _CONNECT_RATE_WINDOW_SECONDS)
+    return n <= limit
 
 
 def _consume_ws_ticket(ticket: str) -> tuple[int, int, int] | None:
@@ -114,6 +123,9 @@ async def task_progress(websocket: WebSocket, task_id: int, ticket: str = ""):
     if not await asyncio.to_thread(_validate_task_ws_access, user_id, tv, task_id):
         await websocket.close(code=4404)
         return
+    if not await asyncio.to_thread(_ws_connect_allowed, user_id, "task"):
+        await websocket.close(code=4408)
+        return
 
     await websocket.accept()
     ticks = 0
@@ -177,6 +189,9 @@ async def user_events(websocket: WebSocket, ticket: str = "", last_id: str = "$"
     user_id, tv = ticket_payload
     if not await asyncio.to_thread(_validate_event_ws_access, user_id, tv):
         await websocket.close(code=4401)
+        return
+    if not await asyncio.to_thread(_ws_connect_allowed, user_id, "events"):
+        await websocket.close(code=4408)
         return
 
     await websocket.accept()

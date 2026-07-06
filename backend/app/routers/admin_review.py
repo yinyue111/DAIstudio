@@ -20,7 +20,6 @@ from ..services import audit, credits, generation, safe_logging
 from ..services.task_output import build_task_out
 from .admin_helpers import age_minutes as _age_minutes
 from .admin_helpers import page as _page
-from .admin_helpers import require_admin_password as _require_admin_password
 from .admin_helpers import setting_int as _setting_int
 
 router = APIRouter()
@@ -34,7 +33,6 @@ def refund_needs_review_task(
     admin: User = Depends(require_admin),
     request: Request = None,
 ):
-    _require_admin_password(admin, body.admin_password, request)
     task = db.get(GenTask, task_id)
     if not task:
         raise HTTPException(404, "任务不存在")
@@ -86,7 +84,6 @@ def settle_needs_review_task(
     admin: User = Depends(require_admin),
     request: Request = None,
 ):
-    _require_admin_password(admin, body.admin_password, request)
     task = db.get(GenTask, task_id)
     if not task:
         raise HTTPException(404, "任务不存在")
@@ -197,7 +194,6 @@ def handle_asset_report(
     admin: User = Depends(require_admin),
     request: Request = None,
 ):
-    _require_admin_password(admin, body.admin_password, request)
     report = db.get(AssetReport, report_id)
     if not report:
         raise HTTPException(404, "举报不存在")

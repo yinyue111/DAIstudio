@@ -2,7 +2,8 @@
 
 import { useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
-import { api, downloadBlob, loginPath } from "../lib/api";
+import { api, downloadBlob } from "../lib/api";
+import { redirectOnAuthError, reportBackgroundError, showError } from "../lib/errorHandling";
 import Nav from "../components/Nav";
 import { canDownloadAsset, isAssetTakenDown } from "../components/AssetMedia";
 import AssetWindowControls from "../components/AssetWindowControls";
@@ -27,6 +28,7 @@ import StudioPromptWorkspace from "./studio/StudioPromptWorkspace";
 import StudioReferencePanel from "./studio/StudioReferencePanel";
 import StudioResults from "./studio/StudioResults";
 import StudioStructuredEditor from "./studio/StudioStructuredEditor";
+import { assetVariationSourceUrl } from "./studio/assetActions";
 import { generationSubmitDisabled } from "./studio/taskConcurrency";
 import {
   assetSignature,
@@ -130,7 +132,7 @@ export default function Home() {
   } = studioCreationFacts({ creationMode, imageEditProductMode, editSubjectMode });
 
   useEffect(() => {
-    api.me().then(setMe).catch(() => router.push(loginPath()));
+    api.me().then(setMe).catch((e) => redirectOnAuthError(e, router, setMsg, "studio session probe"));
     api.config().then((c) => {
       setCfg(c);
       // honour admin defaults so the values we submit match the backend config
@@ -150,7 +152,7 @@ export default function Home() {
           ]),
         ));
       }
-    }).catch(() => {});
+    }).catch((e) => showError(setMsg, e, "加载创作配置失败"));
     loadWorks({ restoreActive: true });
     try {
       const draft = window.localStorage.getItem(STUDIO_DRAFT_PROMPT_KEY);
@@ -163,7 +165,9 @@ export default function Home() {
         window.localStorage.removeItem(STUDIO_VARIATION_DRAFT_KEY);
         applyVariationDraft(JSON.parse(variationDraft));
       }
-    } catch (e) {}
+    } catch (e) {
+      reportBackgroundError(e, "restore studio draft");
+    }
     return () => {
       stopAllTracking();
       revokeUploadedObjectUrls();
@@ -177,7 +181,7 @@ export default function Home() {
     setRatio(nearestRatio(current.w, current.h, videoRatioOptions()));
   }, [category, ratio]);
 
-  function refreshMe() { api.me().then(setMe).catch(() => {}); }
+  function refreshMe() { api.me().then(setMe).catch((e) => reportBackgroundError(e, "refresh current user")); }
 
   const {
     task,
@@ -438,13 +442,8 @@ export default function Home() {
     setPromptDirty(true);
   }
 
-  function variationSourceUrl(asset) {
-    if (!asset || asset.type !== "image") return "";
-    return asset.unlocked ? (asset.hd_url || asset.preview_url || "") : (asset.preview_url || "");
-  }
-
   function createImageVariation(asset) {
-    const sourceUrl = variationSourceUrl(asset);
+    const sourceUrl = assetVariationSourceUrl(asset, { respectUnlock: true });
     if (!sourceUrl) {
       setMsg("当前图片暂不可作为变体来源，请先确认预览可用。");
       return;
@@ -528,7 +527,7 @@ export default function Home() {
     setBusyAssetIds(new Set(busyAssetIdsRef.current));
     try {
       const updated = await api.unlock(asset.id);
-      if (task) api.task(task.id).then(setTask).catch(() => {});
+      if (task) api.task(task.id).then(setTask).catch((e) => reportBackgroundError(e, "refresh active task after unlock"));
       if (lightbox && lightbox.id === asset.id) setLightbox(updated);
       refreshMe(); loadWorks();
     } catch (e) {

@@ -28,6 +28,8 @@ def claim_terminal(db, task_id: int, status: str, *, error: str | None = None,
     and refund idempotent when workers, recovery, or duplicate delivery race.
     """
     values: dict = {"status": status, "finished_at": datetime.now(timezone.utc)}
+    if status == "succeeded":
+        values["phase"] = None
     if error is not None:
         values["error"] = error[:1000]
     if cost_settled is not None:

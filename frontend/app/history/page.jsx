@@ -2,7 +2,8 @@
 
 import { useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
-import { api, downloadBlob, loginPath } from "../../lib/api";
+import { api, downloadBlob } from "../../lib/api";
+import { redirectOnAuthError, reportBackgroundError, showError } from "../../lib/errorHandling";
 import Nav from "../../components/Nav";
 import AssetMedia, {
   assetPreviewSrc,
@@ -11,7 +12,9 @@ import AssetMedia, {
   isAssetTakenDown,
 } from "../../components/AssetMedia";
 import AssetPreviewDialog from "../../components/AssetPreviewDialog";
+import { assetVariationSourceUrl, confirmAssetUnlock } from "../studio/assetActions";
 import { STUDIO_VARIATION_DRAFT_KEY } from "../studio/constants";
+import { statusStyle, statusZh } from "../studio/helpers";
 
 function srcOf(a) {
   return assetPreviewSrc(a);
@@ -39,18 +42,6 @@ function runningTaskHint(task) {
   return "正在等待视频网关响应，完成后会自动出现在历史记录。";
 }
 
-function unlockConfirm(asset, me, cfg) {
-  const type = asset.type === "video" ? "视频" : "图片";
-  const balance = Number(me?.balance_credits ?? 0);
-  const cost = Number(asset.unlock_cost ?? cfg?.models?.[asset.type]?.unlock_cost ?? 0);
-  return window.confirm(`解锁${type}将扣除 ${cost} 积分，当前余额 ${balance}，确认继续？`);
-}
-
-function variationSourceUrl(asset) {
-  if (!asset || asset.type !== "image") return "";
-  return asset.hd_url || asset.preview_url || asset.url || "";
-}
-
 export default function HistoryPage() {
   const router = useRouter();
   const PAGE = 30;
@@ -69,8 +60,8 @@ export default function HistoryPage() {
   const busyAssetIdsRef = useRef(new Set());
 
   useEffect(() => {
-    api.me().then(setMe).catch(() => router.push(loginPath()));
-    api.config().then(setCfg).catch(() => {});
+    api.me().then(setMe).catch((e) => redirectOnAuthError(e, router, setMsg, "history session probe"));
+    api.config().then(setCfg).catch((e) => showError(setMsg, e, "加载下载配置失败"));
     load(true);
     return () => {
       trackersRef.current.forEach((stop) => stop());
@@ -125,7 +116,7 @@ export default function HistoryPage() {
     try {
       await api.retryTask(taskId);
       load(true);
-      api.me().then(setMe).catch(() => {});
+      api.me().then(setMe).catch((e) => reportBackgroundError(e, "refresh current user after retry"));
     } catch (e) {
       setMsg(e.message);
     }
@@ -141,7 +132,7 @@ export default function HistoryPage() {
     try {
       const next = await api.cancelTask(task.id);
       upsertTask(next);
-      api.me().then(setMe).catch(() => {});
+      api.me().then(setMe).catch((e) => reportBackgroundError(e, "refresh current user after cancel"));
     } catch (e) {
       setMsg(e.message);
     }
@@ -174,7 +165,7 @@ export default function HistoryPage() {
             stop();
             trackersRef.current.delete(task.id);
           }
-          api.me().then(setMe).catch(() => {});
+          api.me().then(setMe).catch((e) => reportBackgroundError(e, "refresh current user after tracked task"));
           return;
         }
       } catch (e) {
@@ -213,13 +204,13 @@ export default function HistoryPage() {
       setMsg("素材已下架，不能继续解锁。");
       return;
     }
-    if (!unlockConfirm(asset, me, cfg)) return;
+    if (!confirmAssetUnlock(asset, me, cfg)) return;
     await withAssetBusy(asset.id, async () => {
       try {
         const updated = await api.unlock(asset.id);
         if (lightbox && lightbox.id === asset.id) setLightbox(updated);
         load(true);
-        api.me().then(setMe).catch(() => {});
+        api.me().then(setMe).catch((e) => reportBackgroundError(e, "refresh current user after unlock"));
       } catch (e) {
         setMsg(e.message);
       }
@@ -249,7 +240,7 @@ export default function HistoryPage() {
   }
 
   function createVariation(asset) {
-    const sourceUrl = variationSourceUrl(asset);
+    const sourceUrl = assetVariationSourceUrl(asset);
     if (!sourceUrl) {
       setMsg("当前图片暂不可作为变体来源，请确认预览可用后再试。");
       return;
@@ -459,20 +450,6 @@ function HistoryAssetButton({ asset, onOpen, onVariation }) {
       )}
     </div>
   );
-}
-
-function statusZh(s) {
-  return { queued: "排队中", running: "生成中", succeeded: "已完成", failed: "失败", needs_review: "待确认", canceled: "已取消" }[s] || s;
-}
-function statusStyle(s) {
-  return {
-    queued: "bg-white/10 text-mist",
-    running: "bg-aqua/15 text-aqua",
-    succeeded: "bg-ok/15 text-ok",
-    failed: "bg-bad/15 text-bad",
-    needs_review: "bg-warn/15 text-warn",
-    canceled: "bg-white/10 text-fog",
-  }[s] || "bg-white/10 text-mist";
 }
 
 function taskSummaryLabel(t) {

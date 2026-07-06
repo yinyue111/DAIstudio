@@ -8,6 +8,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
+from ..config import settings
 from ..db import get_db
 from ..deps import get_current_user
 from ..models import GenTask, User
@@ -24,6 +25,7 @@ from ..services.generation_request import (
     validate_generation_params,
 )
 from ..services.progress import set_progress
+from ..services.rate_limit import incr_window
 from ..services.ssrf import SsrfError, assert_safe_user_asset_url
 from ..services.task_output import build_task_out, build_task_outs
 from ..services.user_events import publish_user_event
@@ -32,6 +34,14 @@ router = APIRouter(prefix="/api", tags=["tasks"])
 
 _WS_TICKET_TTL_SECONDS = 60
 _EVENT_WS_TICKET_TTL_SECONDS = 60
+_WS_TICKET_RATE_WINDOW_SECONDS = 60
+
+
+def _rate_limit_ws_ticket(user_id: int, scope: str) -> None:
+    limit = max(1, int(settings.ws_ticket_rate_per_minute or 1))
+    n = incr_window(f"ws:ticket-rate:{scope}:{user_id}", _WS_TICKET_RATE_WINDOW_SECONDS)
+    if n > limit:
+        raise HTTPException(429, "WebSocket 连接过于频繁,请稍后再试")
 
 
 def _page(limit: int, offset: int, cap: int) -> tuple[int, int]:
@@ -78,6 +88,7 @@ def create_task_ws_ticket(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
+    _rate_limit_ws_ticket(user.id, "task")
     task = db.get(GenTask, task_id)
     if not task or task.user_id != user.id:
         raise HTTPException(404, "任务不存在")
@@ -92,6 +103,7 @@ def create_task_ws_ticket(
 
 @router.post("/events/ws-ticket")
 def create_event_ws_ticket(user: User = Depends(get_current_user)):
+    _rate_limit_ws_ticket(user.id, "events")
     ticket = secrets.token_urlsafe(32)
     redis_client.setex(
         f"ws:event-ticket:{ticket}",

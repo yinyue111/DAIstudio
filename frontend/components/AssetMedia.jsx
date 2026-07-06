@@ -41,11 +41,19 @@ function mediaAllowlistOrigins() {
   const origins = new Set();
   if (typeof window !== "undefined") origins.add(window.location.origin);
   if (API_BASE) {
-    try { origins.add(new URL(API_BASE, typeof window !== "undefined" ? window.location.origin : undefined).origin); } catch (e) {}
+    try {
+      origins.add(new URL(API_BASE, typeof window !== "undefined" ? window.location.origin : undefined).origin);
+    } catch (e) {
+      // Invalid operator-provided media origins are ignored by the allowlist.
+    }
   }
-  for (const source of String(process.env.NEXT_PUBLIC_MEDIA_SRC || "").split(/\s+/)) {
+  for (const source of String(process.env.NEXT_PUBLIC_MEDIA_SRC || "").split(/[,\s]+/)) {
     if (!source || source === "'self'" || source === "self") continue;
-    try { origins.add(new URL(source).origin); } catch (e) {}
+    try {
+      origins.add(new URL(source).origin);
+    } catch (e) {
+      // Invalid operator-provided media origins are ignored by the allowlist.
+    }
   }
   return origins;
 }

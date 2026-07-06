@@ -14,6 +14,7 @@ global.window = {
 
 const apiSource = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "../lib/api.js"), "utf8");
 const loginSource = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "../app/login/page.jsx"), "utf8");
+const navigationSource = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "../lib/navigation.js"), "utf8");
 
 function legacyTokenClearingFunction(name) {
   const match = apiSource.match(new RegExp(`export function ${name}\\([^)]*\\) \\{([\\s\\S]*?)\\n\\}`));
@@ -80,9 +81,24 @@ assert.match(
   "login page must scrub accidentally leaked credential query params on hydration",
 );
 assert.match(
+  navigationSource,
+  /SENSITIVE_QUERY_KEYS = \["phone", "password", "smsCode", "sms_code", "nickname"\]/,
+  "credential query scrubber must cover login/register sensitive fields",
+);
+assert.match(
+  navigationSource,
+  /if \(url\.pathname === "\/login"\) return "";/,
+  "login redirect helper must not allow next=/login loops after successful auth",
+);
+assert.match(
   loginSource,
-  /for \(const key of \["phone", "password", "smsCode", "nickname"\]\)/,
-  "login page credential query scrubber must cover all login/register sensitive fields",
+  /await api\.me\(\{\s*redirectOn401:\s*false\s*\}\);\s*\n\s*navigateAfterLogin\(nextPath,\s*router\);/,
+  "login submit should verify the cookie session before leaving the login page",
+);
+assert.match(
+  loginSource,
+  /window\.location\.assign\(nextPath\);/,
+  "login success should use a hard navigation fallback instead of relying only on client router state",
 );
 
 console.log("api auth cookie test passed");

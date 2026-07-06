@@ -20,7 +20,6 @@ from .admin_helpers import assert_quota_grant_limits as _assert_quota_grant_limi
 from .admin_helpers import quota_bulk_grant_item_key as _quota_bulk_grant_item_key
 from .admin_helpers import remember_quota_grant_fingerprint as _remember_quota_grant_fingerprint
 from .admin_helpers import replay_quota_grant as _replay_quota_grant
-from .admin_helpers import require_admin_password as _require_admin_password
 from .admin_helpers import (
     reserve_quota_bulk_grant_idempotency as _reserve_quota_bulk_grant_idempotency,
 )
@@ -36,7 +35,6 @@ def grant_quota(
     admin: User = Depends(require_admin),
     request: Request = None,
 ):
-    _require_admin_password(admin, body.admin_password, request)
     note = (body.note or "").strip()
     if not note:
         raise HTTPException(400, "请填写额度发放原因")
@@ -94,7 +92,6 @@ def bulk_grant_quota(
     admin: User = Depends(require_admin),
     request: Request = None,
 ):
-    _require_admin_password(admin, body.admin_password, request)
     granted: list[QuotaBulkGrantItemOut] = []
     failed: list[QuotaBulkGrantItemOut] = []
     lock_key = f"admin:quota:grant:{admin.id}"

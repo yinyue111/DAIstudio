@@ -8,8 +8,9 @@
 # does not create tables in production.
 # Gateway key / other secrets are read from backend/.env (env_file below).
 # DATABASE_URL / REDIS_URL are overridden here for the container network.
-# Production frontend should usually be served behind the same reverse proxy as
-# the API; set NEXT_PUBLIC_API_BASE only for split-origin deployments.
+# Compose direct access defaults the browser API to http://localhost:8000 and
+# the frontend server-side session probe to http://api:8000. If you change
+# API_PORT, set NEXT_PUBLIC_API_BASE to the matching browser-visible origin.
 # Production: set POSTGRES_PASSWORD in the shell/root .env for Compose DB URL
 # interpolation. Backend application secrets (METRICS_TOKEN,
 # PAYMENT_CONFIG_SECRET, gateway keys, payment keys) are read from backend/.env
@@ -92,7 +93,7 @@ services:
   worker:
     build: ./backend
     restart: unless-stopped
-    stop_grace_period: ${WORKER_STOP_GRACE_PERIOD:-10m}
+    stop_grace_period: ${WORKER_STOP_GRACE_PERIOD:-15m}
     # No -B here: beat runs in its own service so scaling workers (--scale
     # worker=N) does NOT start N schedulers racing on the same cron jobs.
     command: celery -A app.celery_app.celery_app worker -l info --concurrency=${WORKER_CONCURRENCY:-4} -Q ${WORKER_QUEUES:-default,image,video_submit,video_poll,video_download,parse,cleanup,payment}
@@ -135,7 +136,10 @@ services:
     build:
       context: ./frontend
       args:
-        NEXT_PUBLIC_API_BASE: ${NEXT_PUBLIC_API_BASE:-}
+        NEXT_PUBLIC_API_BASE: ${NEXT_PUBLIC_API_BASE:-http://localhost:8000}
+        API_INTERNAL_BASE: ${API_INTERNAL_BASE:-http://api:8000}
+    environment:
+      API_INTERNAL_BASE: ${API_INTERNAL_BASE:-http://api:8000}
     ports:
       - "127.0.0.1:${FRONTEND_PORT:-3000}:3000"
     healthcheck:

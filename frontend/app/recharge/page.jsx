@@ -5,6 +5,8 @@ import { useRouter } from "next/navigation";
 import QRCode from "qrcode";
 import Nav from "../../components/Nav";
 import { api, loginPath, wsUrl } from "../../lib/api";
+import { reportBackgroundError } from "../../lib/errorHandling";
+import { paymentStatusStyle, paymentStatusText } from "./status";
 
 const PROVIDERS = [
   ["alipay", "支付宝"],
@@ -57,7 +59,7 @@ export default function RechargePage() {
                 setActiveOrder(next.status === "pending" ? next : null);
               }
             })
-            .catch(() => {});
+            .catch((e) => reportBackgroundError(e, "refresh pending payment order"));
         }
         setPackageId(pkgs[1]?.id || pkgs[0]?.id || "");
         setProvider(readyProviders.includes("alipay") ? "alipay" : readyProviders[0] || "alipay");
@@ -96,10 +98,10 @@ export default function RechargePage() {
               .then((next) => {
                 patchOrder(next);
                 if (activeOrderRef.current?.order_no === orderNo) setActiveOrder(next);
-                api.me().then(setMe).catch(() => {});
-                api.paymentOrders(12).then(setOrders).catch(() => {});
+                api.me().then(setMe).catch((e) => reportBackgroundError(e, "refresh current user after payment event"));
+                api.paymentOrders(12).then(setOrders).catch((e) => reportBackgroundError(e, "refresh payment orders after event"));
               })
-              .catch(() => {});
+              .catch((e) => reportBackgroundError(e, "load paid payment order from event"));
           }
         };
         ws.onclose = () => {
@@ -148,10 +150,10 @@ export default function RechargePage() {
         setMsg("");
         setActiveOrder(next);
         if (next.status === "paid") {
-          api.me().then(setMe).catch(() => {});
-          api.paymentOrders(12).then(setOrders).catch(() => {});
+          api.me().then(setMe).catch((e) => reportBackgroundError(e, "refresh current user after paid order poll"));
+          api.paymentOrders(12).then(setOrders).catch((e) => reportBackgroundError(e, "refresh payment orders after paid poll"));
         } else if (next.status !== "pending") {
-          api.paymentOrders(12).then(setOrders).catch(() => {});
+          api.paymentOrders(12).then(setOrders).catch((e) => reportBackgroundError(e, "refresh payment orders after terminal poll"));
         }
         if (next.status !== "pending" && pollRef.current) {
           clearInterval(pollRef.current);
@@ -281,7 +283,7 @@ export default function RechargePage() {
       }
     } catch (e) {
       setMsg(e.message);
-      refreshOrders().catch(() => {});
+      refreshOrders().catch((err) => reportBackgroundError(err, "refresh orders after create failure"));
     } finally {
       setLoading(false);
     }
@@ -299,7 +301,7 @@ export default function RechargePage() {
       if (seq === createOrderSeqRef.current && activeOrderRef.current?.order_no === orderNo) {
         setActiveOrder(paid);
       }
-      api.me().then(setMe).catch(() => {});
+      api.me().then(setMe).catch((err) => reportBackgroundError(err, "refresh current user after mock pay"));
     } catch (e) {
       setMsg(e.message);
     } finally {
@@ -319,8 +321,8 @@ export default function RechargePage() {
       if (seq === createOrderSeqRef.current && activeOrderRef.current?.order_no === orderNo) {
         setActiveOrder(next);
       }
-      refreshOrders().catch(() => {});
-      if (next.status === "paid") api.me().then(setMe).catch(() => {});
+      refreshOrders().catch((err) => reportBackgroundError(err, "refresh orders after active order refresh"));
+      if (next.status === "paid") api.me().then(setMe).catch((err) => reportBackgroundError(err, "refresh current user after active order paid"));
     } catch (e) {
       setMsg(e.message);
     } finally {
@@ -336,7 +338,7 @@ export default function RechargePage() {
       const next = await api.paymentOrder(orderNo);
       patchOrder(next);
       if (seq === createOrderSeqRef.current) setActiveOrder(next);
-      if (next.status === "paid") api.me().then(setMe).catch(() => {});
+      if (next.status === "paid") api.me().then(setMe).catch((err) => reportBackgroundError(err, "refresh current user after viewing paid order"));
     } catch (e) {
       setMsg(e.message);
     } finally {
@@ -462,8 +464,8 @@ export default function RechargePage() {
                   </div>
                 )}
                 <div className="mt-3 flex items-center justify-between text-sm">
-                  <span className={`badge ${statusStyle(orderExpired ? "closed" : activeOrder.status)}`}>
-                    {orderExpired ? "已过期" : statusZh(activeOrder.status)}
+                  <span className={`badge ${paymentStatusStyle(orderExpired ? "closed" : activeOrder.status)}`}>
+                    {orderExpired ? "已过期" : paymentStatusText(activeOrder.status)}
                   </span>
                   <span className="text-fog">￥{(activeOrder.amount_cents / 100).toFixed(2)}</span>
                 </div>
@@ -534,7 +536,7 @@ export default function RechargePage() {
                       <td className="pr-3">{o.provider === "wechat" ? "微信" : "支付宝"}</td>
                       <td className="pr-3">￥{(o.amount_cents / 100).toFixed(2)}</td>
                       <td className="pr-3 font-display text-snow">{o.credits}</td>
-                      <td className="pr-3"><span className={`badge ${statusStyle(o.status)}`}>{statusZh(o.status)}</span></td>
+                      <td className="pr-3"><span className={`badge ${paymentStatusStyle(o.status)}`}>{paymentStatusText(o.status)}</span></td>
                       <td className="pr-3 text-xs text-fog">{o.created_at ? new Date(o.created_at).toLocaleString() : "-"}</td>
                       <td className="pr-3">
                         {o.status === "pending" ? (
@@ -578,17 +580,4 @@ function isLocalMockOrder(order) {
   } catch (e) {
     return false;
   }
-}
-
-function statusZh(status) {
-  return { pending: "待支付", paid: "已支付", closed: "已关闭", failed: "失败" }[status] || status;
-}
-
-function statusStyle(status) {
-  return {
-    pending: "bg-aqua/15 text-aqua",
-    paid: "bg-ok/15 text-ok",
-    closed: "bg-white/10 text-fog",
-    failed: "bg-bad/15 text-bad",
-  }[status] || "bg-white/10 text-fog";
 }

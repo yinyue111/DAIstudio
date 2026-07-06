@@ -2,6 +2,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import { api } from "../../../lib/api";
+import { reportBackgroundError } from "../../../lib/errorHandling";
 import { paymentPackageDiff, providerLabel } from "./admin-helpers";
 import { Card, PayInput, PaySecret, Th } from "./admin-ui";
 
@@ -411,7 +412,7 @@ export function Settings() {
       setMsg(e.message);
       setMsgKind("bad");
     });
-    api.config().then(setCfg).catch(() => {});
+    api.config().then(setCfg).catch((e) => reportBackgroundError(e, "load admin payment runtime config"));
     api.adminGateway().then(setGw).catch((e) => {
       setMsg(e.message);
       setMsgKind("bad");

@@ -5,11 +5,10 @@ import { fileURLToPath } from "node:url";
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const source = readFileSync(join(root, "lib/api.js"), "utf8");
+const { loginPath: importedLoginPath, sanitizeNextPath } = await import("../lib/navigation.js");
 
 const match = source.match(/function resolveApiBase\(\) \{([\s\S]*?)\n\}\n\nexport const API_BASE/);
 assert.ok(match, "resolveApiBase helper is missing");
-const loginPathMatch = source.match(/export function loginPath\(([^)]*)\) \{([\s\S]*?)\n\}\n\nfunction redirectToLogin/);
-assert.ok(loginPathMatch, "loginPath helper is missing");
 
 function apiBase({ configured, href }) {
   const process = { env: { NEXT_PUBLIC_API_BASE: configured, NODE_ENV: "development" } };
@@ -82,22 +81,32 @@ assert.equal(
   );
 }
 
-function loginPath({ href, nextPath }) {
-  const window = { location: new URL(href) };
-  return new Function("window", `function loginPath(${loginPathMatch[1]}) {${loginPathMatch[2]}\n}\nreturn loginPath(arguments[1]);`)(window, nextPath);
+function evaluatedLoginPath({ href, nextPath }) {
+  globalThis.window = { location: new URL(href) };
+  return importedLoginPath(nextPath);
 }
 
 assert.equal(
-  loginPath({ href: "http://localhost:3002/profile?filter=image#top" }),
+  evaluatedLoginPath({ href: "http://localhost:3002/profile?filter=image#top" }),
   "/login?next=%2Fprofile%3Ffilter%3Dimage%23top",
 );
 assert.equal(
-  loginPath({ href: "http://localhost:3002/login?next=%2Fprofile" }),
+  evaluatedLoginPath({ href: "http://localhost:3002/login?next=%2Fprofile" }),
   "/login",
 );
 assert.equal(
-  loginPath({ href: "http://localhost:3002/", nextPath: "//evil.example/path" }),
+  evaluatedLoginPath({ href: "http://localhost:3002/", nextPath: "//evil.example/path" }),
   "/login",
+);
+assert.equal(
+  evaluatedLoginPath({ href: "http://localhost:3002/profile?phone=13800000000&password=secret&filter=image" }),
+  "/login?next=%2Fprofile%3Ffilter%3Dimage",
+  "login redirect next paths must strip credential-like query params before reaching browser history",
+);
+assert.equal(
+  sanitizeNextPath("/login?next=/profile?password=secret"),
+  "",
+  "nested login redirects must not create loops or preserve credential params",
 );
 
 console.log("api base localhost alignment test passed");

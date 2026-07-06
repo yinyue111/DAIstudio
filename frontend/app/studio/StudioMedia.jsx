@@ -4,6 +4,7 @@ import { useEffect, useState } from "react";
 import { authenticatedObjectUrl } from "../../lib/api";
 import AssetMedia, { assetPreviewSrc, assetUnavailableText, canDownloadAsset, isAssetTakenDown } from "../../components/AssetMedia";
 import AssetPreviewDialog from "../../components/AssetPreviewDialog";
+import { reportBackgroundError } from "../../lib/errorHandling";
 import { assetDims, mediaAspectStyle, mediaThumbSrc } from "./helpers";
 
 export function srcOf(a) {
@@ -57,7 +58,8 @@ export function ReferenceAssetPreview({ asset, compact = false }) {
         objectUrl = url;
         setSecureSrc(url);
       })
-      .catch(() => {
+      .catch((e) => {
+        reportBackgroundError(e, "load protected reference preview");
         if (!cancelled) setFailed(true);
       });
     return () => {

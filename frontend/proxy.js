@@ -9,6 +9,7 @@ const PUBLIC_PATHS = new Set([
 ]);
 
 const PUBLIC_FILE_RE = /\.(?:avif|css|gif|ico|jpg|jpeg|js|json|map|mp4|png|svg|txt|webmanifest|webp|woff|woff2)$/i;
+const SENSITIVE_QUERY_KEYS = ["phone", "password", "smsCode", "sms_code", "nickname"];
 
 function isPublicRequest(pathname) {
   return pathname.startsWith("/api/")
@@ -20,6 +21,9 @@ function isPublicRequest(pathname) {
 
 function loginRedirectUrl(request) {
   const url = request.nextUrl.clone();
+  for (const key of SENSITIVE_QUERY_KEYS) {
+    url.searchParams.delete(key);
+  }
   const target = `${url.pathname}${url.search}`;
   url.pathname = "/login";
   url.search = "";
@@ -30,7 +34,7 @@ function loginRedirectUrl(request) {
 }
 
 function apiBaseForRequest(request) {
-  return (process.env.NEXT_PUBLIC_API_BASE || request.nextUrl.origin).replace(/\/$/, "");
+  return (process.env.API_INTERNAL_BASE || process.env.NEXT_PUBLIC_API_BASE || request.nextUrl.origin).replace(/\/$/, "");
 }
 
 async function hasValidSession(request) {

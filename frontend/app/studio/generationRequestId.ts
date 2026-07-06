@@ -56,13 +56,17 @@ function generatePendingClientRequestId(
       pendingRef.current = stored;
       return stored.id;
     }
-  } catch (e) {}
+  } catch (e) {
+    // localStorage may be unavailable; fall through to a fresh request id.
+  }
   const id = `${prefix}-${randomId()}`;
   const record = { scope, signature, id, createdAt: now() };
   pendingRef.current = record;
   try {
     storage?.setItem(storageKey, JSON.stringify(record));
-  } catch (e) {}
+  } catch (e) {
+    // localStorage may be unavailable; idempotency still works in memory.
+  }
   return id;
 }
 
@@ -80,7 +84,11 @@ function clearPendingClientRequest(
     const stored = JSON.parse(storage?.getItem(storageKey) || "null");
     if (!id || stored?.id === id) storage?.removeItem(storageKey);
   } catch (e) {
-    try { storage?.removeItem(storageKey); } catch (_e) {}
+    try {
+      storage?.removeItem(storageKey);
+    } catch (_e) {
+      // localStorage may be unavailable; in-memory state was already cleared.
+    }
   }
 }
 
