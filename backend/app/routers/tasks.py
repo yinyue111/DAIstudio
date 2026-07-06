@@ -16,19 +16,22 @@ from ..schemas import TaskOut
 from ..services import credits, generation
 from ..services.config_store import get_model_config
 from ..services.generation import assert_model_snapshot_compatible, model_snapshot
+from ..services.generation_request import (
+    assert_reference_access,
+    default_image_n,
+    estimate_generation_cost,
+    estimate_generation_cost_from_snapshot,
+    validate_generation_params,
+)
+from ..services.progress import set_progress
 from ..services.ssrf import SsrfError, assert_safe_user_asset_url
 from ..services.task_output import build_task_out, build_task_outs
-from .generate import (
-    _assert_reference_access,
-    _default_image_n,
-    _estimate_cost,
-    _estimate_cost_from_snapshot,
-    _validate_params,
-)
+from ..services.user_events import publish_user_event
 
 router = APIRouter(prefix="/api", tags=["tasks"])
 
 _WS_TICKET_TTL_SECONDS = 60
+_EVENT_WS_TICKET_TTL_SECONDS = 60
 
 
 def _page(limit: int, offset: int, cap: int) -> tuple[int, int]:
@@ -87,6 +90,17 @@ def create_task_ws_ticket(
     return {"ticket": ticket, "expires_in": _WS_TICKET_TTL_SECONDS}
 
 
+@router.post("/events/ws-ticket")
+def create_event_ws_ticket(user: User = Depends(get_current_user)):
+    ticket = secrets.token_urlsafe(32)
+    redis_client.setex(
+        f"ws:event-ticket:{ticket}",
+        _EVENT_WS_TICKET_TTL_SECONDS,
+        f"{user.id}:{user.token_version}",
+    )
+    return {"ticket": ticket, "expires_in": _EVENT_WS_TICKET_TTL_SECONDS}
+
+
 @router.post("/tasks/{task_id}/retry", response_model=TaskOut)
 def retry_task(task_id: int, db: Session = Depends(get_db),
                user: User = Depends(get_current_user)):
@@ -100,9 +114,9 @@ def retry_task(task_id: int, db: Session = Depends(get_db),
     if not model or not model.enabled:
         raise HTTPException(400, f"未配置可用的{task.category}模型")
     try:
-        task_params = _validate_params(task.category, _retry_params(task))
+        task_params = validate_generation_params(task.category, _retry_params(task))
         if task.category == "image" and task_params.get("n") is None:
-            task_params["n"] = _default_image_n(db)
+            task_params["n"] = default_image_n(db)
         n_images = int(task_params.get("n") or 1) if task.category == "image" else 1
     except (TypeError, ValueError):
         raise HTTPException(400, "任务参数非法,无法重试")
@@ -114,11 +128,12 @@ def retry_task(task_id: int, db: Session = Depends(get_db),
             "last_frame_image",
             "style_reference_image",
             "character_reference_image",
+            "mask_image_url",
         ):
             assert_safe_user_asset_url(task_params.get(_url_key))
     except SsrfError as e:
         raise HTTPException(400, f"素材链接被安全策略拦截:{e}")
-    _assert_reference_access(
+    assert_reference_access(
         db,
         user.id,
         task.source_asset_url,
@@ -127,6 +142,7 @@ def retry_task(task_id: int, db: Session = Depends(get_db),
         task_params.get("last_frame_image"),
         task_params.get("style_reference_image"),
         task_params.get("character_reference_image"),
+        task_params.get("mask_image_url"),
     )
     snapshot = (task.params or {}).get("_model_snapshot") or model_snapshot(model)
     try:
@@ -135,7 +151,7 @@ def retry_task(task_id: int, db: Session = Depends(get_db),
         raise HTTPException(409, str(e)) from e
     task_params["_model_snapshot"] = snapshot
     if snapshot:
-        cost = _estimate_cost_from_snapshot(
+        cost = estimate_generation_cost_from_snapshot(
             snapshot,
             task.category,
             task.stage,
@@ -144,7 +160,7 @@ def retry_task(task_id: int, db: Session = Depends(get_db),
             source_type=task.source_type,
         )
     else:
-        cost = _estimate_cost(
+        cost = estimate_generation_cost(
             model,
             task.category,
             task.stage,
@@ -181,12 +197,12 @@ def retry_task(task_id: int, db: Session = Depends(get_db),
     db.refresh(task)
 
     try:
-        from ..tasks import generate_image_task, generate_video_task
+        from ..tasks import enqueue_with_request_context, generate_image_task, generate_video_task
 
         if task.category == "image":
-            generate_image_task.delay(task_id)
+            enqueue_with_request_context(generate_image_task, task_id)
         else:
-            generate_video_task.delay(task_id)
+            enqueue_with_request_context(generate_video_task, task_id)
     except Exception as e:  # noqa: BLE001
         if cost > 0:
             credits.refund(db, user.id, cost, biz_ref=task_id, commit=False)
@@ -196,3 +212,61 @@ def retry_task(task_id: int, db: Session = Depends(get_db),
         raise HTTPException(503, "任务入队失败,已退回额度")
 
     return build_task_out(db, task)
+
+
+@router.post("/tasks/{task_id}/cancel", response_model=TaskOut)
+def cancel_task(
+    task_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    task = db.get(GenTask, task_id)
+    if not task or task.user_id != user.id:
+        raise HTTPException(404, "任务不存在")
+    if task.status == "queued":
+        claimed = db.execute(
+            update(GenTask)
+            .where(
+                GenTask.id == task_id,
+                GenTask.user_id == user.id,
+                GenTask.status == "queued",
+            )
+            .values(
+                status="canceled",
+                phase=None,
+                error="用户已取消任务",
+                finished_at=datetime.now(timezone.utc),
+            )
+        ).rowcount
+        if (claimed or 0) != 1:
+            db.rollback()
+            db.refresh(task)
+            raise HTTPException(409, "任务状态已变化,请刷新后重试")
+        db.refresh(task)
+        if task.cost_frozen and task.cost_settled == 0:
+            try:
+                credits.refund(db, user.id, task.cost_frozen, biz_ref=task.id, commit=False)
+            except credits.InsufficientCredits as e:
+                db.rollback()
+                raise HTTPException(400, str(e))
+        db.commit()
+        db.refresh(task)
+        set_progress(task.id, 100, "canceled")
+        publish_user_event(user.id, "task_updated", {"task_id": task.id, "status": "canceled"})
+        return build_task_out(db, task)
+    if task.status == "running":
+        if task.category == "video" and task.external_task_id:
+            raise HTTPException(409, "视频任务已提交到外部网关，暂不支持中途取消")
+        params = dict(task.params or {})
+        if params.get("_cancel_requested"):
+            return build_task_out(db, task)
+        params["_cancel_requested"] = True
+        task.params = params
+        task.error = "取消请求已提交，系统将在安全阶段停止任务"
+        db.commit()
+        db.refresh(task)
+        publish_user_event(user.id, "task_updated", {"task_id": task.id, "status": task.status, "cancel_requested": True})
+        return build_task_out(db, task)
+    if task.status == "canceled":
+        return build_task_out(db, task)
+    raise HTTPException(409, "当前任务状态不支持取消")

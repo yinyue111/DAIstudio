@@ -1,4 +1,18 @@
-"use client";
+export const CREATION_MODES = [
+  { key: "image", label: "文生图", icon: "✦" },
+  { key: "image_edit", label: "图片编辑", icon: "◐" },
+  { key: "video", label: "文生视频", icon: "▶" },
+  { key: "video_edit", label: "图生视频", icon: "▣" },
+];
+
+export const EDIT_STYLE_KEYS = {
+  image: ["场景背景", "广告目标", "风格", "构图", "景别", "视角镜头", "视角构图", "光线", "色调配色", "材质纹理", "氛围情绪", "后期质感", "标签"],
+  video: ["场景背景", "广告目标", "风格", "视角构图", "镜头运动", "剪辑节奏", "时序分镜", "字幕卖点", "光线", "色调配色", "材质纹理", "氛围情绪", "转场", "时长建议", "后期质感", "标签"],
+};
+
+export function creationModeLabel(mode) {
+  return CREATION_MODES.find((item) => item.key === mode)?.label || "生成";
+}
 
 export const RATIOS = [
   { key: "1:1", label: "1:1", hint: "头像 / 方图", w: 1, h: 1 },
@@ -17,9 +31,8 @@ export const RATIOS = [
 export const VIDEO_RATIO_KEYS = new Set(["1:1", "3:4", "4:3", "9:16", "16:9"]);
 
 export const IMAGE_QUALITY_PRESETS = [
-  { key: "1k", label: "1K", hint: "快速预览", maxSide: 1024 },
-  { key: "2k", label: "2K", hint: "均衡清晰", maxSide: 2048 },
-  { key: "4k", label: "4K", hint: "官方 4K", maxSide: 3840 },
+  { key: "1k", label: "标准", hint: "快速生成", maxSide: 1024 },
+  { key: "2k", label: "2K", hint: "按 2K 请求，展示网关实际返回图", maxSide: 2048 },
 ];
 
 export const VIDEO_QUALITIES = [
@@ -28,22 +41,19 @@ export const VIDEO_QUALITIES = [
   { key: "1080p", label: "1080p", hint: "高清" },
 ];
 
+export const MAX_VIDEO_DURATION_SECONDS = 15;
+
 export const VIDEO_DURATION_PRESETS = [
   { seconds: 5, label: "5s", hint: "短镜头预览" },
   { seconds: 8, label: "8s", hint: "平台常用短片" },
   { seconds: 10, label: "10s", hint: "完整短镜头" },
   { seconds: 15, label: "15s", hint: "广告片段" },
-  { seconds: 30, label: "30s", hint: "短广告" },
-  { seconds: 60, label: "1min", hint: "完整广告" },
-  { seconds: 180, label: "3min", hint: "口播/种草" },
-  { seconds: 300, label: "5min", hint: "长内容" },
-  { seconds: 600, label: "10min", hint: "长视频" },
-  { seconds: 900, label: "15min", hint: "最长" },
 ];
 
-export const TERMINAL_TASK_STATUSES = new Set(["succeeded", "failed", "needs_review"]);
+export const TERMINAL_TASK_STATUSES = new Set(["succeeded", "failed", "needs_review", "canceled"]);
 export const PARSE_POLL_INTERVAL_MS = 1000;
 export const PARSE_POLL_TIMEOUT_MS = 240_000;
+export const STUDIO_VARIATION_DRAFT_KEY = "studio_variation_draft_v1";
 
 export const EXAMPLES = [
   "赛博朋克城市夜景，霓虹灯反射在湿漉漉的街道上，电影感，超广角",

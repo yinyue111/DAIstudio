@@ -243,6 +243,34 @@ class ParseRecord(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
+class ReverseOperation(Base):
+    __tablename__ = "reverse_operations"
+    __table_args__ = (
+        CheckConstraint(
+            "status in ('running', 'succeeded', 'failed')",
+            name="ck_reverse_operations_status_valid",
+        ),
+        Index("uq_reverse_operations_user_client_request_id", "user_id", "client_request_id", unique=True),
+        Index("ix_reverse_operations_user_created", "user_id", "created_at"),
+    )
+
+    id: Mapped[int] = mapped_column(BigIntPK, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("users.id"), index=True)
+    client_request_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    request_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    target: Mapped[str] = mapped_column(String(32), nullable=False)
+    asset_url: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(String(16), default="running", nullable=False)
+    result: Mapped[dict | None] = mapped_column(JSONType)
+    charged_credits: Mapped[int] = mapped_column(BigInteger, default=0, nullable=False)
+    reference_count: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    error: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
 class GenTask(Base):
     __tablename__ = "gen_tasks"
     __table_args__ = (
@@ -253,7 +281,7 @@ class GenTask(Base):
         CheckConstraint("category in ('image', 'video')", name="ck_gen_tasks_category_valid"),
         CheckConstraint("stage in ('preview', 'final')", name="ck_gen_tasks_stage_valid"),
         CheckConstraint(
-            "status in ('queued', 'running', 'succeeded', 'failed', 'needs_review')",
+            "status in ('queued', 'running', 'succeeded', 'failed', 'needs_review', 'canceled')",
             name="ck_gen_tasks_status_valid",
         ),
         CheckConstraint(
@@ -274,7 +302,7 @@ class GenTask(Base):
     model_use: Mapped[str | None] = mapped_column(String(16))  # vision/image/video
     params: Mapped[dict | None] = mapped_column(JSONType)
     client_request_id: Mapped[str | None] = mapped_column(String(128))
-    status: Mapped[str] = mapped_column(String(16), default="queued")  # queued/running/succeeded/failed
+    status: Mapped[str] = mapped_column(String(16), default="queued")  # queued/running/succeeded/failed/canceled
     cost_frozen: Mapped[int] = mapped_column(BigInteger, default=0)
     cost_settled: Mapped[int] = mapped_column(BigInteger, default=0)
     external_task_id: Mapped[str | None] = mapped_column(Text)  # async video task id
@@ -343,6 +371,34 @@ class GenAsset(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
+class UserPrompt(Base):
+    __tablename__ = "user_prompts"
+    __table_args__ = (
+        CheckConstraint("category in ('image', 'video', 'general')", name="ck_user_prompts_category_valid"),
+        CheckConstraint(
+            "source in ('manual', 'reverse', 'generate', 'library')",
+            name="ck_user_prompts_source_valid",
+        ),
+        CheckConstraint("usage_count >= 0", name="ck_user_prompts_usage_count_nonnegative"),
+        Index("ix_user_prompts_user_created", "user_id", "created_at"),
+        Index("ix_user_prompts_user_favorite", "user_id", "favorite"),
+    )
+
+    id: Mapped[int] = mapped_column(BigIntPK, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("users.id"), index=True)
+    title: Mapped[str] = mapped_column(String(128), nullable=False)
+    prompt: Mapped[str] = mapped_column(Text, nullable=False)
+    category: Mapped[str] = mapped_column(String(16), default="general", nullable=False)
+    source: Mapped[str] = mapped_column(String(16), default="manual", nullable=False)
+    favorite: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    usage_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    params: Mapped[dict | None] = mapped_column(JSONType)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
 class AssetReport(Base):
     __tablename__ = "asset_reports"
     __table_args__ = (
@@ -409,6 +465,11 @@ class GatewayCall(Base):
 
 class AuditLog(Base):
     __tablename__ = "audit_logs"
+    __table_args__ = (
+        Index("ix_audit_logs_user_id_id", "user_id", "id"),
+        Index("ix_audit_logs_action_id", "action", "id"),
+        Index("ix_audit_logs_created_at", "created_at"),
+    )
 
     id: Mapped[int] = mapped_column(BigIntPK, primary_key=True, autoincrement=True)
     user_id: Mapped[int | None] = mapped_column(BigInteger)

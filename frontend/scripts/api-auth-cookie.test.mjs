@@ -69,5 +69,20 @@ assert.match(
   /api\.me\(\{\s*redirectOn401:\s*false\s*\}\)/,
   "login page session probe must not redirect on anonymous 401 responses",
 );
+assert.match(
+  loginSource,
+  /<form[^>]*method="post"[^>]*onSubmit=\{submit\}/,
+  "login form must degrade to POST so credentials are never leaked through URL query params",
+);
+assert.match(
+  loginSource,
+  /scrubCredentialQuery\(\)/,
+  "login page must scrub accidentally leaked credential query params on hydration",
+);
+assert.match(
+  loginSource,
+  /for \(const key of \["phone", "password", "smsCode", "nickname"\]\)/,
+  "login page credential query scrubber must cover all login/register sensitive fields",
+);
 
 console.log("api auth cookie test passed");

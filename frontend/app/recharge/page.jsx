@@ -4,7 +4,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import QRCode from "qrcode";
 import Nav from "../../components/Nav";
-import { api, loginPath } from "../../lib/api";
+import { api, loginPath, wsUrl } from "../../lib/api";
 
 const PROVIDERS = [
   ["alipay", "支付宝"],
@@ -27,9 +27,11 @@ export default function RechargePage() {
   const [now, setNow] = useState(() => Date.now());
   const pollRef = useRef(null);
   const pollFailuresRef = useRef(0);
+  const eventWsRef = useRef(null);
   const createOrderSeqRef = useRef(0);
   const providerRef = useRef(provider);
   const packageIdRef = useRef(packageId);
+  const activeOrderRef = useRef(activeOrder);
 
   useEffect(() => {
     api.me()
@@ -47,10 +49,13 @@ export default function RechargePage() {
         setOrders(rows);
         const pending = rows.find((o) => o.status === "pending" && o.code_url);
         if (pending) {
+          const seq = createOrderSeqRef.current;
           api.paymentOrder(pending.order_no)
             .then((next) => {
-              setActiveOrder(next.status === "pending" ? next : null);
               patchOrder(next);
+              if (seq === createOrderSeqRef.current && !activeOrderRef.current) {
+                setActiveOrder(next.status === "pending" ? next : null);
+              }
             })
             .catch(() => {});
         }
@@ -66,8 +71,52 @@ export default function RechargePage() {
       });
     return () => {
       if (pollRef.current) clearInterval(pollRef.current);
+      if (eventWsRef.current) eventWsRef.current.close();
     };
   }, []);
+
+  useEffect(() => {
+    let stopped = false;
+    let retryTimer = null;
+    async function connect() {
+      if (stopped) return;
+      try {
+        const ticket = await api.eventWsTicket();
+        if (stopped) return;
+        const ws = new WebSocket(wsUrl(`/ws/events?ticket=${encodeURIComponent(ticket.ticket)}&last_id=$`));
+        eventWsRef.current = ws;
+        ws.onmessage = (event) => {
+          let data = null;
+          try { data = JSON.parse(event.data); } catch (e) { return; }
+          for (const item of data.events || []) {
+            if (item.type !== "payment_paid") continue;
+            const orderNo = item.payload?.order_no;
+            if (!orderNo) continue;
+            api.paymentOrder(orderNo)
+              .then((next) => {
+                patchOrder(next);
+                if (activeOrderRef.current?.order_no === orderNo) setActiveOrder(next);
+                api.me().then(setMe).catch(() => {});
+                api.paymentOrders(12).then(setOrders).catch(() => {});
+              })
+              .catch(() => {});
+          }
+        };
+        ws.onclose = () => {
+          if (stopped) return;
+          retryTimer = window.setTimeout(connect, 3000);
+        };
+      } catch (e) {
+        if (!stopped) retryTimer = window.setTimeout(connect, 5000);
+      }
+    }
+    connect();
+    return () => {
+      stopped = true;
+      if (retryTimer) window.clearTimeout(retryTimer);
+      if (eventWsRef.current) eventWsRef.current.close();
+    };
+  }, [activeOrder?.order_no]);
 
   useEffect(() => {
     const timer = setInterval(() => setNow(Date.now()), 1000);
@@ -81,14 +130,23 @@ export default function RechargePage() {
     }
     if (!activeOrder || activeOrder.status !== "pending") return;
     let stopped = false;
+    const orderNo = activeOrder.order_no;
+    const seq = createOrderSeqRef.current;
     const poll = async () => {
       if (stopped) return;
       try {
-        const next = await api.paymentOrder(activeOrder.order_no);
+        const next = await api.paymentOrder(orderNo);
+        patchOrder(next);
+        if (
+          stopped
+          || seq !== createOrderSeqRef.current
+          || activeOrderRef.current?.order_no !== orderNo
+        ) {
+          return;
+        }
         pollFailuresRef.current = 0;
         setMsg("");
         setActiveOrder(next);
-        patchOrder(next);
         if (next.status === "paid") {
           api.me().then(setMe).catch(() => {});
           api.paymentOrders(12).then(setOrders).catch(() => {});
@@ -100,6 +158,13 @@ export default function RechargePage() {
           pollRef.current = null;
         }
       } catch (e) {
+        if (
+          stopped
+          || seq !== createOrderSeqRef.current
+          || activeOrderRef.current?.order_no !== orderNo
+        ) {
+          return;
+        }
         pollFailuresRef.current += 1;
         const retryDelay = pollFailuresRef.current >= 5 ? "自动检查会降低频率继续进行。" : "正在继续自动检查。";
         setMsg(`${e.message}。${retryDelay}`);
@@ -169,15 +234,21 @@ export default function RechargePage() {
     packageIdRef.current = packageId;
   }, [packageId]);
 
+  useEffect(() => {
+    activeOrderRef.current = activeOrder;
+  }, [activeOrder]);
+
   function patchOrder(next) {
     setOrders((rows) => [next, ...rows.filter((r) => r.order_no !== next.order_no)].slice(0, 12));
   }
 
   async function refreshOrders() {
+    const seq = createOrderSeqRef.current;
+    const currentOrderNo = activeOrderRef.current?.order_no;
     const rows = await api.paymentOrders(12);
     setOrders(rows);
-    if (activeOrder) {
-      const current = rows.find((o) => o.order_no === activeOrder.order_no);
+    if (currentOrderNo && seq === createOrderSeqRef.current && activeOrderRef.current?.order_no === currentOrderNo) {
+      const current = rows.find((o) => o.order_no === currentOrderNo);
       if (current) setActiveOrder(current);
     }
     return rows;
@@ -218,12 +289,16 @@ export default function RechargePage() {
 
   async function mockPay() {
     if (!activeOrder) return;
+    const orderNo = activeOrder.order_no;
+    const seq = createOrderSeqRef.current;
     setLoading(true);
     setMsg("");
     try {
-      const paid = await api.mockPayOrder(activeOrder.order_no);
-      setActiveOrder(paid);
+      const paid = await api.mockPayOrder(orderNo);
       patchOrder(paid);
+      if (seq === createOrderSeqRef.current && activeOrderRef.current?.order_no === orderNo) {
+        setActiveOrder(paid);
+      }
       api.me().then(setMe).catch(() => {});
     } catch (e) {
       setMsg(e.message);
@@ -234,12 +309,16 @@ export default function RechargePage() {
 
   async function refreshActiveOrder() {
     if (!activeOrder) return;
+    const orderNo = activeOrder.order_no;
+    const seq = createOrderSeqRef.current;
     setLoading(true);
     setMsg("");
     try {
-      const next = await api.paymentOrder(activeOrder.order_no);
-      setActiveOrder(next);
+      const next = await api.paymentOrder(orderNo);
       patchOrder(next);
+      if (seq === createOrderSeqRef.current && activeOrderRef.current?.order_no === orderNo) {
+        setActiveOrder(next);
+      }
       refreshOrders().catch(() => {});
       if (next.status === "paid") api.me().then(setMe).catch(() => {});
     } catch (e) {
@@ -250,12 +329,13 @@ export default function RechargePage() {
   }
 
   async function viewOrder(orderNo) {
+    const seq = ++createOrderSeqRef.current;
     setLoading(true);
     setMsg("");
     try {
       const next = await api.paymentOrder(orderNo);
-      setActiveOrder(next);
       patchOrder(next);
+      if (seq === createOrderSeqRef.current) setActiveOrder(next);
       if (next.status === "paid") api.me().then(setMe).catch(() => {});
     } catch (e) {
       setMsg(e.message);
@@ -466,7 +546,7 @@ export default function RechargePage() {
                             onClick={() => {
                               setPackageId(o.package_id);
                               setProvider(o.provider);
-                              setActiveOrder(o);
+                              viewOrder(o.order_no);
                             }}
                             className="btn-ghost btn-sm"
                           >

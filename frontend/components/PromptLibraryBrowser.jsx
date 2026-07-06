@@ -9,6 +9,15 @@ const PROMPT_LIBRARY_PREVIEW_URL = "/prompt-library/prompt-preview.json";
 const PROMPT_LIBRARY_LICENSE_URL = "/prompt-library/license.json";
 const CATEGORY_ALL = { id: "all", label: "全部", count: 0 };
 
+function safeExternalUrl(value) {
+  try {
+    const url = new URL(String(value || ""));
+    return url.protocol === "http:" || url.protocol === "https:" ? url.href : "";
+  } catch (error) {
+    return "";
+  }
+}
+
 export default function PromptLibraryBrowser({
   variant = "panel",
   title = "提示词库",
@@ -96,6 +105,7 @@ export default function PromptLibraryBrowser({
 
   const total = library?.stats?.total || library?.items?.length || 0;
   const visibleItems = filteredItems.slice(0, visible);
+  const licenseSourceUrl = safeExternalUrl(license?.sourceUrl);
 
   return (
     <div className={isPage ? "panel p-4 sm:p-5" : "mt-2.5 rounded-xl3 border border-line bg-base2/40 p-3 animate-fadeup"}>
@@ -103,18 +113,18 @@ export default function PromptLibraryBrowser({
         <div>
           <div className="flex items-center gap-2">
             <h2 className={isPage ? "text-xl font-bold text-snow" : "text-sm font-semibold text-snow"}>{title}</h2>
-            <span className="badge bg-white/8 text-fog">{total || "读取中"} 条</span>
+            <span className="badge bg-white/[0.08] text-fog">{total || "读取中"} 条</span>
           </div>
           <p className="mt-0.5 text-xs text-fog">
             {description}
             {!isPage && library?.preview?.sourceTotal ? ` · 面板预览 ${library.items.length} / ${library.preview.sourceTotal}` : ""}
           </p>
-          {license?.sourceUrl && (
+          {licenseSourceUrl && (
             <p className="mt-1 text-[11px] text-fog">
               来源：
               <a
-                className="text-brand hover:text-brand2"
-                href={license.sourceUrl}
+                className="text-brand hover:text-iris-400"
+                href={licenseSourceUrl}
                 target="_blank"
                 rel="noreferrer"
               >
@@ -202,6 +212,7 @@ export default function PromptLibraryBrowser({
 function PromptLibraryCard({ item, categories, primaryLabel, secondaryLabel, onPrimary, onSecondary }) {
   const category = categories.find((c) => c.id === item.category) || { label: item.category, accent: "#7b61ff" };
   const excerpt = compactPrompt(item.prompt);
+  const sourceUrl = safeExternalUrl(item.sourceUrl);
   return (
     <article className="group overflow-hidden rounded-xl2 border border-line bg-black/15 transition hover:border-line2 hover:bg-white/5">
       <div className="grid grid-cols-[112px_1fr] gap-2 p-2">
@@ -225,16 +236,16 @@ function PromptLibraryCard({ item, categories, primaryLabel, secondaryLabel, onP
           <p className="mt-1 line-clamp-3 text-[11px] leading-relaxed text-fog">{excerpt}</p>
           <div className="mt-2 flex flex-wrap gap-1">
             {(item.tags || []).slice(0, 3).map((tag) => (
-              <span key={tag} className="rounded-full bg-white/6 px-1.5 py-0.5 text-[10px] text-fog">{tag}</span>
+              <span key={tag} className="rounded-full bg-white/[0.06] px-1.5 py-0.5 text-[10px] text-fog">{tag}</span>
             ))}
           </div>
         </div>
       </div>
       <div className="flex items-center justify-between gap-2 border-t border-line px-2 py-2">
-        {item.sourceUrl ? (
+        {sourceUrl ? (
           <a
             className="truncate text-[10px] text-fog hover:text-brand"
-            href={item.sourceUrl}
+            href={sourceUrl}
             target="_blank"
             rel="noreferrer"
           >

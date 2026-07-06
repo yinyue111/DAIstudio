@@ -1,4 +1,5 @@
 import "./globals.css";
+import ErrorBoundary from "../components/ErrorBoundary";
 
 export const metadata = {
   title: "造梦 · AI 创作工作台",
@@ -18,7 +19,9 @@ export default function RootLayout({ children }) {
   return (
     <html lang="zh-CN" suppressHydrationWarning>
       <body className="min-h-screen" suppressHydrationWarning>
-        {children}
+        <ErrorBoundary>
+          {children}
+        </ErrorBoundary>
       </body>
     </html>
   );

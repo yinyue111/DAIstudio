@@ -275,6 +275,8 @@ def generation_cost_from_snapshot(
 def reverse_cost(target: str, *, preset: str | None = None) -> int:
     if target == "video":
         return REVERSE_VIDEO_PRESET_COSTS.get((preset or "standard").strip().lower(), REVERSE_VIDEO_PRESET_COSTS["standard"])
+    if target == "product_profile":
+        return REVERSE_IMAGE_COST
     return REVERSE_IMAGE_COST
 
 

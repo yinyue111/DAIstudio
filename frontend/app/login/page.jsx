@@ -25,6 +25,7 @@ export default function LoginPage() {
 
   useEffect(() => {
     let cancelled = false;
+    scrubCredentialQuery();
     api.me({ redirectOn401: false })
       .then(() => {
         if (!cancelled) router.replace(currentNextPath() || "/");
@@ -133,7 +134,7 @@ export default function LoginPage() {
           </p>
         </div>
 
-        <form className="panel p-6" onSubmit={submit}>
+        <form className="panel p-6" method="post" autoComplete="on" onSubmit={submit}>
           <div className="mb-5 flex rounded-full border border-line bg-base2/50 p-1 text-sm">
             {[["login", "登录"], ["register", "注册"]].map(([k, label]) => (
               <button
@@ -157,6 +158,7 @@ export default function LoginPage() {
             value={phone}
             onChange={(e) => setPhone(e.target.value.trim())}
             inputMode="numeric"
+            autoComplete="tel"
           />
 
           {isRegister && (
@@ -168,6 +170,7 @@ export default function LoginPage() {
                 placeholder="显示名称"
                 value={nickname}
                 onChange={(e) => setNickname(e.target.value)}
+                autoComplete="nickname"
               />
               {featuresError && (
                 <p className="mb-4 rounded-xl border border-bad/30 bg-bad/10 px-3 py-2 text-sm text-bad">
@@ -190,6 +193,7 @@ export default function LoginPage() {
                       value={smsCode}
                       onChange={(e) => setSmsCode(e.target.value.replace(/\D/g, "").slice(0, 6))}
                       inputMode="numeric"
+                      autoComplete="one-time-code"
                     />
                     <button
                       onClick={sendCode}
@@ -213,6 +217,7 @@ export default function LoginPage() {
             placeholder="至少 6 位"
             value={password}
             onChange={(e) => setPassword(e.target.value)}
+            autoComplete={isRegister ? "new-password" : "current-password"}
           />
 
           <button type="submit" disabled={loading || (isRegister && (!featuresLoaded || !!featuresError || !registrationEnabled))} className="btn-primary btn-lg w-full">
@@ -245,5 +250,25 @@ function currentNextPath() {
     return safeNextPath(new URLSearchParams(window.location.search).get("next"));
   } catch (e) {
     return "";
+  }
+}
+
+function scrubCredentialQuery() {
+  if (typeof window === "undefined") return;
+  try {
+    const url = new URL(window.location.href);
+    let changed = false;
+    for (const key of ["phone", "password", "smsCode", "nickname"]) {
+      if (url.searchParams.has(key)) {
+        url.searchParams.delete(key);
+        changed = true;
+      }
+    }
+    if (changed) {
+      const next = `${url.pathname}${url.search}${url.hash}`;
+      window.history.replaceState(null, "", next);
+    }
+  } catch (e) {
+    // Best-effort privacy cleanup only.
   }
 }

@@ -77,8 +77,8 @@ def test_reverse_refunds_configured_cost_on_gateway_failure(client, make_user, a
 
 
 def test_reverse_refunds_configured_cost_on_unexpected_gateway_error(client, make_user, auth, monkeypatch):
-    make_user("13900000038", balance=1000, admin=True)
-    h = auth("13900000038")
+    make_user("13900009040", balance=1000, admin=True)
+    h = auth("13900009040")
 
     r = client.put("/api/admin/models", json={
         "use": "vision",
@@ -123,8 +123,9 @@ def test_admin_report_includes_reverse_model_call_spend(client, make_user, auth)
 
 
 def test_usage_report_does_not_count_refunds_as_negative_spend(client, make_user, auth):
-    uid = make_user("13900000039", balance=1000, admin=True)
-    h = auth("13900000039")
+    phone = "13900009041"
+    uid = make_user(phone, balance=1000, admin=True)
+    h = auth(phone)
     db = SessionLocal()
     try:
         credits.consume(db, uid, 10, biz_type="reverse", biz_ref=1, note="reverse")
@@ -133,7 +134,7 @@ def test_usage_report_does_not_count_refunds_as_negative_spend(client, make_user
         db.close()
 
     report = client.get("/api/admin/usage/report", headers=h).json()
-    row = next(x for x in report["per_user"] if x["phone"] == "13900000039")
+    row = next(x for x in report["per_user"] if x["phone"] == phone)
     assert row["spend_credits"] == 10
 
 
@@ -326,8 +327,8 @@ def test_video_reverse_uses_fallback_in_mock(client, make_user, auth):
 
 
 def test_video_reverse_charges_per_reference_frame(client, make_user, auth, monkeypatch):
-    make_user("13900000039", balance=1000, admin=True)
-    h = auth("13900000039")
+    make_user("13900009042", balance=1000, admin=True)
+    h = auth("13900009042")
     assert client.put("/api/admin/models", json={
         "use": "vision",
         "model_id": "mock-vision",

@@ -7,6 +7,7 @@ from app.db import SessionLocal
 from app.models import PaymentOrder, PaymentProviderConfig
 from app.services import payment_config, payments
 from app.services.config_store import set_setting
+from app.services.user_events import read_user_events
 
 
 def _set_payment_enabled(enabled: bool = True):
@@ -88,7 +89,7 @@ def test_payment_packages_and_create_order(client, make_user, auth):
 
 def test_mock_payment_marks_paid_and_grants_once(client, make_user, auth):
     _set_payment_enabled(True)
-    make_user("13900000201", balance=100)
+    uid = make_user("13900000201", balance=100)
     h = auth("13900000201")
 
     order = client.post("/api/payments/orders", json={
@@ -101,6 +102,11 @@ def test_mock_payment_marks_paid_and_grants_once(client, make_user, auth):
     assert paid1.status_code == 200, paid1.text
     assert paid1.json()["status"] == "paid"
     assert client.get("/api/me", headers=h).json()["balance_credits"] == before + 330
+    _, events = read_user_events(uid, "0", block_ms=1)
+    assert any(
+        e["type"] == "payment_paid" and e["payload"].get("order_no") == order["order_no"]
+        for e in events
+    )
 
     paid2 = client.post(f"/api/payments/orders/{order['order_no']}/mock-pay", headers=h)
     assert paid2.status_code == 200, paid2.text
@@ -182,6 +188,48 @@ def test_create_order_keeps_failed_order_when_gateway_fails(client, make_user, a
     try:
         rows = db.query(PaymentOrder).filter(PaymentOrder.user_id.isnot(None)).all()
         assert any(row.status == payments.FAILED and row.raw.get("error") == "gateway down" for row in rows)
+    finally:
+        db.close()
+
+
+def test_create_order_clears_orphan_pending_order_without_code_url(client, make_user, auth, monkeypatch):
+    _set_payment_enabled(True)
+    user_id = make_user("13900000243", balance=100)
+    db = SessionLocal()
+    try:
+        orphan = PaymentOrder(
+            order_no="ali-orphan-without-code-url",
+            user_id=user_id,
+            provider="alipay",
+            package_id="starter",
+            amount_cents=990,
+            credits=100,
+            status=payments.PENDING,
+            expires_at=datetime.now(timezone.utc) + timedelta(minutes=20),
+        )
+        db.add(orphan)
+        db.commit()
+    finally:
+        db.close()
+    h = auth("13900000243")
+
+    r = client.post("/api/payments/orders", json={
+        "provider": "alipay",
+        "package_id": "starter",
+    }, headers=h)
+
+    assert r.status_code == 200, r.text
+    db = SessionLocal()
+    try:
+        orphan = db.query(PaymentOrder).filter(PaymentOrder.order_no == "ali-orphan-without-code-url").one()
+        assert orphan.status == payments.FAILED
+        assert "二维码未创建完成" in orphan.raw["error"]
+        active = db.query(PaymentOrder).filter(
+            PaymentOrder.user_id == user_id,
+            PaymentOrder.status == payments.PENDING,
+        ).all()
+        assert len(active) == 1
+        assert active[0].code_url
     finally:
         db.close()
 

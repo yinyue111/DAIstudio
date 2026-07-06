@@ -2,15 +2,26 @@
 delivery / retries)."""
 from __future__ import annotations
 
+import logging
 import secrets
 import time
 
 from ..config import settings
 from ..redis_client import redis_client
 
+log = logging.getLogger("locks")
+
 _RELEASE_IF_OWNER_LUA = """
 if redis.call("get", KEYS[1]) == ARGV[1] then
   return redis.call("del", KEYS[1])
+else
+  return 0
+end
+"""
+
+_REFRESH_IF_OWNER_LUA = """
+if redis.call("get", KEYS[1]) == ARGV[1] then
+  return redis.call("expire", KEYS[1], ARGV[2])
 else
   return 0
 end
@@ -24,12 +35,21 @@ def acquire(key: str, ttl: int | None = None) -> str | None:
     return token if redis_client.set(key, token, nx=True, ex=ttl) else None
 
 
+def _token_matches(value, token: str) -> bool:
+    if isinstance(value, bytes):
+        try:
+            value = value.decode()
+        except UnicodeDecodeError:
+            return False
+    return value == token
+
+
 def release(key: str, token: str | None = None) -> None:
     if not token:
         try:
             redis_client.delete(key)
-        except Exception:
-            pass
+        except Exception:  # noqa: BLE001
+            log.debug("lock delete failed for %s", key, exc_info=True)
         return
     for attempt in range(3):
         try:
@@ -43,7 +63,7 @@ def release(key: str, token: str | None = None) -> None:
         try:
             pipe = redis_client.pipeline()
             pipe.watch(key)
-            if pipe.get(key) != token:
+            if not _token_matches(pipe.get(key), token):
                 pipe.reset()
                 return
             pipe.multi()
@@ -54,10 +74,41 @@ def release(key: str, token: str | None = None) -> None:
             if pipe is not None:
                 try:
                     pipe.reset()
-                except Exception:
-                    pass
+                except Exception:  # noqa: BLE001
+                    log.debug("lock release pipeline reset failed for %s", key, exc_info=True)
             if attempt < 2:
                 time.sleep(0.05 * (attempt + 1))
+
+
+def refresh(key: str, token: str | None, ttl: int) -> bool:
+    """Extend a lock only when still owned by this worker."""
+    if not token:
+        return False
+    try:
+        return bool(redis_client.eval(_REFRESH_IF_OWNER_LUA, 1, key, token, int(ttl)))
+    except Exception:  # noqa: BLE001
+        log.debug("lock refresh failed for %s", key, exc_info=True)
+    for attempt in range(3):
+        pipe = None
+        try:
+            pipe = redis_client.pipeline()
+            pipe.watch(key)
+            if not _token_matches(pipe.get(key), token):
+                pipe.reset()
+                return False
+            pipe.multi()
+            pipe.expire(key, int(ttl))
+            pipe.execute()
+            return True
+        except Exception:
+            if pipe is not None:
+                try:
+                    pipe.reset()
+                except Exception:  # noqa: BLE001
+                    log.debug("lock refresh pipeline reset failed for %s", key, exc_info=True)
+            if attempt < 2:
+                time.sleep(0.05 * (attempt + 1))
+    return False
 
 
 class RedisSemaphore:
@@ -101,5 +152,5 @@ class RedisSemaphore:
         if self.acquired:
             try:
                 redis_client.zrem(self.key, self.member)
-            except Exception:
-                pass
+            except Exception:  # noqa: BLE001
+                log.debug("semaphore release failed for %s", self.key, exc_info=True)

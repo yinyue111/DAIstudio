@@ -4,14 +4,20 @@ import { useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { api, downloadBlob, loginPath } from "../../lib/api";
 import Nav from "../../components/Nav";
-import AssetMedia, { assetPreviewSrc, assetUnavailableText, isAssetTakenDown } from "../../components/AssetMedia";
-import { estimateVideoFinalCredits } from "../studio/helpers";
+import AssetMedia, {
+  assetPreviewLabel,
+  assetPreviewSrc,
+  assetUnavailableText,
+  canDownloadAsset,
+  isAssetTakenDown,
+} from "../../components/AssetMedia";
+import { STUDIO_VARIATION_DRAFT_KEY } from "../studio/constants";
 
 function srcOf(a) {
   return assetPreviewSrc(a);
 }
 
-const TERMINAL_STATUSES = new Set(["succeeded", "failed", "needs_review"]);
+const TERMINAL_STATUSES = new Set(["succeeded", "failed", "needs_review", "canceled"]);
 
 function isTerminalStatus(status) {
   return TERMINAL_STATUSES.has(status);
@@ -27,7 +33,7 @@ function runningTaskHint(task) {
   const isHighRes = Math.max(width, height) > 2560 || width * height >= 3840 * 2160 * 0.9;
   if (task.category === "image") {
     return isHighRes && n > 1
-      ? `正在等待图像网关响应，${n} 张 4K 图可能需要数分钟；如果网关超时会自动失败并退回积分。`
+      ? `正在等待图像网关响应，${n} 张高分辨率图可能需要数分钟；如果网关超时会自动失败并退回积分。`
       : "正在等待图像网关响应，完成后会自动出现在历史记录。";
   }
   return "正在等待视频网关响应，完成后会自动出现在历史记录。";
@@ -37,17 +43,12 @@ function unlockConfirm(asset, me, cfg) {
   const type = asset.type === "video" ? "视频" : "图片";
   const balance = Number(me?.balance_credits ?? 0);
   const cost = Number(asset.unlock_cost ?? cfg?.models?.[asset.type]?.unlock_cost ?? 0);
-  return window.confirm(`解锁${type}高清将扣除 ${cost} 积分，当前余额 ${balance}，确认继续？`);
+  return window.confirm(`解锁${type}将扣除 ${cost} 积分，当前余额 ${balance}，确认继续？`);
 }
 
-function finalCostForTask(task, cfg) {
-  const estimated = Number(task?.final_cost_estimate ?? 0);
-  if (estimated > 0) return estimated;
-  const params = task?.params || {};
-  return estimateVideoFinalCredits(cfg, {
-    resolution: params.target_resolution || params.resolution,
-    duration: params.target_duration || params.duration,
-  });
+function variationSourceUrl(asset) {
+  if (!asset || asset.type !== "image") return "";
+  return asset.hd_url || asset.preview_url || asset.url || "";
 }
 
 export default function HistoryPage() {
@@ -60,7 +61,6 @@ export default function HistoryPage() {
   const [hasMore, setHasMore] = useState(false);
   const [lightbox, setLightbox] = useState(null);
   const [msg, setMsg] = useState("");
-  const [finalizingId, setFinalizingId] = useState(null);
   const trackersRef = useRef(new Map());
   const loadingRef = useRef(false);
   const loadSeqRef = useRef(0);
@@ -131,6 +131,22 @@ export default function HistoryPage() {
     }
   }
 
+  async function cancelTask(task) {
+    const running = task?.status === "running";
+    const text = running
+      ? "确认提交取消请求？运行中的任务会在安全阶段停止；如果外部网关已接收，可能无法中途取消。"
+      : "确认取消这个排队任务？已冻结积分会退回。";
+    if (!window.confirm(text)) return;
+    setMsg("");
+    try {
+      const next = await api.cancelTask(task.id);
+      upsertTask(next);
+      api.me().then(setMe).catch(() => {});
+    } catch (e) {
+      setMsg(e.message);
+    }
+  }
+
   function upsertTask(next) {
     setTasks((current) => {
       const list = current || [];
@@ -180,34 +196,6 @@ export default function HistoryPage() {
     };
   }
 
-  async function renderFinal(taskId) {
-    if (finalizingId) return;
-    const preview = tasksRef.current.find((t) => t.id === taskId);
-    const cost = finalCostForTask(preview, cfg);
-    const balance = Number(me?.balance_credits ?? 0);
-    if (!window.confirm(`渲染完整视频将冻结 ${cost} 积分，当前余额 ${balance}，确认继续？`)) return;
-    setMsg("");
-    setFinalizingId(taskId);
-    try {
-      const task = await api.generate({
-        category: "video",
-        stage: "final",
-        parent_task_id: taskId,
-        params: {},
-      });
-      upsertTask(task);
-      if (!isTerminalStatus(task.status) && !trackersRef.current.has(task.id)) {
-        trackersRef.current.set(task.id, trackTask(task.id));
-      }
-      load(true);
-      api.me().then(setMe).catch(() => {});
-    } catch (e) {
-      setMsg(e.message);
-    } finally {
-      setFinalizingId(null);
-    }
-  }
-
   async function withAssetBusy(assetId, fn) {
     if (busyAssetIdsRef.current.has(assetId)) return;
     busyAssetIdsRef.current.add(assetId);
@@ -243,16 +231,43 @@ export default function HistoryPage() {
       setMsg("素材已下架，不能继续下载。");
       return;
     }
+    if (!canDownloadAsset(asset)) {
+      setMsg("请先解锁后再下载。");
+      return;
+    }
     await withAssetBusy(asset.id, async () => {
       try {
-        await downloadBlob(
+        const filename = await downloadBlob(
           `/api/assets/${asset.id}/download`,
           asset.type === "video" ? `asset-${asset.id}.mp4` : undefined,
         );
+        setMsg(`已开始下载 ${filename}`);
       } catch (e) {
         setMsg(e.message);
       }
     });
+  }
+
+  function createVariation(asset) {
+    const sourceUrl = variationSourceUrl(asset);
+    if (!sourceUrl) {
+      setMsg("当前图片暂不可作为变体来源，请确认预览可用后再试。");
+      return;
+    }
+    try {
+      window.localStorage.setItem(STUDIO_VARIATION_DRAFT_KEY, JSON.stringify({
+        asset: {
+          ...asset,
+          type: "image",
+          url: sourceUrl,
+          thumb: asset.preview_url || asset.thumb || sourceUrl,
+        },
+        prompt: "基于这张图生成同主体、同构图、同光线和同广告质感的近似变体；保留主体结构、产品文字、Logo、比例和核心视觉，只做轻微差异化。",
+      }));
+      router.push("/");
+    } catch (e) {
+      setMsg(e.message || "创建变体草稿失败");
+    }
   }
 
   return (
@@ -286,30 +301,23 @@ export default function HistoryPage() {
         ) : (
           <div className="space-y-4">
             {tasks.map((t) => {
-              const finalStatus = t.final_status;
-              const finalAssetCount = Number(t.final_asset_count || 0);
-              const hasPendingFinal = ["queued", "running"].includes(finalStatus);
-              const hasSucceededFinal = finalStatus === "succeeded" && finalAssetCount > 0;
-              const hasNeedsReviewFinal = finalStatus === "needs_review";
-              const hasActiveOrSucceededFinal = hasPendingFinal || hasSucceededFinal;
-              const hasFailedFinal = finalStatus === "failed";
-              const hasBlockingFinal = hasActiveOrSucceededFinal || hasNeedsReviewFinal;
               return (
               <div key={t.id} className="card p-4 animate-fadeup">
                 <div className="mb-3 flex flex-wrap items-center gap-2 text-sm">
-                  <span className="font-display font-semibold text-snow">{taskSummaryLabel(t)}</span>
-                  <span className="chip">{t.category === "video" ? "视频" : "图片"}</span>
-                  {t.stage === "preview" && t.category === "video" && (
-                    <span className="chip">预览</span>
-                  )}
-                  <span className={`badge ${statusStyle(t.status)}`}>{statusZh(t.status)}</span>
+	                  <span className="font-display font-semibold text-snow">{taskSummaryLabel(t)}</span>
+	                  <span className="chip">{t.category === "video" ? "视频" : "图片"}</span>
+	                  <span className={`badge ${statusStyle(t.status)}`}>{statusZh(t.status)}</span>
                   <span className="ml-auto text-xs text-fog">
                     {(t.created_at || "").replace("T", " ").slice(0, 16)} · 结算 {t.cost_settled}
                   </span>
                 </div>
                 {t.partial && (
                   <div className="mb-3 rounded-lg bg-warn/10 px-3 py-2 text-xs text-warn">
-                    <p>批量生成完成 {t.saved_count || t.assets?.length || 0}/{t.requested_count || "?"} 张，失败部分已按实际成功张数结算。</p>
+                    {t.status === "needs_review" ? (
+                      <p>批量生成已保存 {t.saved_count || t.assets?.length || 0}/{t.requested_count || "?"} 张成功结果，剩余部分状态未知，积分暂不结算或退回，待系统确认。</p>
+                    ) : (
+                      <p>批量生成完成 {t.saved_count || t.assets?.length || 0}/{t.requested_count || "?"} 张，失败部分已按实际成功张数结算。</p>
+                    )}
                     {t.partial_errors?.length > 0 && (
                       <p className="mt-1 text-warn/80">未完成原因：{t.partial_errors.join("；")}</p>
                     )}
@@ -320,35 +328,14 @@ export default function HistoryPage() {
                   <div>
                     <div className="grid grid-cols-3 gap-2 sm:grid-cols-6">
                       {t.assets.map((a) => (
-                        <HistoryAssetButton key={a.id} asset={a} onOpen={() => setLightbox(a)} />
+                        <HistoryAssetButton
+                          key={a.id}
+                          asset={a}
+                          onOpen={() => setLightbox(a)}
+                          onVariation={() => createVariation(a)}
+                        />
                       ))}
                     </div>
-                    {t.category === "video" && t.stage === "preview" && t.status === "succeeded" && hasActiveOrSucceededFinal && (
-                      <p className="mt-3 rounded-lg border border-line bg-white/5 px-3 py-2 text-center text-xs text-fog">
-                        已提交完整渲染
-                      </p>
-                    )}
-                    {t.category === "video" && t.stage === "preview" && t.status === "succeeded" && hasNeedsReviewFinal && (
-                      <p className="mt-3 rounded-lg border border-warn/30 bg-warn/10 px-3 py-2 text-center text-xs text-warn">
-                        完整渲染待确认，请查看最终任务状态
-                      </p>
-                    )}
-                    {t.category === "video" && t.stage === "preview" && t.status === "succeeded" && hasFailedFinal && !hasActiveOrSucceededFinal && (
-                      <p className="mt-3 rounded-lg border border-warn/30 bg-warn/10 px-3 py-2 text-center text-xs text-warn">
-                        完整渲染失败，可重新提交
-                      </p>
-                    )}
-                    {t.category === "video" && t.stage === "preview" && t.status === "succeeded" && !hasBlockingFinal && (
-                      <button
-                        onClick={() => renderFinal(t.id)}
-                        disabled={finalizingId === t.id}
-                        className="btn-primary btn-sm mt-3 w-full"
-                      >
-                        {finalizingId === t.id
-                          ? "提交中…"
-                          : `方向满意 → 渲染完整视频(${finalCostForTask(t, cfg)}积分)`}
-                      </button>
-                    )}
                   </div>
                 ) : (
                   <div className="flex flex-col gap-2 rounded-lg border border-line bg-white/[0.03] px-3 py-2 sm:flex-row sm:items-center sm:justify-between">
@@ -360,7 +347,14 @@ export default function HistoryPage() {
                           : runningTaskHint(t)}
                     </p>
                     {!isTerminalStatus(t.status) && (
-                      <button onClick={() => load(true)} className="btn-secondary btn-sm">刷新状态</button>
+                      <div className="flex gap-2">
+                        <button onClick={() => load(true)} className="btn-secondary btn-sm">刷新状态</button>
+                        {["queued", "running"].includes(t.status) && (
+                          <button onClick={() => cancelTask(t)} className="btn-ghost btn-sm text-bad">
+                            {t.status === "running" ? "提交取消请求" : "取消任务"}
+                          </button>
+                        )}
+                      </div>
                     )}
                     {t.status === "failed" && (
                       <button onClick={() => retry(t.id)} className="btn-secondary btn-sm">重试</button>
@@ -389,7 +383,7 @@ export default function HistoryPage() {
           onClick={() => setLightbox(null)}
         >
           <div
-            className="panel max-h-[92vh] max-w-3xl overflow-auto p-3"
+            className="panel max-h-[92vh] w-full max-w-3xl overflow-auto p-3"
             onClick={(e) => e.stopPropagation()}
           >
             {!srcOf(lightbox) ? (
@@ -398,7 +392,7 @@ export default function HistoryPage() {
                   ? "素材已下架，不能继续预览、解锁或下载。"
                   : lightbox.unlocked
                     ? "预览暂不可用，请稍后重试。"
-                    : "预览暂不可用，请先解锁后再下载高清。"}
+                    : "预览暂不可用，请先解锁后再下载。"}
               </div>
             ) : (
               <AssetMedia
@@ -407,14 +401,14 @@ export default function HistoryPage() {
                 controls
                 autoPlay
                 muted={false}
-                className="mx-auto max-h-[76vh] w-auto rounded-xl2"
+                className="mx-auto max-h-[76vh] max-w-full rounded-xl2 object-contain"
                 fallbackClassName="flex min-h-64 items-center justify-center rounded-xl2 bg-black/30 px-6 text-sm text-fog"
                 onError={(e) => setMsg(e?.message || "预览加载失败")}
               />
             )}
             <div className="mt-3 flex flex-col gap-2 text-sm sm:flex-row sm:items-center sm:justify-between">
               <span className="min-w-0 text-fog">
-                {isAssetTakenDown(lightbox) ? "素材已下架" : lightbox.unlocked ? "预览 · 已解锁，可下载高清" : "预览 · 带水印"}
+                {assetPreviewLabel(lightbox)}
                 {lightbox.width ? ` · ${lightbox.width}×${lightbox.height}` : ""}
               </span>
               <div className="flex flex-wrap gap-2 sm:justify-end">
@@ -424,16 +418,21 @@ export default function HistoryPage() {
                     disabled={busyAssetIds.has(lightbox.id)}
                     className="btn-primary btn-sm"
                   >
-                    {busyAssetIds.has(lightbox.id) ? "解锁中…" : "解锁高清"}
+                    {busyAssetIds.has(lightbox.id) ? "解锁中…" : "解锁"}
                   </button>
                 )}
                 {!isAssetTakenDown(lightbox) && lightbox.unlocked && (
                   <button
                     onClick={() => download(lightbox)}
-                    disabled={busyAssetIds.has(lightbox.id)}
-                    className="btn-primary btn-sm"
+                    disabled={busyAssetIds.has(lightbox.id) || !canDownloadAsset(lightbox)}
+                    className={canDownloadAsset(lightbox) ? "btn-primary btn-sm" : "btn-secondary btn-sm cursor-not-allowed opacity-70"}
                   >
                     下载
+                  </button>
+                )}
+                {!isAssetTakenDown(lightbox) && lightbox.type === "image" && (
+                  <button onClick={() => createVariation(lightbox)} className="btn-secondary btn-sm">
+                    生成变体
                   </button>
                 )}
                 <button onClick={() => setLightbox(null)} className="btn-secondary btn-sm">关闭</button>
@@ -446,39 +445,52 @@ export default function HistoryPage() {
   );
 }
 
-function HistoryAssetButton({ asset, onOpen }) {
+function HistoryAssetButton({ asset, onOpen, onVariation }) {
   const src = srcOf(asset);
   const takenDown = isAssetTakenDown(asset);
   return (
-    <button
-      onClick={onOpen}
-      aria-label={`预览${asset.type === "video" ? "视频" : "图片"}素材 #${asset.id}`}
+    <div
       className="group relative overflow-hidden rounded-xl2 border border-line bg-base2 transition hover:border-line2"
       style={mediaAspectStyle(asset)}
     >
-      {!src ? (
-        <div className="flex h-full w-full items-center justify-center px-3 text-center text-xs text-fog">
-          {assetUnavailableText(asset)}
-        </div>
-      ) : (
-        <AssetMedia
-          asset={asset}
-          className="h-full w-full cursor-zoom-in object-contain transition group-hover:scale-105"
-          fallbackClassName="flex h-full w-full items-center justify-center px-3 text-center text-xs text-fog"
-        />
-      )}
+      <button
+        onClick={onOpen}
+        aria-label={`预览${asset.type === "video" ? "视频" : "图片"}素材 #${asset.id}`}
+        className="block h-full w-full"
+      >
+        {!src ? (
+          <div className="flex h-full w-full items-center justify-center px-3 text-center text-xs text-fog">
+            {assetUnavailableText(asset)}
+          </div>
+        ) : (
+          <AssetMedia
+            asset={asset}
+            className="h-full w-full cursor-zoom-in object-contain transition group-hover:scale-105"
+            fallbackClassName="flex h-full w-full items-center justify-center px-3 text-center text-xs text-fog"
+          />
+        )}
+      </button>
       {takenDown && (
         <span className="badge absolute left-1 top-1 bg-bad/80 text-white">已下架</span>
       )}
-      {!takenDown && asset.unlocked && (
-        <span className="badge absolute right-1 top-1 bg-brand text-white">HD</span>
+      {!takenDown && asset.type === "image" && (
+        <button
+          type="button"
+          onClick={(e) => {
+            e.stopPropagation();
+            onVariation();
+          }}
+          className="absolute bottom-1.5 right-1.5 rounded-full border border-white/20 bg-black/65 px-2 py-1 text-[11px] font-medium text-white opacity-100 transition hover:bg-black/80 focus-visible:opacity-100 sm:opacity-0 sm:group-hover:opacity-100 sm:group-focus-within:opacity-100"
+        >
+          变体
+        </button>
       )}
-    </button>
+    </div>
   );
 }
 
 function statusZh(s) {
-  return { queued: "排队中", running: "生成中", succeeded: "已完成", failed: "失败", needs_review: "待确认" }[s] || s;
+  return { queued: "排队中", running: "生成中", succeeded: "已完成", failed: "失败", needs_review: "待确认", canceled: "已取消" }[s] || s;
 }
 function statusStyle(s) {
   return {
@@ -487,6 +499,7 @@ function statusStyle(s) {
     succeeded: "bg-ok/15 text-ok",
     failed: "bg-bad/15 text-bad",
     needs_review: "bg-warn/15 text-warn",
+    canceled: "bg-white/10 text-fog",
   }[s] || "bg-white/10 text-mist";
 }
 
@@ -497,7 +510,7 @@ function taskSummaryLabel(t) {
     if (t.partial) return `${count}/${requested} 张图片`;
     return `${count || requested || 1} 张图片`;
   }
-  return t.stage === "final" ? "完整视频" : "视频预览";
+  return "视频";
 }
 
 function mediaAspectStyle(a) {

@@ -1,0 +1,131 @@
+"use client";
+
+import { useState } from "react";
+
+export function createWorkspaceState() {
+  return {
+    prompt: "",
+    negative: "",
+    imageEditProductMode: false,
+    editSubjectMode: "general",
+    ratio: "1:1",
+    imageQuality: "1k",
+    n: 4,
+    seed: "",
+    vDuration: 5,
+    vResolution: "720p",
+    editMaskMode: "protect_subject",
+    videoProductLockMode: "free",
+    videoAnalysisPreset: "standard",
+    url: "",
+    parsing: false,
+    uploading: false,
+    reversing: false,
+    assets: [],
+    selected: null,
+    productAsset: null,
+    productProfile: null,
+    productProfileSource: "",
+    productProfiling: false,
+    variationSource: null,
+    structured: {},
+    structuredSource: "",
+    promptSourceSignature: "",
+    negativeTouched: false,
+    promptDirty: false,
+  };
+}
+
+export function createModeWorkspaces(modes) {
+  return Object.fromEntries(modes.map(({ key }) => [key, createWorkspaceState()]));
+}
+
+export default function useStudioWorkspaceState({ creationMode, modes }) {
+  const [workspaces, setWorkspaces] = useState(() => createModeWorkspaces(modes));
+  const workspace = workspaces[creationMode] || createWorkspaceState();
+
+  function updateWorkspaceField(field, valueOrUpdater, mode = creationMode) {
+    setWorkspaces((prev) => {
+      const current = prev[mode] || createWorkspaceState();
+      const nextValue = typeof valueOrUpdater === "function"
+        ? valueOrUpdater(current[field])
+        : valueOrUpdater;
+      return {
+        ...prev,
+        [mode]: {
+          ...current,
+          [field]: nextValue,
+        },
+      };
+    });
+  }
+
+  function setWorkspacePatch(patchOrUpdater, mode = creationMode) {
+    setWorkspaces((prev) => {
+      const current = prev[mode] || createWorkspaceState();
+      const patch = typeof patchOrUpdater === "function" ? patchOrUpdater(current) : patchOrUpdater;
+      return {
+        ...prev,
+        [mode]: {
+          ...current,
+          ...patch,
+        },
+      };
+    });
+  }
+
+  const setPrompt = (value) => updateWorkspaceField("prompt", value);
+  const setNegative = (value) => updateWorkspaceField("negative", value);
+  const setEditSubjectMode = (value) => {
+    updateWorkspaceField("editSubjectMode", value);
+    if (creationMode === "image_edit") updateWorkspaceField("imageEditProductMode", value !== "general");
+  };
+  const setRatio = (value, mode) => updateWorkspaceField("ratio", value, mode);
+  const setImageQuality = (value) => updateWorkspaceField("imageQuality", value);
+  const setN = (value) => updateWorkspaceField("n", value);
+  const setSeed = (value) => updateWorkspaceField("seed", value);
+  const setVDuration = (value) => updateWorkspaceField("vDuration", value);
+  const setVResolution = (value) => updateWorkspaceField("vResolution", value);
+  const setEditMaskMode = (value) => updateWorkspaceField("editMaskMode", value);
+  const setVideoProductLockMode = (value) => updateWorkspaceField("videoProductLockMode", value);
+  const setVideoAnalysisPreset = (value) => updateWorkspaceField("videoAnalysisPreset", value);
+  const setUrl = (value) => updateWorkspaceField("url", value);
+  const setStructured = (value) => updateWorkspaceField("structured", value);
+  const setNegativeTouched = (value) => updateWorkspaceField("negativeTouched", value);
+  const setPromptDirty = (value) => {
+    setWorkspaces((prev) => {
+      const current = prev[creationMode] || createWorkspaceState();
+      const nextValue = typeof value === "function" ? value(current.promptDirty) : value;
+      return {
+        ...prev,
+        [creationMode]: {
+          ...current,
+          promptDirty: nextValue,
+          ...(nextValue ? { promptSourceSignature: "" } : {}),
+        },
+      };
+    });
+  };
+
+  return {
+    setWorkspaces,
+    workspace,
+    setWorkspacePatch,
+    setPrompt,
+    setNegative,
+    setEditSubjectMode,
+    setRatio,
+    setImageQuality,
+    setN,
+    setSeed,
+    setVDuration,
+    setVResolution,
+    setEditMaskMode,
+    setVideoProductLockMode,
+    setVideoAnalysisPreset,
+    setUrl,
+    setStructured,
+    setNegativeTouched,
+    setPromptDirty,
+  };
+}

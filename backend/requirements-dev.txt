@@ -5,3 +5,5 @@
 ruff==0.6.9
 pytest==9.1.0
 fakeredis==2.23.2
+pip-audit==2.9.0
+msgpack==1.2.1

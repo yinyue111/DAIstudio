@@ -1,11 +1,12 @@
 """WebSocket progress push: WS /ws/tasks/{id}?ticket=one-time-ticket.
 
-The worker writes progress into Redis; this endpoint relays it until the task
-reaches a terminal state. Falls back gracefully to DB status.
+The worker writes progress into Redis streams; this endpoint relays events
+until the task reaches a terminal state. Falls back gracefully to DB status.
 """
 from __future__ import annotations
 
 import asyncio
+import logging
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
@@ -14,13 +15,17 @@ from ..deps import resolve_token_user
 from ..models import GenTask
 from ..redis_client import redis_client
 from ..services.generation import is_terminal_status
-from ..services.progress import get_progress
+from ..services.progress import get_progress, wait_progress_event
+from ..services.user_events import read_user_events
 
 router = APIRouter(tags=["ws"])
+log = logging.getLogger("ws")
 
 _AUTH_RECHECK_EVERY = 15  # re-validate token revocation/disable roughly every 15s
 _DB_STATUS_RECHECK_EVERY = 2  # keep UI close to the committed task state
+_PROGRESS_BLOCK_MS = 5000
 _TICKET_PREFIX = "ws:task-ticket:"
+_EVENT_TICKET_PREFIX = "ws:event-ticket:"
 
 
 def _consume_ws_ticket(ticket: str) -> tuple[int, int, int] | None:
@@ -42,6 +47,57 @@ def _consume_ws_ticket(ticket: str) -> tuple[int, int, int] | None:
         return None
 
 
+def _consume_event_ticket(ticket: str) -> tuple[int, int] | None:
+    if not ticket:
+        return None
+    key = f"{_EVENT_TICKET_PREFIX}{ticket}"
+    try:
+        raw = redis_client.getdel(key)
+    except AttributeError:
+        raw = redis_client.get(key)
+        if raw is not None:
+            redis_client.delete(key)
+    if not raw:
+        return None
+    try:
+        user_id, tv = (int(p) for p in str(raw).split(":", 1))
+        return user_id, tv
+    except (TypeError, ValueError):
+        return None
+
+
+def _validate_task_ws_access(user_id: int, token_version: int, task_id: int) -> bool:
+    db = SessionLocal()
+    try:
+        if resolve_token_user(db, user_id, token_version) is None:
+            return False
+        task = db.get(GenTask, task_id)
+        return bool(task and task.user_id == user_id)
+    finally:
+        db.close()
+
+
+def _validate_event_ws_access(user_id: int, token_version: int) -> bool:
+    db = SessionLocal()
+    try:
+        return resolve_token_user(db, user_id, token_version) is not None
+    finally:
+        db.close()
+
+
+def _task_db_status(user_id: int, token_version: int, task_id: int) -> tuple[bool, str, str | None, str | None]:
+    db = SessionLocal()
+    try:
+        if resolve_token_user(db, user_id, token_version) is None:
+            return False, "failed", None, None
+        task = db.get(GenTask, task_id)
+        if not task or task.user_id != user_id:
+            return True, "failed", None, None
+        return True, task.status, task.error, task.phase
+    finally:
+        db.close()
+
+
 @router.websocket("/ws/tasks/{task_id}")
 async def task_progress(websocket: WebSocket, task_id: int, ticket: str = ""):
     ticket_payload = _consume_ws_ticket(ticket)
@@ -53,21 +109,15 @@ async def task_progress(websocket: WebSocket, task_id: int, ticket: str = ""):
         await websocket.close(code=4404)
         return
 
-    db = SessionLocal()
-    try:
-        # enforce token revocation / disabled-account at connect, like the REST guard
-        if resolve_token_user(db, user_id, tv) is None:
-            await websocket.close(code=4401)
-            return
-        task = db.get(GenTask, task_id)
-        if not task or task.user_id != user_id:
-            await websocket.close(code=4404)
-            return
-    finally:
-        db.close()
+    # Enforce token revocation / disabled-account at connect, like the REST
+    # guard, without blocking the event loop on synchronous SQLAlchemy I/O.
+    if not await asyncio.to_thread(_validate_task_ws_access, user_id, tv, task_id):
+        await websocket.close(code=4404)
+        return
 
     await websocket.accept()
     ticks = 0
+    last_progress_id = "0"
     try:
         while True:
             ticks += 1
@@ -84,19 +134,14 @@ async def task_progress(websocket: WebSocket, task_id: int, ticket: str = ""):
             recheck_auth = ticks % _AUTH_RECHECK_EVERY == 0
             recheck_task = ticks % _DB_STATUS_RECHECK_EVERY == 0
             if status is None or is_terminal_status(status) or recheck_auth or recheck_task:
-                db = SessionLocal()
-                try:
-                    if resolve_token_user(db, user_id, tv) is None:
-                        await websocket.close(code=4401)
-                        return
-                    task = db.get(GenTask, task_id)
-                    db_status = task.status if task else "failed"
-                    if is_terminal_status(db_status) or status is None or is_terminal_status(status):
-                        status = db_status
-                        error = task.error if task else None
-                    phase = task.phase if task else None
-                finally:
-                    db.close()
+                ok, db_status, db_error, db_phase = await asyncio.to_thread(_task_db_status, user_id, tv, task_id)
+                if not ok:
+                    await websocket.close(code=4401)
+                    return
+                if is_terminal_status(db_status) or status is None or is_terminal_status(status):
+                    status = db_status
+                    error = db_error
+                phase = db_phase
             if is_terminal_status(status):
                 percent = 100
             await websocket.send_json(
@@ -105,11 +150,60 @@ async def task_progress(websocket: WebSocket, task_id: int, ticket: str = ""):
             )
             if is_terminal_status(status):
                 break
-            await asyncio.sleep(1.0)
+            last_progress_id, event = await asyncio.to_thread(
+                wait_progress_event,
+                task_id,
+                last_progress_id,
+                block_ms=_PROGRESS_BLOCK_MS,
+            )
+            if event is not None:
+                # Ensure the next loop sends the freshest hash/DB-backed state.
+                continue
     except WebSocketDisconnect:
         return
     finally:
         try:
             await websocket.close()
-        except Exception:
-            pass
+        except Exception:  # noqa: BLE001
+            log.debug("task websocket close failed", exc_info=True)
+
+
+@router.websocket("/ws/events")
+async def user_events(websocket: WebSocket, ticket: str = "", last_id: str = "$"):
+    ticket_payload = _consume_event_ticket(ticket)
+    if not ticket_payload:
+        await websocket.close(code=4401)
+        return
+    user_id, tv = ticket_payload
+    if not await asyncio.to_thread(_validate_event_ws_access, user_id, tv):
+        await websocket.close(code=4401)
+        return
+
+    await websocket.accept()
+    cursor = last_id or "$"
+    ticks = 0
+    try:
+        while True:
+            ticks += 1
+            cursor, events = await asyncio.to_thread(
+                read_user_events,
+                user_id,
+                cursor,
+                block_ms=25000,
+                count=20,
+            )
+            if events:
+                await websocket.send_json({"events": events, "last_id": cursor})
+            else:
+                await websocket.send_json({"events": [], "last_id": cursor, "heartbeat": True})
+            if ticks % _AUTH_RECHECK_EVERY == 0:
+                if not await asyncio.to_thread(_validate_event_ws_access, user_id, tv):
+                    await websocket.close(code=4401)
+                    return
+    except WebSocketDisconnect:
+        return
+    finally:
+        try:
+            await websocket.close()
+        except Exception:  # noqa: BLE001
+            log.debug("event websocket close failed", exc_info=True)

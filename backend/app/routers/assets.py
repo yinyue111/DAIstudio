@@ -1,9 +1,11 @@
 """Unlock (pay to remove watermark / get HD) + download."""
 from __future__ import annotations
 
+import json
 import os
 import secrets
 import tempfile
+import zipfile
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -15,12 +17,25 @@ from starlette.background import BackgroundTask
 from ..config import settings
 from ..db import get_db
 from ..deps import get_client_ip, get_current_user
-from ..models import AssetReport, GenAsset, User
+from ..models import AssetReport, GenAsset, GenTask, User
 from ..redis_client import redis_client
-from ..schemas import AssetOut, AssetReportIn, AssetReportOut
+from ..schemas import (
+    AssetBatchDeleteOut,
+    AssetBatchIn,
+    AssetBatchItemOut,
+    AssetOut,
+    AssetReportIn,
+    AssetReportOut,
+)
 from ..services import audit, credits, gateway, storage
-from ..services.asset_output import to_asset_out, unlock_cost_for_asset
-from ..services.media_sidecars import keys_for_asset_urls, unlink_keys
+from ..services.asset_output import (
+    is_generated_asset_task,
+    is_settled_generated_asset_task,
+    to_asset_out,
+    unlock_cost_for_asset,
+)
+from ..services.media_sidecars import collect_unreferenced_asset_keys, unlink_keys
+from ..services.retention import detach_asset_reports
 
 router = APIRouter(prefix="/api/assets", tags=["assets"])
 _PLAYBACK_TICKET_TTL_SECONDS = 600
@@ -58,7 +73,10 @@ def _unlocked_owner_asset(db: Session, asset_id: int, user: User) -> GenAsset:
         raise HTTPException(404, "素材不存在")
     if asset.moderation_status != "active":
         raise HTTPException(410, "素材已下架")
-    if not asset.unlocked:
+    task = db.get(GenTask, asset.task_id) if asset.task_id else None
+    if is_generated_asset_task(task) and not is_settled_generated_asset_task(task):
+        raise HTTPException(409, "生成任务尚未完成结算,暂不能下载高清")
+    if not asset.unlocked and not is_generated_asset_task(task):
         raise HTTPException(402, "请先解锁后再下载高清")
     return asset
 
@@ -74,6 +92,133 @@ def _local_download_path(asset: GenAsset) -> Path:
     if not path.exists() or not path.is_file():
         raise HTTPException(404, "文件丢失")
     return path
+
+
+@router.post("/batch/delete", response_model=AssetBatchDeleteOut)
+def batch_delete_assets(
+    body: AssetBatchIn,
+    request: Request,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    deleted: list[int] = []
+    failed: list[AssetBatchItemOut] = []
+    unlink_after_commit: list[str] = []
+    for asset_id in body.asset_ids:
+        asset = db.get(GenAsset, asset_id)
+        if not asset or asset.user_id != user.id:
+            failed.append(AssetBatchItemOut(id=asset_id, ok=False, error="素材不存在"))
+            continue
+        try:
+            unlink_after_commit.extend(collect_unreferenced_asset_keys(db, asset))
+            detach_asset_reports(db, asset.id)
+            db.delete(asset)
+            deleted.append(asset_id)
+        except Exception as e:  # noqa: BLE001
+            failed.append(AssetBatchItemOut(id=asset_id, ok=False, error=str(e)[:120] or "删除失败"))
+    if deleted:
+        db.commit()
+        unlink_keys(unlink_after_commit)
+        audit.log(
+            db,
+            user_id=user.id,
+            action="batch_delete_assets",
+            biz_type="asset",
+            biz_id=None,
+            ip=get_client_ip(request),
+            detail={"asset_ids": deleted, "failed": [f.model_dump() for f in failed]},
+        )
+    else:
+        db.rollback()
+    return AssetBatchDeleteOut(deleted=deleted, failed=failed)
+
+
+@router.post("/batch/download")
+def batch_download_assets(
+    body: AssetBatchIn,
+    request: Request,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    tmp = tempfile.NamedTemporaryFile(prefix="assets-", suffix=".zip", delete=False)
+    tmp_path = Path(tmp.name)
+    tmp.close()
+    added = 0
+    skipped: list[dict] = []
+    try:
+        with zipfile.ZipFile(tmp_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            for asset_id in body.asset_ids:
+                external_tmp: Path | None = None
+                try:
+                    asset = _unlocked_owner_asset(db, asset_id, user)
+                    url = asset.hd_url or asset.preview_url
+                    key = storage.key_from_url(url)
+                    if key:
+                        path = _local_download_path(asset)
+                    elif url:
+                        suffix = ".mp4" if asset.type == "video" else ".bin"
+                        with tempfile.NamedTemporaryFile(
+                            prefix=f"asset-{asset.id}-",
+                            suffix=suffix,
+                            delete=False,
+                        ) as f:
+                            external_tmp = Path(f.name)
+                        max_bytes, allowed_content_types = _external_download_policy(asset)
+                        gateway.download_to_path(
+                            url,
+                            external_tmp,
+                            max_bytes=max_bytes,
+                            allowed_content_types=allowed_content_types,
+                            timeout_seconds=(
+                                int(settings.video_download_timeout_seconds)
+                                if asset.type == "video"
+                                else int(settings.image_download_timeout_seconds)
+                            ),
+                        )
+                        path = external_tmp
+                    else:
+                        raise HTTPException(404, "资源不存在")
+                    media_type, ext = _download_media_info(asset, path)
+                    name = f"asset-{asset.id}.{ext}"
+                    if name in zf.namelist():
+                        name = f"asset-{asset.id}-{added + 1}.{ext}"
+                    zf.write(path, arcname=name)
+                    added += 1
+                except HTTPException as e:
+                    skipped.append({"id": asset_id, "error": str(e.detail)})
+                except Exception as e:  # noqa: BLE001
+                    skipped.append({"id": asset_id, "error": str(e)[:120] or "打包失败"})
+                finally:
+                    if external_tmp is not None:
+                        external_tmp.unlink(missing_ok=True)
+            if skipped:
+                zf.writestr(
+                    "skipped.json",
+                    json.dumps(skipped, ensure_ascii=False, indent=2),
+                )
+        if added <= 0:
+            tmp_path.unlink(missing_ok=True)
+            raise HTTPException(400, "没有可下载的素材")
+        audit.log(
+            db,
+            user_id=user.id,
+            action="batch_download_assets",
+            biz_type="asset",
+            biz_id=None,
+            ip=get_client_ip(request),
+            detail={"asset_ids": body.asset_ids, "added": added, "skipped": skipped},
+        )
+        filename = f"assets-{user.id}-{secrets.token_hex(4)}.zip"
+        return FileResponse(
+            str(tmp_path),
+            media_type="application/zip",
+            filename=filename,
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+            background=BackgroundTask(lambda p: os.unlink(p) if os.path.exists(p) else None, str(tmp_path)),
+        )
+    except Exception:
+        tmp_path.unlink(missing_ok=True)
+        raise
 
 
 @router.post("/{asset_id}/unlock", response_model=AssetOut)
@@ -321,9 +466,11 @@ def delete_asset(asset_id: int, request: Request, db: Session = Depends(get_db),
     asset = db.get(GenAsset, asset_id)
     if not asset or asset.user_id != user.id:
         raise HTTPException(404, "素材不存在")
-    unlink_keys(keys_for_asset_urls(asset.preview_url, asset.hd_url))
+    unlink_after_commit = collect_unreferenced_asset_keys(db, asset)
+    detach_asset_reports(db, asset.id)
     db.delete(asset)
     db.commit()
+    unlink_keys(unlink_after_commit)
     audit.log(db, user_id=user.id, action="delete_asset", biz_type="asset",
               biz_id=asset_id, ip=get_client_ip(request))
     return {"ok": True}

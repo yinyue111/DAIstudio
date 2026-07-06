@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import logging
-from datetime import timezone
+from datetime import datetime, timezone
 
 from ..config import settings
 from ..models import GenTask
@@ -25,7 +25,8 @@ POLL_MAX_CONSEC_ERRORS = 3
 VIDEO_DOWNLOAD_MAX_ATTEMPTS = max(1, int(settings.video_download_max_attempts or 1))
 VIDEO_DOWNLOAD_LIVENESS_TTL = max(
     POLL_LIVENESS_TTL,
-    int(settings.video_download_timeout_seconds) * VIDEO_DOWNLOAD_MAX_ATTEMPTS + 60,
+    180,
+    min(int(settings.video_download_timeout_seconds), 300),
 )
 
 
@@ -41,7 +42,7 @@ def unlink_keys(keys) -> None:
         try:
             storage.local_path(k).unlink(missing_ok=True)
         except Exception:  # noqa: BLE001
-            pass
+            log.warning("failed to unlink stale media key %s", k, exc_info=True)
 
 
 def download_lock_key(task_id: int) -> str:
@@ -52,28 +53,28 @@ def mark_poll_alive(task_id: int) -> None:
     try:
         redis_client.set(f"video:poll:alive:{task_id}", "1", ex=POLL_LIVENESS_TTL)
     except Exception:  # noqa: BLE001
-        pass
+        log.warning("failed to mark video poll alive task=%s", task_id, exc_info=True)
 
 
 def clear_poll_alive(task_id: int) -> None:
     try:
         redis_client.delete(f"video:poll:alive:{task_id}")
     except Exception:  # noqa: BLE001
-        pass
+        log.warning("failed to clear video poll alive task=%s", task_id, exc_info=True)
 
 
 def mark_video_download_alive(task_id: int) -> None:
     try:
         redis_client.set(f"video:download:alive:{task_id}", "1", ex=VIDEO_DOWNLOAD_LIVENESS_TTL)
     except Exception:  # noqa: BLE001
-        pass
+        log.warning("failed to mark video download alive task=%s", task_id, exc_info=True)
 
 
 def clear_video_download_alive(task_id: int) -> None:
     try:
         redis_client.delete(f"video:download:alive:{task_id}")
     except Exception:  # noqa: BLE001
-        pass
+        log.warning("failed to clear video download alive task=%s", task_id, exc_info=True)
 
 
 def bump_poll_errors(task_id: int) -> int:
@@ -81,6 +82,7 @@ def bump_poll_errors(task_id: int) -> int:
         n = incr_window(f"video:poll:err:{task_id}", POLL_LIVENESS_TTL)
         return int(n)
     except Exception:  # noqa: BLE001
+        log.warning("failed to bump video poll errors task=%s", task_id, exc_info=True)
         return 0
 
 
@@ -88,13 +90,14 @@ def reset_poll_errors(task_id: int) -> None:
     try:
         redis_client.delete(f"video:poll:err:{task_id}")
     except Exception:  # noqa: BLE001
-        pass
+        log.warning("failed to reset video poll errors task=%s", task_id, exc_info=True)
 
 
 def poll_chain_alive(task_id: int) -> bool:
     try:
         return bool(redis_client.get(f"video:poll:alive:{task_id}"))
     except Exception:  # noqa: BLE001
+        log.warning("failed to read video poll alive task=%s", task_id, exc_info=True)
         return False
 
 
@@ -102,14 +105,28 @@ def video_download_alive(task_id: int) -> bool:
     try:
         return bool(redis_client.get(f"video:download:alive:{task_id}"))
     except Exception:  # noqa: BLE001
+        log.warning("failed to read video download alive task=%s", task_id, exc_info=True)
+        return False
+
+
+def local_worker_shutting_down() -> bool:
+    try:
+        from ..celery_app import is_worker_shutting_down
+
+        return is_worker_shutting_down(check_redis=False)
+    except Exception:  # noqa: BLE001
+        log.warning("failed to read local worker shutdown flag", exc_info=True)
         return False
 
 
 def enqueue_poll(task_id: int) -> None:
     """Schedule one poll tick; each tick re-enqueues itself until terminal."""
-    from ..tasks import poll_video_task
+    from ..tasks import enqueue_with_request_context, poll_video_task
+    if local_worker_shutting_down():
+        clear_poll_alive(task_id)
+        raise RuntimeError("worker is shutting down; video poll will be resumed by recovery")
     try:
-        poll_video_task.apply_async((task_id,), countdown=VIDEO_POLL_INTERVAL)
+        enqueue_with_request_context(poll_video_task, task_id, countdown=VIDEO_POLL_INTERVAL)
     except Exception:
         clear_poll_alive(task_id)
         log.exception("failed to enqueue video poll for task %s", task_id)
@@ -123,9 +140,12 @@ def has_video_download_result(task: GenTask) -> bool:
 
 def enqueue_video_download(task_id: int, *, countdown: int = 0) -> None:
     """Schedule video result persistence on the dedicated download queue."""
-    from ..tasks import download_video_task
+    from ..tasks import download_video_task, enqueue_with_request_context
+    if local_worker_shutting_down():
+        clear_video_download_alive(task_id)
+        raise RuntimeError("worker is shutting down; video download will be resumed by recovery")
     try:
-        download_video_task.apply_async((task_id,), countdown=countdown)
+        enqueue_with_request_context(download_video_task, task_id, countdown=countdown)
     except Exception:
         clear_video_download_alive(task_id)
         log.exception("failed to enqueue video download for task %s", task_id)
@@ -134,6 +154,7 @@ def enqueue_video_download(task_id: int, *, countdown: int = 0) -> None:
 
 def persist_video_download_result(db, task: GenTask, result: dict) -> None:
     params = dict(task.params or {})
+    params["_video_download_started_at"] = datetime.now(timezone.utc).isoformat()
     if result.get("url"):
         params["_video_result_url"] = result["url"]
     provider_usage = usage_from_response(result)
@@ -147,6 +168,7 @@ def persist_video_download_result(db, task: GenTask, result: dict) -> None:
     task.status = "running"
     task.phase = "downloading"
     db.commit()
+    clear_poll_alive(task.id)
     set_progress(task.id, 90, "running")
 
 

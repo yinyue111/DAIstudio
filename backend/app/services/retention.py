@@ -12,21 +12,26 @@ from sqlalchemy import delete, or_, select, update
 from sqlalchemy.orm import Session
 
 from ..config import settings
-from ..models import AuditLog, GenAsset, GenTask, ParseRecord, UploadedAsset
+from ..models import AssetReport, AuditLog, GenAsset, GenTask, ParseRecord, UploadedAsset
 from ..redis_client import redis_client
 from . import credits, generation, storage
 from .config_store import get_setting
-from .media_sidecars import keys_for_asset_urls, unlink_keys
+from .generation_state import TERMINAL_STATUSES
+from .media_sidecars import collect_unreferenced_asset_keys, unlink_keys
 
 log = logging.getLogger("retention")
 
 
 def _video_poll_alive(task_id: int) -> bool:
     try:
-        return bool(
-            redis_client.get(f"video:poll:alive:{task_id}")
-            or redis_client.get(f"video:download:alive:{task_id}")
-        )
+        return bool(redis_client.get(f"video:poll:alive:{task_id}"))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _video_download_alive(task_id: int) -> bool:
+    try:
+        return bool(redis_client.get(f"video:download:alive:{task_id}"))
     except Exception:  # noqa: BLE001
         return False
 
@@ -47,6 +52,14 @@ def _image_reap_window() -> timedelta:
     seconds = (
         int(settings.image_gateway_timeout_seconds or 0)
         + int(settings.image_download_timeout_seconds or 0)
+    )
+    return timedelta(seconds=seconds + 300)
+
+
+def _video_download_reap_window() -> timedelta:
+    seconds = (
+        int(settings.video_download_timeout_seconds or 0)
+        * max(1, int(settings.video_download_max_attempts or 1))
     )
     return timedelta(seconds=seconds + 300)
 
@@ -88,14 +101,6 @@ def is_expired(created_at: datetime | None, days: int) -> bool:
     return datetime.now(timezone.utc) >= exp
 
 
-def _delete_files(asset: GenAsset) -> None:
-    for key in keys_for_asset_urls(asset.preview_url, asset.hd_url):
-        try:
-            unlink_keys([key])
-        except Exception:  # noqa: BLE001
-            log.warning("failed to delete file for asset %s", asset.id)
-
-
 def purge_expired(db: Session, user_id: int | None = None, limit: int = 1000) -> int:
     """Delete expired assets (files + rows). Returns how many were removed."""
     days = get_retention_days(db)
@@ -105,11 +110,14 @@ def purge_expired(db: Session, user_id: int | None = None, limit: int = 1000) ->
         q = q.where(GenAsset.user_id == user_id)
     q = q.limit(limit)
     rows = list(db.execute(q).scalars())
+    unlink_after_commit: list[str] = []
     for a in rows:
-        _delete_files(a)
+        unlink_after_commit.extend(collect_unreferenced_asset_keys(db, a))
+        detach_asset_reports(db, a.id)
         db.delete(a)
     if rows:
         db.commit()
+        unlink_keys(unlink_after_commit)
         log.info("purged %s expired assets (user=%s)", len(rows), user_id)
     return len(rows)
 
@@ -120,6 +128,17 @@ def _purge_table_older_than(db: Session, model, cutoff: datetime, extra=None) ->
         stmt = stmt.where(extra)
     res = db.execute(stmt)
     db.commit()
+    return res.rowcount or 0
+
+
+def detach_asset_reports(db: Session, asset_id: int) -> int:
+    """Preserve report history when an asset row is deleted."""
+    res = db.execute(
+        update(AssetReport)
+        .where(AssetReport.asset_id == asset_id)
+        .values(asset_id=None)
+        .execution_options(synchronize_session=False)
+    )
     return res.rowcount or 0
 
 
@@ -202,6 +221,22 @@ def _upload_video_preview_key(upload_key: str) -> str | None:
     return "upload_video_preview/" + upload_key.split("/", 1)[1].rsplit(".", 1)[0] + ".jpg"
 
 
+def _upload_related_keys(upload_key: str) -> list[str]:
+    keys = [upload_key]
+    preview_key = _upload_preview_key(upload_key)
+    if preview_key:
+        keys.append(preview_key)
+    keys.extend(_upload_model_ref_keys(upload_key))
+    video_preview_key = _upload_video_preview_key(upload_key)
+    if video_preview_key:
+        keys.append(video_preview_key)
+    return keys
+
+
+def _upload_group_is_referenced(upload_key: str, referenced_urls: set[str]) -> bool:
+    return any(storage.upload_api_url(key) in referenced_urls for key in _upload_related_keys(upload_key))
+
+
 def _delete_uploaded_asset_row(db: Session, key: str) -> bool:
     row = db.get(UploadedAsset, key)
     if not row:
@@ -236,7 +271,7 @@ def purge_uploaded_assets(db: Session, cutoff: datetime, limit: int = 1000) -> i
     removed = 0
     referenced_urls = _referenced_upload_urls(db, cutoff)
     for row in rows:
-        if storage.upload_api_url(row.key) in referenced_urls:
+        if _upload_group_is_referenced(row.key, referenced_urls):
             continue
         if _delete_uploaded_asset_row(db, row.key):
             removed += 1
@@ -333,6 +368,9 @@ def reap_stuck_tasks(db: Session, max_minutes: int = 60) -> int:
     for row in rows:
         task_id = int(row["id"])
         error_message = "任务超时,已自动失败并退回额度"
+        hold_for_review = False
+        review_message = ""
+        review_params = None
         if row["phase"] == "reconciling":
             continue
         # Don't reap a video still inside its valid poll window or actively being
@@ -346,7 +384,7 @@ def reap_stuck_tasks(db: Session, max_minutes: int = 60) -> int:
                         update(GenTask)
                         .where(
                             GenTask.id == task_id,
-                            GenTask.status.not_in(("succeeded", "failed", generation.NEEDS_REVIEW)),
+                            GenTask.status.not_in(TERMINAL_STATUSES),
                         )
                         .values(
                             status=generation.NEEDS_REVIEW,
@@ -364,31 +402,79 @@ def reap_stuck_tasks(db: Session, max_minutes: int = 60) -> int:
                 error_message = "视频提交超时且未记录请求号,已自动失败并退回额度"
             else:
                 sub = _aware(row["external_submitted_at"])
-                if (
-                    (sub and (now - sub) < video_window)
-                    or _video_poll_alive(task_id)
-                    or (
-                        row["phase"] == "downloading"
-                        and bool(params.get("_video_result_url") or params.get("_video_result_mock"))
-                    )
-                ):
+                if _video_poll_alive(task_id):
                     continue
-                if row["external_task_id"]:
-                    error_message = (
-                        f"视频渲染超时,已自动失败并退回额度; "
+                if row["phase"] == "downloading" and bool(
+                    params.get("_video_result_url") or params.get("_video_result_mock")
+                ):
+                    if _video_download_alive(task_id):
+                        continue
+                    download_started_at = None
+                    raw_download_started_at = params.get("_video_download_started_at")
+                    if raw_download_started_at:
+                        try:
+                            download_started_at = datetime.fromisoformat(str(raw_download_started_at))
+                        except ValueError:
+                            download_started_at = None
+                    anchor = _aware(download_started_at) or _aware(row["created_at"])
+                    if anchor and now - anchor < _video_download_reap_window():
+                        continue
+                    hold_for_review = True
+                    review_message = (
+                        "视频结果下载超时,上游已返回结果,冻结积分暂不退回。"
                         f"external_task_id={row['external_task_id'] or 'unknown'}"
                     )
+                    review_params = {**params, "_video_download_state_unknown": True}
+                elif row["phase"] == "downloading":
+                    if row["external_task_id"]:
+                        hold_for_review = True
+                        review_message = (
+                            "视频结果下载状态未知,上游可能已生成结果,冻结积分暂不退回。"
+                            f"external_task_id={row['external_task_id'] or 'unknown'}"
+                        )
+                        review_params = {**params, "_video_download_state_unknown": True}
+                    else:
+                        error_message = "视频结果下载状态未知,已自动失败并退回额度"
+                elif sub and (now - sub) < video_window:
+                    continue
+                elif row["external_task_id"]:
+                    hold_for_review = True
+                    review_message = (
+                        "视频渲染超时且上游任务状态未知,冻结积分暂不退回。"
+                        f"external_task_id={row['external_task_id'] or 'unknown'}"
+                    )
+                    review_params = {**params, "_video_poll_state_unknown": True}
         elif row["category"] == "image":
             created_at = _aware(row["created_at"])
             if not created_at or now - created_at < _image_reap_window():
                 continue
+        if hold_for_review:
+            values = {
+                "status": generation.NEEDS_REVIEW,
+                "phase": "reconciling",
+                "error": review_message,
+                "finished_at": now,
+            }
+            if review_params is not None:
+                values["params"] = review_params
+            res = db.execute(
+                update(GenTask)
+                .where(
+                    GenTask.id == task_id,
+                    GenTask.status.not_in(TERMINAL_STATUSES),
+                )
+                .values(**values)
+            )
+            if res.rowcount or 0:
+                reaped += 1
+            continue
         # Atomic claim: skip if a worker finalized the task between our SELECT
         # and now, so the reaper can't double-refund alongside the worker.
         res = db.execute(
             update(GenTask)
             .where(
                 GenTask.id == task_id,
-                GenTask.status.not_in(("succeeded", "failed", generation.NEEDS_REVIEW)),
+                GenTask.status.not_in(TERMINAL_STATUSES),
             )
             .values(status="failed", error=error_message, finished_at=now)
         )
@@ -407,7 +493,7 @@ def reap_stuck_tasks(db: Session, max_minutes: int = 60) -> int:
                     update(GenTask)
                     .where(
                         GenTask.id == task_id,
-                        GenTask.status.not_in(("succeeded", "failed", generation.NEEDS_REVIEW)),
+                        GenTask.status.not_in(TERMINAL_STATUSES),
                     )
                     .values(
                         status=generation.NEEDS_REVIEW,

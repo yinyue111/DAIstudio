@@ -1,10 +1,76 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { api, assetDownloadObjectUrl } from "../lib/api";
+import { API_BASE, api, assetDownloadObjectUrl } from "../lib/api";
+
+const PLATFORM_MEDIA_PREFIXES = ["/media/", "/api/uploads/"];
+const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "::1"]);
+
+function isPlatformMediaPath(pathname) {
+  return PLATFORM_MEDIA_PREFIXES.some((prefix) => String(pathname || "").startsWith(prefix));
+}
+
+function isLoopbackHost(hostname) {
+  return LOOPBACK_HOSTS.has(String(hostname || "").toLowerCase());
+}
+
+function portOf(url) {
+  if (url.port) return url.port;
+  if (url.protocol === "https:") return "443";
+  if (url.protocol === "http:") return "80";
+  return "";
+}
+
+function resolvedApiUrl() {
+  if (!API_BASE || typeof window === "undefined") return null;
+  try {
+    return new URL(API_BASE, window.location.origin);
+  } catch (e) {
+    return null;
+  }
+}
+
+function normalizeLoopbackPlatformMediaUrl(url) {
+  if (!isPlatformMediaPath(url.pathname) || !isLoopbackHost(url.hostname)) return "";
+  const apiUrl = resolvedApiUrl();
+  if (!apiUrl || portOf(url) !== portOf(apiUrl)) return "";
+  return `${apiUrl.origin}${url.pathname}${url.search}${url.hash}`;
+}
+
+function mediaAllowlistOrigins() {
+  const origins = new Set();
+  if (typeof window !== "undefined") origins.add(window.location.origin);
+  if (API_BASE) {
+    try { origins.add(new URL(API_BASE, typeof window !== "undefined" ? window.location.origin : undefined).origin); } catch (e) {}
+  }
+  for (const source of String(process.env.NEXT_PUBLIC_MEDIA_SRC || "").split(/\s+/)) {
+    if (!source || source === "'self'" || source === "self") continue;
+    try { origins.add(new URL(source).origin); } catch (e) {}
+  }
+  return origins;
+}
+
+export function safeAssetMediaSrc(src) {
+  const value = String(src || "").trim();
+  if (!value) return "";
+  if (value.startsWith("//")) return "";
+  if (value.startsWith("blob:") || value.startsWith("/")) return value;
+  if (typeof window === "undefined") return "";
+  try {
+    const url = new URL(value, window.location.origin);
+    if (!["http:", "https:"].includes(url.protocol)) return "";
+    const origins = mediaAllowlistOrigins();
+    if (origins.has(url.origin)) return url.toString();
+    const normalized = normalizeLoopbackPlatformMediaUrl(url);
+    if (!normalized) return "";
+    return origins.has(new URL(normalized).origin) ? normalized : "";
+  } catch (e) {
+    return "";
+  }
+}
 
 export function assetPreviewSrc(asset) {
-  return asset?.preview_url || asset?.hd_url || "";
+  return safeAssetMediaSrc(asset?.preview_url || asset?.hd_url || "");
 }
 
 export function isAssetTakenDown(asset) {
@@ -18,7 +84,7 @@ export function assetUnavailableText(asset) {
 
 export function assetDisplaySrc(asset, { playbackUrl = "" } = {}) {
   if (asset?.type === "video" && asset.unlocked) {
-    return playbackUrl || asset.preview_url || asset.hd_url || "";
+    return safeAssetMediaSrc(playbackUrl || asset.preview_url || asset.hd_url || "");
   }
   return assetPreviewSrc(asset);
 }
@@ -35,11 +101,29 @@ export function shouldRenderVideo(asset, { playbackUrl = "" } = {}) {
   );
 }
 
+export function isPreviewVideoAsset(asset) {
+  return asset?.type === "video" && asset?.unlocked && !asset?.hd_url;
+}
+
+export function isDownscaledImageAsset(asset) {
+  return false;
+}
+
+export function canDownloadAsset(asset) {
+  return Boolean(asset?.unlocked && !isAssetTakenDown(asset));
+}
+
+export function assetPreviewLabel(asset) {
+  if (isAssetTakenDown(asset)) return "素材已下架";
+  if (!asset?.unlocked) return "预览 · 带水印";
+  return isPreviewVideoAsset(asset) ? "视频 · 可下载" : "预览 · 已解锁，可下载";
+}
+
 function VideoPoster({ src, className, fallbackClassName, onError }) {
   return (
     <div className={`relative ${fallbackClassName || className || ""}`}>
       <img
-        src={src}
+        src={safeAssetMediaSrc(src)}
         alt=""
         loading="lazy"
         className="h-full w-full object-cover"
@@ -88,7 +172,7 @@ export default function AssetMedia({
         })
         .catch((e) => {
           if (!cancelled) {
-            if (!asset.preview_url) setError(e.message || "高清预览加载失败");
+            if (!asset.preview_url) setError(e.message || "预览加载失败");
             if (onError) onError(e);
           }
         });
@@ -104,7 +188,7 @@ export default function AssetMedia({
       })
       .catch((e) => {
         if (!cancelled) {
-          setError(e.message || "视频预览加载失败");
+          setError(e.message || "视频加载失败");
           if (onError) onError(e);
         }
       });
@@ -113,7 +197,7 @@ export default function AssetMedia({
     };
   }, [asset?.id, asset?.type, asset?.unlocked, asset?.hd_url, asset?.moderation_status, interactive]);
 
-  const src = imagePreviewUrl || assetDisplaySrc(asset, { playbackUrl });
+  const src = safeAssetMediaSrc(imagePreviewUrl || assetDisplaySrc(asset, { playbackUrl }));
   const renderVideo = shouldRenderVideo(asset, { playbackUrl });
   if (error) {
     return (
@@ -140,7 +224,7 @@ export default function AssetMedia({
         preload={interactive ? "metadata" : "metadata"}
         className={className}
         onError={(e) => {
-          setError("视频预览加载失败，请重新打开或下载查看");
+          setError("视频加载失败，请重新打开或下载查看");
           if (onError) onError(e);
         }}
       />

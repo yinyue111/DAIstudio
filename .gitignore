@@ -54,6 +54,7 @@ node_modules/
 frontend/node_modules/
 frontend/.next/
 frontend/out/
+frontend/tsconfig.tsbuildinfo
 
 # os
 .DS_Store

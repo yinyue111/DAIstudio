@@ -2,19 +2,41 @@
 from datetime import datetime, timedelta, timezone
 
 import pytest
+from billiard.exceptions import SoftTimeLimitExceeded
 
 from app.db import SessionLocal
-from app.models import GatewayCall, GenAsset, GenTask, User
+from app.models import GatewayCall, GenAsset, GenTask, UploadedAsset, User
 from app.services import (
     credits,
     gateway,
     generation,
+    generation_video_download,
     generation_video_flow,
+    generation_video_submit,
     retention,
     storage,
     video_frames,
 )
 from app.services.config_store import set_setting
+
+
+@pytest.fixture(autouse=True)
+def cleanup_live_generation_tasks():
+    yield
+    db = SessionLocal()
+    try:
+        db.query(GenTask).filter(GenTask.status.in_(("queued", "running"))).update(
+            {
+                "status": "failed",
+                "phase": None,
+                "error": "test cleanup",
+                "finished_at": datetime.now(timezone.utc),
+            },
+            synchronize_session=False,
+        )
+        db.commit()
+    finally:
+        db.close()
 
 
 def _config_video(client, h, extra=None):
@@ -107,7 +129,9 @@ def test_video_resubmit_skipped_when_external_id_present(client, make_user, auth
 
 
 def test_video_rejects_non_video_content(client, make_user, auth, monkeypatch):
-    # gateway "succeeds" with a URL but the bytes aren't a video -> fail + refund
+    # Gateway "succeeds" with a URL but the bytes aren't a video. The upstream
+    # task may have consumed provider resources, so hold for review instead of
+    # refunding automatically.
     if not video_frames.FFPROBE:
         pytest.skip("ffprobe unavailable")
     make_user("13900000067", balance=1000, admin=True)
@@ -124,8 +148,11 @@ def test_video_rejects_non_video_content(client, make_user, auth, monkeypatch):
     }, headers=h)
     assert r.status_code == 200, r.text
     t = client.get(f"/api/tasks/{r.json()['id']}", headers=h).json()
-    assert t["status"] == "failed"
-    assert client.get("/api/me", headers=h).json()["balance_credits"] == 1000  # refunded
+    assert t["status"] == "needs_review"
+    assert "上游生成" in t["error"]
+    me = client.get("/api/me", headers=h).json()
+    assert me["balance_credits"] + me["frozen_credits"] == 1000
+    assert me["frozen_credits"] > 0
 
 
 def test_video_submit_unknown_state_holds_for_review_without_refund(
@@ -365,6 +392,68 @@ def test_admin_settle_needs_review_video_with_result_url(
         db.close()
 
 
+def test_admin_settle_needs_review_video_from_local_result(
+    client,
+    make_user,
+    auth,
+    tiny_mp4,
+):
+    uid = make_user("13900000979", balance=1000, admin=True)
+    h = auth("13900000979")
+    _config_video(client, h)
+    db = SessionLocal()
+    try:
+        video_key = storage.save_bytes(tiny_mp4, "video_preview", "mp4")
+        t = GenTask(
+            user_id=uid,
+            category="video",
+            stage="preview",
+            status="needs_review",
+            phase="reconciling",
+            cost_frozen=5,
+            cost_settled=0,
+            params={
+                "duration": 2,
+                "_video_request_id": "video-review-local",
+                "_video_result_keys": [video_key],
+            },
+        )
+        db.add(t)
+        db.flush()
+        credits.freeze(db, uid, 5, biz_ref=t.id, commit=False)
+        db.commit()
+        tid = t.id
+    finally:
+        db.close()
+
+    listed = client.get("/api/admin/tasks/review", headers=h)
+    assert listed.status_code == 200, listed.text
+    review_task = next(task for task in listed.json() if task["id"] == tid)
+    assert review_task["has_local_results"] is True
+
+    r = client.post(
+        f"/api/admin/tasks/{tid}/settle_review",
+        json={"note": "use local persisted video"},
+        headers=h,
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["status"] == "succeeded"
+    assert body["cost_settled"] == 5
+    assert len(body["assets"]) == 1
+    assert body["assets"][0]["type"] == "video"
+    assert body["assets"][0]["preview_url"].endswith(f"/media/{video_key}")
+    assert client.get("/api/me", headers=h).json()["balance_credits"] == 995
+
+    db = SessionLocal()
+    try:
+        task = db.get(GenTask, tid)
+        assert task.status == "succeeded"
+        assert db.query(GenAsset).filter(GenAsset.task_id == tid).count() == 1
+    finally:
+        db.close()
+
+
 def test_admin_settle_download_failure_keeps_task_in_review(
     client,
     make_user,
@@ -510,6 +599,66 @@ def test_admin_settle_needs_review_image_from_result_url(client, make_user, auth
     assert me["frozen_credits"] == 0
 
 
+def test_admin_settle_needs_review_image_counts_existing_assets(client, make_user, auth):
+    uid = make_user("13900000987", balance=1000, admin=True)
+    h = auth("13900000987")
+    db = SessionLocal()
+    try:
+        t = GenTask(
+            user_id=uid,
+            category="image",
+            stage="preview",
+            status="needs_review",
+            phase="reconciling",
+            cost_frozen=30,
+            cost_settled=0,
+            prompt={"final_text": "manual image batch"},
+            params={"n": 2, "size": "256x256", "_model_snapshot": {"cost_credits": 15, "extra": {}}},
+        )
+        db.add(t)
+        db.flush()
+        first_key = storage.save_bytes(b"\x89PNG\r\n\x1a\nfirst", "hd", "png")
+        second_key = storage.save_bytes(b"\x89PNG\r\n\x1a\nsecond", "hd", "png")
+        db.add_all([
+            GenAsset(
+                task_id=t.id,
+                user_id=uid,
+                type="image",
+                preview_url=storage.public_url(first_key),
+                hd_url=storage.public_url(first_key),
+                unlocked=False,
+            ),
+            GenAsset(
+                task_id=t.id,
+                user_id=uid,
+                type="image",
+                preview_url=storage.public_url(second_key),
+                hd_url=storage.public_url(second_key),
+                unlocked=False,
+            ),
+        ])
+        credits.freeze(db, uid, 30, biz_ref=t.id, commit=False)
+        db.commit()
+        tid = t.id
+    finally:
+        db.close()
+
+    r = client.post(
+        f"/api/admin/tasks/{tid}/settle_review",
+        json={"note": "provider finished"},
+        headers=h,
+    )
+
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["status"] == "succeeded"
+    assert body["cost_settled"] == 30
+    assert len(body["assets"]) == 2
+    me = client.get("/api/me", headers=h).json()
+    assert me["balance_credits"] == 970
+    assert me["frozen_credits"] == 0
+
+
 def test_admin_can_list_needs_review_tasks(client, make_user, auth):
     uid = make_user("13900000976", balance=1000, admin=True)
     h = auth("13900000976")
@@ -595,6 +744,74 @@ def test_preview_task_includes_final_summary_outside_current_page(client, make_u
     assert task["final_asset_count"] == 1
 
 
+def test_final_generation_drops_preview_video_runtime_params(client, make_user, auth, monkeypatch):
+    uid = make_user("13900000978", balance=1000, admin=True)
+    h = auth("13900000978")
+    _config_video(client, h)
+    monkeypatch.setattr("app.services.generation_submit._enqueue_generation_task", lambda *_a, **_k: None)
+    db = SessionLocal()
+    try:
+        preview = GenTask(
+            user_id=uid,
+            category="video",
+            stage="preview",
+            status="succeeded",
+            cost_frozen=5,
+            cost_settled=5,
+            prompt={"final_text": "product spin"},
+            params={
+                "duration": 5,
+                "resolution": "720p",
+                "target_resolution": "1080p",
+                "_video_request_id": "preview-request",
+                "request_id": "preview-request",
+                "_video_result_url": "https://cdn.example.com/preview.mp4",
+                "_video_result_usage": {"total_tokens": 1},
+                "_video_result_mock": True,
+                "_video_download_started_at": "2026-07-05T00:00:00+00:00",
+                "_video_download_attempts": 4,
+                "_video_result_keys": ["video_preview/old.mp4"],
+                "_video_poll_state_unknown": True,
+                "_video_download_state_unknown": True,
+                "_source_trace": {"mode": "reverse"},
+            },
+        )
+        db.add(preview)
+        db.flush()
+        db.add(
+            GenAsset(
+                task_id=preview.id,
+                user_id=uid,
+                type="video",
+                preview_url="http://localhost:8000/media/video_preview/preview.mp4",
+                unlocked=True,
+            )
+        )
+        db.commit()
+        preview_id = preview.id
+    finally:
+        db.close()
+
+    r = client.post(
+        "/api/generate",
+        json={"category": "video", "stage": "final", "parent_task_id": preview_id, "params": {}},
+        headers=h,
+    )
+    assert r.status_code == 200, r.text
+    db = SessionLocal()
+    try:
+        final = db.get(GenTask, r.json()["id"])
+        params = final.params or {}
+        assert params["duration"] == 5
+        assert params["resolution"] == "720p"
+        assert params["target_resolution"] == "1080p"
+        assert params["_source_trace"] == {"mode": "reverse"}
+        assert "request_id" not in params
+        assert not any(key.startswith("_video_") for key in params)
+    finally:
+        db.close()
+
+
 def test_video_download_failure_retries_without_repolling(client, make_user, auth, monkeypatch, tiny_mp4):
     uid = make_user("13900000068", balance=1000, admin=True)
     h = auth("13900000068")
@@ -651,6 +868,7 @@ def test_video_download_failure_retries_without_repolling(client, make_user, aut
     assert all(k["max_bytes"] == generation.settings.video_download_max_bytes for k in download_kwargs)
     assert all(k["timeout_seconds"] == generation.settings.video_download_timeout_seconds for k in download_kwargs)
     assert all(k["allowed_content_types"][0] == "video/" for k in download_kwargs)
+    assert all(callable(k["progress_callback"]) for k in download_kwargs)
 
 
 def test_poll_video_success_only_enqueues_download(client, make_user, auth, monkeypatch):
@@ -678,6 +896,59 @@ def test_poll_video_success_only_enqueues_download(client, make_user, auth, monk
         assert task.status == "running"
         assert task.phase == "downloading"
         assert task.params["_video_result_url"] == "https://cdn.example.com/queued.mp4"
+    finally:
+        db.close()
+
+
+def test_split_poll_video_uses_default_download_enqueue(client, make_user, auth, monkeypatch):
+    uid = make_user("13900000971", balance=1000, admin=True)
+    h = auth("13900000971")
+    _config_video(client, h)
+    tid = _stranded_video(uid, "ext-done-default-enqueue")
+    queued_downloads = []
+    monkeypatch.setattr(generation_video_submit, "enqueue_video_download", lambda task_id, **_kw: queued_downloads.append(task_id))
+    monkeypatch.setattr(
+        "app.services.gateway.poll_video",
+        lambda *_a, **_k: {"status": "succeeded", "url": "https://cdn.example.com/default-queued.mp4"},
+    )
+
+    generation_video_submit.poll_video_once(tid)
+
+    assert queued_downloads == [tid]
+    db = SessionLocal()
+    try:
+        task = db.get(GenTask, tid)
+        assert task.status == "running"
+        assert task.phase == "downloading"
+        assert task.params["_video_result_url"] == "https://cdn.example.com/default-queued.mp4"
+    finally:
+        db.close()
+
+
+def test_split_poll_soft_timeout_holds_for_review(client, make_user, auth, monkeypatch):
+    uid = make_user("13900000969", balance=1000, admin=True)
+    h = auth("13900000969")
+    _config_video(client, h)
+    tid = _stranded_video(uid, "ext-soft-poll")
+    queued_polls = []
+    monkeypatch.setattr(generation_video_submit, "enqueue_poll", lambda task_id: queued_polls.append(task_id))
+
+    def timeout_poll(*_args, **_kwargs):
+        raise SoftTimeLimitExceeded()
+
+    generation_video_submit.poll_video_once(tid, poll_video_fn=timeout_poll)
+
+    assert queued_polls == []
+    db = SessionLocal()
+    try:
+        task = db.get(GenTask, tid)
+        user = db.get(User, uid)
+        assert task.status == "needs_review"
+        assert task.phase == "reconciling"
+        assert "状态查询执行超时" in (task.error or "")
+        assert task.params["_video_poll_state_unknown"] is True
+        assert user.frozen_credits == 5
+        assert user.balance_credits == 995
     finally:
         db.close()
 
@@ -771,7 +1042,7 @@ def test_video_download_uses_persisted_provider_usage_for_settlement(
     assert t["cost_settled"] == 5
 
 
-def test_video_download_final_failure_fails_and_refunds(client, make_user, monkeypatch):
+def test_video_download_final_failure_holds_for_review(client, make_user, monkeypatch):
     uid = make_user("13900000088", balance=1000)
     db = SessionLocal()
     try:
@@ -812,10 +1083,12 @@ def test_video_download_final_failure_fails_and_refunds(client, make_user, monke
     try:
         task = db.get(GenTask, tid)
         user = db.get(User, uid)
-        assert task.status == "failed"
-        assert "视频结果下载失败" in task.error
-        assert user.balance_credits == 1000
-        assert user.frozen_credits == 0
+        assert task.status == "needs_review"
+        assert task.phase == "reconciling"
+        assert "上游生成" in task.error
+        assert task.cost_settled == 0
+        assert user.balance_credits == 995
+        assert user.frozen_credits == 5
         row = db.query(GatewayCall).filter(
             GatewayCall.task_id == tid,
             GatewayCall.kind == "video_download",
@@ -823,6 +1096,35 @@ def test_video_download_final_failure_fails_and_refunds(client, make_user, monke
         ).order_by(GatewayCall.id.desc()).first()
         assert row is not None
         assert row.detail["permanent"] is True
+        assert row.detail["needs_review"] is True
+    finally:
+        db.close()
+
+
+def test_video_poll_transient_errors_hold_after_consecutive_limit(client, make_user, auth, monkeypatch):
+    uid = make_user("13900000972", balance=1000, admin=True)
+    h = auth("13900000972")
+    _config_video(client, h)
+    tid = _stranded_video(uid, "ext-transient-poll")
+    monkeypatch.setattr(
+        "app.services.gateway.poll_video",
+        lambda *_a, **_k: (_ for _ in ()).throw(gateway.GatewayError("temporary 503", transient=True)),
+    )
+    monkeypatch.setattr(generation, "_try_enqueue_poll", lambda _task_id: None)
+
+    for _ in range(generation._POLL_MAX_CONSEC_ERRORS):
+        generation.poll_video_once(tid)
+
+    db = SessionLocal()
+    try:
+        task = db.get(GenTask, tid)
+        user = db.get(User, uid)
+        assert task.status == "needs_review"
+        assert task.phase == "reconciling"
+        assert "状态未知" in (task.error or "")
+        assert task.params["_video_poll_state_unknown"] is True
+        assert user.balance_credits == 995
+        assert user.frozen_credits == 5
     finally:
         db.close()
 
@@ -855,6 +1157,43 @@ def test_video_download_lock_skips_duplicate_finalizer(client, make_user, auth, 
         db.close()
 
     assert client.get(f"/api/tasks/{tid}", headers=h).json()["status"] == "running"
+
+
+def test_split_video_download_soft_timeout_holds_for_review(client, make_user, auth, monkeypatch):
+    uid = make_user("13900000970", balance=1000, admin=True)
+    h = auth("13900000970")
+    _config_video(client, h)
+    tid = _stranded_video(uid, "ext-soft-download")
+    queued_downloads = []
+    db = SessionLocal()
+    try:
+        task = db.get(GenTask, tid)
+        task.phase = "downloading"
+        task.params = {"duration": 2, "_video_result_url": "https://cdn.example.com/soft.mp4"}
+        db.commit()
+    finally:
+        db.close()
+
+    monkeypatch.setattr(generation_video_download, "enqueue_video_download", lambda task_id, **_kw: queued_downloads.append(task_id))
+    monkeypatch.setattr(
+        "app.services.gateway.download_to_storage",
+        lambda *_a, **_k: (_ for _ in ()).throw(SoftTimeLimitExceeded()),
+    )
+
+    generation_video_download.run_video_download_task(tid)
+
+    assert queued_downloads == []
+    db = SessionLocal()
+    try:
+        task = db.get(GenTask, tid)
+        user = db.get(User, uid)
+        assert task.status == "needs_review"
+        assert task.phase == "reconciling"
+        assert "上游生成" in task.error
+        assert user.balance_credits == 995
+        assert user.frozen_credits == 5
+    finally:
+        db.close()
 
 
 def test_download_lock_loser_does_not_refresh_alive_key(client, make_user, auth, monkeypatch):
@@ -967,8 +1306,8 @@ def test_reaper_skips_active_video_download(client, make_user, auth):
             status="running",
             phase="downloading",
             external_task_id="ext-downloading",
-            external_submitted_at=datetime.now(timezone.utc) - timedelta(hours=2),
-            created_at=datetime.now(timezone.utc) - timedelta(hours=2),
+            external_submitted_at=datetime.now(timezone.utc) - timedelta(hours=8),
+            created_at=datetime.now(timezone.utc) - timedelta(hours=8),
             cost_frozen=5,
             params={"duration": 2, "_video_result_url": "https://cdn.example.com/r.mp4"},
         )
@@ -987,8 +1326,8 @@ def test_reaper_skips_active_video_download(client, make_user, auth):
 
 
 def test_reaper_skips_pending_video_download_without_alive_key(client, make_user, auth):
-    uid = make_user("13900000975", balance=1000, admin=True)
-    h = auth("13900000975")
+    uid = make_user("13900000983", balance=1000, admin=True)
+    h = auth("13900000983")
     _config_video(client, h)
     db = SessionLocal()
     try:
@@ -1013,6 +1352,46 @@ def test_reaper_skips_pending_video_download_without_alive_key(client, make_user
         db.refresh(t)
         assert t.status == "running"
         assert t.phase == "downloading"
+    finally:
+        db.close()
+
+
+def test_reaper_holds_expired_pending_video_download_without_alive_key(client, make_user, auth, monkeypatch):
+    uid = make_user("13900000982", balance=1000, admin=True)
+    h = auth("13900000982")
+    _config_video(client, h)
+    monkeypatch.setattr(retention.settings, "video_download_timeout_seconds", 1)
+    monkeypatch.setattr(retention.settings, "video_download_max_attempts", 1)
+    db = SessionLocal()
+    try:
+        t = GenTask(
+            user_id=uid,
+            category="video",
+            stage="preview",
+            status="running",
+            phase="downloading",
+            external_task_id="ext-expired-download",
+            external_submitted_at=datetime.now(timezone.utc) - timedelta(minutes=10),
+            created_at=datetime.now(timezone.utc) - timedelta(minutes=10),
+            cost_frozen=5,
+            cost_settled=0,
+            params={"duration": 2, "_video_result_url": "https://cdn.example.com/expired.mp4"},
+        )
+        db.add(t)
+        db.flush()
+        credits.freeze(db, uid, 5, biz_ref=t.id, commit=False)
+        db.commit()
+        tid = t.id
+
+        assert retention.reap_stuck_tasks(db, max_minutes=1) >= 1
+        held = db.get(GenTask, tid)
+        user = db.get(User, uid)
+        assert held.status == "needs_review"
+        assert held.phase == "reconciling"
+        assert "结果下载超时" in (held.error or "")
+        assert held.params["_video_download_state_unknown"] is True
+        assert user.balance_credits == 995
+        assert user.frozen_credits == 5
     finally:
         db.close()
 
@@ -1055,7 +1434,7 @@ def test_reaper_holds_video_submitting_with_request_id_for_review(client, make_u
         db.close()
 
 
-def test_reaper_refunds_submitted_video_timeout(client, make_user, auth, monkeypatch):
+def test_reaper_holds_submitted_video_timeout_for_review(client, make_user, auth, monkeypatch):
     uid = make_user("13900000982", balance=1000, admin=True)
     h = auth("13900000982")
     _config_video(client, h)
@@ -1085,17 +1464,19 @@ def test_reaper_refunds_submitted_video_timeout(client, make_user, auth, monkeyp
         frozen_after_freeze = user.frozen_credits
 
         assert retention.reap_stuck_tasks(db, max_minutes=60) == 1
-        failed = db.get(GenTask, tid)
+        held = db.get(GenTask, tid)
         user = db.get(User, uid)
-        assert failed.status == "failed"
-        assert "视频渲染超时" in (failed.error or "")
-        assert user.balance_credits == balance_after_freeze + frozen_after_freeze
-        assert user.frozen_credits == 0
+        assert held.status == "needs_review"
+        assert held.phase == "reconciling"
+        assert "上游任务状态未知" in (held.error or "")
+        assert held.params["_video_poll_state_unknown"] is True
+        assert user.balance_credits == balance_after_freeze
+        assert user.frozen_credits == frozen_after_freeze
     finally:
         db.close()
 
 
-def test_video_render_timeout_fails_and_refunds(client, make_user, auth, monkeypatch):
+def test_video_render_timeout_holds_for_review(client, make_user, auth, monkeypatch):
     uid = make_user("13900000976", balance=1000, admin=True)
     h = auth("13900000976")
     _config_video(client, h)
@@ -1129,12 +1510,14 @@ def test_video_render_timeout_fails_and_refunds(client, make_user, auth, monkeyp
     db = SessionLocal()
     try:
         task = db.get(GenTask, tid)
-        assert task.status == "failed"
+        assert task.status == "needs_review"
+        assert task.phase == "reconciling"
         assert task.cost_settled == 0
-        assert "视频渲染超时" in (task.error or "")
+        assert "状态未知" in (task.error or "")
+        assert task.params["_video_poll_state_unknown"] is True
         user = db.get(User, uid)
-        assert user.balance_credits == balance_after_freeze + frozen_after_freeze
-        assert user.frozen_credits == 0
+        assert user.balance_credits == balance_after_freeze
+        assert user.frozen_credits == frozen_after_freeze
     finally:
         db.close()
 
@@ -1335,18 +1718,106 @@ def test_final_text_video_without_poster_gets_public_preview(
             model,
             {"status": "succeeded", "url": "https://cdn.example.com/final.mp4"},
         )
+    finally:
+        db.close()
+
+
+def test_final_video_localizes_uploaded_poster_without_http_fetch(
+    client,
+    make_user,
+    auth,
+    monkeypatch,
+    tiny_mp4,
+):
+    uid = make_user("13900000068", balance=1000, admin=True)
+    h = auth("13900000068")
+    _config_video(client, h)
+    monkeypatch.setattr(generation.settings, "mock_mode", False)
+    monkeypatch.setattr(generation.settings, "video_gateway_base_url", "https://video-gateway.test")
+    monkeypatch.setattr(generation.settings, "video_gateway_api_key", "sk-test")
+    monkeypatch.setattr(
+        "app.services.gateway.download_to_storage",
+        lambda _url, subdir, ext, **_k: generation.storage.save_bytes(tiny_mp4, subdir, ext),
+    )
+
+    upload_key = storage.save_bytes(b"\x89PNG\r\n\x1a\n", "upload", "png")
+    db = SessionLocal()
+    try:
+        db.add(UploadedAsset(
+            key=upload_key,
+            user_id=uid,
+            mime="image/png",
+            width=32,
+            height=32,
+            bytes=8,
+            original_filename="poster.png",
+        ))
+        preview = GenTask(
+            user_id=uid,
+            category="video",
+            stage="preview",
+            status="succeeded",
+            prompt={"final_text": "product video"},
+            params={"duration": 2, "reference_image_url": storage.upload_api_url(upload_key)},
+            cost_frozen=5,
+            cost_settled=5,
+        )
+        db.add(preview)
+        db.flush()
+        final_task = GenTask(
+            user_id=uid,
+            category="video",
+            stage="final",
+            status="running",
+            phase="downloading",
+            parent_task_id=preview.id,
+            prompt={"final_text": "product video"},
+            params={"duration": 2, "reference_image_url": storage.upload_api_url(upload_key)},
+            cost_frozen=50,
+        )
+        db.add(final_task)
+        db.flush()
+        credits.freeze(db, uid, 50, biz_ref=final_task.id, commit=False)
+        db.commit()
         tid = final_task.id
+    finally:
+        db.close()
+
+    def forbidden_http_download(*_args, **_kwargs):
+        raise AssertionError("uploaded poster should be read from local storage")
+
+    monkeypatch.setattr("app.services.gateway.download_bytes_limited", forbidden_http_download)
+    monkeypatch.setattr(
+        "app.services.generation_media.make_image_preview",
+        lambda raw, **_kwargs: (b"preview-png", 32, 32),
+    )
+
+    db = SessionLocal()
+    try:
+        final_task = db.get(GenTask, tid)
+        model = generation.get_model_config(db, "video")
+        generation._finalize_video_success(
+            db,
+            final_task,
+            model,
+            {"status": "succeeded", "url": "https://cdn.example.com/final.mp4"},
+        )
     finally:
         db.close()
 
     task = client.get(f"/api/tasks/{tid}", headers=h).json()
     assert task["status"] == "succeeded", task
+    assert task["assets"][0]["preview_url"].startswith("http://localhost:8000/media/preview/")
+
+    task = client.get(f"/api/tasks/{tid}", headers=h).json()
+    assert task["status"] == "succeeded", task
     asset = task["assets"][0]
     assert asset["preview_url"].startswith("http://localhost:8000/media/preview/")
-    assert asset["hd_url"] is None
-    assert asset["unlocked"] is False
+    assert "/media/video_hd/" in asset["hd_url"]
+    assert asset["unlocked"] is True
+    assert asset["unlock_cost"] == 0
     assert client.get(asset["preview_url"].replace("http://localhost:8000", "")).status_code == 200
-    assert client.get(f"/api/assets/{asset['id']}/download", headers=h).status_code == 402
+    assert client.get(f"/api/assets/{asset['id']}/download", headers=h).status_code == 200
     db = SessionLocal()
     try:
         stored = db.get(GenAsset, asset["id"])

@@ -143,7 +143,8 @@ make run-frontend
 
 - 前端：http://localhost:3000
 - 后端：http://localhost:8000
-- 健康检查：http://localhost:8000/api/health
+- 存活检查：http://localhost:8000/api/live
+- 就绪检查：http://localhost:8000/api/ready
 
 ## Docker 部署
 
@@ -166,8 +167,10 @@ MODEL_CONFIG_SECRET=<strong-random-secret-at-least-32-chars>
 PUBLIC_BASE_URL=https://dream.aiwuq.cn
 CORS_ORIGINS=https://dream.aiwuq.cn
 PAYMENT_FRONTEND_BASE_URL=https://dream.aiwuq.cn
-TRUSTED_PROXY_IPS=127.0.0.1,172.16.0.0/12
+TRUSTED_PROXY_IPS=127.0.0.1
 ```
+
+`TRUSTED_PROXY_IPS` 只能填写真正转发到 API 的反代来源 IP。按本文档的 nginx 配置，API 只监听宿主机 `127.0.0.1:8000`，所以生产默认只信任 `127.0.0.1`。不要直接信任整个 Docker 私网网段，否则同网络内其他容器可能伪造 `X-Forwarded-For`。
 
 然后在 shell 或根目录 `.env` 中设置 Compose 需要插值的数据库密码：
 
@@ -348,7 +351,7 @@ Docker Compose 部署时，在线升级配置同样写在 `backend/.env`。Compo
 1. `ONLINE_UPDATE_REPO_DIR` 指向宿主机真实 checkout 的挂载目录。
 2. `ONLINE_UPDATE_APPLY_COMMAND` 指向一个不会直接重启 API 的固定命令，例如写入一个队列文件、调用宿主机 systemd oneshot、或通知外部 supervisor。
 3. 宿主机 oneshot/supervisor 再执行 `docker compose up -d --build migrate api worker beat frontend`。
-4. 重启完成后用 `https://dream.aiwuq.cn/api/health`、容器 `healthy` 状态和后台版本页确认生效。
+4. 重启完成后先用 `https://dream.aiwuq.cn/api/live` 确认进程存活，再用 `https://dream.aiwuq.cn/api/ready` 确认 DB/Redis 就绪，最后检查容器状态和后台版本页。
 
 如果暂时没有宿主机执行器，建议把 `ONLINE_UPDATE_APPLY_COMMAND` 留空：后台只完成 Git 快进，之后由运维在宿主机手动执行 Compose 生效。
 
@@ -428,8 +431,15 @@ SMS_TEMPLATE_CODE=<your-template-code>
 | `DEBUG` | 本地可设 `true`，生产必须 `false` |
 | `DATABASE_URL` | PostgreSQL 连接串 |
 | `REDIS_URL` | Redis 连接串 |
+| `DB_POOL_SIZE` / `DB_MAX_OVERFLOW` | PostgreSQL 连接池容量和溢出连接数 |
+| `DB_POOL_TIMEOUT_SECONDS` / `DB_POOL_RECYCLE_SECONDS` | PostgreSQL 获取连接超时和连接回收时间 |
+| `REDIS_MAX_CONNECTIONS` | API/Worker/Celery Redis 最大连接数 |
+| `REDIS_SOCKET_CONNECT_TIMEOUT_SECONDS` / `REDIS_SOCKET_TIMEOUT_SECONDS` | Redis 连接和读写超时 |
 | `JWT_SECRET` | 登录态签名密钥，生产必须强随机 |
 | `PUBLIC_BASE_URL` | 后端公开访问地址，用于媒体 URL |
+| `STORAGE_BACKEND` | 媒体存储后端，当前版本仅支持 `local`；S3/MinIO 配置为预留骨架，运行时会拒绝启用 |
+| `STORAGE_S3_ENDPOINT_URL` / `STORAGE_S3_BUCKET` | 预留的 S3/MinIO endpoint 与 bucket，当前不要启用 |
+| `STORAGE_S3_PUBLIC_BASE_URL` | 预留的对象存储公开访问前缀，当前不要启用 |
 | `CORS_ORIGINS` | 前端允许来源 |
 | `TRUSTED_PROXY_IPS` | 可传递 `X-Forwarded-For` 的反代 IP |
 | `GATEWAY_BASE_URL` / `GATEWAY_API_KEY` | OpenAI 兼容模型网关兜底配置 |
@@ -446,8 +456,9 @@ SMS_TEMPLATE_CODE=<your-template-code>
 | `ONLINE_UPDATE_APPLY_COMMAND` | 代码更新后执行的固定生效命令 |
 | `ONLINE_UPDATE_ALLOW_LOCAL_REMOTE` | 是否允许在线升级使用本地 Git remote，默认 `false`，仅建议测试环境开启 |
 | `MAX_IMAGE_N` | 单次图片生成最大张数，默认 8 |
-| `MAX_IMAGE_DIM` | 图片最大边长，默认 3840；gpt-image-2 官方 4K 建议使用 3840x2160、2160x3840 或同面积内的 16 倍数尺寸 |
-| `MAX_VIDEO_SECONDS` | 视频最大时长，默认 900 秒 |
+| `MAX_IMAGE_DIM` | 图片最大边长，默认 2048；当前前端隐藏 4K，2K 会按请求提交并展示网关实际返回图 |
+| `MAX_VIDEO_SECONDS` | 上传/参考视频源最大时长，默认 900 秒 |
+| `MAX_VIDEO_GENERATION_SECONDS` | 单条生成视频最大时长，默认 15 秒，应用层硬上限 15 秒 |
 | `REVERSE_VIDEO_FRAMES` | 视频反推抽帧数量 |
 | `NEXT_PUBLIC_API_BASE` | 前端访问 API 的跨域地址；同域部署可留空 |
 

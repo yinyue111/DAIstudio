@@ -1,47 +1,52 @@
 "use client";
 
-import { Lightbox, ResultCard } from "./StudioMedia";
+import { forwardRef } from "react";
+import { Lightbox, ResultCard } from "./StudioMedia.jsx";
+import GroupedAssetGallery from "./GroupedAssetGallery.jsx";
 import { isTerminalTaskStatus, statusStyle, statusZh, taskResultTitle } from "./helpers";
 
-export default function StudioResults({
+const StudioResults = forwardRef(function StudioResults({
   task,
   runningSnapshot,
   showRunningProgress,
   trackingLost,
-  finalTaskId,
+  backgroundTasks = [],
   submitting,
-  videoFinalCost,
   works,
   lightbox,
   setLightbox,
   busyAssetIds,
   onRefreshActiveTask,
+  onCancelTask,
+  onDismissBackgroundTask,
+  onCancelBackgroundTask,
   onUnlock,
   onDownload,
-  onReport,
-  onSubmitFinal,
-}) {
-  const finalStatus = task?.final_status || null;
-  const finalAssetCount = Number(task?.final_asset_count || 0);
-  const hasPendingFinal = ["queued", "running"].includes(finalStatus);
-  const hasSucceededFinal = finalStatus === "succeeded" && finalAssetCount > 0;
-  const hasNeedsReviewFinal = finalStatus === "needs_review";
-  const hasFailedFinal = finalStatus === "failed";
-  const hasBlockingFinal = hasPendingFinal || hasSucceededFinal || hasNeedsReviewFinal;
-  const hasSubmittedFinal = Boolean(task?.final_task_id || finalTaskId);
+  onVariation,
+}, ref) {
+  const cancelableStatus = task?.status;
+  const showCancel = ["queued", "running"].includes(cancelableStatus);
+  const visibleBackgroundTasks = (backgroundTasks || []).filter((item) => item?.id && item.id !== task?.id);
 
   return (
     <>
       {task && (
-        <section className="mx-auto mt-8 max-w-5xl animate-fadeup">
+        <section ref={ref} className="mx-auto mt-8 scroll-mt-5 max-w-5xl animate-fadeup lg:scroll-mt-6">
           <div className="card p-4">
             <div className="mb-3 flex items-center justify-between">
               <span className="text-sm font-display font-semibold">{taskResultTitle(task, runningSnapshot)}</span>
-              <span className={`badge ${statusStyle(task.status)}`}>{statusZh(task.status)}</span>
+              <div className="flex items-center gap-2">
+                {showCancel && (
+                  <button type="button" onClick={onCancelTask} className="btn-ghost btn-sm text-bad">
+                    {cancelableStatus === "running" ? "提交取消请求" : "取消任务"}
+                  </button>
+                )}
+                <span className={`badge ${statusStyle(task.status)}`}>{statusZh(task.status)}</span>
+              </div>
             </div>
             {showRunningProgress && (
               <div className="mb-4">
-                <div className="mb-2 h-1.5 w-full overflow-hidden rounded-full bg-white/8">
+                <div className="mb-2 h-1.5 w-full overflow-hidden rounded-full bg-white/[0.08]">
                   <div
                     className="h-full rounded-full bg-brand transition-all duration-500"
                     style={{ width: `${task.progress || 8}%` }}
@@ -80,10 +85,17 @@ export default function StudioResults({
             {task.error && <p className="mb-3 rounded-lg bg-bad/10 px-3 py-2 text-sm text-bad">{task.error}</p>}
             {task.partial && (
               <div className="mb-3 rounded-lg bg-warn/10 px-3 py-2 text-sm text-warn">
-                <p>
-                  本次批量生成完成 {task.saved_count || task.assets?.length || 0}/{task.requested_count || "?"} 张，
-                  失败部分已按实际成功张数结算。
-                </p>
+                {task.status === "needs_review" ? (
+                  <p>
+                    本次批量生成已保存 {task.saved_count || task.assets?.length || 0}/{task.requested_count || "?"} 张成功结果，
+                    剩余部分状态未知，积分暂不结算或退回，待系统确认。
+                  </p>
+                ) : (
+                  <p>
+                    本次批量生成完成 {task.saved_count || task.assets?.length || 0}/{task.requested_count || "?"} 张，
+                    失败部分已按实际成功张数结算。
+                  </p>
+                )}
                 {task.partial_errors?.length > 0 && (
                   <p className="mt-1 text-xs text-warn/80">未完成原因：{task.partial_errors.join("；")}</p>
                 )}
@@ -99,38 +111,74 @@ export default function StudioResults({
                     onOpen={() => setLightbox(asset)}
                     onUnlock={() => onUnlock(asset)}
                     onDownload={() => onDownload(asset)}
-                    onReport={() => onReport(asset)}
+                    onVariation={onVariation}
                   />
                 ))}
               </div>
             )}
-            {task.category === "video" && task.stage === "preview" && task.status === "succeeded" && hasPendingFinal && (
-              <div className="mt-4 rounded-lg border border-line bg-white/5 px-3 py-2 text-center text-sm text-fog">
-                完整视频正在渲染 · <a href="/history" className="text-brand hover:text-brand-2">去历史查看</a>
+          </div>
+        </section>
+      )}
+
+      {visibleBackgroundTasks.length > 0 && (
+        <section className="mx-auto mt-4 max-w-5xl">
+          <div className="rounded-xl2 border border-line bg-base2/80 p-3">
+            <div className="mb-2 flex items-center justify-between gap-3">
+              <div>
+                <h3 className="text-sm font-display font-semibold text-snow">后台生成任务</h3>
+                <p className="text-xs text-fog">图片任务可并发提交，旧任务完成后会同步到作品墙。</p>
               </div>
-            )}
-            {task.category === "video" && task.stage === "preview" && task.status === "succeeded" && hasSucceededFinal && (
-              <a href="/history" className="btn-secondary mt-4 block w-full text-center">
-                完整视频已完成 · 去历史查看
-              </a>
-            )}
-            {task.category === "video" && task.stage === "preview" && task.status === "succeeded" && hasNeedsReviewFinal && (
-              <div className="mt-4 rounded-lg border border-warn/30 bg-warn/10 px-3 py-2 text-center text-sm text-warn">
-                完整视频待确认 · <a href="/history" className="underline underline-offset-2">去历史查看</a>
-              </div>
-            )}
-            {task.category === "video" && task.stage === "preview" && task.status === "succeeded" && hasFailedFinal && (
-              <p className="mt-4 rounded-lg border border-warn/30 bg-warn/10 px-3 py-2 text-center text-sm text-warn">
-                完整视频渲染失败，可重新提交
-              </p>
-            )}
-            {task.category === "video" && task.stage === "preview" && task.status === "succeeded" && !hasBlockingFinal && (
-              <button onClick={onSubmitFinal} disabled={submitting} className="btn-primary mt-4 w-full">
-                {submitting
-                  ? "提交中…"
-                  : `${hasSubmittedFinal ? "重新渲染完整视频" : "方向满意 → 渲染完整视频"} · ${videoFinalCost}积分`}
-              </button>
-            )}
+              <a href="/history" className="btn-secondary btn-sm">历史记录</a>
+            </div>
+            <div className="space-y-2">
+              {visibleBackgroundTasks.map((item) => {
+                const terminal = isTerminalTaskStatus(item.status);
+                const cancelable = ["queued", "running"].includes(item.status);
+                return (
+                  <div key={item.id} className="rounded-lg border border-white/10 bg-white/[0.03] px-3 py-2">
+                    <div className="flex items-center justify-between gap-2">
+                      <div className="min-w-0">
+                        <div className="flex flex-wrap items-center gap-2">
+                          <span className="text-sm text-mist">
+                            {item.category === "video" ? "视频" : "图片"} · {item.requested_count || item.params?.n || 1} 张
+                          </span>
+                          <span className={`badge ${statusStyle(item.status)}`}>{statusZh(item.status)}</span>
+                        </div>
+                        {item.error && <p className="mt-1 text-xs text-bad">{item.error}</p>}
+                      </div>
+                      <div className="flex shrink-0 items-center gap-2">
+                        {cancelable && (
+                          <button
+                            type="button"
+                            onClick={() => onCancelBackgroundTask?.(item.id)}
+                            className="btn-ghost btn-sm text-bad"
+                          >
+                            取消
+                          </button>
+                        )}
+                        {(terminal || item.status === "unknown") && (
+                          <button
+                            type="button"
+                            onClick={() => onDismissBackgroundTask?.(item.id)}
+                            className="btn-ghost btn-sm"
+                          >
+                            关闭
+                          </button>
+                        )}
+                      </div>
+                    </div>
+                    {!terminal && item.status !== "unknown" && (
+                      <div className="mt-2 h-1.5 w-full overflow-hidden rounded-full bg-white/[0.08]">
+                        <div
+                          className="h-full rounded-full bg-brand transition-all duration-500"
+                          style={{ width: `${item.progress || 8}%` }}
+                        />
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
           </div>
         </section>
       )}
@@ -139,7 +187,7 @@ export default function StudioResults({
         <div className="mb-5 flex items-end justify-between">
           <div>
             <h2 className="text-xl font-bold">我的作品墙</h2>
-            <p className="mt-1 text-sm text-fog">最近生成的创作，点击查看 / 解锁 / 下载。</p>
+            <p className="mt-1 text-sm text-fog">最近生成的创作，点击查看、生成变体或下载。</p>
           </div>
           <a href="/profile" className="btn-secondary btn-sm">查看全部</a>
         </div>
@@ -155,19 +203,20 @@ export default function StudioResults({
             <p className="text-sm text-mist">还没有作品，输入提示词开始你的第一次创作。</p>
           </div>
         ) : (
-          <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-4">
-            {works.map((asset) => (
+          <GroupedAssetGallery
+            assets={works}
+            renderAsset={(asset) => (
               <ResultCard
-                key={asset.id}
                 a={asset}
+                fixedAspect
                 unlocking={busyAssetIds?.has(asset.id)}
                 onOpen={() => setLightbox(asset)}
                 onUnlock={() => onUnlock(asset)}
                 onDownload={() => onDownload(asset)}
-                onReport={() => onReport(asset)}
+                onVariation={onVariation}
               />
-            ))}
-          </div>
+            )}
+          />
         )}
       </section>
 
@@ -178,9 +227,13 @@ export default function StudioResults({
           onClose={() => setLightbox(null)}
           onUnlock={() => onUnlock(lightbox)}
           onDownload={() => onDownload(lightbox)}
-          onReport={() => onReport(lightbox)}
+          onVariation={onVariation}
         />
       )}
     </>
   );
-}
+});
+
+StudioResults.displayName = "StudioResults";
+
+export default StudioResults;

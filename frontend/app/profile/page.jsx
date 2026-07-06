@@ -4,7 +4,15 @@ import { useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { api, clearToken, downloadBlob, loginPath } from "../../lib/api";
 import Nav from "../../components/Nav";
-import AssetMedia, { assetPreviewSrc, assetUnavailableText, isAssetTakenDown } from "../../components/AssetMedia";
+import AssetMedia, {
+  assetPreviewLabel,
+  assetPreviewSrc,
+  assetUnavailableText,
+  canDownloadAsset,
+  isAssetTakenDown,
+} from "../../components/AssetMedia";
+import GroupedAssetGallery from "../studio/GroupedAssetGallery";
+import { STUDIO_VARIATION_DRAFT_KEY } from "../studio/constants";
 
 const PAGE = 30;
 function srcOf(a) {
@@ -15,7 +23,12 @@ function unlockConfirm(asset, me, cfg) {
   const type = asset.type === "video" ? "视频" : "图片";
   const balance = Number(me?.balance_credits ?? 0);
   const cost = Number(asset.unlock_cost ?? cfg?.models?.[asset.type]?.unlock_cost ?? 0);
-  return window.confirm(`解锁${type}高清将扣除 ${cost} 积分，当前余额 ${balance}，确认继续？`);
+  return window.confirm(`解锁${type}将扣除 ${cost} 积分，当前余额 ${balance}，确认继续？`);
+}
+
+function variationSourceUrl(asset) {
+  if (!asset || asset.type !== "image") return "";
+  return asset.hd_url || asset.preview_url || asset.url || "";
 }
 
 export default function ProfilePage() {
@@ -24,6 +37,12 @@ export default function ProfilePage() {
   const [cfg, setCfg] = useState(null);
   const [data, setData] = useState(null);
   const [filter, setFilter] = useState("all");
+  const [assetFilters, setAssetFilters] = useState({
+    created_from: "",
+    created_to: "",
+    model_use: "",
+    size: "",
+  });
   const [assets, setAssets] = useState(null);
   const [loading, setLoading] = useState(false);
   const reqRef = useRef(0);
@@ -34,6 +53,8 @@ export default function ProfilePage() {
   const [msg, setMsg] = useState("");
   const [busyAssetIds, setBusyAssetIds] = useState(() => new Set());
   const busyAssetIdsRef = useRef(new Set());
+  const [selectedIds, setSelectedIds] = useState(() => new Set());
+  const [batchDownloading, setBatchDownloading] = useState(false);
 
   // change password
   const [pwOpen, setPwOpen] = useState(false);
@@ -49,12 +70,22 @@ export default function ProfilePage() {
 
   useEffect(() => {
     loadAssets(true);
-  }, [filter]);
+  }, [filter, assetFilters.created_from, assetFilters.created_to, assetFilters.model_use, assetFilters.size]);
+
+  useEffect(() => {
+    if (!assets) return;
+    const visibleIds = new Set(assets.map((asset) => asset.id));
+    setSelectedIds((prev) => {
+      const next = new Set([...prev].filter((id) => visibleIds.has(id)));
+      return next.size === prev.size ? prev : next;
+    });
+  }, [assets]);
 
   function paramsFor(f) {
-    if (f === "fav") return { favorite: true };
-    if (f === "image" || f === "video") return { type: f };
-    return {};
+    const base = { ...assetFilters };
+    if (f === "fav") return { ...base, favorite: true };
+    if (f === "image" || f === "video") return { ...base, type: f };
+    return base;
   }
 
   async function loadAssets(reset) {
@@ -66,6 +97,7 @@ export default function ProfilePage() {
       assetsRef.current = [];
       setAssets(null);
       setHasMore(false);
+      setSelectedIds(new Set());
     }
     const myReq = ++reqRef.current;  // newest request wins; stale pages are dropped
     const currentAssets = reset ? [] : (assetsRef.current || []);
@@ -95,9 +127,10 @@ export default function ProfilePage() {
   }
 
   function patchAsset(updated) {
+    const removedFromCurrentView = filter === "fav" && updated.favorite === false;
     setAssets((prev) => {
       const list = prev || [];
-      if (filter === "fav" && updated.favorite === false) {
+      if (removedFromCurrentView) {
         const next = list.filter((x) => x.id !== updated.id);
         assetsRef.current = next;
         return next;
@@ -106,6 +139,14 @@ export default function ProfilePage() {
       assetsRef.current = next;
       return next;
     });
+    if (removedFromCurrentView) {
+      setSelectedIds((prev) => {
+        if (!prev.has(updated.id)) return prev;
+        const next = new Set(prev);
+        next.delete(updated.id);
+        return next;
+      });
+    }
     if (lightbox && lightbox.id === updated.id) setLightbox(updated);
   }
 
@@ -158,6 +199,12 @@ export default function ProfilePage() {
           assetsRef.current = next;
           return next;
         });
+        setSelectedIds((prev) => {
+          if (!prev.has(asset.id)) return prev;
+          const next = new Set(prev);
+          next.delete(asset.id);
+          return next;
+        });
         if (lightbox && lightbox.id === asset.id) setLightbox(null);
         api.profile().then(setData).catch(() => {});
       } catch (e) { setMsg(e.message); }
@@ -169,14 +216,95 @@ export default function ProfilePage() {
       setMsg("素材已下架，不能继续下载。");
       return;
     }
+    if (!canDownloadAsset(asset)) {
+      setMsg("请先解锁后再下载。");
+      return;
+    }
     await withAssetBusy(asset.id, async () => {
       try {
-        await downloadBlob(
+        const filename = await downloadBlob(
           `/api/assets/${asset.id}/download`,
           asset.type === "video" ? `asset-${asset.id}.mp4` : undefined,
         );
+        setMsg(`已开始下载 ${filename}`);
       } catch (e) { setMsg(e.message); }
     });
+  }
+
+  function createVariation(asset) {
+    const sourceUrl = variationSourceUrl(asset);
+    if (!sourceUrl) {
+      setMsg("当前图片暂不可作为变体来源，请确认预览可用后再试。");
+      return;
+    }
+    try {
+      window.localStorage.setItem(STUDIO_VARIATION_DRAFT_KEY, JSON.stringify({
+        asset: {
+          ...asset,
+          type: "image",
+          url: sourceUrl,
+          thumb: asset.preview_url || asset.thumb || sourceUrl,
+        },
+        prompt: "基于这张图生成同主体、同构图、同光线和同广告质感的近似变体；保留主体结构、产品文字、Logo、比例和核心视觉，只做轻微差异化。",
+      }));
+      router.push("/");
+    } catch (e) {
+      setMsg(e.message || "创建变体草稿失败");
+    }
+  }
+
+  function toggleSelected(assetId) {
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(assetId)) next.delete(assetId);
+      else next.add(assetId);
+      return next;
+    });
+  }
+
+  async function batchDelete() {
+    const visibleIds = new Set((assetsRef.current || []).map((asset) => asset.id));
+    const ids = [...selectedIds].filter((id) => visibleIds.has(id));
+    if (!ids.length) return;
+    if (!window.confirm(`确认删除选中的 ${ids.length} 个素材？删除后不可恢复。`)) return;
+    setMsg("");
+    try {
+      const res = await api.batchDeleteAssets(ids);
+      const deleted = new Set(res.deleted || []);
+      setAssets((prev) => {
+        const next = (prev || []).filter((x) => !deleted.has(x.id));
+        assetsRef.current = next;
+        return next;
+      });
+      setSelectedIds(new Set());
+      api.profile().then(setData).catch(() => {});
+      const failed = res.failed?.length || 0;
+      setMsg(failed ? `已删除 ${deleted.size} 个，${failed} 个删除失败。` : `已删除 ${deleted.size} 个素材。`);
+    } catch (e) {
+      setMsg(e.message);
+    }
+  }
+
+  async function batchDownload() {
+    const selectedAssets = (assetsRef.current || []).filter((asset) => selectedIds.has(asset.id));
+    const downloadable = selectedAssets.filter(canDownloadAsset);
+    const skipped = selectedAssets.length - downloadable.length;
+    const ids = downloadable.map((asset) => asset.id);
+    if (!selectedAssets.length || batchDownloading) return;
+    if (!ids.length) {
+      setMsg("选中的素材都未解锁或已下架，无法批量下载。");
+      return;
+    }
+    setMsg("");
+    setBatchDownloading(true);
+    try {
+      const filename = await api.batchDownloadAssets(ids);
+      setMsg(skipped ? `已开始下载 ${filename}，已跳过 ${skipped} 个未解锁或已下架素材。` : `已开始下载 ${filename}`);
+    } catch (e) {
+      setMsg(e.message);
+    } finally {
+      setBatchDownloading(false);
+    }
   }
 
   async function changePassword() {
@@ -191,6 +319,90 @@ export default function ProfilePage() {
 
   const u = data?.user || me;
   const initial = (u?.nickname || u?.phone || "?").slice(-2);
+  const visibleSelectedCount = (assets || []).filter((asset) => selectedIds.has(asset.id)).length;
+
+  function renderAssetCard(a) {
+    const src = srcOf(a);
+    const busy = busyAssetIds.has(a.id);
+    const takenDown = isAssetTakenDown(a);
+    return (
+      <div className={`group relative flex h-full flex-col overflow-hidden rounded-xl2 border bg-base2 ${selectedIds.has(a.id) ? "border-brand" : "border-line"}`}>
+        <label className="absolute right-2 top-2 z-10 flex h-7 w-7 cursor-pointer items-center justify-center rounded-full border border-white/20 bg-black/55">
+          <input
+            type="checkbox"
+            checked={selectedIds.has(a.id)}
+            onChange={() => toggleSelected(a.id)}
+            className="h-3.5 w-3.5 accent-brand"
+            aria-label={`选择素材 #${a.id}`}
+          />
+        </label>
+        <button
+          onClick={() => setLightbox(a)}
+          aria-label={`预览${a.type === "video" ? "视频" : "图片"}素材 #${a.id}`}
+          className="relative block aspect-[4/5] w-full cursor-zoom-in overflow-hidden bg-black/20"
+        >
+          {!src ? (
+            <div className="absolute inset-0 flex h-full w-full items-center justify-center px-3 text-center text-xs text-fog">
+              {assetUnavailableText(a)}
+            </div>
+          ) : (
+            <AssetMedia
+              asset={a}
+              className="absolute inset-0 h-full w-full object-contain transition duration-300 group-hover:scale-[1.04]"
+              fallbackClassName="absolute inset-0 flex h-full w-full items-center justify-center px-3 text-center text-xs text-fog"
+            />
+          )}
+          <span className="badge absolute left-2 top-2 bg-black/60 text-white">
+            {a.type === "video" ? "视频" : "图片"}
+          </span>
+          {takenDown && <span className="badge absolute right-2 bottom-2 bg-bad/80 text-white">已下架</span>}
+          {a.days_left != null && (
+            <span className="badge absolute bottom-2 left-2 bg-black/60 text-fog">{a.days_left} 天后过期</span>
+          )}
+        </button>
+        <div className="mt-auto flex items-center justify-between gap-1 p-2">
+          <div className="flex items-center gap-2">
+            <button
+              onClick={() => toggleFav(a)}
+              disabled={busy || takenDown}
+              title={takenDown ? "素材已下架" : "收藏"}
+              aria-label={`${a.favorite ? "取消收藏" : "收藏"}素材 #${a.id}`}
+              className={`text-base leading-none transition disabled:opacity-50 ${a.favorite ? "text-rose" : "text-fog hover:text-snow"}`}>
+              {a.favorite ? "★" : "☆"}
+            </button>
+            <button
+              onClick={() => del(a)}
+              disabled={busy}
+              title="删除"
+              aria-label={`删除${a.type === "video" ? "视频" : "图片"}素材 #${a.id}`}
+              className="text-fog transition hover:text-bad disabled:opacity-50">🗑</button>
+          </div>
+          {takenDown ? (
+            <span className="btn-secondary btn-sm cursor-not-allowed opacity-60">已下架</span>
+          ) : (
+            <div className="flex gap-1.5">
+              {a.type === "image" && (
+                <button onClick={() => createVariation(a)} disabled={busy} className="btn-secondary btn-sm">
+                  变体
+                </button>
+              )}
+              {a.unlocked ? (
+                <button
+                  onClick={() => download(a)}
+                  disabled={busy || !canDownloadAsset(a)}
+                  className={canDownloadAsset(a) ? "btn-primary btn-sm" : "btn-secondary btn-sm cursor-not-allowed opacity-70"}
+                >
+                  {busy ? "处理中…" : "下载"}
+                </button>
+              ) : (
+                <button onClick={() => unlock(a)} disabled={busy} className="btn-secondary btn-sm">解锁</button>
+              )}
+            </div>
+          )}
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="min-h-screen">
@@ -256,6 +468,63 @@ export default function ProfilePage() {
           ))}
         </div>
 
+        <div className="mb-5 grid gap-2 rounded-xl2 border border-line bg-white/[0.03] p-3 sm:grid-cols-[1fr_1fr_auto_auto_auto]">
+          <input
+            type="date"
+            className="input px-3 py-2 text-xs"
+            value={assetFilters.created_from}
+            onChange={(e) => setAssetFilters((v) => ({ ...v, created_from: e.target.value }))}
+            aria-label="开始日期"
+          />
+          <input
+            type="date"
+            className="input px-3 py-2 text-xs"
+            value={assetFilters.created_to}
+            onChange={(e) => setAssetFilters((v) => ({ ...v, created_to: e.target.value }))}
+            aria-label="结束日期"
+          />
+          <select
+            className="input px-3 py-2 text-xs"
+            value={assetFilters.model_use}
+            onChange={(e) => setAssetFilters((v) => ({ ...v, model_use: e.target.value }))}
+            aria-label="模型类型"
+          >
+            <option value="">全部模型</option>
+            <option value="image">图片模型</option>
+            <option value="video">视频模型</option>
+          </select>
+          <select
+            className="input px-3 py-2 text-xs"
+            value={assetFilters.size}
+            onChange={(e) => setAssetFilters((v) => ({ ...v, size: e.target.value }))}
+            aria-label="画面比例"
+          >
+            <option value="">全部比例</option>
+            <option value="portrait">竖图</option>
+            <option value="landscape">横图</option>
+            <option value="square">方图</option>
+          </select>
+          <button
+            onClick={() => setAssetFilters({ created_from: "", created_to: "", model_use: "", size: "" })}
+            className="btn-secondary btn-sm"
+          >
+            重置筛选
+          </button>
+        </div>
+
+        {visibleSelectedCount > 0 && (
+          <div className="mb-5 flex flex-wrap items-center justify-between gap-2 rounded-xl2 border border-brand/30 bg-brand/10 px-3 py-2">
+            <span className="text-sm text-mist">已选择 {visibleSelectedCount} 个素材</span>
+            <div className="flex flex-wrap gap-2">
+              <button onClick={batchDownload} disabled={batchDownloading} className="btn-secondary btn-sm">
+                {batchDownloading ? "打包中..." : "批量下载"}
+              </button>
+              <button onClick={batchDelete} className="btn-ghost btn-sm text-bad">批量删除</button>
+              <button onClick={() => setSelectedIds(new Set())} className="btn-ghost btn-sm">取消选择</button>
+            </div>
+          </div>
+        )}
+
         {msg && (
           <div className="mb-5 rounded-xl border border-bad/30 bg-bad/10 px-4 py-2.5 text-sm text-bad">{msg}</div>
         )}
@@ -274,70 +543,13 @@ export default function ProfilePage() {
           </div>
         ) : (
           <>
-            <div className="masonry">
-              {assets.map((a) => {
-                const src = srcOf(a);
-                const busy = busyAssetIds.has(a.id);
-                const takenDown = isAssetTakenDown(a);
-                return (
-                  <div key={a.id} className="group overflow-hidden rounded-xl2 border border-line bg-base2">
-                    <button
-                      onClick={() => setLightbox(a)}
-                      aria-label={`预览${a.type === "video" ? "视频" : "图片"}素材 #${a.id}`}
-                      className="relative block w-full cursor-zoom-in bg-black/20"
-                      style={mediaAspectStyle(a)}
-                    >
-                      {!src ? (
-                        <div className="flex h-full w-full items-center justify-center px-3 text-center text-xs text-fog">
-                          {assetUnavailableText(a)}
-                        </div>
-                      ) : (
-                        <AssetMedia
-                          asset={a}
-                          className="h-full w-full object-contain transition duration-300 group-hover:scale-[1.04]"
-                          fallbackClassName="flex h-full w-full items-center justify-center px-3 text-center text-xs text-fog"
-                        />
-                      )}
-                      <span className="badge absolute left-2 top-2 bg-black/60 text-white">
-                        {a.type === "video" ? "视频" : "图片"}
-                      </span>
-                      {takenDown && <span className="badge absolute right-2 top-2 bg-bad/80 text-white">已下架</span>}
-                      {!takenDown && a.unlocked && <span className="badge absolute right-2 top-2 bg-brand text-white">HD</span>}
-                      {a.days_left != null && (
-                        <span className="badge absolute bottom-2 left-2 bg-black/60 text-fog">{a.days_left} 天后过期</span>
-                      )}
-                    </button>
-                    <div className="flex items-center justify-between gap-1 p-2">
-                      <div className="flex items-center gap-2">
-                        <button
-                          onClick={() => toggleFav(a)}
-                          disabled={busy || takenDown}
-                          title={takenDown ? "素材已下架" : "收藏"}
-                          aria-label={`${a.favorite ? "取消收藏" : "收藏"}素材 #${a.id}`}
-                          className={`text-base leading-none transition disabled:opacity-50 ${a.favorite ? "text-rose" : "text-fog hover:text-snow"}`}>
-                          {a.favorite ? "★" : "☆"}
-                        </button>
-                        <button
-                          onClick={() => del(a)}
-                          disabled={busy}
-                          title="删除"
-                          aria-label={`删除${a.type === "video" ? "视频" : "图片"}素材 #${a.id}`}
-                          className="text-fog transition hover:text-bad disabled:opacity-50">🗑</button>
-                      </div>
-                      {takenDown ? (
-                        <span className="btn-secondary btn-sm cursor-not-allowed opacity-60">已下架</span>
-                      ) : a.unlocked ? (
-                        <button onClick={() => download(a)} disabled={busy} className="btn-primary btn-sm">
-                          {busy ? "处理中…" : "下载"}
-                        </button>
-                      ) : (
-                        <button onClick={() => unlock(a)} disabled={busy} className="btn-secondary btn-sm">解锁</button>
-                      )}
-                    </div>
-                  </div>
-                );
-              })}
-            </div>
+            <GroupedAssetGallery
+              assets={assets}
+              renderAsset={renderAssetCard}
+              className="grid grid-cols-1 items-start gap-4 sm:grid-cols-2"
+              groupClassName="rounded-xl2 border border-line bg-white/[0.025] p-2.5"
+              assetGridClassName="grid grid-cols-1 gap-3"
+            />
             {hasMore && (
               <div className="mt-6 text-center">
                 <button onClick={() => loadAssets(false)} disabled={loading} className="btn-secondary">
@@ -351,14 +563,14 @@ export default function ProfilePage() {
 
       {lightbox && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 p-4 backdrop-blur-sm" role="dialog" aria-modal="true" onClick={() => setLightbox(null)}>
-          <div className="panel max-h-[92vh] max-w-3xl overflow-auto p-3" onClick={(e) => e.stopPropagation()}>
+          <div className="panel max-h-[92vh] w-full max-w-3xl overflow-auto p-3" onClick={(e) => e.stopPropagation()}>
             {!srcOf(lightbox) ? (
               <div className="flex min-h-64 items-center justify-center rounded-xl2 bg-black/30 px-6 text-sm text-fog">
                 {isAssetTakenDown(lightbox)
                   ? "素材已下架，不能继续预览、解锁或下载。"
                   : lightbox.unlocked
                     ? "预览暂不可用，请稍后重试。"
-                    : "预览暂不可用，请先解锁后再下载高清。"}
+                    : "预览暂不可用，请先解锁后再下载。"}
               </div>
             ) : (
               <AssetMedia
@@ -367,14 +579,14 @@ export default function ProfilePage() {
                 controls
                 autoPlay
                 muted={false}
-                className="mx-auto max-h-[76vh] w-auto rounded-xl2"
+                className="mx-auto max-h-[76vh] max-w-full rounded-xl2 object-contain"
                 fallbackClassName="flex min-h-64 items-center justify-center rounded-xl2 bg-black/30 px-6 text-sm text-fog"
                 onError={(e) => setMsg(e?.message || "预览加载失败")}
               />
             )}
             <div className="mt-3 flex flex-col gap-2 text-sm sm:flex-row sm:items-center sm:justify-between">
               <span className="min-w-0 text-fog">
-                {isAssetTakenDown(lightbox) ? "素材已下架" : lightbox.unlocked ? "预览 · 已解锁，可下载高清" : "预览 · 带水印"}
+                {assetPreviewLabel(lightbox)}
                 {lightbox.days_left != null ? ` · ${lightbox.days_left} 天后过期` : ""}
               </span>
               <div className="flex flex-wrap gap-2 sm:justify-end">
@@ -383,8 +595,21 @@ export default function ProfilePage() {
                   {lightbox.favorite ? "★ 已收藏" : "☆ 收藏"}
                 </button>
                 )}
-                {!isAssetTakenDown(lightbox) && !lightbox.unlocked && <button onClick={() => unlock(lightbox)} disabled={busyAssetIds.has(lightbox.id)} className="btn-primary btn-sm">解锁高清</button>}
-                {!isAssetTakenDown(lightbox) && lightbox.unlocked && <button onClick={() => download(lightbox)} disabled={busyAssetIds.has(lightbox.id)} className="btn-primary btn-sm">下载</button>}
+                {!isAssetTakenDown(lightbox) && !lightbox.unlocked && <button onClick={() => unlock(lightbox)} disabled={busyAssetIds.has(lightbox.id)} className="btn-primary btn-sm">解锁</button>}
+                {!isAssetTakenDown(lightbox) && lightbox.unlocked && (
+                  <button
+                    onClick={() => download(lightbox)}
+                    disabled={busyAssetIds.has(lightbox.id) || !canDownloadAsset(lightbox)}
+                    className={canDownloadAsset(lightbox) ? "btn-primary btn-sm" : "btn-secondary btn-sm cursor-not-allowed opacity-70"}
+                  >
+                    下载
+                  </button>
+                )}
+                {!isAssetTakenDown(lightbox) && lightbox.type === "image" && (
+                  <button onClick={() => createVariation(lightbox)} className="btn-secondary btn-sm">
+                    生成变体
+                  </button>
+                )}
                 <button onClick={() => setLightbox(null)} className="btn-secondary btn-sm">关闭</button>
               </div>
             </div>
@@ -402,11 +627,4 @@ function Stat({ label, value }) {
       <div className="mt-0.5 text-xs text-fog">{label}</div>
     </div>
   );
-}
-
-function mediaAspectStyle(a) {
-  const width = Number(a?.width);
-  const height = Number(a?.height);
-  if (!width || !height) return { aspectRatio: "1 / 1" };
-  return { aspectRatio: `${width} / ${height}` };
 }

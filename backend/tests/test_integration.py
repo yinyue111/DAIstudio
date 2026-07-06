@@ -6,7 +6,16 @@ import pytest
 from sqlalchemy.exc import IntegrityError
 
 from app.db import SessionLocal
-from app.models import AuditLog, CreditTransaction, GenAsset, GenTask, ModelConfig, PhoneWhitelist
+from app.models import (
+    AssetReport,
+    AuditLog,
+    CreditTransaction,
+    GenAsset,
+    GenTask,
+    ModelConfig,
+    PhoneWhitelist,
+    UserPrompt,
+)
 from app.services import sms, storage
 from app.services.config_store import set_setting
 
@@ -15,6 +24,14 @@ def test_health(client):
     r = client.get("/api/health").json()
     assert r["ok"] is True
     assert "components" not in r
+
+    live = client.get("/api/live").json()
+    assert live == {"ok": True}
+
+    ready = client.get("/api/ready").json()
+    assert ready["ok"] is True
+    assert ready["components"]["db"] == "ok"
+    assert ready["components"]["redis"] == "ok"
 
     detail = client.get("/api/health/detail").json()
     assert detail["ok"] is True
@@ -139,7 +156,10 @@ def test_generate_unlock_profile(client, make_user, auth):
     assert t["status"] == "succeeded", t
     assert len(t["assets"]) == 2
     a0 = t["assets"][0]
-    assert a0["hd_url"] is None          # HD hidden before unlock
+    assert a0["unlocked"] is True
+    assert a0["watermarked"] is False
+    assert a0["unlock_cost"] == 0
+    assert a0["hd_url"]
     assert a0["preview_url"]
     assert client.get(urlparse(a0["preview_url"]).path).status_code == 200
 
@@ -160,13 +180,14 @@ def test_generate_unlock_profile(client, make_user, auth):
     finally:
         db.close()
 
-    # unlock is free for generated assets and reveals HD -> balance unchanged
+    # Generated assets are charged at generation time and download directly.
+    assert client.get(f"/api/assets/{a0['id']}/download", headers=h).status_code == 200
+
+    # Old unlock entrypoint remains idempotent/free for generated assets.
     u = client.post(f"/api/assets/{a0['id']}/unlock", headers=h)
     assert u.status_code == 200
     assert u.json()["unlocked"] is True
     assert u.json()["hd_url"]
-    assert client.get(urlparse(u.json()["hd_url"]).path).status_code == 404
-    assert client.get(f"/api/assets/{a0['id']}/download", headers=h).status_code == 200
     assert client.get("/api/me", headers=h).json()["balance_credits"] == 970
 
     # appears in personal gallery with expiry info
@@ -403,6 +424,42 @@ def test_video_preview_settles_preview_cost(client, make_user, auth):
     assert client.get("/api/me", headers=h).json()["balance_credits"] == 985
 
 
+def test_video_final_can_generate_directly_without_preview_parent(client, make_user, auth):
+    make_user("13900001002", balance=1000, admin=True)
+    h = auth("13900001002")
+
+    r = client.put("/api/admin/models", json={
+        "use": "video",
+        "model_id": "mock-video",
+        "cost_credits": 50,
+        "unlock_cost": 0,
+        "enabled": True,
+        "admin_password": "pass123456",
+        "extra": {},
+    }, headers=h)
+    assert r.status_code == 200, r.text
+
+    r = client.post("/api/generate", json={
+        "category": "video",
+        "stage": "final",
+        "instruction": "direct final clip, product reveal",
+        "params": {"duration": 2, "resolution": "480p", "target_resolution": "480p"},
+    }, headers=h)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["stage"] == "final"
+    assert body["parent_task_id"] is None
+
+    t = client.get(f"/api/tasks/{body['id']}", headers=h).json()
+    assert t["status"] == "succeeded", t
+    assert t["stage"] == "final"
+    assert t["cost_frozen"] == 16
+    assert t["cost_settled"] == 16
+    assert t["assets"][0]["type"] == "video"
+    assert t["assets"][0]["unlocked"] is True
+    assert client.get("/api/me", headers=h).json()["balance_credits"] == 984
+
+
 def test_video_preview_adapts_ratio_and_cover_from_reference(
     client, make_user, auth, monkeypatch
 ):
@@ -553,7 +610,9 @@ def test_video_final_uses_selected_quality_and_reference_poster(
     assert seen["first_frame_image"].startswith("data:image/jpeg;base64,")
     task = client.get(f"/api/tasks/{r.json()['id']}", headers=h).json()
     assert urlparse(task["assets"][0]["preview_url"]).path.startswith("/media/preview/")
-    assert task["assets"][0]["unlocked"] is False
+    assert task["assets"][0]["unlocked"] is True
+    assert task["assets"][0]["unlock_cost"] == 0
+    assert task["assets"][0]["hd_url"]
 
 
 def test_video_final_is_idempotent_for_same_preview(client, make_user, auth, monkeypatch, tiny_mp4):
@@ -1019,10 +1078,10 @@ def test_image_generation_adapts_size_from_reference(client, make_user, auth, mo
     assert seen["size"] == "720x1280"
 
 
-def test_image_generation_adapts_size_from_reference_at_4k_default(client, make_user, auth, monkeypatch):
+def test_image_generation_adapts_size_from_reference_at_2k_default(client, make_user, auth, monkeypatch):
     make_user("13900000079", balance=1000, admin=True)
     h = auth("13900000079")
-    client.put("/api/admin/settings", json={"image_size": "2880x2880", "admin_password": "pass123456"}, headers=h)
+    client.put("/api/admin/settings", json={"image_size": "2048x2048", "admin_password": "pass123456"}, headers=h)
 
     seen = {}
 
@@ -1045,7 +1104,7 @@ def test_image_generation_adapts_size_from_reference_at_4k_default(client, make_
     }, headers=h)
     assert r.status_code == 200, r.text
 
-    assert seen["size"] == "2160x3840"
+    assert seen["size"] == "1152x2048"
 
 
 def test_insufficient_credits(client, make_user, auth):
@@ -1117,6 +1176,69 @@ def test_admin_guard(client, make_user, auth):
     assert client.get("/api/admin/users", headers=h).status_code == 403
 
 
+def test_admin_users_support_search_and_pagination(client, make_user, auth):
+    make_user("13900001001", admin=True)
+    make_user("13900001002", balance=10)
+    make_user("13900001003", balance=20)
+    ah = auth("13900001001")
+
+    all_rows = client.get("/api/admin/users?limit=1&offset=0", headers=ah)
+    assert all_rows.status_code == 200, all_rows.text
+    assert len(all_rows.json()) == 1
+
+    found = client.get("/api/admin/users?q=13900001002&limit=20", headers=ah)
+    assert found.status_code == 200, found.text
+    assert [u["phone"] for u in found.json()] == ["13900001002"]
+
+    admins = client.get("/api/admin/users?is_admin=true", headers=ah)
+    assert admins.status_code == 200, admins.text
+    assert any(u["phone"] == "13900001001" for u in admins.json())
+
+
+def test_admin_bulk_grant_updates_balances(client, make_user, auth):
+    make_user("13900001004", admin=True)
+    uid1 = make_user("13900001005", balance=10)
+    uid2 = make_user("13900001006", balance=20)
+    ah = auth("13900001004")
+
+    r = client.post("/api/admin/quota/bulk-grant", headers=ah, json={
+        "idempotency_key": "bulk-grant-test-001",
+        "items": [
+            {"user_id": uid1, "amount": 7, "note": "批量测试"},
+            {"user_id": uid2, "amount": 9, "note": "批量测试"},
+        ],
+    })
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert len(body["granted"]) == 2
+    assert body["failed"] == []
+
+    h1 = auth("13900001005")
+    h2 = auth("13900001006")
+    assert client.get("/api/me", headers=h1).json()["balance_credits"] == 17
+    assert client.get("/api/me", headers=h2).json()["balance_credits"] == 29
+
+    replay = client.post("/api/admin/quota/bulk-grant", headers=ah, json={
+        "idempotency_key": "bulk-grant-test-001",
+        "items": [
+            {"user_id": uid1, "amount": 7, "note": "批量测试"},
+            {"user_id": uid2, "amount": 9, "note": "批量测试"},
+        ],
+    })
+    assert replay.status_code == 200, replay.text
+    assert len(replay.json()["granted"]) == 2
+    assert client.get("/api/me", headers=h1).json()["balance_credits"] == 17
+    assert client.get("/api/me", headers=h2).json()["balance_credits"] == 29
+
+    conflict = client.post("/api/admin/quota/bulk-grant", headers=ah, json={
+        "idempotency_key": "bulk-grant-test-001",
+        "items": [
+            {"user_id": uid1, "amount": 8, "note": "批量测试"},
+        ],
+    })
+    assert conflict.status_code == 409
+
+
 def _gen(client, h, n=2):
     r = client.post("/api/generate", json={
         "source_asset_url": "http://x/y.png", "source_type": "image",
@@ -1181,6 +1303,266 @@ def test_favorite_and_delete(client, make_user, auth):
     assert not model_ref_path.exists()
     after = client.get("/api/profile/assets", headers=h).json()
     assert all(x["id"] != a["id"] for x in after)
+
+
+def test_profile_assets_filters_and_batch_operations(client, make_user, auth):
+    make_user("13900001007", balance=1000)
+    h = auth("13900001007")
+    tid = _gen(client, h, n=2)
+    task = client.get(f"/api/tasks/{tid}", headers=h).json()
+    asset_ids = [a["id"] for a in task["assets"]]
+    for asset_id in asset_ids:
+        assert client.post(f"/api/assets/{asset_id}/unlock", headers=h).status_code == 200
+
+    square = client.get("/api/profile/assets?type=image&model_use=image&size=square&min_width=1", headers=h)
+    assert square.status_code == 200, square.text
+    assert {a["id"] for a in square.json()} >= set(asset_ids)
+
+    dl = client.post("/api/assets/batch/download", headers=h, json={"asset_ids": asset_ids})
+    assert dl.status_code == 200, dl.text
+    assert dl.headers["content-type"].startswith("application/zip")
+
+    deleted = client.post("/api/assets/batch/delete", headers=h, json={"asset_ids": asset_ids})
+    assert deleted.status_code == 200, deleted.text
+    assert set(deleted.json()["deleted"]) == set(asset_ids)
+    after = client.get("/api/profile/assets", headers=h).json()
+    assert all(a["id"] not in asset_ids for a in after)
+
+
+def test_delete_asset_keeps_shared_underlying_file(client, make_user, auth):
+    uid = make_user("13900001018", balance=1000)
+    h = auth("13900001018")
+    key = storage.save_bytes(b"\x89PNG\r\n\x1a\nshared", "hd", "png")
+    path = storage.local_path(key)
+    db = SessionLocal()
+    try:
+        task = GenTask(
+            user_id=uid,
+            category="image",
+            stage="preview",
+            status="succeeded",
+        )
+        db.add(task)
+        db.flush()
+        first = GenAsset(
+            task_id=task.id,
+            user_id=uid,
+            type="image",
+            preview_url=storage.public_url(key),
+            hd_url=storage.public_url(key),
+            unlocked=True,
+            moderation_status="active",
+        )
+        second = GenAsset(
+            task_id=task.id,
+            user_id=uid,
+            type="image",
+            preview_url=storage.public_url(key),
+            hd_url=storage.public_url(key),
+            unlocked=True,
+            moderation_status="active",
+        )
+        db.add_all([first, second])
+        db.commit()
+        first_id = first.id
+        second_id = second.id
+    finally:
+        db.close()
+
+    deleted = client.delete(f"/api/assets/{first_id}", headers=h)
+
+    assert deleted.status_code == 200, deleted.text
+    assert path.exists()
+    download = client.get(f"/api/assets/{second_id}/download", headers=h)
+    assert download.status_code == 200, download.text
+
+
+def test_delete_reported_asset_detaches_report_history(client, make_user, auth):
+    uid = make_user("13900001019", balance=1000)
+    h = auth("13900001019")
+    db = SessionLocal()
+    try:
+        task = GenTask(
+            user_id=uid,
+            category="image",
+            stage="preview",
+            status="succeeded",
+        )
+        db.add(task)
+        db.flush()
+        asset = GenAsset(
+            task_id=task.id,
+            user_id=uid,
+            type="image",
+            preview_url="/media/preview/reported-delete.png",
+            moderation_status="active",
+        )
+        db.add(asset)
+        db.flush()
+        report = AssetReport(
+            asset_id=asset.id,
+            reporter_user_id=uid,
+            owner_user_id=uid,
+            reason="other",
+            status="open",
+        )
+        db.add(report)
+        db.commit()
+        asset_id = asset.id
+        report_id = report.id
+    finally:
+        db.close()
+
+    deleted = client.delete(f"/api/assets/{asset_id}", headers=h)
+
+    assert deleted.status_code == 200, deleted.text
+    db = SessionLocal()
+    try:
+        assert db.get(GenAsset, asset_id) is None
+        kept_report = db.get(AssetReport, report_id)
+        assert kept_report is not None
+        assert kept_report.asset_id is None
+    finally:
+        db.close()
+
+
+def test_cancel_queued_task_refunds_frozen_credits(client, make_user, auth):
+    uid = make_user("13900001008", balance=100)
+    h = auth("13900001008")
+    db = SessionLocal()
+    try:
+        task = GenTask(
+            user_id=uid,
+            category="image",
+            stage="preview",
+            prompt={"instruction": "queued"},
+            model_use="image",
+            params={"n": 1, "size": "256x256"},
+            status="queued",
+            cost_frozen=15,
+            cost_settled=0,
+        )
+        db.add(task)
+        db.flush()
+        from app.services import credits
+
+        credits.freeze(db, uid, 15, biz_ref=task.id, commit=False)
+        db.commit()
+        db.refresh(task)
+        task_id = task.id
+    finally:
+        db.close()
+
+    before = client.get("/api/me", headers=h).json()
+    assert before["balance_credits"] == 85
+    assert before["frozen_credits"] == 15
+    r = client.post(f"/api/tasks/{task_id}/cancel", headers=h)
+    assert r.status_code == 200, r.text
+    assert r.json()["status"] == "canceled"
+    after = client.get("/api/me", headers=h).json()
+    assert after["balance_credits"] == 100
+    assert after["frozen_credits"] == 0
+
+
+def test_cancel_running_task_marks_cancel_requested(client, make_user, auth):
+    uid = make_user("13900001018", balance=100)
+    h = auth("13900001018")
+    db = SessionLocal()
+    try:
+        task = GenTask(
+            user_id=uid,
+            category="image",
+            stage="preview",
+            prompt={"instruction": "running"},
+            model_use="image",
+            params={"n": 1, "size": "256x256"},
+            status="running",
+            cost_frozen=15,
+            cost_settled=0,
+        )
+        db.add(task)
+        db.commit()
+        task_id = task.id
+    finally:
+        db.close()
+
+    r = client.post(f"/api/tasks/{task_id}/cancel", headers=h)
+
+    assert r.status_code == 200, r.text
+    assert r.json()["status"] == "running"
+    db = SessionLocal()
+    try:
+        saved = db.get(GenTask, task_id)
+        assert saved.params["_cancel_requested"] is True
+        assert saved.error == "取消请求已提交，系统将在安全阶段停止任务"
+    finally:
+        db.close()
+
+
+def test_cancel_running_submitted_video_is_rejected(client, make_user, auth):
+    uid = make_user("13900001019", balance=100)
+    h = auth("13900001019")
+    db = SessionLocal()
+    try:
+        task = GenTask(
+            user_id=uid,
+            category="video",
+            stage="preview",
+            prompt={"instruction": "running video"},
+            model_use="video",
+            params={"duration": 5},
+            status="running",
+            phase="polling",
+            external_task_id="external-123",
+            cost_frozen=15,
+            cost_settled=0,
+        )
+        db.add(task)
+        db.commit()
+        task_id = task.id
+    finally:
+        db.close()
+
+    r = client.post(f"/api/tasks/{task_id}/cancel", headers=h)
+
+    assert r.status_code == 409
+    assert "外部网关" in r.text
+
+
+def test_prompt_history_crud_and_auto_record(client, make_user, auth):
+    make_user("13900001009", balance=1000)
+    h = auth("13900001009")
+
+    created = client.post("/api/prompts/history", headers=h, json={
+        "title": "产品图",
+        "prompt": "高端产品摄影，柔和布光",
+        "category": "image",
+        "source": "manual",
+        "favorite": True,
+    })
+    assert created.status_code == 200, created.text
+    prompt_id = created.json()["id"]
+
+    listed = client.get("/api/prompts/history?favorite=true&q=产品", headers=h)
+    assert listed.status_code == 200, listed.text
+    assert any(row["id"] == prompt_id for row in listed.json())
+
+    patched = client.patch(f"/api/prompts/history/{prompt_id}", headers=h, json={"increment_usage": True})
+    assert patched.status_code == 200, patched.text
+    assert patched.json()["usage_count"] == 1
+
+    tid = _gen(client, h, n=1)
+    assert client.get(f"/api/tasks/{tid}", headers=h).json()["status"] == "succeeded"
+    rows = client.get("/api/prompts/history?source=generate", headers=h).json()
+    assert any("生成提示词" in row["title"] for row in rows)
+
+    deleted = client.delete(f"/api/prompts/history/{prompt_id}", headers=h)
+    assert deleted.status_code == 200, deleted.text
+    db = SessionLocal()
+    try:
+        assert db.get(UserPrompt, prompt_id) is None
+    finally:
+        db.close()
 
 
 def test_retry_requires_failed(client, make_user, auth):

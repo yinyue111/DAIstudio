@@ -15,9 +15,9 @@ def test_ark_text_flags():
     assert "--watermark false" in t
 
 
-def test_ark_text_allows_15_min_duration():
-    t = gateway._ark_text("long ad sequence", {"duration": 900, "resolution": "1080p"})
-    assert "--duration 900" in t
+def test_ark_text_formats_duration_flag():
+    t = gateway._ark_text("long ad sequence", {"duration": 15, "resolution": "1080p"})
+    assert "--duration 15" in t
 
 
 def test_ark_content_image_to_video():
@@ -90,6 +90,30 @@ def test_ark_expired_status_is_failed(monkeypatch):
 
     assert res["status"] == "failed"
     assert res["error"] == "task expired"
+
+
+def test_ark_poll_extracts_nested_download_url(monkeypatch):
+    monkeypatch.setattr(settings, "mock_mode", False)
+    monkeypatch.setattr(settings, "video_gateway_base_url", "https://ark.example.com/api/v3")
+    monkeypatch.setattr(settings, "video_gateway_api_key", "test-key")
+    monkeypatch.setattr(settings, "video_gateway_format", "ark")
+    monkeypatch.setattr(
+        gateway,
+        "_video_get",
+        lambda *_args, **_kwargs: {
+            "status": "succeeded",
+            "content": {
+                "result": {
+                    "download_url": "https://cdn.example.com/ark-download.mp4",
+                },
+            },
+        },
+    )
+
+    res = gateway.poll_video("task-1", "doubao-seedance-1-5-pro-251215")
+
+    assert res["status"] == "succeeded"
+    assert res["url"] == "https://cdn.example.com/ark-download.mp4"
 
 
 def test_generic_video_submit_preserves_first_frame(monkeypatch):
@@ -247,7 +271,7 @@ def test_video_ark_uses_per_model_gateway_config(monkeypatch):
     task_id = gateway.submit_video(
         "animate",
         "doubao-seedance-x",
-        {"duration": 5, "ratio": "9:16"},
+        {"duration": 5, "resolution": "1080p", "ratio": "9:16", "seed": 42},
         gateway_config=cfg,
     )
 
@@ -255,6 +279,12 @@ def test_video_ark_uses_per_model_gateway_config(monkeypatch):
     assert seen["url"] == "https://ark.model.example.com/api/v3/contents/generations/tasks"
     assert seen["headers"]["Authorization"] == "Bearer ark-key"
     assert seen["json"]["model"] == "doubao-seedance-x"
+    assert seen["json"]["resolution"] == "1080p"
+    assert seen["json"]["duration"] == 5
+    assert seen["json"]["ratio"] == "9:16"
+    assert seen["json"]["seed"] == 42
+    assert seen["json"]["watermark"] is False
+    assert "--resolution 1080p" in seen["json"]["content"][0]["text"]
 
 
 def test_generic_video_poll_accepts_data_dict(monkeypatch):
@@ -275,6 +305,46 @@ def test_generic_video_poll_accepts_data_dict(monkeypatch):
 
     assert res["status"] == "succeeded"
     assert res["url"] == "https://cdn.example.com/video.mp4"
+
+
+def test_generic_video_poll_accepts_top_level_video_urls(monkeypatch):
+    monkeypatch.setattr(settings, "mock_mode", False)
+    monkeypatch.setattr(settings, "video_gateway_base_url", "https://video.example.com")
+    monkeypatch.setattr(settings, "video_gateway_api_key", "test-key")
+    monkeypatch.setattr(settings, "video_gateway_format", "openai")
+    monkeypatch.setattr(
+        gateway,
+        "_video_get",
+        lambda *_args, **_kwargs: {
+            "status": "succeeded",
+            "video_url": "https://cdn.example.com/video-url.mp4",
+            "download_url": "https://cdn.example.com/download-url.mp4",
+        },
+    )
+
+    res = gateway.poll_video("task-1", "video-model")
+
+    assert res["status"] == "succeeded"
+    assert res["url"] == "https://cdn.example.com/video-url.mp4"
+
+
+def test_generic_video_poll_url_encodes_task_id(monkeypatch):
+    monkeypatch.setattr(settings, "mock_mode", False)
+    monkeypatch.setattr(settings, "video_gateway_base_url", "https://video.example.com")
+    monkeypatch.setattr(settings, "video_gateway_api_key", "test-key")
+    monkeypatch.setattr(settings, "video_gateway_format", "openai")
+    seen = {}
+
+    def fake_get(path, timeout=30, config=None):
+        seen["path"] = path
+        return {"status": "running"}
+
+    monkeypatch.setattr(gateway, "_video_get", fake_get)
+
+    res = gateway.poll_video("task/a?b#c", "video-model")
+
+    assert seen["path"] == "/v1/videos/task%2Fa%3Fb%23c"
+    assert res["status"] == "running"
 
 
 def test_generic_video_request_id_lookup(monkeypatch):
@@ -300,10 +370,10 @@ def test_generic_video_request_id_lookup(monkeypatch):
     monkeypatch.setattr(gateway, "_video_get", fake_get)
 
     found = gateway.find_video_by_request_id(
-        "req-1",
-        "video-model",
+        "req/a?b#c",
+        "video/model",
         extra={
-            "request_query_path": "/v1/videos/by-request/{request_id}",
+            "request_query_path": "/v1/videos/by-request/{request_id}?model={model}",
             "request_query_result_path": "data.task",
             "request_query_id_field": "id",
             "request_query_status_field": "state",
@@ -311,7 +381,7 @@ def test_generic_video_request_id_lookup(monkeypatch):
         },
     )
 
-    assert seen == {"path": "/v1/videos/by-request/req-1", "timeout": 12}
+    assert seen == {"path": "/v1/videos/by-request/req%2Fa%3Fb%23c?model=video%2Fmodel", "timeout": 12}
     assert found["external_task_id"] == "task-from-request"
     assert found["status"] == "succeeded"
     assert found["url"] == "https://cdn.example.com/result.mp4"

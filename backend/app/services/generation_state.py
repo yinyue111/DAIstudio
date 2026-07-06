@@ -8,7 +8,8 @@ from sqlalchemy import update
 from ..models import GenTask
 
 NEEDS_REVIEW = "needs_review"
-TERMINAL_STATUSES = ("succeeded", "failed", NEEDS_REVIEW)
+CANCELED = "canceled"
+TERMINAL_STATUSES = ("succeeded", "failed", NEEDS_REVIEW, CANCELED)
 
 
 class VideoResultValidationError(RuntimeError):
@@ -31,7 +32,9 @@ def claim_terminal(db, task_id: int, status: str, *, error: str | None = None,
         values["error"] = error[:1000]
     if cost_settled is not None:
         values["cost_settled"] = cost_settled
-    blocked_statuses = ("succeeded", "failed") if status == "succeeded" else TERMINAL_STATUSES
+    # Success settlement is allowed to recover a needs_review task during admin
+    # reconciliation, but it must never revive a user-canceled task.
+    blocked_statuses = ("succeeded", "failed", CANCELED) if status == "succeeded" else TERMINAL_STATUSES
     res = db.execute(
         update(GenTask)
         .where(GenTask.id == task_id, GenTask.status.not_in(blocked_statuses))
@@ -42,3 +45,8 @@ def claim_terminal(db, task_id: int, status: str, *, error: str | None = None,
 
 def is_terminal_status(status: str | None) -> bool:
     return status in TERMINAL_STATUSES
+
+
+def cancel_requested(task: GenTask | None) -> bool:
+    params = getattr(task, "params", None) or {}
+    return bool(isinstance(params, dict) and params.get("_cancel_requested"))

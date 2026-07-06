@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { api } from "../../../lib/api";
 import { Card } from "./admin-ui";
 
@@ -27,6 +27,7 @@ export function VersionUpgrade() {
   const [msgKind, setMsgKind] = useState("ok");
   const [loading, setLoading] = useState(false);
   const [running, setRunning] = useState(false);
+  const runningRef = useRef(false);
 
   async function load(checkRemote = false, { preserveMessage = false } = {}) {
     setLoading(true);
@@ -54,14 +55,18 @@ export function VersionUpgrade() {
   useEffect(() => { load(false); }, []);
 
   async function runUpgrade() {
+    if (runningRef.current) return;
+    runningRef.current = true;
     if (!status?.enabled) {
       setMsg("在线版本升级未启用，请先在服务端设置 ONLINE_UPDATE_ENABLED=true 并重启后端。");
       setMsgKind("bad");
+      runningRef.current = false;
       return;
     }
     if (status?.dirty && !status?.allow_dirty) {
       setMsg("当前工作区有未提交改动，不能在线升级。请先提交或清理后再操作。");
       setMsgKind("bad");
+      runningRef.current = false;
       return;
     }
     setRunning(true);
@@ -70,49 +75,72 @@ export function VersionUpgrade() {
     const freshStatus = await load(true);
     if (!freshStatus || freshStatus.error) {
       setRunning(false);
+      runningRef.current = false;
       if (!freshStatus?.error) setMsg("远端版本检查失败，请稍后重试。");
       setMsgKind("bad");
       return;
     }
     if (freshStatus.dirty && !freshStatus.allow_dirty) {
       setRunning(false);
+      runningRef.current = false;
       setMsg("当前工作区有未提交改动，不能在线升级。请先提交或清理后再操作。");
       setMsgKind("bad");
       return;
     }
     if (!freshStatus.remote_head) {
       setRunning(false);
+      runningRef.current = false;
       setMsg("远端版本未检查成功，不能执行升级。请先确认 GitHub Token 和网络配置。");
       setMsgKind("bad");
       return;
     }
-    if (freshStatus.current_head && freshStatus.current_head === freshStatus.remote_head) {
+    const reapplyCurrent = Boolean(
+      freshStatus.current_head
+      && freshStatus.current_head === freshStatus.remote_head
+      && freshStatus.apply_command_configured,
+    );
+    if (freshStatus.current_head && freshStatus.current_head === freshStatus.remote_head && !reapplyCurrent) {
       setRunning(false);
-      setMsg("当前已经是最新版本，无需执行升级。");
+      runningRef.current = false;
+      setMsg("当前已经是最新版本，且没有配置生效命令。");
       setMsgKind("ok");
+      return;
+    }
+    if (freshStatus.current_head !== freshStatus.remote_head && !freshStatus.apply_command_configured) {
+      setRunning(false);
+      runningRef.current = false;
+      setMsg("检测到新版本，但未配置安全的生效命令。请先在服务端配置 ONLINE_UPDATE_APPLY_COMMAND 后再升级，避免代码已更新但服务未重启/迁移未执行。");
+      setMsgKind("bad");
       return;
     }
     const applyText = freshStatus.apply_command_configured
       ? "升级完成后会执行服务端配置的生效命令。"
-      : "当前没有配置生效命令，代码更新后可能仍需手动重启服务。";
+      : "当前没有配置生效命令，只能在已是最新版本时重新检查状态。";
     if (!window.confirm(
-      `确认从 ${freshStatus.remote}/${freshStatus.branch} 拉取新代码并升级？\n` +
+      (reapplyCurrent
+        ? `当前代码已是最新版本，确认重新执行生效命令？\n`
+        : `确认从 ${freshStatus.remote}/${freshStatus.branch} 拉取新代码并升级？\n`) +
       `当前版本：${shortSha(freshStatus.current_head)}\n` +
       `远端版本：${shortSha(freshStatus.remote_head)}\n${applyText}`,
     )) {
       setRunning(false);
+      runningRef.current = false;
       return;
     }
     setMsg("");
     setMsgKind("ok");
     setResult(null);
     try {
-      const data = await api.adminRunUpdate({ apply: true, confirm: "UPDATE" });
+      const data = await api.adminRunUpdate({
+        apply: true,
+        confirm: "UPDATE",
+        force_apply: reapplyCurrent,
+      });
       setResult(data);
       if (!data.ok) {
         setMsg(data.partial_failure
-          ? "代码已更新，但生效命令执行失败。请查看输出并手动恢复/重试生效命令。"
-          : "生效命令执行失败。请查看输出并修复后重试。");
+          ? "生效命令执行失败，且自动回滚未完成。请查看输出并手动恢复。"
+          : "生效命令执行失败，代码已回滚到升级前版本。请查看输出并修复后重试。");
         setMsgKind("bad");
       } else if (data.changed) {
         setMsg("版本升级已完成");
@@ -130,6 +158,7 @@ export function VersionUpgrade() {
       setMsgKind("bad");
     } finally {
       setRunning(false);
+      runningRef.current = false;
     }
   }
 
@@ -143,7 +172,11 @@ export function VersionUpgrade() {
   }
 
   const currentIsRemote = status.current_head && status.remote_head && status.current_head === status.remote_head;
-  const upgradeDisabled = running || !status.enabled || !!status.error || !status.remote_head || currentIsRemote;
+  const canReapplyCurrent = Boolean(currentIsRemote && status.apply_command_configured);
+  const updateRequiresApplyCommand = Boolean(status.current_head && status.remote_head && !currentIsRemote && !status.apply_command_configured);
+  const upgradeDisabled = running || !status.enabled || !!status.error || !status.remote_head
+    || updateRequiresApplyCommand
+    || (currentIsRemote && !canReapplyCurrent);
 
   return (
     <div className="space-y-4">
@@ -160,7 +193,7 @@ export function VersionUpgrade() {
               {loading ? "刷新中…" : "检查远端版本"}
             </button>
             <button onClick={runUpgrade} disabled={upgradeDisabled} className="btn-primary btn-sm">
-              {running ? "升级中…" : "从 GitHub 更新并生效"}
+              {running ? "升级中…" : updateRequiresApplyCommand ? "需先配置生效命令" : canReapplyCurrent ? "重新执行生效命令" : "从 GitHub 更新并生效"}
             </button>
           </div>
         </div>

@@ -3,20 +3,16 @@ import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-const root = dirname(dirname(fileURLToPath(import.meta.url)));
-const source = readFileSync(join(root, "app/studio/taskConcurrency.js"), "utf8")
-  .replace(/"use client";\s*/, "")
-  .replace(/import\s+\{\s*isTerminalTaskStatus\s*\}\s+from\s+"\.\/helpers\.js";\s*/, "")
-  .replaceAll("export function", "function");
-const pageSource = readFileSync(join(root, "app/page.jsx"), "utf8");
-const versionUpgradeSource = readFileSync(join(root, "app/admin/components/version-upgrade.jsx"), "utf8");
+import { generationSubmitDisabled, shouldBlockNewGeneration } from "../app/studio/taskConcurrency.ts";
 
-const isTerminalTaskStatus = (status) => new Set(["succeeded", "failed", "needs_review"]).has(status);
-const { shouldBlockNewGeneration, generationSubmitDisabled } = new Function(
-  "isTerminalTaskStatus",
-  `${source}
-  return { shouldBlockNewGeneration, generationSubmitDisabled };`
-)(isTerminalTaskStatus);
+const root = dirname(dirname(fileURLToPath(import.meta.url)));
+const pageSource = readFileSync(join(root, "app/page.jsx"), "utf8");
+const taskTrackingSource = readFileSync(join(root, "hooks/useTaskTracking.js"), "utf8");
+const studioRuntimeSource = `${pageSource}\n${taskTrackingSource}`;
+const studioHelpersSource = readFileSync(join(root, "app/studio/helpers.ts"), "utf8");
+const studioResultsSource = readFileSync(join(root, "app/studio/StudioResults.jsx"), "utf8");
+const viewModelSource = readFileSync(join(root, "app/studio/viewModel.ts"), "utf8");
+const versionUpgradeSource = readFileSync(join(root, "app/admin/components/version-upgrade.jsx"), "utf8");
 
 assert.equal(
   shouldBlockNewGeneration({ category: "image", status: "running" }, "image"),
@@ -44,6 +40,11 @@ assert.equal(
   "terminal tasks should not block new generation",
 );
 assert.equal(
+  shouldBlockNewGeneration({ category: "video", status: "canceled" }, "video"),
+  false,
+  "canceled tasks should not block new generation",
+);
+assert.equal(
   generationSubmitDisabled({
     submitting: true,
     currentTask: null,
@@ -59,24 +60,49 @@ assert.match(
   "studio should restore active tasks from backend on initial load",
 );
 assert.match(
-  pageSource,
+  studioRuntimeSource,
   /item\.category\s*===\s*"video"/,
   "restored task guard should focus on long-running video tasks",
 );
 assert.match(
-  pageSource,
+  studioRuntimeSource,
   /startTracking\(active\.id\)/,
   "restored active tasks should resume websocket/poll tracking",
 );
 assert.match(
-  pageSource,
+  studioHelpersSource,
+  /canceled:\s*"已取消"/,
+  "studio status labels should render canceled tasks as canceled, not raw enum text",
+);
+assert.doesNotMatch(
+  studioResultsSource,
+  /hasPendingFinal|finalStatus/,
+  "studio results should no longer expose preview-to-final render cancellation state",
+);
+assert.match(
+  taskTrackingSource,
+  /api\.cancelTask\(task\.id\)/,
+  "studio cancellation should submit the currently tracked direct generation task",
+);
+assert.doesNotMatch(
+  taskTrackingSource,
+  /final_status|final_task_id/,
+  "studio cancellation should not depend on hidden final child task state",
+);
+assert.match(
+  viewModelSource,
   /cfg\?\.features\?\.reverse_prompt_enabled\s*!==\s*false/,
   "reverse prompt UI should consume normalized feature flags, not raw defaults",
 );
+assert.doesNotMatch(
+  pageSource,
+  /reverse_prompt_enabled/,
+  "main page should not own reverse feature flag normalization",
+);
 assert.match(
   versionUpgradeSource,
-  /adminRunUpdate\(\{\s*apply:\s*true,\s*confirm:\s*"UPDATE"\s*\}\)/,
-  "online update apply requests should include the explicit confirmation code",
+  /adminRunUpdate\(\{[\s\S]*apply:\s*true,[\s\S]*confirm:\s*"UPDATE",[\s\S]*force_apply:\s*reapplyCurrent,[\s\S]*\}\)/,
+  "online update apply requests should include the confirmation code and explicit reapply flag",
 );
 
 console.log("studio concurrency test passed");

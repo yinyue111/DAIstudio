@@ -49,6 +49,21 @@ export default function AdminPage() {
     }).catch(() => router.push(loginPath()));
   }, [router]);
 
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const nextTab = params.get("tab");
+    if (TAB_COMPONENTS[nextTab]) setTab(nextTab);
+  }, []);
+
+  function selectTab(nextTab) {
+    setTab(nextTab);
+    const params = new URLSearchParams(window.location.search);
+    if (nextTab === "whitelist") params.delete("tab");
+    else params.set("tab", nextTab);
+    const query = params.toString();
+    router.replace(query ? `/admin?${query}` : "/admin", { scroll: false });
+  }
+
   if (!me) return <div className="p-10 text-sm text-mist">加载中…</div>;
 
   return (
@@ -64,7 +79,7 @@ export default function AdminPage() {
           {TABS.map(([k, label]) => (
             <button
               key={k}
-              onClick={() => setTab(k)}
+              onClick={() => selectTab(k)}
               className={`rounded-full px-4 py-1.5 text-sm font-display font-medium transition-all ${
                 tab === k ? "bg-brand text-white shadow-glow-sm" : "text-mist hover:bg-white/5 hover:text-snow"
               }`}

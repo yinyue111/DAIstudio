@@ -39,7 +39,7 @@ alembic-check: ## Check Alembic migration drift against models
 	cd backend && .venv/bin/alembic check
 
 audit: ## Audit dependencies for known vulnerabilities (backend + frontend)
-	cd backend && .venv/bin/pip install -q pip-audit && .venv/bin/pip-audit
+	cd backend && .venv/bin/python -m pip_audit --progress-spinner off
 	cd frontend && npm audit --omit=dev --audit-level=high --registry=https://registry.npmjs.org
 
 run-api: ## Run the API (reload)
@@ -52,7 +52,7 @@ run-beat: ## Run the Celery beat scheduler (single instance)
 	./scripts/run_beat.sh
 
 run-frontend: ## Run the frontend dev server
-	cd frontend && npm run dev
+	./scripts/run_frontend.sh
 
 build-frontend: ## Production build of the frontend
 	cd frontend && npm run build
@@ -71,15 +71,22 @@ docker-build-check: ## Build backend/frontend Docker images without starting ser
 	POSTGRES_PASSWORD="$${POSTGRES_PASSWORD:-release-check-postgres-password}" \
 		docker compose build api frontend
 
-release-check: compile lint alembic-check test test-frontend build-frontend compose-check docker-build-check ## Run local release gates against the same clean HEAD artifact as CI
+release-check: compile lint alembic-check test test-frontend build-frontend compose-check docker-build-check audit ## Run local release gates against the same clean HEAD artifact as CI
 	tmp="$$(mktemp -d)" && \
 		git archive --format=tar.gz --output="$$tmp/ai-studio-source.tar.gz" HEAD && \
 		python3 scripts/check_release_artifact.py "$$tmp/ai-studio-source.tar.gz" && \
 		rm -rf "$$tmp"
 	find . -maxdepth 3 \( -name .venv -o -name .next -o -name node_modules \) -type d -print | sort
 
-release-check-worktree: compile lint alembic-check test test-frontend build-frontend compose-check docker-build-check ## Run release gates against tracked + untracked worktree files
+release-check-worktree: compile lint alembic-check test test-frontend build-frontend compose-check docker-build-check audit ## Run release gates against tracked + untracked worktree files
 	tmp="$$(mktemp -d)" && \
+		deleted="$$(git ls-files --deleted)" && \
+		if [ -n "$$deleted" ]; then \
+			echo "release-check-worktree: tracked files are deleted in the worktree; commit the deletion or restore them first:" >&2; \
+			printf '%s\n' "$$deleted" >&2; \
+			rm -rf "$$tmp"; \
+			exit 1; \
+		fi && \
 		git ls-files -z --cached --others --exclude-standard | \
 		tar --null -czf "$$tmp/ai-studio-source.tar.gz" --files-from - && \
 		python3 scripts/check_release_artifact.py "$$tmp/ai-studio-source.tar.gz" && \

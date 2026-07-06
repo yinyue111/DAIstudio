@@ -29,7 +29,16 @@ from app.models import (
     User,
 )
 from app.redis_client import redis_client
-from app.services import asset_refs, credits, gateway, generation, locks, ssrf, storage
+from app.services import (
+    asset_refs,
+    credits,
+    gateway,
+    generation,
+    generation_common,
+    locks,
+    ssrf,
+    storage,
+)
 from app.services.ssrf import SsrfError, assert_safe_user_asset_url
 
 
@@ -83,6 +92,87 @@ def test_double_fail_refunds_once(client, make_user):
     db = SessionLocal()
     try:
         assert db.get(User, uid).balance_credits == 100  # refunded once, not 110
+    finally:
+        db.close()
+
+
+def test_fail_and_refund_holds_for_review_when_refund_fails(client, make_user, monkeypatch):
+    """Worker failure settlement must not roll a task back into an active state."""
+    uid = make_user("13900000052", balance=100)
+    db = SessionLocal()
+    try:
+        t = GenTask(user_id=uid, category="image", stage="preview",
+                    status="running", phase="submitting", cost_frozen=10)
+        db.add(t)
+        db.flush()
+        credits.freeze(db, uid, 10, biz_ref=t.id, commit=False)
+        db.commit()
+        tid = t.id
+        user_after_freeze = db.get(User, uid)
+        frozen_after_freeze = user_after_freeze.frozen_credits
+        balance_after_freeze = user_after_freeze.balance_credits
+    finally:
+        db.close()
+
+    def fail_refund(*_args, **_kwargs):
+        raise RuntimeError("ledger mismatch")
+
+    monkeypatch.setattr(generation_common.credits, "refund", fail_refund)
+    d = SessionLocal()
+    try:
+        generation_common.fail_and_refund(d, tid, "provider timeout")
+    finally:
+        d.close()
+
+    db = SessionLocal()
+    try:
+        task = db.get(GenTask, tid)
+        assert task.status == "needs_review"
+        assert task.phase == "reconciling"
+        assert "自动退款失败" in task.error
+        user = db.get(User, uid)
+        assert user.frozen_credits == frozen_after_freeze
+        assert user.balance_credits == balance_after_freeze
+    finally:
+        db.close()
+
+
+def test_cancel_and_refund_holds_for_review_when_refund_fails(client, make_user, monkeypatch):
+    uid = make_user("13900000053", balance=100)
+    db = SessionLocal()
+    try:
+        t = GenTask(user_id=uid, category="image", stage="preview",
+                    status="queued", phase=None, cost_frozen=10)
+        db.add(t)
+        db.flush()
+        credits.freeze(db, uid, 10, biz_ref=t.id, commit=False)
+        db.commit()
+        tid = t.id
+        user_after_freeze = db.get(User, uid)
+        frozen_after_freeze = user_after_freeze.frozen_credits
+        balance_after_freeze = user_after_freeze.balance_credits
+    finally:
+        db.close()
+
+    def fail_refund(*_args, **_kwargs):
+        raise RuntimeError("ledger mismatch")
+
+    monkeypatch.setattr(generation_common.credits, "refund", fail_refund)
+    d = SessionLocal()
+    try:
+        generation_common.cancel_and_refund(d, tid, "用户已取消任务")
+    finally:
+        d.close()
+
+    db = SessionLocal()
+    try:
+        task = db.get(GenTask, tid)
+        assert task.status == "needs_review"
+        assert task.phase == "reconciling"
+        assert "自动取消退款失败" in task.error
+        user = db.get(User, uid)
+        assert user.frozen_credits == frozen_after_freeze
+        assert user.balance_credits == balance_after_freeze
     finally:
         db.close()
 
@@ -534,6 +624,20 @@ def test_cookie_auth_post_allows_configured_frontend_origin(client, make_user):
     assert ok.status_code == 200, ok.text
 
 
+def test_payment_frontend_origin_is_not_global_csrf_origin(client, make_user, monkeypatch):
+    monkeypatch.setattr(settings, "payment_frontend_base_url", "https://pay.example.com")
+    make_user("13900000192", password="pass123456")
+    login = client.post(
+        "/api/auth/login",
+        json={"phone": "13900000192", "password": "pass123456"},
+    )
+    assert login.status_code == 200, login.text
+
+    blocked = client.post("/api/me/logout", headers={"Origin": "https://pay.example.com"})
+    assert blocked.status_code == 403
+    assert "CSRF origin check failed" in blocked.text
+
+
 def test_bearer_post_with_cookie_is_not_csrf_blocked(client, make_user, auth):
     make_user("13900000195", password="pass123456")
     h = auth("13900000195")
@@ -844,6 +948,21 @@ def test_production_rejects_unsupported_jwt_algorithm(monkeypatch):
     monkeypatch.setattr(settings, "debug", True)
     monkeypatch.setattr(settings, "jwt_algorithm", "none")
     with pytest.raises(RuntimeError, match="JWT_ALGORITHM"):
+        validate_runtime_config()
+
+
+def test_runtime_rejects_invalid_celery_soft_time_limit(monkeypatch):
+    monkeypatch.setattr(settings, "celery_task_time_limit_seconds", 100)
+    monkeypatch.setattr(settings, "celery_task_soft_time_limit_seconds", 100)
+    with pytest.raises(RuntimeError, match="SOFT_TIME_LIMIT"):
+        validate_runtime_config()
+
+
+def test_runtime_rejects_incomplete_s3_storage(monkeypatch):
+    monkeypatch.setattr(settings, "storage_backend", "s3")
+    monkeypatch.setattr(settings, "storage_s3_bucket", "")
+    monkeypatch.setattr(settings, "storage_s3_public_base_url", "")
+    with pytest.raises(RuntimeError, match="STORAGE_BACKEND=s3"):
         validate_runtime_config()
 
 
@@ -1211,6 +1330,7 @@ def test_parse_localize_respects_user_storage_quota(client, make_user, auth, mon
 def test_parse_localizes_all_images_not_just_first_eight(client, make_user, auth, monkeypatch):
     make_user("13900000189", balance=1000)
     h = auth("13900000189")
+    monkeypatch.setattr(settings, "parse_localize_max_assets", 20)
     monkeypatch.setattr(
         "app.routers.parse.parse_url",
         lambda _url: [
@@ -1236,6 +1356,72 @@ def test_parse_localizes_all_images_not_just_first_eight(client, make_user, auth
     assert assets[-1]["original_url"] == "https://cdn.example.com/full-9.jpg"
 
 
+def test_parse_localize_uses_parse_specific_download_timeout(
+    client,
+    make_user,
+    auth,
+    monkeypatch,
+):
+    make_user("13900000191", balance=1000)
+    h = auth("13900000191")
+    seen = {}
+    monkeypatch.setattr(settings, "parse_localize_download_timeout_seconds", 7)
+    monkeypatch.setattr(
+        "app.routers.parse.parse_url",
+        lambda _url: [
+            {
+                "type": "image",
+                "url": "https://cdn.example.com/full.jpg",
+                "thumb": "https://cdn.example.com/thumb.jpg",
+            }
+        ],
+    )
+
+    def fake_download(*_args, **kwargs):
+        seen.update(kwargs)
+        return _png_bytes()
+
+    monkeypatch.setattr("app.services.gateway.download_bytes_limited", fake_download)
+
+    r = client.post("/api/parse", json={"url": "https://www.xiaohongshu.com/explore/timeout"}, headers=h)
+
+    assert r.status_code == 200, r.text
+    assert r.json()["assets"]
+    assert seen["timeout_seconds"] == 7
+
+
+def test_parse_localize_respects_localization_cap(client, make_user, auth, monkeypatch):
+    make_user("13900000192", balance=1000)
+    h = auth("13900000192")
+    calls = []
+    monkeypatch.setattr(settings, "parse_localize_max_assets", 3)
+    monkeypatch.setattr(
+        "app.routers.parse.parse_url",
+        lambda _url: [
+            {
+                "type": "image",
+                "url": f"https://cdn.example.com/full-{idx}.jpg",
+                "thumb": f"https://cdn.example.com/thumb-{idx}.jpg",
+            }
+            for idx in range(10)
+        ],
+    )
+
+    def fake_localize(url, *_args, **_kwargs):
+        calls.append(url)
+        return f"http://localhost:8000/media/preview/{url.rsplit('-', 1)[-1].replace('.jpg', '.png')}"
+
+    monkeypatch.setattr("app.routers.parse._localize_media_url", fake_localize)
+
+    r = client.post("/api/parse", json={"url": "https://www.xiaohongshu.com/explore/capped"}, headers=h)
+
+    assert r.status_code == 200, r.text
+    assets = r.json()["assets"]
+    assert len(assets) == 3
+    assert len(calls) == 3
+    assert assets[-1]["original_url"] == "https://cdn.example.com/full-2.jpg"
+
+
 def test_parse_submit_returns_queued_when_worker_is_async(client, make_user, auth, monkeypatch):
     make_user("13900000186", balance=1000)
     h = auth("13900000186")
@@ -1243,8 +1429,8 @@ def test_parse_submit_returns_queued_when_worker_is_async(client, make_user, aut
 
     class _Delay:
         @staticmethod
-        def delay(parse_id):
-            queued_ids.append(parse_id)
+        def apply_async(args=None, kwargs=None, **_options):
+            queued_ids.append((args or [None])[0])
 
     monkeypatch.setattr("app.tasks.parse_url_task", _Delay)
     monkeypatch.setitem(celery_app.conf, "task_always_eager", False)
@@ -1500,6 +1686,190 @@ def test_asset_report_requires_asset_owner(client, make_user, auth):
         db.close()
 
 
+def test_4k_download_serves_actual_gateway_result(client, make_user, auth):
+    owner_id = make_user("13900000194", balance=1000)
+    owner_h = auth("13900000194")
+    key = storage.save_bytes(_png_bytes(size=(941, 1672)), "hd", "png")
+    db = SessionLocal()
+    try:
+        task = GenTask(
+            user_id=owner_id,
+            category="image",
+            stage="preview",
+            status="succeeded",
+            cost_frozen=100,
+            cost_settled=100,
+            params={"size": "2160x3840"},
+        )
+        db.add(task)
+        db.flush()
+        asset = GenAsset(
+            task_id=task.id,
+            user_id=owner_id,
+            type="image",
+            preview_url=storage.public_url(key),
+            hd_url=storage.public_url(key),
+            width=941,
+            height=1672,
+            watermarked=False,
+            unlocked=True,
+            moderation_status="active",
+        )
+        db.add(asset)
+        db.commit()
+        asset_id = asset.id
+    finally:
+        db.close()
+
+    r = client.get(f"/api/assets/{asset_id}/download", headers=owner_h)
+
+    assert r.status_code == 200, r.text
+    assert r.headers["content-type"].startswith("image/png")
+
+
+def test_small_actual_gateway_result_is_exposed_as_downloadable_hd(client, make_user, auth):
+    owner_id = make_user("13900000195", balance=1000)
+    owner_h = auth("13900000195")
+    key = storage.save_bytes(_png_bytes(size=(1023, 1537)), "hd", "png")
+    db = SessionLocal()
+    try:
+        task = GenTask(
+            user_id=owner_id,
+            category="image",
+            stage="preview",
+            status="succeeded",
+            cost_frozen=100,
+            cost_settled=100,
+            params={"size": "2352x3520"},
+        )
+        db.add(task)
+        db.flush()
+        asset = GenAsset(
+            task_id=task.id,
+            user_id=owner_id,
+            type="image",
+            preview_url=storage.public_url(key),
+            hd_url=storage.public_url(key),
+            width=1023,
+            height=1537,
+            watermarked=False,
+            unlocked=True,
+            moderation_status="active",
+        )
+        db.add(asset)
+        db.commit()
+        task_id = task.id
+        asset_id = asset.id
+    finally:
+        db.close()
+
+    task_out = client.get(f"/api/tasks/{task_id}", headers=owner_h)
+    assert task_out.status_code == 200, task_out.text
+    asset_out = next(a for a in task_out.json()["assets"] if a["id"] == asset_id)
+    assert asset_out["unlocked"] is True
+    assert asset_out["hd_url"]
+    assert asset_out["quality_status"] == "ok"
+    assert asset_out["quality_message"] is None
+
+    gallery = client.get("/api/profile/assets", headers=owner_h)
+    assert gallery.status_code == 200, gallery.text
+    gallery_asset = next(a for a in gallery.json() if a["id"] == asset_id)
+    assert gallery_asset["hd_url"]
+    assert gallery_asset["quality_status"] == "ok"
+
+
+def test_actual_gateway_result_state_survives_asset_mutation_endpoints(client, make_user, auth):
+    owner_id = make_user("13900000296", balance=1000)
+    owner_h = auth("13900000296")
+    key = storage.save_bytes(_png_bytes(size=(1023, 1537)), "hd", "png")
+    db = SessionLocal()
+    try:
+        task = GenTask(
+            user_id=owner_id,
+            category="image",
+            stage="preview",
+            status="succeeded",
+            cost_frozen=100,
+            cost_settled=100,
+            params={"size": "2352x3520"},
+        )
+        db.add(task)
+        db.flush()
+        asset = GenAsset(
+            task_id=task.id,
+            user_id=owner_id,
+            type="image",
+            preview_url=storage.public_url(key),
+            hd_url=storage.public_url(key),
+            width=1023,
+            height=1537,
+            watermarked=False,
+            unlocked=True,
+            moderation_status="active",
+        )
+        db.add(asset)
+        db.commit()
+        asset_id = asset.id
+    finally:
+        db.close()
+
+    unlock = client.post(f"/api/assets/{asset_id}/unlock", headers=owner_h)
+    assert unlock.status_code == 200, unlock.text
+    assert unlock.json()["hd_url"]
+    assert unlock.json()["quality_status"] == "ok"
+
+    favorite = client.post(f"/api/assets/{asset_id}/favorite", headers=owner_h)
+    assert favorite.status_code == 200, favorite.text
+    assert favorite.json()["hd_url"]
+    assert favorite.json()["quality_status"] == "ok"
+
+
+def test_2k_actual_gateway_result_remains_downloadable(client, make_user, auth):
+    owner_id = make_user("13900000295", balance=1000)
+    owner_h = auth("13900000295")
+    key = storage.save_bytes(_png_bytes(size=(1024, 1024)), "hd", "png")
+    db = SessionLocal()
+    try:
+        task = GenTask(
+            user_id=owner_id,
+            category="image",
+            stage="preview",
+            status="succeeded",
+            cost_frozen=40,
+            cost_settled=40,
+            params={"size": "2048x2048"},
+        )
+        db.add(task)
+        db.flush()
+        asset = GenAsset(
+            task_id=task.id,
+            user_id=owner_id,
+            type="image",
+            preview_url=storage.public_url(key),
+            hd_url=storage.public_url(key),
+            width=1024,
+            height=1024,
+            watermarked=False,
+            unlocked=True,
+            moderation_status="active",
+        )
+        db.add(asset)
+        db.commit()
+        task_id = task.id
+        asset_id = asset.id
+    finally:
+        db.close()
+
+    task_out = client.get(f"/api/tasks/{task_id}", headers=owner_h)
+    assert task_out.status_code == 200, task_out.text
+    asset_out = next(a for a in task_out.json()["assets"] if a["id"] == asset_id)
+    assert asset_out["hd_url"]
+    assert asset_out["quality_status"] == "ok"
+
+    r = client.get(f"/api/assets/{asset_id}/download", headers=owner_h)
+    assert r.status_code == 200, r.text
+
+
 def test_orphaned_generated_preview_file_cannot_drive_reference_generation(
     client, make_user, auth
 ):
@@ -1609,6 +1979,15 @@ def test_key_from_url_blocks_traversal():
     assert storage.key_from_url(f"{base}/media/tmp/x.png") is None
     assert storage.key_from_url("https://evil.example.com/media/preview/abc.png") is None
     assert storage.key_from_url("https://external.example.com/img.png") is None
+
+
+def test_s3_public_url_and_key_mapping(monkeypatch):
+    monkeypatch.setattr(storage.settings, "storage_backend", "s3")
+    monkeypatch.setattr(storage.settings, "storage_s3_public_base_url", "https://media.example.com/ai")
+    assert storage.public_url("preview/abc.png") == "https://media.example.com/ai/preview/abc.png"
+    assert storage.upload_api_url("upload/ref.png") == "https://media.example.com/ai/upload/ref.png"
+    assert storage.key_from_url("https://media.example.com/ai/preview/abc.png") == "preview/abc.png"
+    assert storage.key_from_url("https://media.example.com/other/preview/abc.png") is None
 
 
 def test_user_asset_local_media_must_be_valid_storage_url():

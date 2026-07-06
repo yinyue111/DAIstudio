@@ -1,7 +1,22 @@
 "use client";
 
-import { ReferenceAssetPreview } from "./StudioMedia";
-import { selectedLabel } from "./helpers";
+import { ReferenceAssetPreview } from "./StudioMedia.jsx";
+import { assetDims, selectedLabel } from "./helpers";
+
+function referencePreviewFrameProps(asset) {
+  const dims = assetDims(asset);
+  if (!dims) return { className: "relative aspect-video" };
+  const ratio = dims.width / dims.height;
+  const heightClass = ratio < 0.85
+    ? "min-h-[240px] max-h-[360px] sm:max-h-[420px]"
+    : ratio > 1.9
+      ? "min-h-[140px] max-h-[240px]"
+      : "min-h-[180px] max-h-[320px]";
+  return {
+    className: `relative w-full ${heightClass}`,
+    style: { aspectRatio: `${dims.width} / ${dims.height}` },
+  };
+}
 
 export default function StudioReferencePanel({
   category,
@@ -15,6 +30,7 @@ export default function StudioReferencePanel({
   setUrl,
   parsing,
   uploading,
+  productBusy = false,
   assets,
   refOpen,
   setRefOpen,
@@ -45,6 +61,7 @@ export default function StudioReferencePanel({
       : "general";
   const productGenerationMode = subjectMode === "product";
   const portraitGenerationMode = subjectMode === "portrait";
+  const productActionBusy = Boolean(uploading || productBusy);
   const modeTitle = isEditMode
     ? (creationMode === "video_edit" ? (portraitGenerationMode ? "视频人物重构" : "图生视频重构") : "图片编辑")
     : (category === "video" ? "视频参考" : "链接反推");
@@ -107,7 +124,7 @@ export default function StudioReferencePanel({
             <div className={`overflow-hidden rounded-xl2 border bg-black/20 ${
               productAsset ? "border-aqua/60" : "border-dashed border-aqua/30"
             }`}>
-              <div className="relative aspect-video">
+              <div {...referencePreviewFrameProps(productAsset)}>
                 {productAsset ? (
                   <>
                     <ReferenceAssetPreview asset={productAsset} />
@@ -119,6 +136,7 @@ export default function StudioReferencePanel({
                   <button
                     type="button"
                     onClick={() => productUploadInputRef.current?.click()}
+                    disabled={productActionBusy}
                     className="flex h-full w-full flex-col items-center justify-center gap-3 px-4 text-center transition hover:bg-white/[0.03]"
                   >
                     <span className="flex h-11 w-11 items-center justify-center rounded-full bg-aqua text-lg text-black shadow-glow-sm">+</span>
@@ -149,10 +167,10 @@ export default function StudioReferencePanel({
             <button
               type="button"
               onClick={() => productUploadInputRef.current?.click()}
-              disabled={uploading}
+              disabled={productActionBusy}
               className="btn-secondary btn-sm mt-2 w-full justify-center border-aqua/30 bg-aqua/10 text-snow"
             >
-              {uploading ? "上传中…" : productAsset
+              {uploading ? "上传中…" : productBusy ? "识别中…" : productAsset
                 ? (portraitGenerationMode ? "替换人物照片" : productGenerationMode ? "替换产品图片" : "替换编辑源图片")
                 : (portraitGenerationMode ? "上传人物照片" : productGenerationMode ? "上传产品图片" : "上传编辑源图片")}
             </button>
@@ -174,7 +192,7 @@ export default function StudioReferencePanel({
           <div className={`overflow-hidden rounded-xl2 border bg-black/20 ${
             selected ? "border-iris/60" : "border-dashed border-line2"
           }`}>
-            <div className="relative aspect-video">
+            <div {...referencePreviewFrameProps(selected)}>
               {selected ? (
                 <>
                   <ReferenceAssetPreview asset={selected} />
@@ -231,7 +249,7 @@ export default function StudioReferencePanel({
             <div className={`overflow-hidden rounded-xl2 border bg-black/20 ${
               productAsset ? "border-aqua/60" : "border-dashed border-aqua/30"
             }`}>
-              <div className="relative aspect-video">
+              <div {...referencePreviewFrameProps(productAsset)}>
                 {productAsset ? (
                   <>
                     <ReferenceAssetPreview asset={productAsset} />
@@ -243,6 +261,7 @@ export default function StudioReferencePanel({
                   <button
                     type="button"
                     onClick={() => productUploadInputRef.current?.click()}
+                    disabled={productActionBusy}
                     className="flex h-full w-full flex-col items-center justify-center gap-3 px-4 text-center transition hover:bg-white/[0.03]"
                   >
                     <span className="flex h-11 w-11 items-center justify-center rounded-full bg-aqua text-lg text-black shadow-glow-sm">+</span>
@@ -277,10 +296,10 @@ export default function StudioReferencePanel({
             <button
               type="button"
               onClick={() => productUploadInputRef.current?.click()}
-              disabled={uploading}
+              disabled={productActionBusy}
               className="btn-secondary btn-sm mt-2 w-full justify-center border-aqua/30 bg-aqua/10 text-snow"
             >
-              {uploading ? "上传中…" : productAsset
+              {uploading ? "上传中…" : productBusy ? "识别中…" : productAsset
                 ? (portraitGenerationMode ? "替换人物照片" : isImageEditMode ? "替换编辑源图片" : "替换产品图片")
                 : (portraitGenerationMode ? "上传人物照片" : isImageEditMode ? "上传编辑源图片" : "上传产品图片")}
             </button>

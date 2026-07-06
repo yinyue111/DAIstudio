@@ -95,6 +95,65 @@ def test_decode_image_response_downloads_each_url_once(monkeypatch):
     )]
 
 
+def test_decode_image_response_prefers_high_resolution_download_url(monkeypatch):
+    calls = []
+
+    def fake_download(url, **kwargs):
+        calls.append((url, kwargs))
+        return b"image-bytes"
+
+    monkeypatch.setattr(gateway, "_download", fake_download)
+    out = gateway._decode_image_response({
+        "data": [{
+            "url": "https://example.com/preview.png",
+            "download_url": "https://example.com/4k.png",
+        }]
+    })
+
+    assert out == [b"image-bytes"]
+    assert calls[0][0] == "https://example.com/4k.png"
+
+
+def test_decode_image_response_prefers_hd_url_over_inline_preview(monkeypatch):
+    calls = []
+
+    def fake_download(url, **kwargs):
+        calls.append((url, kwargs))
+        return b"full-resolution-image"
+
+    monkeypatch.setattr(gateway, "_download", fake_download)
+    out = gateway._decode_image_response({
+        "data": [{
+            "b64_json": base64.b64encode(b"small-inline-preview").decode(),
+            "url": "https://example.com/preview.png",
+            "hd_url": "https://example.com/full-4k.png",
+        }]
+    })
+
+    assert out == [b"full-resolution-image"]
+    assert calls[0][0] == "https://example.com/full-4k.png"
+
+
+def test_decode_image_response_captures_gateway_echo_diagnostics(monkeypatch):
+    raw = base64.b64encode(b"image-bytes").decode()
+
+    out, diagnostics = gateway._decode_image_response_with_diagnostics({
+        "data": [{"b64_json": raw}],
+        "model": "gpt-image-2-codex",
+        "size": "auto",
+        "quality": "auto",
+        "output_format": "jpeg",
+    })
+
+    assert out == [b"image-bytes"]
+    assert len(diagnostics) == 1
+    assert diagnostics[0].model == "gpt-image-2-codex"
+    assert diagnostics[0].size == "auto"
+    assert diagnostics[0].quality == "auto"
+    assert diagnostics[0].output_format == "jpeg"
+    assert diagnostics[0].selected_source == "b64_json"
+
+
 def test_decode_image_response_rejects_oversized_base64(monkeypatch):
     monkeypatch.setattr(settings, "generated_image_max_bytes", 2)
 
@@ -192,7 +251,8 @@ def test_download_to_path_rejects_explicit_non_video_type(monkeypatch, tmp_path)
     else:
         raise AssertionError("download should reject text/html")
 
-    assert 0 < seen["timeout"] <= 123
+    assert 0 < seen["timeout"].connect <= 123
+    assert 0 < seen["timeout"].read <= 123
     assert not out.exists()
 
 
@@ -287,7 +347,8 @@ def test_download_uses_remaining_deadline_for_each_redirect(monkeypatch):
         allowed_content_types=("image/",),
         timeout_seconds=30,
     ) == b"png"
-    assert calls == [27.0, 24.0]
+    assert [call.connect for call in calls] == [27.0, 24.0]
+    assert [call.read for call in calls] == [27.0, 24.0]
 
 
 def test_download_rejects_compressed_result_and_uses_identity_header(monkeypatch):
@@ -342,6 +403,45 @@ def test_image_edit_repeats_without_n(monkeypatch):
     monkeypatch.setattr(settings, "mock_mode", False)
     monkeypatch.setattr(settings, "gateway_base_url", "http://gateway.test")
     monkeypatch.setattr(settings, "gateway_api_key", "test-key")
+    image_raw = gateway._mock_image("x", "256x256", 0)
+    raw = base64.b64encode(image_raw).decode()
+    ref = f"data:image/png;base64,{base64.b64encode(image_raw).decode()}"
+    calls = []
+
+    def fake_request_multipart_json(method, url, *, headers, data, files, timeout, retries):
+        calls.append((method, url, dict(data), list(files), timeout, retries, dict(headers)))
+        return {"data": [{"b64_json": raw}]}
+
+    monkeypatch.setattr(gateway, "_request_multipart_json", fake_request_multipart_json)
+    imgs = gateway.gen_image(
+        "same style",
+        "gpt-image-2",
+        n=3,
+        size="256x256",
+        reference_image_url=ref,
+        edit_path="/v1/images/edits",
+        extra_payload={"mask": ref},
+    )
+
+    assert len(imgs) == 3
+    assert len(calls) == 3
+    assert all(url.endswith("/v1/images/edits") for _method, url, _data, _files, _timeout, _retries, _headers in calls)
+    assert all("n" not in data for _method, _url, data, _files, _timeout, _retries, _headers in calls)
+    assert all(data["model"] == "gpt-image-2" for _method, _url, data, _files, _timeout, _retries, _headers in calls)
+    assert all(data["prompt"] == "same style" for _method, _url, data, _files, _timeout, _retries, _headers in calls)
+    assert all([name for name, _file in files] == ["image", "mask"]
+               for _method, _url, _data, files, _timeout, _retries, _headers in calls)
+    assert all(headers == {"Authorization": "Bearer test-key"}
+               for _method, _url, _data, _files, _timeout, _retries, headers in calls)
+    assert all(timeout == settings.image_gateway_timeout_seconds
+               for _method, _url, _data, _files, timeout, _retries, _headers in calls)
+    assert all(retries == 0 for _method, _url, _data, _files, _timeout, retries, _headers in calls)
+
+
+def test_image_edit_can_use_json_payload_format(monkeypatch):
+    monkeypatch.setattr(settings, "mock_mode", False)
+    monkeypatch.setattr(settings, "gateway_base_url", "http://gateway.test")
+    monkeypatch.setattr(settings, "gateway_api_key", "test-key")
     raw = base64.b64encode(gateway._mock_image("x", "256x256", 0)).decode()
     calls = []
 
@@ -353,22 +453,17 @@ def test_image_edit_repeats_without_n(monkeypatch):
     imgs = gateway.gen_image(
         "same style",
         "gpt-image-2",
-        n=3,
+        n=2,
         size="256x256",
         reference_image_url="http://example.com/ref.png",
-        edit_path="/v1/images/edits",
+        edit_path="/custom/images/edits",
+        extra_payload={"edit_payload_format": "json"},
     )
 
-    assert len(imgs) == 3
-    assert len(calls) == 3
-    assert all(url.endswith("/v1/images/edits") for _method, url, _payload, _timeout, _retries in calls)
-    assert all("n" not in payload for _method, _url, payload, _timeout, _retries in calls)
-    assert all("image" not in payload for _method, _url, payload, _timeout, _retries in calls)
+    assert len(imgs) == 2
+    assert len(calls) == 2
     assert all(payload["images"] == [{"image_url": "http://example.com/ref.png"}]
                for _method, _url, payload, _timeout, _retries in calls)
-    assert all(timeout == settings.image_gateway_timeout_seconds
-               for _method, _url, _payload, timeout, _retries in calls)
-    assert all(retries == 0 for _method, _url, _payload, _timeout, retries in calls)
 
 
 def test_text_to_image_repeats_without_n(monkeypatch):
@@ -566,7 +661,7 @@ def test_text_to_image_batch_rejects_total_size_over_budget(monkeypatch):
         raise AssertionError("oversized batch should fail")
 
 
-def test_text_to_image_retries_transient_gateway_status(monkeypatch):
+def test_text_to_image_retries_explicit_not_accepted_gateway_status(monkeypatch):
     monkeypatch.setattr(settings, "mock_mode", False)
     monkeypatch.setattr(settings, "gateway_base_url", "http://gateway.test")
     monkeypatch.setattr(settings, "gateway_api_key", "test-key")
@@ -578,7 +673,12 @@ def test_text_to_image_retries_transient_gateway_status(monkeypatch):
     def flaky_request_json(method, url, *, headers, payload, timeout, retries):
         calls["n"] += 1
         if calls["n"] == 2:
-            raise gateway.GatewayError("upstream 502", status_code=502, transient=True)
+            raise gateway.GatewayError(
+                "upstream 502",
+                status_code=502,
+                transient=True,
+                submit_state_unknown=False,
+            )
         return {"data": [{"b64_json": raw}]}
 
     monkeypatch.setattr(gateway, "_request_json", flaky_request_json)
@@ -615,6 +715,29 @@ def test_text_to_image_does_not_retry_unknown_submit_state(monkeypatch):
     assert calls["n"] == 1
 
 
+def test_text_to_image_does_not_retry_default_5xx_unknown_submit_state(monkeypatch):
+    monkeypatch.setattr(settings, "mock_mode", False)
+    monkeypatch.setattr(settings, "gateway_base_url", "http://gateway.test")
+    monkeypatch.setattr(settings, "gateway_api_key", "test-key")
+    monkeypatch.setattr(settings, "image_gateway_parallelism", 1)
+    monkeypatch.setattr(settings, "image_gateway_max_retries", 1)
+    calls = {"n": 0}
+
+    def flaky_request_json(method, url, *, headers, payload, timeout, retries):
+        calls["n"] += 1
+        raise gateway.GatewayError("upstream 502", status_code=502, transient=True)
+
+    monkeypatch.setattr(gateway, "_request_json", flaky_request_json)
+    try:
+        gateway.gen_image("a cat", "gpt-image-2", n=1, size="256x256")
+    except gateway.GatewayError as e:
+        assert "upstream 502" in str(e)
+    else:
+        raise AssertionError("default 5xx submit state should not be retried")
+
+    assert calls["n"] == 1
+
+
 def test_download_to_storage_streams_even_when_effective_mock_mode(monkeypatch, tmp_path):
     monkeypatch.setattr(settings, "mock_mode", False)
     monkeypatch.setattr(settings, "gateway_base_url", "")
@@ -636,3 +759,27 @@ def test_download_to_storage_streams_even_when_effective_mock_mode(monkeypatch, 
 
     assert key.startswith("video_preview/")
     assert calls and calls[0][0] == "https://cdn.example.com/out.mp4"
+
+
+def test_download_to_storage_forwards_progress_callback(monkeypatch):
+    calls = []
+    progress = []
+
+    def fake_download_to_path(url, path, **kwargs):
+        calls.append(kwargs)
+        kwargs["progress_callback"]()
+        path.write_bytes(b"video")
+        return 5
+
+    monkeypatch.setattr(gateway, "download_to_path", fake_download_to_path)
+
+    key = gateway.download_to_storage(
+        "https://cdn.example.com/out.mp4",
+        "video_preview",
+        "mp4",
+        progress_callback=lambda: progress.append("tick"),
+    )
+
+    assert key.startswith("video_preview/")
+    assert calls and callable(calls[0]["progress_callback"])
+    assert progress == ["tick"]

@@ -11,6 +11,7 @@ from app.config import settings
 from app.db import SessionLocal
 from app.main import app
 from app.models import AuditLog, GenTask, ModelConfig, UploadedAsset
+from app.services import generation_media
 from app.services.gateway import _mock_image
 from app.services.watermark import make_model_reference
 
@@ -19,6 +20,37 @@ def _png_bytes(size=(32, 48), color=(20, 120, 200)):
     buf = io.BytesIO()
     Image.new("RGB", size, color).save(buf, format="PNG")
     return buf.getvalue()
+
+
+def _white_bg_product_png_bytes(size=(300, 200)):
+    img = Image.new("RGB", size, (255, 255, 255))
+    px = img.load()
+    left = int(size[0] * 0.10)
+    right = int(size[0] * 0.37)
+    top = int(size[1] * 0.30)
+    bottom = int(size[1] * 0.80)
+    for y in range(top, bottom):
+        for x in range(left, right):
+            px[x, y] = (190, 40, 36)
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def _transparent_product_png_bytes(size=(160, 120)):
+    img = Image.new("RGBA", size, (255, 255, 255, 0))
+    px = img.load()
+    for y in range(30, 95):
+        for x in range(45, 120):
+            px[x, y] = (40, 110, 210, 255)
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def _mask_alpha_at(mask_data_uri, x, y):
+    mask_img = Image.open(io.BytesIO(base64.b64decode(mask_data_uri.split(",", 1)[1])))
+    return mask_img.getchannel("A").getpixel((x, y))
 
 
 def _jpeg_with_exif_bytes(size=(32, 48), color=(20, 120, 200)):
@@ -362,7 +394,7 @@ def test_product_image_edit_uses_larger_reference_and_server_fidelity_guard(
 
     up = client.post(
         "/api/uploads/image",
-        files={"file": ("product.png", _png_bytes(size=(2000, 1200)), "image/png")},
+        files={"file": ("product.png", _white_bg_product_png_bytes(size=(2000, 1200)), "image/png")},
         headers=h,
     )
     assert up.status_code == 200, up.text
@@ -401,6 +433,267 @@ def test_product_image_edit_uses_larger_reference_and_server_fidelity_guard(
     ref_bytes = base64.b64decode(seen["reference_image_url"].split(",", 1)[1])
     ref_img = Image.open(io.BytesIO(ref_bytes))
     assert max(ref_img.size) == 1536
+
+
+def test_product_image_edit_auto_generates_mask_for_inpaint(
+    client, make_user, auth, monkeypatch
+):
+    make_user("13900001968", balance=1000)
+    h = auth("13900001968")
+
+    up = client.post(
+        "/api/uploads/image",
+        files={"file": ("product.png", _white_bg_product_png_bytes(size=(2000, 1200)), "image/png")},
+        headers=h,
+    )
+    assert up.status_code == 200, up.text
+    asset = up.json()
+    seen = {}
+    component_sizes = []
+    original_largest_component_mask = generation_media._largest_component_mask
+
+    def recording_largest_component_mask(mask):
+        component_sizes.append(mask.size)
+        return original_largest_component_mask(mask)
+
+    def fake_gen_image(prompt, image_model_id, n=4, size="1024x1024",
+                       reference_image_url=None, edit_path=None, extra_payload=None):
+        seen["extra_payload"] = extra_payload or {}
+        return [_mock_image(prompt, "256x256", 0)]
+
+    monkeypatch.setattr("app.services.gateway.gen_image", fake_gen_image)
+    monkeypatch.setattr(generation_media, "_largest_component_mask", recording_largest_component_mask)
+
+    r = client.post("/api/generate", json={
+        "source_asset_url": asset["url"],
+        "source_type": "image",
+        "source_asset_meta": {
+            "selected_type": "image",
+            "mode": "image_edit",
+            "product_generation_mode": True,
+        },
+        "category": "image",
+        "stage": "preview",
+        "prompt": {
+            "final_text": "put this product in a clean studio scene",
+            "instruction": "put this product in a clean studio scene",
+        },
+        "params": {"n": 1, "size": "1024x1024", "edit_mask_mode": "protect_subject"},
+    }, headers=h)
+    assert r.status_code == 200, r.text
+
+    mask = seen["extra_payload"].get("mask")
+    assert mask.startswith("data:image/png;base64,")
+    mask_img = Image.open(io.BytesIO(base64.b64decode(mask.split(",", 1)[1])))
+    assert mask_img.mode == "RGBA"
+    assert max(mask_img.size) == 1536
+    assert component_sizes
+    assert max(max(size) for size in component_sizes) <= generation_media.EDIT_MASK_ANALYSIS_MAX_SIDE
+
+
+def test_product_image_edit_rgb_mask_protects_detected_subject_not_center_background(
+    client, make_user, auth, monkeypatch
+):
+    make_user("13900001970", balance=1000)
+    h = auth("13900001970")
+
+    up = client.post(
+        "/api/uploads/image",
+        files={"file": ("product.png", _white_bg_product_png_bytes(), "image/png")},
+        headers=h,
+    )
+    assert up.status_code == 200, up.text
+    asset = up.json()
+    seen = {}
+
+    def fake_gen_image(prompt, image_model_id, n=4, size="1024x1024",
+                       reference_image_url=None, edit_path=None, extra_payload=None):
+        seen["extra_payload"] = extra_payload or {}
+        return [_mock_image(prompt, "256x256", 0)]
+
+    monkeypatch.setattr("app.services.gateway.gen_image", fake_gen_image)
+
+    r = client.post("/api/generate", json={
+        "source_asset_url": asset["url"],
+        "source_type": "image",
+        "source_asset_meta": {
+            "selected_type": "image",
+            "mode": "image_edit",
+            "product_generation_mode": True,
+        },
+        "category": "image",
+        "stage": "preview",
+        "prompt": {
+            "final_text": "put this product in a bright lifestyle scene",
+            "instruction": "put this product in a bright lifestyle scene",
+        },
+        "params": {"n": 1, "size": "1024x1024", "edit_mask_mode": "protect_subject"},
+    }, headers=h)
+    assert r.status_code == 200, r.text
+
+    mask = seen["extra_payload"].get("mask")
+    assert mask.startswith("data:image/png;base64,")
+    assert _mask_alpha_at(mask, 70, 110) > 200
+    assert _mask_alpha_at(mask, 180, 100) < 20
+
+
+def test_product_image_edit_alpha_mask_records_high_confidence_subject_protection(
+    client, make_user, auth, monkeypatch
+):
+    uid = make_user("13900001971", balance=1000)
+    h = auth("13900001971")
+
+    up = client.post(
+        "/api/uploads/image",
+        files={"file": ("cutout.png", _transparent_product_png_bytes(), "image/png")},
+        headers=h,
+    )
+    assert up.status_code == 200, up.text
+    asset = up.json()
+    seen = {}
+
+    def fake_gen_image(prompt, image_model_id, n=4, size="1024x1024",
+                       reference_image_url=None, edit_path=None, extra_payload=None):
+        seen["extra_payload"] = extra_payload or {}
+        return [_mock_image(prompt, "256x256", 0)]
+
+    monkeypatch.setattr("app.services.gateway.gen_image", fake_gen_image)
+
+    r = client.post("/api/generate", json={
+        "source_asset_url": asset["url"],
+        "source_type": "image",
+        "source_asset_meta": {
+            "selected_type": "image",
+            "mode": "image_edit",
+            "product_generation_mode": True,
+        },
+        "category": "image",
+        "stage": "preview",
+        "prompt": {
+            "final_text": "put this product in a premium campaign scene",
+            "instruction": "put this product in a premium campaign scene",
+        },
+        "params": {"n": 1, "size": "1024x1024", "edit_mask_mode": "protect_subject"},
+    }, headers=h)
+    assert r.status_code == 200, r.text
+    db = SessionLocal()
+    try:
+        task = (
+            db.query(GenTask)
+            .filter(GenTask.user_id == uid)
+            .order_by(GenTask.id.desc())
+            .first()
+        )
+        assert task is not None
+        assert task.params["_edit_mask_mode"] == "alpha_subject"
+        assert task.params["_edit_mask_confidence"] >= 0.9
+        assert task.params["_edit_mask_bbox"] == [45, 30, 119, 94]
+        assert task.params["_edit_mask_requested_mode"] == "protect_subject"
+        assert task.params["_edit_mask_sent"] is True
+    finally:
+        db.close()
+
+
+def test_product_image_edit_explicit_center_box_mask_is_sent(
+    client, make_user, auth, monkeypatch
+):
+    uid = make_user("13900001972", balance=1000)
+    h = auth("13900001972")
+
+    up = client.post(
+        "/api/uploads/image",
+        files={"file": ("flat.png", _png_bytes(size=(300, 200)), "image/png")},
+        headers=h,
+    )
+    assert up.status_code == 200, up.text
+    asset = up.json()
+    seen = {}
+
+    def fake_gen_image(prompt, image_model_id, n=4, size="1024x1024",
+                       reference_image_url=None, edit_path=None, extra_payload=None):
+        seen["extra_payload"] = extra_payload or {}
+        return [_mock_image(prompt, "256x256", 0)]
+
+    monkeypatch.setattr("app.services.gateway.gen_image", fake_gen_image)
+
+    r = client.post("/api/generate", json={
+        "source_asset_url": asset["url"],
+        "source_type": "image",
+        "source_asset_meta": {
+            "selected_type": "image",
+            "mode": "image_edit",
+            "product_generation_mode": True,
+        },
+        "category": "image",
+        "stage": "preview",
+        "prompt": {
+            "final_text": "change the outer scene but keep center product",
+            "instruction": "change the outer scene but keep center product",
+        },
+        "params": {"n": 1, "size": "1024x1024", "edit_mask_mode": "center_box"},
+    }, headers=h)
+    assert r.status_code == 200, r.text
+
+    mask = seen["extra_payload"].get("mask")
+    assert mask.startswith("data:image/png;base64,")
+    assert _mask_alpha_at(mask, 150, 100) > 200
+    assert _mask_alpha_at(mask, 10, 10) < 20
+    db = SessionLocal()
+    try:
+        task = (
+            db.query(GenTask)
+            .filter(GenTask.user_id == uid)
+            .order_by(GenTask.id.desc())
+            .first()
+        )
+        assert task is not None
+        assert task.params["_edit_mask_mode"] == "center_box"
+        assert task.params["_edit_mask_requested_mode"] == "center_box"
+        assert task.params["_edit_mask_sent"] is True
+    finally:
+        db.close()
+
+
+def test_product_image_edit_can_disable_auto_mask(
+    client, make_user, auth, monkeypatch
+):
+    make_user("13900001969", balance=1000)
+    h = auth("13900001969")
+
+    up = client.post(
+        "/api/uploads/image",
+        files={"file": ("product.png", _png_bytes(size=(900, 600)), "image/png")},
+        headers=h,
+    )
+    assert up.status_code == 200, up.text
+    asset = up.json()
+    seen = {}
+
+    def fake_gen_image(prompt, image_model_id, n=4, size="1024x1024",
+                       reference_image_url=None, edit_path=None, extra_payload=None):
+        seen["extra_payload"] = extra_payload or {}
+        return [_mock_image(prompt, "256x256", 0)]
+
+    monkeypatch.setattr("app.services.gateway.gen_image", fake_gen_image)
+
+    r = client.post("/api/generate", json={
+        "source_asset_url": asset["url"],
+        "source_type": "image",
+        "source_asset_meta": {
+            "selected_type": "image",
+            "mode": "image_edit",
+            "product_generation_mode": True,
+        },
+        "category": "image",
+        "stage": "preview",
+        "prompt": {
+            "final_text": "put this product in a clean studio scene",
+            "instruction": "put this product in a clean studio scene",
+        },
+        "params": {"n": 1, "size": "1024x1024", "edit_mask_mode": "off"},
+    }, headers=h)
+    assert r.status_code == 200, r.text
+    assert "mask" not in seen["extra_payload"]
 
 
 def test_portrait_image_edit_accepts_character_reference_and_server_fidelity_guard(
@@ -719,6 +1012,53 @@ def test_uploaded_image_can_drive_video_first_frame(client, make_user, auth, mon
     ref_bytes = base64.b64decode(seen["first_frame_image"].split(",", 1)[1])
     ref_img = Image.open(io.BytesIO(ref_bytes))
     assert min(ref_img.size) >= 300
+
+
+def test_uploaded_image_video_free_motion_does_not_auto_lock_last_frame(client, make_user, auth, monkeypatch):
+    make_user("13900001970", balance=1000, admin=True)
+    h = auth("13900001970")
+    assert client.put("/api/admin/models", json={
+        "use": "video",
+        "model_id": "mock-video",
+        "cost_credits": 50,
+        "unlock_cost": 0,
+        "enabled": True,
+        "extra": {"preview_cost": 5},
+        "admin_password": "pass123456",
+    }, headers=h).status_code == 200
+
+    up = client.post(
+        "/api/uploads/image",
+        files={"file": ("ref.png", _png_bytes(size=(40, 80)), "image/png")},
+        headers=h,
+    )
+    assert up.status_code == 200, up.text
+    asset = up.json()
+    seen = {}
+
+    def fake_submit(prompt, video_model_id, params, extra=None):
+        seen.update(params)
+        return "mock-upload-video-free"
+
+    monkeypatch.setattr("app.services.gateway.submit_video", fake_submit)
+    r = client.post("/api/generate", json={
+        "source_asset_url": asset["url"],
+        "source_type": "image",
+        "category": "video",
+        "stage": "preview",
+        "prompt": {"final_text": "animate upload with dynamic movement"},
+        "params": {
+            "duration": 5,
+            "resolution": "720p",
+            "ratio": "9:16",
+            "subject_mode": "product",
+            "product_lock_mode": "free",
+        },
+    }, headers=h)
+    assert r.status_code == 200, r.text
+    assert seen["first_frame_image"].startswith("data:image/jpeg;base64,")
+    assert "last_frame_image" not in seen
+    assert "_product_locked" not in seen
 
 
 def test_uploaded_portrait_image_can_drive_video_character_reference(client, make_user, auth, monkeypatch):

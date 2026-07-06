@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import os
 import shlex
 import subprocess
 import sys
@@ -103,6 +104,28 @@ def test_admin_online_update_requires_explicit_confirmation(client, make_user, a
     assert "确认码 UPDATE" in run.text
 
 
+def test_admin_online_update_preview_does_not_merge_without_confirmation(client, make_user, auth, monkeypatch, git_repos):
+    before = _git(git_repos["work"], "rev-parse", "HEAD")
+    (git_repos["source"] / "README.md").write_text("v2\n", encoding="utf-8")
+    _git(git_repos["source"], "add", "README.md")
+    _git(git_repos["source"], "commit", "-m", "update")
+    _git(git_repos["source"], "push", "origin", "main")
+    _configure(monkeypatch, git_repos["work"])
+    make_user("15700002014", admin=True)
+    h = auth("15700002014")
+
+    run = client.post("/api/admin/update/run", json={"apply": False}, headers=h)
+
+    assert run.status_code == 200, run.text
+    data = run.json()
+    assert data["changed"] is True
+    assert data["applied"] is False
+    assert data["before"] == before
+    assert data["after"] == before
+    assert _git(git_repos["work"], "rev-parse", "HEAD") == before
+    assert (git_repos["work"] / "README.md").read_text(encoding="utf-8") == "v1\n"
+
+
 def test_admin_online_update_fast_forwards_and_runs_configured_apply_command(
     client, make_user, auth, monkeypatch, git_repos
 ):
@@ -162,7 +185,42 @@ def test_admin_online_update_noops_when_already_current(client, make_user, auth,
     assert not apply_marker.exists()
 
 
-def test_admin_online_update_reports_partial_failure_when_apply_fails(
+def test_admin_online_update_can_reapply_current_head(client, make_user, auth, monkeypatch, git_repos):
+    apply_script = git_repos["work"] / "apply_current.py"
+    apply_marker = git_repos["work"] / "applied-current.txt"
+    apply_script.write_text(
+        "from pathlib import Path\nPath('applied-current.txt').write_text('reapplied\\n', encoding='utf-8')\n",
+        encoding="utf-8",
+    )
+    _git(git_repos["work"], "add", "apply_current.py")
+    _git(git_repos["work"], "config", "user.email", "tester@example.com")
+    _git(git_repos["work"], "config", "user.name", "Tester")
+    _git(git_repos["work"], "commit", "-m", "local apply current script")
+    _git(git_repos["work"], "push", "origin", "main")
+    _configure(
+        monkeypatch,
+        git_repos["work"],
+        apply_command=f"{shlex.quote(sys.executable)} {shlex.quote(str(apply_script))}",
+    )
+    make_user("15700002024", admin=True)
+    h = auth("15700002024")
+
+    run = client.post(
+        "/api/admin/update/run",
+        json={"apply": True, "confirm": "UPDATE", "force_apply": True},
+        headers=h,
+    )
+
+    assert run.status_code == 200, run.text
+    data = run.json()
+    assert data["ok"] is True
+    assert data["changed"] is False
+    assert data["applied"] is True
+    assert data["before"] == data["after"]
+    assert apply_marker.read_text(encoding="utf-8") == "reapplied\n"
+
+
+def test_admin_online_update_rolls_back_when_apply_fails(
     client, make_user, auth, monkeypatch, git_repos
 ):
     apply_script = git_repos["work"] / "apply_fail.py"
@@ -199,12 +257,84 @@ def test_admin_online_update_reports_partial_failure_when_apply_fails(
     assert data["applied"] is False
     assert data["partial_failure"] is True
     assert data["before"] == before
-    assert data["after"] != before
-    assert (git_repos["work"] / "README.md").read_text(encoding="utf-8") == "v2\n"
+    assert data["after"] == before
+    assert _git(git_repos["work"], "rev-parse", "HEAD") == before
+    assert (git_repos["work"] / "README.md").read_text(encoding="utf-8") == "v1\n"
     assert "sk-should-redact" not in data["output"]
     assert "sk-should-redact" not in data["error"]
     assert "<redacted>" in data["output"]
     assert "<redacted>" in data["error"]
+
+
+def test_admin_online_update_rescans_apply_script_after_merge(
+    client, make_user, auth, monkeypatch, git_repos
+):
+    apply_script = git_repos["work"] / "apply_safe.py"
+    apply_script.write_text(
+        "from pathlib import Path\nPath('applied.txt').write_text('ok\\n', encoding='utf-8')\n",
+        encoding="utf-8",
+    )
+    _git(git_repos["work"], "add", "apply_safe.py")
+    _git(git_repos["work"], "config", "user.email", "tester@example.com")
+    _git(git_repos["work"], "config", "user.name", "Tester")
+    _git(git_repos["work"], "commit", "-m", "safe apply script")
+    _git(git_repos["work"], "push", "origin", "main")
+    _git(git_repos["source"], "pull", "--ff-only")
+    before = _git(git_repos["work"], "rev-parse", "HEAD")
+
+    apply_script_source = git_repos["source"] / "apply_safe.py"
+    apply_script_source.write_text(
+        "import subprocess\nsubprocess.run(['docker', 'compose', 'up', '-d', 'api'], check=True)\n",
+        encoding="utf-8",
+    )
+    (git_repos["source"] / "README.md").write_text("v2\n", encoding="utf-8")
+    _git(git_repos["source"], "add", "README.md", "apply_safe.py")
+    _git(git_repos["source"], "commit", "-m", "unsafe apply replacement")
+    _git(git_repos["source"], "push", "origin", "main")
+
+    _configure(
+        monkeypatch,
+        git_repos["work"],
+        apply_command=f"{shlex.quote(sys.executable)} {shlex.quote(str(apply_script))}",
+    )
+    make_user("15700002026", admin=True)
+    h = auth("15700002026")
+
+    run = client.post("/api/admin/update/run", json={"apply": True, "confirm": "UPDATE"}, headers=h)
+
+    assert run.status_code == 200, run.text
+    data = run.json()
+    assert data["ok"] is False
+    assert data["changed"] is True
+    assert data["applied"] is False
+    assert data["partial_failure"] is True
+    assert data["before"] == before
+    assert data["after"] == before
+    assert _git(git_repos["work"], "rev-parse", "HEAD") == before
+    assert (git_repos["work"] / "README.md").read_text(encoding="utf-8") == "v1\n"
+    assert not (git_repos["work"] / "applied.txt").exists()
+    assert "不能在 API 进程内直接执行" in data["error"]
+
+
+def test_admin_online_update_refuses_changed_apply_without_command(
+    client, make_user, auth, monkeypatch, git_repos
+):
+    before = _git(git_repos["work"], "rev-parse", "HEAD")
+    (git_repos["source"] / "README.md").write_text("v2\n", encoding="utf-8")
+    _git(git_repos["source"], "add", "README.md")
+    _git(git_repos["source"], "commit", "-m", "remote code update")
+    _git(git_repos["source"], "push", "origin", "main")
+
+    _configure(monkeypatch, git_repos["work"], apply_command="")
+    make_user("15700002016", admin=True)
+    h = auth("15700002016")
+
+    run = client.post("/api/admin/update/run", json={"apply": True, "confirm": "UPDATE"}, headers=h)
+
+    assert run.status_code == 400, run.text
+    assert "未配置 ONLINE_UPDATE_APPLY_COMMAND" in run.text
+    assert _git(git_repos["work"], "rev-parse", "HEAD") == before
+    assert (git_repos["work"] / "README.md").read_text(encoding="utf-8") == "v1\n"
 
 
 def test_admin_online_update_status_returns_config_error(client, make_user, auth, monkeypatch, tmp_path):
@@ -392,6 +522,40 @@ def test_online_update_rejects_script_that_restarts_api_container(monkeypatch, g
         encoding="utf-8",
     )
     _configure(monkeypatch, git_repos["work"], apply_command=str(script))
+
+    with pytest.raises(online_update.OnlineUpdateError, match="登录 502"):
+        online_update._apply_command()
+
+
+def test_online_update_rejects_repo_relative_apply_script_that_restarts_api(monkeypatch, git_repos):
+    from app.services import online_update
+
+    script = git_repos["work"] / "apply-update.py"
+    script.write_text(
+        "import subprocess\n"
+        "subprocess.run(['docker', 'compose', 'up', '-d', '--build', 'migrate', 'api', 'worker'])\n",
+        encoding="utf-8",
+    )
+    _configure(monkeypatch, git_repos["work"], apply_command=f"{shlex.quote(sys.executable)} apply-update.py")
+
+    with pytest.raises(online_update.OnlineUpdateError, match="登录 502"):
+        online_update._apply_command()
+
+
+def test_online_update_rejects_path_apply_script_that_restarts_api(monkeypatch, git_repos, tmp_path):
+    from app.services import online_update
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    script = bin_dir / "ai-studio-apply-update"
+    script.write_text(
+        "#!/bin/sh\n"
+        "docker compose restart api worker\n",
+        encoding="utf-8",
+    )
+    script.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_dir}:{os.environ.get('PATH', '')}")
+    _configure(monkeypatch, git_repos["work"], apply_command="ai-studio-apply-update")
 
     with pytest.raises(online_update.OnlineUpdateError, match="登录 502"):
         online_update._apply_command()

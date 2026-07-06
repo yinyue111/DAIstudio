@@ -49,6 +49,18 @@ class _RequestIdFilter(logging.Filter):
         return True
 
 
+def current_request_id() -> str:
+    return request_id_ctx.get()
+
+
+def set_request_id(value: str | None):
+    return request_id_ctx.set((value or "-").strip() or "-")
+
+
+def reset_request_id(token) -> None:
+    request_id_ctx.reset(token)
+
+
 def setup_logging() -> None:
     handler = logging.StreamHandler()
     handler.setFormatter(
@@ -72,19 +84,20 @@ class RequestContextMiddleware(BaseHTTPMiddleware):
         except Exception:
             log.exception("unhandled error %s %s", request.method, request.url.path)
             raise
+        try:
+            dt = time.time() - t0
+            path = request.url.path
+            if not path.startswith(("/media", "/metrics")):
+                log.info("%s %s -> %s %.0fms", request.method, path,
+                         response.status_code, dt * 1000)
+            if _PROM and not path.startswith(("/media", "/metrics")):
+                np = _norm_path(path)
+                _REQ.labels(request.method, np, response.status_code).inc()
+                _LAT.labels(request.method, np).observe(dt)
+            response.headers["x-request-id"] = rid
+            return response
         finally:
             request_id_ctx.reset(token)
-        dt = time.time() - t0
-        path = request.url.path
-        if not path.startswith(("/media", "/metrics")):
-            log.info("%s %s -> %s %.0fms", request.method, path,
-                     response.status_code, dt * 1000)
-        if _PROM and not path.startswith(("/media", "/metrics")):
-            np = _norm_path(path)
-            _REQ.labels(request.method, np, response.status_code).inc()
-            _LAT.labels(request.method, np).observe(dt)
-        response.headers["x-request-id"] = rid
-        return response
 
 
 def init_sentry() -> bool:

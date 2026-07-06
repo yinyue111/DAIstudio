@@ -8,9 +8,21 @@ from ..schemas import AssetOut
 from .config_store import get_model_config
 
 
+def is_generated_asset_task(task: GenTask | None) -> bool:
+    return bool(task is not None and task.category in {"image", "video"})
+
+
+def is_settled_generated_asset_task(task: GenTask | None) -> bool:
+    if not is_generated_asset_task(task):
+        return False
+    if task.status != "succeeded":
+        return False
+    return int(task.cost_frozen or 0) == 0 or int(task.cost_settled or 0) > 0
+
+
 def unlock_cost_for_asset(db: Session, asset: GenAsset, task: GenTask | None = None) -> int:
     task = task or (db.get(GenTask, asset.task_id) if asset.task_id else None)
-    if task is not None and task.category in {"image", "video"}:
+    if is_settled_generated_asset_task(task):
         return 0
     snapshot = ((task.params or {}).get("_model_snapshot") or {}) if task else {}
     if "unlock_cost" in snapshot:
@@ -29,7 +41,17 @@ def to_asset_out(db: Session, asset: GenAsset, task: GenTask | None = None) -> A
         out.hd_url = None
         out.unlock_cost = 0
         return out
-    if not asset.unlocked:
+    task = task or (db.get(GenTask, asset.task_id) if asset.task_id else None)
+    if is_settled_generated_asset_task(task):
+        out.unlocked = True
+        out.watermarked = False
+        out.unlock_cost = 0
+    elif is_generated_asset_task(task):
+        out.unlocked = False
+        out.watermarked = True
+        out.hd_url = None
+        out.unlock_cost = 0
+    elif not asset.unlocked:
         out.hd_url = None
         out.unlock_cost = unlock_cost_for_asset(db, asset, task=task)
     else:

@@ -62,7 +62,7 @@ def get_config(db: Session = Depends(get_db), _: User = Depends(get_current_user
         "image_n_max": settings.max_image_n,
         "max_upload_image_bytes": settings.max_upload_image_bytes,
         "max_upload_video_bytes": settings.max_upload_video_bytes,
-        "video_duration_max_seconds": settings.max_video_seconds,
+        "video_duration_max_seconds": settings.effective_max_video_generation_seconds,
         "reverse": {
             "image_cost": pricing["reverse"]["image_cost"],
             "video_default_preset": DEFAULT_VIDEO_ANALYSIS_PRESET,

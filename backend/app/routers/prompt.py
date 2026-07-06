@@ -8,23 +8,30 @@ supplied cover image when keyframe sampling isn't available.
 from __future__ import annotations
 
 import base64
+import hashlib
 import inspect
+import json
+import logging
 import secrets
+from datetime import datetime, timezone
 from urllib.parse import urlparse
 
 from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from ..config import settings
 from ..db import get_db
 from ..deps import get_current_user
-from ..models import User
+from ..models import ReverseOperation, User
 from ..schemas import ReverseIn, ReverseOut
 from ..services import asset_refs, credits, gateway, storage, usage, video_frames
 from ..services.config_store import get_model_config, get_setting
 from ..services.content_safety import assert_text_allowed
 from ..services.generation_pricing import reverse_cost
 from ..services.model_gateway_config import runtime_config_for_model
+from ..services.prompt_history import remember_prompt
 from ..services.rate_limit import incr_window
 from ..services.ssrf import SsrfError, assert_safe_user_asset_url
 from ..services.video_analysis import (
@@ -34,6 +41,7 @@ from ..services.video_analysis import (
 )
 
 router = APIRouter(prefix="/api/prompt", tags=["prompt"])
+log = logging.getLogger("prompt")
 
 _VIDEO_EXTS = (".mp4", ".webm", ".mov")
 _UNSUPPORTED_VIDEO_EXTS = (".m3u8",)
@@ -137,6 +145,136 @@ def _reverse_biz_ref() -> int:
     return secrets.randbits(63)
 
 
+def _reverse_request_fingerprint(body: ReverseIn) -> str:
+    payload = {
+        "asset_url": body.asset_url,
+        "target": body.target,
+        "source_type": body.source_type,
+        "video_analysis_preset": body.video_analysis_preset,
+        "fallback_image": body.fallback_image,
+    }
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(raw.encode()).hexdigest()
+
+
+def _reverse_operation_response(op: ReverseOperation) -> ReverseOut:
+    result = op.result if isinstance(op.result, dict) else {}
+    structured = result.get("structured") if isinstance(result.get("structured"), dict) else {}
+    final_text = str(result.get("final_text") or "")
+    if not structured or not final_text:
+        raise HTTPException(409, "该反推请求结果不完整,请重新发起")
+    return ReverseOut(
+        structured=structured,
+        final_text=final_text,
+        charged_credits=int(op.charged_credits or 0),
+        reference_count=max(1, int(op.reference_count or 1)),
+    )
+
+
+def _existing_reverse_operation_replay(
+    db: Session,
+    *,
+    user_id: int,
+    body: ReverseIn,
+) -> ReverseOut | None:
+    raw_key = (body.client_request_id or "").strip()
+    if not raw_key:
+        return None
+    fingerprint = _reverse_request_fingerprint(body)
+    existing = db.execute(
+        select(ReverseOperation).where(
+            ReverseOperation.user_id == user_id,
+            ReverseOperation.client_request_id == raw_key,
+        )
+    ).scalar_one_or_none()
+    if existing is None:
+        return None
+    if existing.request_fingerprint != fingerprint:
+        raise HTTPException(409, "client_request_id 已用于不同反推请求")
+    if existing.status == "succeeded":
+        return _reverse_operation_response(existing)
+    if existing.status == "running":
+        raise HTTPException(409, "反推请求仍在处理中,请稍后重试")
+    raise HTTPException(409, "该反推请求已失败,请重新发起")
+
+
+def _reserve_reverse_operation(
+    db: Session,
+    *,
+    user_id: int,
+    body: ReverseIn,
+) -> tuple[ReverseOperation | None, ReverseOut | None]:
+    raw_key = (body.client_request_id or "").strip()
+    if not raw_key:
+        return None, None
+    fingerprint = _reverse_request_fingerprint(body)
+    op = ReverseOperation(
+        user_id=user_id,
+        client_request_id=raw_key,
+        request_fingerprint=fingerprint,
+        target=body.target,
+        asset_url=body.asset_url,
+        status="running",
+    )
+    try:
+        db.add(op)
+        db.commit()
+        db.refresh(op)
+        return op, None
+    except IntegrityError as e:
+        db.rollback()
+        existing = db.execute(
+            select(ReverseOperation).where(
+                ReverseOperation.user_id == user_id,
+                ReverseOperation.client_request_id == raw_key,
+            )
+        ).scalar_one_or_none()
+        if not existing:
+            raise HTTPException(409, "重复的反推请求已拦截,请更换请求 ID") from e
+        if existing.request_fingerprint != fingerprint:
+            raise HTTPException(409, "client_request_id 已用于不同反推请求") from e
+        if existing.status == "succeeded":
+            return existing, _reverse_operation_response(existing)
+        if existing.status == "running":
+            raise HTTPException(409, "反推请求仍在处理中,请稍后重试") from e
+        raise HTTPException(409, "该反推请求已失败,请重新发起") from e
+
+
+def _finish_reverse_operation(
+    db: Session,
+    op: ReverseOperation | None,
+    *,
+    result: dict,
+    charged_credits: int,
+    reference_count: int,
+) -> None:
+    if not op:
+        return
+    op.status = "succeeded"
+    op.result = {
+        "structured": result.get("structured") or {},
+        "final_text": result.get("final_text") or "",
+    }
+    op.charged_credits = int(charged_credits or 0)
+    op.reference_count = max(1, int(reference_count or 1))
+    op.error = None
+    op.updated_at = datetime.now(timezone.utc)
+    db.commit()
+
+
+def _fail_reverse_operation(db: Session, op: ReverseOperation | None, error: str) -> None:
+    if not op:
+        return
+    try:
+        op.status = "failed"
+        op.error = str(error or "反推失败")[:1000]
+        op.updated_at = datetime.now(timezone.utc)
+        db.commit()
+    except Exception:  # noqa: BLE001
+        db.rollback()
+        log.exception("failed to mark reverse operation %s failed", op.id)
+
+
 def _video_duration_for_reverse(body: ReverseIn, db: Session, user: User) -> float | None:
     if not _is_video_source(body):
         return None
@@ -166,7 +304,6 @@ def _accepts_gateway_config(fn) -> bool:
 @router.post("/reverse", response_model=ReverseOut)
 def reverse(body: ReverseIn, db: Session = Depends(get_db),
             user: User = Depends(get_current_user)):
-    _rate_limit(user.id)
     _assert_text_allowed(db, body.asset_url, body.fallback_image)
     # SSRF: the asset/cover URL is sent to the vision gateway (and the video is
     # downloaded for keyframes) — reject internal/metadata targets up front.
@@ -188,6 +325,14 @@ def reverse(body: ReverseIn, db: Session = Depends(get_db),
     if not model or not model.enabled:
         raise HTTPException(400, "未配置可用的视觉模型")
 
+    replay = _existing_reverse_operation_replay(db, user_id=user.id, body=body)
+    if replay is not None:
+        return replay
+    _rate_limit(user.id)
+    operation, replay = _reserve_reverse_operation(db, user_id=user.id, body=body)
+    if replay is not None:
+        return replay
+
     precharged = 0
     biz_ref = _reverse_biz_ref()
     video_preset = normalize_video_analysis_preset(body.video_analysis_preset)
@@ -204,6 +349,7 @@ def reverse(body: ReverseIn, db: Session = Depends(get_db),
                                 biz_ref=biz_ref,
                                 note=f"preauth target={body.target},preset={video_preset},max_refs={precharge_frames}")
             except credits.InsufficientCredits as e:
+                _fail_reverse_operation(db, operation, str(e))
                 raise HTTPException(400, str(e))
     try:
         refs = _collect_refs(
@@ -218,6 +364,7 @@ def reverse(body: ReverseIn, db: Session = Depends(get_db),
             credits.refund_consumed(db, user.id, precharged, biz_type="reverse",
                                     biz_ref=biz_ref,
                                     note=f"preauth_refund target={body.target}")
+        _fail_reverse_operation(db, operation, "素材引用解析失败")
         raise
     cost = expected_cost
     if precharged > cost:
@@ -234,19 +381,36 @@ def reverse(body: ReverseIn, db: Session = Depends(get_db),
                 credits.refund_consumed(db, user.id, precharged, biz_type="reverse",
                                         biz_ref=biz_ref,
                                         note=f"preauth_refund target={body.target}")
+            _fail_reverse_operation(db, operation, str(e))
             raise HTTPException(400, str(e))
     try:
         kwargs = {"target": body.target}
         if _accepts_gateway_config(gateway.reverse_prompt):
             kwargs["gateway_config"] = runtime_config_for_model(model, "vision")
         result = gateway.reverse_prompt(refs, model.model_id, **kwargs)
-    except HTTPException:
+    except HTTPException as e:
+        if cost:
+            credits.refund_consumed(
+                db,
+                user.id,
+                cost,
+                biz_type="reverse",
+                biz_ref=biz_ref,
+                note=f"failed target={body.target},refs={len(refs)}",
+            )
+        _fail_reverse_operation(db, operation, str(e.detail))
+        usage.record_call(db, kind="reverse", model_id=model.model_id,
+                          user_id=user.id, status="failed",
+                          detail={"target": body.target, "cost": cost,
+                                  "preset": video_preset,
+                                  "error": str(e.detail)[:200]})
         raise
     except gateway.GatewayError as e:
         if cost:
             credits.refund_consumed(db, user.id, cost, biz_type="reverse",
                                     biz_ref=biz_ref,
                                     note=f"failed target={body.target},refs={len(refs)}")
+        _fail_reverse_operation(db, operation, str(e))
         usage.record_call(db, kind="reverse", model_id=model.model_id,
                           user_id=user.id, status="failed",
                           detail={"target": body.target, "cost": cost,
@@ -261,6 +425,7 @@ def reverse(body: ReverseIn, db: Session = Depends(get_db),
             credits.refund_consumed(db, user.id, cost, biz_type="reverse",
                                     biz_ref=biz_ref,
                                     note=f"failed target={body.target},refs={len(refs)}")
+        _fail_reverse_operation(db, operation, str(e))
         usage.record_call(db, kind="reverse", model_id=model.model_id,
                           user_id=user.id, status="failed",
                           detail={"target": body.target, "cost": cost,
@@ -268,12 +433,74 @@ def reverse(body: ReverseIn, db: Session = Depends(get_db),
                                   "error": str(e)[:200]})
         raise HTTPException(502, "反推失败:服务暂时不可用,请稍后重试")
 
+    try:
+        _assert_text_allowed(db, result.get("structured"), result.get("final_text"))
+    except HTTPException:
+        if cost:
+            credits.refund_consumed(
+                db,
+                user.id,
+                cost,
+                biz_type="reverse",
+                biz_ref=biz_ref,
+                note=f"blocked_output target={body.target},refs={len(refs)}",
+            )
+        _fail_reverse_operation(db, operation, "反推结果被内容安全策略拦截")
+        usage.record_call(
+            db,
+            kind="reverse",
+            model_id=model.model_id,
+            user_id=user.id,
+            status="failed",
+            usage=result.get("usage"),
+            detail={
+                "target": body.target,
+                "preset": video_preset,
+                "frames": len(refs),
+                "cost": cost,
+                "blocked_output": True,
+            },
+        )
+        raise
+
     # real-cost accounting: persist the provider's token usage for this call
     usage.record_call(db, kind="reverse", model_id=model.model_id, user_id=user.id,
                       status="ok", latency_ms=result.get("latency_ms"),
                       usage=result.get("usage"),
                       detail={"target": body.target, "preset": video_preset,
                               "frames": len(refs), "cost": cost})
+    _finish_reverse_operation(
+        db,
+        operation,
+        result=result,
+        charged_credits=cost,
+        reference_count=max(1, len(refs)),
+    )
+    try:
+        if body.target == "video":
+            history_title = "视频反推提示词"
+            history_category = "video"
+        elif body.target == "product_profile":
+            history_title = "主体身份档案"
+            history_category = "image"
+        else:
+            history_title = "图片反推提示词"
+            history_category = "image"
+        remember_prompt(
+            db,
+            user_id=user.id,
+            prompt=result.get("final_text"),
+            title=history_title,
+            category=history_category,
+            source="reverse",
+            params={"asset_url": body.asset_url, "reference_count": max(1, len(refs))},
+            commit=True,
+        )
+    except Exception:
+        rollback = getattr(db, "rollback", None)
+        if callable(rollback):
+            rollback()
+        log.exception("failed to remember reverse prompt history for user %s", user.id)
     return ReverseOut(
         structured=result["structured"],
         final_text=result["final_text"],

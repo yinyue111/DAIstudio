@@ -46,6 +46,10 @@ def _validate_configured_egress_url(name: str, url: str, *, require_https: bool 
 
 
 def validate_runtime_config() -> None:
+    celery_settings = settings.celery
+    storage_settings = settings.storage
+    if int(celery_settings.task_soft_time_limit_seconds) >= int(celery_settings.task_time_limit_seconds):
+        raise RuntimeError("CELERY_TASK_SOFT_TIME_LIMIT_SECONDS 必须小于 CELERY_TASK_TIME_LIMIT_SECONDS")
     if not public_base_is_local() and settings.debug:
         raise RuntimeError("PUBLIC_BASE_URL 非本地域名时禁止 DEBUG=true")
     # Production must never explicitly force local placeholder generations. The
@@ -87,6 +91,13 @@ def validate_runtime_config() -> None:
             "JWT_ALGORITHM 不支持。仅允许 "
             f"{','.join(sorted(_ALLOWED_JWT_ALGORITHMS))}"
         )
+    if str(storage_settings.backend or "local").lower() not in {"local", "s3"}:
+        raise RuntimeError("STORAGE_BACKEND 仅支持 local 或 s3")
+    if str(storage_settings.backend or "local").lower() == "s3":
+        raise RuntimeError(
+            "当前版本暂不支持 STORAGE_BACKEND=s3。媒体下载、抽帧、上传复用和高清鉴权仍依赖本地文件路径，"
+            "请使用 STORAGE_BACKEND=local；完整对象存储适配完成后再启用 S3/MinIO。"
+        )
     if not settings.debug and settings.payment_mock_enabled:
         raise RuntimeError("生产环境(DEBUG=false)必须设置 PAYMENT_MOCK_ENABLED=false")
     if settings.payment_mock_enabled and not mock_payments_allowed():
@@ -113,7 +124,18 @@ def validate_model_gateway_rows(db) -> None:
 
     from .models import ModelConfig
 
-    for row in db.execute(select(ModelConfig)).scalars():
+    rows = list(db.execute(select(ModelConfig)).scalars())
+    required_uses = {"vision", "image", "video"}
+    configured_uses = {str(row.use or "") for row in rows}
+    missing_uses = sorted(required_uses - configured_uses)
+    if missing_uses:
+        raise RuntimeError(
+            "生产环境缺少必需的模型配置行:"
+            f"{','.join(missing_uses)}。请先运行数据库初始化/迁移 seed,"
+            "或在后台补齐模型配置后再启动。"
+        )
+
+    for row in rows:
         if row.base_url:
             validate_base_url(f"模型 {row.use} Base URL", row.base_url)
         has_partial_db_gateway = bool(row.base_url) != bool(row.api_key_encrypted)

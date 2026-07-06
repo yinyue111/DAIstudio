@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import io
 import re
+import tempfile
 import uuid
 from pathlib import Path
 
@@ -91,7 +92,10 @@ def _normalize_image_upload(data: bytes) -> tuple[bytes, int, int]:
         img.load()
         if fmt == "gif" and getattr(img, "is_animated", False):
             img.seek(0)
-        normalized = img.convert("RGB")
+        has_alpha = "A" in img.getbands() or "transparency" in img.info
+        normalized = img.convert("RGBA" if has_alpha else "RGB")
+        if has_alpha and normalized.getchannel("A").getextrema()[0] >= 255:
+            normalized = normalized.convert("RGB")
         buf = io.BytesIO()
         normalized.save(buf, format="PNG")
     except (OSError, ValueError):
@@ -155,8 +159,16 @@ def _inspect_video_and_poster(path: str) -> tuple[int | None, int | None, float 
         video_frames.release_video_slot()
 
 
-async def _save_upload_stream(file: UploadFile, subdir: str, ext: str, *, limit: int) -> tuple[str, int]:
-    key, path = storage.reserve_key(subdir, ext)
+async def _save_upload_stream(file: UploadFile, subdir: str, ext: str, *, limit: int) -> tuple[str, Path, int, bool]:
+    if storage.is_object_storage_enabled():
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=f".{ext.lstrip('.')}")
+        path = Path(tmp.name)
+        tmp.close()
+        key = ""
+        temporary = True
+    else:
+        key, path = storage.reserve_key(subdir, ext)
+        temporary = False
     total = 0
     try:
         with open(path, "wb") as f:
@@ -174,7 +186,9 @@ async def _save_upload_stream(file: UploadFile, subdir: str, ext: str, *, limit:
     if total <= 0:
         path.unlink(missing_ok=True)
         raise HTTPException(400, "请选择要上传的视频")
-    return key, total
+    if temporary:
+        key = storage.save_file(path, subdir, ext)
+    return key, path, total, temporary
 
 
 @router.post("/image", response_model=Asset)
@@ -295,11 +309,17 @@ async def upload_video(
 
     upload_key = None
     preview_key = None
+    upload_path = None
+    upload_path_temporary = False
     bytes_written = 0
     try:
-        upload_key, bytes_written = await _save_upload_stream(file, "upload_video", ext, limit=limit)
+        upload_key, upload_path, bytes_written, upload_path_temporary = await _save_upload_stream(
+            file,
+            "upload_video",
+            ext,
+            limit=limit,
+        )
         stem = Path(upload_key).stem
-        upload_path = storage.local_path(upload_key)
         width, height, duration, poster = _inspect_video_and_poster(str(upload_path))
         ensure_user_media_quota(db, user.id, bytes_written + (len(poster) if poster else 0))
         if poster:
@@ -337,6 +357,9 @@ async def upload_video(
         db.rollback()
         _cleanup_storage_keys(upload_key, preview_key)
         raise
+    finally:
+        if upload_path_temporary and upload_path is not None:
+            upload_path.unlink(missing_ok=True)
     audit.log(
         db,
         user_id=user.id,

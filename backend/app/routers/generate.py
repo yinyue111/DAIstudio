@@ -2,7 +2,6 @@
 and refunds immediately if enqueue fails."""
 from __future__ import annotations
 
-import hashlib
 import json
 import re
 from datetime import datetime, timezone
@@ -10,7 +9,6 @@ from urllib.parse import urlparse
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy import select
-from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from ..config import settings
@@ -18,15 +16,25 @@ from ..db import get_db
 from ..deps import get_client_ip, get_current_user
 from ..models import GenAsset, GenTask, UploadedAsset, User
 from ..schemas import GenerateIn, TaskOut
-from ..services import asset_refs, audit, credits, generation, locks
-from ..services.config_store import get_model_config, get_setting
+from ..services import asset_refs, generation, locks
+from ..services.config_store import get_model_config
 from ..services.content_safety import assert_text_allowed
 from ..services.generation import (
     assert_model_snapshot_compatible,
-    compact_image_prompt_payload,
     model_snapshot,
 )
-from ..services.generation_pricing import generation_cost, generation_cost_from_snapshot
+from ..services.generation_prompts import compact_image_prompt_payload
+from ..services.generation_request import (
+    assert_client_request_replay,
+    assert_reference_access,
+    default_image_n,
+    estimate_generation_cost_from_snapshot,
+    validate_generation_params,
+)
+from ..services.generation_request import (
+    request_fingerprint as build_request_fingerprint,
+)
+from ..services.generation_submit import submit_generation_task
 from ..services.rate_limit import incr_window
 from ..services.ssrf import (
     SsrfError,
@@ -38,41 +46,6 @@ from ..services.task_output import build_task_out
 router = APIRouter(prefix="/api", tags=["generate"])
 
 
-_SIZE_RE = re.compile(r"^(\d{2,5})x(\d{2,5})$")
-_OPENAI_COMPAT_4K_MAX_PIXELS = 3840 * 2160
-_VIDEO_RESOLUTIONS = {"480p", "720p", "1080p"}
-_VIDEO_RATIOS = {"1:1", "3:4", "4:3", "9:16", "16:9"}
-_COMMON_PARAM_KEYS = {
-    "seed",
-    "negative_prompt",
-    "negative",
-    "reference_width",
-    "reference_height",
-    "width",
-    "height",
-    "subject_mode",
-}
-
-
-def _image_max_pixels() -> int:
-    max_dim = max(1, int(settings.max_image_dim or 1))
-    return min(_OPENAI_COMPAT_4K_MAX_PIXELS, max_dim * max_dim)
-_IMAGE_PARAM_KEYS = _COMMON_PARAM_KEYS | {"n", "size", "style_reference_image", "character_reference_image"}
-_VIDEO_PARAM_KEYS = _COMMON_PARAM_KEYS | {
-    "duration",
-    "target_duration",
-    "resolution",
-    "target_resolution",
-    "ratio",
-    "reference_image_url",
-    "first_frame_image",
-    "last_frame_image",
-    "style_reference_image",
-    "character_reference_image",
-    "preview_resolution",
-    "preview_duration",
-}
-_SUBJECT_MODES = {"general", "product", "portrait"}
 _SOURCE_META_URL_KEYS = {
     "original_url",
     "original_thumb",
@@ -87,103 +60,24 @@ _SOURCE_META_TEXT_KEYS = {
     "product_generation_mode",
     "portrait_generation_mode",
     "subject_mode",
+    "variation_of_asset_id",
 }
 _SOURCE_META_BOOL_KEYS = {"product_generation_mode", "portrait_generation_mode"}
+_SOURCE_META_INT_KEYS = {"variation_of_asset_id"}
 
 
-def _normalise_reference_dimensions(params: dict) -> None:
-    for key in ("reference_width", "reference_height", "width", "height"):
-        if params.get(key) is None:
-            continue
-        try:
-            value = int(params[key])
-        except (TypeError, ValueError):
-            raise HTTPException(400, f"{key} 非法")
-        if not (1 <= value <= 20000):
-            raise HTTPException(400, f"{key} 超出范围")
-        params[key] = value
+def _final_params_from_parent(parent_params: dict | None) -> dict:
+    """Build a clean final-render params payload from preview params.
 
-
-def _validate_params(category: str, params: dict) -> dict:
-    """Clamp / reject user-supplied generation params before they reach the
-    gateway or any media allocation. Mutates and returns the params dict."""
-    params = dict(params or {})
-    try:
-        raw_size = len(json.dumps(params, ensure_ascii=False))
-    except (TypeError, ValueError):
-        raise HTTPException(400, "params 必须是可序列化 JSON")
-    if raw_size > int(settings.max_generate_params_bytes):
-        raise HTTPException(400, "params 过大")
-    allowed = _IMAGE_PARAM_KEYS if category == "image" else _VIDEO_PARAM_KEYS
-    unknown = sorted(str(k) for k in params if k not in allowed)
-    if unknown:
-        raise HTTPException(400, f"不支持的生成参数:{','.join(unknown[:5])}")
-    _normalise_reference_dimensions(params)
-    if params.get("subject_mode") not in (None, ""):
-        subject_mode = str(params["subject_mode"]).strip().lower()
-        if subject_mode not in _SUBJECT_MODES:
-            raise HTTPException(400, "subject_mode 不支持")
-        params["subject_mode"] = subject_mode
-    if params.get("seed") not in (None, ""):
-        try:
-            seed = int(params["seed"])
-        except (TypeError, ValueError):
-            raise HTTPException(400, "seed 非法")
-        if not (0 <= seed <= 2**32 - 1):
-            raise HTTPException(400, "seed 超出范围")
-        params["seed"] = seed
-    if category == "image":
-        if params.get("n") is not None:
-            try:
-                n = int(params["n"])
-            except (TypeError, ValueError):
-                raise HTTPException(400, "出图数量 n 非法")
-            if not (1 <= n <= settings.max_image_n):
-                raise HTTPException(400, f"出图数量需在 1..{settings.max_image_n} 之间")
-            params["n"] = n
-        size = params.get("size")
-        if size is not None:
-            m = _SIZE_RE.match(str(size))
-            if not m:
-                raise HTTPException(400, f"尺寸非法(最大 {settings.max_image_dim}px)")
-            width = int(m.group(1))
-            height = int(m.group(2))
-            ratio = width / height if height else 0
-            if not (
-                0 < width <= settings.max_image_dim
-                and 0 < height <= settings.max_image_dim
-                and width % 16 == 0
-                and height % 16 == 0
-                and width * height <= _image_max_pixels()
-                and (1 / 3) <= ratio <= 3
-            ):
-                raise HTTPException(
-                    400,
-                    f"尺寸非法:最大边 {settings.max_image_dim}px，总像素不超过 {_image_max_pixels()}，宽高需为 16 的倍数",
-                )
-    else:  # video
-        if params.get("duration") is not None:
-            try:
-                d = int(params["duration"])
-            except (TypeError, ValueError):
-                raise HTTPException(400, "时长非法")
-            if not (1 <= d <= settings.max_video_seconds):
-                raise HTTPException(400, f"时长需在 1..{settings.max_video_seconds} 秒之间")
-            params["duration"] = d
-        for key in ("resolution", "target_resolution"):
-            if params.get(key) is not None and params[key] not in _VIDEO_RESOLUTIONS:
-                raise HTTPException(400, f"{key} 仅支持 480p/720p/1080p")
-        if params.get("target_duration") is not None:
-            try:
-                td = int(params["target_duration"])
-            except (TypeError, ValueError):
-                raise HTTPException(400, "target_duration 非法")
-            if not (1 <= td <= settings.max_video_seconds):
-                raise HTTPException(400, f"target_duration 需在 1..{settings.max_video_seconds} 秒之间")
-            params["target_duration"] = td
-        if params.get("ratio") is not None and params["ratio"] not in _VIDEO_RATIOS:
-            raise HTTPException(400, "ratio 不支持")
-    return params
+    Final renders inherit user-facing render controls from the preview, but
+    runtime bookkeeping such as provider request ids, result URLs, download
+    attempts, and reconciliation flags must belong to the final task itself.
+    """
+    return {
+        str(k): v
+        for k, v in dict(parent_params or {}).items()
+        if not str(k).startswith("_video_") and str(k) != "request_id"
+    }
 
 
 def _validate_prompt_payload(prompt: dict, instruction: str | None) -> None:
@@ -256,6 +150,14 @@ def _source_trace(
         if key in _SOURCE_META_BOOL_KEYS and isinstance(source_meta.get(key), bool):
             trace[key] = source_meta[key]
             continue
+        if key in _SOURCE_META_INT_KEYS:
+            try:
+                value = int(source_meta.get(key))
+            except (TypeError, ValueError):
+                continue
+            if value > 0:
+                trace[key] = value
+            continue
         cleaned = _clean_source_meta_text(source_meta.get(key))
         if cleaned:
             trace[key] = cleaned
@@ -267,64 +169,6 @@ def _rate_limit(user_id: int) -> None:
     n = incr_window(key, 3600)
     if n > settings.user_gen_rate_per_hour:
         raise HTTPException(429, "生成过于频繁,请稍后再试")
-
-
-def _estimate_cost(
-    model,
-    category: str,
-    stage: str,
-    n: int = 1,
-    *,
-    params: dict | None = None,
-    source_type: str | None = None,
-) -> int:
-    return generation_cost(
-        category=category,
-        stage=stage,
-        params=params or {},
-        n=n,
-        source_type=source_type,
-        model_extra=getattr(model, "extra", None),
-    )
-
-
-def _estimate_cost_from_snapshot(
-    snapshot: dict,
-    category: str,
-    stage: str,
-    n: int = 1,
-    *,
-    params: dict | None = None,
-    source_type: str | None = None,
-) -> int:
-    return generation_cost_from_snapshot(
-        snapshot,
-        category=category,
-        stage=stage,
-        params=params or {},
-        n=n,
-        source_type=source_type,
-    )
-
-
-def _assert_reference_access(db: Session, user_id: int, *urls: str | None) -> None:
-    for url in urls:
-        if not url:
-            continue
-        key = local_storage_key_from_user_asset_url(url)
-        if not key:
-            continue
-        row = db.get(UploadedAsset, key)
-        if row:
-            if row.user_id != user_id:
-                raise HTTPException(404, "上传素材不存在")
-            continue
-        if key.startswith(("upload/", "upload_preview/", "upload_video/", "upload_video_preview/")):
-            raise HTTPException(404, "上传素材不存在")
-        try:
-            asset_refs.generated_asset_reference_path(db, user_id, key)
-        except asset_refs.AssetRefError as e:
-            raise HTTPException(404, str(e)) from e
 
 
 def _is_local_user_asset(db: Session, user_id: int, url: str | None) -> bool:
@@ -386,16 +230,6 @@ def _video_reference_is_actionable(
     return False
 
 
-def _default_image_n(db: Session) -> int:
-    try:
-        n = int(get_setting(db, "image_n", 4))
-    except (TypeError, ValueError):
-        raise HTTPException(400, "默认出图数量配置非法,请联系管理员")
-    if not (1 <= n <= settings.max_image_n):
-        raise HTTPException(400, f"默认出图数量需在 1..{settings.max_image_n} 之间,请联系管理员")
-    return n
-
-
 def _normalize_client_request_id(value: str | None) -> str | None:
     if value is None:
         return None
@@ -424,47 +258,6 @@ def _existing_client_request_task(
         )
         .limit(1)
     ).scalar_one_or_none()
-
-
-def _fingerprint_clean(value):
-    if isinstance(value, dict):
-        return {
-            str(k): _fingerprint_clean(v)
-            for k, v in value.items()
-            if not str(k).startswith("_")
-        }
-    if isinstance(value, list):
-        return [_fingerprint_clean(v) for v in value]
-    return value
-
-
-def _request_fingerprint(
-    *,
-    category: str,
-    stage: str,
-    source_asset_url: str | None,
-    source_type: str | None,
-    prompt: dict,
-    params: dict,
-    parent_task_id: int | None,
-) -> str:
-    payload = {
-        "category": category,
-        "stage": stage,
-        "source_asset_url": source_asset_url,
-        "source_type": source_type,
-        "prompt": _fingerprint_clean(prompt or {}),
-        "params": _fingerprint_clean(params or {}),
-        "parent_task_id": parent_task_id,
-    }
-    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-    return hashlib.sha256(raw.encode()).hexdigest()
-
-
-def _assert_client_request_replay(task: GenTask, request_fingerprint: str) -> None:
-    existing = ((task.params or {}).get("_client_request_fingerprint") or "").strip()
-    if existing and existing != request_fingerprint:
-        raise HTTPException(409, "client_request_id 已用于不同请求,请更换后重试")
 
 
 def _existing_active_final(db: Session, user_id: int, parent_id: int) -> GenTask | None:
@@ -504,7 +297,7 @@ def generate(body: GenerateIn, request: Request,
     client_request_id = _normalize_client_request_id(body.client_request_id)
     existing_client_task = _existing_client_request_task(db, user.id, client_request_id)
 
-    params = _validate_params(body.category, body.params)
+    params = validate_generation_params(body.category, body.params)
     request_prompt = dict(body.prompt or {})
     if body.instruction:
         request_prompt["instruction"] = body.instruction
@@ -522,27 +315,27 @@ def generate(body: GenerateIn, request: Request,
         ),
     )
 
-    # two-stage video: a `final` render must reference its own preview task
+    # Video now submits full renders directly. Legacy final-from-preview is kept
+    # for old history entries and idempotent clients that still pass a parent.
     parent = None
     if body.stage == "final":
         if body.category != "video":
             raise HTTPException(400, "final 阶段仅支持视频高清渲染")
-        if not body.parent_task_id:
-            raise HTTPException(400, "final 阶段需提供 parent_task_id(预览任务)")
-        parent = db.get(GenTask, body.parent_task_id)
-        if not parent or parent.user_id != user.id:
-            raise HTTPException(404, "预览任务不存在")
-        if (
-            parent.category != "video"
-            or parent.stage != "preview"
-            or parent.status != "succeeded"
-        ):
-            raise HTTPException(400, "final 必须基于已成功的视频预览任务")
-        has_preview_asset = db.execute(
-            select(GenAsset.id).where(GenAsset.task_id == parent.id).limit(1)
-        ).scalar_one_or_none()
-        if has_preview_asset is None:
-            raise HTTPException(400, "预览任务缺少可用素材,无法高清渲染")
+        if body.parent_task_id:
+            parent = db.get(GenTask, body.parent_task_id)
+            if not parent or parent.user_id != user.id:
+                raise HTTPException(404, "预览任务不存在")
+            if (
+                parent.category != "video"
+                or parent.stage != "preview"
+                or parent.status != "succeeded"
+            ):
+                raise HTTPException(400, "final 必须基于已成功的视频预览任务")
+            has_preview_asset = db.execute(
+                select(GenAsset.id).where(GenAsset.task_id == parent.id).limit(1)
+            ).scalar_one_or_none()
+            if has_preview_asset is None:
+                raise HTTPException(400, "预览任务缺少可用素材,无法高清渲染")
 
     # A final render is FULLY derived from its own preview — never trust the
     # client's prompt/source/params for final, or a user could pass preview A's
@@ -552,7 +345,7 @@ def generate(body: GenerateIn, request: Request,
         prompt = dict(parent.prompt or {})
         source_asset_url = parent.source_asset_url
         source_type = parent.source_type
-        task_params = dict(parent.params or {})
+        task_params = _final_params_from_parent(parent.params)
     else:
         prompt = dict(request_prompt)
         if not prompt:
@@ -588,11 +381,12 @@ def generate(body: GenerateIn, request: Request,
             "last_frame_image",
             "style_reference_image",
             "character_reference_image",
+            "mask_image_url",
         ):
             assert_safe_user_asset_url(task_params.get(_url_key))
     except SsrfError as e:
         raise HTTPException(400, f"素材链接被安全策略拦截:{e}")
-    _assert_reference_access(
+    assert_reference_access(
         db,
         user.id,
         source_asset_url,
@@ -601,8 +395,9 @@ def generate(body: GenerateIn, request: Request,
         task_params.get("last_frame_image"),
         task_params.get("style_reference_image"),
         task_params.get("character_reference_image"),
+        task_params.get("mask_image_url"),
     )
-    if body.category == "video" and body.stage == "preview" and not _video_reference_is_actionable(
+    if body.category == "video" and parent is None and not _video_reference_is_actionable(
         db,
         user.id,
         source_asset_url,
@@ -612,13 +407,13 @@ def generate(body: GenerateIn, request: Request,
     ):
         raise HTTPException(400, "视频参考缺少可用封面或反推提示词,请先反推视频或选择带封面的素材")
 
-    n_images = int(task_params.get("n") or _default_image_n(db)) \
+    n_images = int(task_params.get("n") or default_image_n(db)) \
         if body.category == "image" else 1
     # persist the resolved n so freeze (here), the worker, and settlement all
     # agree — otherwise a defaulted n freezes base*4 but settles base*1 (~75% undercharge).
     if body.category == "image":
         task_params["n"] = n_images
-    request_fingerprint = _request_fingerprint(
+    request_fingerprint = build_request_fingerprint(
         category=body.category,
         stage=body.stage,
         source_asset_url=source_asset_url,
@@ -628,7 +423,7 @@ def generate(body: GenerateIn, request: Request,
         parent_task_id=body.parent_task_id,
     )
     if existing_client_task is not None:
-        _assert_client_request_replay(existing_client_task, request_fingerprint)
+        assert_client_request_replay(existing_client_task, request_fingerprint)
         return build_task_out(db, existing_client_task)
     _rate_limit(user.id)
     if body.stage == "final" and parent:
@@ -641,7 +436,7 @@ def generate(body: GenerateIn, request: Request,
         snapshot = inherited_snapshot or model_snapshot(model)
     else:
         snapshot = model_snapshot(model)
-    if body.stage != "final":
+    if body.stage != "final" or parent is None:
         task_params["_source_trace"] = _source_trace(
             source_asset_url=source_asset_url,
             source_type=source_type,
@@ -653,7 +448,7 @@ def generate(body: GenerateIn, request: Request,
             task_params["_source_trace"] = parent_trace
     task_params["_model_snapshot"] = snapshot
     task_params["_client_request_fingerprint"] = request_fingerprint
-    cost = _estimate_cost_from_snapshot(
+    cost = estimate_generation_cost_from_snapshot(
         snapshot,
         body.category,
         body.stage,
@@ -665,7 +460,7 @@ def generate(body: GenerateIn, request: Request,
     def replay_conflicting_task() -> TaskOut | None:
         existing = _existing_client_request_task(db, user.id, client_request_id)
         if existing is not None:
-            _assert_client_request_replay(existing, request_fingerprint)
+            assert_client_request_replay(existing, request_fingerprint)
             return build_task_out(db, existing)
         if body.category == "video" and body.stage == "final" and parent is not None:
             active = _existing_active_final(db, user.id, parent.id)
@@ -674,7 +469,8 @@ def generate(body: GenerateIn, request: Request,
         return None
 
     def create_task() -> TaskOut:
-        task = GenTask(
+        return submit_generation_task(
+            db,
             user_id=user.id,
             source_asset_url=source_asset_url,
             source_type=source_type,
@@ -684,55 +480,11 @@ def generate(body: GenerateIn, request: Request,
             model_use=model_use,
             params=task_params,
             client_request_id=client_request_id,
-            status="queued",
-            cost_frozen=cost,
+            cost=cost,
             parent_task_id=body.parent_task_id,
+            ip=get_client_ip(request),
+            replay_conflicting_task=replay_conflicting_task,
         )
-        db.add(task)
-        try:
-            db.flush()
-        except IntegrityError:
-            db.rollback()
-            replay = replay_conflicting_task()
-            if replay is not None:
-                return replay
-            raise
-
-        # freeze estimated credits (raises 400 on insufficient balance)
-        try:
-            credits.freeze(db, user.id, cost, biz_ref=task.id, commit=False)
-        except (credits.InsufficientCredits, ValueError) as e:
-            db.rollback()
-            raise HTTPException(400, str(e))
-        try:
-            db.commit()
-        except IntegrityError:
-            db.rollback()
-            replay = replay_conflicting_task()
-            if replay is not None:
-                return replay
-            raise
-        db.refresh(task)
-
-        # enqueue; refund if the broker is unreachable
-        try:
-            from ..tasks import generate_image_task, generate_video_task
-
-            if body.category == "image":
-                generate_image_task.delay(task.id)
-            else:
-                generate_video_task.delay(task.id)
-        except Exception as e:  # noqa: BLE001
-            credits.refund(db, user.id, cost, biz_ref=task.id, commit=False)
-            task.status = "failed"
-            task.error = f"入队失败:{e}"
-            db.commit()
-            raise HTTPException(503, "任务入队失败,已退回额度。请确认 Worker/Redis 运行中")
-
-        audit.log(db, user_id=user.id, action="generate", biz_type="gen_task",
-                  biz_id=task.id, ip=get_client_ip(request),
-                  detail={"category": body.category, "stage": body.stage, "cost": cost})
-        return build_task_out(db, task)
 
     if body.category == "video" and body.stage == "final" and parent:
         lock_key = f"gen:final:create:{user.id}:{parent.id}"

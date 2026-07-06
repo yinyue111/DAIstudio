@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { api } from "../../../lib/api";
 import { paymentPackageDiff, providerLabel } from "./admin-helpers";
 import { Card, PayInput, PaySecret, Th } from "./admin-ui";
@@ -29,12 +29,15 @@ export function Payments() {
   const [msgKind, setMsgKind] = useState("ok");
   const [saving, setSaving] = useState("");
   const [secretNonce, setSecretNonce] = useState(0);
+  const loadSeqRef = useRef(0);
 
   function load() {
+    const seq = ++loadSeqRef.current;
     setMsg("");
     setMsgKind("ok");
     Promise.all([api.adminPaymentPackages(), api.adminPaymentProviders()])
       .then(([pkgs, ps]) => {
+        if (seq !== loadSeqRef.current) return;
         setPackages(pkgs);
         setProviders(ps);
         const next = {};
@@ -51,6 +54,7 @@ export function Payments() {
         setSecretNonce((n) => n + 1);
       })
       .catch((e) => {
+        if (seq !== loadSeqRef.current) return;
         setMsg(e.message);
         setMsgKind("bad");
       });

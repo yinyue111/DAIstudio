@@ -11,6 +11,30 @@ import {
 } from "./admin-helpers";
 import { Card, Th } from "./admin-ui";
 
+function validateExternalResultUrl(value, category) {
+  const trimmed = String(value || "").trim();
+  if (!trimmed) return "";
+  let url;
+  try {
+    url = new URL(trimmed);
+  } catch (e) {
+    throw new Error("结果 URL 格式不正确");
+  }
+  if (!["http:", "https:"].includes(url.protocol)) {
+    throw new Error("结果 URL 仅支持 http/https");
+  }
+  const path = `${url.pathname}${url.search}`.toLowerCase();
+  const imageLike = /\.(png|jpe?g|webp|gif)(\?|$|&)/i.test(path);
+  const videoLike = /\.(mp4|webm|mov|m4v)(\?|$|&)/i.test(path);
+  if (category === "image" && !imageLike && !window.confirm("URL 看起来不像图片文件，仍继续交给后端校验？")) {
+    throw new Error("已取消补结果");
+  }
+  if (category === "video" && !videoLike && !window.confirm("URL 看起来不像视频文件，仍继续交给后端校验？")) {
+    throw new Error("已取消补结果");
+  }
+  return url.toString();
+}
+
 export function Models() {
   const [rows, setRows] = useState([]);
   const [providers, setProviders] = useState({});
@@ -58,7 +82,8 @@ export function Models() {
       provider: r.provider || "",
       base_url: r.base_url || "",
       gateway_format: r.gateway_format || "",
-      api_key: r.api_key || "",
+      api_key_present: Boolean(r.api_key),
+      api_key_length: r.api_key ? String(r.api_key).length : 0,
       api_key_configured: !!r.api_key_configured,
       api_key_clear: !!r.api_key_clear,
     });
@@ -98,6 +123,16 @@ export function Models() {
       }
       const cost = Number(r.cost_credits);
       const unlockCost = Number(r.unlock_cost);
+      if (!Number.isFinite(cost) || cost < 1) {
+        setMsgType("bad");
+        setMsg("调用消耗积分必须大于等于 1。");
+        return;
+      }
+      if (!Number.isFinite(unlockCost) || unlockCost < 0) {
+        setMsgType("bad");
+        setMsg("解锁消耗积分不能小于 0。");
+        return;
+      }
       const summary = [
         `用途：${modelUseLabel(r.use)}`,
         `提供商：${r.provider || "环境变量兜底"}`,
@@ -264,7 +299,7 @@ export function Models() {
               </label>
               <label className="grid gap-1 text-xs text-fog">
                 <span>调用消耗积分</span>
-                <input className="input w-full" type="number" min="0" value={r.cost_credits}
+                <input className="input w-full" type="number" min="1" value={r.cost_credits}
                   onChange={(e) => set(i, "cost_credits", e.target.value)} />
               </label>
               <label className="grid gap-1 text-xs text-fog">
@@ -336,14 +371,21 @@ export function ReviewTasks() {
       setMsg("该任务没有可用的本地图片结果，请填写上游结果 URL 后再结算。");
       return;
     }
+    let cleanResultUrl = "";
+    try {
+      cleanResultUrl = validateExternalResultUrl(resultUrl, task.category);
+    } catch (e) {
+      if (e.message !== "已取消补结果") setMsg(e.message);
+      return;
+    }
     const externalTaskId = window.prompt("外部任务 ID(可选)", task.external_task_id || "") || null;
     const note = window.prompt("结算备注(可选)", "人工补结果结算") || "";
-    if (!confirmReviewTaskAction(task, "补结果结算", note, resultUrl)) return;
+    if (!confirmReviewTaskAction(task, "补结果结算", note, cleanResultUrl)) return;
     setBusyId(task.id);
     setMsg("");
     try {
       await api.adminSettleReviewTask(task.id, {
-        result_url: resultUrl,
+        result_url: cleanResultUrl,
         external_task_id: externalTaskId,
         note,
       });
@@ -411,10 +453,18 @@ export function AssetReports() {
   const [status, setStatus] = useState("open");
   const [msg, setMsg] = useState("");
   const [busyId, setBusyId] = useState(null);
+  const loadSeqRef = useRef(0);
 
   const load = () => {
+    const seq = ++loadSeqRef.current;
     setMsg("");
-    api.adminAssetReports({ status }).then(setRows).catch((e) => setMsg(e.message));
+    api.adminAssetReports({ status })
+      .then((nextRows) => {
+        if (seq === loadSeqRef.current) setRows(nextRows);
+      })
+      .catch((e) => {
+        if (seq === loadSeqRef.current) setMsg(e.message);
+      });
   };
   useEffect(() => { load(); }, [status]);
 

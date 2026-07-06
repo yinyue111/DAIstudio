@@ -455,8 +455,8 @@ def _render_with_playwright(url: str) -> str | None:
         if browser is not None:
             try:
                 browser.close()
-            except Exception:
-                pass
+            except Exception:  # noqa: BLE001
+                log.debug("playwright browser close failed", exc_info=True)
         _PW_SEM.release()
 
 

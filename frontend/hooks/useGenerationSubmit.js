@@ -1,0 +1,244 @@
+"use client";
+
+import { useRef, useState } from "react";
+import { api } from "../lib/api";
+import { buildGenerationPayload } from "../app/studio/generationPayload";
+import {
+  clearPendingGenerateRequest,
+  clearPendingReverseRequest,
+  generateClientRequestId,
+  generateReverseClientRequestId,
+} from "../app/studio/generationRequestId";
+import { shouldBlockNewGeneration } from "../app/studio/taskConcurrency";
+import { assetSignature, isRequestTimeoutError, isTerminalTaskStatus } from "../app/studio/helpers";
+
+export default function useGenerationSubmit({
+  cfg,
+  task,
+  category,
+  creationMode,
+  isEditMode,
+  isImageEditMode,
+  subjectMode,
+  prompt,
+  negative,
+  promptDirty,
+  promptSourceSignature,
+  selected,
+  productAsset,
+  productProfile,
+  productProfileSource,
+  variationSource,
+  structured,
+  structuredSource,
+  ratio,
+  imageQuality,
+  n,
+  seed,
+  editMaskMode,
+  vDuration,
+  vResolution,
+  videoProductLockMode,
+  resultsRef,
+  modelEnabled,
+  setMsg,
+  setTask,
+  setRunningSnapshot,
+  setTrackingLost,
+  setWorkspacePatch,
+  trackBackgroundTask,
+  refreshMe,
+  startTracking,
+}) {
+  const [submitting, setSubmitting] = useState(false);
+  const pendingGenerateRequestRef = useRef(null);
+  const pendingProfileReverseRequestRef = useRef(null);
+  const productAssetSignatureByModeRef = useRef({});
+
+  productAssetSignatureByModeRef.current[creationMode] = assetSignature(productAsset);
+
+  function scrollToResults() {
+    if (typeof window === "undefined") return;
+    const run = () => {
+      resultsRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+    };
+    window.requestAnimationFrame(() => window.requestAnimationFrame(run));
+  }
+
+  async function submit(stage = "preview") {
+    if (submitting) return;
+    if (shouldBlockNewGeneration(task, category)) {
+      setMsg(category === "image" ? "" : "当前视频任务仍在生成中，请等待完成后再发起新的视频生成。");
+      return;
+    }
+    if (isEditMode && !productAsset) {
+      setMsg(isImageEditMode ? "请先上传要编辑的图片" : "请先上传产品主体图片");
+      return;
+    }
+    if (isEditMode && !String(prompt || "").trim() && Object.keys(structured || {}).length === 0) {
+      setMsg(isImageEditMode ? "请输入图片编辑要求" : "请先反推风格参考或输入希望迁移的风格提示词");
+      return;
+    }
+    if (!isEditMode && !String(prompt || "").trim() && !selected) {
+      setMsg("请输入提示词，或从参考反推");
+      return;
+    }
+
+    setSubmitting(true);
+    setMsg("");
+    let requestId = null;
+    try {
+      const effCategory = category;
+      if (!modelEnabled(effCategory)) {
+        setMsg(`${effCategory === "video" ? "视频" : "图片"}模型未启用，请联系管理员配置后再使用。`);
+        return;
+      }
+      let resolvedProductProfile = productProfile;
+      let resolvedProductProfileSource = productProfileSource;
+      const needsSubjectProfile = (
+        isEditMode
+        && productAsset?.url
+        && (subjectMode === "product" || subjectMode === "portrait")
+      );
+      const productSignature = assetSignature(productAsset);
+      const isProductAssetStillCurrent = () => (
+        productAssetSignatureByModeRef.current[creationMode] === productSignature
+      );
+      if (needsSubjectProfile && (!resolvedProductProfile || resolvedProductProfileSource !== productSignature)) {
+        setWorkspacePatch?.({ productProfiling: true, productProfile: null, productProfileSource: "" }, creationMode);
+        const profileRequestId = generateReverseClientRequestId(
+          pendingProfileReverseRequestRef,
+          `${creationMode}-profile`,
+          JSON.stringify({
+            url: productAsset.url,
+            sourceType: "image",
+            target: "product_profile",
+            subjectMode,
+          }),
+        );
+        try {
+          const profile = await api.reverse(
+            productAsset.url,
+            "product_profile",
+            null,
+            "image",
+            null,
+            profileRequestId,
+          );
+          clearPendingReverseRequest(pendingProfileReverseRequestRef, profileRequestId);
+          if (!isProductAssetStillCurrent()) {
+            setWorkspacePatch?.({ productProfiling: false }, creationMode);
+            setMsg("主体图片已变更，请重新点击生成。");
+            clearPendingGenerateRequest(pendingGenerateRequestRef, requestId);
+            return;
+          }
+          resolvedProductProfile = {
+            structured: profile?.structured || {},
+            final_text: profile?.final_text || "",
+          };
+          resolvedProductProfileSource = productSignature;
+          setWorkspacePatch?.({
+            productProfile: resolvedProductProfile,
+            productProfileSource: resolvedProductProfileSource,
+            productProfiling: false,
+          }, creationMode);
+          refreshMe();
+        } catch (e) {
+          if (!isRequestTimeoutError(e)) {
+            clearPendingReverseRequest(pendingProfileReverseRequestRef, profileRequestId);
+          }
+          if (!isProductAssetStillCurrent()) {
+            setWorkspacePatch?.({ productProfiling: false }, creationMode);
+            setMsg("主体图片已变更，请重新点击生成。");
+            clearPendingGenerateRequest(pendingGenerateRequestRef, requestId);
+            return;
+          }
+          resolvedProductProfile = null;
+          resolvedProductProfileSource = "";
+          setWorkspacePatch?.({
+            productProfile: null,
+            productProfileSource: "",
+            productProfiling: false,
+          }, creationMode);
+          setMsg(`主体档案识别失败，将使用基础保真约束继续生成：${e.message}`);
+        }
+      }
+      if (isEditMode && productAsset?.url && !isProductAssetStillCurrent()) {
+        setMsg("主体图片已变更，请重新点击生成。");
+        clearPendingGenerateRequest(pendingGenerateRequestRef, requestId);
+        return;
+      }
+      const { payload, ratioOption } = buildGenerationPayload({
+        stage,
+        task: null,
+        cfg,
+        category,
+        creationMode,
+        isEditMode,
+        isImageEditMode,
+        subjectMode,
+        prompt,
+        negative,
+        promptDirty,
+        promptSourceSignature,
+        selected,
+        productAsset,
+        productProfile: resolvedProductProfile,
+        productProfileSource: resolvedProductProfileSource,
+        variationSource,
+        structured,
+        structuredSource,
+        ratio,
+        imageQuality,
+        n,
+        seed,
+        editMaskMode,
+        vDuration,
+        vResolution,
+        videoProductLockMode,
+      });
+      payload.client_request_id = generateClientRequestId(
+        pendingGenerateRequestRef,
+        stage,
+        JSON.stringify(payload),
+      );
+      requestId = payload.client_request_id;
+
+      const nextTask = await api.generate(payload);
+      clearPendingGenerateRequest(pendingGenerateRequestRef, requestId);
+      const previousTask = task;
+      if (
+        previousTask
+        && previousTask.id !== nextTask.id
+        && previousTask.category === "image"
+        && !isTerminalTaskStatus(previousTask.status)
+      ) {
+        trackBackgroundTask(previousTask);
+      }
+      setTask(nextTask);
+      setTrackingLost(false);
+      setRunningSnapshot({
+        category: effCategory,
+        n: effCategory === "image" ? Number(payload.params?.n || n || 1) : 1,
+        ratio: ratioOption,
+      });
+      scrollToResults();
+      refreshMe();
+      startTracking(nextTask.id);
+    } catch (e) {
+      if (isRequestTimeoutError(e)) {
+        setMsg(`${e.message}。任务可能已提交，重新点击会复用同一次请求，避免重复扣费。`);
+      } else {
+        clearPendingGenerateRequest(pendingGenerateRequestRef, requestId);
+        setMsg(e.message);
+      }
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  return {
+    submitting,
+    submit,
+  };
+}

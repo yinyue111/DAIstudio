@@ -10,7 +10,8 @@
     "dev": "next dev --webpack -p 3000",
     "build": "next build --webpack",
     "start": "next start -p 3000",
-    "test:unit": "node scripts/api-auth-cookie.test.mjs && node scripts/api-base-localhost.test.mjs && node scripts/api-upload-rights.test.mjs && node scripts/reference-preview-security.test.mjs && node scripts/download-blob-navigation.test.mjs && node scripts/admin-payment-env-readonly.test.mjs && node scripts/security-headers.test.mjs && node scripts/style-transfer-prompt.test.mjs && node scripts/studio-image-size.test.mjs && node scripts/studio-concurrency.test.mjs && node scripts/studio-workspace-state.test.mjs"
+    "test:unit": "node scripts/api-auth-cookie.test.mjs && node scripts/api-base-localhost.test.mjs && node scripts/auth-middleware.test.mjs && node scripts/api-admin-users-query.test.mjs && node scripts/api-upload-rights.test.mjs && node scripts/reference-preview-security.test.mjs && node scripts/download-blob-navigation.test.mjs && node scripts/admin-payment-env-readonly.test.mjs && node scripts/security-headers.test.mjs && node scripts/history-final-request.test.mjs && node scripts/prompts-tabs.test.mjs && node scripts/nav-layout-stability.test.mjs && tsx scripts/asset-media-src.test.mjs && tsx scripts/style-transfer-prompt.test.mjs && tsx scripts/edit-prompt.test.mjs && tsx scripts/generation-payload.test.mjs && tsx scripts/studio-image-size.test.mjs && tsx scripts/studio-concurrency.test.mjs && tsx scripts/studio-workspace-state.test.mjs",
+    "typecheck": "tsc --noEmit"
   },
   "dependencies": {
     "next": "16.2.9",
@@ -19,9 +20,13 @@
     "react-dom": "18.3.1"
   },
   "devDependencies": {
+    "@types/node": "26.0.1",
+    "@types/react": "19.2.17",
     "autoprefixer": "10.4.19",
     "postcss": "8.5.15",
-    "tailwindcss": "3.4.6"
+    "tailwindcss": "3.4.6",
+    "tsx": "^4.22.4",
+    "typescript": "6.0.3"
   },
   "overrides": {
     "postcss": "8.5.15"

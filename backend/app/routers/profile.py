@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
@@ -33,6 +33,18 @@ def _maybe_purge(db: Session, user_id: int) -> None:
             retention.purge_expired(db, user_id=user_id)
     except Exception:  # noqa: BLE001
         db.rollback()
+
+
+def _parse_dt(value: str | None, *, end_of_day: bool = False) -> datetime | None:
+    if not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(value)
+    except ValueError:
+        raise HTTPException(400, "日期格式应为 YYYY-MM-DD 或 ISO 时间") from None
+    if end_of_day and len(value.strip()) == 10:
+        dt = dt.replace(hour=23, minute=59, second=59, microsecond=999999)
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
 
 @router.get("")
@@ -66,6 +78,10 @@ def profile(db: Session = Depends(get_db), user: User = Depends(get_current_user
 
 @router.get("/assets", response_model=list[AssetOut])
 def my_assets(type: str = "all", favorite: bool = False,
+              created_from: str | None = None, created_to: str | None = None,
+              model_use: str | None = None, size: str | None = None,
+              min_width: int | None = None, min_height: int | None = None,
+              max_width: int | None = None, max_height: int | None = None,
               limit: int = 60, offset: int = 0,
               db: Session = Depends(get_db), user: User = Depends(get_current_user)):
     # best-effort, throttled: drop this user's expired assets (rate-limited so a
@@ -84,6 +100,29 @@ def my_assets(type: str = "all", favorite: bool = False,
         q = q.where(GenAsset.type == type)
     if favorite:
         q = q.where(GenAsset.favorite.is_(True))
+    start = _parse_dt(created_from)
+    end = _parse_dt(created_to, end_of_day=True)
+    if start:
+        q = q.where(GenAsset.created_at >= start)
+    if end:
+        q = q.where(GenAsset.created_at <= end)
+    if model_use in {"vision", "image", "video"}:
+        q = q.where(GenTask.model_use == model_use)
+    if size in {"square", "portrait", "landscape"}:
+        if size == "square":
+            q = q.where(GenAsset.width.is_not(None), GenAsset.height.is_not(None), GenAsset.width == GenAsset.height)
+        elif size == "portrait":
+            q = q.where(GenAsset.width.is_not(None), GenAsset.height.is_not(None), GenAsset.height > GenAsset.width)
+        else:
+            q = q.where(GenAsset.width.is_not(None), GenAsset.height.is_not(None), GenAsset.width > GenAsset.height)
+    if min_width is not None:
+        q = q.where(GenAsset.width >= max(1, int(min_width)))
+    if min_height is not None:
+        q = q.where(GenAsset.height >= max(1, int(min_height)))
+    if max_width is not None:
+        q = q.where(GenAsset.width <= max(1, int(max_width)))
+    if max_height is not None:
+        q = q.where(GenAsset.height <= max(1, int(max_height)))
     limit, offset = _page(limit, offset, 200)
     q = q.limit(limit).offset(offset)
 

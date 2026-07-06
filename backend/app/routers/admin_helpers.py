@@ -1,6 +1,8 @@
 """Helper modules for admin router endpoints."""
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 from datetime import datetime, timezone
 
@@ -13,7 +15,7 @@ from ..db import get_db
 from ..deps import get_client_ip, require_admin
 from ..models import AdminIdempotencyKey, GenTask, ModelConfig, User
 from ..redis_client import redis_client
-from ..schemas import ModelConfigIn, QuotaGrantIn
+from ..schemas import ModelConfigIn, QuotaBulkGrantIn, QuotaGrantIn, QuotaGrantItemIn
 from ..services import generation, payment_config
 from ..services.config_store import get_setting
 from ..services.model_gateway_config import (
@@ -169,6 +171,72 @@ def quota_grant_idempotency_raw(body: QuotaGrantIn) -> str:
     if not re.fullmatch(r"[A-Za-z0-9_.:-]{8,128}", raw):
         raise HTTPException(400, "idempotency_key 格式非法")
     return raw
+
+
+def quota_bulk_grant_idempotency_raw(body: QuotaBulkGrantIn) -> str:
+    raw = (body.idempotency_key or "").strip()
+    if not raw:
+        raise HTTPException(400, "idempotency_key 必填")
+    if not re.fullmatch(r"[A-Za-z0-9_.:-]{8,96}", raw):
+        raise HTTPException(400, "idempotency_key 格式非法")
+    return raw
+
+
+def quota_bulk_grant_fingerprint(body: QuotaBulkGrantIn) -> str:
+    payload = [
+        {
+            "user_id": int(item.user_id),
+            "amount": int(item.amount),
+            "note": (item.note or "").strip(),
+        }
+        for item in body.items
+    ]
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def reserve_quota_bulk_grant_idempotency(
+    db: Session,
+    *,
+    admin_id: int,
+    body: QuotaBulkGrantIn,
+) -> tuple[str, bool]:
+    raw = quota_bulk_grant_idempotency_raw(body)
+    marker_key = f"bulk:{raw}"
+    marker_note = f"bulk:{quota_bulk_grant_fingerprint(body)}"
+    try:
+        db.add(
+            AdminIdempotencyKey(
+                admin_id=admin_id,
+                scope="quota_grant",
+                key=marker_key,
+                amount=0,
+                note=marker_note,
+            )
+        )
+        db.flush()
+    except IntegrityError as e:
+        db.rollback()
+        existing = db.execute(
+            select(AdminIdempotencyKey).where(
+                AdminIdempotencyKey.admin_id == admin_id,
+                AdminIdempotencyKey.scope == "quota_grant",
+                AdminIdempotencyKey.key == marker_key,
+            )
+        ).scalar_one_or_none()
+        if existing and (existing.note or "") == marker_note:
+            return raw, False
+        raise HTTPException(409, "幂等键已用于不同批量额度发放请求") from e
+    return raw, True
+
+
+def quota_bulk_grant_item_key(raw_key: str, index: int, item: QuotaGrantItemIn) -> str:
+    note = (item.note or "").strip()
+    raw_digest = hashlib.sha256(raw_key.encode()).hexdigest()[:16]
+    digest = hashlib.sha256(
+        f"{raw_key}\x1f{index}\x1f{item.user_id}\x1f{item.amount}\x1f{note}".encode()
+    ).hexdigest()[:24]
+    return f"bulk:{raw_digest}:{index}:{digest}"
 
 
 def reserve_quota_grant_idempotency(

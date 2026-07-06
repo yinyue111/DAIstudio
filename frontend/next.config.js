@@ -54,6 +54,7 @@ const nextConfig = {
   reactStrictMode: true,
   output: "standalone",
   outputFileTracingRoot: path.join(__dirname),
+  allowedDevOrigins: ["127.0.0.1", "localhost"],
   // Internal tool: allow loading remote reference / result images without the
   // next/image optimizer (we use plain <img>).
   async headers() {

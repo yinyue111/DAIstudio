@@ -125,3 +125,31 @@ def ark_content(prompt: str, params: dict) -> list:
     if character and str(character) not in seen_images:
         content.append({"type": "image_url", "image_url": {"url": character}})
     return content
+
+
+def ark_payload(model_id: str, prompt: str, params: dict) -> dict:
+    """Build the Ark video task body with native generation fields.
+
+    Keep text flags in ``content`` for older gateways, but also send the fields
+    Ark exposes at the request-body layer. Without these native fields, some
+    gateways treat ``--resolution 1080p`` as plain prompt text and fall back to
+    their default 480p output.
+    """
+    params = params or {}
+    payload = {"model": model_id, "content": ark_content(prompt, params)}
+    if params.get("resolution"):
+        payload["resolution"] = str(params["resolution"])
+    if params.get("duration") not in (None, ""):
+        try:
+            payload["duration"] = int(params["duration"])
+        except (TypeError, ValueError):
+            pass
+    if params.get("ratio"):
+        payload["ratio"] = str(params["ratio"])
+    if params.get("seed") not in (None, ""):
+        try:
+            payload["seed"] = int(params["seed"])
+        except (TypeError, ValueError):
+            pass
+    payload["watermark"] = False
+    return payload

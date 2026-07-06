@@ -1,7 +1,7 @@
 """Hardening: input validation on generate params + server-side reverse switch."""
 
 from app.db import SessionLocal
-from app.models import GenTask, ParseRecord, User
+from app.models import GatewayCall, GenTask, ParseRecord, User
 from app.services import gateway, generation, storage
 from app.services.progress import set_progress
 
@@ -176,6 +176,135 @@ def test_needs_review_image_task_is_not_reprocessed(client, make_user, monkeypat
         db.close()
 
 
+def test_canceled_task_cannot_be_revived_by_success_claim(client, make_user):
+    uid = make_user("13900000057", balance=1000)
+    db = SessionLocal()
+    try:
+        task = GenTask(
+            user_id=uid,
+            category="image",
+            stage="preview",
+            status="canceled",
+            cost_frozen=10,
+            prompt={"final_text": "canceled"},
+            params={"n": 1, "size": "256x256"},
+        )
+        db.add(task)
+        db.commit()
+        tid = task.id
+
+        assert generation.claim_terminal(db, tid, "succeeded", cost_settled=10) is False
+        db.rollback()
+        assert db.get(GenTask, tid).status == "canceled"
+    finally:
+        db.close()
+
+
+def test_image_worker_does_not_revive_queued_task_canceled_during_claim(client, make_user, monkeypatch):
+    from sqlalchemy.orm import Session as OrmSession
+
+    uid = make_user("13900000059", balance=1000)
+    db = SessionLocal()
+    try:
+        task = GenTask(
+            user_id=uid,
+            category="image",
+            stage="preview",
+            status="queued",
+            cost_frozen=10,
+            prompt={"final_text": "cancel race"},
+            params={"n": 1, "size": "256x256"},
+        )
+        db.add(task)
+        db.commit()
+        tid = task.id
+    finally:
+        db.close()
+
+    original_execute = OrmSession.execute
+    canceled = {"done": False}
+
+    def cancel_before_claim(self, statement, *args, **kwargs):
+        text = str(statement)
+        if not canceled["done"] and "UPDATE gen_tasks SET status" in text and "status = :status_1" in text:
+            canceled["done"] = True
+            race_db = SessionLocal()
+            try:
+                race_task = race_db.get(GenTask, tid)
+                race_task.status = "canceled"
+                race_db.commit()
+            finally:
+                race_db.close()
+        return original_execute(self, statement, *args, **kwargs)
+
+    monkeypatch.setattr(OrmSession, "execute", cancel_before_claim)
+    monkeypatch.setattr(
+        "app.services.gateway.gen_image",
+        lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("canceled task generated")),
+    )
+
+    generation.run_image_task(tid)
+    db = SessionLocal()
+    try:
+        assert db.get(GenTask, tid).status == "canceled"
+    finally:
+        db.close()
+
+
+def test_image_worker_honors_cancel_before_settlement_after_save(client, make_user, monkeypatch):
+    uid = make_user("13900000058", balance=1000)
+    db = SessionLocal()
+    try:
+        task = GenTask(
+            user_id=uid,
+            category="image",
+            stage="preview",
+            status="queued",
+            cost_frozen=10,
+            prompt={"final_text": "cancel after image return"},
+            params={"n": 1, "size": "256x256"},
+        )
+        db.add(task)
+        db.flush()
+        from app.services import credits
+
+        credits.freeze(db, uid, 10, biz_ref=task.id, commit=False)
+        db.commit()
+        tid = task.id
+    finally:
+        db.close()
+
+    original_save_bytes = storage.save_bytes
+    canceled = {"done": False}
+
+    def save_and_cancel_once(*args, **kwargs):
+        key = original_save_bytes(*args, **kwargs)
+        if not canceled["done"]:
+            canceled["done"] = True
+            race_db = SessionLocal()
+            try:
+                race_task = race_db.get(GenTask, tid)
+                race_task.params = {**(race_task.params or {}), "_cancel_requested": True}
+                race_db.commit()
+            finally:
+                race_db.close()
+        return key
+
+    monkeypatch.setattr(storage, "save_bytes", save_and_cancel_once)
+
+    generation.run_image_task(tid)
+    db = SessionLocal()
+    try:
+        task = db.get(GenTask, tid)
+        user = db.get(User, uid)
+        assert task.status == "canceled"
+        assert task.cost_settled == 0
+        assert user.balance_credits == 1000
+        assert user.frozen_credits == 0
+    finally:
+        db.close()
+
+
 def test_partial_image_generation_exposes_gateway_slot_failure(client, make_user, auth, monkeypatch):
     make_user("13900000049", balance=1000)
     h = auth("13900000049")
@@ -247,7 +376,7 @@ def test_partial_image_generation_unknown_slot_returns_saved_images(
 
     assert r.status_code == 200, r.text
     task = client.get(f"/api/tasks/{r.json()['id']}", headers=h).json()
-    assert task["status"] == "succeeded"
+    assert task["status"] == "needs_review"
     assert task["partial"] is True
     assert task["requested_count"] == 4
     assert task["saved_count"] == 2
@@ -255,10 +384,10 @@ def test_partial_image_generation_unknown_slot_returns_saved_images(
     assert task["partial_errors"] == ["read timed out"]
     assert len(task["assets"]) == 2
     assert task["cost_frozen"] == 60
-    assert task["cost_settled"] == 30
+    assert task["cost_settled"] == 0
     me = client.get("/api/me", headers=h).json()
-    assert me["balance_credits"] == 970
-    assert me["frozen_credits"] == 0
+    assert me["balance_credits"] == 940
+    assert me["frozen_credits"] == 60
 
     db = SessionLocal()
     try:
@@ -267,7 +396,7 @@ def test_partial_image_generation_unknown_slot_returns_saved_images(
         assert db_task.params["_requested_n"] == 4
         assert db_task.params["_saved_n"] == 2
         assert db_task.params["_image_result_keys"]
-        assert db_task.status == "succeeded"
+        assert db_task.status == "needs_review"
     finally:
         db.close()
 
@@ -522,7 +651,7 @@ def test_video_reference_rejects_external_video_without_cover(client, make_user,
     assert "视频参考缺少可用封面" in r.text
 
 
-def test_generate_accepts_4k_size(client, make_user, auth, monkeypatch):
+def test_generate_accepts_2k_size(client, make_user, auth, monkeypatch):
     make_user("13900000029", balance=1000)
     h = auth("13900000029")
 
@@ -540,10 +669,10 @@ def test_generate_accepts_4k_size(client, make_user, auth, monkeypatch):
         "source_asset_url": "http://x/y.png", "source_type": "image",
         "source_asset_meta": {"user_confirmed_rights": True},
         "category": "image", "stage": "preview", "instruction": "x",
-        "params": {"n": 1, "size": "2880x2880"},
+        "params": {"n": 1, "size": "2048x2048"},
     }, headers=h)
     assert r.status_code == 200, r.text
-    assert seen["size"] == "2880x2880"
+    assert seen["size"] == "2048x2048"
 
 
 def test_generate_respects_lower_max_image_dim_area(client, make_user, auth, monkeypatch):
@@ -562,6 +691,31 @@ def test_generate_respects_lower_max_image_dim_area(client, make_user, auth, mon
     assert "总像素不超过" in r.text
 
 
+def test_2k_generation_keeps_gateway_actual_result(client, make_user, auth, monkeypatch):
+    make_user("13900000239", balance=1000)
+    h = auth("13900000239")
+
+    monkeypatch.setattr(
+        "app.services.gateway.gen_image",
+        lambda prompt, _model, n=1, size="2048x2048", **_kwargs: [
+            gateway._mock_image(prompt, "1024x1024", 0)
+        ],
+    )
+
+    r = client.post("/api/generate", json={
+        "category": "image",
+        "stage": "preview",
+        "prompt": {"final_text": "2k request accepts actual gateway result"},
+        "params": {"n": 1, "size": "2048x2048"},
+    }, headers=h)
+    assert r.status_code == 200, r.text
+
+    task = client.get(f"/api/tasks/{r.json()['id']}", headers=h).json()
+    assert task["status"] == "succeeded"
+    assert task["assets"][0]["width"] == 1024
+    assert task["assets"][0]["height"] == 1024
+
+
 def test_admin_settings_respects_lower_max_image_dim_area(client, make_user, auth, monkeypatch):
     make_user("13900000035", balance=1000, admin=True)
     h = auth("13900000035")
@@ -576,9 +730,10 @@ def test_admin_settings_respects_lower_max_image_dim_area(client, make_user, aut
     assert "总像素不超过" in r.text
 
 
-def test_4k_generation_rejects_gateway_downscaled_result(client, make_user, auth, monkeypatch):
+def test_4k_generation_keeps_actual_gateway_result(client, make_user, auth, monkeypatch):
     make_user("13900000032", balance=1000)
     h = auth("13900000032")
+    monkeypatch.setattr("app.routers.generate.settings.max_image_dim", 3840)
 
     monkeypatch.setattr(
         "app.services.gateway.gen_image",
@@ -596,14 +751,84 @@ def test_4k_generation_rejects_gateway_downscaled_result(client, make_user, auth
     assert r.status_code == 200, r.text
 
     task = client.get(f"/api/tasks/{r.json()['id']}", headers=h).json()
-    assert task["status"] == "failed"
-    assert "分辨率低于请求" in task["error"]
-    assert client.get("/api/me", headers=h).json()["balance_credits"] == 1000
+    assert task["status"] == "succeeded"
+    assert task["assets"][0]["width"] == 1024
+    assert task["assets"][0]["height"] == 1024
+    assert task["assets"][0]["quality_status"] == "ok"
+    assert task["assets"][0]["preview_url"]
+    db = SessionLocal()
+    try:
+        call = (
+            db.query(GatewayCall)
+            .filter(GatewayCall.task_id == r.json()["id"], GatewayCall.kind == "image")
+            .order_by(GatewayCall.id.desc())
+            .first()
+        )
+        assert call is not None
+        assert call.status == "ok"
+        assert call.detail["size"] == "2880x2880"
+        assert call.detail["returned_sizes"] == ["1024x1024"]
+        assert call.detail["saved_n"] == 1
+    finally:
+        db.close()
+
+
+def test_4k_generation_saves_gateway_auto_downgrade_result(client, make_user, auth, monkeypatch):
+    make_user("13900009039", balance=1000)
+    h = auth("13900009039")
+    monkeypatch.setattr("app.routers.generate.settings.max_image_dim", 3840)
+
+    def fake_gen_image(prompt, _model, n=1, size="2880x2880", **_kwargs):
+        result = gateway.ImageBatchResult(
+            [gateway._mock_image(prompt, "1024x1024", 0)],
+            diagnostics=[
+                gateway.ImageResponseDiagnostic(
+                    model="gpt-image-2-codex",
+                    size="auto",
+                    quality="auto",
+                    output_format="jpeg",
+                    selected_source="b64_json",
+                )
+            ],
+        )
+        return result
+
+    monkeypatch.setattr("app.services.gateway.gen_image", fake_gen_image)
+
+    r = client.post("/api/generate", json={
+        "category": "image",
+        "stage": "preview",
+        "prompt": {"final_text": "4k request but gateway auto-downgrades"},
+        "params": {"n": 1, "size": "2880x2880"},
+    }, headers=h)
+    assert r.status_code == 200, r.text
+
+    task = client.get(f"/api/tasks/{r.json()['id']}", headers=h).json()
+    assert task["status"] == "succeeded"
+    assert task["error"] is None
+    assert task["assets"][0]["width"] == 1024
+    assert task["assets"][0]["height"] == 1024
+    db = SessionLocal()
+    try:
+        call = (
+            db.query(GatewayCall)
+            .filter(GatewayCall.task_id == r.json()["id"], GatewayCall.kind == "image")
+            .order_by(GatewayCall.id.desc())
+            .first()
+        )
+        assert call is not None
+        assert call.detail["gateway_echo_sizes"] == ["auto"]
+        assert call.detail["gateway_echo_qualities"] == ["auto"]
+        assert call.detail["gateway_echo_models"] == ["gpt-image-2-codex"]
+        assert call.detail["gateway_selected_sources"] == ["b64_json"]
+    finally:
+        db.close()
 
 
 def test_4k_generation_keeps_gateway_full_resolution_result(client, make_user, auth, monkeypatch):
     make_user("13900000033", balance=1000)
     h = auth("13900000033")
+    monkeypatch.setattr("app.routers.generate.settings.max_image_dim", 3840)
 
     monkeypatch.setattr(
         "app.services.gateway.gen_image",
@@ -708,7 +933,7 @@ def test_generate_rejects_oversized_duration(client, make_user, auth):
     assert "时长" in r.text
 
 
-def test_generate_accepts_max_15_min_video_duration(client, make_user, auth):
+def test_generate_accepts_max_15_second_video_duration(client, make_user, auth):
     make_user("13900000028", balance=1000, admin=True)
     h = auth("13900000028")
     client.put("/api/admin/models", json={
@@ -719,7 +944,7 @@ def test_generate_accepts_max_15_min_video_duration(client, make_user, auth):
     r = client.post("/api/generate", json={
         "source_type": "image",
         "category": "video", "stage": "preview", "instruction": "x",
-        "params": {"duration": 900, "resolution": "480p", "ratio": "9:16"},
+        "params": {"duration": 15, "resolution": "480p", "ratio": "9:16"},
     }, headers=h)
     assert r.status_code == 200, r.text
     task = client.get(f"/api/tasks/{r.json()['id']}", headers=h).json()

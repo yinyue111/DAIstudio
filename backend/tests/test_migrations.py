@@ -151,6 +151,82 @@ def test_migrated_schema_has_core_integrity_constraints(tmp_path, monkeypatch):
             )
 
 
+def test_latest_migration_can_downgrade_and_reupgrade(tmp_path, monkeypatch):
+    db_path = tmp_path / "rollback-smoke.db"
+    monkeypatch.setattr(settings, "database_url", f"sqlite:///{db_path}")
+    backend = Path(__file__).resolve().parents[1]
+    cfg = Config(str(backend / "alembic.ini"))
+    cfg.set_main_option("script_location", str(backend / "alembic"))
+
+    command.upgrade(cfg, "head")
+    engine = sa.create_engine(f"sqlite:///{db_path}")
+    expected_audit_indexes = {
+        "ix_audit_logs_user_id_id",
+        "ix_audit_logs_action_id",
+        "ix_audit_logs_created_at",
+    }
+    assert expected_audit_indexes <= {idx["name"] for idx in sa.inspect(engine).get_indexes("audit_logs")}
+    assert "reverse_operations" in sa.inspect(engine).get_table_names()
+
+    command.downgrade(cfg, "-1")
+    insp = sa.inspect(engine)
+    assert "reverse_operations" not in insp.get_table_names()
+    assert expected_audit_indexes <= {idx["name"] for idx in insp.get_indexes("audit_logs")}
+
+    command.upgrade(cfg, "head")
+
+    insp = sa.inspect(engine)
+    assert "user_prompts" in insp.get_table_names()
+    assert "reverse_operations" in insp.get_table_names()
+    assert expected_audit_indexes <= {idx["name"] for idx in insp.get_indexes("audit_logs")}
+    gen_task_checks = {c["name"] for c in insp.get_check_constraints("gen_tasks")}
+    assert "ck_gen_tasks_status_valid" in gen_task_checks
+
+
+def test_0023_downgrade_blocks_when_canceled_tasks_exist(tmp_path, monkeypatch):
+    db_path = tmp_path / "migration-0023-canceled.db"
+    monkeypatch.setattr(settings, "database_url", f"sqlite:///{db_path}")
+    backend = Path(__file__).resolve().parents[1]
+    cfg = Config(str(backend / "alembic.ini"))
+    cfg.set_main_option("script_location", str(backend / "alembic"))
+
+    command.upgrade(cfg, "0023_events_cancel_prompt")
+    engine = sa.create_engine(f"sqlite:///{db_path}")
+    with engine.begin() as conn:
+        conn.execute(
+            sa.text(
+                "insert into users "
+                "(id, phone, password_hash, balance_credits, frozen_credits, is_admin, status) "
+                "values (1, '13900000998', 'hash', 0, 0, 0, 'active')"
+            )
+        )
+        conn.execute(
+            sa.text(
+                "insert into gen_tasks "
+                "(id, user_id, category, stage, status, source_type, cost_frozen, cost_settled, params) "
+                "values (1, 1, 'image', 'preview', 'canceled', 'image', 0, 0, '{}')"
+            )
+        )
+
+    with pytest.raises(RuntimeError, match="canceled tasks exist"):
+        command.downgrade(cfg, "0022_credit_pricing_defaults")
+
+
+def test_0023_downgrade_removes_prompt_history_when_no_canceled_tasks(tmp_path, monkeypatch):
+    db_path = tmp_path / "migration-0023-clean.db"
+    monkeypatch.setattr(settings, "database_url", f"sqlite:///{db_path}")
+    backend = Path(__file__).resolve().parents[1]
+    cfg = Config(str(backend / "alembic.ini"))
+    cfg.set_main_option("script_location", str(backend / "alembic"))
+
+    command.upgrade(cfg, "0023_events_cancel_prompt")
+    command.downgrade(cfg, "0022_credit_pricing_defaults")
+
+    engine = sa.create_engine(f"sqlite:///{db_path}")
+    insp = sa.inspect(engine)
+    assert "user_prompts" not in insp.get_table_names()
+
+
 def test_0009_reports_duplicate_active_final_tasks_before_index_creation():
     path = Path(__file__).resolve().parents[1] / "alembic/versions/0009_unique_active_final_tasks.py"
     spec = importlib.util.spec_from_file_location("migration_0009", path)

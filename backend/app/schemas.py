@@ -105,8 +105,9 @@ class ParseOut(BaseModel):
 
 # --- Reverse prompt ---
 class ReverseIn(BaseModel):
+    client_request_id: str | None = Field(default=None, min_length=8, max_length=128)
     asset_url: str
-    target: Literal["image", "video"] = "image"  # selects prompt dimensions
+    target: Literal["image", "video", "product_profile"] = "image"  # selects prompt dimensions
     source_type: Literal["image", "video"] | None = None
     video_analysis_preset: Literal["fast", "standard", "fine"] | None = None
     # For a video asset_url with target=video: a cover/keyframe image to fall
@@ -186,6 +187,8 @@ class AssetOut(BaseModel):
     days_left: int | None = None
     category: str | None = None
     unlock_cost: int = 0
+    quality_status: str = "ok"
+    quality_message: str | None = None
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -207,6 +210,103 @@ class AssetReportOut(BaseModel):
     handled_by: int | None = None
     handled_at: datetime | None = None
     created_at: datetime | None = None
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class AssetBatchIn(BaseModel):
+    asset_ids: list[int] = Field(min_length=1, max_length=100)
+
+
+class AssetBatchItemOut(BaseModel):
+    id: int
+    ok: bool = True
+    error: str | None = None
+
+
+class AssetBatchDeleteOut(BaseModel):
+    deleted: list[int] = Field(default_factory=list)
+    failed: list[AssetBatchItemOut] = Field(default_factory=list)
+
+
+# --- Prompt history ---
+class UserPromptIn(BaseModel):
+    title: str | None = Field(default=None, max_length=128)
+    prompt: str = Field(min_length=1, max_length=12000)
+    category: Literal["image", "video", "general"] = "general"
+    source: Literal["manual", "reverse", "generate", "library"] = "manual"
+    favorite: bool = False
+    params: dict[str, Any] | None = None
+
+    @field_validator("title")
+    @classmethod
+    def _title(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        text = v.strip()
+        return text or None
+
+    @field_validator("prompt")
+    @classmethod
+    def _prompt(cls, v: str) -> str:
+        text = v.strip()
+        if not text:
+            raise ValueError("提示词不能为空")
+        return text
+
+    @field_validator("params")
+    @classmethod
+    def _params_size(cls, v: dict[str, Any] | None):
+        if v is not None:
+            _validate_json_payload_size(v, 16 * 1024, "提示词参数")
+        return v
+
+
+class UserPromptUpdateIn(BaseModel):
+    title: str | None = Field(default=None, max_length=128)
+    prompt: str | None = Field(default=None, min_length=1, max_length=12000)
+    category: Literal["image", "video", "general"] | None = None
+    favorite: bool | None = None
+    params: dict[str, Any] | None = None
+    increment_usage: bool = False
+
+    @field_validator("title")
+    @classmethod
+    def _title(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        text = v.strip()
+        return text or None
+
+    @field_validator("prompt")
+    @classmethod
+    def _prompt(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        text = v.strip()
+        if not text:
+            raise ValueError("提示词不能为空")
+        return text
+
+    @field_validator("params")
+    @classmethod
+    def _params_size(cls, v: dict[str, Any] | None):
+        if v is not None:
+            _validate_json_payload_size(v, 16 * 1024, "提示词参数")
+        return v
+
+
+class UserPromptOut(BaseModel):
+    id: int
+    title: str
+    prompt: str
+    category: str
+    source: str
+    favorite: bool
+    usage_count: int
+    params: dict[str, Any] | None = None
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -272,6 +372,30 @@ class QuotaGrantIn(BaseModel):
     note: str | None = Field(default=None, max_length=255)
     admin_password: str | None = Field(default=None, max_length=128)
     idempotency_key: str = Field(min_length=8, max_length=128)
+
+
+class QuotaGrantItemIn(BaseModel):
+    user_id: int
+    amount: int = Field(gt=0)
+    note: str | None = Field(default=None, max_length=255)
+
+
+class QuotaBulkGrantIn(BaseModel):
+    items: list[QuotaGrantItemIn] = Field(min_length=1, max_length=100)
+    admin_password: str | None = Field(default=None, max_length=128)
+    idempotency_key: str = Field(min_length=8, max_length=96)
+
+
+class QuotaBulkGrantItemOut(BaseModel):
+    user_id: int
+    ok: bool = True
+    balance_credits: int | None = None
+    error: str | None = None
+
+
+class QuotaBulkGrantOut(BaseModel):
+    granted: list[QuotaBulkGrantItemOut] = Field(default_factory=list)
+    failed: list[QuotaBulkGrantItemOut] = Field(default_factory=list)
 
 
 class UserStatusIn(BaseModel):
@@ -473,6 +597,7 @@ class OnlineUpdateStatusOut(BaseModel):
 class OnlineUpdateRunIn(BaseModel):
     apply: bool = True
     confirm: str = ""
+    force_apply: bool = False
 
 
 class OnlineUpdateRunOut(BaseModel):

@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import io
 import logging
+import time
 from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -98,6 +99,8 @@ def _localize_media_url(
     url: str | None,
     db: Session | None = None,
     user_id: int | None = None,
+    *,
+    timeout_seconds: int | None = None,
 ) -> LocalizedMedia | None:
     if not url:
         return None
@@ -108,6 +111,7 @@ def _localize_media_url(
             url,
             max_bytes=int(settings.parse_localize_image_max_bytes),
             allowed_content_types=("image/",),
+            timeout_seconds=int(timeout_seconds or settings.parse_localize_download_timeout_seconds),
         )
         try:
             img = Image.open(io.BytesIO(raw))
@@ -176,13 +180,40 @@ def _localize_assets(
 ) -> list[dict]:
     out: list[dict] = []
     captured_iso = (captured_at or datetime.now(timezone.utc)).isoformat()
+    localized_count = 0
+    max_localized = max(1, int(settings.parse_localize_max_assets or 1))
+    total_timeout = max(1, int(settings.parse_localize_total_timeout_seconds or 1))
+    deadline = time.monotonic() + total_timeout
     for asset in assets:
+        if localized_count >= max_localized:
+            log.info(
+                "parse asset localization cap reached localized=%s cap=%s total_assets=%s",
+                localized_count,
+                max_localized,
+                len(assets),
+            )
+            break
+        if time.monotonic() > deadline:
+            log.info(
+                "parse asset localization budget exhausted localized=%s budget_seconds=%s total_assets=%s",
+                localized_count,
+                total_timeout,
+                len(assets),
+            )
+            break
         item = dict(asset)
         item["source_page_url"] = source_page_url
         item["source_captured_at"] = captured_iso
+        remaining_timeout = max(1, min(int(settings.parse_localize_download_timeout_seconds), int(deadline - time.monotonic())))
         if item.get("type") == "image":
-            local = _localize_media_url(item.get("url"), db=db, user_id=user_id)
+            local = _localize_media_url(
+                item.get("url"),
+                db=db,
+                user_id=user_id,
+                timeout_seconds=remaining_timeout,
+            )
             if local:
+                localized_count += 1
                 item["original_url"] = item.get("url")
                 if item.get("thumb"):
                     item["original_thumb"] = item.get("thumb")
@@ -201,8 +232,14 @@ def _localize_assets(
                 # image cannot be localized, omit it from the selectable assets.
                 continue
         elif item.get("type") == "video":
-            local_thumb = _localize_media_url(item.get("thumb"), db=db, user_id=user_id)
+            local_thumb = _localize_media_url(
+                item.get("thumb"),
+                db=db,
+                user_id=user_id,
+                timeout_seconds=remaining_timeout,
+            )
             if local_thumb:
+                localized_count += 1
                 item["original_thumb"] = item.get("thumb")
                 item["thumb"] = _localized_url(local_thumb)
                 if not item.get("thumb_width") and _localized_int(local_thumb, "width"):
@@ -234,8 +271,10 @@ def run_parse_record(parse_id: int) -> None:
         if not rec:
             return
         try:
+            started = time.monotonic()
+            raw_assets = parse_url(rec.url)
             assets = _localize_assets(
-                parse_url(rec.url),
+                raw_assets,
                 db=db,
                 user_id=rec.user_id,
                 source_page_url=rec.url,
@@ -248,6 +287,14 @@ def run_parse_record(parse_id: int) -> None:
             )
             db.commit()
             redis_client.setex(_cache_key(rec.url, rec.user_id), settings.parse_cache_minutes * 60, str(rec.id))
+            log.info(
+                "parse completed id=%s raw_assets=%s localized_assets=%s elapsed=%.2fs url=%s",
+                rec.id,
+                len(raw_assets),
+                len(assets),
+                time.monotonic() - started,
+                redact_url_for_log(rec.url),
+            )
         except SsrfError as e:
             rec.status = "failed"
             rec.error = f"链接被安全策略拦截:{e}"
@@ -295,9 +342,9 @@ def submit_parse(body: ParseIn, request: Request,
     db.refresh(rec)
 
     try:
-        from ..tasks import parse_url_task
+        from ..tasks import enqueue_with_request_context, parse_url_task
 
-        parse_url_task.delay(rec.id)
+        enqueue_with_request_context(parse_url_task, rec.id)
         db.refresh(rec)
     except Exception as e:  # noqa: BLE001
         log.exception("failed to enqueue parse for url=%s", redact_url_for_log(url))

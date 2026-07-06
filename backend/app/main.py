@@ -27,8 +27,10 @@ from .routers import (
     payments,
     profile,
     prompt,
+    prompts,
     tasks,
     uploads,
+    v2,
     ws,
 )
 from .routers import (
@@ -69,8 +71,8 @@ def _csrf_allowed_origins() -> set[str]:
     origins = set()
     for raw in [
         *settings.cors_origin_list,
+        *settings.csrf_allowed_origin_list,
         settings.public_base_url,
-        settings.payment_frontend_base_url,
     ]:
         origin = _normalise_origin(raw)
         if origin:
@@ -266,8 +268,8 @@ for public_subdir, mount_path in (
     )
 
 for r in (auth.router, me.router, config_router.router, profile.router, parse.router,
-          prompt.router, generate.router, tasks.router, uploads.router, assets.router,
-          payments.router, admin.router, ws.router):
+          prompt.router, prompts.router, generate.router, tasks.router, uploads.router, assets.router,
+          payments.router, admin.router, ws.router, v2.router):
     app.include_router(r)
 
 
@@ -293,7 +295,19 @@ def _health_detail() -> dict:
 @app.get("/api/health")
 def health():
     """Public liveness. Keep deployment internals off the internet."""
-    return {"ok": _health_detail()["ok"]}
+    return {"ok": True}
+
+
+@app.get("/api/live")
+def live():
+    """Process liveness for container orchestration."""
+    return {"ok": True}
+
+
+@app.get("/api/ready")
+def ready():
+    """Readiness check: app process plus DB/Redis dependencies."""
+    return _health_detail()
 
 
 @app.get("/api/health/detail")

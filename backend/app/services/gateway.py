@@ -17,11 +17,13 @@ import base64
 import json
 import logging
 import random
+import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from dataclasses import dataclass
-from urllib.parse import urljoin, urlparse
+from pathlib import Path
+from urllib.parse import quote, urljoin, urlparse
 
 import httpx
 
@@ -33,7 +35,10 @@ from .gateway_prompting import mock_reverse as _mock_reverse
 from .gateway_prompting import parse_structured as _parse_structured
 from .gateway_prompting import reverse_template as _reverse_template
 from .gateway_video_payloads import VIDEO_STATUS as _VIDEO_STATUS
-from .gateway_video_payloads import ark_content as _ark_content
+from .gateway_video_payloads import (
+    ark_content as _ark_content,  # noqa: F401 - legacy test/debug hook
+)
+from .gateway_video_payloads import ark_payload as _ark_payload
 from .gateway_video_payloads import ark_text as _ark_text  # noqa: F401 - legacy test/debug hook
 from .gateway_video_payloads import extract_by_path as _extract_by_path
 from .gateway_video_payloads import generic_video_payload_params as _generic_video_payload_params
@@ -74,6 +79,15 @@ class ImageSubrequestFailure:
     retryable_refill: bool
 
 
+@dataclass(frozen=True)
+class ImageResponseDiagnostic:
+    size: str | None = None
+    quality: str | None = None
+    output_format: str | None = None
+    model: str | None = None
+    selected_source: str | None = None
+
+
 class ImageBatchResult(list[bytes]):
     """Image bytes with diagnostics for failed batch slots."""
 
@@ -81,9 +95,11 @@ class ImageBatchResult(list[bytes]):
         self,
         images: list[bytes],
         failures: list[ImageSubrequestFailure] | None = None,
+        diagnostics: list[ImageResponseDiagnostic] | None = None,
     ) -> None:
         super().__init__(images)
         self.failures = failures or []
+        self.diagnostics = diagnostics or []
 
 
 def _gateway_error_message(status_code: int, text: str) -> tuple[str, str]:
@@ -154,6 +170,7 @@ def _guarded_stream(client: httpx.Client, method: str, url: str, **kwargs):
 
 
 def _request(method: str, url: str, *, headers: dict, json: dict | None = None,
+             data: dict | None = None, files: list | None = None,
              timeout: int, retries: int) -> httpx.Response:
     """Single HTTP path for every gateway call (image + video).
 
@@ -170,7 +187,14 @@ def _request(method: str, url: str, *, headers: dict, json: dict | None = None,
             else:
                 client_ctx = httpx.Client(timeout=timeout, follow_redirects=False)
             with client_ctx as c:
-                r = c.request(method, url, headers=headers, json=json)
+                request_kwargs = {"headers": headers}
+                if json is not None:
+                    request_kwargs["json"] = json
+                if data is not None:
+                    request_kwargs["data"] = data
+                if files is not None:
+                    request_kwargs["files"] = files
+                r = c.request(method, url, **request_kwargs)
             log.info("gateway %s %s -> %s in %.2fs", method, redact_url_for_log(url), r.status_code,
                      time.time() - t0)
             if r.is_redirect:
@@ -246,6 +270,28 @@ def _request_json(method: str, url: str, *, headers: dict, payload: dict | None,
     return r.json()
 
 
+def _request_multipart_json(
+    method: str,
+    url: str,
+    *,
+    headers: dict,
+    data: dict,
+    files: list,
+    timeout: int,
+    retries: int,
+) -> dict:
+    r = _request(
+        method,
+        url,
+        headers=headers,
+        data=data,
+        files=files,
+        timeout=timeout,
+        retries=retries,
+    )
+    return r.json()
+
+
 def _get(path: str, timeout: int | None = None,
          config: RuntimeGatewayConfig | None = None) -> dict:
     url = _join_api_path(config, path)
@@ -316,11 +362,66 @@ def reverse_prompt(image_refs, vision_model_id: str, target: str = "image",
 
 
 
+_IMAGE_RESULT_URL_FIELDS = (
+    "download_url",
+    "hd_url",
+    "original_url",
+    "output_url",
+    "image_url",
+    "url",
+)
+
+
+def _image_result_urls(item: dict) -> list[tuple[str, str]]:
+    urls: list[str] = []
+    for field in _IMAGE_RESULT_URL_FIELDS:
+        value = item.get(field)
+        if isinstance(value, str) and value.strip():
+            urls.append((field, value.strip()))
+    seen: set[str] = set()
+    unique: list[tuple[str, str]] = []
+    for field, url in urls:
+        if url in seen:
+            continue
+        seen.add(url)
+        unique.append((field, url))
+    return unique
+
+
+def _image_response_diagnostic(data: dict, item: dict, source: str | None) -> ImageResponseDiagnostic:
+    return ImageResponseDiagnostic(
+        size=str(item.get("size") or data.get("size") or "") or None,
+        quality=str(item.get("quality") or data.get("quality") or "") or None,
+        output_format=str(item.get("output_format") or data.get("output_format") or "") or None,
+        model=str(item.get("model") or data.get("model") or "") or None,
+        selected_source=source,
+    )
+
+
 def _decode_image_response(data: dict) -> list[bytes]:
+    return _decode_image_response_with_diagnostics(data)[0]
+
+
+def _decode_image_response_with_diagnostics(data: dict) -> tuple[list[bytes], list[ImageResponseDiagnostic]]:
     out: list[bytes] = []
+    diagnostics: list[ImageResponseDiagnostic] = []
     max_bytes = int(settings.generated_image_max_bytes)
     for d in data.get("data", []):
-        if d.get("b64_json"):
+        # Some OpenAI-compatible gateways return both an inline b64 preview and
+        # a separate HD/original URL for large outputs. Prefer the URL fields so
+        # a 4K request does not accidentally persist the smaller inline preview.
+        if urls := _image_result_urls(d):
+            source, url = urls[0]
+            out.append(
+                _download(
+                    url,
+                    max_bytes=max_bytes,
+                    allowed_content_types=("image/",),
+                    timeout_seconds=int(settings.image_download_timeout_seconds),
+                )
+            )
+            diagnostics.append(_image_response_diagnostic(data, d, source))
+        elif d.get("b64_json"):
             encoded = str(d["b64_json"])
             if len(encoded) > _max_b64_len(max_bytes):
                 raise GatewayError("图像结果超出大小上限")
@@ -328,16 +429,8 @@ def _decode_image_response(data: dict) -> list[bytes]:
             if len(raw) > max_bytes:
                 raise GatewayError("图像结果超出大小上限")
             out.append(raw)
-        elif d.get("url"):
-            out.append(
-                _download(
-                    d["url"],
-                    max_bytes=max_bytes,
-                    allowed_content_types=("image/",),
-                    timeout_seconds=int(settings.image_download_timeout_seconds),
-                )
-            )
-    return out
+            diagnostics.append(_image_response_diagnostic(data, d, "b64_json"))
+    return out, diagnostics
 
 
 def _image_quality_for_size(size: str | None) -> str:
@@ -353,6 +446,64 @@ def _image_quality_for_size(size: str | None) -> str:
     return "low"
 
 
+def _data_uri_file(value: str, fallback_name: str) -> tuple[str, bytes, str]:
+    prefix, _, encoded = str(value or "").partition(",")
+    if not encoded or not prefix.startswith("data:image/") or ";base64" not in prefix:
+        raise GatewayError("OpenAI 图片编辑需要平台内图片文件引用")
+    mime = prefix[5:].split(";", 1)[0] or "image/png"
+    try:
+        raw = base64.b64decode(encoded)
+    except Exception as e:  # noqa: BLE001
+        raise GatewayError("图片编辑引用解码失败") from e
+    ext = {
+        "image/jpeg": "jpg",
+        "image/jpg": "jpg",
+        "image/png": "png",
+        "image/webp": "webp",
+    }.get(mime.lower(), "png")
+    return f"{fallback_name}.{ext}", raw, mime
+
+
+def _is_openai_images_edit_path(path: str | None) -> bool:
+    return str(path or "").rstrip("/").endswith("/images/edits")
+
+
+def _image_edit_payload_format(path: str | None, extra: dict) -> str:
+    explicit = str(extra.pop("edit_payload_format", "") or extra.pop("_edit_payload_format", "")).strip().lower()
+    if explicit in {"json", "responses_json", "openai_json"}:
+        return "json"
+    if explicit in {"multipart", "openai_multipart"}:
+        return "multipart"
+    return "multipart" if _is_openai_images_edit_path(path) else "json"
+
+
+def _image_edit_multipart_parts(
+    *,
+    model: str,
+    prompt: str,
+    size: str,
+    refs: list[str],
+    extra: dict,
+) -> tuple[dict, list]:
+    mask = extra.pop("mask", None)
+    data = {
+        "model": model,
+        "prompt": prompt,
+        "size": size,
+    }
+    for key, value in extra.items():
+        if value in (None, ""):
+            continue
+        data[key] = str(value).lower() if isinstance(value, bool) else str(value)
+    files = [
+        ("image", _data_uri_file(ref, f"image-{index}"))
+        for index, ref in enumerate(refs, start=1)
+    ]
+    if mask:
+        files.append(("mask", _data_uri_file(str(mask), "mask")))
+    return data, files
+
+
 def _reject_compressed_download(response: httpx.Response) -> None:
     encoding = (response.headers.get("content-encoding") or "").strip().lower()
     if encoding and encoding != "identity":
@@ -365,6 +516,7 @@ def _retryable_image_error(exc: Exception) -> bool:
     return bool(
         exc.transient
         and exc.status_code in (429, 500, 502, 503, 504)
+        and getattr(exc, "submit_state_unknown", None) is False
     )
 
 
@@ -435,7 +587,7 @@ def _post_single_image_repeated(path: str, payload: dict, n: int,
             out.append(img)
         return current_bytes
 
-    def one() -> list[bytes]:
+    def one() -> tuple[list[bytes], list[ImageResponseDiagnostic]]:
         last: Exception | None = None
         for attempt in range(max_retries + 1):
             try:
@@ -453,14 +605,14 @@ def _post_single_image_repeated(path: str, payload: dict, n: int,
                         timeout=timeout,
                         retries=0,
                     )
-                images = _decode_image_response(data)
+                images, diagnostics = _decode_image_response_with_diagnostics(data)
                 if not images:
                     raise GatewayError(
                         "图像子请求未返回结果",
                         transient=True,
                         submit_state_unknown=False,
                     )
-                return images
+                return images, diagnostics
             except Exception as e:  # noqa: BLE001
                 last = e
                 if attempt >= max_retries or not _retryable_image_error(e):
@@ -479,11 +631,14 @@ def _post_single_image_repeated(path: str, payload: dict, n: int,
 
     if workers == 1:
         out: list[bytes] = []
+        diagnostics: list[ImageResponseDiagnostic] = []
         total_bytes = 0
         idx = 0
         while idx < n + max_refills and len(out) < n:
             try:
-                total_bytes = append_with_budget(out, one(), total_bytes)
+                images, item_diagnostics = one()
+                total_bytes = append_with_budget(out, images, total_bytes)
+                diagnostics.extend(item_diagnostics)
             except Exception as e:  # noqa: BLE001
                 log.warning("single image sub-request failed: %s", e)
                 failure = _image_subrequest_failure(idx, e)
@@ -494,9 +649,10 @@ def _post_single_image_repeated(path: str, payload: dict, n: int,
             idx += 1
         if not out:
             _raise_image_batch_empty(failures)
-        return ImageBatchResult(out[:n], failures=failures)
+        return ImageBatchResult(out[:n], failures=failures, diagnostics=diagnostics[:n])
 
     out_by_index: dict[int, list[bytes]] = {}
+    diagnostics_by_index: dict[int, list[ImageResponseDiagnostic]] = {}
     pending = list(range(n))
     next_index = n
     while pending:
@@ -506,13 +662,16 @@ def _post_single_image_repeated(path: str, payload: dict, n: int,
             for fut in as_completed(futures):
                 idx = futures[fut]
                 try:
-                    out_by_index[idx] = fut.result()
+                    images, item_diagnostics = fut.result()
+                    out_by_index[idx] = images
+                    diagnostics_by_index[idx] = item_diagnostics
                 except Exception as e:  # noqa: BLE001
                     failure = _image_subrequest_failure(idx, e)
                     log.warning("image sub-request %s failed: %s", failure.index, e)
                     failures.append(failure)
                     wave_failures.append(failure)
                     out_by_index[idx] = []
+                    diagnostics_by_index[idx] = []
         produced = sum(len(images) for images in out_by_index.values())
         missing = max(0, n - produced)
         refill_count = min(
@@ -527,14 +686,122 @@ def _post_single_image_repeated(path: str, payload: dict, n: int,
         next_index += refill_count
 
     out: list[bytes] = []
+    diagnostics: list[ImageResponseDiagnostic] = []
     total_bytes = 0
     for i in sorted(out_by_index):
         total_bytes = append_with_budget(out, out_by_index.get(i, []), total_bytes)
+        diagnostics.extend(diagnostics_by_index.get(i, []))
         if len(out) >= n:
             break
     if not out:
         _raise_image_batch_empty(failures)
-    return ImageBatchResult(out[:n], failures=failures)
+    return ImageBatchResult(out[:n], failures=failures, diagnostics=diagnostics[:n])
+
+
+def _post_single_image_multipart_repeated(
+    path: str,
+    data: dict,
+    files: list,
+    n: int,
+    config: RuntimeGatewayConfig | None = None,
+) -> ImageBatchResult:
+    n = max(1, int(n))
+    url = _join_api_path(config, path)
+    headers = _auth(config)
+    timeout = settings.image_gateway_timeout_seconds
+    workers = max(1, min(n, int(settings.image_gateway_parallelism or 1)))
+    max_retries = max(0, int(settings.image_gateway_max_retries or 0))
+    batch_max_bytes = max(
+        int(settings.generated_image_max_bytes),
+        int(settings.generated_image_batch_max_bytes or 0),
+    )
+
+    def append_with_budget(out: list[bytes], images: list[bytes], current_bytes: int) -> int:
+        for img in images:
+            current_bytes += len(img)
+            if current_bytes > batch_max_bytes:
+                raise GatewayError("图像批量结果超出大小上限")
+            out.append(img)
+        return current_bytes
+
+    def one() -> tuple[list[bytes], list[ImageResponseDiagnostic]]:
+        last: Exception | None = None
+        for attempt in range(max_retries + 1):
+            try:
+                with locks.RedisSemaphore(
+                    _IMAGE_GATEWAY_SEMAPHORE_KEY,
+                    int(settings.image_gateway_parallelism or 1),
+                    ttl=max(60, int(settings.image_gateway_timeout_seconds) + 60),
+                    wait_timeout=max(30, min(300, int(settings.image_gateway_timeout_seconds))),
+                ):
+                    response = _request_multipart_json(
+                        "POST",
+                        url,
+                        headers=headers,
+                        data=data,
+                        files=files,
+                        timeout=timeout,
+                        retries=0,
+                    )
+                images, diagnostics = _decode_image_response_with_diagnostics(response)
+                if not images:
+                    raise GatewayError("图像网关未返回任何结果", transient=True, submit_state_unknown=False)
+                return images, diagnostics
+            except GatewayError as e:
+                last = e
+                if attempt < max_retries and _retryable_image_error(e):
+                    time.sleep(1.0 * (attempt + 1))
+                    continue
+                raise
+        raise last or GatewayError("图像网关未返回任何结果", transient=True)
+
+    out_by_index: dict[int, list[bytes]] = {}
+    diagnostics_by_index: dict[int, list[ImageResponseDiagnostic]] = {}
+    failures: list[ImageSubrequestFailure] = []
+    pending = list(range(n))
+    next_index = n
+    max_refills = max(0, int(getattr(settings, "image_gateway_refill_attempts", 0) or 0))
+    while pending:
+        wave_failures: list[ImageSubrequestFailure] = []
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            futs = {ex.submit(one): idx for idx in pending}
+            for fut in as_completed(futs):
+                idx = futs[fut]
+                try:
+                    images, diagnostics = fut.result()
+                    out_by_index[idx] = images
+                    diagnostics_by_index[idx] = diagnostics
+                except Exception as e:  # noqa: BLE001
+                    failure = _image_subrequest_failure(idx, e)
+                    log.warning("image edit sub-request %s failed: %s", failure.index, e)
+                    failures.append(failure)
+                    wave_failures.append(failure)
+                    out_by_index[idx] = []
+                    diagnostics_by_index[idx] = []
+        produced = sum(len(images) for images in out_by_index.values())
+        missing = max(0, n - produced)
+        refill_count = min(
+            missing,
+            max_refills,
+            sum(1 for failure in wave_failures if failure.retryable_refill),
+        )
+        if refill_count <= 0:
+            break
+        max_refills -= refill_count
+        pending = list(range(next_index, next_index + refill_count))
+        next_index += refill_count
+
+    out: list[bytes] = []
+    diagnostics: list[ImageResponseDiagnostic] = []
+    total_bytes = 0
+    for i in sorted(out_by_index):
+        total_bytes = append_with_budget(out, out_by_index.get(i, []), total_bytes)
+        diagnostics.extend(diagnostics_by_index.get(i, []))
+        if len(out) >= n:
+            break
+    if not out:
+        _raise_image_batch_empty(failures)
+    return ImageBatchResult(out[:n], failures=failures, diagnostics=diagnostics[:n])
 
 
 # ----------------------------------------------------------------- text -> image
@@ -557,6 +824,8 @@ def gen_image(prompt: str, image_model_id: str, n: int = 4,
     n = max(1, int(n))
     extra = {k: v for k, v in (extra_payload or {}).items() if v not in (None, "")}
     extra.setdefault("quality", _image_quality_for_size(size))
+    extra.setdefault("output_format", "jpeg")
+    extra.setdefault("output_compression", 100)
     refs = [str(x) for x in (reference_image_urls or []) if x]
     if reference_image_url and not refs:
         refs = [reference_image_url]
@@ -564,14 +833,25 @@ def gen_image(prompt: str, image_model_id: str, n: int = 4,
         # Current OpenAI-compatible image-edit gateways often implement edits
         # through the Responses image tool, where `tools[0].n` is invalid.
         # Preserve the user's requested count by issuing single-image edits.
-        payload = {
-            "model": image_model_id,
-            "images": [{"image_url": ref} for ref in refs],
-            "prompt": prompt,
-            "size": size,
-            **extra,
-        }
-        out = _post_single_image_repeated(edit_path, payload, n, config=gateway_config)
+        edit_payload_format = _image_edit_payload_format(edit_path, extra)
+        if edit_payload_format == "multipart":
+            form_data, files = _image_edit_multipart_parts(
+                model=image_model_id,
+                prompt=prompt,
+                size=size,
+                refs=refs,
+                extra=extra,
+            )
+            out = _post_single_image_multipart_repeated(edit_path, form_data, files, n, config=gateway_config)
+        else:
+            payload = {
+                "model": image_model_id,
+                "images": [{"image_url": ref} for ref in refs],
+                "prompt": prompt,
+                "size": size,
+                **extra,
+            }
+            out = _post_single_image_repeated(edit_path, payload, n, config=gateway_config)
     else:
         # The configured gateway maps image generation through an image tool
         # where `tools[0].n` is invalid. Repeat single-image requests instead.
@@ -596,6 +876,25 @@ def _remaining_download_timeout(deadline: float) -> float:
     return remaining
 
 
+def _download_httpx_timeout(remaining: float) -> httpx.Timeout:
+    """Bound both the whole request and a stalled read.
+
+    Provider result URLs can return headers quickly and then trickle or stall.
+    A large total timeout is useful for big videos, but a single blocked read
+    should not occupy a worker for that whole window.
+    """
+    remaining = max(0.1, float(remaining))
+    read_timeout = max(5.0, min(60.0, remaining))
+    connect_timeout = max(2.0, min(30.0, remaining))
+    return httpx.Timeout(
+        remaining,
+        connect=connect_timeout,
+        read=read_timeout,
+        write=max(2.0, min(30.0, remaining)),
+        pool=max(2.0, min(30.0, remaining)),
+    )
+
+
 def _download(
     url: str,
     *,
@@ -614,14 +913,14 @@ def _download(
         assert_safe_url(url)
         timeout = int(timeout_seconds or settings.image_download_timeout_seconds)
         deadline = time.monotonic() + timeout
-        with httpx.Client(follow_redirects=False, timeout=timeout) as c:
+        with httpx.Client(follow_redirects=False, timeout=_download_httpx_timeout(timeout)) as c:
             for _ in range(MAX_REDIRECTS + 1):
                 remaining = _remaining_download_timeout(deadline)
                 with _guarded_stream(
                     c,
                     "GET",
                     url,
-                    timeout=remaining,
+                    timeout=_download_httpx_timeout(remaining),
                     headers=_DOWNLOAD_HEADERS,
                 ) as r:
                     if r.is_redirect and r.headers.get("location"):
@@ -683,20 +982,21 @@ def download_to_path(
     max_bytes: int = _MAX_DOWNLOAD_BYTES,
     timeout_seconds: int | None = None,
     allowed_content_types: tuple[str, ...] | None = None,
+    progress_callback=None,
 ) -> int:
     """Download a gateway result directly to disk with SSRF/redirect checks."""
     try:
         assert_safe_url(url)
         timeout = int(timeout_seconds or settings.image_download_timeout_seconds)
         deadline = time.monotonic() + timeout
-        with httpx.Client(follow_redirects=False, timeout=timeout) as c:
+        with httpx.Client(follow_redirects=False, timeout=_download_httpx_timeout(timeout)) as c:
             for _ in range(MAX_REDIRECTS + 1):
                 remaining = _remaining_download_timeout(deadline)
                 with _guarded_stream(
                     c,
                     "GET",
                     url,
-                    timeout=remaining,
+                    timeout=_download_httpx_timeout(remaining),
                     headers=_DOWNLOAD_HEADERS,
                 ) as r:
                     if r.is_redirect and r.headers.get("location"):
@@ -724,10 +1024,14 @@ def download_to_path(
                         for chunk in r.iter_raw():
                             if time.monotonic() > deadline:
                                 raise GatewayError("下载结果超时")
+                            if not chunk:
+                                continue
                             total += len(chunk)
                             if total > max_bytes:
                                 raise GatewayError("下载结果超出大小上限")
                             f.write(chunk)
+                            if progress_callback:
+                                progress_callback()
                     return total
         raise GatewayError("下载结果重定向次数过多")
     except SsrfError as e:
@@ -748,8 +1052,11 @@ def download_to_storage(
     max_bytes: int = _MAX_DOWNLOAD_BYTES,
     timeout_seconds: int | None = None,
     allowed_content_types: tuple[str, ...] | None = None,
+    progress_callback=None,
 ) -> str:
-    key, path = storage.reserve_key(subdir, ext)
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=f".{ext.lstrip('.')}")
+    path = Path(tmp.name)
+    tmp.close()
     try:
         download_to_path(
             url,
@@ -757,11 +1064,11 @@ def download_to_storage(
             max_bytes=max_bytes,
             timeout_seconds=timeout_seconds,
             allowed_content_types=allowed_content_types,
+            progress_callback=progress_callback,
         )
-    except Exception:
+        return storage.save_file(path, subdir, ext)
+    finally:
         path.unlink(missing_ok=True)
-        raise
-    return key
 
 
 # ----------------------------------------------------------------- text -> video
@@ -786,6 +1093,11 @@ def _video_url(path: str, config: RuntimeGatewayConfig | None = None) -> str:
     if fmt == "openai" and base.endswith("/v1") and path.startswith("/v1/"):
         return f"{base}{path[3:]}"
     return f"{base}{path}"
+
+
+def _format_gateway_path(template: str, **values: str) -> str:
+    encoded = {key: quote(str(value), safe="") for key, value in values.items()}
+    return str(template).format(**encoded)
 
 
 def _video_post(path: str, payload: dict, timeout: int | None = None,
@@ -853,7 +1165,7 @@ def poll_video(external_task_id: str, video_model_id: str,
     if fmt == "ark":
         return _poll_video_ark(external_task_id, gateway_config=gateway_config)
     extra = extra or {}
-    poll_path = (extra.get("poll_path", "/v1/videos/{id}")).format(id=external_task_id)
+    poll_path = _format_gateway_path(extra.get("poll_path", "/v1/videos/{id}"), id=external_task_id)
     if gateway_config is None:
         data = _video_get(poll_path, timeout=30)
     else:
@@ -863,6 +1175,9 @@ def poll_video(external_task_id: str, video_model_id: str,
     if norm == "succeeded":
         url = (
             data.get("url")
+            or data.get("video_url")
+            or data.get("download_url")
+            or _nested_video_url(data)
             or _nested_video_url(data.get("data"))
             or _nested_video_url(data.get("output"))
         )
@@ -884,7 +1199,7 @@ def find_video_by_request_id(request_id: str, video_model_id: str,
     path_template = extra.get("request_query_path")
     if not path_template:
         return None
-    path = str(path_template).format(request_id=request_id, model=video_model_id)
+    path = _format_gateway_path(path_template, request_id=request_id, model=video_model_id)
     data = _video_get(path, timeout=int(extra.get("request_query_timeout_seconds") or 30),
                       config=gateway_config)
     container_path = extra.get("request_query_result_path")
@@ -912,7 +1227,7 @@ def find_video_by_request_id(request_id: str, video_model_id: str,
 
 def _submit_video_ark(prompt: str, model_id: str, params: dict,
                       gateway_config: RuntimeGatewayConfig | None = None) -> str:
-    payload = {"model": model_id, "content": _ark_content(prompt, params)}
+    payload = _ark_payload(model_id, prompt, params)
     if gateway_config is None:
         data = _video_post("/contents/generations/tasks", payload)
     else:
@@ -933,9 +1248,7 @@ def _poll_video_ark(task_id: str, gateway_config: RuntimeGatewayConfig | None = 
     err = None
     if norm == "succeeded":
         content = data.get("content") or {}
-        url = content.get("video_url") or content.get("url")
-        if not url and isinstance(data.get("data"), list) and data["data"]:
-            url = data["data"][0].get("url")
+        url = _nested_video_url(content) or _nested_video_url(data.get("data")) or _nested_video_url(data)
     if norm == "failed":
         err = (data.get("error") or {}).get("message") or str(data.get("error") or "")[:200]
     return {"status": norm, "url": url, "error": err, "raw": data}

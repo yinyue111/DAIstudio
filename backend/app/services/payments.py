@@ -25,6 +25,7 @@ from ..models import PaymentOrder, User
 from . import credits, locks, payment_config
 from .config_store import get_bool_setting
 from .ssrf import pinned_client
+from .user_events import publish_user_event
 
 PAYMENT_PACKAGES = payment_config.DEFAULT_PAYMENT_PACKAGES
 log = logging.getLogger("payments")
@@ -563,6 +564,19 @@ def create_order(db: Session, user: User, provider: str, package_id: str) -> Pay
             )
             .values(status=CLOSED)
         )
+        db.execute(
+            update(PaymentOrder)
+            .where(
+                PaymentOrder.user_id == user.id,
+                PaymentOrder.status == PENDING,
+                PaymentOrder.code_url.is_(None),
+                PaymentOrder.paid_at.is_(None),
+            )
+            .values(
+                status=FAILED,
+                raw={"error": "支付二维码未创建完成,订单已自动关闭,请重新下单"},
+            )
+        )
         pending_count = db.execute(
             select(func.count())
             .select_from(PaymentOrder)
@@ -712,6 +726,17 @@ def mark_paid(
             raise PaymentError(message) from e
         raise
     db.refresh(order)
+    publish_user_event(
+        order.user_id,
+        "payment_paid",
+        {
+            "order_no": order.order_no,
+            "provider": order.provider,
+            "credits": order.credits,
+            "amount_cents": order.amount_cents,
+            "paid_at": order.paid_at.isoformat() if order.paid_at else None,
+        },
+    )
     return order, True
 
 

@@ -29,6 +29,7 @@ from PIL import Image  # noqa: E402
 import app.redis_client as rc  # noqa: E402
 
 rc.redis_client = fakeredis.FakeStrictRedis(decode_responses=True)
+rc.blocking_redis_client = rc.redis_client
 
 # DNS shim for the SSRF guard: IP literals resolve for real (so SSRF blocks on
 # 127.0.0.1 / 169.254.x still fire), but placeholder hostnames used in tests
@@ -70,6 +71,11 @@ def _test_png_bytes(size=(32, 32), color=(80, 120, 180)) -> bytes:
     buf = io.BytesIO()
     Image.new("RGB", size, color).save(buf, format="PNG")
     return buf.getvalue()
+
+
+@pytest.fixture(autouse=True)
+def clear_fake_redis():
+    rc.redis_client.flushall()
 
 
 @pytest.fixture(autouse=True)

@@ -124,13 +124,18 @@ function fallbackDownloadFilename(path, contentType) {
   return `${stem}.${extensionFromContentType(contentType)}`;
 }
 
-export async function downloadBlob(path, filename) {
+export async function downloadBlob(path, filename, options = {}) {
   const headers = {};
   const t = getToken();
   if (t) headers["Authorization"] = `Bearer ${t}`;
+  let body;
+  if (options.body !== undefined) {
+    headers["Content-Type"] = "application/json";
+    body = JSON.stringify(options.body);
+  }
   const { res, blob, errorText } = await fetchBlobWithTimeout(
     `${API_BASE}${path}`,
-    { headers, credentials: "include" },
+    { method: options.method || "GET", headers, credentials: "include", body },
     DOWNLOAD_TIMEOUT_MS,
   );
   if (res.status === 401) {
@@ -154,6 +159,7 @@ export async function downloadBlob(path, filename) {
     URL.revokeObjectURL(u);
     a.remove();
   }, 1000);
+  return finalFilename;
 }
 
 export async function authenticatedObjectUrl(pathOrUrl) {
@@ -361,8 +367,40 @@ export const api = {
   me: (options = {}) => request("/api/me", options),
   config: () => request("/api/config"),
   profile: () => request("/api/profile"),
-  profileAssets: ({ type = "all", favorite = false, limit = 60, offset = 0 } = {}) =>
-    request(`/api/profile/assets?type=${type}&favorite=${favorite}&limit=${limit}&offset=${offset}`),
+  profileAssets: ({
+    type = "all",
+    favorite = false,
+    limit = 60,
+    offset = 0,
+    created_from = "",
+    created_to = "",
+    model_use = "",
+    size = "",
+    min_width = "",
+    min_height = "",
+    max_width = "",
+    max_height = "",
+  } = {}) => {
+    const qs = new URLSearchParams({
+      type,
+      favorite: String(Boolean(favorite)),
+      limit: String(limit),
+      offset: String(offset),
+    });
+    for (const [key, value] of Object.entries({
+      created_from,
+      created_to,
+      model_use,
+      size,
+      min_width,
+      min_height,
+      max_width,
+      max_height,
+    })) {
+      if (value !== undefined && value !== null && String(value).trim() !== "") qs.set(key, String(value));
+    }
+    return request(`/api/profile/assets?${qs.toString()}`);
+  },
   paymentPackages: () => request("/api/payments/packages"),
   paymentConfig: () => request("/api/payments/config"),
   paymentOrders: (limit = 20) => request(`/api/payments/orders?limit=${limit}`),
@@ -386,17 +424,26 @@ export const api = {
     form.append("file", file);
     return upload("/api/uploads/video", form);
   },
-  reverse: (asset_url, target = "image", fallback_image = null, source_type = null, video_analysis_preset = null) =>
+  reverse: (
+    asset_url,
+    target = "image",
+    fallback_image = null,
+    source_type = null,
+    video_analysis_preset = null,
+    client_request_id = null,
+  ) =>
     request("/api/prompt/reverse", {
       method: "POST",
-      body: { asset_url, target, fallback_image, source_type, video_analysis_preset },
+      body: { asset_url, target, fallback_image, source_type, video_analysis_preset, client_request_id },
       timeoutMs: REVERSE_TIMEOUT_MS,
     }),
   generate: (payload) =>
     request("/api/generate", { method: "POST", body: payload, timeoutMs: GENERATE_TIMEOUT_MS }),
   task: (id) => request(`/api/tasks/${id}`),
   taskWsTicket: (id) => request(`/api/tasks/${id}/ws-ticket`, { method: "POST" }),
+  eventWsTicket: () => request("/api/events/ws-ticket", { method: "POST" }),
   tasks: (limit = 30, offset = 0) => request(`/api/tasks?limit=${limit}&offset=${offset}`),
+  cancelTask: (taskId) => request(`/api/tasks/${taskId}/cancel`, { method: "POST" }),
   unlock: (assetId) => request(`/api/assets/${assetId}/unlock`, { method: "POST" }),
   playbackTicket: (assetId) => request(`/api/assets/${assetId}/playback-ticket`, { method: "POST" }),
   playbackUrl: (assetId, ticket) =>
@@ -405,16 +452,42 @@ export const api = {
   reportAsset: (assetId, body) =>
     request(`/api/assets/${assetId}/report`, { method: "POST", body }),
   deleteAsset: (assetId) => request(`/api/assets/${assetId}`, { method: "DELETE" }),
+  batchDeleteAssets: (assetIds) => request("/api/assets/batch/delete", { method: "POST", body: { asset_ids: assetIds } }),
+  batchDownloadAssets: (assetIds) => downloadBlob("/api/assets/batch/download", "assets.zip", {
+    method: "POST",
+    body: { asset_ids: assetIds },
+  }),
   retryTask: (taskId) => request(`/api/tasks/${taskId}/retry`, { method: "POST" }),
   downloadUrl: (assetId) => `${API_BASE}/api/assets/${assetId}/download`,
+  promptHistory: ({ favorite = null, category = "", source = "", q = "", limit = 50, offset = 0 } = {}) => {
+    const qs = new URLSearchParams({ limit: String(limit), offset: String(offset) });
+    if (favorite !== null && favorite !== undefined) qs.set("favorite", String(Boolean(favorite)));
+    if (category) qs.set("category", category);
+    if (source) qs.set("source", source);
+    if (q) qs.set("q", q);
+    return request(`/api/prompts/history?${qs.toString()}`);
+  },
+  createPromptHistory: (body) => request("/api/prompts/history", { method: "POST", body }),
+  updatePromptHistory: (id, body) => request(`/api/prompts/history/${id}`, { method: "PATCH", body }),
+  favoritePromptHistory: (id) => request(`/api/prompts/history/${id}/favorite`, { method: "POST" }),
+  deletePromptHistory: (id) => request(`/api/prompts/history/${id}`, { method: "DELETE" }),
   // admin
   adminWhitelist: () => request("/api/admin/whitelist"),
   adminAddWhitelist: (body) =>
     request("/api/admin/whitelist", { method: "POST", body }),
   adminRemoveWhitelist: (phone, body) =>
     request(`/api/admin/whitelist/${encodeURIComponent(phone)}`, { method: "DELETE", body }),
-  adminUsers: () => request("/api/admin/users"),
+  adminUsers: ({ q = "", status = "", is_admin = "", limit = 50, offset = 0 } = {}) => {
+    const qs = new URLSearchParams({ limit: String(limit), offset: String(offset) });
+    if (q) qs.set("q", q);
+    if (status) qs.set("status", status);
+    if (is_admin !== "" && is_admin !== null && is_admin !== undefined) {
+      qs.set("is_admin", is_admin === true || is_admin === "true" ? "true" : "false");
+    }
+    return request(`/api/admin/users?${qs.toString()}`);
+  },
   adminGrant: (body) => request("/api/admin/quota/grant", { method: "POST", body }),
+  adminBulkGrant: (body) => request("/api/admin/quota/bulk-grant", { method: "POST", body }),
   adminSetUserStatus: (userId, body) =>
     request(`/api/admin/users/${userId}/status`, { method: "PATCH", body }),
   adminResetPassword: (userId, body) =>

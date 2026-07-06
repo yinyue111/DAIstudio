@@ -1,6 +1,4 @@
-"use client";
-
-import { isTerminalTaskStatus } from "./helpers.js";
+import { isTerminalTaskStatus } from "./helpers";
 
 export function shouldBlockNewGeneration(currentTask, nextCategory) {
   if (!currentTask || isTerminalTaskStatus(currentTask.status)) return false;

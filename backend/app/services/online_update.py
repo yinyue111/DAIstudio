@@ -92,9 +92,20 @@ def _read_candidate_apply_file(part: str) -> str:
     if not part or part.startswith("-"):
         return ""
     path = Path(part).expanduser()
-    if not path.is_absolute() and "/" not in part:
-        return ""
-    candidates = [path] if path.is_absolute() else [path, Path(settings.online_update_repo_dir).expanduser() / path]
+    repo = Path(settings.online_update_repo_dir).expanduser()
+    candidates: list[Path] = []
+    if path.is_absolute():
+        candidates.append(path)
+    else:
+        # Scan repo-relative script names such as `python apply.py`; these are
+        # common in deployment docs and otherwise bypass the self-restart guard.
+        candidates.append(repo / path)
+        if "/" in part:
+            candidates.append(path)
+        else:
+            found = shutil.which(part)
+            if found:
+                candidates.append(Path(found))
     try:
         readable = next((candidate for candidate in candidates if candidate.is_file()), None)
         if readable is None:
@@ -107,13 +118,24 @@ def _read_candidate_apply_file(part: str) -> str:
 
 
 def _looks_like_self_restarting_compose(text: str) -> bool:
-    match = _COMPOSE_MUTATION_RE.search(text or "")
+    raw = str(text or "")
+    # Deployment wrappers are often Python scripts:
+    # subprocess.run(["docker", "compose", "up", ..., "api"]).
+    # Normalize common punctuation so the same guard catches shell and argv-list
+    # forms without trying to execute or parse the script.
+    normalized = re.sub(r"['\"`,()[\]{}]", " ", raw)
+    normalized = re.sub(r"\s+", " ", normalized)
+    match = _COMPOSE_MUTATION_RE.search(normalized)
     if not match:
         return False
     # `docker compose up` without explicit services can recreate the whole app,
     # including the API process that is executing the update. If api-like service
     # names are present, it is definitely unsafe for in-process apply.
-    lines = [line for line in str(text).splitlines() if _COMPOSE_MUTATION_RE.search(line)]
+    lines = [
+        re.sub(r"\s+", " ", re.sub(r"['\"`,()[\]{}]", " ", line))
+        for line in raw.splitlines()
+    ]
+    lines = [line for line in lines if _COMPOSE_MUTATION_RE.search(line)]
     return any(_COMPOSE_API_SERVICE_RE.search(line) for line in lines) or bool(lines) or bool(match)
 
 
@@ -400,7 +422,21 @@ def _apply_command() -> list[str]:
     return parts
 
 
-def run_update(*, apply: bool = True) -> dict[str, Any]:
+def _reset_to_head(repo: Path, rev: str, *, allow_dirty: bool = False) -> tuple[bool, str]:
+    """Rollback a failed fast-forward before the new code is considered active."""
+    if allow_dirty:
+        return (
+            False,
+            "检测到配置允许脏工作区，apply 失败后未自动回滚，避免覆盖本地未提交改动。",
+        )
+    try:
+        reset = _git(["reset", "--hard", rev], cwd=repo)
+        return True, reset.output
+    except OnlineUpdateError as e:
+        return False, f"回滚失败:{_clip(str(e))}"
+
+
+def run_update(*, apply: bool = True, force_apply: bool = False) -> dict[str, Any]:
     if not settings.online_update_enabled:
         raise OnlineUpdateError("在线更新未启用,请先设置 ONLINE_UPDATE_ENABLED=true 并重启后端")
     repo = _repo_dir()
@@ -412,18 +448,30 @@ def run_update(*, apply: bool = True) -> dict[str, Any]:
         before = ready["current_head"]
         after_fetch = ready["remote_head"]
         changed = bool(after_fetch and after_fetch != before)
+        force_apply = bool(force_apply and apply and not changed)
         outputs: list[str] = []
-        if changed:
+        command: list[str] = []
+        if apply and (changed or force_apply):
+            command = _apply_command()
+            if changed and not command:
+                raise OnlineUpdateError(
+                    "检测到新版本但未配置 ONLINE_UPDATE_APPLY_COMMAND,已拒绝直接合并代码。"
+                    "请先配置安全的宿主机/外部生效命令，避免出现新代码已落盘但服务未重启或迁移未执行的半升级状态。"
+                )
+        if changed and apply:
             merge = _git(["merge", "--ff-only", "FETCH_HEAD"], cwd=repo)
             if merge.output:
                 outputs.append(merge.output)
         after = _head(repo)
         applied = False
         apply_output = ""
-        if apply and changed:
-            command = _apply_command()
+        if apply and (changed or force_apply):
             if command:
                 try:
+                    # The configured command may point at a repo-local script.
+                    # A just-merged update can replace that script, so re-scan
+                    # the actual file immediately before execution.
+                    _validate_apply_command_safety(command)
                     apply_result = _run(command, cwd=repo)
                     applied = True
                     apply_output = apply_result.output
@@ -431,14 +479,25 @@ def run_update(*, apply: bool = True) -> dict[str, Any]:
                         outputs.append(apply_output)
                 except OnlineUpdateError as e:
                     safe_error = _clip(str(e))
+                    rollback_output = ""
+                    rolled_back = False
+                    if changed:
+                        rolled_back, rollback_output = _reset_to_head(
+                            repo,
+                            before,
+                            allow_dirty=bool(ready.get("dirty")),
+                        )
+                        if rollback_output:
+                            outputs.append(rollback_output)
+                    after_rollback = _head(repo)
                     output = _clip("\n\n".join([*outputs, str(e)]))
                     return {
                         "ok": False,
                         "changed": changed,
                         "applied": False,
-                        "partial_failure": changed,
+                        "partial_failure": True,
                         "before": before,
-                        "after": after,
+                        "after": after_rollback,
                         "remote_head": after_fetch,
                         "output": output,
                         "error": safe_error,
