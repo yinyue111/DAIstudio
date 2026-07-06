@@ -3,6 +3,9 @@
 import { useRef } from "react";
 import { api } from "../lib/api";
 
+const DEFAULT_MAX_UPLOAD_IMAGE_BYTES = 20 * 1024 * 1024;
+const DEFAULT_MAX_UPLOAD_VIDEO_BYTES = 512 * 1024 * 1024;
+
 function formatBytes(bytes) {
   const n = Number(bytes || 0);
   if (!Number.isFinite(n) || n <= 0) return "";
@@ -47,7 +50,9 @@ export default function useMediaUpload({
   const productObjectUrlsRef = useRef({});
 
   function uploadLimitExceeded(file, kind) {
-    const limit = Number(kind === "video" ? cfg?.max_upload_video_bytes : cfg?.max_upload_image_bytes);
+    const fallback = kind === "video" ? DEFAULT_MAX_UPLOAD_VIDEO_BYTES : DEFAULT_MAX_UPLOAD_IMAGE_BYTES;
+    const configured = Number(kind === "video" ? cfg?.max_upload_video_bytes : cfg?.max_upload_image_bytes);
+    const limit = Number.isFinite(configured) && configured > 0 ? configured : fallback;
     if (!limit || !file?.size || file.size <= limit) return false;
     setMsg(`${kind === "video" ? "视频" : "图片"}文件过大，当前 ${formatBytes(file.size)}，上限 ${formatBytes(limit)}。请压缩后再上传。`);
     return true;
@@ -203,6 +208,7 @@ export default function useMediaUpload({
     const refVersion = bumpRefVersion(targetMode);
     bumpReverseRequest(targetMode);
     setMsg("");
+    if (targetMode !== mode) setCreationMode(targetMode);
     setWorkspacePatch({ uploading: true }, targetMode);
     try {
       const uploaded = await api.uploadVideo(file);
@@ -210,7 +216,6 @@ export default function useMediaUpload({
       const { previewUrl, asset } = buildDisplayAsset(uploaded, file, { thumb: uploaded.thumb });
       rememberUploadedObjectUrl(targetMode, previewUrl);
       assignUploadedReferenceAsset(targetMode, asset);
-      if (targetMode !== mode) setCreationMode(targetMode);
     } catch (e) {
       if (isRefVersionCurrent(targetMode, refVersion) && isModeVisible(targetMode)) setMsg(e.message);
     } finally {

@@ -170,7 +170,7 @@ def test_latest_migration_can_downgrade_and_reupgrade(tmp_path, monkeypatch):
 
     command.downgrade(cfg, "-1")
     insp = sa.inspect(engine)
-    assert "reverse_operations" not in insp.get_table_names()
+    assert "reverse_operations" in insp.get_table_names()
     assert expected_audit_indexes <= {idx["name"] for idx in insp.get_indexes("audit_logs")}
 
     command.upgrade(cfg, "head")

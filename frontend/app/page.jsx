@@ -285,6 +285,10 @@ export default function Home() {
     isEditMode,
     isImageEditMode,
     subjectMode,
+    parsing,
+    uploading,
+    reversing,
+    productProfiling,
     prompt,
     negative,
     promptDirty,
@@ -619,7 +623,13 @@ export default function Home() {
         </p>
         <button
           onClick={() => submit(category === "video" ? "final" : "preview")}
-          disabled={generationSubmitDisabled({ submitting, currentTask: task, nextCategory: category, currentModelEnabled })}
+          disabled={generationSubmitDisabled({
+            submitting,
+            busy: parsing || uploading || reversing || productProfiling,
+            currentTask: task,
+            nextCategory: category,
+            currentModelEnabled,
+          })}
           className="btn-primary btn-lg min-w-28 shrink-0 px-4 sm:min-w-32 sm:px-6"
         >
           {(submitting || running) && (

@@ -54,6 +54,17 @@ assert.equal(
   true,
   "in-flight form submission should still be guarded against double click",
 );
+assert.equal(
+  generationSubmitDisabled({
+    submitting: false,
+    busy: true,
+    currentTask: null,
+    nextCategory: "image",
+    currentModelEnabled: true,
+  }),
+  true,
+  "reference parsing, reverse prompt, upload, or subject profiling should block accidental generation",
+);
 assert.match(
   pageSource,
   /loadWorks\(\{\s*restoreActive:\s*true\s*\}\)/,

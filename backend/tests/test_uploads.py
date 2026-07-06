@@ -1216,6 +1216,7 @@ def test_upload_video_returns_reference_asset(client, make_user, auth, tmp_path)
     assert asset["height"] == 48
     url_key = urlparse(asset["url"]).path.removeprefix("/api/uploads/")
     assert url_key.startswith("upload_video/")
+    assert url_key.endswith(".mp4")
     anon = TestClient(app)
     assert anon.get(urlparse(asset["url"]).path).status_code == 401
     assert client.get(urlparse(asset["url"]).path, headers=h).status_code == 200
@@ -1229,8 +1230,13 @@ def test_upload_video_returns_reference_asset(client, make_user, auth, tmp_path)
             AuditLog.user_id == uid,
             AuditLog.action == "upload_video",
         ).order_by(AuditLog.id.desc()).first()
+        row = db.get(UploadedAsset, url_key)
+        assert row.mime == "video/mp4"
+        assert row.bytes > 0
         assert "rights_confirmed" not in log.detail
         assert "rights_confirmation" not in log.detail
+        assert log.detail["sanitized"] is True
+        assert log.detail["raw_bytes"] > 0
     finally:
         db.close()
 
@@ -1255,7 +1261,7 @@ def test_upload_video_runs_probe_off_event_loop(client, make_user, auth, monkeyp
     )
 
     assert r.status_code == 200, r.text
-    assert "_inspect_video_and_poster" in calls
+    assert "_sanitize_video_and_poster" in calls
 
 
 def test_upload_video_rejects_when_ffprobe_missing(client, make_user, auth, monkeypatch, tmp_path):
@@ -1271,6 +1277,58 @@ def test_upload_video_rejects_when_ffprobe_missing(client, make_user, auth, monk
 
     assert r.status_code == 400
     assert "ffprobe" in r.text
+
+
+def test_upload_video_transcode_disables_network_protocols_and_caps_output(monkeypatch, tmp_path):
+    from app.routers import uploads
+
+    src = tmp_path / "src.mp4"
+    src.write_bytes(b"fake")
+    seen = {}
+
+    def fake_run(cmd, **_kwargs):
+        seen["cmd"] = cmd
+        Path(cmd[-1]).write_bytes(b"sanitized")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("app.services.video_frames.FFMPEG", "ffmpeg")
+    monkeypatch.setattr(uploads.subprocess, "run", fake_run)
+    monkeypatch.setattr("app.routers.uploads.settings.max_upload_video_bytes", 12345)
+
+    out = uploads._transcode_sanitized_video(src, duration=1)
+
+    try:
+        cmd = seen["cmd"]
+        assert "-protocol_whitelist" in cmd
+        assert cmd[cmd.index("-protocol_whitelist") + 1] == "file,pipe"
+        assert "-fs" in cmd
+        assert cmd[cmd.index("-fs") + 1] == "12345"
+        assert "http" not in " ".join(cmd).lower()
+    finally:
+        out.unlink(missing_ok=True)
+
+
+def test_upload_video_rejects_sanitized_output_over_limit(monkeypatch, tmp_path):
+    from app.routers import uploads
+
+    src = tmp_path / "src.mp4"
+    src.write_bytes(b"fake")
+
+    def fake_run(cmd, **_kwargs):
+        Path(cmd[-1]).write_bytes(b"x" * 20)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("app.services.video_frames.FFMPEG", "ffmpeg")
+    monkeypatch.setattr(uploads.subprocess, "run", fake_run)
+    monkeypatch.setattr("app.routers.uploads.settings.max_upload_video_bytes", 10)
+
+    try:
+        uploads._transcode_sanitized_video(src, duration=1)
+    except Exception as exc:  # noqa: BLE001
+        assert getattr(exc, "status_code", None) == 413
+        assert "视频净化后仍超过" in str(getattr(exc, "detail", ""))
+    else:
+        raise AssertionError("oversized sanitized video should be rejected")
 
 
 def test_upload_video_allows_upload_without_rights_confirmation(client, make_user, auth, tmp_path):
@@ -1338,7 +1396,7 @@ def test_upload_video_quota_preflight_rejects_before_video_probe(
     def fail_probe(_path):
         raise AssertionError("video probe should not run after quota preflight rejection")
 
-    monkeypatch.setattr("app.routers.uploads._inspect_video_and_poster", fail_probe)
+    monkeypatch.setattr("app.routers.uploads._sanitize_video_and_poster", fail_probe)
     before = {str(p) for p in Path(settings.storage_dir).rglob("*") if p.is_file()}
     r = client.post(
         "/api/uploads/video",
@@ -1368,7 +1426,7 @@ def test_upload_video_missing_content_length_rejects_quota_before_video_probe(
     def fail_probe(_path):
         raise AssertionError("video probe should not run after streamed quota rejection")
 
-    monkeypatch.setattr("app.routers.uploads._inspect_video_and_poster", fail_probe)
+    monkeypatch.setattr("app.routers.uploads._sanitize_video_and_poster", fail_probe)
     before = {str(p) for p in Path(settings.storage_dir).rglob("*") if p.is_file()}
     r = client.post(
         "/api/uploads/video",

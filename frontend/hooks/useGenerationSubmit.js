@@ -20,6 +20,10 @@ export default function useGenerationSubmit({
   isEditMode,
   isImageEditMode,
   subjectMode,
+  parsing = false,
+  uploading = false,
+  reversing = false,
+  productProfiling = false,
   prompt,
   negative,
   promptDirty,
@@ -67,6 +71,18 @@ export default function useGenerationSubmit({
 
   async function submit(stage = "preview") {
     if (submitting) return;
+    if (uploading) {
+      setMsg("素材仍在上传中，请等待上传完成后再生成。");
+      return;
+    }
+    if (parsing || reversing) {
+      setMsg("参考素材仍在抓取或反推中，请等待提示词完成后再生成。");
+      return;
+    }
+    if (productProfiling) {
+      setMsg("主体信息仍在识别中，请稍后再生成。");
+      return;
+    }
     if (shouldBlockNewGeneration(task, category)) {
       setMsg(category === "image" ? "" : "当前视频任务仍在生成中，请等待完成后再发起新的视频生成。");
       return;

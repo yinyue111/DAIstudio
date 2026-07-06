@@ -3,7 +3,7 @@ VENV := backend/.venv
 PY := $(VENV)/bin
 
 .PHONY: help install install-frontend test test-frontend lint fmt compile migrate alembic-check audit compose-check docker-build-check \
-        run-api run-worker run-beat run-frontend build-frontend docker-up docker-down release-check release-check-worktree release-source clean
+        worker-topology-check run-api run-worker run-beat run-frontend build-frontend docker-up docker-down release-check release-check-worktree release-source clean
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | \
@@ -69,9 +69,12 @@ compose-check: ## Validate docker compose rendering with required placeholders
 
 docker-build-check: ## Build backend/frontend Docker images without starting services
 	POSTGRES_PASSWORD="$${POSTGRES_PASSWORD:-release-check-postgres-password}" \
-		docker compose build api frontend
+		docker compose build api worker worker_image worker_video worker_video_download worker_parse beat frontend
 
-release-check: compile lint alembic-check test test-frontend build-frontend compose-check docker-build-check audit ## Run local release gates against the same clean HEAD artifact as CI
+worker-topology-check: ## Validate isolated worker roles and compose services
+	./scripts/test_worker_parallelism.sh
+
+release-check: compile lint alembic-check test test-frontend build-frontend compose-check worker-topology-check docker-build-check audit ## Run local release gates against the same clean HEAD artifact as CI
 	@test -z "$$(git status --porcelain)" || \
 		(echo "release-check archives HEAD; commit or stash worktree changes first, or use release-check-worktree" >&2; exit 1)
 	tmp="$$(mktemp -d)" && \
@@ -80,7 +83,7 @@ release-check: compile lint alembic-check test test-frontend build-frontend comp
 		rm -rf "$$tmp"
 	find . -maxdepth 3 \( -name .venv -o -name .next -o -name node_modules \) -type d -print | sort
 
-release-check-worktree: compile lint alembic-check test test-frontend build-frontend compose-check docker-build-check audit ## Run release gates against tracked + untracked worktree files
+release-check-worktree: compile lint alembic-check test test-frontend build-frontend compose-check worker-topology-check docker-build-check audit ## Run release gates against tracked + untracked worktree files
 	tmp="$$(mktemp -d)" && \
 		deleted="$$(git ls-files --deleted)" && \
 		if [ -n "$$deleted" ]; then \

@@ -644,7 +644,7 @@ def test_online_update_rejects_script_that_restarts_api_container(monkeypatch, g
     script.write_text(
         "#!/bin/sh\n"
         "cd /home/drumxian/DAIstudio\n"
-        "docker compose up -d --build migrate api worker beat frontend\n",
+        "docker compose up -d --build migrate api worker worker_image worker_video worker_video_download worker_parse beat frontend\n",
         encoding="utf-8",
     )
     _configure(monkeypatch, git_repos["work"], apply_command=str(script))

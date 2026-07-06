@@ -195,24 +195,26 @@ ADMIN_PASSWORD='<strong-admin-password>' docker compose run --rm -e ADMIN_PASSWO
 
 ### 3. Worker 队列
 
-默认 Worker 消费全部队列：
+Docker Compose 默认拆成四类 Worker，避免长任务把支付、清理和视频轮询饿死：
 
 ```text
-default,image,video_submit,video_poll,video_download,parse,cleanup,payment
+worker        default,payment,video_poll,cleanup
+worker_image  image
+worker_video  video_submit
+worker_video_download  video_download
+worker_parse  parse
 ```
 
-`make run-worker` 默认使用 `WORKER_CONCURRENCY=4`，可以同时处理多个图片任务；单个多图任务内部还会按 `IMAGE_GATEWAY_PARALLELISM` 并发向图像网关发起子请求。需要兼容特殊 macOS 调试场景时，可显式设置 `WORKER_POOL=solo WORKER_CONCURRENCY=1`，但这会让任务按队列串行执行。
-
-生产流量上来后建议把图片、视频提交、视频轮询、下载、抓取等队列拆到不同 Worker。裸机部署可以用脚本直接拆：
+`make run-worker` 本地默认仍可消费全部队列，方便开发；生产裸机部署可以用 `WORKER_ROLE` 直接拆：
 
 ```bash
-WORKER_QUEUES=image WORKER_CONCURRENCY=6 ./scripts/run_worker.sh
-WORKER_QUEUES=video_submit,video_poll WORKER_CONCURRENCY=2 ./scripts/run_worker.sh
-WORKER_QUEUES=video_download WORKER_CONCURRENCY=2 ./scripts/run_worker.sh
-WORKER_QUEUES=parse,cleanup,payment WORKER_CONCURRENCY=2 ./scripts/run_worker.sh
+WORKER_ROLE=critical ./scripts/run_worker.sh
+WORKER_ROLE=image WORKER_CONCURRENCY=6 ./scripts/run_worker.sh
+WORKER_ROLE=video ./scripts/run_worker.sh
+WORKER_ROLE=parse ./scripts/run_worker.sh
 ```
 
-如果使用 Docker Compose 长期拆队列，需要在 override 文件里复制多个 worker service，并分别设置 `WORKER_QUEUES`。同一个 `worker` service 只能使用一组环境变量。`beat` 服务只能保留一个实例，负责支付对账、卡死任务回收、视频轮询恢复和清理任务。
+特殊场景仍可直接覆盖 `WORKER_QUEUES`。需要兼容 macOS fork 调试时，可显式设置 `WORKER_POOL=solo WORKER_CONCURRENCY=1`，但这会让对应 worker 串行执行。`beat` 服务只能保留一个实例，负责支付对账、卡死任务回收、视频轮询恢复和清理任务。
 
 ## 域名与反向代理
 
@@ -350,7 +352,7 @@ Docker Compose 部署时，在线升级配置同样写在 `backend/.env`。Compo
 
 1. `ONLINE_UPDATE_REPO_DIR` 指向宿主机真实 checkout 的挂载目录。
 2. `ONLINE_UPDATE_APPLY_COMMAND` 指向一个不会直接重启 API 的固定命令，例如写入一个队列文件、调用宿主机 systemd oneshot、或通知外部 supervisor。
-3. 宿主机 oneshot/supervisor 再执行 `docker compose up -d --build migrate api worker beat frontend`。
+3. 宿主机 oneshot/supervisor 再执行 `docker compose up -d --build migrate api worker worker_image worker_video worker_video_download worker_parse beat frontend`。
 4. 重启完成后先用 `https://dream.aiwuq.cn/api/live` 确认进程存活，再用 `https://dream.aiwuq.cn/api/ready` 确认 DB/Redis 就绪，最后检查容器状态和后台版本页。
 
 如果暂时没有宿主机执行器，建议把 `ONLINE_UPDATE_APPLY_COMMAND` 留空：后台只完成 Git 快进，之后由运维在宿主机手动执行 Compose 生效。
@@ -462,6 +464,11 @@ SMS_TEMPLATE_CODE=<your-template-code>
 | `REVERSE_VIDEO_FRAMES` | 视频反推抽帧数量 |
 | `WS_TICKET_RATE_PER_MINUTE` | 单用户 WebSocket ticket 申请频率，默认 60/分钟 |
 | `WS_CONNECT_RATE_PER_MINUTE` | 单用户 WebSocket 连接频率，默认 60/分钟 |
+| `WORKER_CRITICAL_CONCURRENCY` | 短任务 worker 并发，默认 2；只消费 `default,payment,video_poll,cleanup`，避免支付/轮询被长任务饿死 |
+| `WORKER_IMAGE_CONCURRENCY` | 图片生成 worker 并发，默认 4；只消费 `image` |
+| `WORKER_VIDEO_SUBMIT_CONCURRENCY` | 视频提交 worker 并发，默认 1；只消费 `video_submit` |
+| `WORKER_VIDEO_DOWNLOAD_CONCURRENCY` | 视频下载落盘 worker 并发，默认 1；只消费 `video_download` |
+| `WORKER_PARSE_CONCURRENCY` | 链接解析/爬虫 worker 并发，默认 1；只消费 `parse`，用于隔离 Playwright/反爬波动 |
 | `NEXT_PUBLIC_API_BASE` | 浏览器访问 API 的地址；反代部署保持为空，浏览器走同源 `/api`；仅 Compose 直连且没有反代时设为 `http://localhost:8000` |
 | `API_INTERNAL_BASE` | 前端服务端/中间件访问 API 的内部地址；Compose 默认 `http://api:8000`，兼容旧变量 `INTERNAL_API_BASE` |
 
@@ -504,10 +511,11 @@ make release-source
 - 平台内置 SSRF 防护：抓取和网关请求会拒绝内网、回环、链路本地、元数据地址和保留地址。
 - 登录使用 HttpOnly Cookie，生产环境会拒绝默认 `JWT_SECRET`。
 - 生成、上传、解析、支付回调均有大小限制和速率限制。
+- 用户上传视频会先通过 ffmpeg 重编码为去元数据的标准 MP4，再进入存储、网关和下载链路；原始上传字节不会作为平台素材长期保存。
 - 高清素材未解锁前不会返回下载地址。
 - 积分流水采用冻结、结算、退款、解锁的分阶段记账方式，避免重复扣费。
 - 模型调用失败、超时、上游状态未知时，任务可能进入 `needs_review`，由管理员人工对账处理。
-- 小红书、抖音等平台可能触发安全校验或反爬限制，抓取失败不代表平台后端异常；生产使用需要遵守目标平台条款和版权授权要求。
+- 小红书、抖音等平台可能触发安全校验或反爬限制，抓取失败不代表平台后端异常；当前抓取运行在独立 `parse` worker 中，生产上可进一步替换为内部 fetcher 微服务。失败时应引导用户改用手动上传参考素材。
 - 真正泄露过的 API Key、支付密钥、短信密钥必须在供应商控制台轮换；删除本地文件或提交记录不能让旧密钥失效。
 
 ## 常见命令

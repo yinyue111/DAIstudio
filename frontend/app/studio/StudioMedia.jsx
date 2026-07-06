@@ -39,10 +39,12 @@ function PreviewLoading() {
 export function ReferenceAssetPreview({ asset, compact = false }) {
   const [failed, setFailed] = useState(false);
   const [secureSrc, setSecureSrc] = useState("");
+  const [securePosterSrc, setSecurePosterSrc] = useState("");
   const videoRawSrc = asset?.type === "video" ? (asset?.display_url || asset?.url || "") : "";
   const videoPosterSrc = asset?.type === "video" ? (asset?.display_thumb || asset?.thumb || "") : "";
   const rawSrc = asset?.type === "video" ? (videoRawSrc || videoPosterSrc || mediaThumbSrc(asset)) : mediaThumbSrc(asset);
   const protectedSrc = isProtectedUploadSrc(rawSrc);
+  const protectedPosterSrc = isProtectedUploadSrc(videoPosterSrc);
   useEffect(() => {
     setFailed(false);
     setSecureSrc("");
@@ -67,6 +69,28 @@ export function ReferenceAssetPreview({ asset, compact = false }) {
       if (objectUrl) URL.revokeObjectURL(objectUrl);
     };
   }, [rawSrc]);
+  useEffect(() => {
+    setSecurePosterSrc("");
+    if (!videoPosterSrc || !protectedPosterSrc) return;
+    let cancelled = false;
+    let objectUrl = "";
+    authenticatedObjectUrl(videoPosterSrc)
+      .then((url) => {
+        if (cancelled) {
+          URL.revokeObjectURL(url);
+          return;
+        }
+        objectUrl = url;
+        setSecurePosterSrc(url);
+      })
+      .catch((e) => {
+        reportBackgroundError(e, "load protected reference poster");
+      });
+    return () => {
+      cancelled = true;
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
+    };
+  }, [protectedPosterSrc, videoPosterSrc]);
   if (failed) {
     return (
       <div className="flex h-full w-full flex-col items-center justify-center gap-1 bg-base2 text-[10px] text-fog">
@@ -78,7 +102,9 @@ export function ReferenceAssetPreview({ asset, compact = false }) {
   if (asset?.type === "video") {
     if (protectedSrc && !secureSrc) return <PreviewLoading />;
     const src = secureSrc || rawSrc;
-    const canRenderVideo = Boolean(src && (String(src).startsWith("blob:") || protectedSrc || isPlatformSrc(src)));
+    const posterSrc = securePosterSrc || (protectedPosterSrc ? "" : videoPosterSrc);
+    const rawIsPosterOnly = !videoRawSrc && rawSrc === videoPosterSrc;
+    const canRenderVideo = Boolean(!rawIsPosterOnly && src && (String(src).startsWith("blob:") || protectedSrc || isPlatformSrc(src)));
     const videoSrc = canRenderVideo ? src : "";
     if (videoSrc) {
       return (
@@ -88,14 +114,15 @@ export function ReferenceAssetPreview({ asset, compact = false }) {
           muted
           playsInline
           preload="metadata"
-          poster={videoPosterSrc || undefined}
+          poster={posterSrc || undefined}
           className="h-full w-full bg-black/20 object-contain"
           onError={() => setFailed(true)}
         />
       );
     }
-    if (videoPosterSrc) {
-      return <img src={videoPosterSrc} alt="" loading="lazy" className="h-full w-full bg-black/20 object-contain" onError={() => setFailed(true)} />;
+    if (protectedPosterSrc && !securePosterSrc) return <PreviewLoading />;
+    if (posterSrc) {
+      return <img src={posterSrc} alt="" loading="lazy" className="h-full w-full bg-black/20 object-contain" onError={() => setFailed(true)} />;
     }
     return <div className="flex h-full w-full items-center justify-center text-fog">🎬</div>;
   }

@@ -3,7 +3,9 @@ from __future__ import annotations
 
 import asyncio
 import io
+import logging
 import re
+import subprocess
 import tempfile
 import uuid
 from pathlib import Path
@@ -25,6 +27,7 @@ from ..services.upload_quota import ensure_user_media_quota, preflight_user_medi
 from ..services.watermark import make_image_preview, make_model_reference
 
 router = APIRouter(prefix="/api/uploads", tags=["uploads"])
+log = logging.getLogger("uploads")
 _UPLOAD_RATE_LIMIT = 30
 _UPLOAD_RATE_WINDOW = 3600
 _SUPPORTED_FORMATS = {
@@ -149,27 +152,112 @@ def _inspect_video(path: str) -> tuple[int | None, int | None, float | None]:
     )
 
 
-def _inspect_video_and_poster(path: str) -> tuple[int | None, int | None, float | None, bytes | None]:
+def _video_transcode_timeout(duration: float | None) -> int:
+    if not duration:
+        return 180
+    return max(60, min(900, int(duration * 8) + 60))
+
+
+def _transcode_sanitized_video(src: Path, *, duration: float | None = None) -> Path:
+    """Re-encode uploaded video into a metadata-stripped MP4.
+
+    We do not persist user-supplied video bytes directly. Re-encoding through
+    ffmpeg normalizes the container/codecs and drops metadata/data/subtitle
+    streams before the file can be sent to model gateways or downloaded later.
+    """
+    if not video_frames.FFMPEG:
+        raise HTTPException(400, "视频净化组件不可用,请联系管理员安装 ffmpeg")
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
+    dst = Path(tmp.name)
+    tmp.close()
+    cmd = [
+        video_frames.FFMPEG,
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-nostdin",
+        "-protocol_whitelist",
+        "file,pipe",
+        "-i",
+        str(src),
+        "-fs",
+        str(int(settings.max_upload_video_bytes)),
+        "-map",
+        "0:v:0",
+        "-map",
+        "0:a?",
+        "-map_metadata",
+        "-1",
+        "-map_chapters",
+        "-1",
+        "-dn",
+        "-sn",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "veryfast",
+        "-crf",
+        "23",
+        "-pix_fmt",
+        "yuv420p",
+        "-vf",
+        "scale='min(1920,iw)':'min(1080,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "128k",
+        "-movflags",
+        "+faststart",
+        str(dst),
+    ]
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=_video_transcode_timeout(duration),
+        )
+    except subprocess.TimeoutExpired:
+        dst.unlink(missing_ok=True)
+        raise HTTPException(400, "视频净化超时,请压缩后重新上传") from None
+    except (OSError, subprocess.SubprocessError):
+        dst.unlink(missing_ok=True)
+        raise HTTPException(400, "视频净化失败,请更换标准 MP4/MOV/WebM 文件") from None
+    if result.returncode != 0 or not dst.exists() or dst.stat().st_size <= 0:
+        dst.unlink(missing_ok=True)
+        log_msg = (result.stderr or result.stdout or "").strip()[:300]
+        if log_msg:
+            log.info("video transcode rejected upload: %s", log_msg)
+        raise HTTPException(400, "视频净化失败,请更换标准 MP4/MOV/WebM 文件")
+    if dst.stat().st_size > int(settings.max_upload_video_bytes):
+        dst.unlink(missing_ok=True)
+        raise HTTPException(413, f"视频净化后仍超过 {int(settings.max_upload_video_bytes) // 1024 // 1024}MB")
+    return dst
+
+
+def _sanitize_video_and_poster(path: Path) -> tuple[Path, int | None, int | None, float | None, bytes | None]:
     if not video_frames.acquire_video_slot():
         raise HTTPException(429, "视频校验繁忙,请稍后再试")
+    sanitized_path: Path | None = None
     try:
-        width, height, duration = _inspect_video(path)
-        poster = video_frames.extract_poster(path)
-        return width, height, duration, poster
+        _width, _height, source_duration = _inspect_video(str(path))
+        sanitized_path = _transcode_sanitized_video(path, duration=source_duration)
+        width, height, duration = _inspect_video(str(sanitized_path))
+        poster = video_frames.extract_poster(str(sanitized_path))
+        return sanitized_path, width, height, duration, poster
+    except Exception:
+        if sanitized_path is not None:
+            sanitized_path.unlink(missing_ok=True)
+        raise
     finally:
         video_frames.release_video_slot()
 
 
-async def _save_upload_stream(file: UploadFile, subdir: str, ext: str, *, limit: int) -> tuple[str, Path, int, bool]:
-    if storage.is_object_storage_enabled():
-        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=f".{ext.lstrip('.')}")
-        path = Path(tmp.name)
-        tmp.close()
-        key = ""
-        temporary = True
-    else:
-        key, path = storage.reserve_key(subdir, ext)
-        temporary = False
+async def _save_upload_stream_to_temp(file: UploadFile, ext: str, *, limit: int) -> tuple[Path, int]:
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=f".{ext.lstrip('.')}")
+    path = Path(tmp.name)
+    tmp.close()
     total = 0
     try:
         with open(path, "wb") as f:
@@ -187,9 +275,7 @@ async def _save_upload_stream(file: UploadFile, subdir: str, ext: str, *, limit:
     if total <= 0:
         path.unlink(missing_ok=True)
         raise HTTPException(400, "请选择要上传的视频")
-    if temporary:
-        key = await asyncio.to_thread(storage.save_file, path, subdir, ext)
-    return key, path, total, temporary
+    return path, total
 
 
 @router.post("/image", response_model=Asset)
@@ -315,20 +401,19 @@ async def upload_video(
 
     upload_key = None
     preview_key = None
-    upload_path = None
-    upload_path_temporary = False
-    bytes_written = 0
+    raw_path = None
+    sanitized_path = None
+    raw_bytes = 0
+    stored_bytes = 0
+    width = height = duration = None
     try:
-        upload_key, upload_path, bytes_written, upload_path_temporary = await _save_upload_stream(
-            file,
-            "upload_video",
-            ext,
-            limit=limit,
-        )
+        raw_path, raw_bytes = await _save_upload_stream_to_temp(file, ext, limit=limit)
+        preflight_user_media_quota(db, user.id, raw_bytes)
+        sanitized_path, width, height, duration, poster = await asyncio.to_thread(_sanitize_video_and_poster, raw_path)
+        stored_bytes = sanitized_path.stat().st_size
+        ensure_user_media_quota(db, user.id, stored_bytes + (len(poster) if poster else 0))
+        upload_key = await asyncio.to_thread(storage.save_file, sanitized_path, "upload_video", "mp4")
         stem = Path(upload_key).stem
-        ensure_user_media_quota(db, user.id, bytes_written)
-        width, height, duration, poster = await asyncio.to_thread(_inspect_video_and_poster, str(upload_path))
-        ensure_user_media_quota(db, user.id, bytes_written + (len(poster) if poster else 0))
         if poster:
             preview_key = storage.save_bytes_named(poster, "upload_video_preview", f"{stem}.jpg")
         original_filename = _safe_original_filename(file.filename, upload_key.rsplit("/", 1)[-1])
@@ -336,10 +421,10 @@ async def upload_video(
             UploadedAsset(
                 key=upload_key,
                 user_id=user.id,
-                mime=(file.content_type or f"video/{ext}").split(";", 1)[0],
+                mime="video/mp4",
                 width=width,
                 height=height,
-                bytes=bytes_written,
+                bytes=stored_bytes,
                 original_filename=original_filename,
             )
         )
@@ -365,8 +450,10 @@ async def upload_video(
         _cleanup_storage_keys(upload_key, preview_key)
         raise
     finally:
-        if upload_path_temporary and upload_path is not None:
-            upload_path.unlink(missing_ok=True)
+        if raw_path is not None:
+            raw_path.unlink(missing_ok=True)
+        if sanitized_path is not None:
+            sanitized_path.unlink(missing_ok=True)
     audit.log(
         db,
         user_id=user.id,
@@ -376,10 +463,12 @@ async def upload_video(
         detail={
             "filename": file.filename,
             "content_type": file.content_type,
-            "bytes": bytes_written,
+            "raw_bytes": raw_bytes,
+            "bytes": stored_bytes,
             "width": width,
             "height": height,
             "duration": duration,
+            "sanitized": True,
         },
     )
     return Asset(

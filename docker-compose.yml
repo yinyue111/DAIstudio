@@ -95,16 +95,110 @@ services:
     build: ./backend
     restart: unless-stopped
     stop_grace_period: ${WORKER_STOP_GRACE_PERIOD:-15m}
-    # No -B here: beat runs in its own service so scaling workers (--scale
-    # worker=N) does NOT start N schedulers racing on the same cron jobs.
-    command: celery -A app.celery_app.celery_app worker -l info --concurrency=${WORKER_CONCURRENCY:-4} -Q ${WORKER_QUEUES:-default,image,video_submit,video_poll,video_download,parse,cleanup,payment}
+    # Critical short-lived queues only. Keep payment reconciliation, cleanup,
+    # default jobs, and video polling responsive even when parse/video/image
+    # workloads are saturated.
+    command: celery -A app.celery_app.celery_app worker -l info --concurrency=${WORKER_CRITICAL_CONCURRENCY:-2} -Q ${WORKER_CRITICAL_QUEUES:-default,payment,video_poll,cleanup}
     env_file:
       - path: ./backend/.env
         required: false
     environment:
       DATABASE_URL: postgresql+psycopg2://postgres:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD to a strong database password}@postgres:5432/ai_studio
       REDIS_URL: redis://redis:6379/0
-    mem_limit: 2g  # Chromium + ffmpeg renders are memory-heavy; cap to protect the host
+    mem_limit: ${WORKER_CRITICAL_MEM_LIMIT:-1g}
+    volumes:
+      - media:/app/storage
+    healthcheck:
+      test: ["CMD-SHELL", "celery -A app.celery_app.celery_app inspect ping -d celery@$$HOSTNAME || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+  worker_image:
+    build: ./backend
+    restart: unless-stopped
+    stop_grace_period: ${WORKER_STOP_GRACE_PERIOD:-15m}
+    command: celery -A app.celery_app.celery_app worker -l info --concurrency=${WORKER_IMAGE_CONCURRENCY:-4} -Q ${WORKER_IMAGE_QUEUES:-image}
+    env_file:
+      - path: ./backend/.env
+        required: false
+    environment:
+      DATABASE_URL: postgresql+psycopg2://postgres:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD to a strong database password}@postgres:5432/ai_studio
+      REDIS_URL: redis://redis:6379/0
+    mem_limit: ${WORKER_IMAGE_MEM_LIMIT:-2g}
+    volumes:
+      - media:/app/storage
+    healthcheck:
+      test: ["CMD-SHELL", "celery -A app.celery_app.celery_app inspect ping -d celery@$$HOSTNAME || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+  worker_video:
+    build: ./backend
+    restart: unless-stopped
+    stop_grace_period: ${WORKER_STOP_GRACE_PERIOD:-15m}
+    command: celery -A app.celery_app.celery_app worker -l info --concurrency=${WORKER_VIDEO_SUBMIT_CONCURRENCY:-1} -Q ${WORKER_VIDEO_SUBMIT_QUEUES:-video_submit}
+    env_file:
+      - path: ./backend/.env
+        required: false
+    environment:
+      DATABASE_URL: postgresql+psycopg2://postgres:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD to a strong database password}@postgres:5432/ai_studio
+      REDIS_URL: redis://redis:6379/0
+    mem_limit: ${WORKER_VIDEO_SUBMIT_MEM_LIMIT:-1g}
+    volumes:
+      - media:/app/storage
+    healthcheck:
+      test: ["CMD-SHELL", "celery -A app.celery_app.celery_app inspect ping -d celery@$$HOSTNAME || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+  worker_video_download:
+    build: ./backend
+    restart: unless-stopped
+    stop_grace_period: ${WORKER_STOP_GRACE_PERIOD:-15m}
+    command: celery -A app.celery_app.celery_app worker -l info --concurrency=${WORKER_VIDEO_DOWNLOAD_CONCURRENCY:-1} -Q ${WORKER_VIDEO_DOWNLOAD_QUEUES:-video_download}
+    env_file:
+      - path: ./backend/.env
+        required: false
+    environment:
+      DATABASE_URL: postgresql+psycopg2://postgres:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD to a strong database password}@postgres:5432/ai_studio
+      REDIS_URL: redis://redis:6379/0
+    mem_limit: ${WORKER_VIDEO_DOWNLOAD_MEM_LIMIT:-2g}
+    volumes:
+      - media:/app/storage
+    healthcheck:
+      test: ["CMD-SHELL", "celery -A app.celery_app.celery_app inspect ping -d celery@$$HOSTNAME || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+  worker_parse:
+    build: ./backend
+    restart: unless-stopped
+    stop_grace_period: ${WORKER_STOP_GRACE_PERIOD:-15m}
+    command: celery -A app.celery_app.celery_app worker -l info --concurrency=${WORKER_PARSE_CONCURRENCY:-1} -Q ${WORKER_PARSE_QUEUES:-parse}
+    env_file:
+      - path: ./backend/.env
+        required: false
+    environment:
+      DATABASE_URL: postgresql+psycopg2://postgres:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD to a strong database password}@postgres:5432/ai_studio
+      REDIS_URL: redis://redis:6379/0
+    # Chromium + anti-bot rendering can spike memory; keep parse isolated.
+    mem_limit: ${WORKER_PARSE_MEM_LIMIT:-2g}
     volumes:
       - media:/app/storage
     healthcheck:
@@ -128,6 +222,11 @@ services:
     environment:
       DATABASE_URL: postgresql+psycopg2://postgres:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD to a strong database password}@postgres:5432/ai_studio
       REDIS_URL: redis://redis:6379/0
+    healthcheck:
+      test: ["CMD-SHELL", "celery -A app.celery_app.celery_app inspect ping >/dev/null 2>&1 || pgrep -f 'celery.*beat' >/dev/null"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
     depends_on:
       migrate:
         condition: service_completed_successfully

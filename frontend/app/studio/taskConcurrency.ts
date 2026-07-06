@@ -7,12 +7,14 @@ export function shouldBlockNewGeneration(currentTask, nextCategory) {
 
 export function generationSubmitDisabled({
   submitting,
+  busy,
   currentTask,
   nextCategory,
   currentModelEnabled,
 }) {
   return Boolean(
     submitting
+      || busy
       || !currentModelEnabled
       || shouldBlockNewGeneration(currentTask, nextCategory)
   );

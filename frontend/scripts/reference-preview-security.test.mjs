@@ -33,8 +33,13 @@ assert.match(
 );
 assert.match(
   previewSource,
-  /if\s*\(videoPosterSrc\)/,
+  /if\s*\(posterSrc\)/,
   "third-party video references should fall back to poster thumbnails instead of direct playback",
+);
+assert.match(
+  previewSource,
+  /authenticatedObjectUrl\(videoPosterSrc\)/,
+  "protected upload video posters should load through authenticated blob URLs",
 );
 
 console.log("reference preview security test passed");

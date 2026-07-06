@@ -110,8 +110,18 @@ def _duration_seconds(path: str) -> float | None:
         return None
     try:
         out = subprocess.run(
-            [FFPROBE, "-v", "quiet", "-show_entries", "format=duration",
-             "-of", "csv=p=0", path],
+            [
+                FFPROBE,
+                "-v",
+                "quiet",
+                "-protocol_whitelist",
+                "file,pipe",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "csv=p=0",
+                path,
+            ],
             capture_output=True, text=True, timeout=20,
         )
         return float(out.stdout.strip())
@@ -126,8 +136,16 @@ def probe_media(path: str) -> dict:
     try:
         out = subprocess.run(
             [
-                FFPROBE, "-v", "quiet", "-print_format", "json",
-                "-show_streams", "-show_format", path,
+                FFPROBE,
+                "-v",
+                "quiet",
+                "-protocol_whitelist",
+                "file,pipe",
+                "-print_format",
+                "json",
+                "-show_streams",
+                "-show_format",
+                path,
             ],
             capture_output=True, text=True, timeout=20,
         )
@@ -187,6 +205,8 @@ def _scene_change_timestamps(src: str, limit: int) -> list[float]:
             [
                 FFMPEG,
                 "-hide_banner",
+                "-protocol_whitelist",
+                "file,pipe",
                 "-i",
                 src,
                 "-vf",
