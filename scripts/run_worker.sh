@@ -45,7 +45,8 @@ esac
 QUEUES="${WORKER_QUEUES:-$DEFAULT_QUEUES}"
 POOL="${WORKER_POOL:-prefork}"
 CONCURRENCY="${WORKER_CONCURRENCY:-$DEFAULT_CONCURRENCY}"
-CMD=(celery -A app.celery_app.celery_app worker -l info --pool="$POOL" --concurrency="$CONCURRENCY" -Q "$QUEUES")
+NODE_NAME="${WORKER_NAME:-${ROLE}@%h}"
+CMD=(celery -A app.celery_app.celery_app worker -l info -n "$NODE_NAME" --pool="$POOL" --concurrency="$CONCURRENCY" -Q "$QUEUES")
 if [[ "${1:-}" == "--print-command" ]]; then
   printf '%q ' "${CMD[@]}"
   printf '\n'
