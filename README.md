@@ -462,8 +462,8 @@ SMS_TEMPLATE_CODE=<your-template-code>
 | `REVERSE_VIDEO_FRAMES` | 视频反推抽帧数量 |
 | `WS_TICKET_RATE_PER_MINUTE` | 单用户 WebSocket ticket 申请频率，默认 60/分钟 |
 | `WS_CONNECT_RATE_PER_MINUTE` | 单用户 WebSocket 连接频率，默认 60/分钟 |
-| `NEXT_PUBLIC_API_BASE` | 浏览器访问 API 的地址；Compose 直连默认 `http://localhost:8000`，同域反代部署可按实际网关设置为空或同源 |
-| `API_INTERNAL_BASE` | 前端服务端/中间件访问 API 的内部地址；Compose 默认 `http://api:8000` |
+| `NEXT_PUBLIC_API_BASE` | 浏览器访问 API 的地址；反代部署保持为空，浏览器走同源 `/api`；仅 Compose 直连且没有反代时设为 `http://localhost:8000` |
+| `API_INTERNAL_BASE` | 前端服务端/中间件访问 API 的内部地址；Compose 默认 `http://api:8000`，兼容旧变量 `INTERNAL_API_BASE` |
 
 完整配置见 `backend/.env.example`。
 

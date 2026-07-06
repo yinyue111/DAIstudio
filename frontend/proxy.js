@@ -34,7 +34,12 @@ function loginRedirectUrl(request) {
 }
 
 function apiBaseForRequest(request) {
-  return (process.env.API_INTERNAL_BASE || process.env.NEXT_PUBLIC_API_BASE || request.nextUrl.origin).replace(/\/$/, "");
+  return (
+    process.env.API_INTERNAL_BASE
+    || process.env.INTERNAL_API_BASE
+    || process.env.NEXT_PUBLIC_API_BASE
+    || request.nextUrl.origin
+  ).replace(/\/$/, "");
 }
 
 async function hasValidSession(request) {

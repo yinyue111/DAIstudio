@@ -59,8 +59,8 @@ assert.equal(
   const productionApiBase = new Function("process", "window", `function resolveApiBase() {${match[1]}\n}\nreturn resolveApiBase();`)(process, window);
   assert.equal(
     productionApiBase,
-    "http://localhost:8000",
-    "production builds should not silently rewrite loopback API origins to LAN hosts unless explicitly enabled",
+    "",
+    "production builds opened from non-loopback hosts must fall back to same-origin /api instead of calling the client's localhost",
   );
 }
 

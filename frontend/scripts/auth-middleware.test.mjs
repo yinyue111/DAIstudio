@@ -69,8 +69,10 @@ assert.equal(
 
 const originalFetch = globalThis.fetch;
 const originalInternalApiBase = process.env.API_INTERNAL_BASE;
+const originalLegacyInternalApiBase = process.env.INTERNAL_API_BASE;
 const calls = [];
 process.env.API_INTERNAL_BASE = "http://api:8000";
+delete process.env.INTERNAL_API_BASE;
 globalThis.fetch = async (url, options) => {
   calls.push({ url: String(url), cookie: options?.headers?.cookie || "" });
   return new Response("{}", { status: 200 });
@@ -106,6 +108,30 @@ globalThis.fetch = async () => new Response("{}", { status: 401 });
 globalThis.fetch = originalFetch;
 if (originalInternalApiBase === undefined) delete process.env.API_INTERNAL_BASE;
 else process.env.API_INTERNAL_BASE = originalInternalApiBase;
+if (originalLegacyInternalApiBase === undefined) delete process.env.INTERNAL_API_BASE;
+else process.env.INTERNAL_API_BASE = originalLegacyInternalApiBase;
+
+const legacyCalls = [];
+delete process.env.API_INTERNAL_BASE;
+process.env.INTERNAL_API_BASE = "http://legacy-api:8000";
+globalThis.fetch = async (url, options) => {
+  legacyCalls.push({ url: String(url), cookie: options?.headers?.cookie || "" });
+  return new Response("{}", { status: 200 });
+};
+assert.equal(
+  (await middlewareResult("/profile", "valid-cookie-shape")).status,
+  200,
+  "legacy INTERNAL_API_BASE deployments should still validate sessions",
+);
+assert.ok(
+  legacyCalls.every((call) => call.url.startsWith("http://legacy-api:8000/api/me")),
+  "server-side session validation should accept INTERNAL_API_BASE as a compatibility alias",
+);
+globalThis.fetch = originalFetch;
+if (originalInternalApiBase === undefined) delete process.env.API_INTERNAL_BASE;
+else process.env.API_INTERNAL_BASE = originalInternalApiBase;
+if (originalLegacyInternalApiBase === undefined) delete process.env.INTERNAL_API_BASE;
+else process.env.INTERNAL_API_BASE = originalLegacyInternalApiBase;
 
 assert.equal(
   (await middlewareResult("/prompt-library/thumbs/example.jpg")).status,

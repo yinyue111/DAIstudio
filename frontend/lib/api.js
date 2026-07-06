@@ -17,7 +17,7 @@ function resolveApiBase() {
       const currentIsLoopback = ["localhost", "127.0.0.1"].includes(currentHost);
       const allowLanAlias = process.env.NODE_ENV !== "production"
         || process.env.NEXT_PUBLIC_ALLOW_LAN_API_ALIAS === "true";
-      if (!currentIsLoopback && !allowLanAlias) return configured;
+      if (!currentIsLoopback && !allowLanAlias) return "";
       url.hostname = window.location.hostname;
       return url.origin;
     }

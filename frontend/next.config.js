@@ -31,9 +31,31 @@ function websocketOrigin(value) {
   return origin.replace(/^http:/, "ws:").replace(/^https:/, "wss:");
 }
 
+function shouldAllowLoopbackApiOrigin(value) {
+  if (!value) return false;
+  if (!isProd || process.env.NEXT_PUBLIC_ALLOW_LAN_API_ALIAS === "true") return true;
+  try {
+    const url = new URL(value);
+    return !["localhost", "127.0.0.1"].includes(url.hostname);
+  } catch (_err) {
+    return true;
+  }
+}
+
+function publicApiOrigin(value) {
+  if (!shouldAllowLoopbackApiOrigin(value)) return null;
+  return originSource(value);
+}
+
+function publicWebsocketOrigin(value) {
+  if (!shouldAllowLoopbackApiOrigin(value)) return null;
+  return websocketOrigin(value);
+}
+
 function loopbackApiAliases(value) {
   if (!value) return [];
   const allowLanAlias = !isProd || process.env.NEXT_PUBLIC_ALLOW_LAN_API_ALIAS === "true";
+  if (isProd && !allowLanAlias) return [];
   try {
     const url = new URL(value);
     if (!["localhost", "127.0.0.1"].includes(url.hostname)) return [];
@@ -59,8 +81,8 @@ const nextConfig = {
   // next/image optimizer (we use plain <img>).
   async headers() {
     const scriptSrc = isProd ? "script-src 'self' 'unsafe-inline'" : "script-src 'self' 'unsafe-eval' 'unsafe-inline'";
-    const apiOrigin = originSource(process.env.NEXT_PUBLIC_API_BASE);
-    const apiWsOrigin = websocketOrigin(process.env.NEXT_PUBLIC_API_BASE);
+    const apiOrigin = publicApiOrigin(process.env.NEXT_PUBLIC_API_BASE);
+    const apiWsOrigin = publicWebsocketOrigin(process.env.NEXT_PUBLIC_API_BASE);
     const localApi = isProd
       ? loopbackApiAliases(process.env.NEXT_PUBLIC_API_BASE)
       : ["http://localhost:8000", "http://127.0.0.1:8000"];

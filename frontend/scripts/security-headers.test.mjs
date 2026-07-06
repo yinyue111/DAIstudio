@@ -34,20 +34,20 @@ assert.doesNotMatch(
   /(?:img-src|media-src)[^;]*\shttps:/,
   "production CSP must not allow arbitrary HTTPS media sources",
 );
-assert.match(
+assert.doesNotMatch(
   headers.get("content-security-policy") || "",
-  /connect-src[^;]*http:\/\/127\.0\.0\.1:8000[^;]*http:\/\/localhost:8000/,
-  "production CSP must align localhost/127.0.0.1 API aliases with API_BASE rewriting",
+  /connect-src[^;]*http:\/\/(?:127\.0\.0\.1|localhost):8000/,
+  "production CSP must not allow loopback API origins unless LAN aliasing is explicitly enabled",
 );
 assert.doesNotMatch(
   headers.get("content-security-policy") || "",
   /connect-src[^;]*http:\/\/\*:8000/,
   "production CSP must not ship LAN wildcard API rewrites by default",
 );
-assert.match(
+assert.doesNotMatch(
   headers.get("content-security-policy") || "",
-  /connect-src[^;]*ws:\/\/127\.0\.0\.1:8000[^;]*ws:\/\/localhost:8000/,
-  "production CSP must align websocket localhost/127.0.0.1 aliases",
+  /connect-src[^;]*ws:\/\/(?:127\.0\.0\.1|localhost):8000/,
+  "production CSP must not allow loopback websocket origins unless LAN aliasing is explicitly enabled",
 );
 assert.doesNotMatch(
   headers.get("content-security-policy") || "",
