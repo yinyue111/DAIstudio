@@ -140,6 +140,64 @@ def test_purge_uploaded_assets_removes_stale_upload_pair(client, make_user):
         db.close()
 
 
+def test_purge_uploaded_assets_keeps_files_when_commit_fails(client, make_user, monkeypatch):
+    uid = make_user("13900000435", balance=1000)
+    upload_key = storage.save_bytes_named(b"upload", "upload", "retention-rollback.png")
+    preview_key = storage.save_bytes_named(b"preview", "upload_preview", "retention-rollback.png")
+    upload_path = storage.local_path(upload_key)
+    preview_path = storage.local_path(preview_key)
+    db = SessionLocal()
+    try:
+        old = datetime.now(timezone.utc) - timedelta(days=40)
+        db.add(UploadedAsset(
+            key=upload_key,
+            user_id=uid,
+            mime="image/png",
+            bytes=6,
+            original_filename="ref.png",
+            created_at=old,
+        ))
+        db.add(UploadedAsset(
+            key=preview_key,
+            user_id=uid,
+            mime="image/png",
+            bytes=7,
+            original_filename="preview:ref.png",
+            created_at=old,
+        ))
+        db.commit()
+
+        def fail_commit():
+            raise RuntimeError("commit failed")
+
+        monkeypatch.setattr(db, "commit", fail_commit)
+
+        try:
+            retention.purge_uploaded_assets(db, datetime.now(timezone.utc) - timedelta(days=30))
+        except RuntimeError:
+            db.rollback()
+        else:
+            raise AssertionError("purge should surface commit failure")
+
+        assert upload_path.exists()
+        assert preview_path.exists()
+        assert db.get(UploadedAsset, upload_key) is not None
+        assert db.get(UploadedAsset, preview_key) is not None
+    finally:
+        db.close()
+        cleanup = SessionLocal()
+        try:
+            for key in (upload_key, preview_key):
+                row = cleanup.get(UploadedAsset, key)
+                if row:
+                    cleanup.delete(row)
+            cleanup.commit()
+        finally:
+            cleanup.close()
+        upload_path.unlink(missing_ok=True)
+        preview_path.unlink(missing_ok=True)
+
+
 def test_purge_uploaded_assets_removes_null_filename_upload(client, make_user):
     uid = make_user("13900000434", balance=1000)
     upload_key = storage.save_bytes_named(b"upload", "upload", "retention-null-name.png")

@@ -214,7 +214,13 @@ export default function PromptsPage() {
                   <article key={item.id} className="rounded-xl2 border border-line bg-black/15 p-3">
                     <div className="mb-2 flex items-center justify-between gap-2">
                       <h3 className="min-w-0 truncate text-sm font-semibold text-snow">{item.title}</h3>
-                      <button onClick={() => toggleFavorite(item)} className={item.favorite ? "text-rose" : "text-fog hover:text-snow"}>
+                      <button
+                        type="button"
+                        onClick={() => toggleFavorite(item)}
+                        aria-label={item.favorite ? "取消收藏提示词" : "收藏提示词"}
+                        aria-pressed={Boolean(item.favorite)}
+                        className={item.favorite ? "text-rose" : "text-fog hover:text-snow"}
+                      >
                         {item.favorite ? "★" : "☆"}
                       </button>
                     </div>

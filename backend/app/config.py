@@ -136,6 +136,7 @@ class OnlineUpdateSettings(BaseModel):
     timeout_seconds: int
     allow_dirty: bool
     allow_local_remote: bool
+    require_signed_commits: bool
 
 
 class Settings(BaseSettings):
@@ -389,6 +390,9 @@ class Settings(BaseSettings):
     # Development/test escape hatch for local bare repositories. Production
     # should keep this false so a named remote cannot hide a local file path.
     online_update_allow_local_remote: bool = False
+    # When true, online update accepts only commits passing `git verify-commit`.
+    # Keep false unless the deployment repository signs release commits/tags.
+    online_update_require_signed_commits: bool = False
 
     @field_validator("cors_origins")
     @classmethod
@@ -531,6 +535,7 @@ class Settings(BaseSettings):
             timeout_seconds=self.online_update_timeout_seconds,
             allow_dirty=self.online_update_allow_dirty,
             allow_local_remote=self.online_update_allow_local_remote,
+            require_signed_commits=self.online_update_require_signed_commits,
         )
 
     @property

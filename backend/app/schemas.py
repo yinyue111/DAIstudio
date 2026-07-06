@@ -591,6 +591,7 @@ class OnlineUpdateStatusOut(BaseModel):
     dirty_status: str = ""
     apply_command_configured: bool = False
     allow_dirty: bool = False
+    require_signed_commits: bool = False
     error: str | None = None
 
 
@@ -598,6 +599,7 @@ class OnlineUpdateRunIn(BaseModel):
     apply: bool = True
     confirm: str = ""
     force_apply: bool = False
+    expected_remote_head: str = ""
 
 
 class OnlineUpdateRunOut(BaseModel):

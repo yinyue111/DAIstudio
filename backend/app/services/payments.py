@@ -19,6 +19,7 @@ from urllib.parse import quote_plus, urlparse
 from sqlalchemy import func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
+from sqlalchemy.orm.attributes import set_committed_value
 
 from ..config import settings
 from ..models import PaymentOrder, User
@@ -628,17 +629,7 @@ def user_order(db: Session, order_no: str, user_id: int) -> PaymentOrder | None:
 
 
 def list_user_orders(db: Session, user_id: int, limit: int = 20) -> list[PaymentOrder]:
-    db.execute(
-        update(PaymentOrder)
-        .where(
-            PaymentOrder.user_id == user_id,
-            PaymentOrder.status == PENDING,
-            PaymentOrder.expires_at < _now(),
-        )
-        .values(status=CLOSED)
-    )
-    db.commit()
-    return list(
+    orders = list(
         db.execute(
             select(PaymentOrder)
             .where(PaymentOrder.user_id == user_id)
@@ -646,6 +637,7 @@ def list_user_orders(db: Session, user_id: int, limit: int = 20) -> list[Payment
             .limit(min(max(limit, 1), 100))
         ).scalars()
     )
+    return [with_display_status(order) for order in orders]
 
 
 def get_order(db: Session, order_no: str) -> PaymentOrder | None:
@@ -740,11 +732,9 @@ def mark_paid(
     return order, True
 
 
-def close_expired(order: PaymentOrder, db: Session) -> PaymentOrder:
+def with_display_status(order: PaymentOrder) -> PaymentOrder:
     if order.status == PENDING and _aware(order.expires_at) and _aware(order.expires_at) < _now():
-        order.status = CLOSED
-        db.commit()
-        db.refresh(order)
+        set_committed_value(order, "status", CLOSED)
     return order
 
 

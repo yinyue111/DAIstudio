@@ -19,6 +19,7 @@ from urllib.parse import urlparse
 
 from ..config import settings
 from . import locks
+from .ssrf import SsrfError, assert_safe_url, resolve_safe
 
 _REF_RE = re.compile(r"^[A-Za-z0-9._/-]+$")
 _OUTPUT_LIMIT = 12_000
@@ -39,6 +40,7 @@ _GITHUB_TOKEN_RE = re.compile(r"\b(?:gh[opsru]_[A-Za-z0-9_]{8,}|github_pat_[A-Za
 _ALLOWED_REMOTE_SCHEMES = {"https", "ssh"}
 _SCP_REMOTE_RE = re.compile(r"^(?P<user>[A-Za-z0-9._-]+)@(?P<host>[A-Za-z0-9._-]+):(?P<path>[A-Za-z0-9._~/-]+)(?:\.git)?$")
 _GITHUB_SSH_REMOTE_RE = re.compile(r"^(?:git@github\.com:|ssh://git@github\.com/)(?P<repo>[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)(?:\.git)?$")
+_COMMIT_SHA_RE = re.compile(r"^[0-9a-f]{40}$", re.I)
 _COMPOSE_MUTATION_RE = re.compile(
     r"\b(?:docker\s+compose|docker-compose)\b[\s\S]{0,240}\b(?:up|restart|down|rm)\b",
     re.I,
@@ -174,9 +176,20 @@ def _safe_remote(value: str) -> str:
         raise OnlineUpdateError("ONLINE_UPDATE_REMOTE 只允许 Git remote 名称或安全的 Git URL")
     if parsed.scheme in {"https", "ssh"} and not parsed.netloc:
         raise OnlineUpdateError("ONLINE_UPDATE_REMOTE URL 缺少主机")
-    if parsed.username or parsed.password:
+    if parsed.scheme == "https" and (parsed.username or parsed.password):
         raise OnlineUpdateError("ONLINE_UPDATE_REMOTE 不能包含用户名或密码")
+    if parsed.scheme == "ssh" and (parsed.password or (parsed.username and parsed.username != "git")):
+        raise OnlineUpdateError("ONLINE_UPDATE_REMOTE SSH URL 只允许 git 用户且不能包含密码")
     return text
+
+
+def _assert_safe_remote_host(host: str | None, *, label: str) -> None:
+    if not host:
+        raise OnlineUpdateError(f"{label} URL 缺少主机")
+    try:
+        resolve_safe(host)
+    except SsrfError as e:
+        raise OnlineUpdateError(f"{label} 主机不安全: {e}") from e
 
 
 def _is_remote_name(remote: str) -> bool:
@@ -191,15 +204,26 @@ def _validate_remote_url(value: str, *, label: str = "Git remote") -> str:
         return text
     if text.startswith("-") or any(ch.isspace() for ch in text):
         raise OnlineUpdateError(f"{label} 配置非法")
-    if _SCP_REMOTE_RE.fullmatch(text):
+    scp = _SCP_REMOTE_RE.fullmatch(text)
+    if scp:
+        _assert_safe_remote_host(scp.group("host"), label=label)
         return text
     parsed = urlparse(text)
     if parsed.scheme not in _ALLOWED_REMOTE_SCHEMES:
         raise OnlineUpdateError(f"{label} 只允许安全的 Git URL，不能指向本地路径")
     if not parsed.netloc:
         raise OnlineUpdateError(f"{label} URL 缺少主机")
-    if parsed.username or parsed.password:
-        raise OnlineUpdateError(f"{label} 不能包含用户名或密码")
+    if parsed.scheme == "https":
+        if parsed.username or parsed.password:
+            raise OnlineUpdateError(f"{label} 不能包含用户名或密码")
+        try:
+            assert_safe_url(text)
+        except SsrfError as e:
+            raise OnlineUpdateError(f"{label} 主机不安全: {e}") from e
+    if parsed.scheme == "ssh":
+        if parsed.password or (parsed.username and parsed.username != "git"):
+            raise OnlineUpdateError(f"{label} SSH URL 只允许 git 用户且不能包含密码")
+        _assert_safe_remote_host(parsed.hostname, label=label)
     return text
 
 
@@ -335,6 +359,33 @@ def _remote_head(repo: Path, remote: str, branch: str) -> str:
     raise OnlineUpdateError(f"远端分支不存在或无法读取: {remote}/{branch}")
 
 
+def _safe_expected_head(value: str | None) -> str:
+    text = str(value or "").strip()
+    if not text:
+        raise OnlineUpdateError("执行在线升级前必须先检查远端版本，并提交 expected_remote_head")
+    if not _COMMIT_SHA_RE.fullmatch(text):
+        raise OnlineUpdateError("expected_remote_head 必须是 40 位 Git commit SHA")
+    return text.lower()
+
+
+def _verify_remote_head(expected_remote_head: str | None, actual_remote_head: str) -> None:
+    expected = _safe_expected_head(expected_remote_head)
+    actual = str(actual_remote_head or "").strip().lower()
+    if actual != expected:
+        raise OnlineUpdateError(
+            "远端版本在确认后发生变化，已拒绝升级。请重新检查远端版本后再执行。"
+        )
+
+
+def _verify_commit_signature(repo: Path, rev: str) -> None:
+    if not bool(getattr(settings, "online_update_require_signed_commits", False)):
+        return
+    try:
+        _git(["verify-commit", rev], cwd=repo)
+    except OnlineUpdateError as e:
+        raise OnlineUpdateError("远端提交未通过 Git 签名校验，已拒绝在线升级") from e
+
+
 def _ensure_ready(
     repo: Path,
     *,
@@ -394,6 +445,7 @@ def status(*, check_remote: bool = False) -> dict[str, Any]:
         "dirty_status": "",
         "apply_command_configured": bool(str(settings.online_update_apply_command or "").strip()),
         "allow_dirty": bool(settings.online_update_allow_dirty),
+        "require_signed_commits": bool(getattr(settings, "online_update_require_signed_commits", False)),
     }
     try:
         repo = _repo_dir()
@@ -436,7 +488,12 @@ def _reset_to_head(repo: Path, rev: str, *, allow_dirty: bool = False) -> tuple[
         return False, f"回滚失败:{_clip(str(e))}"
 
 
-def run_update(*, apply: bool = True, force_apply: bool = False) -> dict[str, Any]:
+def run_update(
+    *,
+    apply: bool = True,
+    force_apply: bool = False,
+    expected_remote_head: str | None = None,
+) -> dict[str, Any]:
     if not settings.online_update_enabled:
         raise OnlineUpdateError("在线更新未启用,请先设置 ONLINE_UPDATE_ENABLED=true 并重启后端")
     repo = _repo_dir()
@@ -449,6 +506,9 @@ def run_update(*, apply: bool = True, force_apply: bool = False) -> dict[str, An
         after_fetch = ready["remote_head"]
         changed = bool(after_fetch and after_fetch != before)
         force_apply = bool(force_apply and apply and not changed)
+        if apply and (changed or force_apply):
+            _verify_remote_head(expected_remote_head, after_fetch)
+            _verify_commit_signature(repo, after_fetch)
         outputs: list[str] = []
         command: list[str] = []
         if apply and (changed or force_apply):

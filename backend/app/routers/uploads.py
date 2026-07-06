@@ -1,6 +1,7 @@
 """User media uploads used as generation references."""
 from __future__ import annotations
 
+import asyncio
 import io
 import re
 import tempfile
@@ -179,7 +180,7 @@ async def _save_upload_stream(file: UploadFile, subdir: str, ext: str, *, limit:
                 total += len(chunk)
                 if total > limit:
                     raise HTTPException(413, f"视频不能超过 {limit // 1024 // 1024}MB")
-                f.write(chunk)
+                await asyncio.to_thread(f.write, chunk)
     except Exception:
         path.unlink(missing_ok=True)
         raise
@@ -187,7 +188,7 @@ async def _save_upload_stream(file: UploadFile, subdir: str, ext: str, *, limit:
         path.unlink(missing_ok=True)
         raise HTTPException(400, "请选择要上传的视频")
     if temporary:
-        key = storage.save_file(path, subdir, ext)
+        key = await asyncio.to_thread(storage.save_file, path, subdir, ext)
     return key, path, total, temporary
 
 
@@ -207,10 +208,15 @@ async def upload_image(
     if len(data) > limit:
         raise HTTPException(413, f"图片不能超过 {limit // 1024 // 1024}MB")
 
-    normalized_png, width, height = _normalize_image_upload(data)
+    normalized_png, width, height = await asyncio.to_thread(_normalize_image_upload, data)
     try:
-        preview_png, _, _ = make_image_preview(normalized_png, max_pixels=settings.max_upload_image_pixels)
-        model_ref_jpeg, _, _ = make_model_reference(
+        preview_png, _, _ = await asyncio.to_thread(
+            make_image_preview,
+            normalized_png,
+            max_pixels=settings.max_upload_image_pixels,
+        )
+        model_ref_jpeg, _, _ = await asyncio.to_thread(
+            make_model_reference,
             normalized_png,
             max_side=1024,
             max_pixels=settings.max_upload_image_pixels,
@@ -320,7 +326,8 @@ async def upload_video(
             limit=limit,
         )
         stem = Path(upload_key).stem
-        width, height, duration, poster = _inspect_video_and_poster(str(upload_path))
+        ensure_user_media_quota(db, user.id, bytes_written)
+        width, height, duration, poster = await asyncio.to_thread(_inspect_video_and_poster, str(upload_path))
         ensure_user_media_quota(db, user.id, bytes_written + (len(poster) if poster else 0))
         if poster:
             preview_key = storage.save_bytes_named(poster, "upload_video_preview", f"{stem}.jpg")

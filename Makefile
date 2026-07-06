@@ -72,6 +72,8 @@ docker-build-check: ## Build backend/frontend Docker images without starting ser
 		docker compose build api frontend
 
 release-check: compile lint alembic-check test test-frontend build-frontend compose-check docker-build-check audit ## Run local release gates against the same clean HEAD artifact as CI
+	@test -z "$$(git status --porcelain)" || \
+		(echo "release-check archives HEAD; commit or stash worktree changes first, or use release-check-worktree" >&2; exit 1)
 	tmp="$$(mktemp -d)" && \
 		git archive --format=tar.gz --output="$$tmp/ai-studio-source.tar.gz" HEAD && \
 		python3 scripts/check_release_artifact.py "$$tmp/ai-studio-source.tar.gz" && \

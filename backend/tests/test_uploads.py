@@ -2,6 +2,7 @@ import base64
 import io
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 from urllib.parse import urlparse
 
 from fastapi.testclient import TestClient
@@ -138,6 +139,31 @@ def test_upload_image_returns_reference_asset(client, make_user, auth):
     assert anon.get(urlparse(asset["thumb"]).path).status_code == 401
     assert client.get(urlparse(asset["thumb"]).path, headers=h).status_code == 200
     assert client.get(f"/api/uploads/{model_ref_key}", headers=h).status_code == 404
+
+
+def test_upload_image_runs_cpu_image_processing_off_event_loop(client, make_user, auth, monkeypatch):
+    make_user("13900000253", balance=1000)
+    h = auth("13900000253")
+    calls = []
+
+    async def fake_to_thread(func, *args, **kwargs):
+        calls.append(getattr(func, "__name__", str(func)))
+        return func(*args, **kwargs)
+
+    from app.routers import uploads
+
+    monkeypatch.setattr(uploads, "asyncio", SimpleNamespace(to_thread=fake_to_thread), raising=False)
+
+    r = client.post(
+        "/api/uploads/image",
+        files={"file": ("ref.png", _png_bytes(), "image/png")},
+        headers=h,
+    )
+
+    assert r.status_code == 200, r.text
+    assert "_normalize_image_upload" in calls
+    assert "make_image_preview" in calls
+    assert "make_model_reference" in calls
 
 
 def test_upload_image_sanitizes_long_original_filename(client, make_user, auth):
@@ -1209,6 +1235,29 @@ def test_upload_video_returns_reference_asset(client, make_user, auth, tmp_path)
         db.close()
 
 
+def test_upload_video_runs_probe_off_event_loop(client, make_user, auth, monkeypatch, tmp_path):
+    make_user("13900001909", balance=1000)
+    h = auth("13900001909")
+    calls = []
+
+    async def fake_to_thread(func, *args, **kwargs):
+        calls.append(getattr(func, "__name__", str(func)))
+        return func(*args, **kwargs)
+
+    from app.routers import uploads
+
+    monkeypatch.setattr(uploads, "asyncio", SimpleNamespace(to_thread=fake_to_thread), raising=False)
+
+    r = client.post(
+        "/api/uploads/video",
+        files={"file": ("ref.mp4", _mp4_bytes(tmp_path), "video/mp4")},
+        headers=h,
+    )
+
+    assert r.status_code == 200, r.text
+    assert "_inspect_video_and_poster" in calls
+
+
 def test_upload_video_rejects_when_ffprobe_missing(client, make_user, auth, monkeypatch, tmp_path):
     make_user("13900000115", balance=1000)
     h = auth("13900000115")
@@ -1295,6 +1344,36 @@ def test_upload_video_quota_preflight_rejects_before_video_probe(
         "/api/uploads/video",
         files={"file": ("ref.mp4", mp4, "video/mp4")},
         headers={**h, "Content-Length": str(len(mp4) + 2 * 1024 * 1024)},
+    )
+    after = {str(p) for p in Path(settings.storage_dir).rglob("*") if p.is_file()}
+
+    assert r.status_code == 413
+    assert "上传空间不足" in r.text
+    assert after == before
+    db = SessionLocal()
+    try:
+        assert db.query(UploadedAsset).filter(UploadedAsset.user_id == uid).count() == 0
+    finally:
+        db.close()
+
+
+def test_upload_video_missing_content_length_rejects_quota_before_video_probe(
+    client, make_user, auth, monkeypatch, tmp_path
+):
+    uid = make_user("13900001910", balance=1000)
+    h = auth("13900001910")
+    mp4 = _mp4_bytes(tmp_path)
+    monkeypatch.setattr("app.routers.uploads.settings.user_upload_storage_quota_bytes", max(1, len(mp4) - 1))
+
+    def fail_probe(_path):
+        raise AssertionError("video probe should not run after streamed quota rejection")
+
+    monkeypatch.setattr("app.routers.uploads._inspect_video_and_poster", fail_probe)
+    before = {str(p) for p in Path(settings.storage_dir).rglob("*") if p.is_file()}
+    r = client.post(
+        "/api/uploads/video",
+        files={"file": ("ref.mp4", mp4, "video/mp4")},
+        headers=h,
     )
     after = {str(p) for p in Path(settings.storage_dir).rglob("*") if p.is_file()}
 
