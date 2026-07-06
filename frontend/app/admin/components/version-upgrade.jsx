@@ -135,6 +135,7 @@ export function VersionUpgrade() {
         apply: true,
         confirm: "UPDATE",
         force_apply: reapplyCurrent,
+        expected_remote_head: freshStatus.remote_head,
       });
       setResult(data);
       if (!data.ok) {

@@ -5,12 +5,12 @@ import { useRouter } from "next/navigation";
 import { api, downloadBlob, loginPath } from "../../lib/api";
 import Nav from "../../components/Nav";
 import AssetMedia, {
-  assetPreviewLabel,
   assetPreviewSrc,
   assetUnavailableText,
   canDownloadAsset,
   isAssetTakenDown,
 } from "../../components/AssetMedia";
+import AssetPreviewDialog from "../../components/AssetPreviewDialog";
 import { STUDIO_VARIATION_DRAFT_KEY } from "../studio/constants";
 
 function srcOf(a) {
@@ -376,70 +376,42 @@ export default function HistoryPage() {
       </main>
 
       {lightbox && (
-        <div
-          className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 p-4 backdrop-blur-sm"
-          role="dialog"
-          aria-modal="true"
-          onClick={() => setLightbox(null)}
+        <AssetPreviewDialog
+          asset={lightbox}
+          onClose={() => setLightbox(null)}
+          onError={(e) => setMsg(e?.message || "预览加载失败")}
+          meta={lightbox.width ? ` · ${lightbox.width}×${lightbox.height}` : ""}
         >
-          <div
-            className="panel max-h-[92vh] w-full max-w-3xl overflow-auto p-3"
-            onClick={(e) => e.stopPropagation()}
-          >
-            {!srcOf(lightbox) ? (
-              <div className="flex min-h-64 items-center justify-center rounded-xl2 bg-black/30 px-6 text-sm text-fog">
-                {isAssetTakenDown(lightbox)
-                  ? "素材已下架，不能继续预览、解锁或下载。"
-                  : lightbox.unlocked
-                    ? "预览暂不可用，请稍后重试。"
-                    : "预览暂不可用，请先解锁后再下载。"}
-              </div>
-            ) : (
-              <AssetMedia
-                asset={lightbox}
-                interactive
-                controls
-                autoPlay
-                muted={false}
-                className="mx-auto max-h-[76vh] max-w-full rounded-xl2 object-contain"
-                fallbackClassName="flex min-h-64 items-center justify-center rounded-xl2 bg-black/30 px-6 text-sm text-fog"
-                onError={(e) => setMsg(e?.message || "预览加载失败")}
-              />
-            )}
-            <div className="mt-3 flex flex-col gap-2 text-sm sm:flex-row sm:items-center sm:justify-between">
-              <span className="min-w-0 text-fog">
-                {assetPreviewLabel(lightbox)}
-                {lightbox.width ? ` · ${lightbox.width}×${lightbox.height}` : ""}
-              </span>
-              <div className="flex flex-wrap gap-2 sm:justify-end">
-                {!isAssetTakenDown(lightbox) && !lightbox.unlocked && (
-                  <button
-                    onClick={() => unlock(lightbox)}
-                    disabled={busyAssetIds.has(lightbox.id)}
-                    className="btn-primary btn-sm"
-                  >
-                    {busyAssetIds.has(lightbox.id) ? "解锁中…" : "解锁"}
-                  </button>
-                )}
-                {!isAssetTakenDown(lightbox) && lightbox.unlocked && (
-                  <button
-                    onClick={() => download(lightbox)}
-                    disabled={busyAssetIds.has(lightbox.id) || !canDownloadAsset(lightbox)}
-                    className={canDownloadAsset(lightbox) ? "btn-primary btn-sm" : "btn-secondary btn-sm cursor-not-allowed opacity-70"}
-                  >
-                    下载
-                  </button>
-                )}
-                {!isAssetTakenDown(lightbox) && lightbox.type === "image" && (
-                  <button onClick={() => createVariation(lightbox)} className="btn-secondary btn-sm">
-                    生成变体
-                  </button>
-                )}
-                <button onClick={() => setLightbox(null)} className="btn-secondary btn-sm">关闭</button>
-              </div>
-            </div>
-          </div>
-        </div>
+          {({ asset, takenDown, canDownload }) => (
+            <>
+              {!takenDown && !asset.unlocked && (
+                <button
+                  type="button"
+                  onClick={() => unlock(asset)}
+                  disabled={busyAssetIds.has(asset.id)}
+                  className="btn-primary btn-sm"
+                >
+                  {busyAssetIds.has(asset.id) ? "解锁中…" : "解锁"}
+                </button>
+              )}
+              {!takenDown && asset.unlocked && (
+                <button
+                  type="button"
+                  onClick={() => download(asset)}
+                  disabled={busyAssetIds.has(asset.id) || !canDownload}
+                  className={canDownload ? "btn-primary btn-sm" : "btn-secondary btn-sm cursor-not-allowed opacity-70"}
+                >
+                  下载
+                </button>
+              )}
+              {!takenDown && asset.type === "image" && (
+                <button type="button" onClick={() => createVariation(asset)} className="btn-secondary btn-sm">
+                  生成变体
+                </button>
+              )}
+            </>
+          )}
+        </AssetPreviewDialog>
       )}
     </div>
   );

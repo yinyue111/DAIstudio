@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session
 from .config_store import get_bool_setting, get_setting
 
 _SPLIT_RE = re.compile(r"[\n,，、;；]+")
+_LATIN_WORD_RE = re.compile(r"[a-z0-9_]", re.IGNORECASE)
 
 
 def _terms(raw: str | None) -> list[str]:
@@ -30,6 +31,15 @@ def _flatten_text(value: Any) -> str:
         return str(value)
 
 
+def _term_matches(text: str, term: str) -> bool:
+    if not term:
+        return False
+    if not _LATIN_WORD_RE.search(term):
+        return term in text
+    pattern = rf"(?<![a-z0-9_]){re.escape(term)}(?![a-z0-9_])"
+    return re.search(pattern, text, flags=re.IGNORECASE) is not None
+
+
 def assert_text_allowed(db: Session, *values: Any) -> None:
     """Block configured banned terms when content safety is enabled.
 
@@ -44,5 +54,5 @@ def assert_text_allowed(db: Session, *values: Any) -> None:
         return
     text = "\n".join(_flatten_text(v) for v in values).lower()
     for term in terms:
-        if term and term in text:
+        if _term_matches(text, term):
             raise HTTPException(400, "内容安全拦截:提示词包含平台禁止内容")

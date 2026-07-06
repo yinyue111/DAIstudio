@@ -1075,6 +1075,48 @@ def test_content_safety_blocks_configured_prompt_terms(client, make_user, auth):
     )
 
 
+def test_content_safety_does_not_block_configured_word_inside_larger_latin_word(client, make_user, auth):
+    make_user("13900000252", balance=1000, admin=True)
+    h = auth("13900000252")
+    s = client.put(
+        "/api/admin/settings",
+        json={
+            "content_safety_enabled": True,
+            "content_safety_banned_terms": "sex",
+            "admin_password": "pass123456",
+        },
+        headers=h,
+    )
+    assert s.status_code == 200, s.text
+
+    allowed = client.post("/api/generate", json={
+        "category": "image",
+        "stage": "preview",
+        "prompt": {"final_text": "a travel poster for Sussex cliffs"},
+        "params": {"n": 1, "size": "256x256"},
+    }, headers=h)
+    assert allowed.status_code == 200, allowed.text
+
+    blocked = client.post("/api/generate", json={
+        "category": "image",
+        "stage": "preview",
+        "prompt": {"final_text": "a poster containing sex as a standalone banned token"},
+        "params": {"n": 1, "size": "256x256"},
+    }, headers=h)
+    assert blocked.status_code == 400
+    assert "内容安全拦截" in blocked.text
+
+    client.put(
+        "/api/admin/settings",
+        json={
+            "content_safety_enabled": False,
+            "content_safety_banned_terms": "",
+            "admin_password": "pass123456",
+        },
+        headers=h,
+    )
+
+
 def test_content_safety_disabled_by_default(client, make_user, auth):
     make_user("13900000197", balance=1000)
     h = auth("13900000197")

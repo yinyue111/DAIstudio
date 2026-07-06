@@ -2,13 +2,8 @@
 
 import { useEffect, useState } from "react";
 import { authenticatedObjectUrl } from "../../lib/api";
-import AssetMedia, {
-  assetPreviewLabel,
-  assetPreviewSrc,
-  assetUnavailableText,
-  canDownloadAsset,
-  isAssetTakenDown,
-} from "../../components/AssetMedia";
+import AssetMedia, { assetPreviewSrc, assetUnavailableText, canDownloadAsset, isAssetTakenDown } from "../../components/AssetMedia";
+import AssetPreviewDialog from "../../components/AssetPreviewDialog";
 import { assetDims, mediaAspectStyle, mediaThumbSrc } from "./helpers";
 
 export function srcOf(a) {
@@ -209,68 +204,37 @@ export function MasonryItem({ a, onOpen }) {
 }
 
 export function Lightbox({ a, onClose, onUnlock, onDownload, onVariation, unlocking = false }) {
-  const src = srcOf(a);
   const takenDown = isAssetTakenDown(a);
   const dims = assetDims(a);
   const canCreateVariation = a.type === "image" && Boolean(onVariation) && !takenDown;
-  useEffect(() => {
-    const onKeyDown = (event) => {
-      if (event.key === "Escape") onClose();
-    };
-    window.addEventListener("keydown", onKeyDown);
-    return () => window.removeEventListener("keydown", onKeyDown);
-  }, [onClose]);
   return (
-    <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 p-4 backdrop-blur-sm"
-      role="dialog"
-      aria-modal="true"
-      aria-label="素材预览"
-      onClick={onClose}
+    <AssetPreviewDialog
+      asset={a}
+      onClose={onClose}
+      meta={dims ? ` · ${dims.width}×${dims.height}` : ""}
     >
-      <div className="panel max-h-[92vh] w-full max-w-3xl overflow-auto p-3" onClick={(e) => e.stopPropagation()}>
-        {!src ? (
-          <div className="flex min-h-64 items-center justify-center rounded-xl2 bg-black/30 px-6 text-sm text-fog">
-            {takenDown ? "素材已下架，不能继续预览、解锁或下载。" : a.unlocked ? "预览暂不可用，请稍后重试。" : "预览暂不可用，请先解锁后再下载。"}
-          </div>
-        ) : (
-          <AssetMedia
-            asset={a}
-            interactive
-            controls
-            autoPlay
-            muted={false}
-            className="mx-auto max-h-[76vh] max-w-full rounded-xl2 object-contain"
-            fallbackClassName="flex min-h-64 items-center justify-center rounded-xl2 bg-black/30 px-6 text-sm text-fog"
-          />
-        )}
-        <div className="mt-3 flex flex-col gap-2 text-sm sm:flex-row sm:items-center sm:justify-between">
-          <span className="min-w-0 text-fog">
-            {assetPreviewLabel(a)}
-            {dims ? ` · ${dims.width}×${dims.height}` : ""}
-          </span>
-          <div className="flex flex-wrap gap-2 sm:justify-end">
-            {!takenDown && !a.unlocked && (
-              <button onClick={onUnlock} disabled={unlocking} className="btn-primary btn-sm">
+      {() => (
+        <>
+          {!takenDown && !a.unlocked && (
+            <button type="button" onClick={onUnlock} disabled={unlocking} className="btn-primary btn-sm">
                 {unlocking ? "解锁中…" : "解锁"}
-              </button>
-            )}
-            {!takenDown && a.unlocked && (
-              <button
-                onClick={onDownload}
-                disabled={unlocking || !canDownloadAsset(a)}
-                className={canDownloadAsset(a) ? "btn-primary btn-sm" : "btn-secondary btn-sm cursor-not-allowed opacity-70"}
-              >
+            </button>
+          )}
+          {!takenDown && a.unlocked && (
+            <button
+              type="button"
+              onClick={onDownload}
+              disabled={unlocking || !canDownloadAsset(a)}
+              className={canDownloadAsset(a) ? "btn-primary btn-sm" : "btn-secondary btn-sm cursor-not-allowed opacity-70"}
+            >
                 {unlocking ? "处理中…" : "下载"}
-              </button>
-            )}
-            {canCreateVariation && (
-              <button onClick={() => onVariation(a)} className="btn-secondary btn-sm">生成变体</button>
-            )}
-            <button onClick={onClose} className="btn-secondary btn-sm">关闭</button>
-          </div>
-        </div>
-      </div>
-    </div>
+            </button>
+          )}
+          {canCreateVariation && (
+            <button type="button" onClick={() => onVariation(a)} className="btn-secondary btn-sm">生成变体</button>
+          )}
+        </>
+      )}
+    </AssetPreviewDialog>
   );
 }

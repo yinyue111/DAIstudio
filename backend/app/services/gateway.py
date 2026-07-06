@@ -510,6 +510,15 @@ def _reject_compressed_download(response: httpx.Response) -> None:
         raise GatewayError("下载结果不支持压缩编码")
 
 
+def _content_length_exceeds_limit(content_length: str | None, max_bytes: int) -> bool:
+    if not content_length:
+        return False
+    try:
+        return int(content_length) > max_bytes
+    except (TypeError, ValueError):
+        raise GatewayError("下载结果 Content-Length 非法") from None
+
+
 def _retryable_image_error(exc: Exception) -> bool:
     if not isinstance(exc, GatewayError):
         return False
@@ -940,8 +949,7 @@ def _download(
                         content_type.startswith(prefix.lower()) for prefix in allowed_content_types
                     ):
                         raise GatewayError("下载结果类型不支持")
-                    content_length = r.headers.get("content-length")
-                    if content_length and int(content_length) > max_bytes:
+                    if _content_length_exceeds_limit(r.headers.get("content-length"), max_bytes):
                         raise GatewayError("下载结果超出大小上限")
                     buf = bytearray()
                     for chunk in r.iter_raw():
@@ -1016,8 +1024,7 @@ def download_to_path(
                         content_type.startswith(prefix.lower()) for prefix in allowed_content_types
                     ):
                         raise GatewayError("下载结果类型不支持")
-                    content_length = r.headers.get("content-length")
-                    if content_length and int(content_length) > max_bytes:
+                    if _content_length_exceeds_limit(r.headers.get("content-length"), max_bytes):
                         raise GatewayError("下载结果超出大小上限")
                     total = 0
                     with open(path, "wb") as f:

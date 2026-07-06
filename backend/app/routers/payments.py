@@ -108,7 +108,7 @@ def get_order(order_no: str, db: Session = Depends(get_db),
     order = payments.user_order(db, order_no, user.id)
     if not order:
         raise HTTPException(404, "订单不存在")
-    return payments.close_expired(order, db)
+    return payments.with_display_status(order)
 
 
 @router.post("/orders/{order_no}/mock-pay", response_model=PaymentOrderOut)

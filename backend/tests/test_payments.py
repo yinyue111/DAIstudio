@@ -777,7 +777,7 @@ def test_verified_provider_notify_can_credit_locally_closed_order(client, make_u
     assert client.get("/api/me", headers=h).json()["balance_credits"] == 200
 
 
-def test_list_orders_closes_expired_pending_order(client, make_user, auth):
+def test_list_orders_reports_expired_pending_order_without_writing_on_get(client, make_user, auth):
     _set_payment_enabled(True)
     make_user("13900000217", balance=100)
     h = auth("13900000217")
@@ -798,6 +798,41 @@ def test_list_orders_closes_expired_pending_order(client, make_user, auth):
     assert rows.status_code == 200, rows.text
     found = next(o for o in rows.json() if o["order_no"] == order["order_no"])
     assert found["status"] == payments.CLOSED
+
+    db = SessionLocal()
+    try:
+        persisted = db.query(PaymentOrder).filter(PaymentOrder.order_no == order["order_no"]).one()
+        assert persisted.status == payments.PENDING
+    finally:
+        db.close()
+
+
+def test_get_order_reports_expired_pending_order_without_writing_on_get(client, make_user, auth):
+    _set_payment_enabled(True)
+    make_user("13900000251", balance=100)
+    h = auth("13900000251")
+    order = client.post("/api/payments/orders", json={
+        "provider": "wechat",
+        "package_id": "starter",
+    }, headers=h).json()
+    db = SessionLocal()
+    try:
+        row = db.query(PaymentOrder).filter(PaymentOrder.order_no == order["order_no"]).one()
+        row.expires_at = datetime.now(timezone.utc) - timedelta(minutes=1)
+        db.commit()
+    finally:
+        db.close()
+
+    detail = client.get(f"/api/payments/orders/{order['order_no']}", headers=h)
+
+    assert detail.status_code == 200, detail.text
+    assert detail.json()["status"] == payments.CLOSED
+    db = SessionLocal()
+    try:
+        persisted = db.query(PaymentOrder).filter(PaymentOrder.order_no == order["order_no"]).one()
+        assert persisted.status == payments.PENDING
+    finally:
+        db.close()
 
 
 def test_admin_can_customize_payment_package(client, make_user, auth):

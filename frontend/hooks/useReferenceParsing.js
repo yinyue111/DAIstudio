@@ -183,8 +183,7 @@ export default function useReferenceParsing({
       ...(current.negativeTouched ? {} : { negative: "" }),
     }), mode);
     setWorkspacePatch({ parsing: true }, mode);
-      setRefOpen(true);
-    let clientRequestId = null;
+    setRefOpen(true);
     try {
       const first = await api.parse(targetUrl);
       const result = await waitForParseResult(first, refVersion, mode, targetUrl);
@@ -220,6 +219,7 @@ export default function useReferenceParsing({
     const target = selected;
     const targetSignature = assetSignature(target);
     const reqId = bumpReverseRequest(mode);
+    let clientRequestId = null;
     const isCurrent = () => (
       isRequestCurrent(reverseRequestRef, mode, reqId)
       && assetSignature(selectedByModeRef.current[mode]) === targetSignature

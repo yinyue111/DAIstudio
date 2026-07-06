@@ -28,7 +28,11 @@ def online_update_run(
     if body.apply and body.confirm != "UPDATE":
         raise HTTPException(400, "执行在线升级需要确认码 UPDATE")
     try:
-        result = online_update.run_update(apply=body.apply, force_apply=body.force_apply)
+        result = online_update.run_update(
+            apply=body.apply,
+            force_apply=body.force_apply,
+            expected_remote_head=body.expected_remote_head,
+        )
     except online_update.OnlineUpdateError as e:
         audit.log(
             db,

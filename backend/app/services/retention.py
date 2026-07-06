@@ -155,16 +155,18 @@ def purge_parsed_previews(db: Session, cutoff: datetime, limit: int = 1000) -> i
         ).scalars()
     )
     removed = 0
+    unlink_after_commit: list[str] = []
     for row in rows:
-        if _delete_uploaded_asset_row(db, row.key):
+        if _delete_uploaded_asset_row(db, row.key, unlink_after_commit):
             removed += 1
         if row.key.startswith("preview/"):
             model_ref_png_key = row.key.replace("preview/", "model_ref/", 1)
             for model_ref_key in (model_ref_png_key.rsplit(".", 1)[0] + ".jpg", model_ref_png_key):
-                if _delete_uploaded_asset_row(db, model_ref_key):
+                if _delete_uploaded_asset_row(db, model_ref_key, unlink_after_commit):
                     removed += 1
     if removed:
         db.commit()
+        unlink_keys(unlink_after_commit)
     return removed
 
 
@@ -237,14 +239,11 @@ def _upload_group_is_referenced(upload_key: str, referenced_urls: set[str]) -> b
     return any(storage.upload_api_url(key) in referenced_urls for key in _upload_related_keys(upload_key))
 
 
-def _delete_uploaded_asset_row(db: Session, key: str) -> bool:
+def _delete_uploaded_asset_row(db: Session, key: str, unlink_after_commit: list[str]) -> bool:
     row = db.get(UploadedAsset, key)
     if not row:
         return False
-    try:
-        storage.local_path(row.key).unlink(missing_ok=True)
-    except Exception:  # noqa: BLE001
-        log.warning("failed to delete upload %s", row.key)
+    unlink_after_commit.append(row.key)
     db.delete(row)
     return True
 
@@ -269,23 +268,25 @@ def purge_uploaded_assets(db: Session, cutoff: datetime, limit: int = 1000) -> i
         ).scalars()
     )
     removed = 0
+    unlink_after_commit: list[str] = []
     referenced_urls = _referenced_upload_urls(db, cutoff)
     for row in rows:
         if _upload_group_is_referenced(row.key, referenced_urls):
             continue
-        if _delete_uploaded_asset_row(db, row.key):
+        if _delete_uploaded_asset_row(db, row.key, unlink_after_commit):
             removed += 1
         preview_key = _upload_preview_key(row.key)
-        if preview_key and _delete_uploaded_asset_row(db, preview_key):
+        if preview_key and _delete_uploaded_asset_row(db, preview_key, unlink_after_commit):
             removed += 1
         for model_ref_key in _upload_model_ref_keys(row.key):
-            if _delete_uploaded_asset_row(db, model_ref_key):
+            if _delete_uploaded_asset_row(db, model_ref_key, unlink_after_commit):
                 removed += 1
         video_preview_key = _upload_video_preview_key(row.key)
-        if video_preview_key and _delete_uploaded_asset_row(db, video_preview_key):
+        if video_preview_key and _delete_uploaded_asset_row(db, video_preview_key, unlink_after_commit):
             removed += 1
     if removed:
         db.commit()
+        unlink_keys(unlink_after_commit)
     return removed
 
 

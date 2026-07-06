@@ -56,6 +56,19 @@ def _configure(
     monkeypatch.setattr(settings, "online_update_timeout_seconds", 20)
     monkeypatch.setattr(settings, "online_update_allow_dirty", False)
     monkeypatch.setattr(settings, "online_update_allow_local_remote", allow_local_remote)
+    monkeypatch.setattr(settings, "online_update_require_signed_commits", False)
+
+
+def _head(repo: Path) -> str:
+    return _git(repo, "rev-parse", "HEAD")
+
+
+def _run_body(remote_head: str | None = None, **overrides):
+    body = {"apply": True, "confirm": "UPDATE"}
+    if remote_head:
+        body["expected_remote_head"] = remote_head
+    body.update(overrides)
+    return body
 
 
 def test_admin_online_update_disabled_rejects_run(client, make_user, auth, monkeypatch, git_repos):
@@ -70,7 +83,7 @@ def test_admin_online_update_disabled_rejects_run(client, make_user, auth, monke
     assert status.status_code == 200, status.text
     assert status.json()["enabled"] is False
 
-    run = client.post("/api/admin/update/run", json={"apply": True, "confirm": "UPDATE"}, headers=h)
+    run = client.post("/api/admin/update/run", json=_run_body(), headers=h)
     assert run.status_code == 400, run.text
     assert "在线更新未启用" in run.text
 
@@ -88,7 +101,7 @@ def test_admin_online_update_refuses_dirty_worktree(client, make_user, auth, mon
     assert status.status_code == 200, status.text
     assert status.json()["dirty"] is True
 
-    run = client.post("/api/admin/update/run", json={"apply": True, "confirm": "UPDATE"}, headers=h)
+    run = client.post("/api/admin/update/run", json=_run_body(), headers=h)
     assert run.status_code == 400, run.text
     assert "未提交改动" in run.text
 
@@ -105,7 +118,7 @@ def test_admin_online_update_requires_explicit_confirmation(client, make_user, a
 
 
 def test_admin_online_update_preview_does_not_merge_without_confirmation(client, make_user, auth, monkeypatch, git_repos):
-    before = _git(git_repos["work"], "rev-parse", "HEAD")
+    before = _head(git_repos["work"])
     (git_repos["source"] / "README.md").write_text("v2\n", encoding="utf-8")
     _git(git_repos["source"], "add", "README.md")
     _git(git_repos["source"], "commit", "-m", "update")
@@ -141,7 +154,7 @@ def test_admin_online_update_fast_forwards_and_runs_configured_apply_command(
     _git(git_repos["work"], "commit", "-m", "local apply script")
     _git(git_repos["work"], "push", "origin", "main")
     _git(git_repos["source"], "pull", "--ff-only")
-    before = _git(git_repos["work"], "rev-parse", "HEAD")
+    before = _head(git_repos["work"])
     (git_repos["source"] / "README.md").write_text("v2\n", encoding="utf-8")
     _git(git_repos["source"], "add", "README.md")
     _git(git_repos["source"], "commit", "-m", "update")
@@ -155,7 +168,8 @@ def test_admin_online_update_fast_forwards_and_runs_configured_apply_command(
     make_user("15700002003", admin=True)
     h = auth("15700002003")
 
-    run = client.post("/api/admin/update/run", json={"apply": True, "confirm": "UPDATE"}, headers=h)
+    remote_head = _head(git_repos["source"])
+    run = client.post("/api/admin/update/run", json=_run_body(remote_head), headers=h)
     assert run.status_code == 200, run.text
     data = run.json()
     assert data["changed"] is True
@@ -176,7 +190,7 @@ def test_admin_online_update_noops_when_already_current(client, make_user, auth,
     make_user("15700002004", admin=True)
     h = auth("15700002004")
 
-    run = client.post("/api/admin/update/run", json={"apply": True, "confirm": "UPDATE"}, headers=h)
+    run = client.post("/api/admin/update/run", json=_run_body(_head(git_repos["work"])), headers=h)
     assert run.status_code == 200, run.text
     data = run.json()
     assert data["changed"] is False
@@ -207,7 +221,7 @@ def test_admin_online_update_can_reapply_current_head(client, make_user, auth, m
 
     run = client.post(
         "/api/admin/update/run",
-        json={"apply": True, "confirm": "UPDATE", "force_apply": True},
+        json=_run_body(_head(git_repos["work"]), force_apply=True),
         headers=h,
     )
 
@@ -234,7 +248,7 @@ def test_admin_online_update_rolls_back_when_apply_fails(
     _git(git_repos["work"], "commit", "-m", "local failing apply script")
     _git(git_repos["work"], "push", "origin", "main")
     _git(git_repos["source"], "pull", "--ff-only")
-    before = _git(git_repos["work"], "rev-parse", "HEAD")
+    before = _head(git_repos["work"])
     (git_repos["source"] / "README.md").write_text("v2\n", encoding="utf-8")
     _git(git_repos["source"], "add", "README.md")
     _git(git_repos["source"], "commit", "-m", "remote code update")
@@ -248,7 +262,8 @@ def test_admin_online_update_rolls_back_when_apply_fails(
     make_user("15700002006", admin=True)
     h = auth("15700002006")
 
-    run = client.post("/api/admin/update/run", json={"apply": True, "confirm": "UPDATE"}, headers=h)
+    remote_head = _head(git_repos["source"])
+    run = client.post("/api/admin/update/run", json=_run_body(remote_head), headers=h)
 
     assert run.status_code == 200, run.text
     data = run.json()
@@ -280,7 +295,7 @@ def test_admin_online_update_rescans_apply_script_after_merge(
     _git(git_repos["work"], "commit", "-m", "safe apply script")
     _git(git_repos["work"], "push", "origin", "main")
     _git(git_repos["source"], "pull", "--ff-only")
-    before = _git(git_repos["work"], "rev-parse", "HEAD")
+    before = _head(git_repos["work"])
 
     apply_script_source = git_repos["source"] / "apply_safe.py"
     apply_script_source.write_text(
@@ -300,7 +315,8 @@ def test_admin_online_update_rescans_apply_script_after_merge(
     make_user("15700002026", admin=True)
     h = auth("15700002026")
 
-    run = client.post("/api/admin/update/run", json={"apply": True, "confirm": "UPDATE"}, headers=h)
+    remote_head = _head(git_repos["source"])
+    run = client.post("/api/admin/update/run", json=_run_body(remote_head), headers=h)
 
     assert run.status_code == 200, run.text
     data = run.json()
@@ -319,7 +335,7 @@ def test_admin_online_update_rescans_apply_script_after_merge(
 def test_admin_online_update_refuses_changed_apply_without_command(
     client, make_user, auth, monkeypatch, git_repos
 ):
-    before = _git(git_repos["work"], "rev-parse", "HEAD")
+    before = _head(git_repos["work"])
     (git_repos["source"] / "README.md").write_text("v2\n", encoding="utf-8")
     _git(git_repos["source"], "add", "README.md")
     _git(git_repos["source"], "commit", "-m", "remote code update")
@@ -329,12 +345,92 @@ def test_admin_online_update_refuses_changed_apply_without_command(
     make_user("15700002016", admin=True)
     h = auth("15700002016")
 
-    run = client.post("/api/admin/update/run", json={"apply": True, "confirm": "UPDATE"}, headers=h)
+    remote_head = _head(git_repos["source"])
+    run = client.post("/api/admin/update/run", json=_run_body(remote_head), headers=h)
 
     assert run.status_code == 400, run.text
     assert "未配置 ONLINE_UPDATE_APPLY_COMMAND" in run.text
     assert _git(git_repos["work"], "rev-parse", "HEAD") == before
     assert (git_repos["work"] / "README.md").read_text(encoding="utf-8") == "v1\n"
+
+
+def test_admin_online_update_requires_expected_remote_head_for_changed_apply(
+    client, make_user, auth, monkeypatch, git_repos
+):
+    before = _head(git_repos["work"])
+    (git_repos["source"] / "README.md").write_text("v2\n", encoding="utf-8")
+    _git(git_repos["source"], "add", "README.md")
+    _git(git_repos["source"], "commit", "-m", "remote code update")
+    _git(git_repos["source"], "push", "origin", "main")
+
+    _configure(
+        monkeypatch,
+        git_repos["work"],
+        apply_command=f"{shlex.quote(sys.executable)} -V",
+    )
+    make_user("15700002027", admin=True)
+    h = auth("15700002027")
+
+    run = client.post("/api/admin/update/run", json=_run_body(), headers=h)
+
+    assert run.status_code == 400, run.text
+    assert "expected_remote_head" in run.text
+    assert _head(git_repos["work"]) == before
+
+
+def test_admin_online_update_rejects_remote_head_changed_after_confirmation(
+    client, make_user, auth, monkeypatch, git_repos
+):
+    before = _head(git_repos["work"])
+    (git_repos["source"] / "README.md").write_text("v2\n", encoding="utf-8")
+    _git(git_repos["source"], "add", "README.md")
+    _git(git_repos["source"], "commit", "-m", "first remote code update")
+    _git(git_repos["source"], "push", "origin", "main")
+    expected = _head(git_repos["source"])
+    (git_repos["source"] / "README.md").write_text("v3\n", encoding="utf-8")
+    _git(git_repos["source"], "add", "README.md")
+    _git(git_repos["source"], "commit", "-m", "second remote code update")
+    _git(git_repos["source"], "push", "origin", "main")
+
+    _configure(
+        monkeypatch,
+        git_repos["work"],
+        apply_command=f"{shlex.quote(sys.executable)} -V",
+    )
+    make_user("15700002028", admin=True)
+    h = auth("15700002028")
+
+    run = client.post("/api/admin/update/run", json=_run_body(expected), headers=h)
+
+    assert run.status_code == 400, run.text
+    assert "远端版本在确认后发生变化" in run.text
+    assert _head(git_repos["work"]) == before
+
+
+def test_admin_online_update_rejects_unsigned_commit_when_required(
+    client, make_user, auth, monkeypatch, git_repos
+):
+    before = _head(git_repos["work"])
+    (git_repos["source"] / "README.md").write_text("v2\n", encoding="utf-8")
+    _git(git_repos["source"], "add", "README.md")
+    _git(git_repos["source"], "commit", "-m", "unsigned remote code update")
+    _git(git_repos["source"], "push", "origin", "main")
+    remote_head = _head(git_repos["source"])
+
+    _configure(
+        monkeypatch,
+        git_repos["work"],
+        apply_command=f"{shlex.quote(sys.executable)} -V",
+    )
+    monkeypatch.setattr(settings, "online_update_require_signed_commits", True)
+    make_user("15700002029", admin=True)
+    h = auth("15700002029")
+
+    run = client.post("/api/admin/update/run", json=_run_body(remote_head), headers=h)
+
+    assert run.status_code == 400, run.text
+    assert "签名校验" in run.text
+    assert _head(git_repos["work"]) == before
 
 
 def test_admin_online_update_status_returns_config_error(client, make_user, auth, monkeypatch, tmp_path):
@@ -433,6 +529,36 @@ def test_online_update_rejects_plain_git_remote():
     with pytest.raises(online_update.OnlineUpdateError, match="只允许安全的 Git URL"):
         online_update._validate_remote_url(
             "git://github.com/yinyue111/DAIstudio.git",
+            label="Git remote origin",
+        )
+
+
+def test_online_update_rejects_private_https_remote():
+    from app.services import online_update
+
+    with pytest.raises(online_update.OnlineUpdateError, match="主机不安全"):
+        online_update._validate_remote_url(
+            "https://127.0.0.1:8443/repo.git",
+            label="Git remote origin",
+        )
+    with pytest.raises(online_update.OnlineUpdateError, match="主机不安全"):
+        online_update._validate_remote_url(
+            "https://169.254.169.254/latest/meta-data/repo.git",
+            label="Git remote origin",
+        )
+
+
+def test_online_update_rejects_private_ssh_and_scp_remote():
+    from app.services import online_update
+
+    with pytest.raises(online_update.OnlineUpdateError, match="主机不安全"):
+        online_update._validate_remote_url(
+            "ssh://git@10.0.0.1/yinyue111/DAIstudio.git",
+            label="Git remote origin",
+        )
+    with pytest.raises(online_update.OnlineUpdateError, match="主机不安全"):
+        online_update._validate_remote_url(
+            "git@169.254.169.254:yinyue111/DAIstudio.git",
             label="Git remote origin",
         )
 

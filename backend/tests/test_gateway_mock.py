@@ -389,6 +389,39 @@ def test_download_rejects_compressed_result_and_uses_identity_header(monkeypatch
     assert seen["headers"]["Accept-Encoding"] == "identity"
 
 
+def test_download_rejects_invalid_content_length(monkeypatch):
+    class FakeStream:
+        is_redirect = False
+        status_code = 200
+        headers = {"content-type": "image/png", "content-length": "not-a-number"}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def iter_raw(self):
+            yield b"png"
+
+    @gateway.contextmanager
+    def fake_guarded_stream(_client, _method, _url, **_kwargs):
+        yield FakeStream()
+
+    monkeypatch.setattr(gateway, "_guarded_stream", fake_guarded_stream)
+
+    try:
+        gateway._download(
+            "https://cdn.example.com/a.png",
+            max_bytes=1024,
+            allowed_content_types=("image/",),
+        )
+    except gateway.GatewayError as e:
+        assert "Content-Length 非法" in str(e)
+    else:
+        raise AssertionError("invalid Content-Length should be normalized")
+
+
 def test_redact_url_for_log_strips_userinfo_query_and_fragment():
     redacted = redact_url_for_log("https://user:pass@example.com:8443/a.png?sig=secret#token")
 
