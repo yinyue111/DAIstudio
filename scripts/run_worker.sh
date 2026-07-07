@@ -1,37 +1,45 @@
 #!/usr/bin/env bash
-# Celery worker (generation tasks). Defaults to a real process pool so image
-# tasks do not queue behind one another. Set WORKER_POOL=solo locally only when
-# debugging a macOS fork-safety issue.
+# Celery worker (generation tasks). Defaults to non-forking pools for local and
+# bare-metal runs because macOS forked workers can crash in native DB/SSL/image
+# libraries after the app has already imported them. Image keeps concurrency via
+# the threads pool.
 set -e
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT/backend"
 source .venv/bin/activate
 export OBJC_DISABLE_INITIALIZE_FORK_SAFETY=YES
 ROLE="${WORKER_ROLE:-all}"
+DEFAULT_POOL="threads"
 case "$ROLE" in
   critical)
     DEFAULT_QUEUES="default,payment,video_poll,cleanup"
     DEFAULT_CONCURRENCY=2
+    DEFAULT_POOL="solo"
     ;;
   image)
     DEFAULT_QUEUES="image"
     DEFAULT_CONCURRENCY=4
+    DEFAULT_POOL="threads"
     ;;
   video)
     DEFAULT_QUEUES="video_submit,video_download"
     DEFAULT_CONCURRENCY=1
+    DEFAULT_POOL="solo"
     ;;
   video-submit)
     DEFAULT_QUEUES="video_submit"
     DEFAULT_CONCURRENCY=1
+    DEFAULT_POOL="solo"
     ;;
   video-download)
     DEFAULT_QUEUES="video_download"
     DEFAULT_CONCURRENCY=1
+    DEFAULT_POOL="solo"
     ;;
   parse)
     DEFAULT_QUEUES="parse"
     DEFAULT_CONCURRENCY=1
+    DEFAULT_POOL="solo"
     ;;
   all)
     DEFAULT_QUEUES="default,image,video_submit,video_poll,video_download,parse,cleanup,payment"
@@ -43,7 +51,7 @@ case "$ROLE" in
     ;;
 esac
 QUEUES="${WORKER_QUEUES:-$DEFAULT_QUEUES}"
-POOL="${WORKER_POOL:-prefork}"
+POOL="${WORKER_POOL:-$DEFAULT_POOL}"
 CONCURRENCY="${WORKER_CONCURRENCY:-$DEFAULT_CONCURRENCY}"
 NODE_NAME="${WORKER_NAME:-${ROLE}@%h}"
 CMD=(celery -A app.celery_app.celery_app worker -l info -n "$NODE_NAME" --pool="$POOL" --concurrency="$CONCURRENCY" -Q "$QUEUES")

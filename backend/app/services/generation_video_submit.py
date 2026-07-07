@@ -424,29 +424,36 @@ def start_video_task(
                     )
                     return
                 raise
-            usage.record_call(
-                db,
-                kind="video_submit",
-                model_id=model.model_id,
-                user_id=task.user_id,
-                task_id=task.id,
-                status="ok",
-                latency_ms=int((time.time() - submit_t0) * 1000),
-                detail={
-                    "stage": task.stage,
-                    "external_task_id": ext_id,
-                    "resolution": params.get("resolution"),
-                    "target_resolution": params.get("target_resolution"),
-                    "duration": params.get("duration"),
-                    "target_duration": params.get("target_duration"),
-                    "ratio": params.get("ratio"),
-                },
-            )
             task.params = video_persisted_params(task, original_params, params)
             task.external_task_id = ext_id
             task.external_submitted_at = datetime.now(timezone.utc)
             task.phase = "polling"
             db.commit()
+            # The external task id is the recovery point. Persist it before any
+            # best-effort accounting/progress side effects so a worker crash
+            # after upstream acceptance can be resumed instead of stranded in
+            # submitting.
+            try:
+                usage.record_call(
+                    db,
+                    kind="video_submit",
+                    model_id=model.model_id,
+                    user_id=task.user_id,
+                    task_id=task.id,
+                    status="ok",
+                    latency_ms=int((time.time() - submit_t0) * 1000),
+                    detail={
+                        "stage": task.stage,
+                        "external_task_id": ext_id,
+                        "resolution": params.get("resolution"),
+                        "target_resolution": params.get("target_resolution"),
+                        "duration": params.get("duration"),
+                        "target_duration": params.get("target_duration"),
+                        "ratio": params.get("ratio"),
+                    },
+                )
+            except Exception:  # noqa: BLE001
+                log.exception("video submit usage record failed for task %s", task_id)
             set_progress(task_id, 30, "running")
             submitted = True
     except TaskCanceled as e:

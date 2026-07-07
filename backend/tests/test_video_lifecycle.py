@@ -252,6 +252,58 @@ def test_video_unknown_submit_recovers_by_request_id(
         db.close()
 
 
+def test_video_submit_persists_external_id_before_usage_side_effects(
+    client,
+    make_user,
+    auth,
+    monkeypatch,
+):
+    uid = make_user("13900000992", balance=1000, admin=True)
+    h = auth("13900000992")
+    _config_video(client, h)
+    db = SessionLocal()
+    try:
+        task = GenTask(
+            user_id=uid,
+            category="video",
+            stage="preview",
+            status="queued",
+            cost_frozen=5,
+            prompt={"final_text": "persist recovery point first"},
+            params={"duration": 2},
+        )
+        db.add(task)
+        db.flush()
+        credits.freeze(db, uid, 5, biz_ref=task.id, commit=False)
+        db.commit()
+        tid = task.id
+    finally:
+        db.close()
+
+    def fail_usage(*_args, **_kwargs):
+        raise RuntimeError("usage side effect failed")
+
+    queued_polls = []
+    monkeypatch.setattr(generation_video_submit.usage, "record_call", fail_usage)
+
+    generation_video_submit.start_video_task(
+        tid,
+        submit_video_fn=lambda *_args, **_kwargs: "ext-committed-before-usage",
+        try_enqueue_poll_fn=lambda task_id: queued_polls.append(task_id),
+    )
+
+    db = SessionLocal()
+    try:
+        row = db.get(GenTask, tid)
+        assert row.status == "running"
+        assert row.phase == "polling"
+        assert row.external_task_id == "ext-committed-before-usage"
+        assert row.external_submitted_at is not None
+        assert queued_polls == [tid]
+    finally:
+        db.close()
+
+
 def test_video_unknown_submit_request_id_miss_holds_for_review(
     client,
     make_user,
@@ -1340,8 +1392,8 @@ def test_reaper_skips_pending_video_download_without_alive_key(client, make_user
             status="running",
             phase="downloading",
             external_task_id="ext-pending-download",
-            external_submitted_at=datetime.now(timezone.utc) - timedelta(hours=2),
-            created_at=datetime.now(timezone.utc) - timedelta(hours=2),
+            external_submitted_at=datetime.now(timezone.utc) - timedelta(minutes=10),
+            created_at=datetime.now(timezone.utc) - timedelta(minutes=10),
             cost_frozen=5,
             params={"duration": 2, "_video_result_url": "https://cdn.example.com/pending.mp4"},
         )
@@ -1430,6 +1482,49 @@ def test_reaper_holds_video_submitting_with_request_id_for_review(client, make_u
         assert held.cost_settled == 0
         assert "视频提交状态未知" in (held.error or "")
         user = db.get(User, uid)
+        assert user.balance_credits == balance_after_freeze
+        assert user.frozen_credits == frozen_after_freeze
+    finally:
+        db.close()
+
+
+def test_reaper_holds_video_submitting_after_submit_timeout_before_generic_window(
+    client,
+    make_user,
+    auth,
+    monkeypatch,
+):
+    uid = make_user("13900000971", balance=1000, admin=True)
+    h = auth("13900000971")
+    _config_video(client, h)
+    monkeypatch.setattr(retention.settings, "video_submit_timeout_seconds", 1)
+    db = SessionLocal()
+    try:
+        t = GenTask(
+            user_id=uid,
+            category="video",
+            stage="preview",
+            status="running",
+            phase="submitting",
+            created_at=datetime.now(timezone.utc) - timedelta(minutes=6),
+            cost_frozen=5,
+            params={"duration": 2, "_video_request_id": "video-local-timeout"},
+        )
+        db.add(t)
+        db.flush()
+        credits.freeze(db, uid, 5, biz_ref=t.id, commit=False)
+        db.commit()
+        tid = t.id
+        user = db.get(User, uid)
+        balance_after_freeze = user.balance_credits
+        frozen_after_freeze = user.frozen_credits
+
+        assert retention.reap_stuck_tasks(db, max_minutes=60) == 1
+        held = db.get(GenTask, tid)
+        user = db.get(User, uid)
+        assert held.status == "needs_review"
+        assert held.phase == "reconciling"
+        assert "视频提交状态未知" in (held.error or "")
         assert user.balance_credits == balance_after_freeze
         assert user.frozen_credits == frozen_after_freeze
     finally:

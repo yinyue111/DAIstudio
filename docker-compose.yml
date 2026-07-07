@@ -98,7 +98,7 @@ services:
     # Critical short-lived queues only. Keep payment reconciliation, cleanup,
     # default jobs, and video polling responsive even when parse/video/image
     # workloads are saturated.
-    command: celery -A app.celery_app.celery_app worker -l info --concurrency=${WORKER_CRITICAL_CONCURRENCY:-2} -Q ${WORKER_CRITICAL_QUEUES:-default,payment,video_poll,cleanup}
+    command: celery -A app.celery_app.celery_app worker -l info --pool=${WORKER_CRITICAL_POOL:-threads} --concurrency=${WORKER_CRITICAL_CONCURRENCY:-2} -Q ${WORKER_CRITICAL_QUEUES:-default,payment,video_poll,cleanup}
     env_file:
       - path: ./backend/.env
         required: false
@@ -121,7 +121,7 @@ services:
     build: ./backend
     restart: unless-stopped
     stop_grace_period: ${WORKER_STOP_GRACE_PERIOD:-15m}
-    command: celery -A app.celery_app.celery_app worker -l info --concurrency=${WORKER_IMAGE_CONCURRENCY:-4} -Q ${WORKER_IMAGE_QUEUES:-image}
+    command: celery -A app.celery_app.celery_app worker -l info --pool=${WORKER_IMAGE_POOL:-threads} --concurrency=${WORKER_IMAGE_CONCURRENCY:-4} -Q ${WORKER_IMAGE_QUEUES:-image}
     env_file:
       - path: ./backend/.env
         required: false
@@ -144,7 +144,7 @@ services:
     build: ./backend
     restart: unless-stopped
     stop_grace_period: ${WORKER_STOP_GRACE_PERIOD:-15m}
-    command: celery -A app.celery_app.celery_app worker -l info --concurrency=${WORKER_VIDEO_SUBMIT_CONCURRENCY:-1} -Q ${WORKER_VIDEO_SUBMIT_QUEUES:-video_submit}
+    command: celery -A app.celery_app.celery_app worker -l info --pool=${WORKER_VIDEO_SUBMIT_POOL:-solo} --concurrency=${WORKER_VIDEO_SUBMIT_CONCURRENCY:-1} -Q ${WORKER_VIDEO_SUBMIT_QUEUES:-video_submit}
     env_file:
       - path: ./backend/.env
         required: false
@@ -167,7 +167,7 @@ services:
     build: ./backend
     restart: unless-stopped
     stop_grace_period: ${WORKER_STOP_GRACE_PERIOD:-15m}
-    command: celery -A app.celery_app.celery_app worker -l info --concurrency=${WORKER_VIDEO_DOWNLOAD_CONCURRENCY:-1} -Q ${WORKER_VIDEO_DOWNLOAD_QUEUES:-video_download}
+    command: celery -A app.celery_app.celery_app worker -l info --pool=${WORKER_VIDEO_DOWNLOAD_POOL:-solo} --concurrency=${WORKER_VIDEO_DOWNLOAD_CONCURRENCY:-1} -Q ${WORKER_VIDEO_DOWNLOAD_QUEUES:-video_download}
     env_file:
       - path: ./backend/.env
         required: false
@@ -190,7 +190,7 @@ services:
     build: ./backend
     restart: unless-stopped
     stop_grace_period: ${WORKER_STOP_GRACE_PERIOD:-15m}
-    command: celery -A app.celery_app.celery_app worker -l info --concurrency=${WORKER_PARSE_CONCURRENCY:-1} -Q ${WORKER_PARSE_QUEUES:-parse}
+    command: celery -A app.celery_app.celery_app worker -l info --pool=${WORKER_PARSE_POOL:-solo} --concurrency=${WORKER_PARSE_CONCURRENCY:-1} -Q ${WORKER_PARSE_QUEUES:-parse}
     env_file:
       - path: ./backend/.env
         required: false

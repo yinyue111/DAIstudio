@@ -5,9 +5,9 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cmd="$("$ROOT/scripts/run_worker.sh" --print-command)"
 
 case "$cmd" in
-  *"--pool=prefork"*"--concurrency=4"*) ;;
+  *"--pool=threads"*"--concurrency=4"*) ;;
   *)
-    echo "expected default worker command to use prefork concurrency=4, got: $cmd" >&2
+    echo "expected default worker command to use threads concurrency=4, got: $cmd" >&2
     exit 1
     ;;
 esac
@@ -25,36 +25,36 @@ echo "worker parallelism script test passed"
 
 critical_cmd="$(WORKER_ROLE=critical "$ROOT/scripts/run_worker.sh" --print-command)"
 case "$critical_cmd" in
-  *"--concurrency=2"*"default\\,payment\\,video_poll\\,cleanup"*) ;;
+  *"--pool=solo"*"--concurrency=2"*"default\\,payment\\,video_poll\\,cleanup"*) ;;
   *)
-    echo "expected critical worker role to isolate short queues, got: $critical_cmd" >&2
+    echo "expected critical worker role to use solo pool and isolate short queues, got: $critical_cmd" >&2
     exit 1
     ;;
 esac
 
 parse_cmd="$(WORKER_ROLE=parse "$ROOT/scripts/run_worker.sh" --print-command)"
 case "$parse_cmd" in
-  *"--concurrency=1"*" -Q parse"*) ;;
+  *"--pool=solo"*"--concurrency=1"*" -Q parse"*) ;;
   *)
-    echo "expected parse worker role to isolate parse queue, got: $parse_cmd" >&2
+    echo "expected parse worker role to use solo pool and isolate parse queue, got: $parse_cmd" >&2
     exit 1
     ;;
 esac
 
 video_submit_cmd="$(WORKER_ROLE=video-submit "$ROOT/scripts/run_worker.sh" --print-command)"
 case "$video_submit_cmd" in
-  *"--concurrency=1"*" -Q video_submit"*) ;;
+  *"--pool=solo"*"--concurrency=1"*" -Q video_submit"*) ;;
   *)
-    echo "expected video-submit worker role to isolate video_submit queue, got: $video_submit_cmd" >&2
+    echo "expected video-submit worker role to use solo pool and isolate video_submit queue, got: $video_submit_cmd" >&2
     exit 1
     ;;
 esac
 
 video_download_cmd="$(WORKER_ROLE=video-download "$ROOT/scripts/run_worker.sh" --print-command)"
 case "$video_download_cmd" in
-  *"--concurrency=1"*" -Q video_download"*) ;;
+  *"--pool=solo"*"--concurrency=1"*" -Q video_download"*) ;;
   *)
-    echo "expected video-download worker role to isolate video_download queue, got: $video_download_cmd" >&2
+    echo "expected video-download worker role to use solo pool and isolate video_download queue, got: $video_download_cmd" >&2
     exit 1
     ;;
 esac
@@ -71,13 +71,38 @@ if ! grep -q 'WORKER_CRITICAL_QUEUES:-default,payment,video_poll,cleanup' "$ROOT
   exit 1
 fi
 
+if ! grep -q 'WORKER_CRITICAL_POOL:-threads' "$ROOT/docker-compose.yml"; then
+  echo "docker-compose critical worker should default to threads pool" >&2
+  exit 1
+fi
+
+if ! grep -q 'WORKER_IMAGE_POOL:-threads' "$ROOT/docker-compose.yml"; then
+  echo "docker-compose image worker should default to threads pool" >&2
+  exit 1
+fi
+
 if ! grep -q 'WORKER_VIDEO_SUBMIT_QUEUES:-video_submit' "$ROOT/docker-compose.yml"; then
   echo "docker-compose should isolate video_submit queue" >&2
   exit 1
 fi
 
+if ! grep -q 'WORKER_VIDEO_SUBMIT_POOL:-solo' "$ROOT/docker-compose.yml"; then
+  echo "docker-compose video-submit worker should default to solo pool" >&2
+  exit 1
+fi
+
 if ! grep -q 'WORKER_VIDEO_DOWNLOAD_QUEUES:-video_download' "$ROOT/docker-compose.yml"; then
   echo "docker-compose should isolate video_download queue" >&2
+  exit 1
+fi
+
+if ! grep -q 'WORKER_VIDEO_DOWNLOAD_POOL:-solo' "$ROOT/docker-compose.yml"; then
+  echo "docker-compose video-download worker should default to solo pool" >&2
+  exit 1
+fi
+
+if ! grep -q 'WORKER_PARSE_POOL:-solo' "$ROOT/docker-compose.yml"; then
+  echo "docker-compose parse worker should default to solo pool" >&2
   exit 1
 fi
 

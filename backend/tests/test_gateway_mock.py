@@ -298,6 +298,49 @@ def test_download_to_path_rejects_missing_content_type_when_required(monkeypatch
     assert not out.exists()
 
 
+def test_download_to_path_rejects_low_speed_stream(monkeypatch, tmp_path):
+    now = {"value": 1000.0}
+
+    class FakeStream:
+        is_redirect = False
+        status_code = 200
+        headers = {"content-type": "video/mp4"}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def iter_raw(self):
+            now["value"] += 61.0
+            yield b"x" * 1024
+
+    @gateway.contextmanager
+    def fake_guarded_stream(_client, _method, _url, **_kwargs):
+        yield FakeStream()
+
+    monkeypatch.setattr(gateway.time, "monotonic", lambda: now["value"])
+    monkeypatch.setattr(gateway, "_guarded_stream", fake_guarded_stream)
+    out = Path(tmp_path) / "slow.mp4"
+
+    try:
+        gateway.download_to_path(
+            "https://cdn.example.com/rendered.mp4",
+            out,
+            timeout_seconds=300,
+            allowed_content_types=("video/",),
+            low_speed_timeout_seconds=60,
+            low_speed_min_bytes_per_second=16 * 1024,
+        )
+    except gateway.GatewayError as e:
+        assert "速度过慢" in str(e)
+    else:
+        raise AssertionError("slow result downloads must be interrupted")
+
+    assert not out.exists()
+
+
 def test_download_uses_remaining_deadline_for_each_redirect(monkeypatch):
     monkeypatch.setattr(settings, "mock_mode", False)
 

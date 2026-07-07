@@ -383,6 +383,8 @@ def finalize_video_success(db, task: GenTask, model, result: dict) -> None:
                 timeout_seconds=int(settings.video_download_timeout_seconds),
                 allowed_content_types=("video/", "application/octet-stream", "binary/octet-stream"),
                 progress_callback=mark_download_progress,
+                low_speed_timeout_seconds=int(settings.video_download_low_speed_timeout_seconds),
+                low_speed_min_bytes_per_second=int(settings.video_download_low_speed_bytes_per_second),
             )
             mark_download_progress()
             written_keys.append(media_key)

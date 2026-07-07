@@ -64,6 +64,11 @@ def _video_download_reap_window() -> timedelta:
     return timedelta(seconds=seconds + 300)
 
 
+def _video_submit_reap_window() -> timedelta:
+    seconds = int(settings.video_submit_timeout_seconds or 0)
+    return timedelta(seconds=max(300, seconds + 120))
+
+
 def _image_inside_reap_window(task: GenTask, now: datetime) -> bool:
     anchor = _aware(task.created_at)
     return bool(anchor and now - anchor < _image_reap_window())
@@ -344,7 +349,7 @@ def reap_stuck_tasks(db: Session, max_minutes: int = 60) -> int:
     """Fail tasks stuck in queued/running past max_minutes (worker crash etc.)
     and refund their frozen credits. Run frequently (e.g. every 10 min)."""
     now = datetime.now(timezone.utc)
-    cutoff = now - timedelta(minutes=max_minutes)
+    generic_window = timedelta(minutes=max_minutes)
     rows = list(
         db.execute(
             select(
@@ -358,16 +363,15 @@ def reap_stuck_tasks(db: Session, max_minutes: int = 60) -> int:
                 GenTask.cost_frozen,
                 GenTask.cost_settled,
                 GenTask.params,
-            ).where(
-                GenTask.status.in_(("queued", "running")),
-                GenTask.created_at < cutoff,
-            )
+            ).where(GenTask.status.in_(("queued", "running")))
         ).mappings()
     )
     reaped = 0
     video_window = timedelta(seconds=int(settings.video_poll_max_seconds))
     for row in rows:
         task_id = int(row["id"])
+        created_at = _aware(row["created_at"])
+        age = now - created_at if created_at else None
         error_message = "任务超时,已自动失败并退回额度"
         hold_for_review = False
         review_message = ""
@@ -379,6 +383,8 @@ def reap_stuck_tasks(db: Session, max_minutes: int = 60) -> int:
         if row["category"] == "video":
             params = row["params"] or {}
             if row["phase"] == "submitting" and not row["external_task_id"]:
+                if age is not None and age < _video_submit_reap_window():
+                    continue
                 request_id = params.get("_video_request_id") or params.get("request_id")
                 if request_id:
                     res = db.execute(
@@ -445,10 +451,14 @@ def reap_stuck_tasks(db: Session, max_minutes: int = 60) -> int:
                         f"external_task_id={row['external_task_id'] or 'unknown'}"
                     )
                     review_params = {**params, "_video_poll_state_unknown": True}
+                elif age is not None and age < generic_window:
+                    continue
         elif row["category"] == "image":
             created_at = _aware(row["created_at"])
             if not created_at or now - created_at < _image_reap_window():
                 continue
+        elif age is not None and age < generic_window:
+            continue
         if hold_for_review:
             values = {
                 "status": generation.NEEDS_REVIEW,

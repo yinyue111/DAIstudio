@@ -80,6 +80,8 @@ class GatewaySettings(BaseModel):
     video_download_max_attempts: int
     video_download_timeout_seconds: int
     video_download_max_bytes: int
+    video_download_low_speed_timeout_seconds: int
+    video_download_low_speed_bytes_per_second: int
 
     @property
     def effective_mock_mode(self) -> bool:
@@ -228,12 +230,17 @@ class Settings(BaseSettings):
     # render — tune down, or run a dedicated video worker, under high load).
     video_poll_max_seconds: int = 7200
     video_poll_interval_seconds: int = 5
-    video_download_max_attempts: int = 2
+    video_download_max_attempts: int = 3
     # Provider-rendered videos can be large and remote object storage may be
     # slow after generation completes. Keep the media download timeout wider
     # than image downloads while preserving content-type and size checks.
-    video_download_timeout_seconds: int = 300
+    video_download_timeout_seconds: int = 600
     video_download_max_bytes: int = 2 * 1024 * 1024 * 1024
+    # Object-storage result URLs can occasionally stay connected while sending
+    # only a few KB/s. Bound that separately from the total timeout so videos do
+    # not sit at 92% for many minutes when the download path is unhealthy.
+    video_download_low_speed_timeout_seconds: int = 300
+    video_download_low_speed_bytes_per_second: int = 1 * 1024
 
     # Hard ceiling for a single Celery task. Must exceed image render waits and
     # video lifecycle backstops so the worker does not kill valid long renders.
@@ -493,6 +500,8 @@ class Settings(BaseSettings):
             video_download_max_attempts=self.video_download_max_attempts,
             video_download_timeout_seconds=self.video_download_timeout_seconds,
             video_download_max_bytes=self.video_download_max_bytes,
+            video_download_low_speed_timeout_seconds=self.video_download_low_speed_timeout_seconds,
+            video_download_low_speed_bytes_per_second=self.video_download_low_speed_bytes_per_second,
         )
 
     @property

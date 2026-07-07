@@ -893,7 +893,7 @@ def _download_httpx_timeout(remaining: float) -> httpx.Timeout:
     should not occupy a worker for that whole window.
     """
     remaining = max(0.1, float(remaining))
-    read_timeout = max(5.0, min(60.0, remaining))
+    read_timeout = max(5.0, min(120.0, remaining))
     connect_timeout = max(2.0, min(30.0, remaining))
     return httpx.Timeout(
         remaining,
@@ -904,12 +904,30 @@ def _download_httpx_timeout(remaining: float) -> httpx.Timeout:
     )
 
 
+def _check_low_speed_download(
+    *,
+    started_at: float,
+    total: int,
+    low_speed_timeout_seconds: int | None,
+    low_speed_min_bytes_per_second: int | None,
+) -> None:
+    if not low_speed_timeout_seconds or not low_speed_min_bytes_per_second or total <= 0:
+        return
+    elapsed = time.monotonic() - started_at
+    if elapsed < float(low_speed_timeout_seconds):
+        return
+    if total / max(elapsed, 0.001) < float(low_speed_min_bytes_per_second):
+        raise GatewayError("下载结果速度过慢")
+
+
 def _download(
     url: str,
     *,
     max_bytes: int = _MAX_DOWNLOAD_BYTES,
     allowed_content_types: tuple[str, ...] | None = None,
     timeout_seconds: int | None = None,
+    low_speed_timeout_seconds: int | None = None,
+    low_speed_min_bytes_per_second: int | None = None,
 ) -> bytes:
     """Download a gateway-returned result URL with the SSRF guard applied.
 
@@ -952,12 +970,19 @@ def _download(
                     if _content_length_exceeds_limit(r.headers.get("content-length"), max_bytes):
                         raise GatewayError("下载结果超出大小上限")
                     buf = bytearray()
+                    body_started_at = time.monotonic()
                     for chunk in r.iter_raw():
                         if time.monotonic() > deadline:
                             raise GatewayError("下载结果超时")
                         buf += chunk
                         if len(buf) > max_bytes:
                             raise GatewayError("下载结果超出大小上限")
+                        _check_low_speed_download(
+                            started_at=body_started_at,
+                            total=len(buf),
+                            low_speed_timeout_seconds=low_speed_timeout_seconds,
+                            low_speed_min_bytes_per_second=low_speed_min_bytes_per_second,
+                        )
                     return bytes(buf)
         raise GatewayError("下载结果重定向次数过多")
     except SsrfError as e:
@@ -974,12 +999,16 @@ def download_bytes_limited(
     max_bytes: int,
     allowed_content_types: tuple[str, ...] | None = None,
     timeout_seconds: int | None = None,
+    low_speed_timeout_seconds: int | None = None,
+    low_speed_min_bytes_per_second: int | None = None,
 ) -> bytes:
     return _download(
         url,
         max_bytes=max_bytes,
         allowed_content_types=allowed_content_types,
         timeout_seconds=timeout_seconds,
+        low_speed_timeout_seconds=low_speed_timeout_seconds,
+        low_speed_min_bytes_per_second=low_speed_min_bytes_per_second,
     )
 
 
@@ -991,6 +1020,8 @@ def download_to_path(
     timeout_seconds: int | None = None,
     allowed_content_types: tuple[str, ...] | None = None,
     progress_callback=None,
+    low_speed_timeout_seconds: int | None = None,
+    low_speed_min_bytes_per_second: int | None = None,
 ) -> int:
     """Download a gateway result directly to disk with SSRF/redirect checks."""
     try:
@@ -1027,6 +1058,7 @@ def download_to_path(
                     if _content_length_exceeds_limit(r.headers.get("content-length"), max_bytes):
                         raise GatewayError("下载结果超出大小上限")
                     total = 0
+                    body_started_at = time.monotonic()
                     with open(path, "wb") as f:
                         for chunk in r.iter_raw():
                             if time.monotonic() > deadline:
@@ -1037,6 +1069,12 @@ def download_to_path(
                             if total > max_bytes:
                                 raise GatewayError("下载结果超出大小上限")
                             f.write(chunk)
+                            _check_low_speed_download(
+                                started_at=body_started_at,
+                                total=total,
+                                low_speed_timeout_seconds=low_speed_timeout_seconds,
+                                low_speed_min_bytes_per_second=low_speed_min_bytes_per_second,
+                            )
                             if progress_callback:
                                 progress_callback()
                     return total
@@ -1060,6 +1098,8 @@ def download_to_storage(
     timeout_seconds: int | None = None,
     allowed_content_types: tuple[str, ...] | None = None,
     progress_callback=None,
+    low_speed_timeout_seconds: int | None = None,
+    low_speed_min_bytes_per_second: int | None = None,
 ) -> str:
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=f".{ext.lstrip('.')}")
     path = Path(tmp.name)
@@ -1072,6 +1112,8 @@ def download_to_storage(
             timeout_seconds=timeout_seconds,
             allowed_content_types=allowed_content_types,
             progress_callback=progress_callback,
+            low_speed_timeout_seconds=low_speed_timeout_seconds,
+            low_speed_min_bytes_per_second=low_speed_min_bytes_per_second,
         )
         return storage.save_file(path, subdir, ext)
     finally:
