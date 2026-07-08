@@ -466,6 +466,12 @@ def _apply_command() -> list[str]:
         raise OnlineUpdateError(f"ONLINE_UPDATE_APPLY_COMMAND 解析失败: {e}") from e
     if not parts:
         return []
+    executable = os.path.basename(parts[0])
+    if executable in {"make", "gmake"}:
+        raise OnlineUpdateError(
+            "生效命令不能直接调用 make/gmake,请配置固定脚本路径或外部 supervisor 命令。"
+            "Makefile 目标可能间接执行 docker compose 重启 API,导致升级命令中断。"
+        )
     if parts[0] in {"sh", "bash", "zsh"} or parts[0].endswith(("/sh", "/bash", "/zsh")):
         raise OnlineUpdateError("生效命令不能直接调用 shell,请配置固定脚本路径或安全命令")
     if any(part in {"-c", "-m"} for part in parts[1:]):

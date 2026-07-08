@@ -182,8 +182,18 @@ assert.match(
 );
 assert.match(
   generationControlsSource,
-  /高保真锁定/,
-  "video product generation controls should expose a high-fidelity lock option",
+  /文字保真/,
+  "video product generation controls should expose a text-fidelity lock option",
+);
+assert.match(
+  workspaceStateSource,
+  /videoProductLockMode:\s*"locked"/,
+  "video product generation should default to text-fidelity lock mode",
+);
+assert.match(
+  pageSource,
+  /videoProductLockMode:\s*current\.videoProductLockMode \|\| "locked"/,
+  "restored workspaces without a lock mode should use text-fidelity lock mode",
 );
 assert.doesNotMatch(
   pageSource,

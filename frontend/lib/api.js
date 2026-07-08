@@ -58,6 +58,22 @@ export function clearToken() {
   window.localStorage.removeItem("token");
 }
 
+let unauthorizedHandler = null;
+
+export function setUnauthorizedHandler(handler) {
+  unauthorizedHandler = typeof handler === "function" ? handler : null;
+}
+
+function handleUnauthorized() {
+  try {
+    unauthorizedHandler?.();
+  } catch (e) {
+    console.warn("[auth unauthorized handler]", e);
+  }
+  clearToken();
+  redirectToLogin();
+}
+
 function redirectToLogin() {
   if (typeof window !== "undefined") window.location.href = loginPath();
 }
@@ -134,8 +150,7 @@ export async function downloadBlob(path, filename, options = {}) {
     DOWNLOAD_TIMEOUT_MS,
   );
   if (res.status === 401) {
-    clearToken();
-    redirectToLogin();
+    handleUnauthorized();
     throw new Error("登录已过期，请重新登录");
   }
   if (!res.ok) throw new Error(errorTextToMessage(errorText, res.status, "下载失败"));
@@ -174,8 +189,7 @@ export async function authenticatedObjectUrl(pathOrUrl) {
     DOWNLOAD_TIMEOUT_MS,
   );
   if (res.status === 401) {
-    clearToken();
-    redirectToLogin();
+    handleUnauthorized();
     throw new Error("登录已过期，请重新登录");
   }
   if (!res.ok) throw new Error(errorTextToMessage(errorText, res.status, "预览加载失败"));
@@ -193,8 +207,7 @@ export async function assetDownloadObjectUrl(assetId) {
     DOWNLOAD_TIMEOUT_MS,
   );
   if (res.status === 401) {
-    clearToken();
-    redirectToLogin();
+    handleUnauthorized();
     throw new Error("登录已过期，请重新登录");
   }
   if (!res.ok) throw new Error(errorTextToMessage(errorText, res.status, "高清预览加载失败"));
@@ -282,9 +295,10 @@ async function request(
     timeoutMs,
   );
   if (res.status === 401 && auth) {
-    clearToken();
     if (redirectOn401 && typeof window !== "undefined" && !path.startsWith("/api/auth")) {
-      redirectToLogin();
+      handleUnauthorized();
+    } else {
+      clearToken();
     }
     throw new ApiError("登录已过期，请重新登录", { status: 401 });
   }
@@ -325,8 +339,7 @@ async function upload(path, formData, { auth = true } = {}) {
     UPLOAD_TIMEOUT_MS,
   );
   if (res.status === 401 && auth) {
-    clearToken();
-    redirectToLogin();
+    handleUnauthorized();
     throw new ApiError("登录已过期，请重新登录", { status: 401 });
   }
   let data = null;
@@ -360,6 +373,10 @@ export const api = {
   login: (phone, password) =>
     request("/api/auth/login", { method: "POST", body: { phone, password }, auth: false }),
   me: (options = {}) => request("/api/me", options),
+  getDraft: (key) => request(`/api/me/drafts/${encodeURIComponent(key)}`),
+  saveDraft: (key, payload) =>
+    request(`/api/me/drafts/${encodeURIComponent(key)}`, { method: "PUT", body: { payload } }),
+  deleteDraft: (key) => request(`/api/me/drafts/${encodeURIComponent(key)}`, { method: "DELETE" }),
   config: () => request("/api/config"),
   profile: () => request("/api/profile"),
   profileAssets: ({
@@ -435,6 +452,14 @@ export const api = {
   generate: (payload) =>
     request("/api/generate", { method: "POST", body: payload, timeoutMs: GENERATE_TIMEOUT_MS }),
   task: (id) => request(`/api/tasks/${id}`),
+  taskEta: ({ duration = 5, resolution = "720p", stage = "preview" } = {}) => {
+    const qs = new URLSearchParams({
+      duration: String(duration),
+      resolution,
+      stage,
+    });
+    return request(`/api/tasks/eta/video?${qs.toString()}`);
+  },
   taskWsTicket: (id) => request(`/api/tasks/${id}/ws-ticket`, { method: "POST" }),
   eventWsTicket: () => request("/api/events/ws-ticket", { method: "POST" }),
   tasks: (limit = 30, offset = 0) => request(`/api/tasks?limit=${limit}&offset=${offset}`),
@@ -491,6 +516,8 @@ export const api = {
   adminSaveModel: (body) => request("/api/admin/models", { method: "PUT", body }),
   adminProbeModels: (body) => request("/api/admin/models/probe", { method: "POST", body }),
   adminReport: (qs = "") => request(`/api/admin/usage/report${qs}`),
+  adminUsageDashboard: (qs = "") => request(`/api/admin/usage/dashboard${qs}`),
+  adminModelCosts: (qs = "") => request(`/api/admin/usage/model-costs${qs}`),
   adminReportCsvUrl: (qs = "") => `${API_BASE}/api/admin/usage/report${qs}`,
   adminAudit: (qs = "") => request(`/api/admin/audit${qs}`),
   adminReviewTasks: (limit = 50, offset = 0) =>

@@ -10,8 +10,13 @@ PRODUCT_FIDELITY_GUARD = (
     "材质、比例、标签版式、表面纹理和所有可见文字必须完整保留；包装上的品牌名、Logo、中文、"
     "英文、韩文、数字、装饰图案、标签位置和排版必须逐字逐形保持原图，不得翻译、改写、补写、"
     "删减、重排、风格化、模糊或替换。只允许改变背景、台面、道具、光线、构图、阴影和广告质感；"
+    "图片生成时产品必须作为完整主体清晰入镜，包装正面、顶部、底部、左右边缘、抽口、盖子、提手、"
+    "外盒轮廓和所有关键结构都必须可见且连续；画面四周保留安全边距，不得裁切产品、生成半截产品、"
+    "缺失边角、压扁盒体、破坏开口结构，或让草叶、水花、道具、前景虚化遮挡包装和文字；"
     "视频生成时必须用上传产品替换参考片中的原主体、原商品、原品牌或人物，参考片只提供镜头语言、"
-    "展示节奏、可迁移动作、场景和广告质感；如风格迁移与产品保真冲突，优先保证产品和包装文字不变。"
+    "展示节奏、可迁移动作、场景和广告质感；视频镜头需让产品文字面尽量正对镜头，完整包装、Logo"
+    "和主要文字应始终留在画面内，避免快速旋转、侧面展示、裁切包装、强运动模糊、遮挡包装文字或"
+    "产品正面离焦；如风格迁移与产品保真冲突，优先保证产品和包装文字不变。"
 )
 PORTRAIT_FIDELITY_GUARD = (
     "人像高保真硬约束：上传人像照片是唯一人物身份来源，必须完整保留同一个人的脸型、五官比例、"
@@ -38,6 +43,12 @@ _STYLE_TRANSFER_KEEP_KEYS = (
     "氛围情绪", "后期质感", "平台质感", "转场", "时长建议",
 )
 _STYLE_TRANSFER_MOTION_KEYS = {"可迁移主体动作", "主体动作", "产品展示方式"}
+_REFERENCE_PRODUCT_NOUN_RE = re.compile(
+    r"KaHi|Estee\s+Lauder|Advanced\s+Night\s+Repair|Eau\s+de\s+Toilette|"
+    r"skincare\s+bottle|dropper\s+bottle|bottle|香水瓶|香水|瓶身|瓶盖|滴管瓶|护肤瓶|"
+    r"参考商品|参考产品|原商品|原产品",
+    re.IGNORECASE,
+)
 _USER_INSTRUCTION_KEYS = ("user_instruction", "补充要求", "编辑要求", "生成要求")
 _SUBJECT_PROFILE_KEYS = (
     "产品身份档案",
@@ -58,9 +69,66 @@ _GENERATION_PROMPT_SENSITIVE_PATTERNS = (
     (re.compile(r"低机位仰拍|低机位展示"), "平视或自然时尚摄影视角"),
     (re.compile(r"暧昧灯光|私密暧昧|昏暗暧昧"), "柔和明亮的情绪光线"),
     (re.compile(r"画面百分比坐标|百分比坐标"), "画面位置"),
-    (re.compile(r"\d{1,3}(?:\.\d+)?\s*[%％]"), ""),
+    (re.compile(r"\d{1,3}(?:\.\d+)?\s*[%％]\s*(?:-|–|~|至|到)\s*\d{1,3}(?:\.\d+)?\s*[%％]"), "适中占比"),
+    (re.compile(r"\d{1,3}(?:\.\d+)?\s*(?:-|–|~|至|到)\s*\d{1,3}(?:\.\d+)?\s*[%％]"), "适中占比"),
+    (re.compile(r"\d{1,3}(?:\.\d+)?\s*[%％]"), "适中占比"),
     (re.compile(r"#[0-9A-Fa-f]{6}"), ""),
     (re.compile(r"\s+"), " "),
+)
+
+PRODUCT_VIDEO_TEXT_NEGATIVE_TERMS = (
+    "包装文字乱码",
+    "Logo扭曲",
+    "伪文字",
+    "错字",
+    "品牌名变化",
+    "包装文字被改写",
+    "文字被翻译",
+    "标签不可读",
+    "产品正面离焦",
+    "运动模糊遮挡文字",
+    "快速旋转导致文字不可读",
+    "侧面展示导致文字不可读",
+    "裁切包装或Logo",
+    "产品主体出画",
+)
+PRODUCT_IMAGE_NEGATIVE_TERMS = (
+    "产品残缺",
+    "半截产品",
+    "产品被裁切",
+    "产品主体出画",
+    "只显示产品局部",
+    "包装边缘缺失",
+    "顶部缺失",
+    "底部缺失",
+    "左右边缘缺失",
+    "抽口缺失",
+    "盖子缺失",
+    "提手缺失",
+    "盒体破损",
+    "盒体压扁",
+    "包装结构改变",
+    "产品变形",
+    "产品比例失真",
+    "产品被草叶遮挡",
+    "产品被前景遮挡",
+    "道具遮挡Logo",
+    "道具遮挡包装文字",
+    "Logo丢失",
+    "Logo扭曲",
+    "包装文字乱码",
+    "包装文字被改写",
+    "标签不可读",
+)
+_LOCKED_PRODUCT_VIDEO_USER_REWRITES = (
+    (
+        re.compile(r"(?:产品|主体|包装)?(?:缓慢|轻微|慢速)?(?:旋转展示|旋转|转动|环绕|绕拍|侧面展示|翻转)"),
+        "保持产品正面文字面朝向镜头的稳定展示",
+    ),
+    (
+        re.compile(r"(?:水花|液体|泡沫|烟雾)?(?:飞溅|泼溅|喷溅|遮挡)"),
+        "背景水花或光影点缀且不遮挡包装、Logo和文字",
+    ),
 )
 
 
@@ -110,14 +178,27 @@ def _normalise_prompt_fragment(value) -> str:
     return re.sub(r"\s+", " ", text).strip(" ,，;；。")
 
 
-def _rewrite_transfer_motion(value, *, product: bool = False, portrait: bool = False) -> str:
+def _rewrite_transfer_motion(
+    value,
+    *,
+    product: bool = False,
+    portrait: bool = False,
+    product_lock_mode: str = "locked",
+) -> str:
     text = _normalise_prompt_fragment(value)
     if not text:
         return ""
     if product:
+        if product_lock_mode != "free":
+            return (
+                "上传产品作为唯一视频主体，替换参考片中的原主体/原商品/人物；"
+                "复用参考片的展示节奏、入镜顺序、稳定特写、慢速推拉和卖点展示等可迁移动作；"
+                "文字保真模式下保持完整包装、Logo和主要文字始终在画面内，避免裁切主体、"
+                "侧面展示或快速旋转；不要生成参考片里的原商品、原品牌、人物或服装。"
+            )
         return (
             "上传产品作为唯一视频主体，替换参考片中的原主体/原商品/人物；"
-            "复用参考片的展示节奏、入镜顺序、角度切换、旋转、推进、环绕、特写和卖点展示等可迁移动作；"
+            "复用参考片的展示节奏、入镜顺序、角度切换、慢速推拉、稳定特写和卖点展示等可迁移动作；"
             "不要生成参考片里的原商品、原品牌、人物或服装。"
         )
     if portrait:
@@ -127,6 +208,49 @@ def _rewrite_transfer_motion(value, *, product: bool = False, portrait: bool = F
             "不要生成参考片里的原人物、人脸身份、商品品牌或文字水印。"
         )
     return text
+
+
+def _rewrite_locked_product_user_instruction(value) -> str:
+    text = _normalise_prompt_fragment(value)
+    if not text:
+        return ""
+    for pattern, replacement in _LOCKED_PRODUCT_VIDEO_USER_REWRITES:
+        text = pattern.sub(replacement, text)
+    return (
+        "用户补充要求必须服从文字保真模式：保持产品正面、完整包装、Logo和主要文字始终在画面内；"
+        f"{text}"
+    )
+
+
+def _rewrite_product_style_fragment(key: str, value, *, is_video: bool = False) -> str:
+    text = _normalise_prompt_fragment(value)
+    if not text:
+        return ""
+    if key == "广告目标":
+        return (
+            "展示上传产品作为唯一商品主角，迁移参考素材的生活方式场景、消费联想、光线、色调、"
+            "质感和广告氛围；不保留参考商品名称、品类、品牌、SKU或卖点。"
+        )
+    if key == "景别":
+        return (
+            "上传产品中近景/近景，完整产品主体入镜，主体占画幅约55%-75%，"
+            "包装、Logo和主要文字清晰可读。"
+        )
+    if key in {"构图", "视角构图"}:
+        cleaned = _REFERENCE_PRODUCT_NOUN_RE.sub("上传产品", text)
+        return (
+            "上传产品为画面唯一视觉中心，完整入镜，四周保留安全边距，包装正面、顶部、底部、"
+            "左右边缘、抽口/盖子/提手和外盒轮廓都可见；主体占画幅约55%-75%。"
+            f"参考构图只迁移背景留白、视线引导、景深和光影平衡：{cleaned}"
+        )
+    if key == "场景背景":
+        cleaned = re.sub(r"前景[^；。]*覆盖[^；。]*[；。]?", "前景元素只围绕产品底部和边缘，", text)
+        cleaned = _REFERENCE_PRODUCT_NOUN_RE.sub("上传产品", cleaned)
+        return f"{cleaned} 前景草叶、水花、道具和虚化元素不得遮挡上传产品包装、Logo和主要文字。"
+    cleaned = _REFERENCE_PRODUCT_NOUN_RE.sub("上传产品", text)
+    if key in {"主体动作", "可迁移主体动作", "产品展示方式"} and not is_video:
+        return "上传产品保持静态完整展示，只迁移参考素材的商业展示氛围和视觉节奏。"
+    return cleaned
 
 
 def _structured_generation_prompt(prompt_obj: dict, fallback: str) -> str:
@@ -156,6 +280,8 @@ def _style_transfer_generation_prompt(
     *,
     product: bool = False,
     portrait: bool = False,
+    is_video: bool = False,
+    product_lock_mode: str = "locked",
 ) -> str:
     """Keep only transferable visual style fields for product/person edits.
 
@@ -172,13 +298,28 @@ def _style_transfer_generation_prompt(
                 parts.append(f"{key}: {fragment}")
     for key in _STYLE_TRANSFER_KEEP_KEYS:
         if key in _STYLE_TRANSFER_MOTION_KEYS and (product or portrait):
-            fragment = _rewrite_transfer_motion(prompt_obj.get(key), product=product, portrait=portrait)
+            fragment = _rewrite_transfer_motion(
+                prompt_obj.get(key),
+                product=product,
+                portrait=portrait,
+                product_lock_mode=product_lock_mode,
+            )
+        elif product and is_video and product_lock_mode != "free" and key == "镜头运动":
+            fragment = (
+                "固定正面或轻微推拉镜头，稳定展示上传产品，保持完整包装、Logo和主要文字始终在画面内，"
+                "避免环绕、旋转、侧面展示、强运动模糊或裁切主体。"
+            )
+        elif product:
+            fragment = _rewrite_product_style_fragment(key, prompt_obj.get(key), is_video=is_video)
         else:
             fragment = _normalise_prompt_fragment(prompt_obj.get(key))
         if fragment:
             parts.append(f"{key}: {fragment}")
     for key in _USER_INSTRUCTION_KEYS:
-        fragment = _normalise_prompt_fragment(prompt_obj.get(key))
+        if product and is_video and product_lock_mode != "free":
+            fragment = _rewrite_locked_product_user_instruction(prompt_obj.get(key))
+        else:
+            fragment = _normalise_prompt_fragment(prompt_obj.get(key))
         if fragment:
             parts.append(f"用户补充要求: {fragment}")
     base = "；".join(parts)
@@ -240,7 +381,15 @@ def compact_generation_prompt_text(
         for key in ("duration", "target_duration", "resolution", "target_resolution", "product_lock_mode")
     )
     if product or portrait:
-        source = _style_transfer_generation_prompt(prompt_obj, fallback, product=product, portrait=portrait)
+        product_lock_mode = str((params or {}).get("product_lock_mode") or "locked").lower()
+        source = _style_transfer_generation_prompt(
+            prompt_obj,
+            fallback,
+            product=product,
+            portrait=portrait,
+            is_video=is_video,
+            product_lock_mode=product_lock_mode,
+        )
     else:
         source = _structured_generation_prompt(prompt_obj, fallback)
     if not source:
@@ -275,8 +424,54 @@ def compact_generation_prompt_text(
             "私密成人化或成人化表达。"
         )
     elif product:
-        prefix += "产品生成需保持同一商品、Logo、包装结构、品牌色、文字和材质细节稳定。"
+        product_lock_mode = str((params or {}).get("product_lock_mode") or "locked").lower()
+        if is_video and product_lock_mode != "free":
+            prefix += (
+                "产品生成需保持同一商品、Logo、包装结构、品牌色、文字和材质细节稳定；"
+                "文字保真模式下采用固定正面、慢速轻推/轻拉、稳定特写或克制转场，"
+                "保持完整包装、Logo 和主要文字始终在画面内，避免裁切主体、侧面展示、快速旋转、"
+                "强运动模糊、遮挡包装文字或产品正面离焦。"
+            )
+        elif is_video:
+            prefix += (
+                "产品生成需保持同一商品、Logo、包装结构、品牌色、文字和材质细节稳定；"
+                "视频镜头让产品文字面尽量正对镜头，采用慢速推拉或克制转场，"
+                "避免快速旋转、强运动模糊、遮挡包装文字、裁切主体或产品正面离焦。"
+            )
+        else:
+            prefix += (
+                "产品生成需保持同一商品、Logo、包装结构、品牌色、文字和材质细节稳定；"
+                "图片构图必须让完整产品主体入镜，包装正面、顶部、底部、左右边缘、抽口、盖子、提手"
+                "和外盒轮廓全部可见，主体占画面五成五到七成五并保留安全边距；"
+                "不得裁掉包装、不得只显示局部、不得让草叶/水花/道具遮挡Logo和主要文字。"
+            )
     return _trim_generation_prompt(f"{prefix}{source}")
+
+
+def _merge_negative_terms(value: str | None, terms: tuple[str, ...]) -> str:
+    parts = [
+        item.strip()
+        for item in re.split(r"[,，、\n]", str(value or ""))
+        if item.strip()
+    ]
+    seen = {item.lower() for item in parts}
+    for item in terms:
+        if item.lower() not in seen:
+            seen.add(item.lower())
+            parts.append(item)
+    return "，".join(parts)
+
+
+def product_image_negative_prompt(value: str | None = None) -> str:
+    """Merge product-completeness guards into image negative prompts."""
+    cleaned = _REFERENCE_PRODUCT_NOUN_RE.sub("上传产品", str(value or ""))
+    return _merge_negative_terms(cleaned, PRODUCT_IMAGE_NEGATIVE_TERMS)
+
+
+def product_video_negative_prompt(value: str | None = None) -> str:
+    """Merge cheap product-text fidelity guards into video negative prompts."""
+    cleaned = _REFERENCE_PRODUCT_NOUN_RE.sub("上传产品", str(value or ""))
+    return _merge_negative_terms(cleaned, PRODUCT_VIDEO_TEXT_NEGATIVE_TERMS)
 
 
 def compact_image_prompt_payload(prompt: dict, params: dict | None = None) -> dict:

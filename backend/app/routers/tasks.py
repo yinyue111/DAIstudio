@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import secrets
 from datetime import datetime, timezone
+from types import SimpleNamespace
 
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import select, update
@@ -27,6 +28,7 @@ from ..services.generation_request import (
 from ..services.progress import set_progress
 from ..services.rate_limit import incr_window
 from ..services.ssrf import SsrfError, assert_safe_user_asset_url
+from ..services.task_eta import video_eta_for_task
 from ..services.task_output import build_task_out, build_task_outs
 from ..services.user_events import publish_user_event
 
@@ -71,6 +73,29 @@ def list_tasks(db: Session = Depends(get_db), user: User = Depends(get_current_u
         ).scalars()
     )
     return build_task_outs(db, rows)
+
+
+@router.get("/tasks/eta/video")
+def video_task_eta(
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),  # noqa: ARG001
+    duration: int = 5,
+    resolution: str = "720p",
+    stage: str = "preview",
+):
+    task = SimpleNamespace(
+        category="video",
+        stage=stage if stage in {"preview", "final"} else "preview",
+        status="running",
+        params={"duration": duration, "resolution": resolution},
+        created_at=None,
+    )
+    return video_eta_for_task(db, task) or {
+        "eta_source": "fallback",
+        "eta_total_seconds": 120,
+        "eta_remaining_seconds": 120,
+        "eta_sample_count": 0,
+    }
 
 
 @router.get("/tasks/{task_id}", response_model=TaskOut)

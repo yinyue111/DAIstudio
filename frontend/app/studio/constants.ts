@@ -53,6 +53,7 @@ export const VIDEO_DURATION_PRESETS = [
 export const TERMINAL_TASK_STATUSES = new Set(["succeeded", "failed", "needs_review", "canceled"]);
 export const PARSE_POLL_INTERVAL_MS = 1000;
 export const PARSE_POLL_TIMEOUT_MS = 240_000;
+export const STUDIO_SESSION_DRAFT_KEY = "studio_session_draft_v1";
 export const STUDIO_VARIATION_DRAFT_KEY = "studio_variation_draft_v1";
 
 export const EXAMPLES = [

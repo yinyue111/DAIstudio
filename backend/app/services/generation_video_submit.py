@@ -38,7 +38,11 @@ from .generation_model_runtime import (
     poll_video_with_model_config,
     submit_video_with_model_config,
 )
-from .generation_prompts import generation_prompt_for_model, product_fidelity_prompt
+from .generation_prompts import (
+    generation_prompt_for_model,
+    product_fidelity_prompt,
+    product_video_negative_prompt,
+)
 from .generation_state import TERMINAL_STATUSES as TERMINAL
 from .generation_video_download import hold_video_download_for_reconciliation
 from .generation_video_flow import (
@@ -59,6 +63,7 @@ from .progress import set_progress
 log = logging.getLogger("generation")
 VIDEO_FIRST_FRAME_MIN_SIDE = 300
 VIDEO_FIRST_FRAME_MAX_SIDE = 768
+PRODUCT_VIDEO_REFERENCE_MAX_SIDE = 1280
 
 
 def _enqueue_poll_safely(task_id: int) -> None:
@@ -152,20 +157,32 @@ def video_submit_params(db, task: GenTask) -> dict:
         first_frame = first_frame or task.source_asset_url
     elif task.source_type == "video" and not first_frame:
         first_frame = gateway_video_first_frame(db, task)
+    subject_mode = str(params.get("subject_mode") or "").lower()
+    product_lock_mode = str(params.get("product_lock_mode") or "locked").lower()
+    is_product_image_video = task.source_type == "image" and subject_mode == "product"
+    if is_product_image_video:
+        params["negative_prompt"] = product_video_negative_prompt(params.get("negative_prompt"))
     if first_frame:
+        reference_kwargs = {
+            "min_side": VIDEO_FIRST_FRAME_MIN_SIDE,
+            "max_side": PRODUCT_VIDEO_REFERENCE_MAX_SIDE if is_product_image_video else VIDEO_FIRST_FRAME_MAX_SIDE,
+        }
+        if is_product_image_video:
+            reference_kwargs.update(
+                prefer_original_upload=True,
+                quality=92,
+                subsampling=0,
+            )
         safe_ref = gateway_reference_image(
             db,
             task,
             first_frame,
-            min_side=VIDEO_FIRST_FRAME_MIN_SIDE,
-            max_side=VIDEO_FIRST_FRAME_MAX_SIDE,
+            **reference_kwargs,
         )
         params["first_frame_image"] = safe_ref
         if params.get("reference_image_url"):
             params["reference_image_url"] = safe_ref
         last_frame = params.get("last_frame_image")
-        subject_mode = str(params.get("subject_mode") or "").lower()
-        product_lock_mode = str(params.get("product_lock_mode") or "locked").lower()
         should_auto_lock_last_frame = (
             task.source_type == "image"
             and not last_frame
@@ -182,8 +199,7 @@ def video_submit_params(db, task: GenTask) -> dict:
                 db,
                 task,
                 last_frame,
-                min_side=VIDEO_FIRST_FRAME_MIN_SIDE,
-                max_side=VIDEO_FIRST_FRAME_MAX_SIDE,
+                **reference_kwargs,
             )
     character_ref = params.get("character_reference_image")
     if character_ref:

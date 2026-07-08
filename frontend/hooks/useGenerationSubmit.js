@@ -3,6 +3,7 @@
 import { useRef, useState } from "react";
 import { api } from "../lib/api";
 import { buildGenerationPayload } from "../app/studio/generationPayload";
+import { classifyGenerationError } from "../lib/errorHandling";
 import {
   clearPendingGenerateRequest,
   clearPendingReverseRequest,
@@ -176,7 +177,9 @@ export default function useGenerationSubmit({
             productProfileSource: "",
             productProfiling: false,
           }, creationMode);
-          setMsg(`主体档案识别失败，将使用基础保真约束继续生成：${e.message}`);
+          setMsg(`主体档案识别失败，请重新点击生成或更换更清晰的主体图片后再试：${e.message}`);
+          clearPendingGenerateRequest(pendingGenerateRequestRef, requestId);
+          return;
         }
       }
       if (isEditMode && productAsset?.url && !isProductAssetStillCurrent()) {
@@ -246,7 +249,7 @@ export default function useGenerationSubmit({
         setMsg(`${e.message}。任务可能已提交，重新点击会复用同一次请求，避免重复扣费。`);
       } else {
         clearPendingGenerateRequest(pendingGenerateRequestRef, requestId);
-        setMsg(e.message);
+        setMsg(classifyGenerationError(e, { category }).message);
       }
     } finally {
       setSubmitting(false);

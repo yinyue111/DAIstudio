@@ -17,7 +17,7 @@ from app.models import (
     UserPrompt,
 )
 from app.services import sms, storage
-from app.services.config_store import set_setting
+from app.services.config_store import get_setting, set_setting
 
 
 def _clear_active_model_tasks(model_use: str) -> None:
@@ -257,7 +257,7 @@ def test_generate_client_request_id_normalizes_default_image_n_before_fingerprin
     assert first.status_code == 200, first.text
     second = client.post(
         "/api/generate",
-        json={**payload, "params": {"n": 4, "size": "256x256"}},
+        json={**payload, "params": {"n": 1, "size": "256x256"}},
         headers=h,
     )
     assert second.status_code == 200, second.text
@@ -269,10 +269,10 @@ def test_generate_client_request_id_normalizes_default_image_n_before_fingerprin
             GenTask.client_request_id == "studio-retry-default-n",
         ).all()
         assert len(tasks) == 1
-        assert tasks[0].params["n"] == 4
+        assert tasks[0].params["n"] == 1
     finally:
         db.close()
-    assert client.get("/api/me", headers=h).json()["balance_credits"] == 940
+    assert client.get("/api/me", headers=h).json()["balance_credits"] == 985
 
 
 def test_generate_client_request_id_rejects_different_payload(client, make_user, auth):
@@ -1590,56 +1590,65 @@ def test_retry_reprices_failed_image_task(client, make_user, auth):
     uid = make_user("13900000144", balance=1000)
     h = auth("13900000144")
     db = SessionLocal()
+    original_image_n = None
     try:
+        original_image_n = get_setting(db, "image_n", 1)
         set_setting(db, "image_n", 4)
         db.commit()
     finally:
         db.close()
-    _clear_active_model_tasks("image")
-    admin_phone = "13877777165"
-    make_user(admin_phone, balance=1000, admin=True)
-    admin_h = auth(admin_phone)
-    assert client.put("/api/admin/models", json={
-        "use": "image",
-        "model_id": "mock-image",
-        "cost_credits": 5,
-        "unlock_cost": 5,
-        "enabled": True,
-        "provider": None,
-        "base_url": None,
-        "gateway_format": "openai",
-        "api_key_clear": True,
-        "admin_password": "pass123456",
-    }, headers=admin_h).status_code == 200
-    db = SessionLocal()
     try:
-        t = GenTask(
-            user_id=uid,
-            category="image",
-            stage="preview",
-            prompt={"final_text": "retry reprices"},
-            model_use="image",
-            params={"size": "256x256"},
-            status="failed",
-            cost_frozen=5,
-            cost_settled=0,
-        )
-        db.add(t)
-        db.commit()
-        tid = t.id
-    finally:
-        db.close()
+        _clear_active_model_tasks("image")
+        admin_phone = "13877777165"
+        make_user(admin_phone, balance=1000, admin=True)
+        admin_h = auth(admin_phone)
+        assert client.put("/api/admin/models", json={
+            "use": "image",
+            "model_id": "mock-image",
+            "cost_credits": 5,
+            "unlock_cost": 5,
+            "enabled": True,
+            "provider": None,
+            "base_url": None,
+            "gateway_format": "openai",
+            "api_key_clear": True,
+            "admin_password": "pass123456",
+        }, headers=admin_h).status_code == 200
+        db = SessionLocal()
+        try:
+            t = GenTask(
+                user_id=uid,
+                category="image",
+                stage="preview",
+                prompt={"final_text": "retry reprices"},
+                model_use="image",
+                params={"size": "256x256"},
+                status="failed",
+                cost_frozen=5,
+                cost_settled=0,
+            )
+            db.add(t)
+            db.commit()
+            tid = t.id
+        finally:
+            db.close()
 
-    r = client.post(f"/api/tasks/{tid}/retry", headers=h)
-    assert r.status_code == 200, r.text
-    task = client.get(f"/api/tasks/{tid}", headers=h).json()
-    assert task["cost_frozen"] == 60
-    assert len(task["assets"]) == 4
-    db = SessionLocal()
-    try:
-        assert db.get(GenTask, tid).params["n"] == 4
+        r = client.post(f"/api/tasks/{tid}/retry", headers=h)
+        assert r.status_code == 200, r.text
+        task = client.get(f"/api/tasks/{tid}", headers=h).json()
+        assert task["cost_frozen"] == 60
+        assert len(task["assets"]) == 4
+        db = SessionLocal()
+        try:
+            assert db.get(GenTask, tid).params["n"] == 4
+        finally:
+            db.close()
     finally:
-        db.close()
+        db = SessionLocal()
+        try:
+            set_setting(db, "image_n", original_image_n if original_image_n is not None else 1)
+        finally:
+            db.close()
 
 
 def test_retry_preserves_existing_model_snapshot_price(client, make_user, auth):

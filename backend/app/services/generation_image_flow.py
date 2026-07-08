@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import time
+from datetime import datetime, timezone
 
 from sqlalchemy import select, update
 
@@ -24,6 +25,7 @@ from .generation_common import (
 from .generation_media import (
     EDIT_MASK_SEND_CONFIDENCE,
     closest_image_size,
+    composite_product_subject_pixels,
     final_prompt,
     gateway_image_edit_mask,
     gateway_reference_image,
@@ -34,6 +36,7 @@ from .generation_prompts import (
     generation_prompt_for_model,
     is_product_generation_task,
     product_fidelity_prompt,
+    product_image_negative_prompt,
 )
 from .generation_state import NEEDS_REVIEW
 from .generation_state import TERMINAL_STATUSES as TERMINAL_STATUSES
@@ -234,10 +237,16 @@ def run_image_task(task_id: int, *, gen_image_fn=None) -> None:
         if not task or task.status in TERMINAL_STATUSES:
             return
         raise_if_cancel_requested(db, task)
+        claim_params = dict(task.params or {})
+        claim_params["_image_render_started_at"] = datetime.now(timezone.utc).isoformat()
         claimed = db.execute(
             update(GenTask)
             .where(GenTask.id == task_id, GenTask.status == "queued")
-            .values(status="running")
+            .ordered_values(
+                (GenTask.status, "running"),
+                (GenTask.phase, "rendering"),
+                (GenTask.params, claim_params),
+            )
         ).rowcount
         if (claimed or 0) != 1:
             db.rollback()
@@ -254,7 +263,7 @@ def run_image_task(task_id: int, *, gen_image_fn=None) -> None:
             raise RuntimeError("未配置可用的图像模型")
         model = model_from_snapshot(task, model)
 
-        n = int((task.params or {}).get("n") or get_setting(db, "image_n", 4))
+        n = int((task.params or {}).get("n") or get_setting(db, "image_n", 1))
         params = task.params or {}
         is_product = is_product_generation_task(task)
         fallback_size = get_setting(db, "image_size", "1024x1024")
@@ -300,10 +309,22 @@ def run_image_task(task_id: int, *, gen_image_fn=None) -> None:
         edit_path = (model.extra or {}).get("edit_path", settings.image_edit_path) or None
         extra_payload = {
             "seed": params.get("seed"),
-            "negative_prompt": params.get("negative_prompt") or params.get("negative"),
+            "negative_prompt": (
+                product_image_negative_prompt(params.get("negative_prompt") or params.get("negative"))
+                if is_product
+                else (params.get("negative_prompt") or params.get("negative"))
+            ),
             "edit_payload_format": (model.extra or {}).get("edit_payload_format"),
         }
         edit_mask_mode = str(params.get("edit_mask_mode") or "").lower().strip()
+        mask_result = None
+        product_pixel_lock = (
+            is_product
+            and ref
+            and edit_path
+            and edit_mask_mode != "off"
+            and str(params.get("product_pixel_lock") or "strict").lower().strip() not in {"off", "false", "0"}
+        )
         if is_product and ref and edit_path and edit_mask_mode != "off":
             mask_source = params.get("mask_image_url") or task.source_asset_url
             try:
@@ -337,6 +358,11 @@ def run_image_task(task_id: int, *, gen_image_fn=None) -> None:
                 db.commit()
                 if should_send_mask:
                     extra_payload["mask"] = mask_result.data_uri
+                product_pixel_lock = product_pixel_lock and should_send_mask
+        elif product_pixel_lock:
+            product_pixel_lock = False
+        if product_pixel_lock and not mask_result:
+            product_pixel_lock = False
         mode = "edit" if (ref and edit_path) else "txt2img"
         t0 = time.time()
         try:
@@ -420,8 +446,26 @@ def run_image_task(task_id: int, *, gen_image_fn=None) -> None:
         image_errors: list[str] = []
         actual_sizes: list[str] = []
         returned_sizes: list[str] = []
+        product_composite_count = 0
+        product_composite_meta: dict | None = None
         for raw in images:
             try:
+                if product_pixel_lock and mask_result:
+                    try:
+                        composited = composite_product_subject_pixels(
+                            db,
+                            task,
+                            raw,
+                            params.get("mask_image_url") or task.source_asset_url,
+                            mask_result,
+                            max_side=reference_max_side,
+                        )
+                    except Exception as e:  # noqa: BLE001
+                        log.warning("image task %s product pixel lock skipped: %s", task_id, e)
+                        composited = None
+                    if composited:
+                        raw, product_composite_meta = composited
+                        product_composite_count += 1
                 preview_png, hd_w, hd_h = make_image_preview(
                     raw,
                     max_pixels=int(settings.generated_image_max_pixels),
@@ -457,6 +501,14 @@ def run_image_task(task_id: int, *, gen_image_fn=None) -> None:
             except Exception as e:  # noqa: BLE001
                 image_errors.append(str(e)[:300])
                 log.warning("image task %s skipped one invalid image: %s", task_id, e)
+        if product_pixel_lock:
+            task.params = {
+                **(task.params or {}),
+                "_product_pixel_lock": "strict",
+                "_product_composite_applied_count": product_composite_count,
+                **(product_composite_meta or {}),
+            }
+            db.commit()
         if saved_count <= 0:
             usage.record_call(
                 db,

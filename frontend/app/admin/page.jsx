@@ -7,11 +7,12 @@ import { redirectOnAuthError } from "../../lib/errorHandling";
 import Nav from "../../components/Nav";
 import { AssetReports, Models, ReviewTasks } from "./components/model-review-moderation";
 import { Payments, Settings } from "./components/payments-settings";
-import { Audit, Report } from "./components/reports-audit";
+import { Audit, Dashboard, Report } from "./components/reports-audit";
 import { VersionUpgrade } from "./components/version-upgrade";
 import { Users, Whitelist } from "./components/whitelist-users";
 
 const TABS = [
+  ["dashboard", "运营概览"],
   ["whitelist", "白名单"],
   ["users", "用户 / 额度"],
   ["models", "模型配置"],
@@ -25,6 +26,7 @@ const TABS = [
 ];
 
 const TAB_COMPONENTS = {
+  dashboard: Dashboard,
   whitelist: Whitelist,
   users: Users,
   models: Models,
@@ -39,7 +41,7 @@ const TAB_COMPONENTS = {
 
 export default function AdminPage() {
   const router = useRouter();
-  const [tab, setTab] = useState("whitelist");
+  const [tab, setTab] = useState("dashboard");
   const [me, setMe] = useState(null);
   const ActiveTab = TAB_COMPONENTS[tab] || Whitelist;
 
@@ -59,7 +61,7 @@ export default function AdminPage() {
   function selectTab(nextTab) {
     setTab(nextTab);
     const params = new URLSearchParams(window.location.search);
-    if (nextTab === "whitelist") params.delete("tab");
+    if (nextTab === "dashboard") params.delete("tab");
     else params.set("tab", nextTab);
     const query = params.toString();
     router.replace(query ? `/admin?${query}` : "/admin", { scroll: false });

@@ -9,7 +9,7 @@ from pathlib import Path
 from statistics import median
 from typing import Literal
 
-from PIL import Image, ImageDraw, ImageFilter
+from PIL import Image, ImageChops, ImageDraw, ImageFilter
 
 from ..config import settings
 from ..models import GenTask, UploadedAsset
@@ -113,6 +113,28 @@ def _mask_data_uri(mask: Image.Image) -> str:
     buf = io.BytesIO()
     mask.save(buf, format="PNG")
     return image_data_uri(buf.getvalue(), "image/png")
+
+
+def _mask_alpha_from_data_uri(data_uri: str | None) -> Image.Image | None:
+    if not data_uri or "," not in str(data_uri):
+        return None
+    try:
+        raw = base64.b64decode(str(data_uri).split(",", 1)[1])
+        mask = Image.open(io.BytesIO(raw)).convert("RGBA")
+        return mask.getchannel("A")
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _resize_for_mask(raw: bytes, *, max_side: int) -> Image.Image:
+    img = Image.open(io.BytesIO(raw)).convert("RGBA")
+    scale = min(1.0, max_side / max(img.size))
+    if scale < 1.0:
+        img = img.resize(
+            (max(1, int(img.width * scale)), max(1, int(img.height * scale))),
+            Image.Resampling.LANCZOS,
+        )
+    return img
 
 
 def _exclusive_bbox_to_inclusive(
@@ -286,6 +308,157 @@ def _largest_component_mask(mask: Image.Image) -> tuple[Image.Image | None, tupl
     return Image.frombytes("L", (w, h), bytes(out)), best_bbox, len(best)
 
 
+def _edge_enclosed_foreground_mask(rgb: Image.Image, *, bg_noise: float) -> Image.Image | None:
+    """Recover white-on-white product interiors by treating strong edges as barriers.
+
+    The color-distance detector misses white packaging on white backgrounds.
+    On low-noise studio uploads, product outlines and printed labels usually
+    form enough barriers that a border flood-fill can separate the exterior
+    background from the enclosed product body.
+    """
+    if bg_noise > 18:
+        return None
+    w, h = rgb.size
+    if w <= 2 or h <= 2:
+        return None
+    threshold = max(16, min(58, int(bg_noise * 1.8 + 22)))
+    edges = rgb.convert("L").filter(ImageFilter.FIND_EDGES)
+    barrier = edges.point(lambda px: 255 if px >= threshold else 0)
+    barrier = barrier.filter(ImageFilter.MaxFilter(3))
+    barrier_data = barrier.tobytes()
+    visited = bytearray(w * h)
+    stack: list[int] = []
+
+    def push(idx: int) -> None:
+        if not visited[idx] and not barrier_data[idx]:
+            visited[idx] = 1
+            stack.append(idx)
+
+    for x in range(w):
+        push(x)
+        push((h - 1) * w + x)
+    for y in range(h):
+        push(y * w)
+        push(y * w + (w - 1))
+
+    while stack:
+        idx = stack.pop()
+        x = idx % w
+        y = idx // w
+        if x > 0:
+            push(idx - 1)
+        if x + 1 < w:
+            push(idx + 1)
+        if y > 0:
+            push(idx - w)
+        if y + 1 < h:
+            push(idx + w)
+
+    out = bytearray(w * h)
+    for idx, edge_value in enumerate(barrier_data):
+        if edge_value or not visited[idx]:
+            out[idx] = 255
+    mask = Image.frombytes("L", (w, h), bytes(out))
+    mask = mask.filter(ImageFilter.MaxFilter(5)).filter(ImageFilter.MinFilter(3))
+    bbox = _exclusive_bbox_to_inclusive(mask.getbbox())
+    if not bbox:
+        return None
+    area = int(mask.point(lambda px: 1 if px else 0).histogram()[1])
+    bbox_area = (bbox[2] - bbox[0] + 1) * (bbox[3] - bbox[1] + 1)
+    if area / max(1, w * h) > 0.65 or bbox_area / max(1, w * h) > 0.85:
+        return None
+    if bbox[0] <= 1 or bbox[1] <= 1 or bbox[2] >= w - 2 or bbox[3] >= h - 2:
+        return None
+    return mask
+
+
+def _bright_neutral_subject_mask(rgb: Image.Image) -> tuple[Image.Image | None, tuple[int, int, int, int] | None, int]:
+    """Find bright low-saturation packaging on colored/natural backgrounds."""
+    hsv = rgb.convert("HSV")
+    w, h = hsv.size
+    px = hsv.load()
+    raw = bytearray(w * h)
+    for y in range(h):
+        row = y * w
+        for x in range(w):
+            _hue, sat, val = px[x, y]
+            if val >= 150 and sat <= 82:
+                raw[row + x] = 255
+    candidate = Image.frombytes("L", (w, h), bytes(raw))
+    candidate = candidate.filter(ImageFilter.MaxFilter(7)).filter(ImageFilter.MinFilter(5))
+    data = candidate.tobytes()
+    visited = bytearray(w * h)
+    best_component: list[int] = []
+    best_bbox: tuple[int, int, int, int] | None = None
+    best_score = 0.0
+    for start, value in enumerate(data):
+        if not value or visited[start]:
+            continue
+        stack = [start]
+        visited[start] = 1
+        component: list[int] = []
+        min_x = max_x = start % w
+        min_y = max_y = start // w
+        while stack:
+            idx = stack.pop()
+            component.append(idx)
+            x = idx % w
+            y = idx // w
+            min_x = min(min_x, x)
+            max_x = max(max_x, x)
+            min_y = min(min_y, y)
+            max_y = max(max_y, y)
+            if x > 0:
+                nxt = idx - 1
+                if data[nxt] and not visited[nxt]:
+                    visited[nxt] = 1
+                    stack.append(nxt)
+            if x + 1 < w:
+                nxt = idx + 1
+                if data[nxt] and not visited[nxt]:
+                    visited[nxt] = 1
+                    stack.append(nxt)
+            if y > 0:
+                nxt = idx - w
+                if data[nxt] and not visited[nxt]:
+                    visited[nxt] = 1
+                    stack.append(nxt)
+            if y + 1 < h:
+                nxt = idx + w
+                if data[nxt] and not visited[nxt]:
+                    visited[nxt] = 1
+                    stack.append(nxt)
+        bbox = (min_x, min_y, max_x, max_y)
+        area = len(component)
+        bbox_w = max_x - min_x + 1
+        bbox_h = max_y - min_y + 1
+        area_ratio = area / max(1, w * h)
+        bbox_ratio = _bbox_area(bbox) / max(1, w * h)
+        aspect = bbox_w / max(1, bbox_h)
+        center_y = (min_y + max_y) / 2 / max(1, h)
+        touches_edge = min_y <= 2 or max_y >= h - 3 or (min_x <= 2 and max_x >= w - 3)
+        if (
+            touches_edge
+            or area_ratio < 0.008
+            or area_ratio > 0.45
+            or bbox_ratio > 0.60
+            or not (0.45 <= aspect <= 5.5)
+            or center_y < 0.22
+        ):
+            continue
+        score = area * (1.0 + center_y)
+        if score > best_score:
+            best_score = score
+            best_component = component
+            best_bbox = bbox
+    if not best_component or not best_bbox:
+        return None, None, 0
+    out = bytearray(w * h)
+    for idx in best_component:
+        out[idx] = 255
+    return Image.frombytes("L", (w, h), bytes(out)), best_bbox, len(best_component)
+
+
 def _auto_subject_mask(img: Image.Image) -> EditMaskResult:
     source_size = img.size
     work = img
@@ -313,10 +486,19 @@ def _auto_subject_mask(img: Image.Image) -> EditMaskResult:
             if dist >= diff_threshold or (dist >= diff_threshold * 0.65 and sat >= sat_threshold):
                 raw[row + x] = 255
     candidate = Image.frombytes("L", (w, h), bytes(raw))
+    enclosed = _edge_enclosed_foreground_mask(rgb, bg_noise=bg_noise)
+    if enclosed is not None:
+        candidate = ImageChops.lighter(candidate, enclosed)
     candidate = candidate.filter(ImageFilter.MaxFilter(5)).filter(ImageFilter.MinFilter(5))
     component, bbox, area = _largest_component_mask(candidate)
+    bright_component = None
+    bright_bbox = None
+    bright_area = 0
     if component is None or bbox is None:
-        return EditMaskResult(None, "none", 0.0, None, source_size[0], source_size[1], "no_foreground")
+        bright_component, bright_bbox, bright_area = _bright_neutral_subject_mask(rgb)
+        if bright_component is None or bright_bbox is None:
+            return EditMaskResult(None, "none", 0.0, None, source_size[0], source_size[1], "no_foreground")
+        component, bbox, area = bright_component, bright_bbox, bright_area
     area_ratio = area / max(1, w * h)
     bbox_area = (bbox[2] - bbox[0] + 1) * (bbox[3] - bbox[1] + 1)
     bbox_ratio = bbox_area / max(1, w * h)
@@ -332,15 +514,23 @@ def _auto_subject_mask(img: Image.Image) -> EditMaskResult:
             "foreground_too_small",
         )
     if area_ratio > 0.80 or bbox_ratio > 0.92:
-        return EditMaskResult(
-            None,
-            "none",
-            0.0,
-            _scale_bbox(bbox, from_size=(w, h), to_size=source_size),
-            source_size[0],
-            source_size[1],
-            "foreground_too_large",
-        )
+        bright_component, bright_bbox, bright_area = _bright_neutral_subject_mask(rgb)
+        if bright_component is not None and bright_bbox is not None:
+            component, bbox, area = bright_component, bright_bbox, bright_area
+            area_ratio = area / max(1, w * h)
+            bbox_area = (bbox[2] - bbox[0] + 1) * (bbox[3] - bbox[1] + 1)
+            bbox_ratio = bbox_area / max(1, w * h)
+            touches_edge = bbox[0] <= 1 or bbox[1] <= 1 or bbox[2] >= w - 2 or bbox[3] >= h - 2
+        else:
+            return EditMaskResult(
+                None,
+                "none",
+                0.0,
+                _scale_bbox(bbox, from_size=(w, h), to_size=source_size),
+                source_size[0],
+                source_size[1],
+                "foreground_too_large",
+            )
     dilation = max(3, int(round(min(w, h) * 0.025)))
     if dilation % 2 == 0:
         dilation += 1
@@ -365,6 +555,28 @@ def _auto_subject_mask(img: Image.Image) -> EditMaskResult:
         final_bbox = _exclusive_bbox_to_inclusive(final_alpha.getbbox())
         if not final_bbox:
             return EditMaskResult(None, "none", 0.0, None, source_size[0], source_size[1], "empty_subject")
+    if touches_edge or confidence < EDIT_MASK_SEND_CONFIDENCE:
+        bright_component, bright_bbox, bright_area = _bright_neutral_subject_mask(rgb)
+        if bright_component is not None and bright_bbox is not None:
+            bright_alpha = bright_component.filter(ImageFilter.MaxFilter(dilation))
+            bright_final_bbox = _exclusive_bbox_to_inclusive(bright_alpha.getbbox())
+            if bright_final_bbox:
+                bright_confidence = max(confidence if not touches_edge else 0.0, 0.68)
+                if (w, h) != source_size:
+                    bright_alpha = bright_alpha.resize(source_size, Image.Resampling.NEAREST)
+                    bright_final_bbox = _exclusive_bbox_to_inclusive(bright_alpha.getbbox())
+                if bright_final_bbox:
+                    mask = Image.new("RGBA", img.size, (255, 255, 255, 0))
+                    mask.putalpha(bright_alpha)
+                    return EditMaskResult(
+                        data_uri=_mask_data_uri(mask),
+                        mode="auto_subject",
+                        confidence=min(0.82, bright_confidence),
+                        bbox=bright_final_bbox,
+                        width=source_size[0],
+                        height=source_size[1],
+                        reason="bright_neutral_subject",
+                    )
     if confidence < EDIT_MASK_SEND_CONFIDENCE:
         return EditMaskResult(
             None,
@@ -425,6 +637,139 @@ def gateway_image_edit_mask(
         return _center_box_mask(img, reason=result.reason or "auto_subject_unavailable")
     except Exception as e:  # noqa: BLE001
         raise RuntimeError(f"编辑蒙版生成失败:{e}") from e
+
+
+def _fit_subject_bbox(
+    source_size: tuple[int, int],
+    target_bbox: tuple[int, int, int, int],
+) -> tuple[int, int, int, int] | None:
+    source_w, source_h = source_size
+    if source_w <= 0 or source_h <= 0:
+        return None
+    left, top, right, bottom = target_bbox
+    target_w = max(1, right - left + 1)
+    target_h = max(1, bottom - top + 1)
+    scale = min(target_w / source_w, target_h / source_h)
+    fitted_w = max(1, int(round(source_w * scale)))
+    fitted_h = max(1, int(round(source_h * scale)))
+    cx = left + target_w / 2
+    cy = top + target_h / 2
+    fit_left = int(round(cx - fitted_w / 2))
+    fit_top = int(round(cy - fitted_h / 2))
+    return fit_left, fit_top, fit_left + fitted_w - 1, fit_top + fitted_h - 1
+
+
+def _bbox_area(bbox: tuple[int, int, int, int] | None) -> int:
+    if not bbox:
+        return 0
+    left, top, right, bottom = bbox
+    return max(0, right - left + 1) * max(0, bottom - top + 1)
+
+
+def _bbox_iou(
+    a: tuple[int, int, int, int] | None,
+    b: tuple[int, int, int, int] | None,
+) -> float:
+    if not a or not b:
+        return 0.0
+    left = max(a[0], b[0])
+    top = max(a[1], b[1])
+    right = min(a[2], b[2])
+    bottom = min(a[3], b[3])
+    intersection = _bbox_area((left, top, right, bottom))
+    if intersection <= 0:
+        return 0.0
+    union = _bbox_area(a) + _bbox_area(b) - intersection
+    return intersection / max(1, union)
+
+
+def _jpeg_bytes(img: Image.Image) -> bytes:
+    buf = io.BytesIO()
+    img.convert("RGB").save(buf, format="JPEG", quality=96, subsampling=0, optimize=True)
+    return buf.getvalue()
+
+
+def composite_product_subject_pixels(
+    db,
+    task: GenTask,
+    result_raw: bytes,
+    source_url: str | None,
+    source_mask: EditMaskResult | None,
+    *,
+    max_side: int = 1536,
+) -> tuple[bytes, dict] | None:
+    """Composite the original product pixels back onto a generated scene.
+
+    Image-edit gateways may still redraw protected text/logo areas even when a
+    mask is sent. For product mode, the stronger invariant is to reuse the
+    original product pixels and let the model contribute the background/style.
+    """
+    if not source_url or not source_mask or source_mask.mode not in {"alpha_subject", "auto_subject"}:
+        return None
+    source_alpha = _mask_alpha_from_data_uri(source_mask.data_uri)
+    if source_alpha is None:
+        return None
+    try:
+        source_img = _resize_for_mask(_asset_image_bytes_for_mask(db, task, source_url) or b"", max_side=max_side)
+        result_img = Image.open(io.BytesIO(result_raw)).convert("RGBA")
+    except Exception as e:  # noqa: BLE001
+        raise RuntimeError(f"产品像素锁定准备失败:{e}") from e
+    if source_alpha.size != source_img.size:
+        source_alpha = source_alpha.resize(source_img.size, Image.Resampling.NEAREST)
+    source_bbox = _exclusive_bbox_to_inclusive(source_alpha.getbbox()) or source_mask.bbox
+    if not source_bbox:
+        return None
+
+    scaled_source_bbox = _scale_bbox(source_bbox, from_size=source_img.size, to_size=result_img.size)
+    if not scaled_source_bbox:
+        return None
+    target_bbox = scaled_source_bbox
+    placement_method = "source_scaled_bbox"
+    target_confidence = 0.0
+    target_mask = _auto_subject_mask(result_img)
+    if target_mask.mode == "auto_subject" and target_mask.confidence >= 0.55 and target_mask.bbox:
+        target_area_ratio = _bbox_area(target_mask.bbox) / max(1, result_img.width * result_img.height)
+        scaled_area_ratio = _bbox_area(scaled_source_bbox) / max(1, result_img.width * result_img.height)
+        # Reject natural-background false positives that swallow most of the
+        # frame. A good result-side product bbox should be close to the source
+        # placement or at least similarly sized.
+        if (
+            0.015 <= target_area_ratio <= 0.70
+            and target_area_ratio <= max(0.72, scaled_area_ratio * 2.8)
+        ):
+            target_bbox = target_mask.bbox
+            placement_method = "result_subject_bbox"
+            target_confidence = float(target_mask.confidence)
+
+    sx1, sy1, sx2, sy2 = source_bbox
+    source_crop = source_img.crop((sx1, sy1, sx2 + 1, sy2 + 1))
+    alpha_crop = source_alpha.crop((sx1, sy1, sx2 + 1, sy2 + 1))
+    fitted = _fit_subject_bbox(source_crop.size, target_bbox)
+    if not fitted:
+        return None
+    tx1, ty1, tx2, ty2 = fitted
+    paste_w = max(1, tx2 - tx1 + 1)
+    paste_h = max(1, ty2 - ty1 + 1)
+    source_layer = source_crop.resize((paste_w, paste_h), Image.Resampling.LANCZOS)
+    alpha_layer = alpha_crop.resize((paste_w, paste_h), Image.Resampling.LANCZOS)
+    feather = max(1, int(round(min(paste_w, paste_h) * 0.004)))
+    alpha_layer = alpha_layer.filter(ImageFilter.GaussianBlur(feather))
+    if placement_method == "result_subject_bbox" and target_mask.data_uri:
+        target_alpha = _mask_alpha_from_data_uri(target_mask.data_uri)
+        if target_alpha is not None and target_alpha.size == result_img.size:
+            target_clip = target_alpha.crop((tx1, ty1, tx2 + 1, ty2 + 1))
+            target_clip = target_clip.resize((paste_w, paste_h), Image.Resampling.LANCZOS)
+            target_clip = target_clip.filter(ImageFilter.GaussianBlur(feather))
+            alpha_layer = ImageChops.multiply(alpha_layer, target_clip)
+
+    canvas = result_img.copy()
+    canvas.paste(source_layer, (tx1, ty1), alpha_layer)
+    return _jpeg_bytes(canvas), {
+        "_product_composite_source_bbox": list(source_bbox),
+        "_product_composite_target_bbox": list(target_bbox),
+        "_product_composite_target_confidence": round(target_confidence, 3),
+        "_product_composite_placement": placement_method,
+    }
 
 
 def gateway_video_first_frame(db, task: GenTask) -> str | None:

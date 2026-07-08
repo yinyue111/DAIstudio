@@ -150,6 +150,7 @@ class Settings(BaseSettings):
 
     # --- Core ---
     app_name: str = "AI Material Studio"
+    deploy_env: str = "local"  # local | staging | production
     debug: bool = False
     # Comma separated list of allowed CORS origins for the internal frontend.
     cors_origins: str = "http://localhost:3000,http://127.0.0.1:3000"
@@ -160,6 +161,9 @@ class Settings(BaseSettings):
     # Only these reverse-proxy source IPs are allowed to supply X-Forwarded-For.
     # Leave blank for direct local/dev deployments.
     trusted_proxy_ips: str = ""
+    # Production should trust exact proxy IPs only. Set this only for controlled
+    # private deployments where the whole proxy subnet is owned by the operator.
+    allow_broad_trusted_proxy_cidr: bool = False
 
     # --- Datastores ---
     database_url: str = "postgresql+psycopg2://postgres:postgres@localhost:5432/ai_studio"
@@ -400,7 +404,7 @@ class Settings(BaseSettings):
     # should keep this false so a named remote cannot hide a local file path.
     online_update_allow_local_remote: bool = False
     # When true, online update accepts only commits passing `git verify-commit`.
-    # Keep false unless the deployment repository signs release commits/tags.
+    # Production runtime refuses ONLINE_UPDATE_ENABLED=true unless this is true.
     online_update_require_signed_commits: bool = False
 
     @field_validator("cors_origins")

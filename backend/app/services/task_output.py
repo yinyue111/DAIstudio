@@ -7,9 +7,11 @@ from sqlalchemy.orm import Session
 from ..models import GenAsset, GenTask
 from ..schemas import TaskOut
 from .asset_output import to_asset_out
+from .error_codes import task_error_type
 from .generation import is_terminal_status
 from .generation_pricing import generation_cost_from_snapshot
 from .progress import get_progress
+from .task_eta import video_eta_for_task
 
 _PUBLIC_PARAM_KEYS = {
     "n",
@@ -61,6 +63,25 @@ def _decorate_partial(out: TaskOut, task: GenTask) -> None:
         out.partial_errors = [str(e)[:160] for e in errors[:5] if str(e).strip()]
 
 
+def _decorate_error(out: TaskOut, task: GenTask) -> None:
+    if not task.error and task.status not in {"failed", "needs_review"}:
+        return
+    out.error_message = task.error
+    out.error_type = task_error_type(task.params, task.error, status=task.status)
+
+
+def _decorate_eta(db: Session, out: TaskOut, task: GenTask) -> None:
+    eta = video_eta_for_task(db, task)
+    if not eta:
+        return
+    out.eta_source = eta["eta_source"]
+    out.eta_total_seconds = eta["eta_total_seconds"]
+    out.eta_remaining_seconds = eta["eta_remaining_seconds"]
+    out.eta_sample_count = eta["eta_sample_count"]
+    if not out.progress or out.progress <= 8:
+        out.progress = max(out.progress or 0, int(eta.get("progress_estimate") or 0))
+
+
 def _set_final_summary(out: TaskOut, final_task: GenTask | None, asset_count: int = 0) -> None:
     if not final_task:
         return
@@ -107,6 +128,8 @@ def build_task_out(db: Session, task: GenTask) -> TaskOut:
     out.assets = [to_asset_out(db, a, task=task) for a in assets]
     out.progress = _progress_for(task)
     _decorate_partial(out, task)
+    _decorate_error(out, task)
+    _decorate_eta(db, out, task)
     _set_final_cost_estimate(out, task)
     if task.category == "video" and task.stage == "preview":
         final_tasks = list(db.execute(
@@ -184,6 +207,8 @@ def build_task_outs(db: Session, tasks: list[GenTask]) -> list[TaskOut]:
         out.assets = [to_asset_out(db, a, task=t) for a in by_task.get(t.id, [])]
         out.progress = _progress_for(t)
         _decorate_partial(out, t)
+        _decorate_error(out, t)
+        _decorate_eta(db, out, t)
         _set_final_cost_estimate(out, t)
         _set_final_summary(
             out,

@@ -1,5 +1,6 @@
 import "./globals.css";
 import ErrorBoundary from "../components/ErrorBoundary";
+import { ToastProvider } from "../components/ToastProvider";
 
 export const metadata = {
   title: "造梦 · AI 创作工作台",
@@ -20,7 +21,9 @@ export default function RootLayout({ children }) {
     <html lang="zh-CN" suppressHydrationWarning>
       <body className="min-h-screen" suppressHydrationWarning>
         <ErrorBoundary>
-          {children}
+          <ToastProvider>
+            {children}
+          </ToastProvider>
         </ErrorBoundary>
       </body>
     </html>

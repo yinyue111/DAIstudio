@@ -9,6 +9,8 @@ const productPrompt = buildEditPrompt("小红书浴室场景，柔光，干净�
 
 assert.match(productPrompt, /唯一产品身份/);
 assert.match(productPrompt, /包装上的品牌名/);
+assert.match(productPrompt, /完整入镜/);
+assert.match(productPrompt, /半截产品/);
 assert.match(productPrompt, /只用于迁移场景/);
 assert.match(productPrompt, /迁移要求：小红书浴室场景/);
 
@@ -30,6 +32,9 @@ const productNegative = buildEditNegativePrompt("文字乱码，产品变形", {
 assert.match(productNegative, /文字乱码/);
 assert.match(productNegative, /产品变形/);
 assert.match(productNegative, /包装文字被改写/);
+assert.match(productNegative, /产品残缺/);
+assert.match(productNegative, /半截产品/);
+assert.match(productNegative, /产品被裁切/);
 assert.equal(productNegative.split("，").filter((item) => item === "文字乱码").length, 1);
 
 const portraitNegative = buildEditNegativePrompt("", { portraitMode: true });

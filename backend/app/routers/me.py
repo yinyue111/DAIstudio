@@ -1,15 +1,18 @@
 from __future__ import annotations
 
+import re
+from datetime import datetime, timezone
+
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from sqlalchemy.orm import Session
 
 from ..config import settings
 from ..db import get_db
 from ..deps import get_client_ip, get_current_user
-from ..models import User
+from ..models import User, UserDraft
 from ..password_policy import MIN_PASSWORD_LEN
 from ..redis_client import redis_client
-from ..schemas import ChangePasswordIn, UserOut
+from ..schemas import ChangePasswordIn, UserDraftIn, UserDraftOut, UserOut
 from ..security import hash_password, verify_password
 from ..services import audit
 from ..services.rate_limit import incr_window
@@ -18,11 +21,71 @@ router = APIRouter(prefix="/api", tags=["me"])
 
 PASSWORD_FAIL_LIMIT = 8
 PASSWORD_FAIL_WINDOW = 15 * 60
+_DRAFT_KEY_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 
 
 @router.get("/me", response_model=UserOut)
 def me(user: User = Depends(get_current_user)):
     return user
+
+
+def _validate_draft_key(key: str) -> str:
+    value = (key or "").strip().lower()
+    if not _DRAFT_KEY_RE.match(value):
+        raise HTTPException(400, "草稿 key 只能包含小写字母、数字、下划线和短横线")
+    return value
+
+
+def _draft_out(key: str, row: UserDraft | None) -> UserDraftOut:
+    if row is None:
+        return UserDraftOut(key=key, payload={}, updated_at=None)
+    return UserDraftOut(key=row.key, payload=row.payload or {}, updated_at=row.updated_at)
+
+
+@router.get("/me/drafts/{key}", response_model=UserDraftOut)
+def get_draft(
+    key: str,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    key = _validate_draft_key(key)
+    row = db.query(UserDraft).filter(UserDraft.user_id == user.id, UserDraft.key == key).first()
+    return _draft_out(key, row)
+
+
+@router.put("/me/drafts/{key}", response_model=UserDraftOut)
+def save_draft(
+    key: str,
+    body: UserDraftIn,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    key = _validate_draft_key(key)
+    row = db.query(UserDraft).filter(UserDraft.user_id == user.id, UserDraft.key == key).first()
+    now = datetime.now(timezone.utc)
+    if row is None:
+        row = UserDraft(user_id=user.id, key=key, payload=body.payload, updated_at=now)
+        db.add(row)
+    else:
+        row.payload = body.payload
+        row.updated_at = now
+    db.commit()
+    db.refresh(row)
+    return _draft_out(key, row)
+
+
+@router.delete("/me/drafts/{key}")
+def delete_draft(
+    key: str,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    key = _validate_draft_key(key)
+    row = db.query(UserDraft).filter(UserDraft.user_id == user.id, UserDraft.key == key).first()
+    if row is not None:
+        db.delete(row)
+        db.commit()
+    return {"ok": True}
 
 
 @router.post("/me/password")

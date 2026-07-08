@@ -60,6 +60,8 @@ _SOURCE_META_TEXT_KEYS = {
     "product_generation_mode",
     "portrait_generation_mode",
     "subject_mode",
+    "subject_profile_source",
+    "subject_profile_summary",
     "variation_of_asset_id",
 }
 _SOURCE_META_BOOL_KEYS = {"product_generation_mode", "portrait_generation_mode"}
@@ -157,6 +159,11 @@ def _source_trace(
                 continue
             if value > 0:
                 trace[key] = value
+            continue
+        if key == "subject_profile_summary":
+            cleaned = _clean_source_meta_text(source_meta.get(key), max_len=1200)
+            if cleaned:
+                trace[key] = cleaned
             continue
         cleaned = _clean_source_meta_text(source_meta.get(key))
         if cleaned:
@@ -409,8 +416,8 @@ def generate(body: GenerateIn, request: Request,
 
     n_images = int(task_params.get("n") or default_image_n(db)) \
         if body.category == "image" else 1
-    # persist the resolved n so freeze (here), the worker, and settlement all
-    # agree — otherwise a defaulted n freezes base*4 but settles base*1 (~75% undercharge).
+    # Persist the resolved n so freeze (here), the worker, and settlement all
+    # agree even when the client omitted n.
     if body.category == "image":
         task_params["n"] = n_images
     request_fingerprint = build_request_fingerprint(

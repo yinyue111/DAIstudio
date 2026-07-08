@@ -1,10 +1,11 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { api, downloadBlob } from "../../lib/api";
 import { redirectOnAuthError, reportBackgroundError, showError } from "../../lib/errorHandling";
 import Nav from "../../components/Nav";
+import { useToast } from "../../components/ToastProvider";
 import AssetMedia, {
   assetPreviewSrc,
   assetUnavailableText,
@@ -12,6 +13,7 @@ import AssetMedia, {
   isAssetTakenDown,
 } from "../../components/AssetMedia";
 import AssetPreviewDialog from "../../components/AssetPreviewDialog";
+import AssetComparePanel from "../../components/AssetComparePanel";
 import { assetVariationSourceUrl, confirmAssetUnlock } from "../studio/assetActions";
 import { STUDIO_VARIATION_DRAFT_KEY } from "../studio/constants";
 import { statusStyle, statusZh } from "../studio/helpers";
@@ -44,6 +46,7 @@ function runningTaskHint(task) {
 
 export default function HistoryPage() {
   const router = useRouter();
+  const notify = useToast();
   const PAGE = 30;
   const [me, setMe] = useState(null);
   const [cfg, setCfg] = useState(null);
@@ -58,6 +61,7 @@ export default function HistoryPage() {
   const tasksRef = useRef([]);
   const [busyAssetIds, setBusyAssetIds] = useState(() => new Set());
   const busyAssetIdsRef = useRef(new Set());
+  const [compareSelection, setCompareSelection] = useState(() => new Set());
 
   useEffect(() => {
     api.me().then(setMe).catch((e) => redirectOnAuthError(e, router, setMsg, "history session probe"));
@@ -105,7 +109,10 @@ export default function HistoryPage() {
       syncTaskTracking(nextTasks);
       setHasMore(list.length === PAGE);
     } catch (e) {
-      if (seq === loadSeqRef.current) setMsg(e.message);
+      if (seq === loadSeqRef.current) {
+        setMsg(e.message);
+        notify.error(e.message || "历史记录加载失败");
+      }
     } finally {
       if (seq === loadSeqRef.current) loadingRef.current = false;
       setLoading(false);
@@ -119,6 +126,7 @@ export default function HistoryPage() {
       api.me().then(setMe).catch((e) => reportBackgroundError(e, "refresh current user after retry"));
     } catch (e) {
       setMsg(e.message);
+      notify.error(e.message || "任务重试失败");
     }
   }
 
@@ -135,6 +143,7 @@ export default function HistoryPage() {
       api.me().then(setMe).catch((e) => reportBackgroundError(e, "refresh current user after cancel"));
     } catch (e) {
       setMsg(e.message);
+      notify.error(e.message || "取消任务失败");
     }
   }
 
@@ -213,6 +222,7 @@ export default function HistoryPage() {
         api.me().then(setMe).catch((e) => reportBackgroundError(e, "refresh current user after unlock"));
       } catch (e) {
         setMsg(e.message);
+        notify.error(e.message || "解锁失败");
       }
     });
   }
@@ -233,8 +243,10 @@ export default function HistoryPage() {
           asset.type === "video" ? `asset-${asset.id}.mp4` : undefined,
         );
         setMsg(`已开始下载 ${filename}`);
+        notify.success(`已开始下载 ${filename}`);
       } catch (e) {
         setMsg(e.message);
+        notify.error(e.message || "下载失败");
       }
     });
   }
@@ -258,8 +270,33 @@ export default function HistoryPage() {
       router.push("/");
     } catch (e) {
       setMsg(e.message || "创建变体草稿失败");
+      notify.error(e.message || "创建变体草稿失败");
     }
   }
+
+  function toggleCompareAsset(asset) {
+    setCompareSelection((prev) => {
+      const next = new Set(prev);
+      if (next.has(asset.id)) {
+        next.delete(asset.id);
+        return next;
+      }
+      if (next.size >= 4) {
+        notify.warn("最多同时对比 4 个作品。");
+        return prev;
+      }
+      next.add(asset.id);
+      return next;
+    });
+  }
+
+  const compareAssets = useMemo(() => {
+    const byId = new Map();
+    for (const task of tasks || []) {
+      for (const asset of task.assets || []) byId.set(asset.id, asset);
+    }
+    return [...compareSelection].map((id) => byId.get(id)).filter(Boolean);
+  }, [compareSelection, tasks]);
 
   return (
     <div className="min-h-screen">
@@ -280,6 +317,8 @@ export default function HistoryPage() {
             {msg}
           </div>
         )}
+
+        <AssetComparePanel assets={compareAssets} onClose={() => setCompareSelection(new Set())} />
 
         {tasks === null ? (
           <div className="card p-8 text-center text-sm text-mist">加载中…</div>
@@ -324,6 +363,8 @@ export default function HistoryPage() {
                           asset={a}
                           onOpen={() => setLightbox(a)}
                           onVariation={() => createVariation(a)}
+                          onCompare={() => toggleCompareAsset(a)}
+                          compareSelected={compareSelection.has(a.id)}
                         />
                       ))}
                     </div>
@@ -408,7 +449,7 @@ export default function HistoryPage() {
   );
 }
 
-function HistoryAssetButton({ asset, onOpen, onVariation }) {
+function HistoryAssetButton({ asset, onOpen, onVariation, onCompare, compareSelected }) {
   const src = srcOf(asset);
   const takenDown = isAssetTakenDown(asset);
   return (
@@ -448,6 +489,20 @@ function HistoryAssetButton({ asset, onOpen, onVariation }) {
           变体
         </button>
       )}
+      <button
+        type="button"
+        onClick={(e) => {
+          e.stopPropagation();
+          onCompare();
+        }}
+        className={`absolute left-1.5 bottom-1.5 rounded-full border px-2 py-1 text-[11px] font-medium transition ${
+          compareSelected
+            ? "border-brand bg-brand text-white"
+            : "border-white/20 bg-black/65 text-white hover:bg-black/80"
+        }`}
+      >
+        {compareSelected ? "已选" : "对比"}
+      </button>
     </div>
   );
 }

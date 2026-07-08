@@ -2,13 +2,14 @@
 
 import { useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
-import { api, downloadBlob } from "../lib/api";
-import { redirectOnAuthError, reportBackgroundError, showError } from "../lib/errorHandling";
+import { api, downloadBlob, setUnauthorizedHandler } from "../lib/api";
+import { errorMessage, redirectOnAuthError, reportBackgroundError, showError } from "../lib/errorHandling";
 import Nav from "../components/Nav";
 import { canDownloadAsset, isAssetTakenDown } from "../components/AssetMedia";
 import AssetWindowControls from "../components/AssetWindowControls";
 import PromptLibraryBrowser, { STUDIO_DRAFT_PROMPT_KEY } from "../components/PromptLibraryBrowser";
 import StudioGenerationControls from "../components/StudioGenerationControls";
+import { useToast } from "../components/ToastProvider";
 import useGenerationSubmit from "../hooks/useGenerationSubmit";
 import useMediaUpload from "../hooks/useMediaUpload";
 import useReferenceParsing from "../hooks/useReferenceParsing";
@@ -18,6 +19,7 @@ import useVisibleItemWindow from "../hooks/useVisibleItemWindow";
 import {
   CREATION_MODES,
   RATIOS,
+  STUDIO_SESSION_DRAFT_KEY,
   STUDIO_VARIATION_DRAFT_KEY,
   VIDEO_RATIO_KEYS,
   creationModeLabel,
@@ -42,8 +44,33 @@ import {
 } from "./studio/helpers";
 import { buildStudioDerivedViewState, modelEnabledForConfig, studioCreationFacts } from "./studio/viewModel";
 
+function parsePromptDraft(raw) {
+  try {
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed === "object") {
+      return {
+        prompt: String(parsed.prompt || ""),
+        category: String(parsed.category || ""),
+        creationMode: String(parsed.creationMode || ""),
+        savedAt: Number(parsed.savedAt || 0),
+      };
+    }
+  } catch (_e) {
+    // Legacy prompt drafts were stored as plain strings.
+  }
+  return { prompt: String(raw || ""), category: "", creationMode: "", savedAt: 0 };
+}
+
+function promptDraftMode(draft) {
+  if (draft.creationMode && CREATION_MODES.some((item) => item.key === draft.creationMode)) {
+    return draft.creationMode;
+  }
+  return draft.category === "video" ? "video" : "image";
+}
+
 export default function Home() {
   const router = useRouter();
+  const notify = useToast();
   const [me, setMe] = useState(null);
   const [cfg, setCfg] = useState(null);
 
@@ -51,6 +78,9 @@ export default function Home() {
   const [creationMode, setCreationMode] = useState("image"); // image | video | image_edit | video_edit
   const [showNegative, setShowNegative] = useState(false);
   const [promptLibraryOpen, setPromptLibraryOpen] = useState(false);
+  const [promptSaveTitle, setPromptSaveTitle] = useState("");
+  const [promptSaveCategory, setPromptSaveCategory] = useState("image");
+  const [promptSaveFavorite, setPromptSaveFavorite] = useState(false);
 
   // reference (paste link -> reverse) state
   const [refOpen, setRefOpen] = useState(false);
@@ -63,7 +93,8 @@ export default function Home() {
 
   // gallery
   const [works, setWorks] = useState(null);
-  const worksWindow = useVisibleItemWindow(works, { initialCount: 48, step: 24 });
+  const [worksError, setWorksError] = useState("");
+  const worksWindow = useVisibleItemWindow(works, { initialCount: 48, step: 24, resetKey: "studio-works" });
   const visibleWorks = works === null ? null : worksWindow.items;
 
   const busyAssetIdsRef = useRef(new Set());
@@ -71,7 +102,12 @@ export default function Home() {
   const resultsRef = useRef(null);
   const loadWorksSeqRef = useRef(0);
   const taskRef = useRef(null);
+  const workspacesRef = useRef(null);
+  const draftSyncTimerRef = useRef(null);
+  const cloudDraftLoadedRef = useRef(false);
+  const restoredLocalDraftAtRef = useRef(0);
   const {
+    workspaces,
     setWorkspaces,
     workspace,
     setWorkspacePatch,
@@ -132,7 +168,19 @@ export default function Home() {
   } = studioCreationFacts({ creationMode, imageEditProductMode, editSubjectMode });
 
   useEffect(() => {
-    api.me().then(setMe).catch((e) => redirectOnAuthError(e, router, setMsg, "studio session probe"));
+    workspacesRef.current = workspaces;
+  }, [workspaces]);
+
+  useEffect(() => {
+    setUnauthorizedHandler(() => saveStudioSessionDraft("auth_expired"));
+    return () => setUnauthorizedHandler(null);
+  }, [creationMode, showNegative, refOpen, structOpen, me?.id]);
+
+  useEffect(() => {
+    api.me().then((u) => {
+      setMe(u);
+      loadStudioCloudDraft();
+    }).catch((e) => redirectOnAuthError(e, router, setMsg, "studio session probe"));
     api.config().then((c) => {
       setCfg(c);
       // honour admin defaults so the values we submit match the backend config
@@ -155,20 +203,37 @@ export default function Home() {
     }).catch((e) => showError(setMsg, e, "加载创作配置失败"));
     loadWorks({ restoreActive: true });
     try {
-      const draft = window.localStorage.getItem(STUDIO_DRAFT_PROMPT_KEY);
-      if (draft) {
-        setWorkspacePatch({ prompt: draft, promptDirty: true, promptSourceSignature: "" }, "image");
+      const draftRaw = window.localStorage.getItem(STUDIO_DRAFT_PROMPT_KEY);
+      if (draftRaw) {
+        const parsedDraft = parsePromptDraft(draftRaw);
+        const draftMode = promptDraftMode(parsedDraft);
+        setCreationMode(draftMode);
+        setWorkspacePatch({
+          prompt: parsedDraft.prompt,
+          promptDirty: true,
+          promptSourceSignature: "",
+        }, draftMode);
+        restoredLocalDraftAtRef.current = Number(parsedDraft.savedAt || Date.now());
         window.localStorage.removeItem(STUDIO_DRAFT_PROMPT_KEY);
       }
       const variationDraft = window.localStorage.getItem(STUDIO_VARIATION_DRAFT_KEY);
       if (variationDraft) {
-        window.localStorage.removeItem(STUDIO_VARIATION_DRAFT_KEY);
-        applyVariationDraft(JSON.parse(variationDraft));
+        if (applyVariationDraft(JSON.parse(variationDraft))) {
+          window.localStorage.removeItem(STUDIO_VARIATION_DRAFT_KEY);
+        }
+      }
+      const sessionDraft = window.localStorage.getItem(STUDIO_SESSION_DRAFT_KEY);
+      if (sessionDraft) {
+        window.localStorage.removeItem(STUDIO_SESSION_DRAFT_KEY);
+        const parsedDraft = JSON.parse(sessionDraft);
+        restoredLocalDraftAtRef.current = Number(parsedDraft.savedAt || Date.now());
+        restoreStudioSessionDraft(parsedDraft);
       }
     } catch (e) {
       reportBackgroundError(e, "restore studio draft");
     }
     return () => {
+      if (draftSyncTimerRef.current) window.clearTimeout(draftSyncTimerRef.current);
       stopAllTracking();
       revokeUploadedObjectUrls();
       revokeProductObjectUrls();
@@ -176,10 +241,25 @@ export default function Home() {
   }, []);
 
   useEffect(() => {
+    if (!me?.id || !cloudDraftLoadedRef.current) return undefined;
+    if (draftSyncTimerRef.current) window.clearTimeout(draftSyncTimerRef.current);
+    draftSyncTimerRef.current = window.setTimeout(() => {
+      syncStudioDraftToCloud("auto").catch((e) => reportBackgroundError(e, "sync studio cloud draft"));
+    }, 1600);
+    return () => {
+      if (draftSyncTimerRef.current) window.clearTimeout(draftSyncTimerRef.current);
+    };
+  }, [me?.id, workspaces, creationMode, showNegative, refOpen, structOpen]);
+
+  useEffect(() => {
     if (category !== "video" || VIDEO_RATIO_KEYS.has(ratio)) return;
     const current = RATIOS.find((r) => r.key === ratio) || RATIOS[0];
     setRatio(nearestRatio(current.w, current.h, videoRatioOptions()));
   }, [category, ratio]);
+
+  useEffect(() => {
+    setPromptSaveCategory(category === "video" ? "video" : "image");
+  }, [category]);
 
   function refreshMe() { api.me().then(setMe).catch((e) => reportBackgroundError(e, "refresh current user")); }
 
@@ -194,6 +274,7 @@ export default function Home() {
     dismissBackgroundTask,
     cancelBackgroundTask,
     showRunningProgress,
+    taskEtaText,
     restoreActiveTaskFromList,
     startTracking,
     trackBackgroundTask,
@@ -222,6 +303,7 @@ export default function Home() {
     pickAsset,
     doParse,
     doReverse,
+    lastReversePromptRef,
   } = useReferenceParsing({
     creationMode,
     category,
@@ -262,6 +344,7 @@ export default function Home() {
     creationMode,
     category,
     isEditMode,
+    subjectMode,
     uploading,
     setMsg,
     setWorkspacePatch,
@@ -328,9 +411,128 @@ export default function Home() {
     return modelEnabledForConfig(cfg, kind);
   }
 
+  function sanitizeAssetForDraft(asset) {
+    if (!asset) return null;
+    const clean = {};
+    for (const key of [
+      "id", "type", "url", "thumb", "preview_url", "original_url", "original_thumb",
+      "source_page_url", "source_captured_at", "width", "height", "thumb_width", "thumb_height",
+      "unlock_cost", "unlocked", "favorite",
+    ]) {
+      if (asset[key] !== undefined && asset[key] !== null) clean[key] = asset[key];
+    }
+    return clean;
+  }
+
+  function sanitizeWorkspaceForDraft(current) {
+    if (!current) return null;
+    return {
+      prompt: current.prompt || "",
+      negative: current.negative || "",
+      imageEditProductMode: !!current.imageEditProductMode,
+      editSubjectMode: current.editSubjectMode || "general",
+      ratio: current.ratio || "1:1",
+      imageQuality: current.imageQuality || "1k",
+      n: current.n || 1,
+      seed: current.seed || "",
+      vDuration: current.vDuration || 5,
+      vResolution: current.vResolution || "720p",
+      editMaskMode: current.editMaskMode || "protect_subject",
+      videoProductLockMode: current.videoProductLockMode || "locked",
+      videoAnalysisPreset: current.videoAnalysisPreset || "standard",
+      url: current.url || "",
+      assets: (current.assets || []).map(sanitizeAssetForDraft).filter(Boolean).slice(0, 12),
+      selected: sanitizeAssetForDraft(current.selected),
+      productAsset: sanitizeAssetForDraft(current.productAsset),
+      productProfile: current.productProfile || null,
+      productProfileSource: current.productProfileSource || "",
+      variationSource: sanitizeAssetForDraft(current.variationSource),
+      structured: current.structured || {},
+      structuredSource: current.structuredSource || "",
+      promptSourceSignature: current.promptSourceSignature || "",
+      negativeTouched: !!current.negativeTouched,
+      promptDirty: !!current.promptDirty,
+      parsing: false,
+      uploading: false,
+      reversing: false,
+      productProfiling: false,
+    };
+  }
+
+  function buildStudioSessionDraft(reason = "manual") {
+    const snapshot = workspacesRef.current || workspaces;
+    const savedWorkspaces = Object.fromEntries(
+      Object.entries(snapshot || {}).map(([mode, current]) => [mode, sanitizeWorkspaceForDraft(current)]),
+    );
+    return {
+      version: 1,
+      reason,
+      savedAt: Date.now(),
+      creationMode,
+      showNegative,
+      refOpen,
+      structOpen,
+      workspaces: savedWorkspaces,
+      activeTaskId: taskRef.current?.id || null,
+    };
+  }
+
+  function saveStudioSessionDraft(reason = "manual") {
+    if (typeof window === "undefined") return;
+    try {
+      const draft = buildStudioSessionDraft(reason);
+      window.localStorage.setItem(STUDIO_SESSION_DRAFT_KEY, JSON.stringify(draft));
+      if (me?.id) {
+        api.saveDraft("studio", draft).catch((e) => reportBackgroundError(e, "save studio cloud draft"));
+      }
+    } catch (e) {
+      reportBackgroundError(e, "save studio session draft");
+    }
+  }
+
+  async function syncStudioDraftToCloud(reason = "manual") {
+    if (!me?.id) return;
+    await api.saveDraft("studio", buildStudioSessionDraft(reason));
+  }
+
+  async function loadStudioCloudDraft() {
+    try {
+      const row = await api.getDraft("studio");
+      cloudDraftLoadedRef.current = true;
+      const draft = row?.payload;
+      if (!draft?.workspaces) return;
+      const remoteSavedAt = Number(draft.savedAt || 0);
+      if (restoredLocalDraftAtRef.current && remoteSavedAt <= restoredLocalDraftAtRef.current) return;
+      restoreStudioSessionDraft({ ...draft, reason: draft.reason || "cloud" });
+    } catch (e) {
+      cloudDraftLoadedRef.current = true;
+      reportBackgroundError(e, "load studio cloud draft");
+    }
+  }
+
+  function restoreStudioSessionDraft(draft) {
+    if (!draft?.workspaces || typeof draft.workspaces !== "object") return;
+    const validModes = new Set(CREATION_MODES.map((item) => item.key));
+    const restored = Object.fromEntries(
+      Object.entries(draft.workspaces)
+        .filter(([mode, current]) => validModes.has(mode) && current)
+        .map(([mode, current]) => [mode, { ...current }]),
+    );
+    if (!Object.keys(restored).length) return;
+    setWorkspaces((prev) => ({ ...prev, ...restored }));
+    if (validModes.has(draft.creationMode)) setCreationMode(draft.creationMode);
+    setShowNegative(!!draft.showNegative);
+    setRefOpen(!!draft.refOpen);
+    setStructOpen(draft.structOpen !== false);
+    setMsg("已恢复上次登录过期前的工作台草稿。");
+    notify.info(draft.reason === "cloud" ? "已恢复云端工作台草稿。" : "已恢复上次工作台草稿。");
+  }
+
   function switchCreationMode(kind) {
     if (!modelEnabled(kind)) {
-      setMsg(`${kind === "video" || kind === "video_edit" ? "视频" : "图片"}模型未启用，请联系管理员配置后再使用。`);
+      const text = `${kind === "video" || kind === "video_edit" ? "视频" : "图片"}模型未启用，请联系管理员配置后再使用。`;
+      setMsg(text);
+      notify.warn(text);
       return;
     }
     setMsg("");
@@ -355,9 +557,15 @@ export default function Home() {
         }
       }
       setWorks(flat);
+      setWorksError("");
       if (restoreActive && !taskRef.current) restoreActiveTaskFromList(list);
     } catch (e) {
-      if (seq === loadWorksSeqRef.current) setWorks([]);
+      if (seq !== loadWorksSeqRef.current) return;
+      reportBackgroundError(e, "load studio works");
+      const detail = errorMessage(e, "作品加载失败，请重试");
+      setWorksError(`${detail}。已保留当前作品列表。`);
+      setMsg("作品加载失败，请重试，当前作品列表已保留。");
+      notify.error("作品加载失败，请重试，当前作品列表已保留。");
     }
   }
 
@@ -436,6 +644,37 @@ export default function Home() {
     });
   }
 
+  async function saveReversePromptToLibrary() {
+    const text = String(prompt || "").trim();
+    if (!text) {
+      setMsg("当前没有可保存的提示词。");
+      notify.warn("当前没有可保存的提示词。");
+      return;
+    }
+    const reverseSource = lastReversePromptRef.current?.[creationMode] || {};
+    try {
+      await api.createPromptHistory({
+        title: promptSaveTitle.trim() || (category === "video" ? "反推视频提示词" : "反推图片提示词"),
+        prompt: text,
+        category: promptSaveCategory || (category === "video" ? "video" : "image"),
+        source: "reverse",
+        favorite: Boolean(promptSaveFavorite),
+        params: {
+          creation_mode: creationMode,
+          subject_mode: subjectMode,
+          source_signature: reverseSource.sourceSignature || structuredSource || promptSourceSignature || assetSignature(selected),
+          structured,
+        },
+      });
+      setMsg("已保存到“我的提示词”。");
+      notify.success("已保存到“我的提示词”。");
+    } catch (e) {
+      const text = errorMessage(e, "保存提示词失败，请稍后重试");
+      setMsg(text);
+      notify.error(text);
+    }
+  }
+
   function applyLibraryPrompt(text, mode = "replace") {
     const next = String(text || "").trim();
     if (!next) return;
@@ -487,8 +726,8 @@ export default function Home() {
 
   function applyVariationDraft(draft) {
     const asset = draft?.asset;
-    const sourceUrl = variationSourceUrl(asset);
-    if (!asset || asset.type !== "image" || !sourceUrl) return;
+    const sourceUrl = assetVariationSourceUrl(asset, { respectUnlock: true });
+    if (!asset || asset.type !== "image" || !sourceUrl) return false;
     const nextAsset = {
       ...asset,
       type: "image",
@@ -520,6 +759,7 @@ export default function Home() {
     setRefOpen(false);
     setShowNegative(false);
     setMsg("已带入历史图片，可直接生成变体，也可以先微调提示词。");
+    return true;
   }
 
   async function unlock(asset) {
@@ -792,6 +1032,38 @@ export default function Home() {
                 setStructured({ ...structured, [key]: value });
               }}
             />
+            {prompt?.trim() && (structuredSource || promptSourceSignature || lastReversePromptRef.current?.[creationMode]?.prompt) && (
+              <div className="mt-3 flex flex-wrap items-center justify-end gap-2 rounded-xl2 border border-line bg-white/[0.03] p-2">
+                <input
+                  className="input min-w-0 flex-1 px-3 py-2 text-xs sm:max-w-[220px]"
+                  placeholder="保存标题（可选）"
+                  value={promptSaveTitle}
+                  onChange={(e) => setPromptSaveTitle(e.target.value)}
+                />
+                <select
+                  className="input px-3 py-2 text-xs"
+                  value={promptSaveCategory}
+                  onChange={(e) => setPromptSaveCategory(e.target.value)}
+                  aria-label="提示词分类"
+                >
+                  <option value="image">图片</option>
+                  <option value="video">视频</option>
+                  <option value="general">通用</option>
+                </select>
+                <label className="chip cursor-pointer gap-1.5 px-3 py-2 text-xs">
+                  <input
+                    type="checkbox"
+                    checked={promptSaveFavorite}
+                    onChange={(e) => setPromptSaveFavorite(e.target.checked)}
+                    className="h-3.5 w-3.5 accent-brand"
+                  />
+                  收藏
+                </label>
+                <button type="button" onClick={saveReversePromptToLibrary} className="btn-secondary btn-sm">
+                  保存到我的提示词
+                </button>
+              </div>
+            )}
 
           </div>
 
@@ -812,6 +1084,9 @@ export default function Home() {
           busyAssetIds={busyAssetIds}
           onRefreshActiveTask={refreshActiveTask}
           onCancelTask={cancelActiveTask}
+          taskEtaText={taskEtaText}
+          worksError={worksError}
+          onReloadWorks={() => loadWorks()}
           onDismissBackgroundTask={dismissBackgroundTask}
           onCancelBackgroundTask={cancelBackgroundTask}
           onUnlock={unlock}

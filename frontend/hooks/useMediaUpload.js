@@ -2,6 +2,11 @@
 
 import { useRef } from "react";
 import { api } from "../lib/api";
+import { assetSignature, isRequestTimeoutError } from "../app/studio/helpers";
+import {
+  clearPendingReverseRequest,
+  generateReverseClientRequestId,
+} from "../app/studio/generationRequestId";
 
 const DEFAULT_MAX_UPLOAD_IMAGE_BYTES = 20 * 1024 * 1024;
 const DEFAULT_MAX_UPLOAD_VIDEO_BYTES = 512 * 1024 * 1024;
@@ -30,6 +35,7 @@ export default function useMediaUpload({
   creationMode,
   category,
   isEditMode,
+  subjectMode = "",
   uploading,
   setMsg,
   setWorkspacePatch,
@@ -48,6 +54,7 @@ export default function useMediaUpload({
   const videoUploadInputRef = useRef(null);
   const objectUrlsByModeRef = useRef({});
   const productObjectUrlsRef = useRef({});
+  const pendingProfileReverseRequestRef = useRef(null);
 
   function uploadLimitExceeded(file, kind) {
     const fallback = kind === "video" ? DEFAULT_MAX_UPLOAD_VIDEO_BYTES : DEFAULT_MAX_UPLOAD_IMAGE_BYTES;
@@ -112,6 +119,53 @@ export default function useMediaUpload({
     }), mode);
     selectAssetForMode(displayAsset, mode);
     setRefOpen(true);
+  }
+
+  async function prefetchProductProfile(mode, asset, uploadReqId) {
+    if (!isEditMode || !asset?.url || !["product", "portrait"].includes(subjectMode)) return;
+    const signature = assetSignature(asset);
+    setWorkspacePatch({ productProfiling: true, productProfile: null, productProfileSource: "" }, mode);
+    const profileRequestId = generateReverseClientRequestId(
+      pendingProfileReverseRequestRef,
+      `${mode}-profile-prefetch`,
+      JSON.stringify({
+        url: asset.url,
+        sourceType: "image",
+        target: "product_profile",
+        subjectMode,
+      }),
+    );
+    try {
+      const profile = await api.reverse(
+        asset.url,
+        "product_profile",
+        null,
+        "image",
+        null,
+        profileRequestId,
+      );
+      clearPendingReverseRequest(pendingProfileReverseRequestRef, profileRequestId);
+      if (!isRequestCurrent(productUploadRequestRef, mode, uploadReqId)) return;
+      setWorkspacePatch({
+        productProfile: {
+          structured: profile?.structured || {},
+          final_text: profile?.final_text || "",
+        },
+        productProfileSource: signature,
+        productProfiling: false,
+      }, mode);
+    } catch (e) {
+      if (!isRequestTimeoutError(e)) {
+        clearPendingReverseRequest(pendingProfileReverseRequestRef, profileRequestId);
+      }
+      if (!isRequestCurrent(productUploadRequestRef, mode, uploadReqId)) return;
+      setWorkspacePatch({
+        productProfile: null,
+        productProfileSource: "",
+        productProfiling: false,
+      }, mode);
+      if (isModeVisible(mode)) setMsg(`主体档案识别失败，可重新上传更清晰图片后再试：${e.message}`);
+    }
   }
 
   async function doUploadImage(file) {
@@ -181,6 +235,7 @@ export default function useMediaUpload({
         variationSource: null,
       }, mode);
       setRefOpen(true);
+      prefetchProductProfile(mode, asset, productReqId);
     } catch (e) {
       if (isModeVisible(mode)) setMsg(e.message);
     } finally {

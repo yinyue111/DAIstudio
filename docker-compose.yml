@@ -6,16 +6,18 @@
 #       python -m scripts.init_db --admin-phone 13800000000 --credits 1000
 # The migrate service runs Alembic first; init_db only seeds config/admin and
 # does not create tables in production.
-# Gateway key / other secrets are read from backend/.env (env_file below).
+# Gateway key / other secrets are read from BACKEND_ENV_FILE, defaulting to
+# backend/.env.production. For local Docker development, run with
+# BACKEND_ENV_FILE=./backend/.env DEPLOY_ENV=local.
 # DATABASE_URL / REDIS_URL are overridden here for the container network.
 # Reverse-proxy production defaults the browser API to same-origin /api and the
 # frontend server-side session probe to http://api:8000. If you access Compose
 # directly at :3000 without a reverse proxy, set NEXT_PUBLIC_API_BASE to the
 # browser-visible backend origin, for example http://localhost:8000.
 # Production: set POSTGRES_PASSWORD in the shell/root .env for Compose DB URL
-# interpolation. Backend application secrets (METRICS_TOKEN,
-# PAYMENT_CONFIG_SECRET, gateway keys, payment keys) are read from backend/.env
-# through env_file below so there is one source of truth.
+# interpolation. Backend application secrets (JWT_SECRET, METRICS_TOKEN,
+# PAYMENT_CONFIG_SECRET, gateway keys, payment keys) are read from
+# BACKEND_ENV_FILE through env_file below so there is one source of truth.
 # Service ports bind to localhost by default; publish them through nginx/reverse proxy.
 # TRUSTED_PROXY_IPS should list only the actual reverse-proxy source IPs. Do not
 # trust the whole Docker private range; use 127.0.0.1 for the default host proxy
@@ -24,6 +26,9 @@
 name: ai-media-studio
 
 x-pg-password: &pg_password ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD to a strong database password}
+x-backend-env-file: &backend_env_file
+  - path: ${BACKEND_ENV_FILE:-./backend/.env.production}
+    required: true
 
 services:
   postgres:
@@ -55,10 +60,9 @@ services:
 
   migrate:
     build: ./backend
-    env_file:
-      - path: ./backend/.env
-        required: false
+    env_file: *backend_env_file
     environment:
+      DEPLOY_ENV: ${DEPLOY_ENV:-production}
       DATABASE_URL: postgresql+psycopg2://postgres:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD to a strong database password}@postgres:5432/ai_studio
       REDIS_URL: redis://redis:6379/0
     command: alembic upgrade head
@@ -71,10 +75,9 @@ services:
   api:
     build: ./backend
     restart: unless-stopped
-    env_file:
-      - path: ./backend/.env
-        required: false
+    env_file: *backend_env_file
     environment:
+      DEPLOY_ENV: ${DEPLOY_ENV:-production}
       DATABASE_URL: postgresql+psycopg2://postgres:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD to a strong database password}@postgres:5432/ai_studio
       REDIS_URL: redis://redis:6379/0
     command: uvicorn app.main:app --host 0.0.0.0 --port 8000
@@ -99,10 +102,9 @@ services:
     # default jobs, and video polling responsive even when parse/video/image
     # workloads are saturated.
     command: celery -A app.celery_app.celery_app worker -l info --pool=${WORKER_CRITICAL_POOL:-threads} --concurrency=${WORKER_CRITICAL_CONCURRENCY:-2} -Q ${WORKER_CRITICAL_QUEUES:-default,payment,video_poll,cleanup}
-    env_file:
-      - path: ./backend/.env
-        required: false
+    env_file: *backend_env_file
     environment:
+      DEPLOY_ENV: ${DEPLOY_ENV:-production}
       DATABASE_URL: postgresql+psycopg2://postgres:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD to a strong database password}@postgres:5432/ai_studio
       REDIS_URL: redis://redis:6379/0
     mem_limit: ${WORKER_CRITICAL_MEM_LIMIT:-1g}
@@ -122,10 +124,9 @@ services:
     restart: unless-stopped
     stop_grace_period: ${WORKER_STOP_GRACE_PERIOD:-15m}
     command: celery -A app.celery_app.celery_app worker -l info --pool=${WORKER_IMAGE_POOL:-threads} --concurrency=${WORKER_IMAGE_CONCURRENCY:-4} -Q ${WORKER_IMAGE_QUEUES:-image}
-    env_file:
-      - path: ./backend/.env
-        required: false
+    env_file: *backend_env_file
     environment:
+      DEPLOY_ENV: ${DEPLOY_ENV:-production}
       DATABASE_URL: postgresql+psycopg2://postgres:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD to a strong database password}@postgres:5432/ai_studio
       REDIS_URL: redis://redis:6379/0
     mem_limit: ${WORKER_IMAGE_MEM_LIMIT:-2g}
@@ -145,10 +146,9 @@ services:
     restart: unless-stopped
     stop_grace_period: ${WORKER_STOP_GRACE_PERIOD:-15m}
     command: celery -A app.celery_app.celery_app worker -l info --pool=${WORKER_VIDEO_SUBMIT_POOL:-solo} --concurrency=${WORKER_VIDEO_SUBMIT_CONCURRENCY:-1} -Q ${WORKER_VIDEO_SUBMIT_QUEUES:-video_submit}
-    env_file:
-      - path: ./backend/.env
-        required: false
+    env_file: *backend_env_file
     environment:
+      DEPLOY_ENV: ${DEPLOY_ENV:-production}
       DATABASE_URL: postgresql+psycopg2://postgres:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD to a strong database password}@postgres:5432/ai_studio
       REDIS_URL: redis://redis:6379/0
     mem_limit: ${WORKER_VIDEO_SUBMIT_MEM_LIMIT:-1g}
@@ -168,10 +168,9 @@ services:
     restart: unless-stopped
     stop_grace_period: ${WORKER_STOP_GRACE_PERIOD:-15m}
     command: celery -A app.celery_app.celery_app worker -l info --pool=${WORKER_VIDEO_DOWNLOAD_POOL:-solo} --concurrency=${WORKER_VIDEO_DOWNLOAD_CONCURRENCY:-1} -Q ${WORKER_VIDEO_DOWNLOAD_QUEUES:-video_download}
-    env_file:
-      - path: ./backend/.env
-        required: false
+    env_file: *backend_env_file
     environment:
+      DEPLOY_ENV: ${DEPLOY_ENV:-production}
       DATABASE_URL: postgresql+psycopg2://postgres:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD to a strong database password}@postgres:5432/ai_studio
       REDIS_URL: redis://redis:6379/0
     mem_limit: ${WORKER_VIDEO_DOWNLOAD_MEM_LIMIT:-2g}
@@ -191,10 +190,9 @@ services:
     restart: unless-stopped
     stop_grace_period: ${WORKER_STOP_GRACE_PERIOD:-15m}
     command: celery -A app.celery_app.celery_app worker -l info --pool=${WORKER_PARSE_POOL:-solo} --concurrency=${WORKER_PARSE_CONCURRENCY:-1} -Q ${WORKER_PARSE_QUEUES:-parse}
-    env_file:
-      - path: ./backend/.env
-        required: false
+    env_file: *backend_env_file
     environment:
+      DEPLOY_ENV: ${DEPLOY_ENV:-production}
       DATABASE_URL: postgresql+psycopg2://postgres:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD to a strong database password}@postgres:5432/ai_studio
       REDIS_URL: redis://redis:6379/0
     # Chromium + anti-bot rendering can spike memory; keep parse isolated.
@@ -216,10 +214,9 @@ services:
     # Exactly ONE scheduler for the whole stack (retention cleanup, stuck-task
     # reaper, video-resume). Do not scale this service.
     command: celery -A app.celery_app.celery_app beat -l info
-    env_file:
-      - path: ./backend/.env
-        required: false
+    env_file: *backend_env_file
     environment:
+      DEPLOY_ENV: ${DEPLOY_ENV:-production}
       DATABASE_URL: postgresql+psycopg2://postgres:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD to a strong database password}@postgres:5432/ai_studio
       REDIS_URL: redis://redis:6379/0
     healthcheck:

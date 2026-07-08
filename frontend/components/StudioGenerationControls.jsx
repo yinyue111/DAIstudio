@@ -28,7 +28,7 @@ export default function StudioGenerationControls({
   isEditMode = false,
   productGenerationMode = false,
   portraitGenerationMode = false,
-  videoProductLockMode = "free",
+  videoProductLockMode = "locked",
   onVideoProductLockModeChange,
   showNegative,
   onToggleNegative,
@@ -65,6 +65,13 @@ export default function StudioGenerationControls({
     },
   ];
   const editMaskStatus = editMaskOptions.find((option) => option.key === editMaskMode)?.status || "自动识别主体";
+  const applyVideoProductMode = (mode) => {
+    onVideoProductLockModeChange?.(mode);
+    if (mode === "locked") {
+      const current = boundedVideoDuration(vDuration, maxVideoDuration);
+      if (current > 5) onVideoDurationChange?.(5);
+    }
+  };
 
   return (
     <>
@@ -221,18 +228,18 @@ export default function StudioGenerationControls({
                 <div className="flex min-w-0 items-center justify-between gap-3">
                   <span className={controlLabelClass}>产品运动</span>
                   <span className="min-w-0 truncate text-right text-xs text-fog">
-                    {videoProductLockMode === "locked" ? "首末帧锁定" : "保留首帧参考"}
+                    {videoProductLockMode === "locked" ? "文字保真" : "自由运动"}
                   </span>
                 </div>
                 <div className={`${scrollPillRowClass} mt-2`}>
                   {[
-                    { key: "free", label: "自由运动", hint: "只锚定首帧，更适合旋转、泼溅、推拉镜头和动态展示。" },
-                    { key: "locked", label: "高保真锁定", hint: "首末帧都使用产品图，更稳保留包装和文字，但运动会更克制。" },
+                    { key: "locked", label: "文字保真", hint: "首末帧都使用产品图，并自动压到短时长，更稳保留包装、Logo 和文字。" },
+                    { key: "free", label: "自由运动", hint: "只锚定首帧，更适合旋转、泼溅、推拉镜头和动态展示，但包装文字稳定性会下降。" },
                   ].map((option) => (
                     <button
                       key={option.key}
                       type="button"
-                      onClick={() => onVideoProductLockModeChange?.(option.key)}
+                      onClick={() => applyVideoProductMode(option.key)}
                       title={option.hint}
                       className={`chip shrink-0 ${videoProductLockMode === option.key ? "chip-active" : ""}`}
                     >
@@ -240,6 +247,9 @@ export default function StudioGenerationControls({
                     </button>
                   ))}
                 </div>
+                <p className="mt-2 text-xs leading-relaxed text-fog">
+                  包装小字多的产品建议使用高清正面图或透明 PNG；文字保真模式会使用更克制的镜头。自由运动模式下，快速旋转、泼溅和运动模糊会增加文字乱码概率。
+                </p>
               </div>
             )}
           </div>

@@ -1,6 +1,7 @@
 "use client";
 
 import { forwardRef } from "react";
+import { classifyGenerationError } from "../../lib/errorHandling";
 import { Lightbox, ResultCard } from "./StudioMedia.jsx";
 import GroupedAssetGallery from "./GroupedAssetGallery.jsx";
 import { isTerminalTaskStatus, statusStyle, statusZh, taskResultTitle } from "./helpers";
@@ -18,6 +19,9 @@ const StudioResults = forwardRef(function StudioResults({
   busyAssetIds,
   onRefreshActiveTask,
   onCancelTask,
+  taskEtaText,
+  worksError,
+  onReloadWorks,
   onDismissBackgroundTask,
   onCancelBackgroundTask,
   onUnlock,
@@ -46,6 +50,11 @@ const StudioResults = forwardRef(function StudioResults({
             </div>
             {showRunningProgress && (
               <div className="mb-4">
+                {taskEtaText && (
+                  <p className="mb-2 rounded-lg border border-line bg-white/[0.035] px-3 py-2 text-xs text-mist">
+                    {taskEtaText}
+                  </p>
+                )}
                 <div className="mb-2 h-1.5 w-full overflow-hidden rounded-full bg-white/[0.08]">
                   <div
                     className="h-full rounded-full bg-brand transition-all duration-500"
@@ -82,7 +91,16 @@ const StudioResults = forwardRef(function StudioResults({
                 </div>
               </div>
             )}
-            {task.error && <p className="mb-3 rounded-lg bg-bad/10 px-3 py-2 text-sm text-bad">{task.error}</p>}
+            {task.status === "needs_review" && (
+              <div className="mb-3 rounded-lg border border-warn/30 bg-warn/10 px-3 py-2 text-sm text-warn">
+                内容审核中，管理员可在后台待确认任务中处理；确认后可在历史记录中查看结果和积分状态。
+              </div>
+            )}
+            {task.error && (
+              <p className="mb-3 rounded-lg bg-bad/10 px-3 py-2 text-sm text-bad">
+                {classifyGenerationError(task, { category: task.category }).message}
+              </p>
+            )}
             {task.partial && (
               <div className="mb-3 rounded-lg bg-warn/10 px-3 py-2 text-sm text-warn">
                 {task.status === "needs_review" ? (
@@ -191,6 +209,14 @@ const StudioResults = forwardRef(function StudioResults({
           </div>
           <a href="/profile" className="btn-secondary btn-sm">查看全部</a>
         </div>
+        {worksError && (
+          <div className="mb-4 flex flex-col gap-2 rounded-xl border border-warn/30 bg-warn/10 px-4 py-3 text-sm text-warn sm:flex-row sm:items-center sm:justify-between">
+            <span>{worksError}</span>
+            <button type="button" onClick={onReloadWorks} className="btn-secondary btn-sm">
+              重试加载
+            </button>
+          </div>
+        )}
         {works === null ? (
           <div className="masonry">
             {Array.from({ length: 8 }).map((_, i) => (

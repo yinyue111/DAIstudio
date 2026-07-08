@@ -10,12 +10,12 @@ export function createWorkspaceState() {
     editSubjectMode: "general",
     ratio: "1:1",
     imageQuality: "1k",
-    n: 4,
+    n: 1,
     seed: "",
     vDuration: 5,
     vResolution: "720p",
     editMaskMode: "protect_subject",
-    videoProductLockMode: "free",
+    videoProductLockMode: "locked",
     videoAnalysisPreset: "standard",
     url: "",
     parsing: false,
@@ -108,6 +108,7 @@ export default function useStudioWorkspaceState({ creationMode, modes }) {
   };
 
   return {
+    workspaces,
     setWorkspaces,
     workspace,
     setWorkspacePatch,

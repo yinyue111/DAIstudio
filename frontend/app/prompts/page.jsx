@@ -4,11 +4,13 @@ import { useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import Nav from "../../components/Nav";
 import PromptLibraryBrowser, { STUDIO_DRAFT_PROMPT_KEY } from "../../components/PromptLibraryBrowser";
+import { useToast } from "../../components/ToastProvider";
 import { api } from "../../lib/api";
 import { redirectOnAuthError, reportBackgroundError } from "../../lib/errorHandling";
 
 export default function PromptsPage() {
   const router = useRouter();
+  const notify = useToast();
   const [me, setMe] = useState(null);
   const [msg, setMsg] = useState("");
   const [msgKind, setMsgKind] = useState("ok");
@@ -44,12 +46,18 @@ export default function PromptsPage() {
       if (req !== historyReqRef.current) return;
       setMsgKind("bad");
       setMsg(e.message);
+      notify.error(e.message || "提示词加载失败");
     }
   }
 
   function usePrompt(item) {
     try {
-      window.localStorage.setItem(STUDIO_DRAFT_PROMPT_KEY, item.prompt || "");
+      window.localStorage.setItem(STUDIO_DRAFT_PROMPT_KEY, JSON.stringify({
+        prompt: item.prompt || "",
+        category: item.category || "general",
+        creationMode: item.category === "video" ? "video" : "image",
+        savedAt: Date.now(),
+      }));
     } catch (e) {
       reportBackgroundError(e, "save prompt draft");
     }
@@ -65,10 +73,12 @@ export default function PromptsPage() {
       await navigator.clipboard.writeText(item.prompt || "");
       setMsgKind("ok");
       setMsg("提示词已复制");
+      notify.success("提示词已复制");
       window.setTimeout(() => setMsg(""), 1400);
     } catch (e) {
       setMsgKind("bad");
       setMsg("复制失败，请直接进入创作页套用");
+      notify.error("复制失败，请直接进入创作页套用");
     }
   }
 
@@ -76,6 +86,7 @@ export default function PromptsPage() {
     const text = manualPrompt.trim();
     if (!text) {
       setMsgKind("bad");
+      notify.warn("请先填写提示词");
       return setMsg("请先填写提示词");
     }
     setMsg("");
@@ -91,9 +102,11 @@ export default function PromptsPage() {
       loadHistory();
       setMsgKind("ok");
       setMsg("已保存到我的提示词");
+      notify.success("已保存到我的提示词");
     } catch (e) {
       setMsgKind("bad");
       setMsg(e.message);
+      notify.error(e.message || "保存提示词失败");
     }
   }
 
@@ -106,9 +119,11 @@ export default function PromptsPage() {
         }
         return rows.map((row) => (row.id === updated.id ? updated : row));
       });
+      notify.success(updated.favorite ? "已收藏提示词" : "已取消收藏");
     } catch (e) {
       setMsgKind("bad");
       setMsg(e.message);
+      notify.error(e.message || "收藏操作失败");
     }
   }
 
@@ -117,9 +132,11 @@ export default function PromptsPage() {
     try {
       await api.deletePromptHistory(item.id);
       setMyPrompts((rows) => rows.filter((row) => row.id !== item.id));
+      notify.success("提示词已删除");
     } catch (e) {
       setMsgKind("bad");
       setMsg(e.message);
+      notify.error(e.message || "删除提示词失败");
     }
   }
 

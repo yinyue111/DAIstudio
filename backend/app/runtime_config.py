@@ -1,6 +1,7 @@
 """Runtime configuration preflight shared by API and workers."""
 from __future__ import annotations
 
+import ipaddress
 from urllib.parse import urlparse
 
 from . import observability
@@ -45,9 +46,63 @@ def _validate_configured_egress_url(name: str, url: str, *, require_https: bool 
         raise RuntimeError(f"{name} 指向非公网地址或不安全地址:{e}") from e
 
 
+def _production_deploy_enabled() -> bool:
+    return str(getattr(settings, "deploy_env", "") or "").strip().lower() in {"prod", "production"}
+
+
+def _validate_public_https_url(name: str, url: str) -> None:
+    parsed = urlparse(str(url or ""))
+    host = (parsed.hostname or "").lower()
+    if parsed.scheme != "https" or host in {"localhost", "127.0.0.1", "::1"}:
+        raise RuntimeError(f"{name} 生产部署必须是 HTTPS 公网地址")
+
+
+def _validate_production_trusted_proxies() -> None:
+    for item in settings.trusted_proxy_ip_list:
+        if "/" not in item:
+            continue
+        try:
+            network = ipaddress.ip_network(item, strict=False)
+        except ValueError as e:
+            raise RuntimeError(f"TRUSTED_PROXY_IPS 包含非法 CIDR:{item}") from e
+        if not settings.allow_broad_trusted_proxy_cidr:
+            raise RuntimeError(
+                "DEPLOY_ENV=production 时 TRUSTED_PROXY_IPS 默认只允许单个反代 IP。"
+                f"请把 {item} 改为具体 IP，或确认风险后设置 ALLOW_BROAD_TRUSTED_PROXY_CIDR=true"
+            )
+        if network.prefixlen < (24 if network.version == 4 else 120):
+            raise RuntimeError(
+                "ALLOW_BROAD_TRUSTED_PROXY_CIDR=true 也不能信任过宽代理网段。"
+                f"请缩小 TRUSTED_PROXY_IPS={item}"
+            )
+
+
+def _validate_production_deploy_mode() -> None:
+    if not _production_deploy_enabled():
+        return
+    if settings.debug:
+        raise RuntimeError("DEPLOY_ENV=production 时必须设置 DEBUG=false")
+    _validate_public_https_url("PUBLIC_BASE_URL", settings.public_base_url)
+    _validate_public_https_url("PAYMENT_FRONTEND_BASE_URL", settings.payment_frontend_base_url)
+    if settings.sms_provider == "mock":
+        raise RuntimeError("DEPLOY_ENV=production 时禁止 SMS_PROVIDER=mock")
+    localhost_origins = [
+        origin for origin in settings.cors_origin_list
+        if (urlparse(origin).hostname or "").lower() in {"localhost", "127.0.0.1", "::1"}
+    ]
+    if localhost_origins:
+        raise RuntimeError("DEPLOY_ENV=production 时 CORS_ORIGINS 不能包含 localhost/127.0.0.1")
+    _validate_production_trusted_proxies()
+    if settings.online_update_enabled and not settings.online_update_require_signed_commits:
+        raise RuntimeError(
+            "DEPLOY_ENV=production 启用在线升级时必须设置 ONLINE_UPDATE_REQUIRE_SIGNED_COMMITS=true"
+        )
+
+
 def validate_runtime_config() -> None:
     celery_settings = settings.celery
     storage_settings = settings.storage
+    _validate_production_deploy_mode()
     if int(celery_settings.task_soft_time_limit_seconds) >= int(celery_settings.task_time_limit_seconds):
         raise RuntimeError("CELERY_TASK_SOFT_TIME_LIMIT_SECONDS 必须小于 CELERY_TASK_TIME_LIMIT_SECONDS")
     if not public_base_is_local() and settings.debug:
