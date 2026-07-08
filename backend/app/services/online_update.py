@@ -432,8 +432,21 @@ def _ensure_ready(
 
 
 def status(*, check_remote: bool = False) -> dict[str, Any]:
+    apply_command_configured = bool(str(settings.online_update_apply_command or "").strip())
+    apply_command_safe = False
+    apply_command_error = ""
+    if apply_command_configured:
+        try:
+            _apply_command()
+            apply_command_safe = True
+        except OnlineUpdateError as e:
+            apply_command_error = str(e)
+    deployment_mode = _deployment_mode()
     base = {
         "enabled": bool(settings.online_update_enabled),
+        "deployment_mode": deployment_mode,
+        "update_strategy": "manual",
+        "next_action": "在线升级未启用。启用前请先确认仓库目录、GitHub Token、签名校验和外部生效命令。",
         "repo_dir": str(Path(settings.online_update_repo_dir).expanduser()),
         "remote": settings.online_update_remote,
         "branch": settings.online_update_branch,
@@ -443,7 +456,9 @@ def status(*, check_remote: bool = False) -> dict[str, Any]:
         "remote_head": "",
         "dirty": False,
         "dirty_status": "",
-        "apply_command_configured": bool(str(settings.online_update_apply_command or "").strip()),
+        "apply_command_configured": apply_command_configured,
+        "apply_command_safe": apply_command_safe,
+        "apply_command_error": apply_command_error,
         "allow_dirty": bool(settings.online_update_allow_dirty),
         "require_signed_commits": bool(getattr(settings, "online_update_require_signed_commits", False)),
     }
@@ -453,7 +468,63 @@ def status(*, check_remote: bool = False) -> dict[str, Any]:
         base.update(_ensure_ready(repo, check_remote=check_remote, enforce_clean=False))
     except OnlineUpdateError as e:
         base.update({"error": str(e)})
+    base.update(_update_recommendation(base, deployment_mode=deployment_mode))
     return base
+
+
+def _deployment_mode() -> str:
+    deploy_env = str(getattr(settings, "deploy_env", "") or "").strip().lower()
+    in_docker = Path("/.dockerenv").exists() or bool(os.environ.get("container"))
+    if in_docker:
+        return "docker_compose"
+    if deploy_env in {"prod", "production", "staging"}:
+        return "systemd_or_process"
+    return "local_source"
+
+
+def _update_recommendation(status_data: dict[str, Any], *, deployment_mode: str) -> dict[str, str | bool]:
+    if not status_data.get("enabled"):
+        return {
+            "update_strategy": "disabled",
+            "can_apply_online": False,
+            "next_action": "在线升级未启用。需要真实 Git checkout、固定 remote/branch、GitHub Token 和安全的外部生效命令。",
+        }
+    if status_data.get("error"):
+        return {
+            "update_strategy": "blocked",
+            "can_apply_online": False,
+            "next_action": "升级预检未通过。请先修复仓库目录、分支、remote、Token、SSH 或工作区状态。",
+        }
+    if status_data.get("dirty") and not status_data.get("allow_dirty"):
+        return {
+            "update_strategy": "blocked",
+            "can_apply_online": False,
+            "next_action": "当前工作区有未提交改动。请先提交或清理后再升级。",
+        }
+    if status_data.get("apply_command_configured") and not status_data.get("apply_command_safe"):
+        return {
+            "update_strategy": "external_runner_required",
+            "can_apply_online": False,
+            "next_action": (
+                "已检测到生效命令会重启 API 或存在高风险。请改为宿主机 systemd oneshot、"
+                "外部运维队列或后台 supervisor 执行 Compose 重建/重启。"
+            ),
+        }
+    if status_data.get("apply_command_configured") and status_data.get("apply_command_safe"):
+        strategy = "external_runner" if deployment_mode == "docker_compose" else "safe_apply_command"
+        return {
+            "update_strategy": strategy,
+            "can_apply_online": True,
+            "next_action": "可以从页面触发升级。升级会先快进代码，再执行服务端固定生效命令。",
+        }
+    return {
+        "update_strategy": "manual_apply_required",
+        "can_apply_online": False,
+        "next_action": (
+            "当前只能检查远端版本，不能直接合并新代码。请配置安全的 ONLINE_UPDATE_APPLY_COMMAND，"
+            "或在宿主机手动执行拉取、迁移、构建和重启。"
+        ),
+    }
 
 
 def _apply_command() -> list[str]:

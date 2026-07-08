@@ -515,7 +515,11 @@ def test_product_image_edit_auto_generates_mask_for_inpaint(
             "final_text": "put this product in a clean studio scene",
             "instruction": "put this product in a clean studio scene",
         },
-        "params": {"n": 1, "size": "1024x1024", "edit_mask_mode": "protect_subject"},
+        "params": {
+            "n": 1,
+            "size": "1024x1024",
+            "edit_mask_mode": "protect_subject",
+        },
     }, headers=h)
     assert r.status_code == 200, r.text
 
@@ -564,7 +568,11 @@ def test_product_image_edit_rgb_mask_protects_detected_subject_not_center_backgr
             "final_text": "put this product in a bright lifestyle scene",
             "instruction": "put this product in a bright lifestyle scene",
         },
-        "params": {"n": 1, "size": "1024x1024", "edit_mask_mode": "protect_subject"},
+        "params": {
+            "n": 1,
+            "size": "1024x1024",
+            "edit_mask_mode": "protect_subject",
+        },
     }, headers=h)
     assert r.status_code == 200, r.text
 
@@ -599,11 +607,174 @@ def test_auto_subject_mask_detects_white_product_on_natural_background():
     assert bottom < 590
 
 
+def test_auto_subject_mask_recovers_white_product_body_on_white_background():
+    img = Image.new("RGB", (800, 800), (255, 255, 255))
+    draw = ImageDraw.Draw(img)
+    body = [(78, 365), (210, 284), (642, 300), (748, 420), (704, 592), (132, 514)]
+    draw.polygon(body, fill=(247, 247, 244), outline=(226, 226, 222))
+    draw.polygon([(210, 284), (385, 210), (690, 262), (642, 300)], fill=(250, 250, 247), outline=(226, 226, 222))
+    draw.polygon([(642, 300), (748, 420), (704, 592), (640, 525)], fill=(243, 243, 240), outline=(222, 222, 218))
+    draw.rectangle((282, 360, 480, 430), outline=(35, 35, 35), width=3)
+    draw.text((320, 382), "DAMAH", fill=(25, 25, 25))
+    draw.rectangle((180, 503, 676, 534), fill=(28, 28, 26))
+    draw.rectangle((322, 225, 438, 255), fill=(24, 24, 24))
+    draw.text((348, 232), "DAMAH", fill=(240, 240, 240))
+    for y in range(335, 500, 10):
+        draw.line((120, y, 700, y + 16), fill=(232, 232, 228), width=1)
+
+    result = generation_media._auto_subject_mask(img.convert("RGBA"))
+
+    assert result.mode == "auto_subject"
+    assert result.confidence >= generation_media.EDIT_MASK_SEND_CONFIDENCE
+    assert result.bbox is not None
+    left, top, right, bottom = result.bbox
+    assert left < 95
+    assert top < 250
+    assert right > 705
+    assert bottom > 565
+
+
+def test_auto_subject_mask_handles_common_white_product_shapes():
+    def bbox_area(bbox):
+        left, top, right, bottom = bbox
+        return max(0, right - left + 1) * max(0, bottom - top + 1)
+
+    def bbox_iou(a, b):
+        intersection = (
+            max(a[0], b[0]),
+            max(a[1], b[1]),
+            min(a[2], b[2]),
+            min(a[3], b[3]),
+        )
+        intersection_area = bbox_area(intersection)
+        return intersection_area / max(1, bbox_area(a) + bbox_area(b) - intersection_area)
+
+    cases = []
+
+    bottle = Image.new("RGB", (800, 800), (255, 255, 255))
+    draw = ImageDraw.Draw(bottle)
+    draw.rounded_rectangle((330, 235, 485, 640), radius=46, fill=(248, 248, 246), outline=(222, 222, 218), width=4)
+    draw.rectangle((372, 168, 443, 245), fill=(246, 246, 244), outline=(224, 224, 220), width=3)
+    draw.rectangle((390, 124, 480, 166), fill=(245, 245, 242), outline=(224, 224, 220), width=3)
+    draw.rectangle((478, 139, 558, 154), fill=(245, 245, 242), outline=(224, 224, 220), width=3)
+    draw.rectangle((356, 390, 460, 468), outline=(42, 42, 42), width=3)
+    draw.text((374, 420), "MILK", fill=(35, 35, 35))
+    for x in range(345, 470, 14):
+        draw.line((x, 250, x + 18, 630), fill=(235, 235, 232), width=1)
+    cases.append(("bottle", bottle, (320, 115, 565, 650)))
+
+    tube = Image.new("RGB", (800, 800), (255, 255, 255))
+    draw = ImageDraw.Draw(tube)
+    draw.polygon([(238, 190), (525, 250), (470, 650), (165, 594)], fill=(248, 248, 245), outline=(222, 222, 218))
+    draw.polygon([(170, 594), (470, 650), (454, 710), (152, 654)], fill=(238, 238, 234), outline=(215, 215, 210))
+    draw.line((242, 218, 508, 273), fill=(230, 230, 226), width=3)
+    draw.rectangle((292, 354, 425, 416), outline=(35, 35, 35), width=3)
+    draw.text((315, 378), "PURE", fill=(30, 30, 30))
+    for i in range(9):
+        draw.line((255 + i * 20, 230 + i * 4, 205 + i * 20, 590 + i * 4), fill=(235, 235, 231), width=1)
+    cases.append(("tube", tube, (145, 180, 535, 720)))
+
+    pouch = Image.new("RGB", (800, 800), (255, 255, 255))
+    draw = ImageDraw.Draw(pouch)
+    draw.rounded_rectangle((220, 170, 585, 635), radius=70, fill=(248, 248, 245), outline=(222, 222, 218), width=4)
+    draw.polygon([(245, 625), (565, 625), (610, 700), (198, 700)], fill=(238, 238, 234), outline=(216, 216, 212))
+    draw.arc((260, 170, 545, 255), start=0, end=180, fill=(228, 228, 224), width=3)
+    draw.rectangle((303, 340, 505, 430), outline=(30, 30, 30), width=3)
+    draw.text((355, 375), "SOFT", fill=(30, 30, 30))
+    for y in range(470, 600, 14):
+        draw.line((255, y, 550, y), fill=(233, 233, 230), width=1)
+    cases.append(("pouch", pouch, (190, 160, 615, 710)))
+
+    jar = Image.new("RGB", (800, 800), (255, 255, 255))
+    draw = ImageDraw.Draw(jar)
+    draw.ellipse((240, 215, 570, 340), fill=(250, 250, 247), outline=(222, 222, 218), width=4)
+    draw.rectangle((242, 277, 568, 555), fill=(247, 247, 244), outline=(222, 222, 218), width=4)
+    draw.ellipse((242, 490, 568, 620), fill=(242, 242, 238), outline=(218, 218, 214), width=4)
+    draw.rectangle((340, 376, 475, 445), outline=(30, 30, 30), width=3)
+    draw.text((370, 402), "JAR", fill=(30, 30, 30))
+    for y in range(300, 530, 16):
+        draw.line((260, y, 550, y + 4), fill=(235, 235, 232), width=1)
+    cases.append(("jar", jar, (230, 205, 580, 625)))
+
+    for name, image, expected in cases:
+        result = generation_media._auto_subject_mask(image.convert("RGBA"))
+        assert result.mode == "auto_subject", name
+        assert result.confidence >= generation_media.EDIT_MASK_SEND_CONFIDENCE, name
+        assert result.bbox is not None, name
+        assert bbox_iou(result.bbox, expected) >= 0.82, (name, result.bbox, expected)
+
+
 def test_product_image_edit_strict_lock_composites_original_subject_pixels(
     client, make_user, auth, monkeypatch
 ):
     uid = make_user("13900001973", balance=1000)
     h = auth("13900001973")
+
+    up = client.post(
+        "/api/uploads/image",
+        files={"file": ("product.png", _white_bg_product_png_bytes(), "image/png")},
+        headers=h,
+    )
+    assert up.status_code == 200, up.text
+    asset = up.json()
+
+    def fake_gen_image(prompt, image_model_id, n=4, size="1024x1024",
+                       reference_image_url=None, edit_path=None, extra_payload=None):
+        return [_repainted_product_scene_bytes()]
+
+    monkeypatch.setattr("app.services.gateway.gen_image", fake_gen_image)
+
+    r = client.post("/api/generate", json={
+        "source_asset_url": asset["url"],
+        "source_type": "image",
+        "source_asset_meta": {
+            "selected_type": "image",
+            "mode": "image_edit",
+            "product_generation_mode": True,
+        },
+        "category": "image",
+        "stage": "preview",
+        "prompt": {
+            "final_text": "put this product into a forest scene",
+            "instruction": "put this product into a forest scene",
+        },
+        "params": {
+            "n": 1,
+            "size": "1024x1024",
+            "edit_mask_mode": "protect_subject",
+            "product_pixel_lock": "strict",
+        },
+    }, headers=h)
+    assert r.status_code == 200, r.text
+
+    db = SessionLocal()
+    try:
+        task = (
+            db.query(GenTask)
+            .filter(GenTask.user_id == uid)
+            .order_by(GenTask.id.desc())
+            .first()
+        )
+        assert task is not None
+        assert task.params["_product_pixel_lock"] == "strict"
+        assert task.params["_product_composite_applied_count"] == 1
+        asset_row = db.query(GenAsset).filter(GenAsset.task_id == task.id).first()
+        assert asset_row is not None
+        hd_key = asset_row.hd_url.rsplit("/media/", 1)[1]
+        hd = Image.open(Path(settings.storage_dir) / hd_key)
+        r_px, g_px, b_px = hd.convert("RGB").getpixel((128, 128))
+        assert r_px > 140
+        assert g_px < 110
+        assert b_px < 110
+    finally:
+        db.close()
+
+
+def test_product_image_edit_rgb_auto_mask_composites_high_confidence_subject_by_default(
+    client, make_user, auth, monkeypatch
+):
+    uid = make_user("13900001974", balance=1000)
+    h = auth("13900001974")
 
     up = client.post(
         "/api/uploads/image",
@@ -646,16 +817,9 @@ def test_product_image_edit_strict_lock_composites_original_subject_pixels(
             .first()
         )
         assert task is not None
-        assert task.params["_product_pixel_lock"] == "strict"
+        assert task.params["_edit_mask_sent"] is True
+        assert task.params["_product_pixel_lock"] == "auto_subject"
         assert task.params["_product_composite_applied_count"] == 1
-        asset_row = db.query(GenAsset).filter(GenAsset.task_id == task.id).first()
-        assert asset_row is not None
-        hd_key = asset_row.hd_url.rsplit("/media/", 1)[1]
-        hd = Image.open(Path(settings.storage_dir) / hd_key)
-        r_px, g_px, b_px = hd.convert("RGB").getpixel((128, 128))
-        assert r_px > 140
-        assert g_px < 110
-        assert b_px < 110
     finally:
         db.close()
 
@@ -713,6 +877,62 @@ def test_product_image_edit_alpha_mask_records_high_confidence_subject_protectio
         assert task.params["_edit_mask_bbox"] == [45, 30, 119, 94]
         assert task.params["_edit_mask_requested_mode"] == "protect_subject"
         assert task.params["_edit_mask_sent"] is True
+    finally:
+        db.close()
+
+
+def test_product_image_edit_auto_mask_failure_does_not_send_center_box_fallback(
+    client, make_user, auth, monkeypatch
+):
+    uid = make_user("13900001975", balance=1000)
+    h = auth("13900001975")
+
+    up = client.post(
+        "/api/uploads/image",
+        files={"file": ("flat.png", _png_bytes(size=(300, 200)), "image/png")},
+        headers=h,
+    )
+    assert up.status_code == 200, up.text
+    asset = up.json()
+    seen = {}
+
+    def fake_gen_image(prompt, image_model_id, n=4, size="1024x1024",
+                       reference_image_url=None, edit_path=None, extra_payload=None):
+        seen["extra_payload"] = extra_payload or {}
+        return [_mock_image(prompt, "256x256", 0)]
+
+    monkeypatch.setattr("app.services.gateway.gen_image", fake_gen_image)
+
+    r = client.post("/api/generate", json={
+        "source_asset_url": asset["url"],
+        "source_type": "image",
+        "source_asset_meta": {
+            "selected_type": "image",
+            "mode": "image_edit",
+            "product_generation_mode": True,
+        },
+        "category": "image",
+        "stage": "preview",
+        "prompt": {
+            "final_text": "change the scene but keep the product",
+            "instruction": "change the scene but keep the product",
+        },
+        "params": {"n": 1, "size": "1024x1024", "edit_mask_mode": "protect_subject"},
+    }, headers=h)
+    assert r.status_code == 200, r.text
+    assert "mask" not in seen["extra_payload"]
+
+    db = SessionLocal()
+    try:
+        task = (
+            db.query(GenTask)
+            .filter(GenTask.user_id == uid)
+            .order_by(GenTask.id.desc())
+            .first()
+        )
+        assert task is not None
+        assert task.params["_edit_mask_mode"] == "none"
+        assert task.params["_edit_mask_sent"] is False
     finally:
         db.close()
 

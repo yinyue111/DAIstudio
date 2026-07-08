@@ -350,6 +350,14 @@ Docker Compose 部署时，在线升级配置同样写在 `backend/.env.producti
 
 生效命令不要在 API 进程里直接执行 `docker compose up/restart/down/rm`，尤其不能重启 `api` 服务。否则升级脚本会先停掉正在执行命令的 API 容器，命令中断后可能留下“新容器 Created、8000 端口无人监听”的半升级状态，Caddy 转发 `/api/*` 就会返回 502。后端会拒绝这种高风险命令和脚本内容。
 
+后台“版本升级”页会显示部署模式、升级策略和下一步建议：
+
+- `安全生效命令 / 外部执行器`：可以从页面触发升级，后端快进代码后执行固定生效命令。
+- `需外部执行器`：已配置命令但命令会重启 API 或存在高风险，页面会禁用升级按钮，必须改成宿主机 systemd oneshot、外部运维队列或 supervisor。
+- `需手动生效`：只允许检查远端版本，不能直接合并代码。需要先配置安全 `ONLINE_UPDATE_APPLY_COMMAND`，或由运维在宿主机手动拉取、迁移、构建和重启。
+
+类似 sub2api 的“页面更新后重启生效”依赖的是单二进制原子替换，然后让 systemd/Docker restart policy 拉起新进程。本项目是 FastAPI + Next.js + Celery + 迁移的多服务 Compose 架构，不能只替换 API 进程或让 API 自己执行 Compose；必须由 API 外部的执行器完成整组服务生效。
+
 推荐的 Docker 在线升级结构是“API 只拉代码和写状态，宿主机/外部进程完成重启”：
 
 1. `ONLINE_UPDATE_REPO_DIR` 指向宿主机真实 checkout 的挂载目录。

@@ -22,6 +22,8 @@ log = logging.getLogger("generation")
 VIDEO_RESOLUTIONS = ("480p", "720p", "1080p")
 EDIT_MASK_SEND_CONFIDENCE = 0.60
 EDIT_MASK_ANALYSIS_MAX_SIDE = 512
+EDIT_MASK_AUTO_EXPAND_RATIO = 0.010
+EDIT_MASK_AUTO_MAX_EXPAND = 7
 EditMaskMode = Literal["alpha_subject", "auto_subject", "center_box", "none"]
 
 
@@ -308,6 +310,38 @@ def _largest_component_mask(mask: Image.Image) -> tuple[Image.Image | None, tupl
     return Image.frombytes("L", (w, h), bytes(out)), best_bbox, len(best)
 
 
+def _odd_kernel_size(value: int, *, minimum: int = 3, maximum: int | None = None) -> int:
+    size = max(minimum, int(value))
+    if maximum is not None:
+        size = min(size, maximum)
+    if size % 2 == 0:
+        size += 1 if maximum is None or size < maximum else -1
+    return max(1, size)
+
+
+def _refine_auto_subject_alpha(component: Image.Image) -> Image.Image:
+    """Keep RGB auto masks tight so white upload backgrounds are not pasted back.
+
+    Alpha PNG uploads already provide a real cutout. For ordinary JPG/RGB
+    uploads we only have a heuristic subject mask, so aggressive dilation turns
+    any retained white background into a visible sticker edge after inpainting.
+    A tiny trim followed by a small expansion protects product edges without
+    preserving a thick background fringe.
+    """
+    original = component
+    if min(component.size) >= 96:
+        trimmed = component.filter(ImageFilter.MinFilter(3))
+        if trimmed.getbbox():
+            component = trimmed
+    expand = _odd_kernel_size(
+        int(round(min(component.size) * EDIT_MASK_AUTO_EXPAND_RATIO)),
+        minimum=3,
+        maximum=EDIT_MASK_AUTO_MAX_EXPAND,
+    )
+    expanded = component.filter(ImageFilter.MaxFilter(expand))
+    return expanded if expanded.getbbox() else original
+
+
 def _edge_enclosed_foreground_mask(rgb: Image.Image, *, bg_noise: float) -> Image.Image | None:
     """Recover white-on-white product interiors by treating strong edges as barriers.
 
@@ -359,7 +393,7 @@ def _edge_enclosed_foreground_mask(rgb: Image.Image, *, bg_noise: float) -> Imag
         if edge_value or not visited[idx]:
             out[idx] = 255
     mask = Image.frombytes("L", (w, h), bytes(out))
-    mask = mask.filter(ImageFilter.MaxFilter(5)).filter(ImageFilter.MinFilter(3))
+    mask = mask.filter(ImageFilter.MaxFilter(3)).filter(ImageFilter.MinFilter(3))
     bbox = _exclusive_bbox_to_inclusive(mask.getbbox())
     if not bbox:
         return None
@@ -370,6 +404,85 @@ def _edge_enclosed_foreground_mask(rgb: Image.Image, *, bg_noise: float) -> Imag
     if bbox[0] <= 1 or bbox[1] <= 1 or bbox[2] >= w - 2 or bbox[3] >= h - 2:
         return None
     return mask
+
+
+def _edge_span_subject_mask(
+    rgb: Image.Image,
+    *,
+    bg: tuple[int, int, int],
+    bg_noise: float,
+    bg_sat: int,
+) -> Image.Image | None:
+    """Infer a product silhouette from row spans on low-noise white backgrounds.
+
+    White packaging on a white upload background is the hardest cheap-CV case:
+    color distance mostly sees only logo/text/black base, while the actual box
+    body is near the background color. Product photos still contain faint edges,
+    texture, and printed details. For that case, collect reliable per-row detail
+    spans and fill between their left/right edges to approximate the full
+    product silhouette without falling back to a large rectangle.
+    """
+    if bg_noise > 18 or bg_sat > 40 or max(bg) < 225:
+        return None
+    w, h = rgb.size
+    if w < 32 or h < 32:
+        return None
+    gray = rgb.convert("L")
+    edges = gray.filter(ImageFilter.FIND_EDGES).tobytes()
+    data = rgb.tobytes()
+    raw = bytearray(w * h)
+    for y in range(3, h - 3):
+        row = y * w
+        for x in range(3, w - 3):
+            idx = row + x
+            base = idx * 3
+            r = data[base]
+            g = data[base + 1]
+            b = data[base + 2]
+            dist = max(abs(r - bg[0]), abs(g - bg[1]), abs(b - bg[2]))
+            dark = 255 - max(r, g, b)
+            if edges[idx] >= 10 or dist >= 12 or dark >= 14:
+                raw[idx] = 255
+    detail = Image.frombytes("L", (w, h), bytes(raw)).filter(ImageFilter.MaxFilter(3))
+    detail_data = detail.tobytes()
+    out = bytearray(w * h)
+    valid_rows = 0
+    for y in range(h):
+        row = y * w
+        left = None
+        right = None
+        count = 0
+        for x in range(w):
+            if detail_data[row + x]:
+                count += 1
+                if left is None:
+                    left = x
+                right = x
+        if left is None or right is None or count < 4:
+            continue
+        span_w = right - left + 1
+        if left <= 2 or right >= w - 3 or span_w > w * 0.86 or span_w < 8:
+            continue
+        expand = max(6, int(round(span_w * 0.06)))
+        left = max(0, left - expand)
+        right = min(w - 1, right + expand)
+        for x in range(left, right + 1):
+            out[row + x] = 255
+        valid_rows += 1
+    if valid_rows < max(12, int(h * 0.06)):
+        return None
+    mask = Image.frombytes("L", (w, h), bytes(out))
+    mask = mask.filter(ImageFilter.MaxFilter(7)).filter(ImageFilter.MinFilter(3))
+    component, bbox, area = _largest_component_mask(mask)
+    if component is None or bbox is None:
+        return None
+    area_ratio = area / max(1, w * h)
+    bbox_ratio = _bbox_area(bbox) / max(1, w * h)
+    if not (0.03 <= area_ratio <= 0.60 and 0.06 <= bbox_ratio <= 0.76):
+        return None
+    if bbox[0] <= 2 or bbox[1] <= 2 or bbox[2] >= w - 3 or bbox[3] >= h - 3:
+        return None
+    return component
 
 
 def _bright_neutral_subject_mask(rgb: Image.Image) -> tuple[Image.Image | None, tuple[int, int, int, int] | None, int]:
@@ -489,6 +602,9 @@ def _auto_subject_mask(img: Image.Image) -> EditMaskResult:
     enclosed = _edge_enclosed_foreground_mask(rgb, bg_noise=bg_noise)
     if enclosed is not None:
         candidate = ImageChops.lighter(candidate, enclosed)
+    span_subject = _edge_span_subject_mask(rgb, bg=bg, bg_noise=bg_noise, bg_sat=bg_sat)
+    if span_subject is not None:
+        candidate = ImageChops.lighter(candidate, span_subject)
     candidate = candidate.filter(ImageFilter.MaxFilter(5)).filter(ImageFilter.MinFilter(5))
     component, bbox, area = _largest_component_mask(candidate)
     bright_component = None
@@ -531,10 +647,7 @@ def _auto_subject_mask(img: Image.Image) -> EditMaskResult:
                 source_size[1],
                 "foreground_too_large",
             )
-    dilation = max(3, int(round(min(w, h) * 0.025)))
-    if dilation % 2 == 0:
-        dilation += 1
-    subject_alpha = component.filter(ImageFilter.MaxFilter(dilation))
+    subject_alpha = _refine_auto_subject_alpha(component)
     bbox = _exclusive_bbox_to_inclusive(subject_alpha.getbbox())
     if not bbox:
         return EditMaskResult(None, "none", 0.0, None, source_size[0], source_size[1], "empty_subject")
@@ -558,7 +671,7 @@ def _auto_subject_mask(img: Image.Image) -> EditMaskResult:
     if touches_edge or confidence < EDIT_MASK_SEND_CONFIDENCE:
         bright_component, bright_bbox, bright_area = _bright_neutral_subject_mask(rgb)
         if bright_component is not None and bright_bbox is not None:
-            bright_alpha = bright_component.filter(ImageFilter.MaxFilter(dilation))
+            bright_alpha = _refine_auto_subject_alpha(bright_component)
             bright_final_bbox = _exclusive_bbox_to_inclusive(bright_alpha.getbbox())
             if bright_final_bbox:
                 bright_confidence = max(confidence if not touches_edge else 0.0, 0.68)
@@ -631,10 +744,7 @@ def gateway_image_edit_mask(
             return _alpha_subject_mask(img, alpha)
         if str(edit_mask_mode or "").lower().strip() == "center_box":
             return _center_box_mask(img, reason="explicit_center_box")
-        result = _auto_subject_mask(img)
-        if result.data_uri:
-            return result
-        return _center_box_mask(img, reason=result.reason or "auto_subject_unavailable")
+        return _auto_subject_mask(img)
     except Exception as e:  # noqa: BLE001
         raise RuntimeError(f"编辑蒙版生成失败:{e}") from e
 
