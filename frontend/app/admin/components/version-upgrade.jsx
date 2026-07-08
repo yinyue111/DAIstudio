@@ -16,8 +16,29 @@ function StateBadge({ ok, children }) {
   );
 }
 
+function BadBadge({ children }) {
+  return <span className="badge bg-bad/15 text-bad">{children}</span>;
+}
+
 function isGithubHttps(remote) {
   return /^https:\/\/github\.com\//i.test(remote || "");
+}
+
+function deploymentModeLabel(value) {
+  if (value === "docker_compose") return "Docker Compose";
+  if (value === "systemd_or_process") return "Systemd/进程";
+  if (value === "local_source") return "本地源码";
+  return "未知";
+}
+
+function strategyLabel(value) {
+  if (value === "external_runner") return "外部执行器";
+  if (value === "safe_apply_command") return "安全生效命令";
+  if (value === "external_runner_required") return "需外部执行器";
+  if (value === "manual_apply_required") return "需手动生效";
+  if (value === "disabled") return "未启用";
+  if (value === "blocked") return "已阻塞";
+  return "手动";
 }
 
 export function VersionUpgrade() {
@@ -113,6 +134,20 @@ export function VersionUpgrade() {
       setMsgKind("bad");
       return;
     }
+    if (freshStatus.apply_command_configured && freshStatus.apply_command_safe === false) {
+      setRunning(false);
+      runningRef.current = false;
+      setMsg(freshStatus.apply_command_error || "当前 ONLINE_UPDATE_APPLY_COMMAND 不安全，已拒绝在线升级。请改为宿主机 systemd oneshot、外部运维队列或后台 supervisor 执行重启。");
+      setMsgKind("bad");
+      return;
+    }
+    if (!freshStatus.can_apply_online) {
+      setRunning(false);
+      runningRef.current = false;
+      setMsg(freshStatus.next_action || "当前配置不能从页面直接升级生效，请先完成服务端升级配置。");
+      setMsgKind("bad");
+      return;
+    }
     const applyText = freshStatus.apply_command_configured
       ? "升级完成后会执行服务端配置的生效命令。"
       : "当前没有配置生效命令，只能在已是最新版本时重新检查状态。";
@@ -173,10 +208,14 @@ export function VersionUpgrade() {
   }
 
   const currentIsRemote = status.current_head && status.remote_head && status.current_head === status.remote_head;
-  const canReapplyCurrent = Boolean(currentIsRemote && status.apply_command_configured);
+  const applyCommandUsable = Boolean(status.apply_command_configured && status.apply_command_safe !== false);
+  const canReapplyCurrent = Boolean(currentIsRemote && applyCommandUsable);
   const updateRequiresApplyCommand = Boolean(status.current_head && status.remote_head && !currentIsRemote && !status.apply_command_configured);
+  const unsafeApplyCommand = Boolean(status.apply_command_configured && status.apply_command_safe === false);
   const upgradeDisabled = running || !status.enabled || !!status.error || !status.remote_head
+    || !status.can_apply_online
     || updateRequiresApplyCommand
+    || unsafeApplyCommand
     || (currentIsRemote && !canReapplyCurrent);
 
   return (
@@ -194,7 +233,7 @@ export function VersionUpgrade() {
               {loading ? "刷新中…" : "检查远端版本"}
             </button>
             <button onClick={runUpgrade} disabled={upgradeDisabled} className="btn-primary btn-sm">
-              {running ? "升级中…" : updateRequiresApplyCommand ? "需先配置生效命令" : canReapplyCurrent ? "重新执行生效命令" : "从 GitHub 更新并生效"}
+              {running ? "升级中…" : unsafeApplyCommand ? "生效命令不安全" : updateRequiresApplyCommand ? "需先配置生效命令" : canReapplyCurrent ? "重新执行生效命令" : "从 GitHub 更新并生效"}
             </button>
           </div>
         </div>
@@ -218,9 +257,11 @@ export function VersionUpgrade() {
           </div>
           <div className="rounded-xl border border-line bg-base2/60 p-3">
             <div className="mb-1 text-xs text-fog">生效命令</div>
-            <StateBadge ok={status.apply_command_configured}>
-              {status.apply_command_configured ? "已配置" : "未配置"}
-            </StateBadge>
+            {status.apply_command_configured ? (
+              status.apply_command_safe === false ? <BadBadge>不安全</BadBadge> : <StateBadge ok>已配置</StateBadge>
+            ) : (
+              <StateBadge ok={false}>未配置</StateBadge>
+            )}
           </div>
           <div className="rounded-xl border border-line bg-base2/60 p-3">
             <div className="mb-1 text-xs text-fog">GitHub Token</div>
@@ -228,7 +269,30 @@ export function VersionUpgrade() {
               {status.github_token_configured ? "已配置" : isGithubHttps(status.remote) ? "未配置" : "不需要"}
             </StateBadge>
           </div>
+          <div className="rounded-xl border border-line bg-base2/60 p-3">
+            <div className="mb-1 text-xs text-fog">部署模式</div>
+            <StateBadge ok={status.deployment_mode !== "unknown"}>{deploymentModeLabel(status.deployment_mode)}</StateBadge>
+          </div>
+          <div className="rounded-xl border border-line bg-base2/60 p-3">
+            <div className="mb-1 text-xs text-fog">升级策略</div>
+            {status.can_apply_online ? (
+              <StateBadge ok>{strategyLabel(status.update_strategy)}</StateBadge>
+            ) : status.update_strategy === "blocked" || status.update_strategy === "external_runner_required" ? (
+              <BadBadge>{strategyLabel(status.update_strategy)}</BadBadge>
+            ) : (
+              <StateBadge ok={false}>{strategyLabel(status.update_strategy)}</StateBadge>
+            )}
+          </div>
         </div>
+
+        {status.next_action ? (
+          <div className={`mt-4 rounded-xl border p-3 text-sm ${
+            status.can_apply_online ? "border-ok/30 bg-ok/10 text-ok" : "border-warn/30 bg-warn/10 text-warn"
+          }`}>
+            <div className="font-semibold">下一步</div>
+            <div className="mt-1 text-xs leading-relaxed text-mist">{status.next_action}</div>
+          </div>
+        ) : null}
 
         <div className="mt-4 grid gap-3 text-sm md:grid-cols-2">
           <div className="rounded-xl border border-line bg-white/5 p-3">
@@ -262,6 +326,16 @@ export function VersionUpgrade() {
             <pre className="max-h-40 overflow-auto rounded-xl border border-warn/30 bg-warn/10 p-3 text-xs text-warn">
               {status.dirty_status}
             </pre>
+          </div>
+        ) : null}
+
+        {unsafeApplyCommand ? (
+          <div className="mt-4 rounded-xl border border-bad/30 bg-bad/10 p-3 text-sm text-bad">
+            <div className="font-semibold">当前生效命令会导致升级中断，已禁止执行。</div>
+            <div className="mt-2 whitespace-pre-wrap break-words text-xs leading-relaxed">{status.apply_command_error}</div>
+            <div className="mt-2 text-xs leading-relaxed text-mist">
+              处理方式：把 <span className="font-mono">ONLINE_UPDATE_APPLY_COMMAND</span> 改成只通知宿主机的固定命令，例如 systemd oneshot、外部运维队列或 supervisor；真正的 <span className="font-mono">docker compose up/restart api</span> 必须由 API 容器外部执行。
+            </div>
           </div>
         ) : null}
       </Card>

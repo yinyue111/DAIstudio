@@ -589,6 +589,10 @@ class PaymentProviderConfigOut(BaseModel):
 
 class OnlineUpdateStatusOut(BaseModel):
     enabled: bool
+    deployment_mode: str = "unknown"
+    update_strategy: str = "manual"
+    can_apply_online: bool = False
+    next_action: str = ""
     repo_dir: str
     remote: str
     branch: str
@@ -599,6 +603,8 @@ class OnlineUpdateStatusOut(BaseModel):
     dirty: bool = False
     dirty_status: str = ""
     apply_command_configured: bool = False
+    apply_command_safe: bool = False
+    apply_command_error: str = ""
     allow_dirty: bool = False
     require_signed_commits: bool = False
     error: str | None = None

@@ -637,6 +637,41 @@ def test_online_update_rejects_direct_docker_compose_apply_command(monkeypatch, 
         online_update._apply_command()
 
 
+def test_online_update_status_reports_unsafe_apply_command(monkeypatch, git_repos):
+    from app.services import online_update
+
+    _configure(monkeypatch, git_repos["work"], apply_command="docker compose up -d --build migrate api worker")
+
+    data = online_update.status(check_remote=False)
+
+    assert data["apply_command_configured"] is True
+    assert data["apply_command_safe"] is False
+    assert "不能在 API 进程内直接执行" in data["apply_command_error"]
+    assert data["can_apply_online"] is False
+    assert data["update_strategy"] == "external_runner_required"
+    assert "外部" in data["next_action"]
+    assert not data.get("error")
+
+
+def test_online_update_status_reports_safe_apply_strategy(monkeypatch, git_repos):
+    from app.services import online_update
+
+    _configure(
+        monkeypatch,
+        git_repos["work"],
+        apply_command=f"{shlex.quote(sys.executable)} --version",
+    )
+
+    data = online_update.status(check_remote=False)
+
+    assert data["apply_command_configured"] is True
+    assert data["apply_command_safe"] is True
+    assert data["can_apply_online"] is True
+    assert data["update_strategy"] in {"safe_apply_command", "external_runner"}
+    assert "可以" in data["next_action"]
+    assert not data.get("error")
+
+
 def test_online_update_rejects_make_apply_command(monkeypatch, git_repos):
     from app.services import online_update
 
