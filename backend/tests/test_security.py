@@ -179,7 +179,7 @@ def test_cancel_and_refund_holds_for_review_when_refund_fails(client, make_user,
 
 # ---------------------------------------------------------------- billing
 def test_default_n_image_charges_for_all_images(client, make_user, auth):
-    # no n supplied -> freeze AND settle must use the default image_n (4), not 1
+    # no n supplied -> freeze AND settle must use the configured default image_n
     make_user("13900000070", balance=1000)
     h = auth("13900000070")
     r = client.post("/api/generate", json={
@@ -189,9 +189,9 @@ def test_default_n_image_charges_for_all_images(client, make_user, auth):
     assert r.status_code == 200, r.text
     t = client.get(f"/api/tasks/{r.json()['id']}", headers=h).json()
     assert t["status"] == "succeeded", t
-    assert len(t["assets"]) == 4          # seeded image_n default
-    assert t["cost_settled"] == 60        # 1K image cost 15 * n(4)
-    assert client.get("/api/me", headers=h).json()["balance_credits"] == 940
+    assert len(t["assets"]) == 1          # seeded image_n default
+    assert t["cost_settled"] == 15        # 1K image cost 15 * n(1)
+    assert client.get("/api/me", headers=h).json()["balance_credits"] == 985
 
 
 def test_generate_response_exposes_only_public_params(client, make_user, auth):
@@ -1201,6 +1201,8 @@ def test_generate_records_source_trace_for_parsed_reference(client, make_user, a
                 "original_thumb": asset["original_thumb"],
                 "source_page_url": asset["source_page_url"],
                 "source_captured_at": asset["source_captured_at"],
+                "subject_profile_source": "product-upload-signature",
+                "subject_profile_summary": "上传产品是唯一商品主角，Logo、包装文字和盒型必须完整保留。" * 12,
                 "ignored": {"x": "y"},
             },
             "category": "image",
@@ -1226,6 +1228,9 @@ def test_generate_records_source_trace_for_parsed_reference(client, make_user, a
     assert trace["source_page_url"] == "https://www.xiaohongshu.com/explore/source-trace"
     assert trace["source_captured_at"] == asset["source_captured_at"]
     assert trace["source_type"] == "image"
+    assert trace["subject_profile_source"] == "product-upload-signature"
+    assert trace["subject_profile_summary"].startswith("上传产品是唯一商品主角")
+    assert len(trace["subject_profile_summary"]) > 128
     assert "ignored" not in trace
 
 

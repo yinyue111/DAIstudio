@@ -13,7 +13,7 @@ DEFAULT_SETTINGS = {
     "payment_enabled": False,
     "content_safety_enabled": False,
     "content_safety_banned_terms": "",
-    "image_n": 4,
+    "image_n": 1,
     "image_size": "1024x1024",
     "asset_retention_days": 30,
     "audit_retention_days": 90,

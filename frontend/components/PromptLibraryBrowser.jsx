@@ -1,6 +1,7 @@
 "use client";
 
-import { useDeferredValue, useEffect, useMemo, useState } from "react";
+import { useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { reportBackgroundError } from "../lib/errorHandling";
 
 export const STUDIO_DRAFT_PROMPT_KEY = "studio:draftPrompt";
@@ -19,6 +20,13 @@ function safeExternalUrl(value) {
   }
 }
 
+function safeImageUrl(value) {
+  const src = String(value || "").trim();
+  if (!src) return "";
+  if (src.startsWith("/") && !src.startsWith("//")) return src;
+  return safeExternalUrl(src);
+}
+
 export default function PromptLibraryBrowser({
   variant = "panel",
   title = "提示词库",
@@ -35,6 +43,7 @@ export default function PromptLibraryBrowser({
   const [query, setQuery] = useState("");
   const deferredQuery = useDeferredValue(query);
   const [activeCategory, setActiveCategory] = useState("all");
+  const [previewItem, setPreviewItem] = useState(null);
   const isPage = variant === "page";
   const [visible, setVisible] = useState(isPage ? 24 : 8);
   const pageSize = isPage ? 24 : 8;
@@ -196,6 +205,7 @@ export default function PromptLibraryBrowser({
                 secondaryLabel={secondaryLabel}
                 onPrimary={onPrimary}
                 onSecondary={onSecondary}
+                onPreviewImage={setPreviewItem}
               />
             ))}
           </div>
@@ -208,20 +218,38 @@ export default function PromptLibraryBrowser({
           )}
         </>
       )}
+      {previewItem && (
+        <PromptImageDialog
+          item={previewItem}
+          category={categories.find((c) => c.id === previewItem.category)}
+          onClose={() => setPreviewItem(null)}
+        />
+      )}
     </div>
   );
 }
 
-function PromptLibraryCard({ item, categories, primaryLabel, secondaryLabel, onPrimary, onSecondary }) {
+function PromptLibraryCard({ item, categories, primaryLabel, secondaryLabel, onPrimary, onSecondary, onPreviewImage }) {
   const category = categories.find((c) => c.id === item.category) || { label: item.category, accent: "#7b61ff" };
   const excerpt = compactPrompt(item.prompt);
   const sourceUrl = safeExternalUrl(item.sourceUrl);
+  const previewUrl = safeImageUrl(item.previewUrl);
   return (
     <article className="group overflow-hidden rounded-xl2 border border-line bg-black/15 transition hover:border-line2 hover:bg-white/5">
       <div className="grid grid-cols-[112px_1fr] gap-2 p-2">
         <div className="relative aspect-[4/5] overflow-hidden rounded-lg bg-black/20">
-          {item.previewUrl ? (
-            <img loading="lazy" src={item.previewUrl} alt="" className="h-full w-full object-cover transition duration-300 group-hover:scale-[1.04]" />
+          {previewUrl ? (
+            <button
+              type="button"
+              onClick={() => onPreviewImage?.(item)}
+              className="group/preview h-full w-full cursor-zoom-in text-left focus:outline-none focus-visible:ring-2 focus-visible:ring-brand"
+              aria-label={`查看大图：${item.title}`}
+            >
+              <img loading="lazy" src={previewUrl} alt="" className="h-full w-full object-cover transition duration-300 group-hover:scale-[1.04]" />
+              <span className="pointer-events-none absolute inset-x-0 bottom-0 bg-gradient-to-t from-black/75 via-black/25 to-transparent px-2 pb-2 pt-7 text-[10px] text-white/90 opacity-0 transition group-hover/preview:opacity-100 group-focus-visible/preview:opacity-100">
+                点击查看大图
+              </span>
+            </button>
           ) : (
             <div className="flex h-full w-full items-center justify-center px-2 text-center text-[11px] text-fog">无预览</div>
           )}
@@ -264,6 +292,79 @@ function PromptLibraryCard({ item, categories, primaryLabel, secondaryLabel, onP
       </div>
     </article>
   );
+}
+
+function PromptImageDialog({ item, category, onClose }) {
+  const dialogRef = useRef(null);
+  const previousFocusRef = useRef(null);
+  const previewUrl = safeImageUrl(item.previewUrl);
+  const sourceUrl = safeExternalUrl(item.sourceUrl);
+
+  useEffect(() => {
+    previousFocusRef.current = document.activeElement;
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    dialogRef.current?.focus();
+    const onKeyDown = (event) => {
+      if (event.key !== "Escape") return;
+      event.preventDefault();
+      onClose();
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => {
+      window.removeEventListener("keydown", onKeyDown);
+      document.body.style.overflow = previousOverflow;
+      const previous = previousFocusRef.current;
+      if (previous && typeof previous.focus === "function") previous.focus();
+    };
+  }, [onClose]);
+
+  if (!previewUrl || typeof document === "undefined") return null;
+
+  return createPortal((
+    <div
+      ref={dialogRef}
+      tabIndex={-1}
+      role="dialog"
+      aria-modal="true"
+      aria-label={`提示词预览：${item.title}`}
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 p-3 backdrop-blur-sm outline-none sm:p-5"
+      onClick={onClose}
+    >
+      <div className="panel max-h-[92vh] w-full max-w-5xl overflow-hidden p-3 sm:p-4" onClick={(e) => e.stopPropagation()}>
+        <div className="flex max-h-[76vh] items-center justify-center overflow-hidden rounded-xl2 bg-black/30">
+          <img
+            src={previewUrl}
+            alt={item.title}
+            className="max-h-[76vh] w-auto max-w-full object-contain"
+          />
+        </div>
+        <div className="mt-3 flex flex-col gap-2 text-sm sm:flex-row sm:items-center sm:justify-between">
+          <div className="min-w-0">
+            <div className="flex items-center gap-2">
+              <span
+                className="h-1.5 w-1.5 shrink-0 rounded-full"
+                style={{ backgroundColor: category?.accent || "#7b61ff" }}
+              />
+              <span className="truncate font-semibold text-snow">{item.title}</span>
+            </div>
+            <p className="mt-0.5 text-xs text-fog">
+              {category?.label || item.category} · Case {item.caseId}
+              {sourceUrl ? (
+                <>
+                  <span> · </span>
+                  <a className="text-brand hover:text-iris-400" href={sourceUrl} target="_blank" rel="noreferrer">
+                    查看来源
+                  </a>
+                </>
+              ) : null}
+            </p>
+          </div>
+          <button type="button" onClick={onClose} className="btn-secondary btn-sm shrink-0">关闭</button>
+        </div>
+      </div>
+    </div>
+  ), document.body);
 }
 
 function compactPrompt(value) {

@@ -17,6 +17,7 @@ from pathlib import Path
 path = Path(".env")
 text = path.read_text()
 replacements = {
+    "DEPLOY_ENV=production": "DEPLOY_ENV=local",
     "DEBUG=false": "DEBUG=true",
     "MOCK_MODE=false": "MOCK_MODE=true",
     "GATEWAY_BASE_URL=https://your-gateway": "GATEWAY_BASE_URL=",
@@ -26,7 +27,7 @@ for old, new in replacements.items():
     text = text.replace(old, new)
 path.write_text(text)
 PY
-  echo "   created backend/.env for local development (DEBUG=true, MOCK_MODE=true)"
+  echo "   created backend/.env for local development (DEPLOY_ENV=local, DEBUG=true, MOCK_MODE=true)"
 fi
 
 echo "==> (optional) Playwright chromium for dynamic-page scraping"

@@ -12,11 +12,148 @@ from sqlalchemy.orm import Session
 from ..db import get_db
 from ..deps import require_admin
 from ..models import CreditTransaction, GatewayCall, GenTask, User
+from ..services.error_codes import task_error_type
 from .admin_helpers import csv_cell as _csv_cell
 from .admin_helpers import date_key as _date_key
 from .admin_helpers import parse_date as _parse_date
 
 router = APIRouter()
+
+
+def _filter_range(query, column, start_dt, end_dt):
+    if start_dt:
+        query = query.where(column >= start_dt)
+    if end_dt:
+        query = query.where(column <= end_dt)
+    return query
+
+
+def _duration_seconds(task: GenTask) -> int | None:
+    if not task.created_at or not task.finished_at:
+        return None
+    seconds = int((task.finished_at - task.created_at).total_seconds())
+    return seconds if seconds > 0 else None
+
+
+def _detail_cost_credits(detail: dict | None) -> int:
+    if not isinstance(detail, dict):
+        return 0
+    for key in ("estimated_cost_credits", "cost_credits", "credits", "real_cost_credits"):
+        value = detail.get(key)
+        if value is None:
+            continue
+        try:
+            return max(0, int(value))
+        except (TypeError, ValueError):
+            continue
+    return 0
+
+
+@router.get("/usage/dashboard")
+def usage_dashboard(
+    db: Session = Depends(get_db),
+    _: User = Depends(require_admin),
+    start: str | None = None,
+    end: str | None = None,
+):
+    start_dt = _parse_date(start)
+    end_dt = _parse_date(end, end_of_day=True)
+    q = select(GenTask)
+    q = _filter_range(q, GenTask.created_at, start_dt, end_dt)
+    tasks = list(db.execute(q).scalars())
+    task_count = len(tasks)
+    success_count = sum(1 for task in tasks if task.status == "succeeded")
+    failed_count = sum(1 for task in tasks if task.status == "failed")
+    review_count = sum(1 for task in tasks if task.status == "needs_review")
+    durations = [seconds for task in tasks if (seconds := _duration_seconds(task))]
+    dau = len({task.user_id for task in tasks if task.user_id})
+    by_category: dict[str, int] = {}
+    failure_reasons = {
+        "moderation": 0,
+        "user_input": 0,
+        "provider_timeout": 0,
+        "provider_error": 0,
+        "system_error": 0,
+    }
+    for task in tasks:
+        by_category[task.category] = by_category.get(task.category, 0) + 1
+        if task.status in {"failed", "needs_review"}:
+            key = task_error_type(task.params, task.error, status=task.status) or "system_error"
+            failure_reasons[key] = failure_reasons.get(key, 0) + 1
+    daily: dict[str, dict[str, int]] = {}
+    for task in tasks:
+        day = _date_key(task.created_at)
+        if not day:
+            continue
+        row = daily.setdefault(day, {"date": day, "tasks": 0, "succeeded": 0, "failed": 0})
+        row["tasks"] += 1
+        if task.status == "succeeded":
+            row["succeeded"] += 1
+        if task.status == "failed":
+            row["failed"] += 1
+    return {
+        "summary": {
+            "dau": dau,
+            "task_count": task_count,
+            "success_count": success_count,
+            "failed_count": failed_count,
+            "needs_review_count": review_count,
+            "success_rate": round(success_count / task_count, 4) if task_count else 0,
+        },
+        "by_category": by_category,
+        "failure_reasons": failure_reasons,
+        "avg_duration_seconds": round(sum(durations) / len(durations), 1) if durations else 0,
+        "daily": [daily[key] for key in sorted(daily)],
+    }
+
+
+@router.get("/usage/model-costs")
+def model_costs(
+    db: Session = Depends(get_db),
+    _: User = Depends(require_admin),
+    start: str | None = None,
+    end: str | None = None,
+):
+    start_dt = _parse_date(start)
+    end_dt = _parse_date(end, end_of_day=True)
+    q = select(GatewayCall)
+    q = _filter_range(q, GatewayCall.created_at, start_dt, end_dt)
+    grouped: dict[tuple[str, str], dict] = {}
+    for call in db.execute(q).scalars():
+        key = (call.model_id or "unknown", call.kind or "unknown")
+        row = grouped.setdefault(
+            key,
+            {
+                "model_id": key[0],
+                "kind": key[1],
+                "call_count": 0,
+                "ok_count": 0,
+                "failed_count": 0,
+                "total_tokens": 0,
+                "estimated_cost_credits": 0,
+                "latency_ms_total": 0,
+                "latency_samples": 0,
+            },
+        )
+        row["call_count"] += 1
+        if call.status == "failed":
+            row["failed_count"] += 1
+        else:
+            row["ok_count"] += 1
+        row["total_tokens"] += int(call.total_tokens or 0)
+        row["estimated_cost_credits"] += _detail_cost_credits(call.detail)
+        if call.latency_ms is not None:
+            row["latency_ms_total"] += int(call.latency_ms or 0)
+            row["latency_samples"] += 1
+    rows = []
+    for row in grouped.values():
+        samples = row.pop("latency_samples")
+        total_latency = row.pop("latency_ms_total")
+        row["avg_latency_ms"] = round(total_latency / samples, 1) if samples else 0
+        row["failure_rate"] = round(row["failed_count"] / row["call_count"], 4) if row["call_count"] else 0
+        rows.append(row)
+    rows.sort(key=lambda item: (-item["estimated_cost_credits"], -item["call_count"], item["model_id"]))
+    return {"models": rows}
 
 
 @router.get("/usage/report")

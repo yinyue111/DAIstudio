@@ -62,6 +62,7 @@ export default function useReferenceParsing({
   const parseRequestRef = useRef({});
   const reverseRequestRef = useRef({});
   const pendingReverseRequestRef = useRef({});
+  const lastReversePromptRef = useRef({});
   const creationModeRef = useRef("image");
   const urlByModeRef = useRef({});
 
@@ -259,6 +260,12 @@ export default function useReferenceParsing({
             subject: subjectMode,
           })
         : composePromptFromStructured(structured, result.final_text || "");
+      lastReversePromptRef.current[mode] = {
+        prompt: reversePrompt,
+        structured,
+        sourceSignature: targetSignature,
+        category: targetCategory,
+      };
       setWorkspacePatch((current) => {
         const currentPrompt = String(current.prompt || "");
         const currentNegative = String(current.negative || "");
@@ -299,5 +306,6 @@ export default function useReferenceParsing({
     pickAsset,
     doParse,
     doReverse,
+    lastReversePromptRef,
   };
 }

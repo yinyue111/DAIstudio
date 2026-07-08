@@ -153,7 +153,7 @@ Docker Compose 会启动 PostgreSQL、Redis、迁移任务、API、Celery Worker
 ### 1. 准备生产环境变量
 
 ```bash
-cp backend/.env.example backend/.env
+cp backend/.env.example backend/.env.production
 ```
 
 生产必须配置强随机密钥：
@@ -178,7 +178,7 @@ TRUSTED_PROXY_IPS=127.0.0.1
 export POSTGRES_PASSWORD='<strong-postgres-password>'
 ```
 
-`DEBUG`、`PUBLIC_BASE_URL`、`CORS_ORIGINS`、`TRUSTED_PROXY_IPS`、短信、支付、模型网关和在线升级等后端应用配置都只写入 `backend/.env`。Compose 会通过 `env_file` 读取它们；宿主 shell/根目录 `.env` 只用于 `POSTGRES_PASSWORD`、端口和前端构建参数，避免覆盖 `backend/.env`。
+`DEBUG`、`PUBLIC_BASE_URL`、`CORS_ORIGINS`、`TRUSTED_PROXY_IPS`、短信、支付、模型网关和在线升级等后端应用配置都只写入 `backend/.env.production`。Compose 默认通过 `BACKEND_ENV_FILE=./backend/.env.production` 读取它们；宿主 shell/根目录 `.env` 只用于 `POSTGRES_PASSWORD`、端口和前端构建参数，避免覆盖后端应用配置。若你使用其他文件名，启动时显式设置 `BACKEND_ENV_FILE=/path/to/backend.env`。
 
 ### 2. 启动全栈
 
@@ -210,11 +210,12 @@ worker_parse  parse
 ```bash
 WORKER_ROLE=critical ./scripts/run_worker.sh
 WORKER_ROLE=image WORKER_CONCURRENCY=6 ./scripts/run_worker.sh
-WORKER_ROLE=video ./scripts/run_worker.sh
+WORKER_ROLE=video-submit ./scripts/run_worker.sh
+WORKER_ROLE=video-download ./scripts/run_worker.sh
 WORKER_ROLE=parse ./scripts/run_worker.sh
 ```
 
-特殊场景仍可直接覆盖 `WORKER_QUEUES`。需要兼容 macOS fork 调试时，可显式设置 `WORKER_POOL=solo WORKER_CONCURRENCY=1`，但这会让对应 worker 串行执行。`beat` 服务只能保留一个实例，负责支付对账、卡死任务回收、视频轮询恢复和清理任务。
+`WORKER_ROLE=video` 仍作为本地兼容别名存在，但会同时消费 `video_submit,video_download`，生产不建议使用。特殊场景仍可直接覆盖 `WORKER_QUEUES`。需要兼容 macOS fork 调试时，可显式设置 `WORKER_POOL=solo WORKER_CONCURRENCY=1`，但这会让对应 worker 串行执行。`beat` 服务只能保留一个实例，负责支付对账、卡死任务回收、视频轮询恢复和清理任务。
 
 ## 域名与反向代理
 
@@ -332,6 +333,7 @@ ONLINE_UPDATE_APPLY_COMMAND=/usr/local/bin/ai-studio-apply-update
 ONLINE_UPDATE_TIMEOUT_SECONDS=600
 ONLINE_UPDATE_ALLOW_DIRTY=false
 ONLINE_UPDATE_ALLOW_LOCAL_REMOTE=false
+ONLINE_UPDATE_REQUIRE_SIGNED_COMMITS=true
 ```
 
 私有 GitHub 仓库需要创建一个只读 token：
@@ -344,7 +346,7 @@ ONLINE_UPDATE_ALLOW_LOCAL_REMOTE=false
 
 不要写成 `https://token@github.com/...`。后端会拒绝带用户名/密码的 remote，并且会把 token 通过临时 Git 环境配置传给 `ls-remote/fetch`，接口输出和命令日志会做脱敏。
 
-Docker Compose 部署时，在线升级配置同样写在 `backend/.env`。Compose 不会用空默认值覆盖 `backend/.env` 里的 `ONLINE_UPDATE_*`，但镜像内 `/app` 默认不是 Git checkout。要在容器内直接点“从 GitHub 更新并生效”，需要把宿主机真实 checkout 挂载为 `ONLINE_UPDATE_REPO_DIR`；否则请把 `ONLINE_UPDATE_ENABLED=false`，避免后台显示可升级但实际目录没有 `.git`。
+Docker Compose 部署时，在线升级配置同样写在 `backend/.env.production`。Compose 不会用空默认值覆盖该文件里的 `ONLINE_UPDATE_*`，但镜像内 `/app` 默认不是 Git checkout。要在容器内直接点“从 GitHub 更新并生效”，需要把宿主机真实 checkout 挂载为 `ONLINE_UPDATE_REPO_DIR`；否则请把 `ONLINE_UPDATE_ENABLED=false`，避免后台显示可升级但实际目录没有 `.git`。生产环境启用在线升级时必须设置 `ONLINE_UPDATE_REQUIRE_SIGNED_COMMITS=true`，并确保发布分支提交能通过 `git verify-commit`。
 
 生效命令不要在 API 进程里直接执行 `docker compose up/restart/down/rm`，尤其不能重启 `api` 服务。否则升级脚本会先停掉正在执行命令的 API 容器，命令中断后可能留下“新容器 Created、8000 端口无人监听”的半升级状态，Caddy 转发 `/api/*` 就会返回 502。后端会拒绝这种高风险命令和脚本内容。
 
@@ -355,7 +357,7 @@ Docker Compose 部署时，在线升级配置同样写在 `backend/.env`。Compo
 3. 宿主机 oneshot/supervisor 再执行 `docker compose up -d --build migrate api worker worker_image worker_video worker_video_download worker_parse beat frontend`。
 4. 重启完成后先用 `https://dream.aiwuq.cn/api/live` 确认进程存活，再用 `https://dream.aiwuq.cn/api/ready` 确认 DB/Redis 就绪，最后检查容器状态和后台版本页。
 
-如果暂时没有宿主机执行器，建议把 `ONLINE_UPDATE_APPLY_COMMAND` 留空：后台只完成 Git 快进，之后由运维在宿主机手动执行 Compose 生效。
+如果暂时没有宿主机执行器，建议把 `ONLINE_UPDATE_APPLY_COMMAND` 留空：后台只允许查看远端版本和升级预检；检测到新版本时会拒绝直接合并代码，之后由运维在宿主机手动执行拉取、迁移和 Compose 生效。
 
 在服务器上用同一个用户验证：
 

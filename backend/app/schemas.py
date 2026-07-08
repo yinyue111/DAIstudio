@@ -72,6 +72,22 @@ class UserOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
 
+class UserDraftIn(BaseModel):
+    payload: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("payload")
+    @classmethod
+    def _payload_size(cls, v: dict[str, Any]) -> dict[str, Any]:
+        _validate_json_payload_size(v, 96 * 1024, "草稿")
+        return v
+
+
+class UserDraftOut(BaseModel):
+    key: str
+    payload: dict[str, Any] = Field(default_factory=dict)
+    updated_at: datetime | None = None
+
+
 # --- Parse ---
 class ParseIn(BaseModel):
     url: str
@@ -148,6 +164,12 @@ class TaskOut(BaseModel):
     cost_frozen: int
     cost_settled: int
     error: str | None = None
+    error_type: str | None = None
+    error_message: str | None = None
+    eta_source: str | None = None
+    eta_total_seconds: int | None = None
+    eta_remaining_seconds: int | None = None
+    eta_sample_count: int | None = None
     partial: bool = False
     requested_count: int | None = None
     saved_count: int | None = None

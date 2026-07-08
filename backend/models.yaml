@@ -71,5 +71,5 @@ defaults:
   reverse_prompt_enabled: true
   sms_auth_enabled: false
   payment_enabled: false
-  image_n: 4
+  image_n: 1
   image_size: 1024x1024

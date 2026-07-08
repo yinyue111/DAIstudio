@@ -4,6 +4,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import QRCode from "qrcode";
 import Nav from "../../components/Nav";
+import { useToast } from "../../components/ToastProvider";
 import { api, loginPath, wsUrl } from "../../lib/api";
 import { reportBackgroundError } from "../../lib/errorHandling";
 import { paymentStatusStyle, paymentStatusText } from "./status";
@@ -15,6 +16,7 @@ const PROVIDERS = [
 
 export default function RechargePage() {
   const router = useRouter();
+  const notify = useToast();
   const [me, setMe] = useState(null);
   const [packages, setPackages] = useState([]);
   const [providers, setProviders] = useState([]);
@@ -70,6 +72,7 @@ export default function RechargePage() {
           return;
         }
         setMsg(e.message);
+        notify.error(e.message || "充值页加载失败");
       });
     return () => {
       if (pollRef.current) clearInterval(pollRef.current);
@@ -100,6 +103,7 @@ export default function RechargePage() {
                 if (activeOrderRef.current?.order_no === orderNo) setActiveOrder(next);
                 api.me().then(setMe).catch((e) => reportBackgroundError(e, "refresh current user after payment event"));
                 api.paymentOrders(12).then(setOrders).catch((e) => reportBackgroundError(e, "refresh payment orders after event"));
+                notify.success("支付成功，积分已到账。");
               })
               .catch((e) => reportBackgroundError(e, "load paid payment order from event"));
           }
@@ -150,6 +154,7 @@ export default function RechargePage() {
         setMsg("");
         setActiveOrder(next);
         if (next.status === "paid") {
+          notify.success("支付成功，积分已到账。");
           api.me().then(setMe).catch((e) => reportBackgroundError(e, "refresh current user after paid order poll"));
           api.paymentOrders(12).then(setOrders).catch((e) => reportBackgroundError(e, "refresh payment orders after paid poll"));
         } else if (next.status !== "pending") {
@@ -170,6 +175,7 @@ export default function RechargePage() {
         pollFailuresRef.current += 1;
         const retryDelay = pollFailuresRef.current >= 5 ? "自动检查会降低频率继续进行。" : "正在继续自动检查。";
         setMsg(`${e.message}。${retryDelay}`);
+        notify.warn(`${e.message}。${retryDelay}`, { duration: 5000 });
       }
     };
     pollFailuresRef.current = 0;
@@ -211,7 +217,10 @@ export default function RechargePage() {
         if (alive) setQrImage(url);
       })
       .catch((e) => {
-        if (alive) setMsg(e.message || "二维码生成失败");
+        if (alive) {
+          setMsg(e.message || "二维码生成失败");
+          notify.error(e.message || "二维码生成失败");
+        }
       });
     return () => {
       alive = false;
@@ -274,6 +283,7 @@ export default function RechargePage() {
       if (!providers.includes(orderProvider)) throw new Error("当前没有可用支付渠道");
       const order = await api.createPaymentOrder({ provider: orderProvider, package_id: orderPackageId });
       patchOrder(order);
+      notify.success("订单已创建，请扫码支付。");
       if (
         seq === createOrderSeqRef.current
         && providerRef.current === orderProvider
@@ -283,6 +293,7 @@ export default function RechargePage() {
       }
     } catch (e) {
       setMsg(e.message);
+      notify.error(e.message || "创建订单失败");
       refreshOrders().catch((err) => reportBackgroundError(err, "refresh orders after create failure"));
     } finally {
       setLoading(false);
@@ -302,8 +313,10 @@ export default function RechargePage() {
         setActiveOrder(paid);
       }
       api.me().then(setMe).catch((err) => reportBackgroundError(err, "refresh current user after mock pay"));
+      notify.success("模拟支付成功，积分已到账。");
     } catch (e) {
       setMsg(e.message);
+      notify.error(e.message || "模拟支付失败");
     } finally {
       setLoading(false);
     }
@@ -322,9 +335,15 @@ export default function RechargePage() {
         setActiveOrder(next);
       }
       refreshOrders().catch((err) => reportBackgroundError(err, "refresh orders after active order refresh"));
-      if (next.status === "paid") api.me().then(setMe).catch((err) => reportBackgroundError(err, "refresh current user after active order paid"));
+      if (next.status === "paid") {
+        api.me().then(setMe).catch((err) => reportBackgroundError(err, "refresh current user after active order paid"));
+        notify.success("支付成功，积分已到账。");
+      } else {
+        notify.info("订单状态已刷新。");
+      }
     } catch (e) {
       setMsg(e.message);
+      notify.error(e.message || "刷新订单失败");
     } finally {
       setLoading(false);
     }
@@ -341,6 +360,7 @@ export default function RechargePage() {
       if (next.status === "paid") api.me().then(setMe).catch((err) => reportBackgroundError(err, "refresh current user after viewing paid order"));
     } catch (e) {
       setMsg(e.message);
+      notify.error(e.message || "打开订单失败");
     } finally {
       setLoading(false);
     }
@@ -510,8 +530,15 @@ export default function RechargePage() {
         <section className="card p-5">
           <div className="mb-3 flex items-center justify-between">
             <h2 className="text-lg font-bold">最近充值订单</h2>
-            <button onClick={() => refreshOrders().catch((e) => setMsg(e.message))}
-              className="btn-secondary btn-sm">刷新</button>
+            <button
+              onClick={() => refreshOrders().catch((e) => {
+                setMsg(e.message);
+                notify.error(e.message || "订单列表刷新失败");
+              })}
+              className="btn-secondary btn-sm"
+            >
+              刷新
+            </button>
           </div>
           {orders.length === 0 ? (
             <p className="py-8 text-center text-sm text-fog">还没有充值订单。</p>

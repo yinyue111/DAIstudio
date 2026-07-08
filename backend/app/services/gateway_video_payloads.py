@@ -94,6 +94,9 @@ def extract_by_path(data, path: str | None):
 def ark_text(prompt: str, params: dict) -> str:
     """Seedance takes generation params as --flags appended to the text prompt."""
     parts = [prompt.strip()]
+    negative = str((params or {}).get("negative_prompt") or "").strip()
+    if negative:
+        parts.append(f"负向约束：{negative}")
     res = params.get("resolution")
     dur = params.get("duration")
     ratio = params.get("ratio")
@@ -146,6 +149,8 @@ def ark_payload(model_id: str, prompt: str, params: dict) -> dict:
             pass
     if params.get("ratio"):
         payload["ratio"] = str(params["ratio"])
+    if params.get("negative_prompt"):
+        payload["negative_prompt"] = str(params["negative_prompt"])
     if params.get("seed") not in (None, ""):
         try:
             payload["seed"] = int(params["seed"])

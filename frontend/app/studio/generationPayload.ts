@@ -110,7 +110,7 @@ export function buildGenerationPayload({
   editMaskMode = "protect_subject",
   vDuration,
   vResolution,
-  videoProductLockMode = "free",
+  videoProductLockMode = "locked",
 }: BuildGenerationPayloadInput) {
   const isFinal = stage === "final" && task;
   const effCategory = isFinal ? task.category : category;

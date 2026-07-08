@@ -285,7 +285,7 @@ class GenTask(Base):
             name="ck_gen_tasks_status_valid",
         ),
         CheckConstraint(
-            "phase IS NULL OR phase in ('submitting', 'polling', 'downloading', 'reconciling')",
+            "phase IS NULL OR phase in ('rendering', 'submitting', 'polling', 'downloading', 'reconciling')",
             name="ck_gen_tasks_phase_valid",
         ),
         CheckConstraint("cost_frozen >= 0", name="ck_gen_tasks_cost_frozen_nonnegative"),
@@ -306,7 +306,7 @@ class GenTask(Base):
     cost_frozen: Mapped[int] = mapped_column(BigInteger, default=0)
     cost_settled: Mapped[int] = mapped_column(BigInteger, default=0)
     external_task_id: Mapped[str | None] = mapped_column(Text)  # async video task id
-    # video lifecycle sub-state (DB-recoverable): submitting/polling/downloading
+    # DB-recoverable generation sub-state: image rendering, video submit/poll/download, reconciliation.
     phase: Mapped[str | None] = mapped_column(String(16))
     external_submitted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     parent_task_id: Mapped[int | None] = mapped_column(BigInteger)  # video final -> preview
@@ -393,6 +393,22 @@ class UserPrompt(Base):
     favorite: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     usage_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     params: Mapped[dict | None] = mapped_column(JSONType)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+
+class UserDraft(Base):
+    __tablename__ = "user_drafts"
+    __table_args__ = (
+        Index("uq_user_drafts_user_key", "user_id", "key", unique=True),
+    )
+
+    id: Mapped[int] = mapped_column(BigIntPK, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("users.id"), index=True)
+    key: Mapped[str] = mapped_column(String(64), nullable=False)
+    payload: Mapped[dict] = mapped_column(JSONType, nullable=False, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()

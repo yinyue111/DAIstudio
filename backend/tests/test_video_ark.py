@@ -20,6 +20,21 @@ def test_ark_text_formats_duration_flag():
     assert "--duration 15" in t
 
 
+def test_ark_payload_preserves_negative_prompt():
+    payload = gateway._ark_payload(
+        "premium product video",
+        "doubao-seedance-1-5-pro-251215",
+        {
+            "duration": 5,
+            "resolution": "1080p",
+            "negative_prompt": "包装文字乱码，Logo扭曲",
+        },
+    )
+
+    assert payload["negative_prompt"] == "包装文字乱码，Logo扭曲"
+    assert "负向约束：包装文字乱码，Logo扭曲" in payload["content"][0]["text"]
+
+
 def test_ark_content_image_to_video():
     c = gateway._ark_content("animate", {"first_frame_image": "http://x/y.png", "resolution": "720p"})
     assert c[0]["type"] == "text"
@@ -72,6 +87,31 @@ def test_submit_video_mock_when_unconfigured():
     assert res["status"] == "succeeded" and res.get("mock")
 
 
+def test_video_rejects_incomplete_runtime_gateway_config(monkeypatch):
+    monkeypatch.setattr(settings, "mock_mode", False)
+    cfg = RuntimeGatewayConfig(
+        use="video",
+        provider="custom_openai",
+        base_url="",
+        api_key="",
+        gateway_format="openai",
+    )
+
+    try:
+        gateway.submit_video("animate", "video-model", {}, gateway_config=cfg)
+    except gateway.GatewayError as e:
+        assert "配置不完整" in str(e)
+    else:
+        raise AssertionError("incomplete video gateway config must not create a mock task")
+
+    try:
+        gateway.poll_video("external-task", "video-model", gateway_config=cfg)
+    except gateway.GatewayError as e:
+        assert "配置不完整" in str(e)
+    else:
+        raise AssertionError("incomplete video gateway config must not mock poll results")
+
+
 def test_ark_expired_status_is_failed(monkeypatch):
     monkeypatch.setattr(settings, "mock_mode", False)
     monkeypatch.setattr(settings, "video_gateway_base_url", "https://ark.example.com/api/v3")
@@ -90,6 +130,28 @@ def test_ark_expired_status_is_failed(monkeypatch):
 
     assert res["status"] == "failed"
     assert res["error"] == "task expired"
+
+
+def test_ark_unknown_status_with_error_is_failed(monkeypatch):
+    monkeypatch.setattr(settings, "mock_mode", False)
+    monkeypatch.setattr(settings, "video_gateway_base_url", "https://ark.example.com/api/v3")
+    monkeypatch.setattr(settings, "video_gateway_api_key", "test-key")
+    monkeypatch.setattr(settings, "video_gateway_format", "ark")
+    monkeypatch.setattr(
+        gateway,
+        "_video_get",
+        lambda *_args, **_kwargs: {
+            "status": "quota_exceeded",
+            "error": {"code": "insufficient_quota", "message": "video quota exhausted"},
+        },
+    )
+
+    res = gateway.poll_video("task-1", "doubao-seedance-1-5-pro-251215")
+
+    assert res["status"] == "failed"
+    assert res["error"] == "video quota exhausted"
+    assert res["error_code"] == "insufficient_quota"
+    assert res["raw_status"] == "quota_exceeded"
 
 
 def test_ark_poll_extracts_nested_download_url(monkeypatch):
@@ -305,6 +367,28 @@ def test_generic_video_poll_accepts_data_dict(monkeypatch):
 
     assert res["status"] == "succeeded"
     assert res["url"] == "https://cdn.example.com/video.mp4"
+
+
+def test_generic_video_poll_preserves_provider_failure(monkeypatch):
+    monkeypatch.setattr(settings, "mock_mode", False)
+    monkeypatch.setattr(settings, "video_gateway_base_url", "https://video.example.com")
+    monkeypatch.setattr(settings, "video_gateway_api_key", "test-key")
+    monkeypatch.setattr(settings, "video_gateway_format", "openai")
+    monkeypatch.setattr(
+        gateway,
+        "_video_get",
+        lambda *_args, **_kwargs: {
+            "status": "rate_limited",
+            "error": {"code": "rate_limited", "message": "provider rate limit"},
+        },
+    )
+
+    res = gateway.poll_video("task-1", "video-model")
+
+    assert res["status"] == "failed"
+    assert res["error"] == "provider rate limit"
+    assert res["error_code"] == "rate_limited"
+    assert res["raw_status"] == "rate_limited"
 
 
 def test_generic_video_poll_accepts_top_level_video_urls(monkeypatch):

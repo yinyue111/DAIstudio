@@ -28,3 +28,21 @@ assert.match(
   /title="系统提示词"/,
   "the built-in prompt library should be labeled as system prompts",
 );
+
+const browserSource = readFileSync(join(root, "components/PromptLibraryBrowser.jsx"), "utf8");
+
+assert.match(
+  browserSource,
+  /PromptImageDialog/,
+  "prompt library thumbnails should open a large image dialog",
+);
+assert.match(
+  browserSource,
+  /点击查看大图/,
+  "prompt library cards should expose an obvious large-preview affordance",
+);
+assert.match(
+  browserSource,
+  /aria-label=\{`查看大图/,
+  "prompt library image previews should be keyboard and screen-reader accessible",
+);

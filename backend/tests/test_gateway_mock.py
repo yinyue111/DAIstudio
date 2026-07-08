@@ -610,6 +610,40 @@ def test_text_to_image_uses_per_model_gateway_config(monkeypatch):
     assert calls[0][3]["model"] == "gpt-image-x"
 
 
+def test_text_to_image_rejects_incomplete_runtime_gateway_config(monkeypatch):
+    monkeypatch.setattr(settings, "mock_mode", False)
+    cfg = RuntimeGatewayConfig(
+        use="image",
+        provider="custom_openai",
+        base_url="",
+        api_key="",
+        gateway_format="openai",
+    )
+
+    try:
+        gateway.gen_image("a cat", "gpt-image-x", n=1, size="256x256", gateway_config=cfg)
+    except gateway.GatewayError as e:
+        assert "配置不完整" in str(e)
+    else:
+        raise AssertionError("incomplete per-model gateway config must not fall back to mock output")
+
+
+def test_explicit_mock_mode_allows_incomplete_runtime_gateway_config(monkeypatch):
+    monkeypatch.setattr(settings, "mock_mode", True)
+    cfg = RuntimeGatewayConfig(
+        use="image",
+        provider="custom_openai",
+        base_url="",
+        api_key="",
+        gateway_format="openai",
+    )
+
+    imgs = gateway.gen_image("a cat", "gpt-image-x", n=1, size="256x256", gateway_config=cfg)
+
+    assert len(imgs) == 1
+    assert imgs[0][:4] == b"\x89PNG"
+
+
 def test_reverse_uses_per_model_gateway_config(monkeypatch):
     monkeypatch.setattr(settings, "mock_mode", False)
     seen = {}

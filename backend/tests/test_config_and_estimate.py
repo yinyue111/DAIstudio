@@ -1,5 +1,6 @@
 """Platform settings round-trip + video cost-estimate logic."""
 import tempfile
+from pathlib import Path
 
 from fastapi import HTTPException
 from sqlalchemy import create_engine
@@ -15,7 +16,10 @@ from app.runtime_config import validate_model_gateway_rows, validate_runtime_con
 from app.services import config_store
 from app.services.generation_model_runtime import model_snapshot
 from app.services.generation_pricing import generation_cost_from_snapshot
-from app.services.generation_prompts import compact_generation_prompt_text
+from app.services.generation_prompts import (
+    compact_generation_prompt_text,
+    product_image_negative_prompt,
+)
 from app.services.generation_request import estimate_generation_cost, validate_generation_params
 from app.services.model_pricing import estimate_credits_from_usage
 
@@ -27,9 +31,17 @@ def make_session():
     return sessionmaker(bind=eng)()
 
 
+def test_setup_script_creates_local_env_not_production_debug():
+    root = Path(__file__).resolve().parents[2]
+    setup = (root / "scripts" / "setup.sh").read_text(encoding="utf-8")
+
+    assert '"DEPLOY_ENV=production": "DEPLOY_ENV=local"' in setup
+    assert "DEPLOY_ENV=local, DEBUG=true, MOCK_MODE=true" in setup
+
+
 def test_settings_roundtrip():
     db = make_session()
-    assert config_store.get_setting(db, "image_n") == 4          # default
+    assert config_store.get_setting(db, "image_n") == 1          # default
     assert config_store.get_setting(db, "reverse_prompt_enabled") is True
 
     config_store.set_setting(db, "image_n", 6)
@@ -138,6 +150,95 @@ def test_production_rejects_default_jwt_secret(monkeypatch):
         assert "JWT_SECRET 不安全" in str(exc)
     else:
         raise AssertionError("production runtime should reject the default JWT secret")
+
+
+def _set_valid_production_deploy(monkeypatch):
+    monkeypatch.setattr(settings, "deploy_env", "production")
+    monkeypatch.setattr(settings, "debug", False)
+    monkeypatch.setattr(settings, "mock_mode", False)
+    monkeypatch.setattr(settings, "jwt_secret", "x" * 48)
+    monkeypatch.setattr(settings, "metrics_token", "strong-metrics-token-123")
+    monkeypatch.setattr(settings, "payment_mock_enabled", False)
+    monkeypatch.setattr(settings, "payment_config_secret", "")
+    monkeypatch.setattr(settings, "model_config_secret", "x" * 48)
+    monkeypatch.setattr(settings, "gateway_base_url", "https://gateway.example.com")
+    monkeypatch.setattr(settings, "gateway_api_key", "sk-test")
+    monkeypatch.setattr(settings, "video_gateway_format", "openai")
+    monkeypatch.setattr(settings, "video_gateway_base_url", "")
+    monkeypatch.setattr(settings, "video_gateway_api_key", "")
+    monkeypatch.setattr(settings, "public_base_url", "https://studio.example.com")
+    monkeypatch.setattr(settings, "payment_frontend_base_url", "https://studio.example.com")
+    monkeypatch.setattr(settings, "cors_origins", "https://studio.example.com")
+    monkeypatch.setattr(settings, "sms_provider", "http")
+    monkeypatch.setattr(settings, "sms_http_url", "https://sms.example.com/send")
+    monkeypatch.setattr(settings, "trusted_egress_hosts", "")
+    monkeypatch.setattr(settings, "trusted_proxy_ips", "127.0.0.1")
+    monkeypatch.setattr(settings, "allow_broad_trusted_proxy_cidr", False)
+    monkeypatch.setattr(settings, "online_update_enabled", False)
+    monkeypatch.setattr(settings, "online_update_require_signed_commits", False)
+
+
+def test_deploy_env_production_accepts_hardened_public_config(monkeypatch):
+    _set_valid_production_deploy(monkeypatch)
+
+    validate_runtime_config()
+
+
+def test_deploy_env_production_rejects_debug_localhost_and_mock_sms(monkeypatch):
+    _set_valid_production_deploy(monkeypatch)
+    monkeypatch.setattr(settings, "debug", True)
+    try:
+        validate_runtime_config()
+    except RuntimeError as exc:
+        assert "DEBUG=false" in str(exc)
+    else:
+        raise AssertionError("production deploy must reject DEBUG=true")
+
+    _set_valid_production_deploy(monkeypatch)
+    monkeypatch.setattr(settings, "public_base_url", "http://localhost:8000")
+    try:
+        validate_runtime_config()
+    except RuntimeError as exc:
+        assert "PUBLIC_BASE_URL" in str(exc)
+    else:
+        raise AssertionError("production deploy must reject localhost public base")
+
+    _set_valid_production_deploy(monkeypatch)
+    monkeypatch.setattr(settings, "sms_provider", "mock")
+    try:
+        validate_runtime_config()
+    except RuntimeError as exc:
+        assert "SMS_PROVIDER=mock" in str(exc)
+    else:
+        raise AssertionError("production deploy must reject mock SMS")
+
+
+def test_deploy_env_production_rejects_broad_trusted_proxy_cidr(monkeypatch):
+    _set_valid_production_deploy(monkeypatch)
+    monkeypatch.setattr(settings, "trusted_proxy_ips", "127.0.0.1,172.16.0.0/12")
+
+    try:
+        validate_runtime_config()
+    except RuntimeError as exc:
+        assert "TRUSTED_PROXY_IPS" in str(exc)
+    else:
+        raise AssertionError("production deploy must reject broad trusted proxy CIDRs by default")
+
+
+def test_deploy_env_production_requires_signed_online_update(monkeypatch):
+    _set_valid_production_deploy(monkeypatch)
+    monkeypatch.setattr(settings, "online_update_enabled", True)
+    monkeypatch.setattr(settings, "online_update_require_signed_commits", False)
+
+    try:
+        validate_runtime_config()
+    except RuntimeError as exc:
+        assert "ONLINE_UPDATE_REQUIRE_SIGNED_COMMITS=true" in str(exc)
+    else:
+        raise AssertionError("production online update must require signed commits")
+
+    monkeypatch.setattr(settings, "online_update_require_signed_commits", True)
+    validate_runtime_config()
 
 
 def test_public_config_exposes_normalized_feature_flags(client, make_user, auth):
@@ -279,7 +380,12 @@ def test_product_video_prompt_keeps_motion_request_not_reference_product():
 
     out = compact_generation_prompt_text(
         prompt,
-        {"subject_mode": "product", "ratio": "9:16", "_category": "video"},
+        {
+            "subject_mode": "product",
+            "ratio": "9:16",
+            "_category": "video",
+            "product_lock_mode": "free",
+        },
         prompt["final_text"],
         is_product=True,
     )
@@ -295,6 +401,79 @@ def test_product_video_prompt_keeps_motion_request_not_reference_product():
     assert "Estee Lauder" not in out
     assert "Advanced Night Repair" not in out
     assert "dropper bottle" not in out
+
+
+def test_product_image_prompt_rewrites_reference_subject_and_keeps_complete_product():
+    prompt = {
+        "产品身份档案": (
+            "上传产品是 DAMAH 黑魔法棉柔巾，白色长方体软包，Logo、抽口、顶部标签和包装文字必须完整保留。"
+            "产品占画幅55%-75%，替换参考素材原主体。"
+        ),
+        "场景背景": "户外水边草地；前景为深绿色长草叶，覆盖画面下半部并向右上倾斜；远景为虚化水面。",
+        "广告目标": "展示一款名为 KaHi 的 Eau de Toilette 香水，传达清新自然气味联想。",
+        "风格": "日系胶片感产品大片、香水广告海报、社媒竖版封面。",
+        "构图": "竖版 2:3；瓶身占画面宽度约22%、高度约29%；草叶形成斜向引导线。",
+        "景别": "产品近景；香水瓶占画幅面积约7%，草地与水面环境占93%。",
+        "视角镜头": "低机位平视略俯，镜头高度接近草尖与瓶身中线。",
+        "final_text": "参考图复刻，生成 KaHi 香水水边草地广告。",
+    }
+
+    out = compact_generation_prompt_text(
+        prompt,
+        {"subject_mode": "product"},
+        prompt["final_text"],
+        is_product=True,
+    )
+
+    assert "DAMAH 黑魔法棉柔巾" in out
+    assert "完整产品主体入镜" in out
+    assert "五成五到七成五" in out
+    assert "前景元素只围绕产品底部和边缘" in out
+    assert "不得遮挡上传产品包装" in out
+    assert "KaHi" not in out
+    assert "Eau de Toilette" not in out
+    assert "香水" not in out
+    assert "瓶身" not in out
+    assert "占画幅-" not in out
+    assert "适中占比-适中占比" not in out
+
+
+def test_product_image_negative_prompt_sanitizes_reference_product_terms():
+    out = product_image_negative_prompt("KaHi 变形，瓶身比例畸变，文字乱码")
+
+    assert "KaHi" not in out
+    assert "瓶身" not in out
+    assert "上传产品 变形" in out
+    assert "上传产品比例畸变" in out
+    assert "产品残缺" in out
+    assert "半截产品" in out
+    assert "产品被裁切" in out
+
+
+def test_product_video_locked_prompt_rewrites_orbit_and_keeps_product_in_frame():
+    prompt = {
+        "产品身份档案": "上传产品是 DAMAH 黑魔法棉柔巾, Logo 和包装文字必须完整保留。",
+        "场景背景": "冷调棚拍背景",
+        "主体动作": "参考商品旋转展示并切到 Logo 特写",
+        "镜头运动": "缓慢推进并轻微环绕",
+        "user_instruction": "产品旋转展示，水花飞溅，镜头推进",
+        "final_text": "参考视频复刻",
+    }
+
+    out = compact_generation_prompt_text(
+        prompt,
+        {"subject_mode": "product", "ratio": "1:1", "_category": "video"},
+        prompt["final_text"],
+        is_product=True,
+    )
+
+    assert "DAMAH 黑魔法棉柔巾" in out
+    assert "固定正面" in out
+    assert "完整包装、Logo" in out
+    assert "避免裁切主体" in out
+    assert "缓慢推进并轻微环绕" not in out
+    assert "产品旋转展示" not in out
+    assert "背景水花或光影点缀且不遮挡包装" in out
 
 
 def test_product_video_prompt_preserves_uploaded_product_profile():

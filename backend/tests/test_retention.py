@@ -619,6 +619,69 @@ def test_reaper_skips_image_inside_configured_gateway_window(client, make_user, 
         db.close()
 
 
+def test_reaper_skips_queued_image_until_queue_window(client, make_user, monkeypatch):
+    monkeypatch.setattr(settings, "image_gateway_timeout_seconds", 60)
+    monkeypatch.setattr(settings, "image_download_timeout_seconds", 60)
+    uid = make_user("13900000448", balance=1000)
+    db = SessionLocal()
+    try:
+        _clear_active_generation_tasks(db)
+        task = GenTask(
+            user_id=uid,
+            category="image",
+            stage="preview",
+            status="queued",
+            cost_frozen=20,
+            cost_settled=0,
+            created_at=datetime.now(timezone.utc) - timedelta(minutes=20),
+        )
+        db.add(task)
+        db.commit()
+        task_id = task.id
+        credits.freeze(db, uid, 20, task_id)
+
+        assert retention.reap_stuck_tasks(db, max_minutes=60) == 0
+        kept = db.get(GenTask, task_id)
+        assert kept.status == "queued"
+    finally:
+        db.close()
+
+
+def test_reaper_uses_image_render_started_at_not_task_created_at(client, make_user, monkeypatch):
+    monkeypatch.setattr(settings, "image_gateway_timeout_seconds", 60)
+    monkeypatch.setattr(settings, "image_download_timeout_seconds", 60)
+    uid = make_user("13900000449", balance=1000)
+    db = SessionLocal()
+    try:
+        _clear_active_generation_tasks(db)
+        task = GenTask(
+            user_id=uid,
+            category="image",
+            stage="preview",
+            status="running",
+            phase="rendering",
+            cost_frozen=20,
+            cost_settled=0,
+            params={
+                "_image_render_started_at": (
+                    datetime.now(timezone.utc) - timedelta(seconds=30)
+                ).isoformat(),
+            },
+            created_at=datetime.now(timezone.utc) - timedelta(hours=4),
+        )
+        db.add(task)
+        db.commit()
+        task_id = task.id
+        credits.freeze(db, uid, 20, task_id)
+
+        assert retention.reap_stuck_tasks(db, max_minutes=5) == 0
+        kept = db.get(GenTask, task_id)
+        assert kept.status == "running"
+        assert kept.phase == "rendering"
+    finally:
+        db.close()
+
+
 def test_reaper_refunds_image_after_configured_gateway_window(client, make_user, monkeypatch):
     monkeypatch.setattr(settings, "image_gateway_timeout_seconds", 60)
     monkeypatch.setattr(settings, "image_download_timeout_seconds", 60)

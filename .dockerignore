@@ -43,6 +43,7 @@ node_modules
 backend/storage
 backend/backups
 artifacts/posters
+artifacts/e2e-product-flow-*
 dist
 build
 backend/build

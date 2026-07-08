@@ -65,16 +65,18 @@ docker-down: ## Stop the stack
 
 compose-check: ## Validate docker compose rendering with required placeholders
 	POSTGRES_PASSWORD="$${POSTGRES_PASSWORD:-release-check-postgres-password}" \
+		BACKEND_ENV_FILE="$${BACKEND_ENV_FILE:-./backend/.env.example}" \
 		docker compose config --quiet
 
 docker-build-check: ## Build backend/frontend Docker images without starting services
 	POSTGRES_PASSWORD="$${POSTGRES_PASSWORD:-release-check-postgres-password}" \
+		BACKEND_ENV_FILE="$${BACKEND_ENV_FILE:-./backend/.env.example}" \
 		docker compose build api worker worker_image worker_video worker_video_download worker_parse beat frontend
 
 worker-topology-check: ## Validate isolated worker roles and compose services
 	./scripts/test_worker_parallelism.sh
 
-release-check: compile lint alembic-check test test-frontend build-frontend compose-check worker-topology-check docker-build-check audit ## Run local release gates against the same clean HEAD artifact as CI
+release-check: compile lint migrate alembic-check test test-frontend build-frontend compose-check worker-topology-check docker-build-check audit ## Run local release gates against the same clean HEAD artifact as CI
 	@test -z "$$(git status --porcelain)" || \
 		(echo "release-check archives HEAD; commit or stash worktree changes first, or use release-check-worktree" >&2; exit 1)
 	tmp="$$(mktemp -d)" && \
@@ -83,7 +85,7 @@ release-check: compile lint alembic-check test test-frontend build-frontend comp
 		rm -rf "$$tmp"
 	find . -maxdepth 3 \( -name .venv -o -name .next -o -name node_modules \) -type d -print | sort
 
-release-check-worktree: compile lint alembic-check test test-frontend build-frontend compose-check worker-topology-check docker-build-check audit ## Run release gates against tracked + untracked worktree files
+release-check-worktree: compile lint migrate alembic-check test test-frontend build-frontend compose-check worker-topology-check docker-build-check audit ## Run release gates against tracked + untracked worktree files
 	tmp="$$(mktemp -d)" && \
 		deleted="$$(git ls-files --deleted)" && \
 		if [ -n "$$deleted" ]; then \
@@ -93,7 +95,7 @@ release-check-worktree: compile lint alembic-check test test-frontend build-fron
 			exit 1; \
 		fi && \
 		git ls-files -z --cached --others --exclude-standard | \
-		tar --null -czf "$$tmp/ai-studio-source.tar.gz" --files-from - && \
+			COPYFILE_DISABLE=1 tar --null -czf "$$tmp/ai-studio-source.tar.gz" --files-from - && \
 		python3 scripts/check_release_artifact.py "$$tmp/ai-studio-source.tar.gz" && \
 		rm -rf "$$tmp"
 	find . -maxdepth 3 \( -name .venv -o -name .next -o -name node_modules \) -type d -print | sort

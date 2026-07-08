@@ -4,6 +4,79 @@ import { useEffect, useState } from "react";
 import { api, downloadBlob } from "../../../lib/api";
 import { Card, Th } from "./admin-ui";
 
+export function Dashboard() {
+  const [summary, setSummary] = useState(null);
+  const [costs, setCosts] = useState(null);
+  const [start, setStart] = useState("");
+  const [end, setEnd] = useState("");
+  const [msg, setMsg] = useState("");
+
+  function qs() {
+    const p = [];
+    if (start) p.push(`start=${encodeURIComponent(start)}`);
+    if (end) p.push(`end=${encodeURIComponent(end)}`);
+    return p.length ? `?${p.join("&")}` : "";
+  }
+
+  function load() {
+    setMsg("");
+    const suffix = qs();
+    Promise.all([api.adminUsageDashboard(suffix), api.adminModelCosts(suffix)])
+      .then(([dashboard, modelCosts]) => {
+        setSummary(dashboard);
+        setCosts(modelCosts);
+      })
+      .catch((e) => setMsg(e.message));
+  }
+
+  useEffect(() => { load(); }, []);
+
+  const s = summary?.summary || {};
+  const modelRows = costs?.models || [];
+
+  return (
+    <div className="space-y-4">
+      <Card>
+        <div className="flex flex-wrap items-center gap-2 text-sm">
+          <span className="text-fog">日期范围</span>
+          <input type="date" className="input w-auto" value={start} onChange={(e) => setStart(e.target.value)} />
+          <span className="text-fog">—</span>
+          <input type="date" className="input w-auto" value={end} onChange={(e) => setEnd(e.target.value)} />
+          <button onClick={load} className="btn-secondary">刷新概览</button>
+        </div>
+        {msg && <p className="mt-2 text-sm text-bad">{msg}</p>}
+      </Card>
+
+      {!summary ? <Card><span className="text-mist">加载中…</span></Card> : (
+        <>
+          <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-5">
+            <Metric label="活跃用户" value={s.dau || 0} />
+            <Metric label="生成任务" value={s.task_count || 0} />
+            <Metric label="成功率" value={`${Math.round((s.success_rate || 0) * 100)}%`} />
+            <Metric label="待审核" value={s.needs_review_count || 0} />
+            <Metric label="平均耗时" value={`${Math.round(summary.avg_duration_seconds || 0)}s`} />
+          </div>
+          <Card>
+            <div className="mb-3 text-sm font-display font-semibold text-snow">失败原因分布</div>
+            <div className="grid gap-2 sm:grid-cols-5">
+              {Object.entries(summary.failure_reasons || {}).map(([key, value]) => (
+                <div key={key} className="rounded-xl border border-line bg-white/[0.03] px-3 py-2">
+                  <div className="text-[11px] text-fog">{failureLabel(key)}</div>
+                  <div className="font-display text-xl font-bold text-snow">{value}</div>
+                </div>
+              ))}
+            </div>
+          </Card>
+          <Card>
+            <div className="mb-3 text-sm font-display font-semibold text-snow">模型成本与失败率</div>
+            <ModelCostTable rows={modelRows} />
+          </Card>
+        </>
+      )}
+    </div>
+  );
+}
+
 export function Report() {
   const [data, setData] = useState(null);
   const [start, setStart] = useState("");
@@ -86,6 +159,52 @@ export function Report() {
           </Card>
         </>
       )}
+    </div>
+  );
+}
+
+function Metric({ label, value }) {
+  return (
+    <Card>
+      <div className="text-xs text-fog">{label}</div>
+      <div className="mt-1 font-display text-2xl font-bold text-snow">{value}</div>
+    </Card>
+  );
+}
+
+function failureLabel(key) {
+  return {
+    moderation: "审核/待确认",
+    user_input: "用户可修正",
+    provider_timeout: "网关超时",
+    provider_error: "网关异常",
+    system_error: "系统异常",
+  }[key] || key;
+}
+
+function ModelCostTable({ rows }) {
+  if (!rows?.length) return <p className="py-8 text-center text-sm text-fog">暂无模型调用记录。</p>;
+  return (
+    <div className="overflow-x-auto">
+      <table className="w-full text-left text-sm">
+        <thead><tr className="border-b border-line">
+          <Th>模型</Th><Th>类型</Th><Th>调用</Th><Th>失败</Th><Th>失败率</Th><Th>Token</Th><Th>估算积分</Th><Th>均耗时</Th>
+        </tr></thead>
+        <tbody>
+          {rows.map((row) => (
+            <tr key={`${row.model_id}:${row.kind}`} className="border-b border-line/60 text-mist transition-colors hover:bg-white/5">
+              <td className="py-2 pr-3 text-snow">{row.model_id}</td>
+              <td className="pr-3">{row.kind}</td>
+              <td className="pr-3 font-display text-snow">{row.call_count}</td>
+              <td className="pr-3">{row.failed_count}</td>
+              <td className="pr-3">{Math.round((row.failure_rate || 0) * 100)}%</td>
+              <td className="pr-3">{row.total_tokens || 0}</td>
+              <td className="pr-3">{row.estimated_cost_credits || 0}</td>
+              <td>{Math.round(row.avg_latency_ms || 0)}ms</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
     </div>
   );
 }

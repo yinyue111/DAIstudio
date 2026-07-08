@@ -34,6 +34,7 @@ _IMAGE_PARAM_KEYS = _COMMON_PARAM_KEYS | {
     "size",
     "edit_mask_mode",
     "mask_image_url",
+    "product_pixel_lock",
     "style_reference_image",
     "character_reference_image",
     "variation_of_asset_id",
@@ -56,6 +57,7 @@ _VIDEO_PARAM_KEYS = _COMMON_PARAM_KEYS | {
 _SUBJECT_MODES = {"general", "product", "portrait"}
 _PRODUCT_LOCK_MODES = {"locked", "free"}
 _EDIT_MASK_MODES = {"off", "protect_subject", "center_box"}
+_PRODUCT_PIXEL_LOCK_MODES = {"strict", "on", "true", "1", "off", "false", "0"}
 
 
 def image_max_pixels() -> int:
@@ -117,6 +119,11 @@ def validate_generation_params(category: str, params: dict) -> dict:
             if edit_mask_mode not in _EDIT_MASK_MODES:
                 raise HTTPException(400, "edit_mask_mode 不支持")
             params["edit_mask_mode"] = edit_mask_mode
+        if params.get("product_pixel_lock") not in (None, ""):
+            product_pixel_lock = str(params["product_pixel_lock"]).strip().lower()
+            if product_pixel_lock not in _PRODUCT_PIXEL_LOCK_MODES:
+                raise HTTPException(400, "product_pixel_lock 不支持")
+            params["product_pixel_lock"] = product_pixel_lock
         if params.get("n") is not None:
             try:
                 n = int(params["n"])
@@ -236,7 +243,7 @@ def assert_reference_access(db: Session, user_id: int, *urls: str | None) -> Non
 
 def default_image_n(db: Session) -> int:
     try:
-        n = int(get_setting(db, "image_n", 4))
+        n = int(get_setting(db, "image_n", 1))
     except (TypeError, ValueError):
         raise HTTPException(400, "默认出图数量配置非法,请联系管理员")
     if not (1 <= n <= settings.max_image_n):

@@ -1,10 +1,11 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { api, clearToken, downloadBlob, loginPath } from "../../lib/api";
 import { redirectOnAuthError, reportBackgroundError, showError } from "../../lib/errorHandling";
 import Nav from "../../components/Nav";
+import { useToast } from "../../components/ToastProvider";
 import AssetMedia, {
   assetPreviewSrc,
   assetUnavailableText,
@@ -12,6 +13,7 @@ import AssetMedia, {
   isAssetTakenDown,
 } from "../../components/AssetMedia";
 import AssetPreviewDialog from "../../components/AssetPreviewDialog";
+import AssetComparePanel from "../../components/AssetComparePanel";
 import GroupedAssetGallery from "../studio/GroupedAssetGallery";
 import { assetVariationSourceUrl, confirmAssetUnlock } from "../studio/assetActions";
 import { STUDIO_VARIATION_DRAFT_KEY } from "../studio/constants";
@@ -23,6 +25,7 @@ function srcOf(a) {
 
 export default function ProfilePage() {
   const router = useRouter();
+  const notify = useToast();
   const [me, setMe] = useState(null);
   const [cfg, setCfg] = useState(null);
   const [data, setData] = useState(null);
@@ -84,8 +87,7 @@ export default function ProfilePage() {
     setLoading(true);
     setMsg("");
     if (reset) {
-      assetsRef.current = [];
-      setAssets(null);
+      if (!assetsRef.current.length) setAssets(null);
       setHasMore(false);
       setSelectedIds(new Set());
     }
@@ -107,7 +109,10 @@ export default function ProfilePage() {
       setAssets(merged);
       setHasMore(list.length === PAGE);
     } catch (e) {
-      if (myReq === reqRef.current) setMsg(e.message);
+      if (myReq === reqRef.current) {
+        setMsg(e.message);
+        notify.error(e.message || "作品加载失败，已保留当前列表");
+      }
     } finally {
       if (myReq === reqRef.current) {
         loadingRef.current = false;
@@ -155,26 +160,38 @@ export default function ProfilePage() {
   async function unlock(asset) {
     if (isAssetTakenDown(asset)) {
       setMsg("素材已下架，不能继续解锁。");
+      notify.warn("素材已下架，不能继续解锁。");
       return;
     }
     if (!confirmAssetUnlock(asset, me, cfg)) return;
     await withAssetBusy(asset.id, async () => {
       try {
         patchAsset(await api.unlock(asset.id));
+        notify.success("素材已解锁。");
         api.me().then(setMe).catch((e) => reportBackgroundError(e, "refresh current user after unlock"));
         api.profile().then(setData).catch((e) => reportBackgroundError(e, "refresh profile after unlock"));
-      } catch (e) { setMsg(e.message); }
+      } catch (e) {
+        setMsg(e.message);
+        notify.error(e.message || "解锁失败");
+      }
     });
   }
 
   async function toggleFav(asset) {
     if (isAssetTakenDown(asset)) {
       setMsg("素材已下架，不能继续收藏。");
+      notify.warn("素材已下架，不能继续收藏。");
       return;
     }
     await withAssetBusy(asset.id, async () => {
-      try { patchAsset(await api.favoriteAsset(asset.id)); }
-      catch (e) { setMsg(e.message); }
+      try {
+        const updated = await api.favoriteAsset(asset.id);
+        patchAsset(updated);
+        notify.success(updated.favorite ? "已收藏。" : "已取消收藏。");
+      } catch (e) {
+        setMsg(e.message);
+        notify.error(e.message || "收藏操作失败");
+      }
     });
   }
 
@@ -196,18 +213,24 @@ export default function ProfilePage() {
           return next;
         });
         if (lightbox && lightbox.id === asset.id) setLightbox(null);
+        notify.success("素材已删除。");
         api.profile().then(setData).catch((e) => reportBackgroundError(e, "refresh profile after delete"));
-      } catch (e) { setMsg(e.message); }
+      } catch (e) {
+        setMsg(e.message);
+        notify.error(e.message || "删除失败");
+      }
     });
   }
 
   async function download(asset) {
     if (isAssetTakenDown(asset)) {
       setMsg("素材已下架，不能继续下载。");
+      notify.warn("素材已下架，不能继续下载。");
       return;
     }
     if (!canDownloadAsset(asset)) {
       setMsg("请先解锁后再下载。");
+      notify.warn("请先解锁后再下载。");
       return;
     }
     await withAssetBusy(asset.id, async () => {
@@ -217,7 +240,11 @@ export default function ProfilePage() {
           asset.type === "video" ? `asset-${asset.id}.mp4` : undefined,
         );
         setMsg(`已开始下载 ${filename}`);
-      } catch (e) { setMsg(e.message); }
+        notify.success(`已开始下载 ${filename}`);
+      } catch (e) {
+        setMsg(e.message);
+        notify.error(e.message || "下载失败");
+      }
     });
   }
 
@@ -225,6 +252,7 @@ export default function ProfilePage() {
     const sourceUrl = assetVariationSourceUrl(asset);
     if (!sourceUrl) {
       setMsg("当前图片暂不可作为变体来源，请确认预览可用后再试。");
+      notify.warn("当前图片暂不可作为变体来源，请确认预览可用后再试。");
       return;
     }
     try {
@@ -240,6 +268,7 @@ export default function ProfilePage() {
       router.push("/");
     } catch (e) {
       setMsg(e.message || "创建变体草稿失败");
+      notify.error(e.message || "创建变体草稿失败");
     }
   }
 
@@ -269,9 +298,12 @@ export default function ProfilePage() {
       setSelectedIds(new Set());
       api.profile().then(setData).catch((e) => reportBackgroundError(e, "refresh profile after batch action"));
       const failed = res.failed?.length || 0;
-      setMsg(failed ? `已删除 ${deleted.size} 个，${failed} 个删除失败。` : `已删除 ${deleted.size} 个素材。`);
+      const text = failed ? `已删除 ${deleted.size} 个，${failed} 个删除失败。` : `已删除 ${deleted.size} 个素材。`;
+      setMsg(text);
+      notify.success(text);
     } catch (e) {
       setMsg(e.message);
+      notify.error(e.message || "批量删除失败");
     }
   }
 
@@ -283,15 +315,19 @@ export default function ProfilePage() {
     if (!selectedAssets.length || batchDownloading) return;
     if (!ids.length) {
       setMsg("选中的素材都未解锁或已下架，无法批量下载。");
+      notify.warn("选中的素材都未解锁或已下架，无法批量下载。");
       return;
     }
     setMsg("");
     setBatchDownloading(true);
     try {
       const filename = await api.batchDownloadAssets(ids);
-      setMsg(skipped ? `已开始下载 ${filename}，已跳过 ${skipped} 个未解锁或已下架素材。` : `已开始下载 ${filename}`);
+      const text = skipped ? `已开始下载 ${filename}，已跳过 ${skipped} 个未解锁或已下架素材。` : `已开始下载 ${filename}`;
+      setMsg(text);
+      notify.success(text);
     } catch (e) {
       setMsg(e.message);
+      notify.error(e.message || "批量下载失败");
     } finally {
       setBatchDownloading(false);
     }
@@ -299,7 +335,10 @@ export default function ProfilePage() {
 
   async function changePassword() {
     setPwMsg("");
-    if (newPw.length < 6) return setPwMsg("新密码至少 6 位");
+    if (newPw.length < 6) {
+      notify.warn("新密码至少 6 位");
+      return setPwMsg("新密码至少 6 位");
+    }
     try {
       await api.changePassword(oldPw, newPw);
       clearToken();
@@ -310,6 +349,11 @@ export default function ProfilePage() {
   const u = data?.user || me;
   const initial = (u?.nickname || u?.phone || "?").slice(-2);
   const visibleSelectedCount = (assets || []).filter((asset) => selectedIds.has(asset.id)).length;
+  const compareSelection = selectedIds;
+  const compareAssets = useMemo(
+    () => (assets || []).filter((asset) => compareSelection.has(asset.id)).slice(0, 4),
+    [assets, compareSelection],
+  );
 
   function renderAssetCard(a) {
     const src = srcOf(a);
@@ -518,6 +562,8 @@ export default function ProfilePage() {
         {msg && (
           <div className="mb-5 rounded-xl border border-bad/30 bg-bad/10 px-4 py-2.5 text-sm text-bad">{msg}</div>
         )}
+
+        <AssetComparePanel assets={compareAssets} onClose={() => setSelectedIds(new Set())} />
 
         {assets === null ? (
           <div className="masonry">

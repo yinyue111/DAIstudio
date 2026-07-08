@@ -6,12 +6,12 @@ from types import SimpleNamespace
 from urllib.parse import urlparse
 
 from fastapi.testclient import TestClient
-from PIL import Image
+from PIL import Image, ImageDraw
 
 from app.config import settings
 from app.db import SessionLocal
 from app.main import app
-from app.models import AuditLog, GenTask, ModelConfig, UploadedAsset
+from app.models import AuditLog, GenAsset, GenTask, ModelConfig, UploadedAsset
 from app.services import generation_media
 from app.services.gateway import _mock_image
 from app.services.watermark import make_model_reference
@@ -46,6 +46,17 @@ def _transparent_product_png_bytes(size=(160, 120)):
             px[x, y] = (40, 110, 210, 255)
     buf = io.BytesIO()
     img.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def _repainted_product_scene_bytes(size=(256, 256)):
+    img = Image.new("RGB", size, (18, 36, 28))
+    px = img.load()
+    for y in range(92, 164):
+        for x in range(80, 176):
+            px[x, y] = (40, 90, 210)
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=95)
     return buf.getvalue()
 
 
@@ -561,6 +572,92 @@ def test_product_image_edit_rgb_mask_protects_detected_subject_not_center_backgr
     assert mask.startswith("data:image/png;base64,")
     assert _mask_alpha_at(mask, 70, 110) > 200
     assert _mask_alpha_at(mask, 180, 100) < 20
+
+
+def test_auto_subject_mask_detects_white_product_on_natural_background():
+    img = Image.new("RGB", (512, 768), (42, 68, 38))
+    draw = ImageDraw.Draw(img)
+    draw.rectangle((0, 0, 511, 230), fill=(176, 174, 154))
+    draw.ellipse((410, 40, 500, 130), fill=(245, 235, 200))
+    for x in range(0, 512, 18):
+        draw.line((x, 260, x - 80, 767), fill=(34, 78, 32), width=5)
+        draw.line((x + 8, 300, x + 120, 767), fill=(82, 102, 45), width=3)
+    draw.rounded_rectangle((86, 336, 446, 520), radius=10, fill=(244, 244, 239), outline=(230, 230, 225), width=4)
+    draw.rectangle((96, 494, 436, 515), fill=(26, 26, 24))
+    draw.rectangle((205, 405, 328, 455), outline=(20, 20, 20), width=3)
+    draw.text((222, 420), "DAMAH", fill=(20, 20, 20))
+
+    result = generation_media._auto_subject_mask(img.convert("RGBA"))
+
+    assert result.mode == "auto_subject"
+    assert result.confidence >= generation_media.EDIT_MASK_SEND_CONFIDENCE
+    assert result.bbox is not None
+    left, top, right, bottom = result.bbox
+    assert left > 40
+    assert top > 250
+    assert right < 490
+    assert bottom < 590
+
+
+def test_product_image_edit_strict_lock_composites_original_subject_pixels(
+    client, make_user, auth, monkeypatch
+):
+    uid = make_user("13900001973", balance=1000)
+    h = auth("13900001973")
+
+    up = client.post(
+        "/api/uploads/image",
+        files={"file": ("product.png", _white_bg_product_png_bytes(), "image/png")},
+        headers=h,
+    )
+    assert up.status_code == 200, up.text
+    asset = up.json()
+
+    def fake_gen_image(prompt, image_model_id, n=4, size="1024x1024",
+                       reference_image_url=None, edit_path=None, extra_payload=None):
+        return [_repainted_product_scene_bytes()]
+
+    monkeypatch.setattr("app.services.gateway.gen_image", fake_gen_image)
+
+    r = client.post("/api/generate", json={
+        "source_asset_url": asset["url"],
+        "source_type": "image",
+        "source_asset_meta": {
+            "selected_type": "image",
+            "mode": "image_edit",
+            "product_generation_mode": True,
+        },
+        "category": "image",
+        "stage": "preview",
+        "prompt": {
+            "final_text": "put this product into a forest scene",
+            "instruction": "put this product into a forest scene",
+        },
+        "params": {"n": 1, "size": "1024x1024", "edit_mask_mode": "protect_subject"},
+    }, headers=h)
+    assert r.status_code == 200, r.text
+
+    db = SessionLocal()
+    try:
+        task = (
+            db.query(GenTask)
+            .filter(GenTask.user_id == uid)
+            .order_by(GenTask.id.desc())
+            .first()
+        )
+        assert task is not None
+        assert task.params["_product_pixel_lock"] == "strict"
+        assert task.params["_product_composite_applied_count"] == 1
+        asset_row = db.query(GenAsset).filter(GenAsset.task_id == task.id).first()
+        assert asset_row is not None
+        hd_key = asset_row.hd_url.rsplit("/media/", 1)[1]
+        hd = Image.open(Path(settings.storage_dir) / hd_key)
+        r_px, g_px, b_px = hd.convert("RGB").getpixel((128, 128))
+        assert r_px > 140
+        assert g_px < 110
+        assert b_px < 110
+    finally:
+        db.close()
 
 
 def test_product_image_edit_alpha_mask_records_high_confidence_subject_protection(
@@ -1085,6 +1182,58 @@ def test_uploaded_image_video_free_motion_does_not_auto_lock_last_frame(client, 
     assert seen["first_frame_image"].startswith("data:image/jpeg;base64,")
     assert "last_frame_image" not in seen
     assert "_product_locked" not in seen
+
+
+def test_uploaded_product_video_uses_high_fidelity_reference_and_negative_prompt(
+    client, make_user, auth, monkeypatch
+):
+    make_user("13900001971", balance=1000, admin=True)
+    h = auth("13900001971")
+    assert client.put("/api/admin/models", json={
+        "use": "video",
+        "model_id": "mock-video",
+        "cost_credits": 50,
+        "unlock_cost": 0,
+        "enabled": True,
+        "extra": {"preview_cost": 5},
+        "admin_password": "pass123456",
+    }, headers=h).status_code == 200
+
+    up = client.post(
+        "/api/uploads/image",
+        files={"file": ("product.png", _png_bytes(size=(2000, 1200)), "image/png")},
+        headers=h,
+    )
+    assert up.status_code == 200, up.text
+    asset = up.json()
+    seen = {}
+
+    def fake_submit(prompt, video_model_id, params, extra=None):
+        seen.update(params)
+        return "mock-product-video-fidelity"
+
+    monkeypatch.setattr("app.services.gateway.submit_video", fake_submit)
+    r = client.post("/api/generate", json={
+        "source_asset_url": asset["url"],
+        "source_type": "image",
+        "category": "video",
+        "stage": "preview",
+        "prompt": {"final_text": "生成产品广告视频"},
+        "params": {
+            "duration": 5,
+            "resolution": "720p",
+            "ratio": "16:9",
+            "subject_mode": "product",
+        },
+    }, headers=h)
+    assert r.status_code == 200, r.text
+    assert seen["last_frame_image"] == seen["first_frame_image"]
+    assert seen["_product_locked"] is True
+    assert "包装文字乱码" in seen["negative_prompt"]
+    assert "Logo扭曲" in seen["negative_prompt"]
+    ref_bytes = base64.b64decode(seen["first_frame_image"].split(",", 1)[1])
+    ref_img = Image.open(io.BytesIO(ref_bytes))
+    assert max(ref_img.size) == 1280
 
 
 def test_uploaded_portrait_image_can_drive_video_character_reference(client, make_user, auth, monkeypatch):

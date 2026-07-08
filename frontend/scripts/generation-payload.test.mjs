@@ -124,6 +124,8 @@ assert.doesNotMatch(productEdit.payload.prompt.final_text, /Advanced Night Repai
 assert.doesNotMatch(productEdit.payload.prompt.final_text, /dropper bottle/i);
 assert.match(productEdit.payload.params.negative_prompt, /包装文字被改写/);
 assert.match(productEdit.payload.params.negative_prompt, /低清/);
+assert.match(productEdit.payload.params.negative_prompt, /产品残缺/);
+assert.match(productEdit.payload.params.negative_prompt, /产品被裁切/);
 
 const staleReversePromptArgs = {
   stage: "preview",
@@ -359,6 +361,13 @@ const productVideoEditLocked = buildGenerationPayload({
 });
 
 assert.equal(productVideoEditLocked.payload.params.product_lock_mode, "locked");
+
+const productVideoEditDefault = buildGenerationPayload({
+  ...productVideoEditArgs,
+  videoProductLockMode: undefined,
+});
+
+assert.equal(productVideoEditDefault.payload.params.product_lock_mode, "locked");
 
 const fakeStorage = new Map();
 const storage = {

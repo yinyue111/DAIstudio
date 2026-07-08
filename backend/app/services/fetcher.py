@@ -29,6 +29,7 @@ parse.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import re
@@ -251,6 +252,8 @@ def _normalise_asset_url(url: str | None) -> str | None:
     if not url:
         return None
     url = url.strip()
+    if not url or url.startswith("data:"):
+        return None
     if url.startswith("//"):
         return "https:" + url
     # XHS image hosts serve the same content over https; prefer it so browser
@@ -601,6 +604,18 @@ def _plain_json(raw: str, label: str) -> dict | None:
     except json.JSONDecodeError:
         log.warning("failed to parse %s json state", label, exc_info=True)
         return None
+
+
+def _json_from_jsonp(raw: str, label: str) -> dict | None:
+    text = (raw or "").strip()
+    if not text:
+        return None
+    if text.startswith("{"):
+        return _plain_json(text, label)
+    m = re.search(r"^[^(]*\((.*)\)\s*;?\s*$", text, flags=re.S)
+    if not m:
+        return None
+    return _plain_json(m.group(1), label)
 
 
 def _xhs_scene_url(image: dict, scene: str) -> str | None:
@@ -1329,10 +1344,106 @@ def _push_product_asset(
     })
 
 
+def _push_product_video_asset(
+    out: list[dict],
+    seen: set[str],
+    raw_url: str | None,
+    *,
+    thumb: str | None = None,
+    width: int | None = None,
+    height: int | None = None,
+) -> None:
+    safe = _safe_asset_url(raw_url)
+    if not safe or safe in seen:
+        return
+    if _looks_like_audio_url(safe):
+        return
+    path = urlparse(safe).path.lower()
+    if not path.endswith(_VID_EXT):
+        return
+    seen.add(safe)
+    out.append({
+        "type": "video",
+        "url": safe,
+        "thumb": _safe_asset_url(thumb) if thumb else None,
+        "width": width,
+        "height": height,
+    })
+
+
+def _jd_video_ids_from_html(html: str) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    patterns = (
+        r"\bmainVideoId\b\s*[:=]\s*[\"']?(\d{5,20})",
+        r"\bvideoId\b\s*[:=]\s*[\"']?(\d{5,20})",
+        r"\bdata-vu\s*=\s*[\"'](\d{5,20})[\"']",
+    )
+    for pattern in patterns:
+        for match in re.finditer(pattern, html, flags=re.I):
+            video_id = match.group(1)
+            if video_id in seen:
+                continue
+            seen.add(video_id)
+            out.append(video_id)
+    return out
+
+
+def _jd_video_api_url(video_id: str) -> str:
+    params = {
+        "callback": "jdVideo",
+        "vid": video_id,
+        "type": "1",
+        "from": "1",
+        "appid": "item-v3",
+        "functionId": "pc_tencent_video_v3",
+        "_": str(int(time.time() * 1000)),
+    }
+    return "https://api.m.jd.com/tencent/video_v3?" + urlencode(params)
+
+
+def _fetch_jd_video_asset(video_id: str) -> dict | None:
+    raw = _render_with_httpx(
+        _jd_video_api_url(video_id),
+        timeout=8.0,
+        max_read_seconds=5.0,
+        max_body_bytes=512_000,
+    )
+    data = _json_from_jsonp(raw, "jd video")
+    if not data or data.get("code") not in (0, "0", None):
+        return None
+    ext = data.get("extInfo") if isinstance(data.get("extInfo"), dict) else {}
+    play_url = data.get("playUrl") or data.get("url")
+    if not isinstance(play_url, str):
+        return None
+    return {
+        "url": play_url,
+        "thumb": data.get("imageUrl") if isinstance(data.get("imageUrl"), str) else None,
+        "width": _int_or_none(ext.get("vwidth") or ext.get("width")),
+        "height": _int_or_none(ext.get("vheight") or ext.get("height")),
+    }
+
+
 def _extract_jd_assets(html: str, base_url: str) -> list[dict]:
     soup = BeautifulSoup(html, "lxml")
     out: list[dict] = []
     seen: set[str] = set()
+
+    for video_id in _jd_video_ids_from_html(html):
+        try:
+            video = _fetch_jd_video_asset(video_id)
+        except (httpx.HTTPError, SsrfError, ValueError) as e:
+            log.warning("jd video fetch failed id=%s error=%s", video_id, e)
+            continue
+        if video:
+            _push_product_video_asset(
+                out,
+                seen,
+                video.get("url"),
+                thumb=video.get("thumb"),
+                width=video.get("width"),
+                height=video.get("height"),
+            )
 
     # Preferred: product gallery emitted as imageList: ["jfs/...", ...].
     m = re.search(r"\bimageList\s*:\s*\[(.*?)\]", html, flags=re.S)
@@ -1380,6 +1491,120 @@ def _extract_taobao_assets(html: str, base_url: str) -> list[dict]:
     return _filter_safe_assets(out)
 
 
+def _walk_strings(obj):
+    if isinstance(obj, str):
+        yield obj
+    elif isinstance(obj, dict):
+        for value in obj.values():
+            yield from _walk_strings(value)
+    elif isinstance(obj, list):
+        for value in obj:
+            yield from _walk_strings(value)
+
+
+def _extract_taobao_assets_from_json(data: dict | None) -> list[dict]:
+    out: list[dict] = []
+    seen: set[str] = set()
+    if not isinstance(data, dict):
+        return out
+
+    for text in _walk_strings(data):
+        if not text:
+            continue
+        cleaned = text.replace("\\/", "/")
+        if (
+            "alicdn.com" in cleaned
+            or "taobaocdn.com" in cleaned
+            or cleaned.startswith(("imgextra/", "bao/uploaded/", "/imgextra/", "/bao/uploaded/"))
+        ):
+            _push_product_asset(out, seen, cleaned, platform="taobao")
+        for match in _URL_IN_JSON_RE.finditer(text):
+            _push_product_asset(
+                out,
+                seen,
+                match.group(0).replace("\\/", "/"),
+                platform="taobao",
+            )
+    return _filter_safe_assets(out)
+
+
+def _taobao_mtop_detail_url(item_id: str, api_name: str) -> str:
+    app_key = "12574478"
+    timestamp = str(int(time.time() * 1000))
+    ex_params = {
+        "id": item_id,
+        "detail_v": "3.5.0",
+        "appReqFrom": "detail",
+        "container_type": "xdetail",
+        "dinamic_v3": "true",
+        "supportV7": "true",
+        "ultron2": "true",
+        "itemNumId": item_id,
+        "pageCode": "miniAppDetail",
+        "_from_": "miniapp",
+        "openFrom": "pagedetail",
+        "pageSource": "1",
+        "requestSource": "detailH5",
+    }
+    payload = json.dumps(
+        {
+            "id": item_id,
+            "detail_v": "3.5.0",
+            "exParams": json.dumps(ex_params, separators=(",", ":"), ensure_ascii=False),
+        },
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    # Public H5 detail endpoints normally accept an empty-token signature. When
+    # Taobao requires login/security verification it returns a structured error;
+    # in that case we simply fall back to the clearer platform message.
+    sign = hashlib.md5(f"&{timestamp}&{app_key}&{payload}".encode()).hexdigest()
+    params = {
+        "jsv": "2.7.4",
+        "appKey": app_key,
+        "t": timestamp,
+        "sign": sign,
+        "api": api_name,
+        "v": "1.0",
+        "ttid": "201200@taobao_h5_10.2.10",
+        "requestSource": "detailH5",
+        "isSec": "0",
+        "ecode": "0",
+        "AntiFlood": "true",
+        "AntiCreep": "true",
+        "H5Request": "true",
+        "type": "jsonp",
+        "dataType": "jsonp",
+        "safariGoLogin": "true",
+        "mainDomain": "taobao.com",
+        "subDomain": "m",
+        "prefix": "h5api",
+        "syncCookieMode": "true",
+        "getJSONP": "true",
+        "callback": "mtopjsonp1",
+        "data": payload,
+    }
+    return f"https://h5api.m.taobao.com/h5/{api_name}/1.0/?" + urlencode(params)
+
+
+def _fetch_taobao_h5_detail_assets(item_id: str) -> list[dict]:
+    for api_name in ("mtop.taobao.pcdetail.data.get", "mtop.taobao.detail.data.get"):
+        raw = _render_with_httpx(
+            _taobao_mtop_detail_url(item_id, api_name),
+            timeout=8.0,
+            max_read_seconds=5.0,
+            max_body_bytes=2_000_000,
+        )
+        data = _json_from_jsonp(raw, api_name)
+        assets = _extract_taobao_assets_from_json(data)
+        if assets:
+            return assets
+        ret = data.get("ret") if isinstance(data, dict) else None
+        if ret:
+            log.info("taobao h5 detail returned no assets api=%s ret=%s", api_name, ret)
+    return []
+
+
 def _run_jd(url: str) -> list[dict]:
     first = _render_page_with_httpx(
         url,
@@ -1390,7 +1615,11 @@ def _run_jd(url: str) -> list[dict]:
     pages: list[RenderedPage] = [first]
 
     candidate_url = _jd_return_url(first)
-    sku = _jd_sku_from_url(candidate_url or first.final_url or url)
+    sku = (
+        _jd_sku_from_url(candidate_url)
+        or _jd_sku_from_url(first.final_url)
+        or _jd_sku_from_url(url)
+    )
     if sku:
         pc_url = f"https://item.jd.com/{sku}.html"
         if pc_url not in {p.final_url for p in pages}:
@@ -1426,7 +1655,11 @@ def _run_taobao(url: str) -> list[dict]:
     pages: list[RenderedPage] = [first]
 
     target = _taobao_target_url(first)
-    item_id = _taobao_item_id_from_url(target or first.final_url or url)
+    item_id = (
+        _taobao_item_id_from_url(target)
+        or _taobao_item_id_from_url(first.final_url)
+        or _taobao_item_id_from_url(url)
+    )
     for candidate in (
         target,
         f"https://item.taobao.com/item.htm?id={item_id}" if item_id else None,
@@ -1457,6 +1690,13 @@ def _run_taobao(url: str) -> list[dict]:
             return assets
         if msg := _ecommerce_security_message("taobao", page.html, page.final_url):
             blocked = msg
+    if item_id:
+        try:
+            assets = _fetch_taobao_h5_detail_assets(item_id)
+            if assets:
+                return assets
+        except (httpx.HTTPError, SsrfError, ValueError) as e:
+            log.warning("taobao h5 detail fallback failed item=%s error=%s", item_id, e)
     if blocked:
         raise ValueError(blocked)
     return []
@@ -1632,10 +1872,10 @@ _REGISTRY: list[PlatformExtractor] = [
         "未获取到 X 帖子素材，可能被登录态、访问频率或帖子可见性限制拦截"),
     PlatformExtractor(
         "京东", _is_jd_host, _run_jd, _timeout_hint("京东"),
-        "未获取到京东商品图片，可能被安全校验、登录态或商品可见性限制拦截"),
+        "未获取到京东商品素材，可能被安全校验、登录态或商品可见性限制拦截"),
     PlatformExtractor(
         "淘宝", _is_taobao_host, _run_taobao, _timeout_hint("淘宝"),
-        "未获取到淘宝商品图片，可能被安全校验、登录态或商品可见性限制拦截"),
+        "未获取到淘宝商品素材，可能被安全校验、登录态或商品可见性限制拦截"),
     # catch-all generic web fallback — must stay last
     PlatformExtractor(
         "网页", lambda _host: True, _run_generic, _timeout_hint(),

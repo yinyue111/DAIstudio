@@ -74,6 +74,16 @@ def _image_inside_reap_window(task: GenTask, now: datetime) -> bool:
     return bool(anchor and now - anchor < _image_reap_window())
 
 
+def _image_render_started_at(params: dict | None, fallback: datetime | None) -> datetime | None:
+    raw = (params or {}).get("_image_render_started_at")
+    if raw:
+        try:
+            return _aware(datetime.fromisoformat(str(raw)))
+        except ValueError:
+            return _aware(fallback)
+    return _aware(fallback)
+
+
 def get_retention_days(db: Session) -> int:
     try:
         return int(get_setting(db, "asset_retention_days", 30))
@@ -356,6 +366,7 @@ def reap_stuck_tasks(db: Session, max_minutes: int = 60) -> int:
                 GenTask.id,
                 GenTask.user_id,
                 GenTask.category,
+                GenTask.status,
                 GenTask.phase,
                 GenTask.external_task_id,
                 GenTask.external_submitted_at,
@@ -454,9 +465,16 @@ def reap_stuck_tasks(db: Session, max_minutes: int = 60) -> int:
                 elif age is not None and age < generic_window:
                     continue
         elif row["category"] == "image":
-            created_at = _aware(row["created_at"])
-            if not created_at or now - created_at < _image_reap_window():
-                continue
+            params = row["params"] or {}
+            if row["status"] == "queued":
+                if age is not None and age < generic_window:
+                    continue
+                error_message = "任务排队超时,已自动失败并退回额度"
+            else:
+                anchor = _image_render_started_at(params, row["created_at"])
+                if not anchor or now - anchor < _image_reap_window():
+                    continue
+                error_message = "图片生成任务超时,已自动失败并退回额度"
         elif age is not None and age < generic_window:
             continue
         if hold_for_review:

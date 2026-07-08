@@ -144,9 +144,24 @@ def _join_api_path(config: RuntimeGatewayConfig | None, path: str) -> str:
 def _gateway_mock(config: RuntimeGatewayConfig | None = None) -> bool:
     if settings.mock_mode:
         return True
-    if config is None:
+    if config is None or config.source == "env":
         return settings.effective_mock_mode
-    return not config.base_url or not config.api_key
+    return False
+
+
+def _ensure_gateway_configured(config: RuntimeGatewayConfig | None, label: str) -> None:
+    if settings.mock_mode:
+        return
+    if config is not None and config.source in {"model", "probe"} and not config.configured:
+        raise GatewayError(f"{label}网关配置不完整:缺少 Base URL 或 API Key")
+
+
+def _video_gateway_mock(config: RuntimeGatewayConfig | None = None) -> bool:
+    if settings.mock_mode:
+        return True
+    if config is None or config.source == "env":
+        return settings.effective_video_mock
+    return False
 
 
 def _pin_required(url: str) -> bool:
@@ -303,6 +318,7 @@ def _get(path: str, timeout: int | None = None,
 
 def list_models(config: RuntimeGatewayConfig) -> list[dict]:
     """Return models advertised by an OpenAI-compatible provider."""
+    _ensure_gateway_configured(config, "模型")
     if _gateway_mock(config):
         raise GatewayError("模型提供商未配置 Base URL 或 API Key")
     data = _get("/models", timeout=30, config=config)
@@ -333,6 +349,7 @@ def reverse_prompt(image_refs, vision_model_id: str, target: str = "image",
     keyframes sampled from a reference video, in temporal order). ``target``
     selects the image vs video template. Returns the parsed prompt plus the
     provider ``usage`` (real token consumption) and call latency."""
+    _ensure_gateway_configured(gateway_config, "反推")
     if _gateway_mock(gateway_config):
         return _mock_reverse(target)
     refs = [image_refs] if isinstance(image_refs, str) else [r for r in image_refs if r]
@@ -827,6 +844,7 @@ def gen_image(prompt: str, image_model_id: str, n: int = 4,
     fall back to plain text -> image. This keeps the default path safe even
     when the gateway has no edit endpoint configured.
     """
+    _ensure_gateway_configured(gateway_config, "图像")
     if _gateway_mock(gateway_config):
         return [_mock_image(prompt, size, i) for i in range(n)]
 
@@ -1149,6 +1167,47 @@ def _format_gateway_path(template: str, **values: str) -> str:
     return str(template).format(**encoded)
 
 
+def _compact_text(value) -> str:
+    text = str(value or "").strip()
+    return text[:300]
+
+
+def _video_provider_error(data) -> tuple[str | None, str | None]:
+    if not isinstance(data, dict):
+        return None, None
+    err = data.get("error")
+    if isinstance(err, dict):
+        message = (
+            err.get("message")
+            or err.get("msg")
+            or err.get("detail")
+            or err.get("reason")
+            or err.get("description")
+        )
+        code = err.get("code") or err.get("type") or err.get("error_code")
+        return _compact_text(message) or None, _compact_text(code) or None
+    if err:
+        return _compact_text(err), None
+    for message_key in ("error_message", "errorMessage", "message", "reason", "fail_reason"):
+        if data.get(message_key):
+            code = data.get("error_code") or data.get("code")
+            return _compact_text(data.get(message_key)), _compact_text(code) or None
+    for nested_key in ("data", "output", "content", "result"):
+        message, code = _video_provider_error(data.get(nested_key))
+        if message or code:
+            return message, code
+    return None, None
+
+
+def _normalise_video_status(raw_status, data) -> tuple[str, str | None, str | None, str]:
+    raw = str(raw_status or "").strip().lower()
+    norm = _VIDEO_STATUS.get(raw)
+    error_message, error_code = _video_provider_error(data)
+    if norm is None:
+        norm = "failed" if (error_message or error_code) else ("running" if raw else "queued")
+    return norm, error_message, error_code, raw
+
+
 def _video_post(path: str, payload: dict, timeout: int | None = None,
                 config: RuntimeGatewayConfig | None = None) -> dict:
     # submit is non-idempotent -> retries=0 so a retry can't double-submit a job
@@ -1176,10 +1235,9 @@ def submit_video(prompt: str, video_model_id: str, params: dict,
     """Submit an async video job; returns an external task id."""
     if settings.mock_mode:
         return f"mock-{random.randint(100000, 999999)}"
-    if gateway_config is None and settings.effective_video_mock:
+    if _video_gateway_mock(gateway_config):
         return f"mock-{random.randint(100000, 999999)}"
-    if gateway_config is not None and (not gateway_config.base_url or not gateway_config.api_key):
-        return f"mock-{random.randint(100000, 999999)}"
+    _ensure_gateway_configured(gateway_config, "视频")
     fmt = gateway_config.gateway_format if gateway_config is not None else settings.video_gateway_format
     if fmt == "ark":
         return _submit_video_ark(prompt, video_model_id, params, gateway_config=gateway_config)
@@ -1206,10 +1264,10 @@ def poll_video(external_task_id: str, video_model_id: str,
     if (
         settings.mock_mode
         or str(external_task_id).startswith("mock-")
-        or (gateway_config is None and settings.effective_video_mock)
-        or (gateway_config is not None and (not gateway_config.base_url or not gateway_config.api_key))
+        or _video_gateway_mock(gateway_config)
     ):
         return {"status": "succeeded", "url": None, "mock": True}
+    _ensure_gateway_configured(gateway_config, "视频")
     fmt = gateway_config.gateway_format if gateway_config is not None else settings.video_gateway_format
     if fmt == "ark":
         return _poll_video_ark(external_task_id, gateway_config=gateway_config)
@@ -1219,7 +1277,7 @@ def poll_video(external_task_id: str, video_model_id: str,
         data = _video_get(poll_path, timeout=30)
     else:
         data = _video_get(poll_path, timeout=30, config=gateway_config)
-    norm = _VIDEO_STATUS.get((data.get("status") or "").lower(), "running")
+    norm, err, err_code, raw_status = _normalise_video_status(data.get("status"), data)
     url = None
     if norm == "succeeded":
         url = (
@@ -1230,7 +1288,14 @@ def poll_video(external_task_id: str, video_model_id: str,
             or _nested_video_url(data.get("data"))
             or _nested_video_url(data.get("output"))
         )
-    return {"status": norm, "url": url, "raw": data}
+    return {
+        "status": norm,
+        "url": url,
+        "error": err,
+        "error_code": err_code,
+        "raw_status": raw_status or None,
+        "raw": data,
+    }
 
 
 def find_video_by_request_id(request_id: str, video_model_id: str,
@@ -1264,12 +1329,15 @@ def find_video_by_request_id(request_id: str, video_model_id: str,
         ext_id = record.get("task_id") or record.get("id")
     if not ext_id:
         return None
-    raw_status = str(_extract_by_path(record, status_field) or "").lower()
-    norm = _VIDEO_STATUS.get(raw_status, "running" if raw_status else "queued")
+    raw_status = _extract_by_path(record, status_field)
+    norm, err, err_code, raw_status = _normalise_video_status(raw_status, record)
     return {
         "external_task_id": str(ext_id),
         "status": norm,
         "url": _nested_video_url(record),
+        "error": err,
+        "error_code": err_code,
+        "raw_status": raw_status or None,
         "raw": data,
     }
 
@@ -1292,12 +1360,16 @@ def _poll_video_ark(task_id: str, gateway_config: RuntimeGatewayConfig | None = 
         data = _video_get(f"/contents/generations/tasks/{task_id}", timeout=30)
     else:
         data = _video_get(f"/contents/generations/tasks/{task_id}", timeout=30, config=gateway_config)
-    norm = _VIDEO_STATUS.get((data.get("status") or "").lower(), "running")
+    norm, err, err_code, raw_status = _normalise_video_status(data.get("status"), data)
     url = None
-    err = None
     if norm == "succeeded":
         content = data.get("content") or {}
         url = _nested_video_url(content) or _nested_video_url(data.get("data")) or _nested_video_url(data)
-    if norm == "failed":
-        err = (data.get("error") or {}).get("message") or str(data.get("error") or "")[:200]
-    return {"status": norm, "url": url, "error": err, "raw": data}
+    return {
+        "status": norm,
+        "url": url,
+        "error": err,
+        "error_code": err_code,
+        "raw_status": raw_status or None,
+        "raw": data,
+    }

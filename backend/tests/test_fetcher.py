@@ -837,6 +837,84 @@ def test_jd_extractor_reads_product_gallery_and_upgrades_size():
     assert all("s720x720" not in a["url"] for a in assets)
 
 
+def test_jd_extractor_reads_main_video(monkeypatch):
+    def fake_video(video_id):
+        assert video_id == "3573240983"
+        return {
+            "url": "https://vod.300hu.com/path/product-demo.mp4?source=1",
+            "thumb": "https://img.300hu.com/path/poster.jpg",
+            "width": 1280,
+            "height": 720,
+        }
+
+    monkeypatch.setattr(fetcher, "_fetch_jd_video_asset", fake_video)
+    html = """
+    <html><body>
+      <script>var pageConfig = {
+        imageAndVideoJson: {"mainVideoId":"3573240983"},
+        imageList: ["jfs/t1/product.jpg"]
+      };</script>
+      <div class="video" id="v-video" data-vu="3573240983"></div>
+    </body></html>
+    """
+
+    assets = fetcher._extract_jd_assets(html, "https://item.jd.com/100108209840.html")
+
+    assert assets[0] == {
+        "type": "video",
+        "url": "https://vod.300hu.com/path/product-demo.mp4?source=1",
+        "thumb": "https://img.300hu.com/path/poster.jpg",
+        "width": 1280,
+        "height": 720,
+    }
+    assert assets[1]["url"] == "https://img13.360buyimg.com/n1/jfs/t1/product.jpg"
+
+
+def test_jd_video_api_jsonp_parsed(monkeypatch):
+    monkeypatch.setattr(
+        fetcher,
+        "_render_with_httpx",
+        lambda *_args, **_kwargs: (
+            'jdVideo({"duration":10,"code":0,'
+            '"imageUrl":"https://img.300hu.com/poster.jpg",'
+            '"playUrl":"https://vod.300hu.com/video.mp4?source=1",'
+            '"extInfo":{"vwidth":1280,"vheight":720}})'
+        ),
+    )
+
+    asset = fetcher._fetch_jd_video_asset("3573240983")
+
+    assert asset == {
+        "url": "https://vod.300hu.com/video.mp4?source=1",
+        "thumb": "https://img.300hu.com/poster.jpg",
+        "width": 1280,
+        "height": 720,
+    }
+
+
+def test_jd_fallback_keeps_sku_from_original_url(monkeypatch):
+    calls = []
+
+    def fake_page(url, **_kwargs):
+        calls.append(url)
+        if len(calls) == 1:
+            return fetcher.RenderedPage(
+                html="<html><title>京东验证</title></html>",
+                final_url="https://cfe.m.jd.com/privatedomain/risk_handler/03101900/",
+            )
+        return fetcher.RenderedPage(
+            html='<script>var pageConfig = { imageList: ["jfs/t1/product.jpg"] };</script>',
+            final_url=url,
+        )
+
+    monkeypatch.setattr(fetcher, "_render_page_with_httpx", fake_page)
+
+    assets = fetcher.parse_url("https://item.jd.com/100108209840.html?from=card")
+
+    assert calls[1] == "https://item.jd.com/100108209840.html"
+    assert assets[0]["url"] == "https://img13.360buyimg.com/n1/jfs/t1/product.jpg"
+
+
 def test_jd_short_link_falls_back_to_pc_product_page(monkeypatch):
     calls = []
 
@@ -900,6 +978,59 @@ def test_taobao_short_link_uses_embedded_target_url(monkeypatch):
     assert assets[0]["url"] == "https://img.alicdn.com/imgextra/i1/abc/O1CN01main.jpg"
 
 
+def test_taobao_h5_detail_fallback_extracts_product_images(monkeypatch):
+    def fake_page(url, **_kwargs):
+        return fetcher.RenderedPage(
+            html='<a href="https://bixi.alicdn.com/punish/foo"></a><script>x5secdata=""</script>',
+            final_url=url,
+        )
+
+    monkeypatch.setattr(fetcher, "_render_page_with_httpx", fake_page)
+    monkeypatch.setattr(
+        fetcher,
+        "_render_with_httpx",
+        lambda *_args, **_kwargs: (
+            'mtopjsonp1({"api":"mtop.taobao.detail.data.get","v":"1.0",'
+            '"ret":["SUCCESS::调用成功"],"data":{"item":{"images":['
+            '"//img.alicdn.com/imgextra/i1/abc/O1CN01main.jpg_430x430q90.jpg",'
+            '"//img.alicdn.com/imgextra/i2/abc/O1CN01detail.jpg"'
+            ']}}})'
+        ),
+    )
+
+    assets = fetcher.parse_url("https://detail.tmall.com/item.htm?id=991767518632")
+
+    assert [a["url"] for a in assets[:2]] == [
+        "https://img.alicdn.com/imgextra/i1/abc/O1CN01main.jpg",
+        "https://img.alicdn.com/imgextra/i2/abc/O1CN01detail.jpg",
+    ]
+
+
+def test_taobao_h5_fallback_keeps_item_id_from_original_url(monkeypatch):
+    def fake_page(_url, **_kwargs):
+        return fetcher.RenderedPage(
+            html='<a href="https://bixi.alicdn.com/punish/foo"></a><script>x5secdata=""</script>',
+            final_url="https://login.taobao.com/member/login.jhtml?from=sm",
+        )
+
+    def fake_h5(item_id):
+        assert item_id == "991767518632"
+        return [{
+            "type": "image",
+            "url": "https://img.alicdn.com/imgextra/i1/abc/O1CN01main.jpg",
+            "thumb": "https://img.alicdn.com/imgextra/i1/abc/O1CN01main.jpg",
+            "width": None,
+            "height": None,
+        }]
+
+    monkeypatch.setattr(fetcher, "_render_page_with_httpx", fake_page)
+    monkeypatch.setattr(fetcher, "_fetch_taobao_h5_detail_assets", fake_h5)
+
+    assets = fetcher.parse_url("https://detail.tmall.com/item.htm?id=991767518632")
+
+    assert assets[0]["url"] == "https://img.alicdn.com/imgextra/i1/abc/O1CN01main.jpg"
+
+
 def test_taobao_security_page_returns_clear_error(monkeypatch):
     monkeypatch.setattr(
         fetcher,
@@ -908,6 +1039,11 @@ def test_taobao_security_page_returns_clear_error(monkeypatch):
             html='<a href="https://bixi.alicdn.com/punish/foo"></a><script>x5secdata=""</script>',
             final_url=url,
         ),
+    )
+    monkeypatch.setattr(
+        fetcher,
+        "_render_with_httpx",
+        lambda *_args, **_kwargs: 'mtopjsonp1({"ret":["RGV587_ERROR::SM::login"],"data":{}})',
     )
 
     try:
