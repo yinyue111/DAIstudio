@@ -57,7 +57,7 @@ _VIDEO_PARAM_KEYS = _COMMON_PARAM_KEYS | {
 _SUBJECT_MODES = {"general", "product", "portrait"}
 _PRODUCT_LOCK_MODES = {"locked", "free"}
 _EDIT_MASK_MODES = {"off", "protect_subject", "center_box"}
-_PRODUCT_PIXEL_LOCK_MODES = {"strict", "on", "true", "1", "off", "false", "0"}
+_PRODUCT_PIXEL_LOCK_MODES = {"auto", "strict", "on", "true", "1", "off", "false", "0"}
 
 
 def image_max_pixels() -> int:

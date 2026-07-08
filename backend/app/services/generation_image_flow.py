@@ -317,13 +317,15 @@ def run_image_task(task_id: int, *, gen_image_fn=None) -> None:
             "edit_payload_format": (model.extra or {}).get("edit_payload_format"),
         }
         edit_mask_mode = str(params.get("edit_mask_mode") or "").lower().strip()
+        product_pixel_lock_mode = str(params.get("product_pixel_lock") or "auto").lower().strip()
         mask_result = None
+        product_pixel_lock_label = "strict"
         product_pixel_lock = (
             is_product
             and ref
             and edit_path
             and edit_mask_mode != "off"
-            and str(params.get("product_pixel_lock") or "strict").lower().strip() not in {"off", "false", "0"}
+            and product_pixel_lock_mode not in {"off", "false", "0"}
         )
         if is_product and ref and edit_path and edit_mask_mode != "off":
             mask_source = params.get("mask_image_url") or task.source_asset_url
@@ -358,7 +360,22 @@ def run_image_task(task_id: int, *, gen_image_fn=None) -> None:
                 db.commit()
                 if should_send_mask:
                     extra_payload["mask"] = mask_result.data_uri
-                product_pixel_lock = product_pixel_lock and should_send_mask
+                if product_pixel_lock_mode in {"strict", "on", "true", "1"}:
+                    product_pixel_lock_label = "strict"
+                    product_pixel_lock = product_pixel_lock and should_send_mask
+                else:
+                    product_pixel_lock_label = "auto_subject" if mask_result.mode == "auto_subject" else "auto_alpha"
+                    product_pixel_lock = (
+                        product_pixel_lock
+                        and should_send_mask
+                        and (
+                            mask_result.mode == "alpha_subject"
+                            or (
+                                mask_result.mode == "auto_subject"
+                                and mask_result.confidence >= 0.78
+                            )
+                        )
+                    )
         elif product_pixel_lock:
             product_pixel_lock = False
         if product_pixel_lock and not mask_result:
@@ -504,7 +521,7 @@ def run_image_task(task_id: int, *, gen_image_fn=None) -> None:
         if product_pixel_lock:
             task.params = {
                 **(task.params or {}),
-                "_product_pixel_lock": "strict",
+                "_product_pixel_lock": product_pixel_lock_label,
                 "_product_composite_applied_count": product_composite_count,
                 **(product_composite_meta or {}),
             }
