@@ -1100,6 +1100,49 @@ def test_structured_portrait_reference_without_instruction_uses_image_edit(
         db.close()
 
 
+def test_character_reference_image_alone_uses_image_edit(
+    client, make_user, auth, monkeypatch
+):
+    make_user("13900001976", balance=1000)
+    h = auth("13900001976")
+    source = client.post(
+        "/api/uploads/image",
+        files={"file": ("character.png", _png_bytes(size=(1200, 1600)), "image/png")},
+        headers=h,
+    )
+    assert source.status_code == 200, source.text
+    seen = {}
+
+    def fake_gen_image(prompt, image_model_id, n=4, size="1024x1024",
+                       reference_image_url=None, edit_path=None, extra_payload=None):
+        seen["reference_image_url"] = reference_image_url
+        seen["edit_path"] = edit_path
+        return [_mock_image(prompt, "256x256", 0)]
+
+    monkeypatch.setattr("app.services.gateway.gen_image", fake_gen_image)
+
+    r = client.post("/api/generate", json={
+        "source_type": "image",
+        "category": "image",
+        "stage": "preview",
+        "prompt": {
+            "final_text": "保持上传人物的身份、身体轮廓、坐姿和柔和侧光",
+            "图像类型": "人物图",
+        },
+        "params": {
+            "n": 1,
+            "size": "1024x1024",
+            "subject_mode": "portrait",
+            "character_reference_image": source.json()["url"],
+        },
+    }, headers=h)
+
+    assert r.status_code == 200, r.text
+    assert r.json()["cost_frozen"] == 20
+    assert seen["reference_image_url"].startswith("data:image/jpeg;base64,")
+    assert seen["edit_path"] == "/v1/images/edits"
+
+
 def test_portrait_negative_prompt_ignores_stale_wedding_and_contact_fields(
     client, make_user, auth, monkeypatch
 ):
@@ -1149,6 +1192,55 @@ def test_portrait_negative_prompt_ignores_stale_wedding_and_contact_fields(
     assert "旧解析" not in seen["prompt"]
     assert "通用婚纱蕾丝" in seen["negative_prompt"]
     assert "浅色隐形眼镜" in seen["negative_prompt"]
+
+
+def test_portrait_negative_prompt_uses_effective_lighting_instead_of_guard_text(
+    client, make_user, auth, monkeypatch
+):
+    make_user("13900001979", balance=1000)
+    h = auth("13900001979")
+    source = client.post(
+        "/api/uploads/image",
+        files={"file": ("portrait.png", _png_bytes(size=(1200, 1600)), "image/png")},
+        headers=h,
+    )
+    assert source.status_code == 200, source.text
+    seen = {}
+
+    def fake_gen_image(prompt, image_model_id, n=4, size="1024x1024",
+                       reference_image_url=None, edit_path=None, extra_payload=None):
+        seen["negative_prompt"] = extra_payload["negative_prompt"]
+        return [_mock_image(prompt, "256x256", 0)]
+
+    monkeypatch.setattr("app.services.gateway.gen_image", fake_gen_image)
+    canonical = (
+        "成年职业人像，人物直立居中，白色婚纱与浅色隐形眼镜；"
+        "使用硬质影棚主光、高锐度 HDR 和深黑高对比阴影，明确无柔雾、无柔焦、"
+        "无光晕、无高光扩散。"
+    )
+
+    r = client.post("/api/generate", json={
+        "source_asset_url": source.json()["url"],
+        "source_type": "image",
+        "category": "image",
+        "stage": "preview",
+        "prompt": {
+            "final_text": canonical,
+            "user_instruction": canonical,
+            "图像类型": "人物图",
+            "光线": "旧解析：左上大面积柔光，暗部保留冷蓝层次",
+            "后期质感": "旧解析：低对比柔雾、宽泛光晕、低锐化、非 HDR",
+        },
+        "params": {
+            "n": 1,
+            "size": "1024x1024",
+            "reference_image_url": source.json()["url"],
+        },
+    }, headers=h)
+
+    assert r.status_code == 200, r.text
+    for term in ("暗部死黑", "柔雾丢失", "光晕丢失", "HDR", "硬锐化"):
+        assert term not in seen["negative_prompt"]
 
 
 def test_plain_text_portrait_without_reference_does_not_claim_uploaded_identity(

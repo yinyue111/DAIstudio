@@ -56,6 +56,21 @@ _REFERENCE_PRODUCT_NOUN_RE = re.compile(
     re.IGNORECASE,
 )
 _USER_INSTRUCTION_KEYS = ("user_instruction", "补充要求", "编辑要求", "生成要求")
+_PORTRAIT_NEGATIVE_EVIDENCE_KEYS = (
+    "主体",
+    "人物比例",
+    "身材体态",
+    "身材曲线",
+    "体态线条",
+    "服装结构",
+    "服装覆盖",
+    "妆发五官",
+    "构图",
+    "视角镜头",
+    "视角构图",
+    "光线",
+    "后期质感",
+)
 _SUBJECT_PROFILE_KEYS = (
     "产品身份档案",
     "人物身份档案",
@@ -404,13 +419,7 @@ def _rewrite_product_style_fragment(key: str, value, *, is_video: bool = False) 
     return cleaned
 
 
-def _structured_generation_prompt(prompt_obj: dict, fallback: str) -> str:
-    canonical = _meaningful_canonical_prompt(
-        fallback,
-        allow_short=_explicit_canonical_matches(prompt_obj, fallback),
-    )
-    if canonical:
-        return canonical
+def _structured_generation_prompt(prompt_obj: dict) -> str:
     parts: list[str] = []
     for key in _GENERATION_PROMPT_KEEP_KEYS:
         value = prompt_obj.get(key)
@@ -426,9 +435,28 @@ def _structured_generation_prompt(prompt_obj: dict, fallback: str) -> str:
         if fragment:
             parts.append(f"{key}: {fragment}")
     base = "；".join(parts)
-    if not base:
-        base = _normalise_prompt_fragment(fallback)
     return base
+
+
+def portrait_negative_prompt_evidence(task: GenTask) -> str:
+    """Return only user/reverse evidence that can justify portrait negatives."""
+    prompt_obj = task.prompt if isinstance(task.prompt, dict) else {}
+    fallback = str(prompt_obj.get("final_text") or prompt_obj.get("instruction") or "")
+    canonical = _meaningful_canonical_prompt(
+        fallback,
+        allow_short=_explicit_canonical_matches(prompt_obj, fallback),
+    )
+    if canonical:
+        return canonical
+    for key in (*_USER_INSTRUCTION_KEYS, "instruction"):
+        instruction = _meaningful_canonical_prompt(prompt_obj.get(key), allow_short=True)
+        if instruction:
+            return instruction
+    return "；".join(
+        fragment
+        for key in _PORTRAIT_NEGATIVE_EVIDENCE_KEYS
+        if (fragment := _compact_prompt_field(key, prompt_obj.get(key)))
+    )
 
 
 def _style_transfer_generation_prompt(
@@ -566,7 +594,7 @@ def compact_generation_prompt_text(
             product_video_template=product_video_template,
         )
     else:
-        source = _structured_generation_prompt(prompt_obj, fallback)
+        source = _structured_generation_prompt(prompt_obj)
     if not source:
         source = str(fallback or "")
     if product:
@@ -689,13 +717,38 @@ def portrait_image_negative_prompt(value: str | None = None, prompt: str | None 
         terms.extend(("硬质影棚光", "平坦阴影"))
     if re.search(r"暗部.{0,16}层次|抬升黑位|抬起黑位|暗部不死黑", prompt_text, re.IGNORECASE):
         terms.append("暗部死黑")
-    if re.search(r"柔雾|柔焦|soft\s*focus|雾化", prompt_text, re.IGNORECASE):
+    haze_requested = bool(re.search(r"柔雾|雾化", prompt_text, re.IGNORECASE)) and not re.search(
+        r"(?:无|非|不要|不使用|去除|取消)(?:任何)?(?:柔雾|雾化)|"
+        r"(?:避免|不得)(?:出现|使用|加入|添加|产生|保留)(?:柔雾|雾化)|"
+        r"no\s+(?:haze|mist)",
+        prompt_text,
+        re.IGNORECASE,
+    )
+    soft_focus_requested = bool(
+        re.search(r"柔焦|soft\s*focus", prompt_text, re.IGNORECASE)
+    ) and not re.search(
+        r"(?:无|非|不要|不使用|去除|取消)(?:任何)?柔焦|"
+        r"(?:避免|不得)(?:出现|使用|加入|添加|产生|保留)柔焦|"
+        r"no\s+soft\s*focus",
+        prompt_text,
+        re.IGNORECASE,
+    )
+    if haze_requested or soft_focus_requested:
         terms.append("柔雾丢失")
-    if re.search(r"光晕|高光扩散|bloom|halation", prompt_text, re.IGNORECASE):
+    halo_requested = bool(
+        re.search(r"光晕|高光扩散|bloom|halation", prompt_text, re.IGNORECASE)
+    ) and not re.search(
+        r"(?:无|非|不要|不使用|去除|取消)(?:任何)?(?:光晕|高光扩散|bloom|halation)|"
+        r"(?:避免|不得)(?:出现|使用|加入|添加|产生|保留)(?:光晕|高光扩散|bloom|halation)|"
+        r"no\s+(?:bloom|halation)",
+        prompt_text,
+        re.IGNORECASE,
+    )
+    if halo_requested:
         terms.append("光晕丢失")
     if re.search(r"非\s*HDR|non[-\s]?HDR", prompt_text, re.IGNORECASE):
         terms.append("HDR")
-    if re.search(r"低锐化|低锐度|中低锐度|低微对比|柔焦", prompt_text, re.IGNORECASE):
+    if re.search(r"低锐化|低锐度|中低锐度|低微对比", prompt_text, re.IGNORECASE) or soft_focus_requested:
         terms.append("硬锐化")
     return _merge_negative_terms(value, tuple(terms))
 

@@ -37,6 +37,7 @@ from .generation_prompts import (
     is_portrait_generation_task,
     is_product_generation_task,
     portrait_image_negative_prompt,
+    portrait_negative_prompt_evidence,
     product_fidelity_prompt,
     product_image_negative_prompt,
 )
@@ -317,7 +318,10 @@ def run_image_task(task_id: int, *, gen_image_fn=None) -> None:
                 else IMAGE_EDIT_REFERENCE_MAX_SIDE
             )
         )
-        explicit_reference_url = params.get("reference_image_url")
+        explicit_reference_url = (
+            params.get("reference_image_url")
+            or params.get("character_reference_image")
+        )
         should_load_reference = bool(explicit_reference_url) or (
             bool((task.prompt or {}).get("instruction")) and task.source_type == "image"
         )
@@ -356,7 +360,7 @@ def run_image_task(task_id: int, *, gen_image_fn=None) -> None:
                 else (
                     portrait_image_negative_prompt(
                         params.get("negative_prompt") or params.get("negative"),
-                        prompt,
+                        portrait_negative_prompt_evidence(task),
                     )
                     if is_portrait
                     else (params.get("negative_prompt") or params.get("negative"))
