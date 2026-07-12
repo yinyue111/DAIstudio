@@ -34,7 +34,9 @@ from .generation_media import (
 from .generation_model_runtime import gen_image_with_model_config, model_from_snapshot
 from .generation_prompts import (
     generation_prompt_for_model,
+    is_portrait_generation_task,
     is_product_generation_task,
+    portrait_image_negative_prompt,
     product_fidelity_prompt,
     product_image_negative_prompt,
 )
@@ -48,6 +50,18 @@ log = logging.getLogger("generation")
 
 IMAGE_EDIT_REFERENCE_MAX_SIDE = 1024
 IMAGE_PRODUCT_EDIT_REFERENCE_MAX_SIDE = 1536
+IMAGE_PORTRAIT_EDIT_REFERENCE_MAX_SIDE = 1536
+PORTRAIT_NEGATIVE_EVIDENCE_KEYS = (
+    "final_text",
+    "主体",
+    "人物比例",
+    "身材体态",
+    "体态线条",
+    "服装结构",
+    "视角镜头",
+    "光线",
+    "后期质感",
+)
 
 
 def acquire_image_terminal_boundary(db, task_id: int) -> GenTask | None:
@@ -293,12 +307,19 @@ def run_image_task(task_id: int, *, gen_image_fn=None) -> None:
         n = int((task.params or {}).get("n") or get_setting(db, "image_n", 1))
         params = task.params or {}
         is_product = is_product_generation_task(task)
+        is_portrait = is_portrait_generation_task(task)
         fallback_size = get_setting(db, "image_size", "1024x1024")
         ref_w, ref_h = reference_dimensions(task)
         size = params.get("size") or closest_image_size(ref_w, ref_h, fallback_size)
         prompt = final_prompt(task)
         prompt = generation_prompt_for_model(prompt, task)
         prompt = product_fidelity_prompt(prompt, task)
+        prompt_obj = task.prompt if isinstance(task.prompt, dict) else {}
+        portrait_negative_evidence = "；".join(
+            str(prompt_obj.get(key) or "")
+            for key in PORTRAIT_NEGATIVE_EVIDENCE_KEYS
+            if prompt_obj.get(key)
+        )
 
         set_progress(task_id, 30, "running")
         raise_if_cancel_requested(db, db.get(GenTask, task_id))
@@ -307,13 +328,21 @@ def run_image_task(task_id: int, *, gen_image_fn=None) -> None:
         reference_max_side = (
             IMAGE_PRODUCT_EDIT_REFERENCE_MAX_SIDE
             if is_product
-            else IMAGE_EDIT_REFERENCE_MAX_SIDE
+            else (
+                IMAGE_PORTRAIT_EDIT_REFERENCE_MAX_SIDE
+                if is_portrait
+                else IMAGE_EDIT_REFERENCE_MAX_SIDE
+            )
         )
-        if (task.prompt or {}).get("instruction") and task.source_type == "image":
+        explicit_reference_url = params.get("reference_image_url")
+        should_load_reference = bool(explicit_reference_url) or (
+            bool((task.prompt or {}).get("instruction")) and task.source_type == "image"
+        )
+        if should_load_reference:
             ref = gateway_reference_image(
                 db,
                 task,
-                task.source_asset_url,
+                explicit_reference_url or task.source_asset_url,
                 max_side=reference_max_side,
                 prefer_original_upload=True,
                 quality=92,
@@ -339,7 +368,14 @@ def run_image_task(task_id: int, *, gen_image_fn=None) -> None:
             "negative_prompt": (
                 product_image_negative_prompt(params.get("negative_prompt") or params.get("negative"))
                 if is_product
-                else (params.get("negative_prompt") or params.get("negative"))
+                else (
+                    portrait_image_negative_prompt(
+                        params.get("negative_prompt") or params.get("negative"),
+                        portrait_negative_evidence,
+                    )
+                    if is_portrait
+                    else (params.get("negative_prompt") or params.get("negative"))
+                )
             ),
             "edit_payload_format": (model.extra or {}).get("edit_payload_format"),
         }

@@ -21,23 +21,28 @@ PRODUCT_FIDELITY_GUARD = (
 )
 PORTRAIT_FIDELITY_GUARD = (
     "人像高保真硬约束：上传人像照片是唯一人物身份来源，必须完整保留同一个人的脸型、五官比例、"
-    "眼睛、鼻子、嘴型、发际线、发型特征、肤色、年龄感、性别、体态和可识别身份；不得替换成参考"
+    "眼睛、鼻子、嘴型、发际线、发型特征、肤色、年龄感、性别和可识别身份；同时保持参考人物在"
+    "服装覆盖下可见的整体身体轮廓，包括肩宽、胸廓饱满度、躯干长度、自然腰线、胯宽、四肢比例、"
+    "姿态重心和胸腰胯过渡，不得主动瘦身、增大、缩小、拉长或重塑体型；不得替换成参考"
     "素材中的人物，不得混合两个人的长相，不得改变面部结构、年龄、性别或关键身份特征。只允许迁移"
     "参考素材的场景、构图、光线、色调、服化道、动作节奏、镜头语言和广告质感；整体表达必须保持"
     "成年、自然、得体、专业商业人像或角色设定语境，避免未成年感、夸张身体展示姿态、身体局部凝视、"
-    "私密成人化意图；如风格迁移与人物身份保真冲突，优先保证人物身份、面部结构和自然表情稳定。"
+    "私密成人化意图；严格复刻原图主光方向、软硬程度、明暗对比、脸部与服装高光落点、补光关系、"
+    "阴影浓度、暗部色彩层次、材质反射和柔雾/高光扩散强度；如风格迁移与人物保真冲突，优先保证"
+    "人物身份、身体轮廓比例、面部结构、自然表情和原图光影关系稳定。"
 )
 GENERATION_PROMPT_MIN_CHARS = 1000
 GENERATION_PROMPT_MAX_CHARS = 1500
+CANONICAL_FINAL_TEXT_MIN_CHARS = 80
 _GENERATION_PROMPT_KEEP_KEYS = (
-    "图像类型", "反推重点", "主体", "人像意图", "人物比例", "身材体态",
-    "体态线条", "服装结构", "服装覆盖", "妆发五官",
-    "商品服装", "细节特征", "场景背景", "广告目标", "风格", "构图", "景别",
+    "图像类型", "反推重点", "主体", "人像意图", "人物比例", "身材体态", "身材曲线",
+    "体态线条", "光线", "材质纹理", "后期质感", "服装结构", "服装覆盖", "妆发五官",
+    "色调配色", "商品服装", "细节特征", "场景背景", "广告目标", "风格", "构图", "景别",
     "视角镜头", "视角构图", "主体动作", "镜头运动", "剪辑节奏", "时序分镜",
-    "光线", "色调配色", "材质纹理", "文字版式", "氛围情绪", "后期质感",
+    "文字版式", "氛围情绪",
     "平台质感", "一致性约束", "标签",
 )
-_GENERATION_PROMPT_DROP_KEYS = {"身材曲线", "尺码三围", "露肤度", "负向"}
+_GENERATION_PROMPT_DROP_KEYS = {"尺码三围", "露肤度", "负向"}
 _STYLE_TRANSFER_KEEP_KEYS = (
     "场景背景", "广告目标", "风格", "构图", "景别", "视角镜头", "视角构图",
     "可迁移主体动作", "主体动作", "产品展示方式", "镜头运动", "剪辑节奏", "时序分镜", "字幕卖点", "光线", "色调配色",
@@ -60,20 +65,24 @@ _SUBJECT_PROFILE_KEYS = (
 )
 _GENERATION_PROMPT_SENSITIVE_PATTERNS = (
     (re.compile(r"尺码三围[:：]?\s*[^；。,\n]*[；。,\n]?"), ""),
-    (re.compile(r"身材曲线[:：]?\s*[^；。,\n]*[；。,\n]?"), ""),
     (re.compile(r"露肤度[:：]?\s*[^；。,\n]*[；。,\n]?"), ""),
+    (
+        re.compile(
+            r"(?:胸围\s*[:：]?\s*)?\d{1,3}(?:\.\d+)?\s*(?:cm|厘米)\s*[/／,，、]\s*"
+            r"(?:腰围\s*[:：]?\s*)?\d{1,3}(?:\.\d+)?\s*(?:cm|厘米)\s*[/／,，、]\s*"
+            r"(?:臀围\s*[:：]?\s*)?\d{1,3}(?:\.\d+)?\s*(?:cm|厘米)\b",
+            re.IGNORECASE,
+        ),
+        "",
+    ),
     (re.compile(r"胸围/腰围/臀围|胸围|腰围|臀围|三围|罩杯|胸大臀翘|翘臀|乳沟"), "整体体态比例"),
     (re.compile(r"性感化|性感|诱惑|挑逗|勾引|撩人|火辣|擦边|成人写真|情趣"), "成熟得体的商业人像气质"),
     (re.compile(r"胸部特写|臀部特写|身体局部特写|突出胸部|突出臀部|私密部位"), "避免身体局部凝视"),
     (re.compile(r"高露肤|大面积露肤|裸露|半裸|暴露|低胸|透视装|湿身诱惑|衣服滑落"), "服装覆盖自然得体"),
     (re.compile(r"少女感|萝莉|幼态性感|可爱性感|青春诱惑"), "成年、成熟自然、不幼态"),
-    (re.compile(r"低机位仰拍|低机位展示"), "平视或自然时尚摄影视角"),
+    (re.compile(r"低机位展示"), "平视或自然时尚摄影视角"),
     (re.compile(r"暧昧灯光|私密暧昧|昏暗暧昧"), "柔和明亮的情绪光线"),
     (re.compile(r"画面百分比坐标|百分比坐标"), "画面位置"),
-    (re.compile(r"\d{1,3}(?:\.\d+)?\s*[%％]\s*(?:-|–|~|至|到)\s*\d{1,3}(?:\.\d+)?\s*[%％]"), "适中占比"),
-    (re.compile(r"\d{1,3}(?:\.\d+)?\s*(?:-|–|~|至|到)\s*\d{1,3}(?:\.\d+)?\s*[%％]"), "适中占比"),
-    (re.compile(r"\d{1,3}(?:\.\d+)?\s*[%％]"), "适中占比"),
-    (re.compile(r"#[0-9A-Fa-f]{6}"), ""),
     (re.compile(r"\s+"), " "),
 )
 
@@ -126,6 +135,13 @@ PRODUCT_IMAGE_NEGATIVE_TERMS = (
     "白色光晕",
     "剪纸边缘",
     "悬浮贴纸感",
+)
+PORTRAIT_IMAGE_BASE_NEGATIVE_TERMS = (
+    "主动瘦身",
+    "躯干拉长",
+    "颈部拉长",
+    "腿部拉长",
+    "胸廓-腰线-胯部比例改变",
 )
 _LOCKED_PRODUCT_VIDEO_USER_REWRITES = (
     (
@@ -182,25 +198,37 @@ def is_product_generation_task(task: GenTask) -> bool:
     return str(trace.get("product_generation_mode")).lower() in {"true", "1", "yes"}
 
 
-def _is_portrait_generation_task(task: GenTask) -> bool:
+def is_portrait_generation_task(task: GenTask) -> bool:
+    if is_product_generation_task(task):
+        return False
     params = task.params or {}
     if str(params.get("subject_mode") or "").lower() == "portrait":
         return True
     trace = params.get("_source_trace")
-    if not isinstance(trace, dict):
-        return False
-    return (
+    if isinstance(trace, dict) and (
         str(trace.get("portrait_generation_mode")).lower() in {"true", "1", "yes"}
         or str(trace.get("subject_mode") or "").lower() == "portrait"
+    ):
+        return True
+    prompt_obj = task.prompt if isinstance(task.prompt, dict) else {}
+    has_reference = bool(
+        params.get("reference_image_url")
+        or params.get("character_reference_image")
+        or (
+            getattr(task, "source_type", None) == "image"
+            and getattr(task, "source_asset_url", None)
+            and prompt_obj.get("instruction")
+        )
     )
+    return has_reference and "人物" in str(prompt_obj.get("图像类型") or "")
 
 
 def product_fidelity_prompt(prompt: str, task: GenTask) -> str:
-    if _is_portrait_generation_task(task):
+    if is_portrait_generation_task(task):
         text = str(prompt or "")
         if "人像高保真硬约束" in text:
-            return text
-        return f"{PORTRAIT_FIDELITY_GUARD}{text}"
+            return _trim_generation_prompt(text)
+        return _trim_generation_prompt(f"{PORTRAIT_FIDELITY_GUARD}{text}")
     if not is_product_generation_task(task):
         return prompt
     text = str(prompt or "")
@@ -216,6 +244,56 @@ def _normalise_prompt_fragment(value) -> str:
     for pattern, replacement in _GENERATION_PROMPT_SENSITIVE_PATTERNS:
         text = pattern.sub(replacement, text)
     return re.sub(r"\s+", " ", text).strip(" ,，;；。")
+
+
+_PROMPT_FIELD_LIMITS = {
+    "反推重点": 140,
+    "主体": 160,
+    "人像意图": 100,
+    "人物比例": 150,
+    "身材体态": 170,
+    "身材曲线": 170,
+    "体态线条": 170,
+    "光线": 220,
+    "材质纹理": 150,
+    "后期质感": 170,
+    "服装结构": 150,
+    "服装覆盖": 100,
+    "妆发五官": 130,
+}
+
+
+def _compact_prompt_field(key: str, value) -> str:
+    text = _normalise_prompt_fragment(value)
+    if not text:
+        return ""
+    chunks = [item.strip() for item in re.split(r"(?<=[。；;.!?！？])", text) if item.strip()]
+    if chunks:
+        unique: list[str] = []
+        seen: set[str] = set()
+        for chunk in chunks:
+            normalized = chunk.rstrip("。；;.!?！？")
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            unique.append(chunk)
+        text = "".join(unique)
+    limit = _PROMPT_FIELD_LIMITS.get(key, 120)
+    return text[:limit].rstrip(" ,，;；。")
+
+
+def _meaningful_canonical_prompt(value) -> str:
+    text = _normalise_prompt_fragment(value)
+    if len(text) < CANONICAL_FINAL_TEXT_MIN_CHARS:
+        return ""
+    compact = re.sub(r"[\s,，;；。.!！?？:：]+", "", text).lower()
+    if compact in {"参考图复刻", "参考片复刻", "同款复刻", "samestylehighquality"}:
+        return ""
+    return text
+
+
+def _has_subject_profile(prompt_obj: dict) -> bool:
+    return any(_normalise_prompt_fragment(prompt_obj.get(key)) for key in _SUBJECT_PROFILE_KEYS)
 
 
 def _rewrite_transfer_motion(
@@ -297,10 +375,13 @@ def _rewrite_product_style_fragment(key: str, value, *, is_video: bool = False) 
 
 
 def _structured_generation_prompt(prompt_obj: dict, fallback: str) -> str:
+    canonical = _meaningful_canonical_prompt(fallback)
+    if canonical:
+        return canonical
     parts: list[str] = []
     for key in _GENERATION_PROMPT_KEEP_KEYS:
         value = prompt_obj.get(key)
-        fragment = _normalise_prompt_fragment(value)
+        fragment = _compact_prompt_field(key, value)
         if fragment:
             parts.append(f"{key}: {fragment}")
     for key, value in prompt_obj.items():
@@ -308,7 +389,7 @@ def _structured_generation_prompt(prompt_obj: dict, fallback: str) -> str:
             continue
         if key in {"final_text", "instruction", "negative", "negative_prompt"}:
             continue
-        fragment = _normalise_prompt_fragment(value)
+        fragment = _compact_prompt_field(key, value)
         if fragment:
             parts.append(f"{key}: {fragment}")
     base = "；".join(parts)
@@ -412,6 +493,15 @@ def _is_product_prompt(prompt_obj: dict, params: dict | None) -> bool:
     return subject_mode == "product" or trace_mode == "product" or "产品" in image_type
 
 
+def _has_explicit_subject_mode(params: dict | None, mode: str) -> bool:
+    subject_mode = str((params or {}).get("subject_mode") or "").lower()
+    source_trace = (params or {}).get("_source_trace")
+    trace_mode = ""
+    if isinstance(source_trace, dict):
+        trace_mode = str(source_trace.get("subject_mode") or "").lower()
+    return subject_mode == mode or trace_mode == mode
+
+
 def compact_generation_prompt_text(
     prompt_obj: dict,
     params: dict | None,
@@ -420,13 +510,20 @@ def compact_generation_prompt_text(
     is_portrait: bool | None = None,
     is_product: bool | None = None,
 ) -> str:
+    explicit_product = is_product is True or _has_explicit_subject_mode(params, "product")
     portrait = _is_portrait_prompt(prompt_obj, params) if is_portrait is None else is_portrait
     product = _is_product_prompt(prompt_obj, params) if is_product is None else is_product
+    if explicit_product:
+        portrait = False
     is_video = str((params or {}).get("_category") or "").lower() == "video" or any(
         key in (params or {})
         for key in ("duration", "target_duration", "resolution", "target_resolution", "product_lock_mode")
     )
-    if product or portrait:
+    portrait_transfer = portrait and _has_explicit_subject_mode(params, "portrait")
+    canonical = _meaningful_canonical_prompt(fallback)
+    if canonical and not product and not (portrait_transfer and _has_subject_profile(prompt_obj)):
+        source = canonical
+    elif product or portrait_transfer:
         product_lock_mode = str((params or {}).get("product_lock_mode") or "locked").lower()
         product_video_template = str((params or {}).get("product_video_template") or "stable_showcase").lower()
         source = _style_transfer_generation_prompt(
@@ -455,10 +552,13 @@ def compact_generation_prompt_text(
                 "背景道具和商业广告质感；不要生成参考图里的商品、品牌、Logo、包装或文字。"
             )
     elif portrait:
-        prefix = (
-            "生成版提示词：以上传人像照片作为唯一人物身份，参考图仅迁移场景、构图、光线、色调、"
-            "妆造氛围、服装结构、动作节奏、镜头语言和商业质感；不要生成参考图里的人脸身份或具体人物。"
-        )
+        if portrait_transfer:
+            prefix = (
+                "生成版提示词：以上传人像照片作为唯一人物身份，参考图只迁移场景、构图、光影、妆造氛围、"
+                "动作与镜头语言；不得混入参考图人物身份。"
+            )
+        else:
+            prefix = "生成版提示词：严格按反推记录复刻原图成年人物、构图、身体轮廓、服装、光影和质感。"
     else:
         prefix = (
             "生成版提示词：参考图复刻，保留主体身份、构图关系、光线方向、色调、场景和商业风格；"
@@ -466,10 +566,11 @@ def compact_generation_prompt_text(
         )
     if portrait:
         prefix += (
-            "人像输出必须明确成年、自然、得体、专业商业人像/品牌 Lookbook/角色设定语境；"
-            "重点描述脸型五官、发型、妆容、姿态、服装结构、体态比例、整体体态线条、镜头氛围和光影；"
-            "避免身体尺寸、三围、罩杯、服装覆盖失衡、湿身成人化、夸张身体展示姿态、低角度身体凝视、"
-            "私密成人化或成人化表达。"
+            "保持专业商业人像、品牌 Lookbook 或角色设定语境；复刻脸型五官、服装结构、肩宽、胸廓、"
+            "躯干长度、腰线、胯宽、四肢比例、姿态重心和整体体态线条，不得主动瘦身、增大、缩小或拉长。"
+            "复刻主光方向与软硬、脸部和服装"
+            "高光落点、补光、阴影、暗部色彩、材质反射、柔雾和高光扩散；避免身体尺寸、身体局部凝视、"
+            "服装覆盖失衡、夸张展示姿态或成人化表达。"
         )
     elif product:
         product_lock_mode = str((params or {}).get("product_lock_mode") or "locked").lower()
@@ -518,6 +619,31 @@ def product_image_negative_prompt(value: str | None = None) -> str:
     return _merge_negative_terms(cleaned, PRODUCT_IMAGE_NEGATIVE_TERMS)
 
 
+def portrait_image_negative_prompt(value: str | None = None, prompt: str | None = None) -> str:
+    """Merge portrait fidelity guards that are supported by the active prompt."""
+    prompt_text = str(prompt or "")
+    terms = list(PORTRAIT_IMAGE_BASE_NEGATIVE_TERMS)
+    if re.search(r"后仰|斜向|斜坐|对角构图|对角线构图", prompt_text, re.IGNORECASE):
+        terms.append("直立居中姿态")
+    if re.search(r"低机位|仰拍|近距离透视|前景.{0,12}放大|透视.{0,12}缩短", prompt_text, re.IGNORECASE):
+        terms.append("前景透视丢失")
+    if re.search(r"非婚纱|不是婚纱|避免.{0,8}婚纱|不得.{0,8}婚纱", prompt_text, re.IGNORECASE):
+        terms.append("通用婚纱蕾丝")
+    if re.search(r"柔光|大面积光源|低对比|柔和阴影", prompt_text, re.IGNORECASE):
+        terms.extend(("硬质影棚光", "平坦阴影"))
+    if re.search(r"暗部.{0,16}层次|抬升黑位|抬起黑位|暗部不死黑", prompt_text, re.IGNORECASE):
+        terms.append("暗部死黑")
+    if re.search(r"柔雾|柔焦|soft\s*focus|雾化", prompt_text, re.IGNORECASE):
+        terms.append("柔雾丢失")
+    if re.search(r"光晕|高光扩散|bloom|halation", prompt_text, re.IGNORECASE):
+        terms.append("光晕丢失")
+    if re.search(r"非\s*HDR|non[-\s]?HDR", prompt_text, re.IGNORECASE):
+        terms.append("HDR")
+    if re.search(r"低锐化|低锐度|中低锐度|低微对比|柔焦", prompt_text, re.IGNORECASE):
+        terms.append("硬锐化")
+    return _merge_negative_terms(value, tuple(terms))
+
+
 def product_video_negative_prompt(value: str | None = None) -> str:
     """Merge cheap product-text fidelity guards into video negative prompts."""
     cleaned = _REFERENCE_PRODUCT_NOUN_RE.sub("上传产品", str(value or ""))
@@ -547,10 +673,11 @@ def generation_prompt_for_model(prompt: str, task: GenTask) -> str:
     """Compact reverse-analysis text into a generation-safe image prompt."""
     params = dict(task.params or {})
     params["_category"] = task.category
+    explicit_portrait = is_portrait_generation_task(task)
     return compact_generation_prompt_text(
         task.prompt or {},
         params,
         prompt,
-        is_portrait=_is_portrait_generation_task(task),
+        is_portrait=True if explicit_portrait else None,
         is_product=is_product_generation_task(task),
     )

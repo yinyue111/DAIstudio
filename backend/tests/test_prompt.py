@@ -42,6 +42,18 @@ def test_reverse_image_template_captures_commercial_material_dimensions():
     assert "商业人像" in template
     assert "品牌 Lookbook" in template
     assert "不得写三围尺寸" in template
+    assert "解剖比例与镜头透视畸变分开记录" in template
+    assert "不得默认写成纤细修长、7.5 头身或长颈" in template
+    assert "机位高度、主体距离、仰角" in template
+    assert "近镜前景放大" in template
+    assert "人物自身左/右" in template
+    assert "画面左/右" in template
+    assert "不得臆造婚纱蕾丝" in template
+    assert "不得臆造浅色隐形眼镜" in template
+    assert (
+        "人物图 final_text 的优先顺序必须是姿态重心/整体轮廓/视角镜头 "
+        "→ 妆发五官/服装结构 → 光线/材质纹理/后期质感"
+    ) in template
     assert "不要写成普通美图描述" in template
     assert '"身材曲线"' not in template
     assert '"尺码三围"' not in template

@@ -12,6 +12,7 @@ import {
   composePromptFromStructured,
   composeStyleTransferPrompt,
   imageSizeFor,
+  shouldUseImageReference,
   styleTransferStructured,
   videoDurationLimit,
   videoRatioOptions,
@@ -116,7 +117,7 @@ export function buildGenerationPayload({
   videoProductLockMode = "locked",
   videoProductTemplate = "stable_showcase",
 }: BuildGenerationPayloadInput) {
-  const isFinal = stage === "final" && task;
+  const isFinal = stage === "final" && Boolean(task);
   const effCategory = isFinal ? task.category : category;
   const parentParams = isFinal ? (task?.params || {}) : {};
   const finalRatioKey = parentParams.target_ratio || parentParams.ratio || ratio;
@@ -172,7 +173,7 @@ export function buildGenerationPayload({
   const baseFinalText = (
     promptDirty
       ? [structuredText, promptText].filter(Boolean).join("；")
-      : (structuredText || promptText)
+      : (isEditMode ? (structuredText || promptText) : (promptText || structuredText))
   ) || "生成同风格的新素材";
   const profiledBaseFinalText = (
     isEditMode
@@ -193,9 +194,12 @@ export function buildGenerationPayload({
     })
     : baseFinalText;
 
-  const useRefImage = !isFinal && sourceAsset && sourceAsset.type === "image" && (
-    isEditMode || Object.keys(effectiveStructured).length === 0
-  );
+  const useRefImage = shouldUseImageReference({
+    isFinal,
+    sourceAsset,
+    isEditMode,
+    structured: effectiveStructured,
+  });
   const useRefVideo = !isFinal && sourceAsset && sourceAsset.type === "video" && Object.keys(effectiveStructured).length === 0;
   const sourceAssetMeta = sourceAsset ? {
     ...buildSourceAssetMeta(sourceAsset),
@@ -237,6 +241,7 @@ export function buildGenerationPayload({
             size: imageSize,
             ...(dims ? { reference_width: dims.width, reference_height: dims.height } : {}),
             ...(seed !== "" ? { seed: Number(seed) } : {}),
+            ...(useRefImage && refImage ? { reference_image_url: refImage } : {}),
             ...(styleReferenceUrl ? { style_reference_image: styleReferenceUrl } : {}),
             ...(portraitMode && refImage ? { character_reference_image: refImage } : {}),
             ...(subjectModeParam ? { subject_mode: subjectModeParam } : {}),

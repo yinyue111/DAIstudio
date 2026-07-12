@@ -37,6 +37,7 @@ _IMAGE_PARAM_KEYS = _COMMON_PARAM_KEYS | {
     "product_pixel_lock",
     "style_reference_image",
     "character_reference_image",
+    "reference_image_url",
     "variation_of_asset_id",
 }
 _VIDEO_PARAM_KEYS = _COMMON_PARAM_KEYS | {
@@ -114,6 +115,9 @@ def validate_generation_params(category: str, params: dict) -> dict:
             raise HTTPException(400, "seed 超出范围")
         params["seed"] = seed
     if category == "image":
+        reference_image_url = params.get("reference_image_url")
+        if reference_image_url is not None and not isinstance(reference_image_url, str):
+            raise HTTPException(400, "reference_image_url 非法")
         if params.get("variation_of_asset_id") not in (None, ""):
             try:
                 variation_of_asset_id = int(params["variation_of_asset_id"])

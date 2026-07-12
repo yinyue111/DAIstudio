@@ -1589,18 +1589,19 @@ def test_reverse_portrait_prompt_is_compacted_for_image_gateway(client, make_use
                        reference_image_url=None, edit_path=None, extra_payload=None,
                        **_kwargs):
         seen["prompt"] = prompt
+        seen["extra_payload"] = extra_payload
         from app.services.gateway import _mock_image
         return [_mock_image(prompt, "256x256", 0)]
 
     monkeypatch.setattr("app.services.gateway.gen_image", fake_gen_image)
     noisy = "；".join(
         [
-            "人物图，参考图复刻",
+            "人物图，参考图复刻，原始反推唯一锚点",
             "主体在画面 52% 位置，肩宽 38%，腰线 44%，腿长 61%",
             "身材曲线: 肩颈、胸腰臀、腰臀比明显",
             "尺码三围: S/M，胸围/腰围/臀围比例可见",
             "露肤度: 高露肤，低胸，腿部可见",
-            "构图为竖版中景，柔和侧逆光，小红书写真风格",
+            "构图为竖版中景，留白 18%，光线为柔和侧逆光，风格为小红书商业写真",
         ]
         * 80
     )
@@ -1635,7 +1636,19 @@ def test_reverse_portrait_prompt_is_compacted_for_image_gateway(client, make_use
     assert "三围" not in sent
     assert "胸围" not in sent
     assert "低胸" not in sent
-    assert "%" not in sent
+    assert "原始反推唯一锚点" in sent
+    assert "52%" in sent
+    assert "18%" in sent
+    negative = seen["extra_payload"]["negative_prompt"]
+    assert "主动瘦身" in negative
+    assert "硬质影棚光" in negative
+    assert "平坦阴影" in negative
+    assert "前景透视丢失" not in negative
+    assert "通用婚纱蕾丝" not in negative
+    assert "柔雾丢失" not in negative
+    assert "光晕丢失" not in negative
+    assert "HDR" not in negative
+    assert "硬锐化" not in negative
     db = SessionLocal()
     try:
         stored = db.get(GenTask, r.json()["id"])

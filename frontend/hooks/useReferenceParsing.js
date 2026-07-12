@@ -289,7 +289,11 @@ export default function useReferenceParsing({
             video: targetCategory === "video",
             subject: subjectMode,
           })
-        : composePromptFromStructured(structured, result.final_text || "");
+        : composePromptFromStructured(
+            structured,
+            result.final_text || "",
+            { preferFallback: true },
+          );
       lastReversePromptRef.current[mode] = {
         prompt: reversePrompt,
         structured,

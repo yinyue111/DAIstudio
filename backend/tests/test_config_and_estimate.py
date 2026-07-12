@@ -4,6 +4,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import yaml
@@ -24,6 +25,9 @@ from app.services.generation_model_runtime import model_snapshot
 from app.services.generation_pricing import generation_cost_from_snapshot
 from app.services.generation_prompts import (
     compact_generation_prompt_text,
+    generation_prompt_for_model,
+    is_portrait_generation_task,
+    portrait_image_negative_prompt,
     product_image_negative_prompt,
 )
 from app.services.generation_request import estimate_generation_cost, validate_generation_params
@@ -742,6 +746,82 @@ def test_product_image_negative_prompt_sanitizes_reference_product_terms():
     assert "产品被裁切" in out
 
 
+def test_portrait_image_negative_prompt_merges_fidelity_guards_without_duplicates():
+    prompt = (
+        "成年女性斜向后仰坐姿，低机位仰拍与近距离透视，前景自然放大；"
+        "服装为非婚纱的冰晶有机雕塑结构；左上大面积柔光，暗部保留冷蓝层次；"
+        "低对比柔雾与宽泛光晕，抬升黑位，低锐化、非 HDR。"
+    )
+
+    out = portrait_image_negative_prompt("多余肢体，主动瘦身", prompt)
+
+    assert "多余肢体" in out
+    assert out.count("主动瘦身") == 1
+    assert "躯干拉长" in out
+    assert "颈部拉长" in out
+    assert "腿部拉长" in out
+    assert "胸廓-腰线-胯部比例改变" in out
+    assert "直立居中姿态" in out
+    assert "前景透视丢失" in out
+    assert "通用婚纱蕾丝" in out
+    assert "硬质影棚光" in out
+    assert "平坦阴影" in out
+    assert "暗部死黑" in out
+    assert "柔雾丢失" in out
+    assert "光晕丢失" in out
+    assert "HDR" in out
+    assert "硬锐化" in out
+
+
+def test_portrait_image_negative_prompt_does_not_force_reference_specific_style():
+    out = portrait_image_negative_prompt(
+        "多余肢体",
+        "成年职业人像，直立居中，白色婚纱，硬质影棚光，高锐度 HDR。",
+    )
+
+    assert "主动瘦身" in out
+    assert "胸廓-腰线-胯部比例改变" in out
+    for term in (
+        "直立居中姿态",
+        "前景透视丢失",
+        "通用婚纱蕾丝",
+        "硬质影棚光",
+        "平坦阴影",
+        "暗部死黑",
+        "柔雾丢失",
+        "光晕丢失",
+        "HDR",
+        "硬锐化",
+    ):
+        assert term not in out
+
+
+def test_structured_portrait_task_is_detected_when_reference_is_present():
+    task = SimpleNamespace(
+        params={
+            "n": 1,
+            "size": "576x1024",
+            "reference_image_url": "http://localhost:8000/media/preview/portrait.png",
+        },
+        prompt={"图像类型": "人物图", "final_text": "参考图复刻"},
+        source_type="image",
+        source_asset_url="http://localhost:8000/media/preview/portrait.png",
+    )
+
+    assert is_portrait_generation_task(task) is True
+
+
+def test_structured_portrait_without_reference_is_not_reference_fidelity_task():
+    task = SimpleNamespace(
+        params={"n": 1, "size": "576x1024"},
+        prompt={"图像类型": "人物图", "final_text": "成年职业人像，直立居中，硬质影棚光"},
+        source_type="image",
+        source_asset_url=None,
+    )
+
+    assert is_portrait_generation_task(task) is False
+
+
 def test_product_video_locked_prompt_rewrites_orbit_and_keeps_product_in_frame():
     prompt = {
         "产品身份档案": "上传产品是 DAMAH 黑魔法棉柔巾, Logo 和包装文字必须完整保留。",
@@ -881,6 +961,174 @@ def test_portrait_generation_prompt_reframes_body_language_safely():
     assert "湿身诱惑" not in out
     assert "成人写真" not in out
     assert "三围" not in out
+
+
+def test_portrait_generation_prompt_preserves_clothed_body_silhouette_without_measurements():
+    prompt = {
+        "图像类型": "人物图",
+        "主体": "成年女性模特，坐姿，身体轻微后仰，面向镜头",
+        "人像意图": "幻想时尚 editorial 商业人像",
+        "人物比例": "躯干长度、肩宽和头身比例贴近参考图",
+        "身材体态": "坐姿重心稳定，肩颈舒展，躯干轻微后仰",
+        "身材曲线": "服装覆盖下的胸廓饱满度、自然腰线、胯宽和胸腰胯过渡贴近参考图",
+        "体态线条": "整体呈自然 S 形轮廓，不主动瘦身或拉长躯干",
+        "服装结构": "合身硬质胸衣完整覆盖上身，骨线和腰封结构清晰",
+        "final_text": "成年女性幻想礼服商业人像",
+    }
+
+    out = compact_generation_prompt_text(prompt, {}, prompt["final_text"])
+
+    assert "胸廓饱满度" in out
+    assert "自然腰线" in out
+    assert "胯宽" in out
+    assert "不主动瘦身或拉长躯干" in out
+    assert "三围" not in out
+    assert "罩杯" not in out
+
+
+def test_portrait_generation_prompt_prefers_meaningful_canonical_final_text():
+    canonical = (
+        "参考图复刻，成年女性斜向后仰坐姿，躯干因透视自然缩短，保持服装覆盖下饱满胸廓、自然腰线、"
+        "较宽胯部与近镜大腿的原始比例；镜头位于腰至大腿高度，约十五度低机位仰拍，35mm 近距离透视；"
+        "左前上方大面积柔光，下方珍珠反光，冷紫蓝轮廓光，抬起黑位、低微对比、宽泛光晕与柔雾，低锐化、非 HDR。"
+    )
+    prompt = {
+        "图像类型": "人物图",
+        "主体": "成年女性直立居中，身体纤细修长",
+        "人物比例": "7.5 头身，长颈，长腿，躯干拉长",
+        "光线": "正面硬质影棚光，高反差 HDR，阴影死黑",
+        "final_text": canonical,
+    }
+
+    out = compact_generation_prompt_text(prompt, {}, canonical)
+
+    assert "斜向后仰坐姿" in out
+    assert "宽泛光晕与柔雾" in out
+    assert "直立居中" not in out
+    assert "7.5 头身" not in out
+    assert "正面硬质影棚光" not in out
+
+
+def test_portrait_generation_prompt_expands_placeholder_final_text_from_structured_fields():
+    prompt = {
+        "图像类型": "人物图",
+        "主体": "成年女性斜向后仰坐姿",
+        "身材体态": "胸廓、自然腰线、胯宽和坐姿重心按参考图保持",
+        "视角镜头": "腰至大腿高度机位，35mm 近距离透视",
+        "光线": "左前上方大面积柔光，下方珍珠反光，冷紫蓝轮廓光",
+        "final_text": "参考图复刻",
+    }
+
+    out = compact_generation_prompt_text(prompt, {}, prompt["final_text"])
+
+    assert "斜向后仰坐姿" in out
+    assert "35mm 近距离透视" in out
+    assert "下方珍珠反光" in out
+    assert not out.endswith("参考图复刻")
+
+
+def test_portrait_prompt_sanitization_preserves_visual_parameters_but_removes_body_measurements():
+    canonical = (
+        "参考图复刻，人物中心位于画面横向 82%、纵向 25%，背景主色 #F2EEF2；"
+        "使用低机位仰拍与 35mm 近距离透视，保持前景大腿自然放大、躯干透视缩短；"
+        "分析记录中的胸围/腰围/臀围 88cm/60cm/92cm 不得进入生成提示，只保留服装覆盖下的整体轮廓。"
+    )
+    prompt = {"图像类型": "人物图", "final_text": canonical}
+
+    out = compact_generation_prompt_text(prompt, {}, canonical)
+
+    assert "82%" in out
+    assert "25%" in out
+    assert "#F2EEF2" in out
+    assert "低机位仰拍" in out
+    assert "35mm" in out
+    assert "胸围" not in out
+    assert "腰围" not in out
+    assert "臀围" not in out
+    assert "88cm" not in out
+    assert "60cm" not in out
+    assert "92cm" not in out
+
+
+@pytest.mark.parametrize(
+    "measurement",
+    [
+        "胸围88cm/60cm/92cm",
+        "胸围 88cm/腰围 60cm/臀围 92cm",
+        "胸围88厘米，腰围60厘米，臀围92厘米",
+    ],
+)
+def test_portrait_prompt_removes_labeled_compact_body_measurements(measurement):
+    prompt = {
+        "图像类型": "人物图",
+        "身材体态": f"服装覆盖下的整体轮廓；分析记录 {measurement} 不得进入生成提示",
+        "构图": "人物中心位于画面横向 82%，背景主色 #F2EEF2",
+        "视角镜头": "35mm 近距离透视",
+        "final_text": "参考图复刻",
+    }
+
+    out = compact_generation_prompt_text(prompt, {}, prompt["final_text"])
+
+    assert "胸围" not in out
+    assert "腰围" not in out
+    assert "臀围" not in out
+    assert "88cm" not in out and "88厘米" not in out
+    assert "60cm" not in out and "60厘米" not in out
+    assert "92cm" not in out and "92厘米" not in out
+    assert "35mm" in out
+    assert "82%" in out
+    assert "#F2EEF2" in out
+
+
+def test_portrait_generation_prompt_prioritizes_reference_lighting_and_finish_when_long():
+    prompt = {
+        "图像类型": "人物图",
+        "反推重点": "人物比例、礼服结构和原图光影必须优先复刻。" * 18,
+        "主体": "成年女性模特坐姿，头部后仰，右手靠近下颌。" * 12,
+        "人像意图": "幻想时尚 editorial 商业人像",
+        "人物比例": "中近景，躯干和裙摆透视贴近原图。" * 10,
+        "身材体态": "肩颈、胸廓、腰线、胯线和坐姿重心贴近原图。" * 10,
+        "体态线条": "保持原图自然 S 形体态，不瘦身、不增大、不缩小。" * 10,
+        "服装结构": "白色硬质胸衣、蕾丝骨线、透明纱袖和珠光装饰。" * 10,
+        "场景背景": "冷蓝黑水晶珍珠背景。" * 15,
+        "构图": "9:16 中近景，人物中心偏上。" * 15,
+        "光线": "左上四十五度大面积柔光；脸部与胸衣有柔和珠光高光；右侧银白补光；暗部保留冷蓝黑层次。",
+        "色调配色": "珍珠白、冷蓝灰和暗蓝黑低饱和配色。",
+        "材质纹理": "水晶高折射、胸衣柔润光泽、薄纱半透明散射。",
+        "后期质感": "低对比柔雾，高光扩散但不吞没五官和胸衣结构，暗部不死黑。",
+        "标签": "portrait, editorial, crystal, fantasy, fashion" * 20,
+        "final_text": "参考图复刻",
+    }
+
+    out = compact_generation_prompt_text(prompt, {}, prompt["final_text"])
+
+    assert len(out) <= 1500
+    assert "左上四十五度大面积柔光" in out
+    assert "脸部与胸衣有柔和珠光高光" in out
+    assert "暗部保留冷蓝黑层次" in out
+    assert "薄纱半透明散射" in out
+    assert "低对比柔雾" in out
+    assert "高光扩散" in out
+
+
+def test_model_prompt_infers_portrait_fidelity_from_reverse_image_type():
+    task = SimpleNamespace(
+        category="image",
+        params={"n": 1, "size": "576x1024"},
+        prompt={
+            "图像类型": "人物图",
+            "主体": "成年女性模特坐姿",
+            "身材曲线": "服装覆盖下的胸廓饱满度、自然腰线和胯宽贴近原图",
+            "光线": "左上大面积柔光，脸部与胸衣高光柔和，暗部保留冷蓝层次",
+            "final_text": "参考图复刻",
+        },
+    )
+
+    out = generation_prompt_for_model(task.prompt["final_text"], task)
+
+    assert "不得主动瘦身" in out
+    assert "胸廓饱满度" in out
+    assert "脸部与胸衣高光柔和" in out
 
 
 def test_generation_params_rejects_invalid_variation_source_id():

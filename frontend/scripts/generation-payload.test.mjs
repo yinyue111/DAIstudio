@@ -5,6 +5,8 @@ import { fileURLToPath } from "node:url";
 
 import { buildGenerationPayload } from "../app/studio/generationPayload.ts";
 import { MAX_VIDEO_DURATION_SECONDS, VIDEO_DURATION_PRESETS } from "../app/studio/constants.ts";
+import { buildStudioDerivedViewState } from "../app/studio/viewModel.ts";
+import { composePromptFromStructured } from "../app/studio/helpers.ts";
 import {
   PENDING_GENERATE_STORAGE_KEY,
   PENDING_REVERSE_STORAGE_KEY,
@@ -43,6 +45,23 @@ assert.deepEqual(
   VIDEO_DURATION_PRESETS.map((item) => item.seconds),
   [5, 8, 10, 15],
   "video duration presets should stop at the 15s generation limit",
+);
+
+const canonicalReversePrompt = "参考图复刻：成年人物后仰斜坐，腰腿高度低机位向上约15度，35-45mm近距离透视；保持服装覆盖下较饱满胸廓、自然腰线、较宽胯部与近镜大腿，左前上方大面积柔光、冷紫轮廓光、抬升黑位和宽范围高光扩散。";
+assert.equal(
+  composePromptFromStructured(
+    {
+      "图像类型": "人物图",
+      "主体": "成年女性模特坐姿",
+      "人物比例": "纤细修长的7.5头身",
+      "构图": "竖版9:16，主体占画幅82%",
+      "光线": "左前上方大面积柔光",
+    },
+    canonicalReversePrompt,
+    { preferFallback: true },
+  ),
+  canonicalReversePrompt,
+  "reverse parsing should preserve the API final_text instead of rebuilding every structured field",
 );
 
 const productAsset = {
@@ -149,6 +168,67 @@ const staleReversePromptArgs = {
 const staleReversePrompt = buildGenerationPayload(staleReversePromptArgs);
 assert.doesNotMatch(staleReversePrompt.payload.prompt.final_text, /旧参考 A/);
 assert.match(staleReversePrompt.payload.prompt.final_text, /生成同风格的新素材/);
+
+const structuredPortraitReference = buildGenerationPayload({
+  ...staleReversePromptArgs,
+  prompt: canonicalReversePrompt,
+  promptSourceSignature: "image|http://localhost:8000/api/uploads/upload/style.jpg|",
+  selected: styleAsset,
+  structured: {
+    "图像类型": "人物图",
+    "主体": "成年人物后仰斜坐",
+    "人物比例": "服装覆盖下胸廓较饱满，腰线自然，近镜大腿受透视放大",
+    "构图": "竖版9:16，主体占画幅82%，前景占25%",
+    "视角镜头": "腰腿高度低机位向上约15度，35-45mm近距离透视",
+    "光线": "左前上方大面积柔光，右后冷紫轮廓光",
+  },
+  structuredSource: "image|http://localhost:8000/api/uploads/upload/style.jpg|",
+  ratio: "9:16",
+});
+
+assert.equal(structuredPortraitReference.payload.prompt.final_text, canonicalReversePrompt);
+assert.equal(structuredPortraitReference.payload.prompt.instruction, canonicalReversePrompt);
+assert.equal(structuredPortraitReference.payload.params.reference_image_url, styleAsset.url);
+assert.equal(structuredPortraitReference.payload.params.subject_mode, undefined);
+
+const portraitReferencePricing = buildStudioDerivedViewState({
+  cfg: {
+    image_size_max_dim: 2048,
+    image_n_max: 8,
+    models: { image: { cost_credits: 15 } },
+    pricing: {
+      image: {
+        unit_costs: { "1k": 15 },
+        edit_unit_costs: { "1k": 20 },
+      },
+    },
+  },
+  creationMode: "image",
+  category: "image",
+  isEditMode: false,
+  isImageEditMode: false,
+  subjectMode: "general",
+  productGenerationMode: false,
+  portraitGenerationMode: false,
+  task: null,
+  submitting: false,
+  selected: styleAsset,
+  productAsset: null,
+  structured: structuredPortraitReference.effectiveStructured,
+  prompt: canonicalReversePrompt,
+  ratio: "9:16",
+  imageQuality: "1k",
+  n: 1,
+  vDuration: 5,
+  vResolution: "720p",
+  videoAnalysisPreset: "standard",
+});
+
+assert.equal(
+  portraitReferencePricing.estCost,
+  20,
+  "a structured portrait reference should display image-edit pricing before submit",
+);
 
 const userEditedPrompt = buildGenerationPayload({
   ...staleReversePromptArgs,

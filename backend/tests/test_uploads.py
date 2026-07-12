@@ -18,7 +18,7 @@ from PIL import Image, ImageDraw
 from app.config import settings
 from app.db import SessionLocal
 from app.main import app
-from app.models import AuditLog, GenAsset, GenTask, ModelConfig, UploadedAsset
+from app.models import AuditLog, GatewayCall, GenAsset, GenTask, ModelConfig, UploadedAsset
 from app.services import generation_media, storage
 from app.services.gateway import _mock_image
 from app.services.watermark import make_model_reference
@@ -1012,6 +1012,162 @@ def test_uploaded_image_can_drive_reference_edit_generation(
     assert seen["size"] == "512x1024"
 
 
+def test_structured_portrait_reference_without_instruction_uses_image_edit(
+    client, make_user, auth, monkeypatch
+):
+    make_user("13900001970", balance=1000)
+    h = auth("13900001970")
+
+    source = client.post(
+        "/api/uploads/image",
+        files={
+            "file": (
+                "source-portrait.png",
+                _png_bytes(size=(1200, 2000), color=(20, 120, 200)),
+                "image/png",
+            )
+        },
+        headers=h,
+    )
+    assert source.status_code == 200, source.text
+    explicit_reference = client.post(
+        "/api/uploads/image",
+        files={
+            "file": (
+                "explicit-landscape.png",
+                _png_bytes(size=(2000, 1200), color=(180, 80, 40)),
+                "image/png",
+            )
+        },
+        headers=h,
+    )
+    assert explicit_reference.status_code == 200, explicit_reference.text
+    seen = {}
+
+    def fake_gen_image(prompt, image_model_id, n=4, size="1024x1024",
+                       reference_image_url=None, edit_path=None, extra_payload=None):
+        seen["reference_image_url"] = reference_image_url
+        seen["edit_path"] = edit_path
+        seen["extra_payload"] = extra_payload
+        return [_mock_image(prompt, "256x256", 0)]
+
+    monkeypatch.setattr("app.services.gateway.gen_image", fake_gen_image)
+
+    r = client.post("/api/generate", json={
+        "source_asset_url": source.json()["url"],
+        "source_type": "image",
+        "category": "image",
+        "stage": "preview",
+        "prompt": {
+            "final_text": (
+                "保持参考人物斜向后仰坐姿、低机位仰拍与近距离透视，前景自然放大；"
+                "服装为非婚纱的冰晶有机雕塑结构；左上大面积柔光，暗部保留冷蓝层次；"
+                "低对比柔雾与宽泛光晕，抬升黑位，低锐化、非 HDR。"
+            ),
+            "图像类型": "人物图",
+        },
+        "params": {
+            "n": 1,
+            "size": "1024x1024",
+            "reference_image_url": explicit_reference.json()["url"],
+            "negative_prompt": "用户自定义负向词",
+        },
+    }, headers=h)
+
+    assert r.status_code == 200, r.text
+    task = r.json()
+    assert task["cost_frozen"] == 20
+    assert seen["reference_image_url"].startswith("data:image/jpeg;base64,")
+    ref_bytes = base64.b64decode(seen["reference_image_url"].split(",", 1)[1])
+    ref_img = Image.open(io.BytesIO(ref_bytes))
+    assert max(ref_img.size) == 1536
+    assert ref_img.width > ref_img.height
+    assert seen["edit_path"] == "/v1/images/edits"
+    assert "用户自定义负向词" in seen["extra_payload"]["negative_prompt"]
+    assert "主动瘦身" in seen["extra_payload"]["negative_prompt"]
+    assert "HDR" in seen["extra_payload"]["negative_prompt"]
+
+    db = SessionLocal()
+    try:
+        call = db.query(GatewayCall).filter(
+            GatewayCall.task_id == task["id"],
+            GatewayCall.kind == "image",
+            GatewayCall.status == "ok",
+        ).order_by(GatewayCall.id.desc()).first()
+        assert call is not None
+        assert call.detail["mode"] == "edit"
+    finally:
+        db.close()
+
+
+def test_plain_text_portrait_without_reference_does_not_claim_uploaded_identity(
+    client, make_user, auth, monkeypatch
+):
+    make_user("13900001973", balance=1000)
+    h = auth("13900001973")
+    seen = {}
+
+    def fake_gen_image(prompt, image_model_id, n=4, size="1024x1024",
+                       reference_image_url=None, edit_path=None, extra_payload=None):
+        seen["prompt"] = prompt
+        seen["reference_image_url"] = reference_image_url
+        seen["edit_path"] = edit_path
+        seen["negative_prompt"] = extra_payload["negative_prompt"]
+        return [_mock_image(prompt, "256x256", 0)]
+
+    monkeypatch.setattr("app.services.gateway.gen_image", fake_gen_image)
+
+    r = client.post("/api/generate", json={
+        "source_type": "image",
+        "category": "image",
+        "stage": "preview",
+        "prompt": {
+            "final_text": (
+                "成年职业人像，人物直立居中，穿白色婚纱，使用硬质影棚主光和清晰锐利的 HDR 质感，"
+                "保持自然五官、完整服装与干净背景。"
+            ),
+            "图像类型": "人物图",
+        },
+        "params": {"n": 1, "size": "1024x1024"},
+    }, headers=h)
+
+    assert r.status_code == 200, r.text
+    assert r.json()["cost_frozen"] == 15
+    assert seen["reference_image_url"] is None
+    assert seen["edit_path"] == "/v1/images/edits"
+    assert "上传人像照片是唯一人物身份来源" not in seen["prompt"]
+    assert seen["negative_prompt"] is None
+
+
+@pytest.mark.parametrize(
+    "reference_value",
+    [123, {"url": "https://example.com/reference.png"}],
+)
+def test_image_reference_url_rejects_non_string_value(
+    client, make_user, auth, reference_value
+):
+    make_user("13900001971", balance=1000)
+    h = auth("13900001971")
+
+    r = client.post("/api/generate", json={
+        "source_type": "image",
+        "category": "image",
+        "stage": "preview",
+        "prompt": {
+            "final_text": "保持参考人物、姿态、机位和光影关系",
+            "图像类型": "人物图",
+        },
+        "params": {
+            "n": 1,
+            "size": "1024x1024",
+            "reference_image_url": reference_value,
+        },
+    }, headers=h)
+
+    assert r.status_code == 400, r.text
+    assert "reference_image_url 非法" in r.text
+
+
 def test_uploaded_large_image_edit_uses_high_resolution_original(
     client, make_user, auth, monkeypatch
 ):
@@ -1099,6 +1255,55 @@ def test_product_image_edit_uses_larger_reference_and_server_fidelity_guard(
     ref_bytes = base64.b64decode(seen["reference_image_url"].split(",", 1)[1])
     ref_img = Image.open(io.BytesIO(ref_bytes))
     assert max(ref_img.size) == 1536
+
+
+def test_product_negative_prompt_wins_when_metadata_also_marks_portrait(
+    client, make_user, auth, monkeypatch
+):
+    make_user("13900001972", balance=1000)
+    h = auth("13900001972")
+    seen = {}
+
+    def fake_gen_image(prompt, image_model_id, n=4, size="1024x1024",
+                       reference_image_url=None, edit_path=None, extra_payload=None):
+        seen["prompt"] = prompt
+        seen["negative_prompt"] = extra_payload["negative_prompt"]
+        return [_mock_image(prompt, "256x256", 0)]
+
+    monkeypatch.setattr("app.services.gateway.gen_image", fake_gen_image)
+
+    r = client.post("/api/generate", json={
+        "source_asset_url": "https://example.com/product.png",
+        "source_type": "image",
+        "source_asset_meta": {
+            "product_generation_mode": True,
+            "portrait_generation_mode": True,
+        },
+        "category": "image",
+        "stage": "preview",
+        "prompt": {
+            "final_text": "move this product into a premium studio ad",
+            "instruction": "move this product into a premium studio ad",
+            "图像类型": "人物+产品混合图",
+        },
+        "params": {
+            "n": 1,
+            "size": "1024x1024",
+            "subject_mode": "product",
+            "edit_mask_mode": "off",
+            "negative_prompt": "用户自定义负向词",
+        },
+    }, headers=h)
+
+    assert r.status_code == 200, r.text
+    assert "用户自定义负向词" in seen["negative_prompt"]
+    assert "产品残缺" in seen["negative_prompt"]
+    assert "主动瘦身" not in seen["negative_prompt"]
+    assert "产品高保真硬约束" in seen["prompt"]
+    assert "人像高保真硬约束" not in seen["prompt"]
+    assert "上传人像照片作为唯一人物身份" not in seen["prompt"]
+    assert "品牌 Lookbook" not in seen["prompt"]
+    assert "不得主动瘦身" not in seen["prompt"]
 
 
 def test_product_image_edit_auto_generates_mask_for_inpaint(
