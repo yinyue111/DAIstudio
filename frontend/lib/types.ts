@@ -6,7 +6,17 @@
  */
 
 // Re-export API-level types so the rest of the codebase can import from one place.
-export type { Asset, AssetType, GeneratePayload, ReverseTarget, Task, TaskStatus } from "./api";
+export type {
+  Asset,
+  AssetType,
+  EditMaskMode,
+  GeneratePayload,
+  ProductPixelLockMode,
+  ReverseTarget,
+  SubjectProtectionPreview,
+  Task,
+  TaskStatus,
+} from "./api";
 
 // ─── Studio workspace ────────────────────────────────────────────────────────
 
@@ -64,6 +74,9 @@ export interface WorkspaceState {
   vDuration: number;
   vResolution: string;
   editMaskMode: "protect_subject" | "center_box" | "off";
+  productPixelLockMode: ProductPixelLockMode;
+  videoProductLockMode: "locked" | "free";
+  videoProductTemplate: string;
   videoAnalysisPreset: string;
   url: string;
   parsing: boolean;
@@ -75,6 +88,9 @@ export interface WorkspaceState {
   productProfile: SubjectProfile | null;
   productProfileSource: string;
   productProfiling: boolean;
+  subjectProtection: SubjectProtectionPreview | null;
+  subjectProtectionLoading: boolean;
+  subjectProtectionSource: string;
   variationSource: Asset | null;
   structured: Record<string, string>;
   structuredSource: string;
@@ -167,4 +183,4 @@ export interface EditReadyStep {
   pendingText: string;
 }
 
-import type { Asset } from "./api";
+import type { Asset, ProductPixelLockMode, SubjectProtectionPreview } from "./api";

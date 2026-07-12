@@ -139,7 +139,5 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    if "payment_packages" in _tables():
-        op.get_bind().execute(
-            sa.text("DELETE FROM payment_packages WHERE id = 'team'")
-        )
+    # The upgrade cannot distinguish a seeded team package from preexisting data.
+    pass

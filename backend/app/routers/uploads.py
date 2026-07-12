@@ -7,7 +7,9 @@ import logging
 import re
 import subprocess
 import tempfile
+import threading
 import uuid
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, File, HTTPException, Request, UploadFile
@@ -50,6 +52,71 @@ _SUPPORTED_VIDEO_SUFFIXES = {
 _UPLOAD_CHUNK_BYTES = 1024 * 1024
 _MAX_ORIGINAL_FILENAME = 180
 _FILENAME_SAFE_RE = re.compile(r"[\x00-\x1f\x7f/\\:]+")
+_UPLOAD_PROCESSING_SEMAPHORE = threading.BoundedSemaphore(
+    int(settings.upload_processing_parallelism)
+)
+
+
+async def _finish_thread_task_after_cancel(
+    task: asyncio.Task,
+    cancelled: asyncio.CancelledError,
+    on_cancel_result=None,
+) -> None:
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            continue
+        except Exception:  # noqa: BLE001
+            break
+    if task.done() and not task.cancelled():
+        try:
+            result = task.result()
+        except Exception:  # noqa: BLE001
+            log.exception("upload background operation failed while request cancellation was pending")
+        else:
+            if on_cancel_result is not None:
+                try:
+                    on_cancel_result(result)
+                except Exception:  # noqa: BLE001
+                    log.exception("upload cancellation cleanup failed")
+    raise cancelled
+
+
+async def _run_upload_thread(func, /, *args, on_cancel_result=None, **kwargs):
+    task = asyncio.create_task(asyncio.to_thread(func, *args, **kwargs))
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError as cancelled:
+        await _finish_thread_task_after_cancel(task, cancelled, on_cancel_result)
+
+
+@asynccontextmanager
+async def _upload_processing_slot():
+    acquire_task = asyncio.create_task(
+        asyncio.to_thread(
+            _UPLOAD_PROCESSING_SEMAPHORE.acquire,
+            True,
+            float(settings.upload_processing_acquire_timeout_seconds),
+        )
+    )
+    try:
+        acquired = await asyncio.shield(acquire_task)
+    except asyncio.CancelledError as cancelled:
+        while not acquire_task.done():
+            try:
+                await asyncio.shield(acquire_task)
+            except asyncio.CancelledError:
+                continue
+        if acquire_task.result():
+            _UPLOAD_PROCESSING_SEMAPHORE.release()
+        raise cancelled
+    if not acquired:
+        raise HTTPException(503, "媒体处理繁忙,请稍后重试")
+    try:
+        yield
+    finally:
+        _UPLOAD_PROCESSING_SEMAPHORE.release()
 
 
 def _content_length(request: Request) -> int | None:
@@ -268,8 +335,8 @@ async def _save_upload_stream_to_temp(file: UploadFile, ext: str, *, limit: int)
                 total += len(chunk)
                 if total > limit:
                     raise HTTPException(413, f"视频不能超过 {limit // 1024 // 1024}MB")
-                await asyncio.to_thread(f.write, chunk)
-    except Exception:
+                await _run_upload_thread(f.write, chunk)
+    except (Exception, asyncio.CancelledError):
         path.unlink(missing_ok=True)
         raise
     if total <= 0:
@@ -285,81 +352,100 @@ async def upload_image(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    _rate_limit_upload(user.id)
-    limit = int(settings.max_upload_image_bytes)
-    enforce_content_length(request, limit + 1024 * 1024, f"图片不能超过 {limit // 1024 // 1024}MB")
-    data = await file.read(limit + 1)
-    if not data:
-        raise HTTPException(400, "请选择要上传的图片")
-    if len(data) > limit:
-        raise HTTPException(413, f"图片不能超过 {limit // 1024 // 1024}MB")
+    async with _upload_processing_slot():
+        _rate_limit_upload(user.id)
+        limit = int(settings.max_upload_image_bytes)
+        enforce_content_length(request, limit + 1024 * 1024, f"图片不能超过 {limit // 1024 // 1024}MB")
+        data = await file.read(limit + 1)
+        if not data:
+            raise HTTPException(400, "请选择要上传的图片")
+        if len(data) > limit:
+            raise HTTPException(413, f"图片不能超过 {limit // 1024 // 1024}MB")
 
-    normalized_png, width, height = await asyncio.to_thread(_normalize_image_upload, data)
-    try:
-        preview_png, _, _ = await asyncio.to_thread(
-            make_image_preview,
-            normalized_png,
-            max_pixels=settings.max_upload_image_pixels,
-        )
-        model_ref_jpeg, _, _ = await asyncio.to_thread(
-            make_model_reference,
-            normalized_png,
-            max_side=1024,
-            max_pixels=settings.max_upload_image_pixels,
-            quality=92,
-            subsampling=0,
-        )
-    except Exception:  # noqa: BLE001
-        raise HTTPException(400, "图片内容无法解析,请更换文件")
+        normalized_png, width, height = await _run_upload_thread(_normalize_image_upload, data)
+        try:
+            preview_png, _, _ = await _run_upload_thread(
+                make_image_preview,
+                normalized_png,
+                max_pixels=settings.max_upload_image_pixels,
+            )
+            model_ref_jpeg, _, _ = await _run_upload_thread(
+                make_model_reference,
+                normalized_png,
+                max_side=1024,
+                max_pixels=settings.max_upload_image_pixels,
+                quality=92,
+                subsampling=0,
+            )
+        except Exception:  # noqa: BLE001
+            raise HTTPException(400, "图片内容无法解析,请更换文件")
 
-    upload_key = None
-    preview_key = None
-    model_ref_key = None
-    try:
-        ensure_user_media_quota(db, user.id, len(normalized_png) + len(preview_png) + len(model_ref_jpeg))
-        stem = uuid.uuid4().hex
-        upload_key = storage.save_bytes_named(normalized_png, "upload", f"{stem}.png")
-        preview_key = storage.save_bytes_named(preview_png, "upload_preview", f"{stem}.png")
-        model_ref_key = storage.save_bytes_named(model_ref_jpeg, "upload_model_ref", f"{stem}.jpg")
-        original_filename = _safe_original_filename(file.filename, upload_key.rsplit("/", 1)[-1])
-        db.add(
-            UploadedAsset(
-                key=upload_key,
-                user_id=user.id,
-                mime="image/png",
-                width=width,
-                height=height,
-                bytes=len(normalized_png),
-                original_filename=original_filename,
+        upload_key = None
+        preview_key = None
+        model_ref_key = None
+        try:
+            ensure_user_media_quota(db, user.id, len(normalized_png) + len(preview_png) + len(model_ref_jpeg))
+            stem = uuid.uuid4().hex
+            upload_key = await _run_upload_thread(
+                storage.save_bytes_named,
+                normalized_png,
+                "upload",
+                f"{stem}.png",
+                on_cancel_result=lambda key: _cleanup_storage_keys(key),
             )
-        )
-        db.add(
-            UploadedAsset(
-                key=preview_key,
-                user_id=user.id,
-                mime="image/png",
-                width=width,
-                height=height,
-                bytes=len(preview_png),
-                original_filename=f"preview:{original_filename}",
+            preview_key = await _run_upload_thread(
+                storage.save_bytes_named,
+                preview_png,
+                "upload_preview",
+                f"{stem}.png",
+                on_cancel_result=lambda key: _cleanup_storage_keys(key),
             )
-        )
-        db.add(
-            UploadedAsset(
-                key=model_ref_key,
-                user_id=user.id,
-                mime="image/jpeg",
-                width=width,
-                height=height,
-                bytes=len(model_ref_jpeg),
-                original_filename=f"model-ref:{original_filename}.jpg",
+            model_ref_key = await _run_upload_thread(
+                storage.save_bytes_named,
+                model_ref_jpeg,
+                "upload_model_ref",
+                f"{stem}.jpg",
+                on_cancel_result=lambda key: _cleanup_storage_keys(key),
             )
-        )
-        db.commit()
-    except Exception:  # noqa: BLE001
-        db.rollback()
-        _cleanup_storage_keys(upload_key, preview_key, model_ref_key)
-        raise
+            original_filename = _safe_original_filename(file.filename, upload_key.rsplit("/", 1)[-1])
+            db.add(
+                UploadedAsset(
+                    key=upload_key,
+                    user_id=user.id,
+                    mime="image/png",
+                    width=width,
+                    height=height,
+                    bytes=len(normalized_png),
+                    original_filename=original_filename,
+                )
+            )
+            db.add(
+                UploadedAsset(
+                    key=preview_key,
+                    user_id=user.id,
+                    mime="image/png",
+                    width=width,
+                    height=height,
+                    bytes=len(preview_png),
+                    original_filename=f"preview:{original_filename}",
+                )
+            )
+            db.add(
+                UploadedAsset(
+                    key=model_ref_key,
+                    user_id=user.id,
+                    mime="image/jpeg",
+                    width=width,
+                    height=height,
+                    bytes=len(model_ref_jpeg),
+                    original_filename=f"model-ref:{original_filename}.jpg",
+                )
+            )
+            db.commit()
+        except (Exception, asyncio.CancelledError):  # noqa: BLE001
+            db.rollback()
+            _cleanup_storage_keys(upload_key, preview_key, model_ref_key)
+            raise
     audit.log(
         db,
         user_id=user.id,
@@ -406,54 +492,75 @@ async def upload_video(
     raw_bytes = 0
     stored_bytes = 0
     width = height = duration = None
-    try:
-        raw_path, raw_bytes = await _save_upload_stream_to_temp(file, ext, limit=limit)
-        preflight_user_media_quota(db, user.id, raw_bytes)
-        sanitized_path, width, height, duration, poster = await asyncio.to_thread(_sanitize_video_and_poster, raw_path)
-        stored_bytes = sanitized_path.stat().st_size
-        ensure_user_media_quota(db, user.id, stored_bytes + (len(poster) if poster else 0))
-        upload_key = await asyncio.to_thread(storage.save_file, sanitized_path, "upload_video", "mp4")
-        stem = Path(upload_key).stem
-        if poster:
-            preview_key = storage.save_bytes_named(poster, "upload_video_preview", f"{stem}.jpg")
-        original_filename = _safe_original_filename(file.filename, upload_key.rsplit("/", 1)[-1])
-        db.add(
-            UploadedAsset(
-                key=upload_key,
-                user_id=user.id,
-                mime="video/mp4",
-                width=width,
-                height=height,
-                bytes=stored_bytes,
-                original_filename=original_filename,
+    async with _upload_processing_slot():
+        try:
+            raw_path, raw_bytes = await _save_upload_stream_to_temp(file, ext, limit=limit)
+            preflight_user_media_quota(db, user.id, raw_bytes)
+            sanitized_path, width, height, duration, poster = await _run_upload_thread(
+                _sanitize_video_and_poster,
+                raw_path,
+                on_cancel_result=lambda result: result[0].unlink(missing_ok=True),
             )
-        )
-        if preview_key:
+            stored_bytes = sanitized_path.stat().st_size
+            ensure_user_media_quota(db, user.id, stored_bytes + (len(poster) if poster else 0))
+            upload_key = await _run_upload_thread(
+                storage.save_file,
+                sanitized_path,
+                "upload_video",
+                "mp4",
+                on_cancel_result=lambda key: _cleanup_storage_keys(key),
+            )
+            stem = Path(upload_key).stem
+            if poster:
+                preview_key = await _run_upload_thread(
+                    storage.save_bytes_named,
+                    poster,
+                    "upload_video_preview",
+                    f"{stem}.jpg",
+                    on_cancel_result=lambda key: _cleanup_storage_keys(key),
+                )
+            original_filename = _safe_original_filename(file.filename, upload_key.rsplit("/", 1)[-1])
             db.add(
                 UploadedAsset(
-                    key=preview_key,
+                    key=upload_key,
                     user_id=user.id,
-                    mime="image/jpeg",
+                    mime="video/mp4",
                     width=width,
                     height=height,
-                    bytes=len(poster),
-                    original_filename=f"poster:{original_filename}",
+                    bytes=stored_bytes,
+                    original_filename=original_filename,
                 )
             )
-        db.commit()
-    except HTTPException:
-        db.rollback()
-        _cleanup_storage_keys(upload_key, preview_key)
-        raise
-    except Exception:  # noqa: BLE001
-        db.rollback()
-        _cleanup_storage_keys(upload_key, preview_key)
-        raise
-    finally:
-        if raw_path is not None:
-            raw_path.unlink(missing_ok=True)
-        if sanitized_path is not None:
-            sanitized_path.unlink(missing_ok=True)
+            if preview_key:
+                db.add(
+                    UploadedAsset(
+                        key=preview_key,
+                        user_id=user.id,
+                        mime="image/jpeg",
+                        width=width,
+                        height=height,
+                        bytes=len(poster),
+                        original_filename=f"poster:{original_filename}",
+                    )
+                )
+            db.commit()
+        except HTTPException:
+            db.rollback()
+            _cleanup_storage_keys(upload_key, preview_key)
+            raise
+        except asyncio.CancelledError:
+            db.rollback()
+            _cleanup_storage_keys(upload_key, preview_key)
+            raise
+        except Exception:  # noqa: BLE001
+            db.rollback()
+            _cleanup_storage_keys(upload_key, preview_key)
+            raise
+        finally:
+            if raw_path is not None:
+                raw_path.unlink(missing_ok=True)
+            if sanitized_path is not None:
+                sanitized_path.unlink(missing_ok=True)
     audit.log(
         db,
         user_id=user.id,

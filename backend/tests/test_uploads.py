@@ -1,10 +1,17 @@
+import asyncio
 import base64
 import io
+import os
+import stat
 import subprocess
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
 from urllib.parse import urlparse
 
+import pytest
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 from PIL import Image, ImageDraw
 
@@ -12,7 +19,7 @@ from app.config import settings
 from app.db import SessionLocal
 from app.main import app
 from app.models import AuditLog, GenAsset, GenTask, ModelConfig, UploadedAsset
-from app.services import generation_media
+from app.services import generation_media, storage
 from app.services.gateway import _mock_image
 from app.services.watermark import make_model_reference
 
@@ -98,6 +105,267 @@ def _mp4_bytes(tmp_path):
     return out.read_bytes()
 
 
+class _PartialWriteFailure:
+    def __init__(self, file_obj):
+        self._file_obj = file_obj
+
+    def __enter__(self):
+        self._file_obj.__enter__()
+        return self
+
+    def __exit__(self, exc_type, exc, traceback):
+        return self._file_obj.__exit__(exc_type, exc, traceback)
+
+    def __getattr__(self, name):
+        return getattr(self._file_obj, name)
+
+    def write(self, data):
+        partial_size = max(1, len(data) // 2)
+        self._file_obj.write(data[:partial_size])
+        self._file_obj.flush()
+        raise OSError("simulated partial write failure")
+
+
+class _TrackingSemaphore:
+    def __init__(self, value=1):
+        self._semaphore = threading.BoundedSemaphore(value)
+        self._lock = threading.Lock()
+        self.active = 0
+        self.acquire_started = threading.Event()
+
+    def acquire(self, blocking=True, timeout=None):
+        self.acquire_started.set()
+        if timeout is None:
+            acquired = self._semaphore.acquire(blocking)
+        else:
+            acquired = self._semaphore.acquire(blocking, timeout)
+        if acquired:
+            with self._lock:
+                self.active += 1
+        return acquired
+
+    def release(self):
+        with self._lock:
+            self.active -= 1
+        self._semaphore.release()
+
+    def is_active(self):
+        with self._lock:
+            return self.active > 0
+
+
+def _fail_storage_writes_after_partial_write(monkeypatch, directory):
+    real_open = open
+    real_named_temporary_file = storage.tempfile.NamedTemporaryFile
+    resolved_directory = directory.resolve()
+
+    def failing_open(file, mode="r", *args, **kwargs):
+        file_obj = real_open(file, mode, *args, **kwargs)
+        path = Path(file)
+        if any(flag in mode for flag in ("w", "x", "a")) and path.parent.resolve() == resolved_directory:
+            return _PartialWriteFailure(file_obj)
+        return file_obj
+
+    def failing_named_temporary_file(*args, **kwargs):
+        file_obj = real_named_temporary_file(*args, **kwargs)
+        temp_directory = kwargs.get("dir")
+        if temp_directory is not None and Path(temp_directory).resolve() == resolved_directory:
+            return _PartialWriteFailure(file_obj)
+        return file_obj
+
+    monkeypatch.setattr(storage, "open", failing_open, raising=False)
+    monkeypatch.setattr(storage.tempfile, "NamedTemporaryFile", failing_named_temporary_file)
+
+
+def _configure_local_storage(monkeypatch, tmp_path):
+    root = tmp_path / "storage"
+    monkeypatch.setattr(storage, "ROOT", root)
+    monkeypatch.setattr(storage.settings, "storage_backend", "local")
+    return root
+
+
+def test_save_bytes_new_file_uses_process_umask_permissions(monkeypatch, tmp_path):
+    root = _configure_local_storage(monkeypatch, tmp_path)
+    root.mkdir()
+    control = root / "control.bin"
+    previous_umask = os.umask(0o027)
+    try:
+        with open(control, "wb") as file_obj:
+            file_obj.write(b"control")
+        key = storage.save_bytes(b"payload", "upload", "bin")
+    finally:
+        os.umask(previous_umask)
+
+    assert stat.S_IMODE((root / key).stat().st_mode) == stat.S_IMODE(control.stat().st_mode)
+
+
+def test_save_bytes_named_overwrite_preserves_permission_bits(monkeypatch, tmp_path):
+    root = _configure_local_storage(monkeypatch, tmp_path)
+    destination = root / "upload"
+    destination.mkdir(parents=True)
+    target = destination / "stable.png"
+    target.write_bytes(b"old payload")
+    target.chmod(0o640)
+
+    storage.save_bytes_named(b"new payload", "upload", target.name)
+
+    assert target.read_bytes() == b"new payload"
+    assert stat.S_IMODE(target.stat().st_mode) == 0o640
+
+
+def test_save_bytes_named_overwrite_preserves_setid_permission_bits(monkeypatch, tmp_path):
+    root = _configure_local_storage(monkeypatch, tmp_path)
+    destination = root / "upload"
+    destination.mkdir(parents=True)
+    target = destination / "stable-setid.png"
+    target.write_bytes(b"old payload")
+    target.chmod(0o6755)
+    assert stat.S_IMODE(target.stat().st_mode) == 0o6755
+
+    storage.save_bytes_named(b"new payload", "upload", target.name)
+
+    assert target.read_bytes() == b"new payload"
+    assert stat.S_IMODE(target.stat().st_mode) == 0o6755
+
+
+def test_save_bytes_named_supports_name_max_filename(monkeypatch, tmp_path):
+    root = _configure_local_storage(monkeypatch, tmp_path)
+    destination = root / "upload"
+    destination.mkdir(parents=True)
+    try:
+        name_max = os.pathconf(destination, "PC_NAME_MAX")
+    except (OSError, ValueError):
+        pytest.skip("filesystem does not expose PC_NAME_MAX")
+    suffix = ".png"
+    filename = "a" * (name_max - len(suffix)) + suffix
+    assert len(os.fsencode(filename)) == name_max
+    target = destination / filename
+    target.write_bytes(b"control")
+    target.unlink()
+
+    key = storage.save_bytes_named(b"payload", "upload", filename)
+
+    assert key == f"upload/{filename}"
+    assert target.read_bytes() == b"payload"
+
+
+def test_save_bytes_named_replace_failure_preserves_target(monkeypatch, tmp_path):
+    class ReplaceFailure(OSError):
+        pass
+
+    root = _configure_local_storage(monkeypatch, tmp_path)
+    destination = root / "upload"
+    destination.mkdir(parents=True)
+    target = destination / "stable.png"
+    target.write_bytes(b"old payload")
+    target.chmod(0o640)
+
+    def fail_replace(_source, _target):
+        raise ReplaceFailure("simulated replace failure")
+
+    monkeypatch.setattr(storage.os, "replace", fail_replace)
+
+    with pytest.raises(ReplaceFailure, match="simulated replace failure"):
+        storage.save_bytes_named(b"new payload", "upload", target.name)
+
+    assert target.read_bytes() == b"old payload"
+    assert stat.S_IMODE(target.stat().st_mode) == 0o640
+    assert list(destination.iterdir()) == [target]
+
+
+def test_cleanup_failure_does_not_mask_replace_failure(monkeypatch, tmp_path):
+    class ReplaceFailure(OSError):
+        pass
+
+    class CleanupFailure(OSError):
+        pass
+
+    root = _configure_local_storage(monkeypatch, tmp_path)
+    target = root / "upload" / "stable.png"
+    target.parent.mkdir(parents=True)
+    target.write_bytes(b"old payload")
+    real_unlink = Path.unlink
+    cleanup_failed = False
+
+    def fail_replace(_source, _target):
+        raise ReplaceFailure("simulated replace failure")
+
+    def fail_first_temp_cleanup(path, *args, **kwargs):
+        nonlocal cleanup_failed
+        if path.suffix == ".tmp" and not cleanup_failed:
+            cleanup_failed = True
+            raise CleanupFailure("simulated cleanup failure")
+        return real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(storage.os, "replace", fail_replace)
+    monkeypatch.setattr(Path, "unlink", fail_first_temp_cleanup)
+
+    with pytest.raises(ReplaceFailure, match="simulated replace failure") as exc_info:
+        storage.save_bytes_named(b"new payload", "upload", target.name)
+
+    assert isinstance(exc_info.value.__cause__, CleanupFailure)
+    assert target.read_bytes() == b"old payload"
+
+
+def test_save_bytes_partial_write_does_not_publish_target(monkeypatch, tmp_path):
+    root = tmp_path / "storage"
+    destination = root / "upload"
+    monkeypatch.setattr(storage, "ROOT", root)
+    monkeypatch.setattr(storage.settings, "storage_backend", "local")
+    monkeypatch.setattr(
+        storage.uuid,
+        "uuid4",
+        lambda: SimpleNamespace(hex="11111111111111111111111111111111"),
+    )
+    _fail_storage_writes_after_partial_write(monkeypatch, destination)
+
+    with pytest.raises(OSError, match="simulated partial write failure"):
+        storage.save_bytes(b"complete payload", "upload", "bin")
+
+    target = destination / "11111111111111111111111111111111.bin"
+    assert not target.exists()
+    assert list(destination.iterdir()) == []
+
+
+def test_save_bytes_named_partial_write_preserves_existing_target(monkeypatch, tmp_path):
+    root = tmp_path / "storage"
+    destination = root / "upload"
+    destination.mkdir(parents=True)
+    target = destination / "stable.png"
+    target.write_bytes(b"previous complete payload")
+    monkeypatch.setattr(storage, "ROOT", root)
+    monkeypatch.setattr(storage.settings, "storage_backend", "local")
+    _fail_storage_writes_after_partial_write(monkeypatch, destination)
+
+    with pytest.raises(OSError, match="simulated partial write failure"):
+        storage.save_bytes_named(b"replacement payload", "upload", target.name)
+
+    assert target.read_bytes() == b"previous complete payload"
+    assert list(destination.iterdir()) == [target]
+
+
+def test_save_file_partial_write_does_not_publish_target(monkeypatch, tmp_path):
+    root = tmp_path / "storage"
+    destination = root / "upload_video"
+    source = tmp_path / "source.mp4"
+    source.write_bytes(b"complete video payload")
+    monkeypatch.setattr(storage, "ROOT", root)
+    monkeypatch.setattr(storage.settings, "storage_backend", "local")
+    monkeypatch.setattr(
+        storage.uuid,
+        "uuid4",
+        lambda: SimpleNamespace(hex="22222222222222222222222222222222"),
+    )
+    _fail_storage_writes_after_partial_write(monkeypatch, destination)
+
+    with pytest.raises(OSError, match="simulated partial write failure"):
+        storage.save_file(source, "upload_video", "mp4")
+
+    target = destination / "22222222222222222222222222222222.mp4"
+    assert not target.exists()
+    assert list(destination.iterdir()) == []
+
+
 def _enable_multi_image_edit():
     db = SessionLocal()
     try:
@@ -156,14 +424,17 @@ def test_upload_image_runs_cpu_image_processing_off_event_loop(client, make_user
     make_user("13900000253", balance=1000)
     h = auth("13900000253")
     calls = []
+    cleanup_callbacks = []
 
-    async def fake_to_thread(func, *args, **kwargs):
+    async def fake_run_upload_thread(func, *args, on_cancel_result=None, **kwargs):
         calls.append(getattr(func, "__name__", str(func)))
+        if on_cancel_result is not None:
+            cleanup_callbacks.append((getattr(func, "__name__", str(func)), on_cancel_result))
         return func(*args, **kwargs)
 
     from app.routers import uploads
 
-    monkeypatch.setattr(uploads, "asyncio", SimpleNamespace(to_thread=fake_to_thread), raising=False)
+    monkeypatch.setattr(uploads, "_run_upload_thread", fake_run_upload_thread)
 
     r = client.post(
         "/api/uploads/image",
@@ -175,6 +446,364 @@ def test_upload_image_runs_cpu_image_processing_off_event_loop(client, make_user
     assert "_normalize_image_upload" in calls
     assert "make_image_preview" in calls
     assert "make_model_reference" in calls
+    assert calls.count("save_bytes_named") == 3
+    assert [name for name, _callback in cleanup_callbacks] == [
+        "save_bytes_named",
+        "save_bytes_named",
+        "save_bytes_named",
+    ]
+
+
+def test_upload_processing_slot_cancelled_while_waiting_does_not_leak_permit(monkeypatch):
+    from app.routers import uploads
+
+    semaphore = _TrackingSemaphore(1)
+    assert semaphore.acquire(False)
+    semaphore.acquire_started.clear()
+    monkeypatch.setattr(uploads, "_UPLOAD_PROCESSING_SEMAPHORE", semaphore)
+
+    async def scenario():
+        entered = False
+
+        async def waiter():
+            nonlocal entered
+            async with uploads._upload_processing_slot():
+                entered = True
+
+        task = asyncio.create_task(waiter())
+        assert await asyncio.to_thread(semaphore.acquire_started.wait, 2)
+        task.cancel()
+        semaphore.release()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert entered is False
+
+    asyncio.run(scenario())
+    assert semaphore.acquire(False)
+    assert not semaphore.acquire(False)
+    semaphore.release()
+
+
+def test_upload_processing_slot_keeps_permit_until_cancelled_thread_finishes(monkeypatch):
+    from app.routers import uploads
+
+    semaphore = _TrackingSemaphore(1)
+    worker_started = threading.Event()
+    allow_worker_exit = threading.Event()
+    cancellation_cleanup_started = asyncio.Event()
+    monkeypatch.setattr(uploads, "_UPLOAD_PROCESSING_SEMAPHORE", semaphore)
+    real_finish_after_cancel = uploads._finish_thread_task_after_cancel
+
+    async def tracked_finish_after_cancel(*args, **kwargs):
+        cancellation_cleanup_started.set()
+        return await real_finish_after_cancel(*args, **kwargs)
+
+    monkeypatch.setattr(uploads, "_finish_thread_task_after_cancel", tracked_finish_after_cancel)
+
+    def blocking_worker():
+        worker_started.set()
+        assert allow_worker_exit.wait(timeout=5)
+
+    async def scenario():
+        async def run_worker():
+            async with uploads._upload_processing_slot():
+                await uploads._run_upload_thread(blocking_worker)
+
+        task = asyncio.create_task(run_worker())
+        assert await asyncio.to_thread(worker_started.wait, 2)
+        task.cancel()
+        await cancellation_cleanup_started.wait()
+        assert not semaphore.acquire(False)
+        allow_worker_exit.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(scenario())
+    assert semaphore.acquire(False)
+    semaphore.release()
+
+
+def test_upload_processing_slot_returns_503_when_acquire_times_out(monkeypatch):
+    from app.routers import uploads
+
+    class TimedOutSemaphore:
+        def __init__(self):
+            self.release_called = False
+
+        def acquire(self, blocking=True, timeout=None):
+            assert blocking is True
+            assert timeout == uploads.settings.upload_processing_acquire_timeout_seconds
+            return False
+
+        def release(self):
+            self.release_called = True
+
+    semaphore = TimedOutSemaphore()
+    monkeypatch.setattr(uploads, "_UPLOAD_PROCESSING_SEMAPHORE", semaphore)
+
+    async def scenario():
+        with pytest.raises(HTTPException) as exc_info:
+            async with uploads._upload_processing_slot():
+                raise AssertionError("timed-out slot must not enter its body")
+        assert exc_info.value.status_code == 503
+        assert "媒体处理繁忙" in str(exc_info.value.detail)
+
+    asyncio.run(scenario())
+    assert semaphore.release_called is False
+
+
+def test_cancelled_upload_stream_removes_partial_raw_temp_file(monkeypatch, tmp_path):
+    from app.routers import uploads
+
+    raw_path = tmp_path / "partial.mp4"
+    second_read_started = asyncio.Event()
+
+    class FakeTempFile:
+        name = str(raw_path)
+
+        def close(self):
+            pass
+
+    class BlockingUpload:
+        def __init__(self):
+            self.read_count = 0
+
+        async def read(self, _size):
+            self.read_count += 1
+            if self.read_count == 1:
+                return b"partial"
+            second_read_started.set()
+            await asyncio.Event().wait()
+
+    monkeypatch.setattr(uploads.tempfile, "NamedTemporaryFile", lambda **_kwargs: FakeTempFile())
+
+    async def scenario():
+        task = asyncio.create_task(
+            uploads._save_upload_stream_to_temp(BlockingUpload(), "mp4", limit=1024)
+        )
+        await second_read_started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(scenario())
+    assert not raw_path.exists()
+
+
+def test_cancelled_video_sanitize_removes_completed_result_temp(monkeypatch, tmp_path):
+    from app.routers import uploads
+
+    sanitizer_started = threading.Event()
+    allow_sanitizer_return = threading.Event()
+    sanitized_path = tmp_path / "cancelled-sanitized.mp4"
+    raw_path = tmp_path / "raw.mp4"
+    raw_path.write_bytes(b"raw")
+
+    def sanitizer(_path):
+        sanitizer_started.set()
+        assert allow_sanitizer_return.wait(timeout=5)
+        sanitized_path.write_bytes(b"sanitized")
+        return sanitized_path, 32, 48, 1.0, None
+
+    async def scenario():
+        task = asyncio.create_task(
+            uploads._run_upload_thread(
+                sanitizer,
+                raw_path,
+                on_cancel_result=lambda result: result[0].unlink(missing_ok=True),
+            )
+        )
+        assert await asyncio.to_thread(sanitizer_started.wait, 2)
+        task.cancel()
+        allow_sanitizer_return.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(scenario())
+    assert not sanitized_path.exists()
+
+
+def test_cancelled_video_storage_removes_completed_persisted_key(monkeypatch, tmp_path):
+    from app.routers import uploads
+
+    save_started = threading.Event()
+    allow_save_return = threading.Event()
+    stored_path = tmp_path / "upload_video" / "cancelled.mp4"
+    key = "upload_video/cancelled.mp4"
+
+    def save_file():
+        stored_path.parent.mkdir(parents=True, exist_ok=True)
+        stored_path.write_bytes(b"persisted")
+        save_started.set()
+        assert allow_save_return.wait(timeout=5)
+        return key
+
+    monkeypatch.setattr(uploads.storage, "local_path", lambda value: tmp_path / value)
+
+    async def scenario():
+        task = asyncio.create_task(
+            uploads._run_upload_thread(
+                save_file,
+                on_cancel_result=lambda result: uploads._cleanup_storage_keys(result),
+            )
+        )
+        assert await asyncio.to_thread(save_started.wait, 2)
+        task.cancel()
+        allow_save_return.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(scenario())
+    assert not stored_path.exists()
+
+
+def test_upload_image_holds_processing_slot_through_storage_and_commit(
+    client, make_user, auth, monkeypatch
+):
+    make_user("13900000255", balance=1000)
+    headers = auth("13900000255")
+    from app.routers import uploads
+
+    semaphore = _TrackingSemaphore(1)
+    monkeypatch.setattr(uploads, "_UPLOAD_PROCESSING_SEMAPHORE", semaphore)
+    real_save = uploads.storage.save_bytes_named
+    real_commit = uploads.Session.commit
+
+    def checked_save(*args, **kwargs):
+        assert semaphore.is_active()
+        return real_save(*args, **kwargs)
+
+    def checked_commit(session, *args, **kwargs):
+        if any(isinstance(row, UploadedAsset) for row in session.new):
+            assert semaphore.is_active()
+        return real_commit(session, *args, **kwargs)
+
+    monkeypatch.setattr(uploads.storage, "save_bytes_named", checked_save)
+    monkeypatch.setattr(uploads.Session, "commit", checked_commit)
+
+    response = client.post(
+        "/api/uploads/image",
+        files={"file": ("gated.png", _png_bytes(), "image/png")},
+        headers=headers,
+    )
+    assert response.status_code == 200, response.text
+
+
+def test_upload_video_holds_processing_slot_through_temp_storage_poster_and_commit(
+    client, make_user, auth, monkeypatch, tmp_path
+):
+    make_user("13900000256", balance=1000)
+    headers = auth("13900000256")
+    from app.routers import uploads
+
+    semaphore = _TrackingSemaphore(1)
+    monkeypatch.setattr(uploads, "_UPLOAD_PROCESSING_SEMAPHORE", semaphore)
+    real_stream = uploads._save_upload_stream_to_temp
+    real_save_file = uploads.storage.save_file
+    real_save_bytes = uploads.storage.save_bytes_named
+    real_commit = uploads.Session.commit
+
+    async def checked_stream(*args, **kwargs):
+        assert semaphore.is_active()
+        return await real_stream(*args, **kwargs)
+
+    def fake_sanitize(_raw_path):
+        assert semaphore.is_active()
+        sanitized = tmp_path / "sanitized.mp4"
+        sanitized.write_bytes(b"sanitized-video")
+        return sanitized, 32, 48, 1.0, b"poster"
+
+    def checked_save_file(*args, **kwargs):
+        assert semaphore.is_active()
+        return real_save_file(*args, **kwargs)
+
+    def checked_save_bytes(*args, **kwargs):
+        assert semaphore.is_active()
+        return real_save_bytes(*args, **kwargs)
+
+    def checked_commit(session, *args, **kwargs):
+        if any(isinstance(row, UploadedAsset) for row in session.new):
+            assert semaphore.is_active()
+        return real_commit(session, *args, **kwargs)
+
+    monkeypatch.setattr(uploads, "_save_upload_stream_to_temp", checked_stream)
+    monkeypatch.setattr(uploads, "_sanitize_video_and_poster", fake_sanitize)
+    monkeypatch.setattr(uploads.storage, "save_file", checked_save_file)
+    monkeypatch.setattr(uploads.storage, "save_bytes_named", checked_save_bytes)
+    monkeypatch.setattr(uploads.Session, "commit", checked_commit)
+
+    response = client.post(
+        "/api/uploads/video",
+        files={"file": ("gated.mp4", b"raw-video", "video/mp4")},
+        headers=headers,
+    )
+    assert response.status_code == 200, response.text
+
+
+def test_upload_image_processing_respects_global_parallelism(client, make_user, auth, monkeypatch):
+    make_user("13900000254", balance=1000)
+    headers = auth("13900000254")
+    active = 0
+    peak = 0
+    state_lock = threading.Lock()
+    two_entered = threading.Event()
+    third_entered = threading.Event()
+    third_acquire_started = threading.Event()
+    release_processing = threading.Event()
+
+    from app.routers import uploads
+
+    class CountingSemaphore(_TrackingSemaphore):
+        def __init__(self):
+            super().__init__(2)
+            self._acquire_count = 0
+            self._count_lock = threading.Lock()
+
+        def acquire(self, blocking=True, timeout=None):
+            with self._count_lock:
+                self._acquire_count += 1
+                if self._acquire_count >= 3:
+                    third_acquire_started.set()
+            return super().acquire(blocking, timeout)
+
+    monkeypatch.setattr(uploads, "_UPLOAD_PROCESSING_SEMAPHORE", CountingSemaphore())
+    real_normalize = uploads._normalize_image_upload
+
+    def _blocking_normalize(data):
+        nonlocal active, peak
+        with state_lock:
+            active += 1
+            peak = max(peak, active)
+            if active >= 2:
+                two_entered.set()
+            if active >= 3:
+                third_entered.set()
+        try:
+            assert release_processing.wait(timeout=5)
+            return real_normalize(data)
+        finally:
+            with state_lock:
+                active -= 1
+
+    monkeypatch.setattr(uploads, "_normalize_image_upload", _blocking_normalize)
+
+    def _upload(index):
+        return client.post(
+            "/api/uploads/image",
+            files={"file": (f"ref-{index}.png", _png_bytes(), "image/png")},
+            headers=headers,
+        )
+
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        futures = [pool.submit(_upload, index) for index in range(3)]
+        assert two_entered.wait(timeout=5)
+        assert third_acquire_started.wait(timeout=5)
+        assert not third_entered.is_set()
+        release_processing.set()
+        responses = [future.result(timeout=10) for future in futures]
+
+    assert all(response.status_code == 200 for response in responses)
+    assert peak == 2
 
 
 def test_upload_image_sanitizes_long_original_filename(client, make_user, auth):
@@ -702,6 +1331,88 @@ def test_auto_subject_mask_handles_common_white_product_shapes():
         assert result.confidence >= generation_media.EDIT_MASK_SEND_CONFIDENCE, name
         assert result.bbox is not None, name
         assert bbox_iou(result.bbox, expected) >= 0.82, (name, result.bbox, expected)
+
+
+def test_subject_protection_preview_reports_alpha_mask_and_requires_owner(client, make_user, auth):
+    make_user("13900001976", balance=1000)
+    make_user("13900001977", balance=1000)
+    owner_h = auth("13900001976")
+    other_h = auth("13900001977")
+
+    up = client.post(
+        "/api/uploads/image",
+        files={"file": ("product.png", _transparent_product_png_bytes(), "image/png")},
+        headers=owner_h,
+    )
+    assert up.status_code == 200, up.text
+    asset = up.json()
+
+    preview = client.post(
+        "/api/subject-protection/preview",
+        json={"asset_url": asset["url"], "edit_mask_mode": "protect_subject"},
+        headers=owner_h,
+    )
+    assert preview.status_code == 200, preview.text
+    data = preview.json()
+    assert data["mode"] == "alpha_subject"
+    assert data["risk_level"] == "low"
+    assert data["will_send_mask"] is True
+    assert data["pixel_lock_recommended"] is True
+    assert data["mask_data_uri"].startswith("data:image/png;base64,")
+
+    other_preview = client.post(
+        "/api/subject-protection/preview",
+        json={"asset_url": asset["url"], "edit_mask_mode": "protect_subject"},
+        headers=other_h,
+    )
+    assert other_preview.status_code == 404
+
+
+def test_subject_protection_preview_distinguishes_auto_center_and_off(client, make_user, auth):
+    make_user("13900001978", balance=1000)
+    h = auth("13900001978")
+
+    up = client.post(
+        "/api/uploads/image",
+        files={"file": ("product.png", _white_bg_product_png_bytes(), "image/png")},
+        headers=h,
+    )
+    assert up.status_code == 200, up.text
+    asset = up.json()
+
+    auto_preview = client.post(
+        "/api/subject-protection/preview",
+        json={"asset_url": asset["url"], "edit_mask_mode": "protect_subject"},
+        headers=h,
+    )
+    assert auto_preview.status_code == 200, auto_preview.text
+    auto_data = auto_preview.json()
+    assert auto_data["mode"] == "auto_subject"
+    assert auto_data["will_send_mask"] is True
+    assert auto_data["risk_level"] in {"low", "medium"}
+
+    center_preview = client.post(
+        "/api/subject-protection/preview",
+        json={"asset_url": asset["url"], "edit_mask_mode": "center_box"},
+        headers=h,
+    )
+    assert center_preview.status_code == 200, center_preview.text
+    center_data = center_preview.json()
+    assert center_data["mode"] == "center_box"
+    assert center_data["risk_level"] == "medium"
+    assert center_data["will_send_mask"] is True
+    assert "不等于真正识别产品主体" in center_data["message"]
+
+    off_preview = client.post(
+        "/api/subject-protection/preview",
+        json={"asset_url": asset["url"], "edit_mask_mode": "off"},
+        headers=h,
+    )
+    assert off_preview.status_code == 200, off_preview.text
+    off_data = off_preview.json()
+    assert off_data["mode"] == "none"
+    assert off_data["risk_level"] == "high"
+    assert off_data["will_send_mask"] is False
 
 
 def test_product_image_edit_strict_lock_composites_original_subject_pixels(
@@ -1614,14 +2325,17 @@ def test_upload_video_runs_probe_off_event_loop(client, make_user, auth, monkeyp
     make_user("13900001909", balance=1000)
     h = auth("13900001909")
     calls = []
+    cleanup_callbacks = []
 
-    async def fake_to_thread(func, *args, **kwargs):
+    async def fake_run_upload_thread(func, *args, on_cancel_result=None, **kwargs):
         calls.append(getattr(func, "__name__", str(func)))
+        if on_cancel_result is not None:
+            cleanup_callbacks.append((getattr(func, "__name__", str(func)), on_cancel_result))
         return func(*args, **kwargs)
 
     from app.routers import uploads
 
-    monkeypatch.setattr(uploads, "asyncio", SimpleNamespace(to_thread=fake_to_thread), raising=False)
+    monkeypatch.setattr(uploads, "_run_upload_thread", fake_run_upload_thread)
 
     r = client.post(
         "/api/uploads/video",
@@ -1631,6 +2345,11 @@ def test_upload_video_runs_probe_off_event_loop(client, make_user, auth, monkeyp
 
     assert r.status_code == 200, r.text
     assert "_sanitize_video_and_poster" in calls
+    assert {name for name, _callback in cleanup_callbacks} == {
+        "_sanitize_video_and_poster",
+        "save_file",
+        "save_bytes_named",
+    }
 
 
 def test_upload_video_rejects_when_ffprobe_missing(client, make_user, auth, monkeypatch, tmp_path):

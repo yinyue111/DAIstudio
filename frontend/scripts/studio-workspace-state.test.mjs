@@ -17,6 +17,102 @@ const viewModelSource = readFileSync(join(root, "app/studio/viewModel.ts"), "utf
 const structuredEditorSource = readFileSync(join(root, "app/studio/StudioStructuredEditor.jsx"), "utf8");
 const generationControlsSource = readFileSync(join(root, "components/StudioGenerationControls.jsx"), "utf8");
 const studioSource = `${pageSource}\n${workspaceStateSource}\n${promptWorkspaceSource}\n${editPromptSource}\n${generationPayloadSource}\n${referenceParsingSource}\n${viewModelSource}\n${constantsSource}\n${generationControlsSource}`;
+const subjectProtectionModule = await import("../lib/studioSubjectProtection.js").catch(() => ({}));
+const { startSubjectProtectionPreview } = subjectProtectionModule;
+
+assert.equal(
+  typeof startSubjectProtectionPreview,
+  "function",
+  "subject-protection preview requests should use a cancellable runner",
+);
+
+function deferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
+
+{
+  const pending = deferred();
+  const failure = new Error("preview failed");
+  const errors = [];
+  const request = startSubjectProtectionPreview({
+    load: () => pending.promise,
+    onSuccess: () => assert.fail("a rejected preview must not report success"),
+    onError: (error) => errors.push(error),
+  });
+
+  await Promise.resolve();
+  pending.reject(failure);
+  await request.settled;
+  assert.deepEqual(errors, [failure], "a delayed preview rejection should reach onError");
+}
+
+{
+  const first = deferred();
+  const second = deferred();
+  const writes = [];
+  const firstRequest = startSubjectProtectionPreview({
+    load: () => first.promise,
+    onSuccess: (value) => writes.push(`first:${value}`),
+    onError: (error) => writes.push(`first-error:${error.message}`),
+  });
+  await Promise.resolve();
+  firstRequest.cancel();
+  const secondRequest = startSubjectProtectionPreview({
+    load: () => second.promise,
+    onSuccess: (value) => writes.push(`second:${value}`),
+    onError: (error) => writes.push(`second-error:${error.message}`),
+  });
+
+  await Promise.resolve();
+  first.resolve("stale");
+  second.resolve("current");
+  await Promise.all([firstRequest.settled, secondRequest.settled]);
+  assert.deepEqual(writes, ["second:current"], "canceling request A should not suppress request B");
+}
+
+{
+  const pending = deferred();
+  const writes = [];
+  const request = startSubjectProtectionPreview({
+    load: () => pending.promise,
+    onSuccess: (value) => writes.push(value),
+    onError: (error) => writes.push(error.message),
+  });
+
+  await Promise.resolve();
+  request.cancel();
+  pending.reject(new Error("disposed"));
+  await request.settled;
+  assert.deepEqual(writes, [], "a disposed preview request should not write success or error state");
+}
+
+{
+  const values = [];
+  const successfulRequest = startSubjectProtectionPreview({
+    load: () => "sync success",
+    onSuccess: (value) => values.push(value),
+    onError: (error) => assert.fail(error),
+  });
+  await successfulRequest.settled;
+
+  const failure = new Error("sync failure");
+  const errors = [];
+  const failedRequest = startSubjectProtectionPreview({
+    load: () => { throw failure; },
+    onSuccess: () => assert.fail("a synchronously thrown load must not report success"),
+    onError: (error) => errors.push(error),
+  });
+  await failedRequest.settled;
+
+  assert.deepEqual(values, ["sync success"], "a synchronous preview result should reach onSuccess");
+  assert.deepEqual(errors, [failure], "a synchronous preview failure should reach onError");
+}
 
 for (const field of [
   "prompt",
@@ -34,8 +130,13 @@ for (const field of [
   "vDuration",
   "vResolution",
   "editMaskMode",
+  "productPixelLockMode",
   "videoProductLockMode",
+  "videoProductTemplate",
   "videoAnalysisPreset",
+  "subjectProtection",
+  "subjectProtectionLoading",
+  "subjectProtectionSource",
   "structured",
   "structuredSource",
   "promptSourceSignature",
@@ -151,14 +252,34 @@ assert.match(
   "video product lock mode should be submitted with the generation payload",
 );
 assert.match(
+  generationSubmitSource,
+  /productPixelLockMode,/,
+  "product pixel lock mode should be submitted with the generation payload",
+);
+assert.match(
+  generationSubmitSource,
+  /videoProductTemplate,/,
+  "video product template should be submitted with the generation payload",
+);
+assert.match(
   generationPayloadSource,
   /product_lock_mode:\s*videoProductLockMode === "locked" \? "locked" : "free"/,
   "video product lock mode should be explicit in image-to-video edit params",
 );
 assert.match(
   generationPayloadSource,
+  /product_video_template:\s*videoProductTemplate \|\| "stable_showcase"/,
+  "video product template should be explicit in product image-to-video params",
+);
+assert.match(
+  generationPayloadSource,
   /edit_mask_mode:\s*editMaskMode \|\| "protect_subject"/,
   "product image editing should explicitly send the selected inpaint mask mode",
+);
+assert.match(
+  generationPayloadSource,
+  /product_pixel_lock:\s*editMaskMode === "off" \? "off" : \(productPixelLockMode \|\| "auto"\)/,
+  "product image editing should explicitly send the selected pixel-lock mode",
 );
 assert.match(
   generationControlsSource,
@@ -177,6 +298,16 @@ assert.match(
 );
 assert.match(
   generationControlsSource,
+  /像素锁/,
+  "product image editing controls should expose pixel-lock options",
+);
+assert.match(
+  generationControlsSource,
+  /强制像素锁/,
+  "product image editing controls should expose strict pixel-lock mode",
+);
+assert.match(
+  generationControlsSource,
   /自由运动/,
   "video product generation controls should expose a dynamic free-motion option",
 );
@@ -186,9 +317,55 @@ assert.match(
   "video product generation controls should expose a text-fidelity lock option",
 );
 assert.match(
+  generationControlsSource,
+  /产品模板/,
+  "video product generation controls should expose product-safe video templates",
+);
+assert.match(
+  constantsSource,
+  /VIDEO_PRODUCT_TEMPLATES/,
+  "product-safe video templates should live in studio constants",
+);
+assert.match(
+  workspaceStateSource,
+  /productPixelLockMode:\s*"auto"/,
+  "product image editing should default to automatic pixel lock",
+);
+assert.match(
+  pageSource,
+  /productPixelLockMode:\s*current\.productPixelLockMode \|\| "auto"/,
+  "restored workspaces without a product pixel lock mode should use automatic pixel lock",
+);
+assert.match(
   workspaceStateSource,
   /videoProductLockMode:\s*"locked"/,
   "video product generation should default to text-fidelity lock mode",
+);
+assert.match(
+  workspaceStateSource,
+  /videoProductTemplate:\s*"stable_showcase"/,
+  "video product generation should default to the stable showcase template",
+);
+assert.match(
+  pageSource,
+  /subjectProtectionPreview\(productAsset\.url,\s*requestedMode\)/,
+  "product image editing should preflight subject-protection before generation",
+);
+const subjectProtectionEffect = pageSource.match(
+  /useEffect\(\(\) => \{\s*const mode = creationMode;\s*const shouldPreview = \([\s\S]*?\n  \}, \[([\s\S]*?)\]\);/,
+);
+assert.ok(subjectProtectionEffect, "subject-protection preview should be managed by a focused effect");
+for (const outputState of ["subjectProtection", "subjectProtectionLoading", "subjectProtectionSource"]) {
+  assert.doesNotMatch(
+    subjectProtectionEffect[1],
+    new RegExp(`\\b${outputState}\\b`),
+    `${outputState} should not restart and cancel the request that produced it`,
+  );
+}
+assert.match(
+  generationControlsSource,
+  /主体保护预检/,
+  "product image editing controls should show subject-protection preflight status",
 );
 assert.match(
   pageSource,

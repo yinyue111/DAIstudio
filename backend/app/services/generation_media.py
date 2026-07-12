@@ -13,7 +13,7 @@ from PIL import Image, ImageChops, ImageDraw, ImageFilter
 
 from ..config import settings
 from ..models import GenTask, UploadedAsset
-from . import asset_refs, gateway, storage, video_frames
+from . import asset_refs, gateway, locks, storage, video_frames
 from .image_options import IMAGE_SIZES
 from .watermark import make_image_preview
 
@@ -45,6 +45,10 @@ class EditMaskResult:
             "_edit_mask_bbox": list(self.bbox) if self.bbox else None,
             "_edit_mask_source": self.reason or self.mode,
         }
+
+
+class SubjectProtectionBusy(RuntimeError):
+    pass
 
 
 def final_prompt(task: GenTask) -> str:
@@ -91,21 +95,22 @@ def image_data_uri(raw: bytes, mime: str = "image/jpeg") -> str:
     return f"data:{mime};base64,{base64.b64encode(raw).decode()}"
 
 
-def _asset_image_bytes_for_mask(db, task: GenTask, url: str | None) -> bytes | None:
+def _asset_image_bytes_for_mask(db, task: GenTask | int, url: str | None) -> bytes | None:
     if not url:
         return None
+    user_id = int(task if isinstance(task, int) else task.user_id)
     key = storage.key_from_url(url)
     if not key:
         return None
     row = db.get(UploadedAsset, key)
     if row:
-        if row.user_id != task.user_id:
+        if row.user_id != user_id:
             raise RuntimeError("上传素材不存在")
         path = storage.local_path(key)
     elif key.startswith(("upload/", "upload_preview/", "upload_video/", "upload_video_preview/")):
         raise RuntimeError("上传素材不存在")
     else:
-        path = asset_refs.generated_asset_reference_path(db, task.user_id, key)
+        path = asset_refs.generated_asset_reference_path(db, user_id, key)
     if not path.exists() or not path.is_file():
         raise RuntimeError("素材文件不存在")
     return Path(path).read_bytes()
@@ -715,7 +720,7 @@ def _auto_subject_mask(img: Image.Image) -> EditMaskResult:
 
 def gateway_image_edit_mask(
     db,
-    task: GenTask,
+    task: GenTask | int,
     url: str | None,
     *,
     max_side: int = 1024,
@@ -728,10 +733,20 @@ def gateway_image_edit_mask(
     foreground detection; center-box protection is only a compatibility
     fallback and should not be presented as true subject recognition.
     """
-    raw = _asset_image_bytes_for_mask(db, task, url)
-    if not raw:
-        return None
+    slot = locks.RedisSemaphore(
+        "semaphore:subject-protection",
+        limit=int(settings.subject_protection_parallelism),
+        ttl=120,
+        wait_timeout=0,
+    )
     try:
+        slot.__enter__()
+    except TimeoutError:
+        raise SubjectProtectionBusy("主体保护处理繁忙,请稍后再试") from None
+    try:
+        raw = _asset_image_bytes_for_mask(db, task, url)
+        if not raw:
+            return None
         img = Image.open(io.BytesIO(raw)).convert("RGBA")
         scale = min(1.0, max_side / max(img.size))
         if scale < 1.0:
@@ -746,7 +761,11 @@ def gateway_image_edit_mask(
             return _center_box_mask(img, reason="explicit_center_box")
         return _auto_subject_mask(img)
     except Exception as e:  # noqa: BLE001
+        if isinstance(e, SubjectProtectionBusy):
+            raise
         raise RuntimeError(f"编辑蒙版生成失败:{e}") from e
+    finally:
+        slot.__exit__(None, None, None)
 
 
 def _fit_subject_bbox(

@@ -92,7 +92,7 @@ assert.doesNotMatch(
 );
 assert.match(
   taskTrackingSource,
-  /api\.cancelTask\(task\.id\)/,
+  /api\.cancelTask\((?:task|currentTask)\.id\)/,
   "studio cancellation should submit the currently tracked direct generation task",
 );
 assert.doesNotMatch(

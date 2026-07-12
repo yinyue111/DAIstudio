@@ -61,7 +61,7 @@ assert.match(
 );
 assert.match(
   taskTrackingSource,
-  /startPolling\(id,\s*runId\)/,
+  /startPolling\(id,\s*runId(?:,\s*(?:ownerSession|ownerRequest))?\)/,
   "websocket fallback should pass the current tracking generation into polling",
 );
 assert.match(
@@ -96,7 +96,7 @@ assert.match(
 );
 assert.match(
   pageSource,
-  /if \(applyVariationDraft\(JSON\.parse\(variationDraft\)\)\) \{\s*window\.localStorage\.removeItem\(STUDIO_VARIATION_DRAFT_KEY\);/s,
+  /if \(variationDraft && applyVariationDraft\(variationDraft\)\) \{\s*removeStudioUserDraft\(window\.localStorage, STUDIO_VARIATION_DRAFT_KEY, u\?\.id\);/s,
   "variation draft should only be removed after successful recovery",
 );
 assert.match(
@@ -106,7 +106,7 @@ assert.match(
 );
 assert.match(
   promptsPageSource,
-  /JSON\.stringify\(\{[\s\S]*category:\s*item\.category/,
+  /saveStudioUserDraft\([\s\S]*category:\s*item\.category/,
   "prompt library handoff should preserve prompt category for video prompts",
 );
 assert.match(
@@ -124,10 +124,11 @@ assert.match(
   /CREATION_MODES\.some\(\(item\) => item\.key === draft\.creationMode\)/,
   "structured prompt drafts should validate mode keys against creation-mode objects",
 );
-assert.match(
-  pageSource,
-  /restoredLocalDraftAtRef\.current = Number\(parsedDraft\.savedAt \|\| Date\.now\(\)\)/,
-  "prompt library handoff should block older cloud workspace drafts from overriding the selected prompt",
+const cloudDraftLoadIndex = pageSource.indexOf('const row = await api.getDraft("studio")');
+const promptTransferApplyIndex = pageSource.indexOf("if (promptDraft)");
+assert.ok(
+  cloudDraftLoadIndex >= 0 && promptTransferApplyIndex > cloudDraftLoadIndex,
+  "prompt-library handoff must apply after cloud initialization so an older cloud workspace cannot override the selected prompt",
 );
 assert.match(
   toastSource,

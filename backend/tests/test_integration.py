@@ -51,6 +51,25 @@ def test_health(client):
     assert detail["components"]["redis"] == "ok"
 
 
+def test_readiness_failure_returns_503_without_dependency_error_details(client, monkeypatch):
+    class BrokenEngine:
+        @staticmethod
+        def connect():
+            raise RuntimeError("postgresql://internal-db.example:5432/private")
+
+    monkeypatch.setattr("app.main.engine", BrokenEngine())
+
+    ready = client.get("/api/ready")
+    assert ready.status_code == 503
+    assert ready.json()["ok"] is False
+    assert ready.json()["components"]["db"] == "error"
+    assert "internal-db" not in ready.text
+
+    detail = client.get("/api/health/detail")
+    assert detail.status_code == 200
+    assert "internal-db" in detail.text
+
+
 def test_register_login_me(client):
     db = SessionLocal()
     set_setting(db, "sms_auth_enabled", False)
@@ -129,7 +148,7 @@ def test_sms_send_returns_disabled_when_switch_is_off(client):
     assert r.json() == {"ok": False, "disabled": True}
 
 
-def test_production_registration_allows_public_phone_without_sms(client, monkeypatch):
+def test_production_registration_rejects_public_phone_without_sms(client, monkeypatch):
     monkeypatch.setattr("app.routers.auth.settings.debug", False)
     db = SessionLocal()
     try:
@@ -140,13 +159,14 @@ def test_production_registration_allows_public_phone_without_sms(client, monkeyp
 
     features = client.get("/api/auth/features")
     assert features.status_code == 200, features.text
-    assert features.json()["registration_enabled"] is True
+    assert features.json()["registration_enabled"] is False
 
     r = client.post(
         "/api/auth/register",
         json={"phone": "13700000005", "password": "secret1234"},
     )
-    assert r.status_code == 200, r.text
+    assert r.status_code == 400, r.text
+    assert "注册暂未开放" in r.text
 
 
 def test_generate_unlock_profile(client, make_user, auth):
@@ -469,6 +489,10 @@ def test_video_final_can_generate_directly_without_preview_parent(client, make_u
     assert t["cost_settled"] == 16
     assert t["assets"][0]["type"] == "video"
     assert t["assets"][0]["unlocked"] is True
+    assert "/media/preview/" in t["assets"][0]["preview_url"]
+    assert t["assets"][0]["preview_url"].endswith(".png")
+    assert "/media/video_hd/" in t["assets"][0]["hd_url"]
+    assert t["assets"][0]["hd_url"].endswith(".mp4")
     assert client.get("/api/me", headers=h).json()["balance_credits"] == 984
 
 
@@ -1340,6 +1364,16 @@ def test_profile_assets_filters_and_batch_operations(client, make_user, auth):
     assert set(deleted.json()["deleted"]) == set(asset_ids)
     after = client.get("/api/profile/assets", headers=h).json()
     assert all(a["id"] not in asset_ids for a in after)
+
+
+def test_batch_download_rejects_too_many_assets(client, make_user, auth):
+    make_user("13900001047", balance=1000)
+    h = auth("13900001047")
+
+    r = client.post("/api/assets/batch/download", headers=h, json={"asset_ids": list(range(1, 32))})
+
+    assert r.status_code == 413
+    assert "单次最多打包" in r.text
 
 
 def test_delete_asset_keeps_shared_underlying_file(client, make_user, auth):

@@ -15,7 +15,9 @@ export function createWorkspaceState() {
     vDuration: 5,
     vResolution: "720p",
     editMaskMode: "protect_subject",
+    productPixelLockMode: "auto",
     videoProductLockMode: "locked",
+    videoProductTemplate: "stable_showcase",
     videoAnalysisPreset: "standard",
     url: "",
     parsing: false,
@@ -27,6 +29,9 @@ export function createWorkspaceState() {
     productProfile: null,
     productProfileSource: "",
     productProfiling: false,
+    subjectProtection: null,
+    subjectProtectionLoading: false,
+    subjectProtectionSource: "",
     variationSource: null,
     structured: {},
     structuredSource: "",
@@ -87,7 +92,9 @@ export default function useStudioWorkspaceState({ creationMode, modes }) {
   const setVDuration = (value) => updateWorkspaceField("vDuration", value);
   const setVResolution = (value) => updateWorkspaceField("vResolution", value);
   const setEditMaskMode = (value) => updateWorkspaceField("editMaskMode", value);
+  const setProductPixelLockMode = (value) => updateWorkspaceField("productPixelLockMode", value);
   const setVideoProductLockMode = (value) => updateWorkspaceField("videoProductLockMode", value);
+  const setVideoProductTemplate = (value) => updateWorkspaceField("videoProductTemplate", value);
   const setVideoAnalysisPreset = (value) => updateWorkspaceField("videoAnalysisPreset", value);
   const setUrl = (value) => updateWorkspaceField("url", value);
   const setStructured = (value) => updateWorkspaceField("structured", value);
@@ -122,7 +129,9 @@ export default function useStudioWorkspaceState({ creationMode, modes }) {
     setVDuration,
     setVResolution,
     setEditMaskMode,
+    setProductPixelLockMode,
     setVideoProductLockMode,
+    setVideoProductTemplate,
     setVideoAnalysisPreset,
     setUrl,
     setStructured,

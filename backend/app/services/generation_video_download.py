@@ -4,8 +4,10 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable
 from datetime import datetime, timezone
+from types import SimpleNamespace
 
 from billiard.exceptions import SoftTimeLimitExceeded
+from sqlalchemy import update
 
 from ..config import settings
 from ..db import SessionLocal
@@ -139,22 +141,33 @@ def persist_local_video_result_asset(db, task: GenTask, keys: list[str]) -> list
     return written_keys
 
 
-def hold_video_download_for_reconciliation(db, task_id: int, error: str) -> None:
+def hold_video_download_for_reconciliation(
+    db,
+    task_id: int,
+    error: str,
+    *,
+    expected_status: str | None = None,
+    expected_phase: str | None = None,
+    expected_external_task_id: str | None = None,
+) -> bool:
     """Hold provider-success videos when local persistence failed."""
     db.rollback()
-    task = db.get(GenTask, task_id)
+    task = db.get(GenTask, task_id, populate_existing=True)
     if not task:
-        return
+        return False
     params = dict(task.params or {})
-    mark_needs_review(
+    return mark_needs_review(
         db,
         task_id,
         (
             "视频已由上游生成,但结果下载落盘失败,需要系统恢复或管理员确认。"
-            f"external_task_id={task.external_task_id or 'unknown'}; "
+            f"external_task_id={expected_external_task_id or task.external_task_id or 'unknown'}; "
             f"result_url={'present' if params.get('_video_result_url') else 'missing'}; "
             f"error={error[:500]}"
         ),
+        expected_status=expected_status,
+        expected_phase=expected_phase,
+        expected_external_task_id=expected_external_task_id,
     )
 
 
@@ -178,13 +191,27 @@ def try_enqueue_video_download(
     task_id: int,
     *,
     countdown: int = 0,
+    external_task_id: str | None = None,
+    expected_status: str | None = None,
+    expected_phase: str | None = None,
     enqueue_video_download_fn: EnqueueVideoDownload | None = None,
 ) -> None:
     enqueue = enqueue_video_download_fn or enqueue_video_download
     try:
-        enqueue(task_id, countdown=countdown)
+        enqueue(
+            task_id,
+            countdown=countdown,
+            external_task_id=external_task_id,
+        )
     except Exception as e:  # noqa: BLE001
-        hold_video_download_for_reconciliation(db, task_id, str(e))
+        hold_video_download_for_reconciliation(
+            db,
+            task_id,
+            str(e),
+            expected_status=expected_status,
+            expected_phase=expected_phase,
+            expected_external_task_id=external_task_id,
+        )
 
 
 def finalize_or_retry_video_download(
@@ -193,19 +220,41 @@ def finalize_or_retry_video_download(
     model,
     result: dict,
     *,
+    expected_status: str | None = None,
+    expected_phase: str | None = None,
+    expected_external_task_id: str | None = None,
     enqueue_video_download_fn: EnqueueVideoDownload | None = None,
 ) -> bool:
     """Return True when finalised; False when a recoverable download retry was queued."""
-    lock_key = download_lock_key(task.id)
+    task_id = task.id
+    task_user_id = task.user_id
+    task_stage = task.stage
+    observed_status = expected_status if expected_status is not None else task.status
+    observed_phase = expected_phase if expected_phase is not None else task.phase
+    observed_external_task_id = (
+        expected_external_task_id
+        if expected_external_task_id is not None
+        else task.external_task_id
+    )
+    observed_params = dict(task.params or {})
+    attempts = int(observed_params.get("_video_download_attempts") or 0) + 1
+    lock_key = download_lock_key(task_id)
     lock_token = locks.acquire(lock_key, ttl=VIDEO_DOWNLOAD_LIVENESS_TTL)
     if not lock_token:
-        log.info("video task %s download/finalize already in progress", task.id)
+        log.info("video task %s download/finalize already in progress", task_id)
         return False
-    mark_video_download_alive(task.id)
+    mark_video_download_alive(task_id, observed_external_task_id)
     task._download_lock_token = lock_token
     try:
-        finalize_video_success(db, task, model, result)
-        return True
+        return finalize_video_success(
+            db,
+            task,
+            model,
+            result,
+            expected_status=observed_status,
+            expected_phase=observed_phase,
+            expected_external_task_id=observed_external_task_id,
+        )
     except VideoResultValidationError as e:
         # The provider already reported a terminal success, so an invalid or
         # unverifiable local file is an accounting ambiguity, not a clean user
@@ -214,54 +263,73 @@ def finalize_or_retry_video_download(
             db,
             kind="video_download",
             model_id=model.model_id,
-            user_id=task.user_id,
-            task_id=task.id,
+            user_id=task_user_id,
+            task_id=task_id,
             status="failed",
             detail={
-                "stage": task.stage,
-                "external_task_id": task.external_task_id,
+                "stage": task_stage,
+                "external_task_id": observed_external_task_id,
                 "permanent": True,
                 "needs_review": True,
                 "error": str(e)[:300],
             },
         )
-        hold_video_download_for_reconciliation(db, task.id, str(e))
+        hold_video_download_for_reconciliation(
+            db,
+            task_id,
+            str(e),
+            expected_status=observed_status,
+            expected_phase=observed_phase,
+            expected_external_task_id=observed_external_task_id,
+        )
         return True
     except LocalVideoSettlementError as e:
         usage.record_call(
             db,
             kind="video_download",
             model_id=model.model_id,
-            user_id=task.user_id,
-            task_id=task.id,
+            user_id=task_user_id,
+            task_id=task_id,
             status="failed",
             detail={
-                "stage": task.stage,
-                "external_task_id": task.external_task_id,
+                "stage": task_stage,
+                "external_task_id": observed_external_task_id,
                 "local_settlement": True,
                 "error": str(e)[:300],
             },
         )
-        hold_video_download_for_reconciliation(db, task.id, str(e))
+        hold_video_download_for_reconciliation(
+            db,
+            task_id,
+            str(e),
+            expected_status=observed_status,
+            expected_phase=observed_phase,
+            expected_external_task_id=observed_external_task_id,
+        )
         return True
     except SoftTimeLimitExceeded:
-        log.warning("video task %s download/finalize hit soft time limit; holding for review", task.id)
-        hold_video_download_for_reconciliation(db, task.id, "视频结果下载执行超时")
+        log.warning("video task %s download/finalize hit soft time limit; holding for review", task_id)
+        hold_video_download_for_reconciliation(
+            db,
+            task_id,
+            "视频结果下载执行超时",
+            expected_status=observed_status,
+            expected_phase=observed_phase,
+            expected_external_task_id=observed_external_task_id,
+        )
         return True
     except Exception as e:  # noqa: BLE001
-        mark_video_download_alive(task.id)
-        params = dict(task.params or {})
-        attempts = int(params.get("_video_download_attempts") or 0)
+        mark_video_download_alive(task_id, observed_external_task_id)
         usage_detail = {
-            "stage": task.stage,
-            "external_task_id": task.external_task_id,
+            "stage": task_stage,
+            "external_task_id": observed_external_task_id,
             "attempt": attempts,
             "error": str(e)[:300],
         }
         if attempts < VIDEO_DOWNLOAD_MAX_ATTEMPTS:
             log.warning(
                 "video task %s download/finalize attempt %s/%s failed: %s",
-                task.id,
+                task_id,
                 attempts,
                 VIDEO_DOWNLOAD_MAX_ATTEMPTS,
                 e,
@@ -270,15 +338,18 @@ def finalize_or_retry_video_download(
                 db,
                 kind="video_download",
                 model_id=model.model_id,
-                user_id=task.user_id,
-                task_id=task.id,
+                user_id=task_user_id,
+                task_id=task_id,
                 status="failed",
                 detail=usage_detail,
             )
             try_enqueue_video_download(
                 db,
-                task.id,
+                task_id,
                 countdown=VIDEO_POLL_INTERVAL,
+                external_task_id=observed_external_task_id,
+                expected_status=observed_status,
+                expected_phase=observed_phase,
                 enqueue_video_download_fn=enqueue_video_download_fn,
             )
             return False
@@ -288,12 +359,19 @@ def finalize_or_retry_video_download(
             db,
             kind="video_download",
             model_id=model.model_id,
-            user_id=task.user_id,
-            task_id=task.id,
+            user_id=task_user_id,
+            task_id=task_id,
             status="failed",
             detail=usage_detail,
         )
-        hold_video_download_for_reconciliation(db, task.id, str(e))
+        hold_video_download_for_reconciliation(
+            db,
+            task_id,
+            str(e),
+            expected_status=observed_status,
+            expected_phase=observed_phase,
+            expected_external_task_id=observed_external_task_id,
+        )
         return True
     finally:
         if hasattr(task, "_download_lock_token"):
@@ -304,21 +382,46 @@ def finalize_or_retry_video_download(
 def run_video_download_task(
     task_id: int,
     *,
+    expected_external_task_id: str | None = None,
     get_model_config_fn: GetModelConfig | None = None,
     enqueue_video_download_fn: EnqueueVideoDownload | None = None,
 ) -> None:
     """Persist a completed provider video on the dedicated download queue."""
     db = SessionLocal()
+    expected_status = None
+    expected_phase = None
+    identity_captured = False
     try:
+        if not expected_external_task_id:
+            log.warning(
+                "video download task %s missing external generation identity; ignoring delivery",
+                task_id,
+            )
+            return
         task = db.get(GenTask, task_id)
-        if not task or task.status in TERMINAL:
+        if not task or task.external_task_id != expected_external_task_id:
             return
-        if task.category != "video" or task.phase != "downloading":
+        observed_status = task.status
+        observed_phase = task.phase
+        observed_category = task.category
+        if observed_status in TERMINAL:
             return
+        if observed_category != "video" or observed_phase != "downloading":
+            return
+        expected_status = observed_status
+        expected_phase = observed_phase
+        identity_captured = True
         model_loader = get_model_config_fn or get_model_config
         model = model_loader(db, "video")
         if not model:
-            hold_video_download_for_reconciliation(db, task_id, "视频模型配置缺失")
+            hold_video_download_for_reconciliation(
+                db,
+                task_id,
+                "视频模型配置缺失",
+                expected_status=expected_status,
+                expected_phase=expected_phase,
+                expected_external_task_id=expected_external_task_id,
+            )
             return
         model = model_from_snapshot(task, model)
         finalize_or_retry_video_download(
@@ -326,20 +429,60 @@ def run_video_download_task(
             task,
             model,
             download_result_from_task(task),
+            expected_status=expected_status,
+            expected_phase=expected_phase,
+            expected_external_task_id=expected_external_task_id,
             enqueue_video_download_fn=enqueue_video_download_fn,
         )
     except SoftTimeLimitExceeded:
         log.warning("run_video_download_task %s hit soft time limit; holding for review", task_id)
-        hold_video_download_for_reconciliation(db, task_id, "视频结果下载执行超时")
+        if identity_captured:
+            hold_video_download_for_reconciliation(
+                db,
+                task_id,
+                "视频结果下载执行超时",
+                expected_status=expected_status,
+                expected_phase=expected_phase,
+                expected_external_task_id=expected_external_task_id,
+            )
     except Exception as e:  # noqa: BLE001
         log.exception("run_video_download_task %s failed", task_id)
-        hold_video_download_for_reconciliation(db, task_id, str(e))
+        if identity_captured:
+            hold_video_download_for_reconciliation(
+                db,
+                task_id,
+                str(e),
+                expected_status=expected_status,
+                expected_phase=expected_phase,
+                expected_external_task_id=expected_external_task_id,
+            )
     finally:
         db.close()
 
 
-def finalize_video_success(db, task: GenTask, model, result: dict) -> None:
-    params = dict(task.params or {})
+def finalize_video_success(
+    db,
+    task: GenTask,
+    model,
+    result: dict,
+    *,
+    expected_status: str | None = None,
+    expected_phase: str | None = None,
+    expected_external_task_id: str | None = None,
+) -> bool:
+    task_id = task.id
+    task_user_id = task.user_id
+    task_stage = task.stage
+    task_cost_frozen = task.cost_frozen
+    observed_status = expected_status if expected_status is not None else task.status
+    observed_phase = expected_phase if expected_phase is not None else task.phase
+    observed_external_task_id = (
+        expected_external_task_id
+        if expected_external_task_id is not None
+        else task.external_task_id
+    )
+    observed_params = dict(task.params or {})
+    params = dict(observed_params)
     video_url = result.get("url") or params.get("_video_result_url")
     # Only mock mode may legitimately lack a URL; a real "succeeded" with no URL
     # is a failure (don't fabricate a placeholder and charge for it).
@@ -349,32 +492,73 @@ def finalize_video_success(db, task: GenTask, model, result: dict) -> None:
         params["_video_result_url"] = video_url
     params.setdefault("_video_download_started_at", datetime.now(timezone.utc).isoformat())
     params["_video_download_attempts"] = int(params.get("_video_download_attempts") or 0) + 1
-    task.params = params
-    task.phase = "downloading"
+    real_cost = settlement_cost(task, model)
+    real_cost = max(0, min(int(real_cost or 0), int(task_cost_frozen or 0)))
+    poster_url = video_poster_url(task, params)
+    poster_owner = SimpleNamespace(user_id=task_user_id)
+    download_lock_token = getattr(task, "_download_lock_token", None)
+    conditions = [
+        GenTask.id == task_id,
+        GenTask.status == observed_status,
+        GenTask.params == observed_params,
+    ]
+    if observed_phase is None:
+        conditions.append(GenTask.phase.is_(None))
+    else:
+        conditions.append(GenTask.phase == observed_phase)
+    if observed_external_task_id is None:
+        conditions.append(GenTask.external_task_id.is_(None))
+    else:
+        conditions.append(GenTask.external_task_id == observed_external_task_id)
+    transitioned = db.execute(
+        update(GenTask)
+        .where(*conditions)
+        .values(params=params, phase="downloading")
+        .execution_options(synchronize_session=False)
+    ).rowcount
+    if (transitioned or 0) != 1:
+        db.rollback()
+        return False
     db.commit()
-    mark_video_download_alive(task.id)
+    mark_video_download_alive(task_id, observed_external_task_id)
 
-    media_meta = {"width": None, "height": None, "duration": int(params.get("duration", 0)) or None}
+    fallback_duration = int(params.get("duration", 0)) or None
+    media_meta = {"width": None, "height": None, "duration": fallback_duration}
     written_keys: list[str] = []
     if result.get("mock") or not video_url:
-        # mock / no direct url -> placeholder still so the flow is demonstrable
-        still = gateway.mock_video_preview_image()
-        pv_key = storage.save_bytes(still, "preview", "png")
-        written_keys.append(pv_key)
-        preview_url = storage.public_url(pv_key)
-        hd_url = preview_url if task.stage == "final" else None
+        media_subdir = "video_hd" if task_stage == "final" else "video_preview"
+        media_key = storage.save_bytes(gateway.mock_video(), media_subdir, "mp4")
+        written_keys.append(media_key)
+        local = storage.public_url(media_key)
+        media_meta = video_media_meta(media_key, fallback_duration)
+        if not media_meta.get("width"):
+            media_meta = {"width": 640, "height": 360, "duration": 1}
+        if task_stage == "final":
+            still = gateway.mock_video_preview_image()
+            poster_key = storage.save_bytes(still, "preview", "png")
+            written_keys.append(poster_key)
+            preview_url = storage.public_url(poster_key)
+            hd_url = local
+        else:
+            preview_url = local
+            hd_url = None
     else:
         # Download + store the mp4 locally (Ark URLs expire within ~24h). If we
         # can't persist it, hold the task for reconciliation rather than charging
         # for a result behind an expiring URL that will soon 404.
         try:
-            set_progress(task.id, 92, "running")
+            set_progress(task_id, 92, "running")
+
             def mark_download_progress() -> None:
-                mark_video_download_alive(task.id)
-                locks.refresh(download_lock_key(task.id), getattr(task, "_download_lock_token", None), VIDEO_DOWNLOAD_LIVENESS_TTL)
+                mark_video_download_alive(task_id, observed_external_task_id)
+                locks.refresh(
+                    download_lock_key(task_id),
+                    download_lock_token,
+                    VIDEO_DOWNLOAD_LIVENESS_TTL,
+                )
 
             mark_download_progress()
-            media_subdir = "video_hd" if task.stage == "final" else "video_preview"
+            media_subdir = "video_hd" if task_stage == "final" else "video_preview"
             media_key = gateway.download_to_storage(
                 video_url,
                 media_subdir,
@@ -404,10 +588,15 @@ def finalize_video_success(db, task: GenTask, model, result: dict) -> None:
         if video_frames.FFPROBE and not media_meta.get("width"):
             unlink_keys(written_keys)
             raise VideoResultValidationError("视频网关返回的不是有效视频(无视频流)")
-        if task.stage == "final":
+        if task_stage == "final":
             # gate full video behind unlock; poster = the source first frame
             hd_url = local
-            preview_url = localize_video_poster(db, task, video_poster_url(task, params), written_keys)
+            preview_url = localize_video_poster(
+                db,
+                poster_owner,
+                poster_url,
+                written_keys,
+            )
             if not preview_url:
                 # pure text-to-video has no reference poster -> grab the rendered
                 # clip's first frame so the locked asset isn't blank in the UI.
@@ -430,8 +619,8 @@ def finalize_video_success(db, task: GenTask, model, result: dict) -> None:
 
     db.add(
         GenAsset(
-            task_id=task.id,
-            user_id=task.user_id,
+            task_id=task_id,
+            user_id=task_user_id,
             type="video",
             preview_url=preview_url,
             hd_url=hd_url,
@@ -442,35 +631,70 @@ def finalize_video_success(db, task: GenTask, model, result: dict) -> None:
             duration=media_meta.get("duration"),
         )
     )
-    real_cost = settlement_cost(task, model)
-    real_cost = max(0, min(int(real_cost or 0), int(task.cost_frozen or 0)))
-    if not claim_terminal(db, task.id, "succeeded", cost_settled=real_cost):
-        db.rollback()  # another runner finalized first -> discard our row + files
-        unlink_keys(written_keys)
-        return
+    claimed_terminal = False
     try:
+        claimed_terminal = claim_terminal(
+            db,
+            task_id,
+            "succeeded",
+            cost_settled=real_cost,
+            expected_status=observed_status,
+            expected_phase=observed_phase,
+            expected_external_task_id=observed_external_task_id,
+        )
+        if not claimed_terminal:
+            db.rollback()
+            unlink_keys(written_keys)
+            return False
         credits.settle(
             db,
-            task.user_id,
-            reserved=task.cost_frozen,
+            task_user_id,
+            reserved=task_cost_frozen,
             real_cost=real_cost,
-            biz_ref=task.id,
+            biz_ref=task_id,
             commit=False,
         )
         db.commit()
     except Exception as e:
         db.rollback()
-        params = dict(task.params or {})
-        params["_video_result_keys"] = list(written_keys)
-        task = db.get(GenTask, task.id)
-        if task:
-            task.params = {**(task.params or {}), **params}
+        if not claimed_terminal:
+            unlink_keys(written_keys)
+            raise
+        fallback_params = {**params, "_video_result_keys": list(written_keys)}
+        fallback_conditions = [
+            GenTask.id == task_id,
+            GenTask.status == observed_status,
+            GenTask.params == params,
+        ]
+        if observed_phase is None:
+            fallback_conditions.append(GenTask.phase.is_(None))
+        else:
+            fallback_conditions.append(GenTask.phase == observed_phase)
+        if observed_external_task_id is None:
+            fallback_conditions.append(GenTask.external_task_id.is_(None))
+        else:
+            fallback_conditions.append(
+                GenTask.external_task_id == observed_external_task_id
+            )
+        restored = db.execute(
+            update(GenTask)
+            .where(*fallback_conditions)
+            .values(params=fallback_params)
+            .execution_options(synchronize_session=False)
+        ).rowcount
+        if (restored or 0) == 1:
             db.commit()
+        else:
+            db.rollback()
+            unlink_keys(written_keys)
         raise LocalVideoSettlementError(f"视频已落盘但本地结算失败:{e}") from e
-    set_progress(task.id, 100, "succeeded")
-    clear_poll_alive(task.id)
-    clear_video_download_alive(task.id)
-    publish_task_update(task, "succeeded")
+    set_progress(task_id, 100, "succeeded")
+    clear_poll_alive(task_id, observed_external_task_id)
+    clear_video_download_alive(task_id, observed_external_task_id)
+    completed_task = db.get(GenTask, task_id, populate_existing=True)
+    if completed_task is not None:
+        publish_task_update(completed_task, "succeeded")
+    return True
 
 
 def admin_settle_needs_review_video(

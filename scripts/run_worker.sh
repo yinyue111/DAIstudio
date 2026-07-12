@@ -14,7 +14,7 @@ case "$ROLE" in
   critical)
     DEFAULT_QUEUES="default,payment,video_poll,cleanup"
     DEFAULT_CONCURRENCY=2
-    DEFAULT_POOL="solo"
+    DEFAULT_POOL="threads"
     ;;
   image)
     DEFAULT_QUEUES="image"

@@ -13,6 +13,7 @@ from .config import settings
 
 request_id_ctx: ContextVar[str] = ContextVar("request_id", default="-")
 log = logging.getLogger("access")
+_REQUEST_ID = re.compile(r"[A-Za-z0-9._:-]{1,128}\Z")
 
 # --- Prometheus metrics (optional; only if prometheus_client is installed) ---
 try:
@@ -53,8 +54,15 @@ def current_request_id() -> str:
     return request_id_ctx.get()
 
 
+def normalize_request_id(value: str | None) -> str | None:
+    """Return a bounded, header-safe request id or reject the supplied value."""
+    if not value or not _REQUEST_ID.fullmatch(value):
+        return None
+    return value
+
+
 def set_request_id(value: str | None):
-    return request_id_ctx.set((value or "-").strip() or "-")
+    return request_id_ctx.set(normalize_request_id(value) or "-")
 
 
 def reset_request_id(token) -> None:
@@ -76,7 +84,7 @@ def setup_logging() -> None:
 
 class RequestContextMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request, call_next):
-        rid = request.headers.get("x-request-id") or uuid.uuid4().hex[:12]
+        rid = normalize_request_id(request.headers.get("x-request-id")) or uuid.uuid4().hex[:12]
         token = request_id_ctx.set(rid)
         t0 = time.time()
         try:

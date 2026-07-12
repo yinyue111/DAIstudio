@@ -29,6 +29,9 @@ path.write_text(text)
 PY
   echo "   created backend/.env for local development (DEPLOY_ENV=local, DEBUG=true, MOCK_MODE=true)"
 fi
+if [ -f .env ]; then
+  chmod 600 .env
+fi
 
 echo "==> (optional) Playwright chromium for dynamic-page scraping"
 python -m playwright install chromium || echo "   skipped (fetcher falls back to httpx+bs4)"
@@ -44,6 +47,9 @@ echo "==> frontend: npm ci"
 cd "$ROOT/frontend"
 npm ci
 [ -f .env.local ] || cp .env.local.example .env.local
+if [ -f .env.local ]; then
+  chmod 600 .env.local
+fi
 
 echo ""
 echo "Setup complete. Start the three processes in separate terminals:"

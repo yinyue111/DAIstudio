@@ -1,8 +1,10 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { api, downloadBlob } from "../../../lib/api";
+import { formatLocalDateTime } from "../../../lib/datetime";
 import { Card, Th } from "./admin-ui";
+import { createLatestRequestGate } from "./latest-request";
 
 export function Dashboard() {
   const [summary, setSummary] = useState(null);
@@ -10,6 +12,8 @@ export function Dashboard() {
   const [start, setStart] = useState("");
   const [end, setEnd] = useState("");
   const [msg, setMsg] = useState("");
+  const requestGateRef = useRef(null);
+  if (!requestGateRef.current) requestGateRef.current = createLatestRequestGate();
 
   function qs() {
     const p = [];
@@ -19,17 +23,24 @@ export function Dashboard() {
   }
 
   function load() {
+    const requestGeneration = requestGateRef.current.begin();
     setMsg("");
     const suffix = qs();
     Promise.all([api.adminUsageDashboard(suffix), api.adminModelCosts(suffix)])
       .then(([dashboard, modelCosts]) => {
+        if (!requestGateRef.current.isCurrent(requestGeneration)) return;
         setSummary(dashboard);
         setCosts(modelCosts);
       })
-      .catch((e) => setMsg(e.message));
+      .catch((e) => {
+        if (requestGateRef.current.isCurrent(requestGeneration)) setMsg(e.message);
+      });
   }
 
-  useEffect(() => { load(); }, []);
+  useEffect(() => {
+    load();
+    return () => requestGateRef.current.invalidate();
+  }, []);
 
   const s = summary?.summary || {};
   const modelRows = costs?.models || [];
@@ -82,6 +93,8 @@ export function Report() {
   const [start, setStart] = useState("");
   const [end, setEnd] = useState("");
   const [msg, setMsg] = useState("");
+  const requestGateRef = useRef(null);
+  if (!requestGateRef.current) requestGateRef.current = createLatestRequestGate();
 
   function qs() {
     const p = [];
@@ -90,10 +103,21 @@ export function Report() {
     return p.length ? `?${p.join("&")}` : "";
   }
   const load = () => {
+    const requestGeneration = requestGateRef.current.begin();
+    const suffix = qs();
     setMsg("");
-    api.adminReport(qs()).then(setData).catch((e) => setMsg(e.message));
+    api.adminReport(suffix)
+      .then((nextData) => {
+        if (requestGateRef.current.isCurrent(requestGeneration)) setData(nextData);
+      })
+      .catch((e) => {
+        if (requestGateRef.current.isCurrent(requestGeneration)) setMsg(e.message);
+      });
   };
-  useEffect(() => { load(); }, []);
+  useEffect(() => {
+    load();
+    return () => requestGateRef.current.invalidate();
+  }, []);
 
   async function downloadCsv() {
     const suffix = qs() ? qs() + "&format=csv" : "?format=csv";
@@ -214,16 +238,28 @@ export function Audit() {
   const [action, setAction] = useState("");
   const [userId, setUserId] = useState("");
   const [msg, setMsg] = useState("");
+  const requestGateRef = useRef(null);
+  if (!requestGateRef.current) requestGateRef.current = createLatestRequestGate();
 
   function load() {
+    const requestGeneration = requestGateRef.current.begin();
     const p = [];
     if (action) p.push(`action=${encodeURIComponent(action)}`);
     if (userId) p.push(`user_id=${encodeURIComponent(userId)}`);
     const qs = p.length ? `?${p.join("&")}` : "";
     setMsg("");
-    api.adminAudit(qs).then(setRows).catch((e) => setMsg(e.message));
+    api.adminAudit(qs)
+      .then((nextRows) => {
+        if (requestGateRef.current.isCurrent(requestGeneration)) setRows(nextRows);
+      })
+      .catch((e) => {
+        if (requestGateRef.current.isCurrent(requestGeneration)) setMsg(e.message);
+      });
   }
-  useEffect(() => { load(); }, []);
+  useEffect(() => {
+    load();
+    return () => requestGateRef.current.invalidate();
+  }, []);
 
   return (
     <Card>
@@ -242,7 +278,9 @@ export function Audit() {
           <tbody>
             {rows.map((r) => (
               <tr key={r.id} className="border-b border-line/60 align-top text-mist transition-colors hover:bg-white/5">
-                <td className="whitespace-nowrap py-2 pr-3 text-xs">{(r.created_at || "").replace("T", " ").slice(0, 19)}</td>
+                <td className="whitespace-nowrap py-2 pr-3 text-xs">
+                  {formatLocalDateTime(r.created_at, { includeSeconds: true })}
+                </td>
                 <td className="pr-3 text-snow">{r.user_id ?? "-"}</td>
                 <td className="pr-3 font-display text-snow">{r.action}</td>
                 <td className="pr-3 text-xs">{r.biz_type ? `${r.biz_type}#${r.biz_id ?? ""}` : "-"}</td>

@@ -17,7 +17,9 @@ from ..schemas import (
 )
 from ..services import audit, credits, locks
 from .admin_helpers import assert_quota_grant_limits as _assert_quota_grant_limits
+from .admin_helpers import lock_admin_quota_serialization as _lock_admin_quota_serialization
 from .admin_helpers import quota_bulk_grant_item_key as _quota_bulk_grant_item_key
+from .admin_helpers import refresh_quota_fingerprint_expiry as _refresh_quota_fingerprint_expiry
 from .admin_helpers import remember_quota_grant_fingerprint as _remember_quota_grant_fingerprint
 from .admin_helpers import replay_quota_grant as _replay_quota_grant
 from .admin_helpers import (
@@ -26,6 +28,24 @@ from .admin_helpers import (
 from .admin_helpers import reserve_quota_grant_idempotency as _reserve_quota_grant_idempotency
 
 router = APIRouter()
+
+
+def _acquire_quota_advisory_lock(key: str) -> str | None:
+    try:
+        return locks.acquire(key, ttl=30)
+    except Exception:  # noqa: BLE001
+        # Redis is only a fast contention signal. The database lock below is
+        # the correctness boundary for replay and daily-limit serialization.
+        return ""
+
+
+def _release_quota_advisory_lock(key: str, token: str | None) -> None:
+    if not token:
+        return
+    try:
+        locks.release(key, token)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 @router.post("/quota/grant", response_model=UserOut)
@@ -38,16 +58,12 @@ def grant_quota(
     note = (body.note or "").strip()
     if not note:
         raise HTTPException(400, "请填写额度发放原因")
-    replay = _replay_quota_grant(db, admin_id=admin.id, body=body, note=note)
-    if replay is not None:
-        return replay
-    if not db.get(User, body.user_id):
-        raise HTTPException(404, "用户不存在")
     lock_key = f"admin:quota:grant:{admin.id}"
-    lock_token = locks.acquire(lock_key, ttl=30)
-    if not lock_token:
+    lock_token = _acquire_quota_advisory_lock(lock_key)
+    if lock_token is None:
         raise HTTPException(409, "额度发放正在处理中,请稍后重试")
     try:
+        _lock_admin_quota_serialization(db, admin.id)
         replay = _replay_quota_grant(db, admin_id=admin.id, body=body, note=note)
         if replay is not None:
             return replay
@@ -65,13 +81,22 @@ def grant_quota(
             return user
         try:
             user = credits.grant(db, body.user_id, body.amount, note=note, commit=False)
+            _refresh_quota_fingerprint_expiry(
+                db.execute(
+                    select(AdminIdempotencyKey).where(
+                        AdminIdempotencyKey.admin_id == admin.id,
+                        AdminIdempotencyKey.scope == "quota_grant",
+                        AdminIdempotencyKey.key == idem_key,
+                    )
+                ).scalar_one()
+            )
             db.commit()
             db.refresh(user)
         except ValueError as e:
             db.rollback()
             raise HTTPException(400, str(e)) from e
     finally:
-        locks.release(lock_key, lock_token)
+        _release_quota_advisory_lock(lock_key, lock_token)
     _remember_quota_grant_fingerprint(admin.id, body, note, idem_key)
     audit.log(
         db,
@@ -95,10 +120,11 @@ def bulk_grant_quota(
     granted: list[QuotaBulkGrantItemOut] = []
     failed: list[QuotaBulkGrantItemOut] = []
     lock_key = f"admin:quota:grant:{admin.id}"
-    lock_token = locks.acquire(lock_key, ttl=30)
-    if not lock_token:
+    lock_token = _acquire_quota_advisory_lock(lock_key)
+    if lock_token is None:
         raise HTTPException(409, "额度发放正在处理中,请稍后重试")
     try:
+        _lock_admin_quota_serialization(db, admin.id)
         idem_key, created_request = _reserve_quota_bulk_grant_idempotency(
             db,
             admin_id=admin.id,
@@ -165,9 +191,18 @@ def bulk_grant_quota(
             except (ValueError, credits.InsufficientCredits, HTTPException) as e:
                 message = str(getattr(e, "detail", None) or e)
                 failed.append(QuotaBulkGrantItemOut(user_id=item.user_id, ok=False, error=message[:160]))
+        marker = db.execute(
+            select(AdminIdempotencyKey).where(
+                AdminIdempotencyKey.admin_id == admin.id,
+                AdminIdempotencyKey.scope == "quota_grant",
+                AdminIdempotencyKey.key == f"bulk:{idem_key}",
+            )
+        ).scalar_one_or_none()
+        if created_request and marker is not None:
+            _refresh_quota_fingerprint_expiry(marker)
         db.commit()
     finally:
-        locks.release(lock_key, lock_token)
+        _release_quota_advisory_lock(lock_key, lock_token)
     audit.log(
         db,
         user_id=admin.id,

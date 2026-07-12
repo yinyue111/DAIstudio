@@ -5,6 +5,11 @@ import { fileURLToPath } from "node:url";
 
 const storage = new Map();
 global.window = {
+  location: {
+    origin: "http://localhost:3000",
+    hostname: "localhost",
+    href: "http://localhost:3000/",
+  },
   localStorage: {
     getItem: (key) => storage.get(key) ?? null,
     setItem: (key, value) => storage.set(key, String(value)),
@@ -16,15 +21,18 @@ const apiSource = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "..
 const loginSource = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "../app/login/page.jsx"), "utf8");
 const navigationSource = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "../lib/navigation.js"), "utf8");
 
-function legacyTokenClearingFunction(name) {
-  const match = apiSource.match(new RegExp(`export function ${name}\\([^)]*\\) \\{([\\s\\S]*?)\\n\\}`));
-  assert.ok(match, `expected ${name} export in frontend/lib/api.js`);
-  return new Function(match[1]);
+function loadApiModule() {
+  const executableSource = apiSource
+    .replace(/^import .*;\n?/gm, "")
+    .replace(/^export \{.*;\n?/gm, "")
+    .replace(/^export /gm, "");
+  return new Function(
+    "loginPath",
+    `${executableSource}\nreturn { getToken, setToken, clearToken, api };`,
+  )(() => "/login");
 }
 
-const getToken = legacyTokenClearingFunction("getToken");
-const setToken = legacyTokenClearingFunction("setToken");
-const clearToken = legacyTokenClearingFunction("clearToken");
+const { getToken, setToken, clearToken, api } = loadApiModule();
 
 window.localStorage.setItem("token", "legacy-token");
 assert.equal(getToken(), null);
@@ -36,6 +44,78 @@ assert.equal(window.localStorage.getItem("token"), null);
 window.localStorage.setItem("token", "another-legacy-token");
 clearToken();
 assert.equal(window.localStorage.getItem("token"), null);
+
+const workingLocalStorage = window.localStorage;
+const storageFailures = [
+  {
+    name: "localStorage access",
+    install() {
+      Object.defineProperty(window, "localStorage", {
+        configurable: true,
+        get() {
+          const error = new Error("Access to storage is disabled");
+          error.name = "SecurityError";
+          throw error;
+        },
+      });
+    },
+  },
+  {
+    name: "localStorage.removeItem",
+    install() {
+      Object.defineProperty(window, "localStorage", {
+        configurable: true,
+        value: {
+          removeItem() {
+            const error = new Error("Storage mutation is disabled");
+            error.name = "SecurityError";
+            throw error;
+          },
+        },
+      });
+    },
+  },
+];
+
+let cookieRequest;
+global.fetch = async (url, options) => {
+  cookieRequest = { url, options };
+  return {
+    ok: true,
+    status: 200,
+    text: async () => JSON.stringify({ id: 1 }),
+  };
+};
+
+for (const failure of storageFailures) {
+  failure.install();
+  assert.doesNotThrow(() => {
+    assert.equal(getToken(), null);
+    setToken("ignored-cookie-token");
+    clearToken();
+  }, `${failure.name} failure must not block HttpOnly cookie auth`);
+  cookieRequest = null;
+  assert.deepEqual(await api.me(), { id: 1 });
+  assert.ok(cookieRequest, `${failure.name} failure must not prevent the cookie request`);
+  assert.equal(cookieRequest.options.credentials, "include");
+}
+
+Object.defineProperty(window, "localStorage", {
+  configurable: true,
+  value: workingLocalStorage,
+});
+
+const browserWindow = global.window;
+delete global.window;
+try {
+  assert.doesNotThrow(() => {
+    assert.equal(getToken(), null);
+    setToken("ignored-server-token");
+    clearToken();
+  }, "token helpers must be safe when window is unavailable during SSR");
+} finally {
+  global.window = browserWindow;
+}
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const appDir = join(root, "app");

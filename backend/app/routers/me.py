@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import math
 import re
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
+from sqlalchemy import update
 from sqlalchemy.orm import Session
 
 from ..config import settings
@@ -21,6 +23,8 @@ router = APIRouter(prefix="/api", tags=["me"])
 
 PASSWORD_FAIL_LIMIT = 8
 PASSWORD_FAIL_WINDOW = 15 * 60
+STUDIO_DRAFT_MAX_FUTURE_SKEW_MS = 24 * 60 * 60 * 1000
+MAX_SAFE_INTEGER = 9_007_199_254_740_991
 _DRAFT_KEY_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 
 
@@ -42,6 +46,37 @@ def _draft_out(key: str, row: UserDraft | None) -> UserDraftOut:
     return UserDraftOut(key=row.key, payload=row.payload or {}, updated_at=row.updated_at)
 
 
+def _numeric_saved_at(payload: dict, now_ms: int) -> int | None:
+    value = payload.get("savedAt")
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, float):
+        if not math.isfinite(value) or not value.is_integer():
+            return None
+        value = int(value)
+    if not isinstance(value, int):
+        return None
+    if (
+        value <= 0
+        or value > MAX_SAFE_INTEGER
+        or value > now_ms + STUDIO_DRAFT_MAX_FUTURE_SKEW_MS
+    ):
+        return None
+    return value
+
+
+def _normalized_studio_payload(payload: dict, now_ms: int) -> tuple[dict, int | None]:
+    saved_at = _numeric_saved_at(payload, now_ms)
+    if "savedAt" not in payload:
+        return payload, None
+    normalized = dict(payload)
+    if saved_at is None:
+        normalized.pop("savedAt", None)
+    else:
+        normalized["savedAt"] = saved_at
+    return normalized, saved_at
+
+
 @router.get("/me/drafts/{key}", response_model=UserDraftOut)
 def get_draft(
     key: str,
@@ -61,13 +96,43 @@ def save_draft(
     user: User = Depends(get_current_user),
 ):
     key = _validate_draft_key(key)
-    row = db.query(UserDraft).filter(UserDraft.user_id == user.id, UserDraft.key == key).first()
+    if key == "studio":
+        if db.get_bind().dialect.name == "sqlite":
+            # SQLite ignores SELECT FOR UPDATE. A no-value-change write starts
+            # a real write transaction so concurrent sessions serialize here.
+            db.execute(update(User).where(User.id == user.id).values(id=User.id))
+        else:
+            # The user row always exists and serializes both first insert and
+            # later updates for this user's singleton Studio draft.
+            db.query(User.id).filter(User.id == user.id).with_for_update().one()
     now = datetime.now(timezone.utc)
+    now_ms = int(now.timestamp() * 1000)
+    incoming_payload = body.payload
+    incoming_saved_at = None
+    if key == "studio":
+        incoming_payload, incoming_saved_at = _normalized_studio_payload(body.payload, now_ms)
+    row = db.query(UserDraft).filter(UserDraft.user_id == user.id, UserDraft.key == key).first()
     if row is None:
-        row = UserDraft(user_id=user.id, key=key, payload=body.payload, updated_at=now)
+        row = UserDraft(user_id=user.id, key=key, payload=incoming_payload, updated_at=now)
         db.add(row)
     else:
-        row.payload = body.payload
+        stored_saved_at = (
+            _numeric_saved_at(row.payload or {}, now_ms) if key == "studio" else None
+        )
+        if (
+            stored_saved_at is not None
+            and (
+                incoming_saved_at is None
+                or (
+                    stored_saved_at <= now_ms
+                    and incoming_saved_at <= stored_saved_at
+                )
+            )
+        ):
+            db.commit()
+            db.refresh(row)
+            return _draft_out(key, row)
+        row.payload = incoming_payload
         row.updated_at = now
     db.commit()
     db.refresh(row)

@@ -122,7 +122,9 @@ jobs:
       - name: Validate compose config
         run: docker compose config --quiet
         env:
+          BACKEND_ENV_FILE: ./backend/.env.example
           POSTGRES_PASSWORD: ci-postgres-password
+          REDIS_PASSWORD: ci-redis-password
           METRICS_TOKEN: ci-metrics-token
           PAYMENT_CONFIG_SECRET: ci-payment-config-secret-32-bytes-long
           SMS_PROVIDER: http
@@ -130,7 +132,9 @@ jobs:
       - name: Build production images
         run: docker compose build api frontend
         env:
+          BACKEND_ENV_FILE: ./backend/.env.example
           POSTGRES_PASSWORD: ci-postgres-password
+          REDIS_PASSWORD: ci-redis-password
           NEXT_TELEMETRY_DISABLED: "1"
 
   release-artifact:

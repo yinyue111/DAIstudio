@@ -298,8 +298,22 @@ def cancel_task(
         if params.get("_cancel_requested"):
             return build_task_out(db, task)
         params["_cancel_requested"] = True
-        task.params = params
-        task.error = "取消请求已提交，系统将在安全阶段停止任务"
+        claimed = db.execute(
+            update(GenTask)
+            .where(
+                GenTask.id == task_id,
+                GenTask.user_id == user.id,
+                GenTask.status == "running",
+            )
+            .values(
+                params=params,
+                error="取消请求已提交，系统将在安全阶段停止任务",
+            )
+        ).rowcount
+        if (claimed or 0) != 1:
+            db.rollback()
+            db.refresh(task)
+            raise HTTPException(409, "任务状态已变化,请刷新后重试")
         db.commit()
         db.refresh(task)
         publish_user_event(user.id, "task_updated", {"task_id": task.id, "status": task.status, "cancel_requested": True})

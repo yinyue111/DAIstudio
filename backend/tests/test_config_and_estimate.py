@@ -1,19 +1,25 @@
 """Platform settings round-trip + video cost-estimate logic."""
+import os
+import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
+import pytest
+import yaml
 from fastapi import HTTPException
+from pydantic import ValidationError
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 import app.celery_app as celery_module
 import app.models  # noqa: F401  (register tables)
 from app.celery_app import celery_app
-from app.config import settings
+from app.config import Settings, settings
 from app.db import Base, SessionLocal
-from app.redis_client import redis_connection_kwargs
+from app.redis_client import celery_redis_url, redis_connection_kwargs
 from app.runtime_config import validate_model_gateway_rows, validate_runtime_config
-from app.services import config_store
+from app.services import config_store, locks
 from app.services.generation_model_runtime import model_snapshot
 from app.services.generation_pricing import generation_cost_from_snapshot
 from app.services.generation_prompts import (
@@ -37,6 +43,39 @@ def test_setup_script_creates_local_env_not_production_debug():
 
     assert '"DEPLOY_ENV=production": "DEPLOY_ENV=local"' in setup
     assert "DEPLOY_ENV=local, DEBUG=true, MOCK_MODE=true" in setup
+    assert "chmod 600 .env" in setup
+
+
+def test_compose_isolates_and_authenticates_redis_and_uses_readiness_probe():
+    root = Path(__file__).resolve().parents[2]
+    compose = yaml.safe_load((root / "docker-compose.yml").read_text(encoding="utf-8"))
+    services = compose["services"]
+
+    assert "/api/ready" in " ".join(services["api"]["healthcheck"]["test"])
+    assert "--requirepass" in services["redis"]["command"]
+    assert "REDISCLI_AUTH" in " ".join(services["redis"]["healthcheck"]["test"])
+    assert services["redis"]["networks"] == ["backend_internal"]
+    assert services["frontend"]["networks"] == ["frontend_edge"]
+    assert set(services["api"]["networks"]) == {"backend_internal", "frontend_edge"}
+    for name in ("worker", "worker_image", "worker_video", "worker_video_download", "worker_parse", "beat"):
+        assert services[name]["depends_on"]["redis"]["condition"] == "service_healthy"
+        assert set(services[name]["networks"]) == {"backend_internal", "external_access"}
+        assert "${POSTGRES_PASSWORD" not in services[name]["environment"]["DATABASE_URL"]
+        assert "${REDIS_PASSWORD" not in services[name]["environment"]["REDIS_URL"]
+    assert compose["networks"]["backend_internal"]["internal"] is True
+    assert compose["networks"]["external_access"] is None
+    beat_health = " ".join(services["beat"]["healthcheck"]["test"])
+    assert "/proc/1/cmdline" in beat_health
+    assert "celery" in beat_health and "beat" in beat_health
+    assert "pgrep" not in beat_health
+
+
+def test_beat_runtime_requires_distributed_lease(monkeypatch):
+    monkeypatch.setattr(celery_module, "_validate_worker_runtime_config", lambda: None)
+    monkeypatch.setattr(locks, "acquire", lambda *_args, **_kwargs: None)
+
+    with pytest.raises(RuntimeError, match="scheduler.*active"):
+        celery_module._validate_beat_runtime_config()
 
 
 def test_settings_roundtrip():
@@ -50,6 +89,28 @@ def test_settings_roundtrip():
     assert config_store.get_setting(db, "reverse_prompt_enabled") is False
 
     assert config_store.get_setting(db, "unknown_key", "fallback") == "fallback"
+
+
+@pytest.mark.parametrize("value", [0, -1])
+def test_upload_processing_parallelism_rejects_values_below_one(value):
+    with pytest.raises(ValidationError, match="upload_processing_parallelism"):
+        Settings(_env_file=None, upload_processing_parallelism=value)
+
+
+@pytest.mark.parametrize("value", [0, -0.1, float("nan"), float("inf"), float("-inf")])
+def test_upload_processing_acquire_timeout_requires_positive_finite_value(value):
+    with pytest.raises(ValidationError, match="upload_processing_acquire_timeout_seconds"):
+        Settings(_env_file=None, upload_processing_acquire_timeout_seconds=value)
+
+
+def test_upload_processing_limits_accept_minimum_valid_values():
+    configured = Settings(
+        _env_file=None,
+        upload_processing_parallelism=1,
+        upload_processing_acquire_timeout_seconds=0.001,
+    )
+    assert configured.upload_processing_parallelism == 1
+    assert configured.upload_processing_acquire_timeout_seconds == 0.001
 
 
 def test_public_config_exposes_video_reverse_presets(client, make_user, auth):
@@ -73,6 +134,237 @@ def test_redis_blocking_client_uses_bounded_pool_settings():
     assert kwargs["max_connections"] >= 1
     assert kwargs["socket_connect_timeout"] > 0
     assert kwargs["socket_timeout"] > 0
+
+
+def test_redis_password_is_structured_for_client_and_encoded_for_celery(monkeypatch):
+    monkeypatch.setattr(settings, "redis_url", "redis://cache:6379/2")
+    monkeypatch.setattr(settings, "redis_password", "p@ss:/?#[] word")
+
+    assert redis_connection_kwargs()["password"] == "p@ss:/?#[] word"
+    assert celery_redis_url() == "redis://:p%40ss%3A%2F%3F%23%5B%5D%20word@cache:6379/2"
+
+
+def test_redis_acl_username_is_canonicalized_once_for_celery(monkeypatch):
+    monkeypatch.setattr(settings, "redis_url", "redis://service%40worker@cache:6379/2")
+    monkeypatch.setattr(settings, "redis_password", "secret")
+
+    assert redis_connection_kwargs()["password"] == "secret"
+    assert celery_redis_url() == "redis://service%40worker:secret@cache:6379/2"
+
+
+def test_redis_password_rejects_ambiguous_dual_sources():
+    with pytest.raises(ValidationError, match="not both"):
+        Settings(
+            _env_file=None,
+            redis_url="redis://:url-secret@localhost:6379/0",
+            redis_password="separate-secret",
+        )
+
+
+@pytest.mark.parametrize(
+    ("ttl", "refresh"),
+    [(0, 1), (3, 0), (-1, 1), (2, 1), (5, 2)],
+)
+def test_beat_lease_settings_reject_invalid_durations(ttl, refresh):
+    with pytest.raises(ValidationError, match="celery beat lease"):
+        Settings(
+            _env_file=None,
+            celery_beat_lease_ttl_seconds=ttl,
+            celery_beat_lease_refresh_seconds=refresh,
+        )
+
+
+def test_beat_lease_refreshes_and_releases_owner_token(monkeypatch):
+    stop = celery_module.threading.Event()
+    refreshed = celery_module.threading.Event()
+    calls = []
+    monkeypatch.setattr(settings, "celery_beat_lease_refresh_seconds", 1)
+    monkeypatch.setattr(settings, "celery_beat_lease_ttl_seconds", 3)
+
+    def refresh(key, token, ttl):
+        calls.append((key, token, ttl))
+        refreshed.set()
+        return True
+
+    monkeypatch.setattr(locks, "refresh", refresh)
+    thread = celery_module.threading.Thread(
+        target=celery_module._beat_lease_loop,
+        kwargs={"stop_event": stop, "token": "owner", "exit_process": lambda _code: None},
+    )
+    thread.start()
+    assert refreshed.wait(timeout=2)
+    stop.set()
+    thread.join(timeout=2)
+    assert calls == [(settings.celery_beat_lease_key, "owner", 3)]
+
+
+def test_beat_lease_loss_fails_closed(monkeypatch):
+    exited = celery_module.threading.Event()
+    monkeypatch.setattr(settings, "celery_beat_lease_refresh_seconds", 1)
+    monkeypatch.setattr(settings, "celery_beat_lease_ttl_seconds", 3)
+    monkeypatch.setattr(locks, "refresh", lambda *_args, **_kwargs: False)
+    celery_module._beat_lease_loop(
+        stop_event=_ImmediateWaitEvent(),
+        token="lost-owner",
+        exit_process=lambda code: exited.set() if code == 1 else None,
+    )
+    assert exited.is_set()
+
+
+def test_beat_lease_refresh_exception_fails_closed(monkeypatch):
+    exited = celery_module.threading.Event()
+    monkeypatch.setattr(settings, "celery_beat_lease_refresh_seconds", 1)
+    monkeypatch.setattr(settings, "celery_beat_lease_ttl_seconds", 3)
+    monkeypatch.setattr(
+        locks,
+        "refresh",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(ConnectionError("redis unavailable")),
+    )
+
+    celery_module._beat_lease_loop(
+        stop_event=_ImmediateWaitEvent(),
+        token="lost-owner",
+        exit_process=lambda code: exited.set() if code == 1 else None,
+    )
+
+    assert exited.is_set()
+
+
+def test_beat_lease_loss_exits_real_child_process_with_code_one():
+    backend = Path(__file__).resolve().parents[1]
+    env = {**os.environ, "PYTHONPATH": str(backend)}
+    code = """
+import os
+import sys
+try:
+    import app.celery_app as module
+    module.locks.refresh = lambda *_args, **_kwargs: False
+    class Immediate:
+        def wait(self, _timeout): return False
+        def is_set(self): return False
+    print('READY', flush=True)
+    module._beat_lease_loop(stop_event=Immediate(), token='lost')
+except BaseException:
+    os._exit(97)
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=backend,
+        env=env,
+        check=False,
+        timeout=10,
+        capture_output=True,
+        text=True,
+    )
+    assert completed.stdout.strip() == "READY"
+    assert completed.returncode == 1
+    assert "Traceback" not in completed.stderr
+
+
+def test_beat_lease_stop_wins_race_after_refresh_returns(monkeypatch):
+    stop = celery_module.threading.Event()
+    refresh_started = celery_module.threading.Event()
+    allow_refresh_return = celery_module.threading.Event()
+    exited = []
+
+    def refresh(*_args, **_kwargs):
+        refresh_started.set()
+        assert allow_refresh_return.wait(timeout=2)
+        return False
+
+    monkeypatch.setattr(settings, "celery_beat_lease_refresh_seconds", 1)
+    monkeypatch.setattr(settings, "celery_beat_lease_ttl_seconds", 3)
+    monkeypatch.setattr(locks, "refresh", refresh)
+    thread = celery_module.threading.Thread(
+        target=celery_module._beat_lease_loop,
+        kwargs={"stop_event": stop, "token": "owner", "exit_process": exited.append},
+    )
+    thread.start()
+    assert refresh_started.wait(timeout=2)
+    stop.set()
+    allow_refresh_return.set()
+    thread.join(timeout=2)
+    assert not thread.is_alive()
+    assert exited == []
+
+
+class _ImmediateWaitEvent:
+    def wait(self, _timeout):
+        return False
+
+    def is_set(self):
+        return False
+
+
+def test_beat_lease_start_is_idempotent_and_cleanup_is_token_scoped(monkeypatch):
+    celery_module._beat_lease_token = None
+    celery_module._beat_lease_thread = None
+    acquired = []
+    released = []
+    monkeypatch.setattr(locks, "acquire", lambda key, ttl: acquired.append((key, ttl)) or "owner-token")
+    monkeypatch.setattr(locks, "release", lambda key, token: released.append((key, token)))
+    monkeypatch.setattr(celery_module.threading.Thread, "start", lambda _self: None)
+
+    try:
+        assert celery_module._start_beat_lease() == "owner-token"
+        assert celery_module._start_beat_lease() == "owner-token"
+        assert len(acquired) == 1
+    finally:
+        celery_module._stop_beat_lease()
+    assert released == [(settings.celery_beat_lease_key, "owner-token")]
+
+
+def test_beat_lease_thread_start_failure_releases_owner_token(monkeypatch):
+    celery_module._beat_lease_token = None
+    celery_module._beat_lease_thread = None
+    released = []
+    monkeypatch.setattr(locks, "acquire", lambda *_args, **_kwargs: "owner-token")
+    monkeypatch.setattr(locks, "release", lambda key, token: released.append((key, token)))
+    monkeypatch.setattr(
+        celery_module.threading.Thread,
+        "start",
+        lambda _self: (_ for _ in ()).throw(RuntimeError("thread unavailable")),
+    )
+
+    with pytest.raises(RuntimeError, match="thread unavailable"):
+        celery_module._start_beat_lease()
+    assert celery_module._beat_lease_token is None
+    assert released == [(settings.celery_beat_lease_key, "owner-token")]
+
+
+def test_beat_cleanup_does_not_release_while_renew_thread_is_still_running(monkeypatch):
+    refresh_started = celery_module.threading.Event()
+    allow_refresh_return = celery_module.threading.Event()
+    released = []
+
+    def refresh(*_args, **_kwargs):
+        refresh_started.set()
+        assert allow_refresh_return.wait(timeout=3)
+        return True
+
+    monkeypatch.setattr(settings, "celery_beat_lease_refresh_seconds", 1)
+    monkeypatch.setattr(settings, "celery_beat_lease_ttl_seconds", 1)
+    monkeypatch.setattr(locks, "refresh", refresh)
+    monkeypatch.setattr(locks, "release", lambda key, token: released.append((key, token)))
+    celery_module._beat_lease_stop.clear()
+    thread = celery_module.threading.Thread(
+        target=celery_module._beat_lease_loop,
+        kwargs={
+            "stop_event": celery_module._beat_lease_stop,
+            "token": "owner-token",
+            "exit_process": lambda _code: None,
+        },
+    )
+    celery_module._beat_lease_token = "owner-token"
+    celery_module._beat_lease_thread = thread
+    thread.start()
+    assert refresh_started.wait(timeout=2)
+
+    celery_module._stop_beat_lease()
+    assert thread.is_alive()
+    assert released == []
+    allow_refresh_return.set()
+    thread.join(timeout=2)
 
 
 def test_nested_settings_accessors_preserve_flat_env_fields(monkeypatch):
@@ -476,6 +768,30 @@ def test_product_video_locked_prompt_rewrites_orbit_and_keeps_product_in_frame()
     assert "背景水花或光影点缀且不遮挡包装" in out
 
 
+def test_video_generation_params_accept_product_video_template():
+    params = validate_generation_params(
+        "video",
+        {
+            "duration": 5,
+            "resolution": "1080p",
+            "ratio": "9:16",
+            "subject_mode": "product",
+            "product_lock_mode": "locked",
+            "product_video_template": "soft_splash",
+        },
+    )
+
+    assert params["product_video_template"] == "soft_splash"
+
+    try:
+        validate_generation_params("video", {"product_video_template": "wild_spin"})
+    except HTTPException as e:
+        assert e.status_code == 400
+        assert "product_video_template" in str(e.detail)
+    else:
+        raise AssertionError("invalid product video template should be rejected")
+
+
 def test_product_video_prompt_preserves_uploaded_product_profile():
     prompt = {
         "产品身份档案": (
@@ -505,6 +821,31 @@ def test_product_video_prompt_preserves_uploaded_product_profile():
     assert "上传产品替换参考视频" in out
     assert "Estee Lauder" not in out
     assert "Advanced Night Repair" not in out
+
+
+def test_product_video_prompt_applies_template_constraint():
+    prompt = {
+        "产品身份档案": "上传产品是 DAMAH 黑魔法棉柔巾, Logo 和包装文字必须完整保留。",
+        "可迁移主体动作": "参考商品入场，水花飞溅",
+        "镜头运动": "快速环绕",
+        "final_text": "参考视频复刻",
+    }
+
+    out = compact_generation_prompt_text(
+        prompt,
+        {
+            "subject_mode": "product",
+            "ratio": "9:16",
+            "_category": "video",
+            "product_video_template": "soft_splash",
+        },
+        prompt["final_text"],
+        is_product=True,
+    )
+
+    assert "产品视频模板：轻水花" in out
+    assert "不得覆盖Logo、包装文字" in out
+    assert "快速环绕" not in out
 
 
 def test_portrait_generation_prompt_reframes_body_language_safely():
@@ -663,7 +1004,16 @@ def test_celery_task_routes_are_split_by_workload():
     assert router.route({}, "download.video", args=(), kwargs={})["queue"].name == "video_download"
     assert router.route({}, "parse.url", args=(), kwargs={})["queue"].name == "parse"
     assert router.route({}, "cleanup.reap_stuck", args=(), kwargs={})["queue"].name == "cleanup"
+    assert router.route({}, "cleanup.reap_reverse", args=(), kwargs={})["queue"].name == "cleanup"
     assert router.route({}, "payments.reconcile", args=(), kwargs={})["queue"].name == "payment"
+
+
+def test_reverse_reaper_is_registered_and_scheduled():
+    assert "cleanup.reap_reverse" in celery_app.tasks
+    assert any(
+        entry.get("task") == "cleanup.reap_reverse"
+        for entry in celery_app.conf.beat_schedule.values()
+    )
 
 
 def test_redis_and_celery_connection_limits_are_configured():

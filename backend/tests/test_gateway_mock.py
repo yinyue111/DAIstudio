@@ -4,7 +4,7 @@ import time
 from pathlib import Path
 
 from app.config import settings
-from app.services import gateway
+from app.services import gateway, video_frames
 from app.services.model_gateway_config import RuntimeGatewayConfig
 from app.services.safe_logging import redact_url_for_log
 from app.services.watermark import image_ext, make_image_preview
@@ -19,6 +19,19 @@ def test_mock_image_and_preview():
     preview, w, h = make_image_preview(imgs[0])
     assert preview[:4] == b"\x89PNG"
     assert (w, h) == (256, 256)
+
+
+def test_mock_video_is_a_playable_mp4(tmp_path):
+    raw = gateway.mock_video()
+    assert raw[4:8] == b"ftyp"
+
+    path = tmp_path / "mock-video.mp4"
+    path.write_bytes(raw)
+    if video_frames.FFPROBE:
+        meta = video_frames.probe_media(str(path))
+        assert meta["width"] == 640
+        assert meta["height"] == 360
+        assert meta["duration"] == 1.0
 
 
 def test_image_ext_detects_jpeg():

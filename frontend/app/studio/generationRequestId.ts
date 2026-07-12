@@ -1,9 +1,21 @@
 export const PENDING_GENERATE_STORAGE_KEY = "studio_pending_generate_request_v1";
 export const PENDING_REVERSE_STORAGE_KEY = "studio_pending_reverse_request_v1";
 const PENDING_GENERATE_TTL_MS = 2 * 60 * 60 * 1000;
+const MAX_PENDING_REQUESTS = 16;
 
 type RequestStorage = Pick<Storage, "getItem" | "setItem" | "removeItem"> | null;
-type PendingRequestRef = { current: any };
+type PendingRequestRef = { current: unknown };
+type PendingRequestRecord = {
+  scope: string;
+  signature: string;
+  id: string;
+  createdAt: number;
+};
+type PendingRequestState = {
+  records: PendingRequestRecord[];
+  storageDisabled: boolean;
+};
+const sharedPendingStates = new WeakMap<object, Map<string, PendingRequestState>>();
 type PendingRequestOptions = {
   storage?: RequestStorage;
   now?: () => number;
@@ -16,11 +28,16 @@ type InternalPendingRequestOptions = PendingRequestOptions & {
 type InternalClearRequestOptions = {
   storage?: RequestStorage;
   storageKey: string;
+  now?: () => number;
 };
 
 function clientStorage() {
   if (typeof window === "undefined") return null;
-  return window.sessionStorage || null;
+  try {
+    return window.sessionStorage || null;
+  } catch (e) {
+    return null;
+  }
 }
 
 function randomRequestSuffix() {
@@ -28,6 +45,167 @@ function randomRequestSuffix() {
     return window.crypto.randomUUID();
   }
   return `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
+function pendingRecords(value: unknown, now: number): PendingRequestRecord[] {
+  const candidates = Array.isArray(value) ? value : value ? [value] : [];
+  return candidates.filter((record): record is PendingRequestRecord => {
+    if (!record || typeof record !== "object") return false;
+    const candidate = record as Partial<PendingRequestRecord>;
+    const ageMs = now - Number(candidate.createdAt || 0);
+    return (
+      typeof candidate.scope === "string"
+      && typeof candidate.signature === "string"
+      && typeof candidate.id === "string"
+      && Boolean(candidate.id)
+      && Number.isFinite(ageMs)
+      && ageMs >= 0
+      && ageMs <= PENDING_GENERATE_TTL_MS
+    );
+  });
+}
+
+function mergePendingRecords(
+  memoryRecords: PendingRequestRecord[],
+  storedRecords: PendingRequestRecord[],
+) {
+  const merged: PendingRequestRecord[] = [];
+  for (const record of [...storedRecords, ...memoryRecords]) {
+    const index = merged.findIndex(
+      (candidate) => candidate.scope === record.scope && candidate.signature === record.signature,
+    );
+    if (index < 0) {
+      merged.push(record);
+    } else if (record.createdAt >= merged[index].createdAt) {
+      merged[index] = record;
+    }
+  }
+  return merged
+    .sort((left, right) => left.createdAt - right.createdAt)
+    .slice(-MAX_PENDING_REQUESTS);
+}
+
+function pendingRequestState(value: unknown, now: number): PendingRequestState {
+  if (value && typeof value === "object" && !Array.isArray(value)) {
+    const state = value as Partial<PendingRequestState>;
+    if (Array.isArray(state.records)) {
+      return {
+        records: mergePendingRecords(pendingRecords(state.records, now), []),
+        storageDisabled: Boolean(state.storageDisabled),
+      };
+    }
+  }
+  return {
+    records: mergePendingRecords(pendingRecords(value, now), []),
+    storageDisabled: false,
+  };
+}
+
+function sharedPendingState(
+  storage: RequestStorage,
+  storageKey: string,
+  now: number,
+): PendingRequestState | null {
+  if (!storage) return null;
+  const state = sharedPendingStates.get(storage)?.get(storageKey);
+  return state ? pendingRequestState(state, now) : null;
+}
+
+function updateSharedPendingState(
+  storage: RequestStorage,
+  storageKey: string,
+  records: PendingRequestRecord[],
+  storageDisabled: boolean,
+) {
+  if (!storage) return;
+  let statesByKey = sharedPendingStates.get(storage);
+  if (!statesByKey) {
+    statesByKey = new Map();
+    sharedPendingStates.set(storage, statesByKey);
+  }
+  statesByKey.set(storageKey, { records, storageDisabled });
+}
+
+function storedPendingRecords(storage: RequestStorage, storageKey: string, now: number) {
+  if (!storage) return { records: [], failed: false };
+  let storedValue: string | null;
+  try {
+    storedValue = storage.getItem(storageKey);
+  } catch (e) {
+    return { records: [], failed: true };
+  }
+  try {
+    return {
+      records: pendingRecords(JSON.parse(storedValue || "null"), now),
+      failed: false,
+    };
+  } catch (e) {
+    return { records: [], failed: false };
+  }
+}
+
+function persistPendingRecords(
+  storage: RequestStorage,
+  storageKey: string,
+  records: PendingRequestRecord[],
+) {
+  if (!storage) return true;
+  try {
+    if (records.length) {
+      storage.setItem(storageKey, JSON.stringify(records));
+    } else {
+      storage.removeItem(storageKey);
+    }
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
+function updatePendingRef(
+  pendingRef: PendingRequestRef,
+  records: PendingRequestRecord[],
+  storageDisabled: boolean,
+) {
+  pendingRef.current = { records, storageDisabled };
+}
+
+function updatePendingState(
+  pendingRef: PendingRequestRef,
+  storage: RequestStorage,
+  storageKey: string,
+  records: PendingRequestRecord[],
+  storageDisabled: boolean,
+) {
+  updatePendingRef(pendingRef, records, storageDisabled);
+  updateSharedPendingState(storage, storageKey, records, storageDisabled);
+}
+
+function resolvePendingState(
+  pendingRef: PendingRequestRef,
+  storage: RequestStorage,
+  storageKey: string,
+  now: number,
+): PendingRequestState {
+  const localState = pendingRequestState(pendingRef.current, now);
+  const sharedState = sharedPendingState(storage, storageKey, now);
+  if (sharedState?.storageDisabled) return sharedState;
+  if (localState.storageDisabled) {
+    updateSharedPendingState(storage, storageKey, localState.records, true);
+    return localState;
+  }
+  if (!storage) return localState;
+
+  const stored = storedPendingRecords(storage, storageKey, now);
+  if (stored.failed) {
+    const fallback = sharedState || localState;
+    const failedState = { records: fallback.records, storageDisabled: true };
+    updateSharedPendingState(storage, storageKey, failedState.records, true);
+    return failedState;
+  }
+  const records = mergePendingRecords(stored.records, []);
+  updateSharedPendingState(storage, storageKey, records, false);
+  return { records, storageDisabled: false };
 }
 
 function generatePendingClientRequestId(
@@ -41,32 +219,30 @@ function generatePendingClientRequestId(
   now = Date.now,
   randomId = randomRequestSuffix,
 }: InternalPendingRequestOptions) {
-  const existing = pendingRef.current;
-  if (existing?.scope === scope && existing?.signature === signature && existing?.id) return existing.id;
-  try {
-    const stored = JSON.parse(storage?.getItem(storageKey) || "null");
-    const ageMs = now() - Number(stored?.createdAt || 0);
-    if (
-      stored?.scope === scope
-      && stored?.signature === signature
-      && stored?.id
-      && ageMs >= 0
-      && ageMs <= PENDING_GENERATE_TTL_MS
-    ) {
-      pendingRef.current = stored;
-      return stored.id;
+  const currentTime = now();
+  const state = resolvePendingState(pendingRef, storage, storageKey, currentTime);
+  let records = state.records;
+  let storageDisabled = state.storageDisabled;
+  const existing = records.find(
+    (record) => record.scope === scope && record.signature === signature,
+  );
+  if (existing) {
+    if (!storageDisabled && !persistPendingRecords(storage, storageKey, records)) {
+      storageDisabled = true;
     }
-  } catch (e) {
-    // localStorage may be unavailable; fall through to a fresh request id.
+    updatePendingState(pendingRef, storage, storageKey, records, storageDisabled);
+    return existing.id;
   }
+
   const id = `${prefix}-${randomId()}`;
-  const record = { scope, signature, id, createdAt: now() };
-  pendingRef.current = record;
-  try {
-    storage?.setItem(storageKey, JSON.stringify(record));
-  } catch (e) {
-    // localStorage may be unavailable; idempotency still works in memory.
+  const nextRecords = mergePendingRecords(
+    [...records, { scope, signature, id, createdAt: currentTime }],
+    [],
+  );
+  if (!storageDisabled && !persistPendingRecords(storage, storageKey, nextRecords)) {
+    storageDisabled = true;
   }
+  updatePendingState(pendingRef, storage, storageKey, nextRecords, storageDisabled);
   return id;
 }
 
@@ -76,20 +252,18 @@ function clearPendingClientRequest(
   {
   storageKey,
   storage = clientStorage(),
+  now = Date.now,
 }: InternalClearRequestOptions) {
-  if (!id || pendingRef.current?.id === id) {
-    pendingRef.current = null;
+  if (!id) return;
+  const currentTime = now();
+  const state = resolvePendingState(pendingRef, storage, storageKey, currentTime);
+  let storageDisabled = state.storageDisabled;
+  let records = state.records;
+  records = records.filter((record) => record.id !== id);
+  if (!storageDisabled && !persistPendingRecords(storage, storageKey, records)) {
+    storageDisabled = true;
   }
-  try {
-    const stored = JSON.parse(storage?.getItem(storageKey) || "null");
-    if (!id || stored?.id === id) storage?.removeItem(storageKey);
-  } catch (e) {
-    try {
-      storage?.removeItem(storageKey);
-    } catch (_e) {
-      // localStorage may be unavailable; in-memory state was already cleared.
-    }
-  }
+  updatePendingState(pendingRef, storage, storageKey, records, storageDisabled);
 }
 
 export function generateClientRequestId(

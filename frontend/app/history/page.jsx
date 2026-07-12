@@ -3,7 +3,9 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { api, downloadBlob } from "../../lib/api";
+import { formatLocalDateTime } from "../../lib/datetime";
 import { redirectOnAuthError, reportBackgroundError, showError } from "../../lib/errorHandling";
+import { saveStudioUserDraft } from "../../lib/studioSession";
 import Nav from "../../components/Nav";
 import { useToast } from "../../components/ToastProvider";
 import AssetMedia, {
@@ -258,7 +260,7 @@ export default function HistoryPage() {
       return;
     }
     try {
-      window.localStorage.setItem(STUDIO_VARIATION_DRAFT_KEY, JSON.stringify({
+      const saved = saveStudioUserDraft(window.localStorage, STUDIO_VARIATION_DRAFT_KEY, me?.id, {
         asset: {
           ...asset,
           type: "image",
@@ -266,7 +268,8 @@ export default function HistoryPage() {
           thumb: asset.preview_url || asset.thumb || sourceUrl,
         },
         prompt: "基于这张图生成同主体、同构图、同光线和同广告质感的近似变体；保留主体结构、产品文字、Logo、比例和核心视觉，只做轻微差异化。",
-      }));
+      });
+      if (!saved) throw new Error("无法保存当前用户的变体草稿");
       router.push("/");
     } catch (e) {
       setMsg(e.message || "创建变体草稿失败");
@@ -338,7 +341,7 @@ export default function HistoryPage() {
 	                  <span className="chip">{t.category === "video" ? "视频" : "图片"}</span>
 	                  <span className={`badge ${statusStyle(t.status)}`}>{statusZh(t.status)}</span>
                   <span className="ml-auto text-xs text-fog">
-                    {(t.created_at || "").replace("T", " ").slice(0, 16)} · 结算 {t.cost_settled}
+                    {formatLocalDateTime(t.created_at)} · 结算 {t.cost_settled}
                   </span>
                 </div>
                 {t.partial && (

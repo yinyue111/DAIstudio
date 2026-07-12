@@ -38,7 +38,7 @@ from .generation_prompts import (
     product_fidelity_prompt,
     product_image_negative_prompt,
 )
-from .generation_state import NEEDS_REVIEW
+from .generation_state import NEEDS_REVIEW, claim_terminal
 from .generation_state import TERMINAL_STATUSES as TERMINAL_STATUSES
 from .generation_video_flow import unlink_keys
 from .progress import set_progress
@@ -48,6 +48,31 @@ log = logging.getLogger("generation")
 
 IMAGE_EDIT_REFERENCE_MAX_SIDE = 1024
 IMAGE_PRODUCT_EDIT_REFERENCE_MAX_SIDE = 1536
+
+
+def acquire_image_terminal_boundary(db, task_id: int) -> GenTask | None:
+    """Serialize image success with running-task cancellation."""
+    if db.get_bind().dialect.name == "sqlite":
+        claimed = db.execute(
+            update(GenTask)
+            .where(GenTask.id == task_id, GenTask.status == "running")
+            .values(status=GenTask.status)
+        ).rowcount
+        if (claimed or 0) != 1:
+            return None
+        task = db.get(GenTask, task_id, populate_existing=True)
+    else:
+        task = db.execute(
+            select(GenTask)
+            .where(GenTask.id == task_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        ).scalar_one_or_none()
+        if not task or task.status != "running":
+            return None
+    if task:
+        db.refresh(task)
+    return task
 
 
 def image_review_has_local_results(task: GenTask) -> bool:
@@ -127,13 +152,14 @@ def hold_image_success_for_reconciliation(
     *,
     written_keys: list[str] | None = None,
     saved_count: int | None = None,
+    params_update: dict | None = None,
 ) -> None:
     """Hold provider-success image tasks when local accounting failed."""
     db.rollback()
     task = db.get(GenTask, task_id)
     if not task:
         return
-    params = dict(task.params or {})
+    params = {**(task.params or {}), **(params_update or {})}
     if written_keys:
         params["_image_result_keys"] = list(written_keys)
     if saved_count is not None:
@@ -160,13 +186,14 @@ def hold_image_submit_unknown_for_reconciliation(
     written_keys: list[str] | None = None,
     saved_count: int | None = None,
     requested_count: int | None = None,
+    params_update: dict | None = None,
 ) -> None:
     """Hold image batches when at least one upstream submit may still finish."""
     db.rollback()
     task = db.get(GenTask, task_id)
     if not task:
         return
-    params = dict(task.params or {})
+    params = {**(task.params or {}), **(params_update or {})}
     if written_keys:
         params["_image_result_keys"] = list(written_keys)
     if saved_count is not None:
@@ -465,7 +492,9 @@ def run_image_task(task_id: int, *, gen_image_fn=None) -> None:
         returned_sizes: list[str] = []
         product_composite_count = 0
         product_composite_meta: dict | None = None
+        pending_assets: list[GenAsset] = []
         for raw in images:
+            item_keys: list[str] = []
             try:
                 if product_pixel_lock and mask_result:
                     try:
@@ -493,14 +522,17 @@ def run_image_task(task_id: int, *, gen_image_fn=None) -> None:
                     max_pixels=int(settings.generated_image_max_pixels),
                 )
                 hd_key = storage.save_bytes(raw, "hd", image_ext(raw))
+                item_keys.append(hd_key)
                 pv_key = storage.save_bytes(preview_png, "preview", "png")
+                item_keys.append(pv_key)
                 model_ref_key = storage.save_bytes_named(
                     model_ref_jpeg,
                     "model_ref",
                     pv_key.split("/", 1)[1].rsplit(".", 1)[0] + ".jpg",
                 )
-                written_keys += [hd_key, pv_key, model_ref_key]
-                db.add(
+                item_keys.append(model_ref_key)
+                written_keys.extend(item_keys)
+                pending_assets.append(
                     GenAsset(
                         task_id=task.id,
                         user_id=task.user_id,
@@ -516,16 +548,18 @@ def run_image_task(task_id: int, *, gen_image_fn=None) -> None:
                 saved_count += 1
                 actual_sizes.append(f"{hd_w}x{hd_h}")
             except Exception as e:  # noqa: BLE001
+                unlink_keys(item_keys)
                 image_errors.append(str(e)[:300])
                 log.warning("image task %s skipped one invalid image: %s", task_id, e)
-        if product_pixel_lock:
-            task.params = {
-                **(task.params or {}),
+        pixel_lock_params_update = (
+            {
                 "_product_pixel_lock": product_pixel_lock_label,
                 "_product_composite_applied_count": product_composite_count,
                 **(product_composite_meta or {}),
             }
-            db.commit()
+            if product_pixel_lock
+            else {}
+        )
         if saved_count <= 0:
             usage.record_call(
                 db,
@@ -603,35 +637,40 @@ def run_image_task(task_id: int, *, gen_image_fn=None) -> None:
                 written_keys=written_keys,
                 saved_count=saved_count,
                 requested_count=n,
+                params_update=pixel_lock_params_update,
             )
             return
         try:
-            raise_if_cancel_requested(db, db.get(GenTask, task_id, populate_existing=True))
-        except TaskCanceled:
-            db.rollback()
-            unlink_keys(written_keys)
-            raise
-        if partial_detail:
-            task.params = {
-                **(task.params or {}),
-                "_partial": True,
-                "_requested_n": n,
-                "_saved_n": saved_count,
-                "_skipped_n": skipped_n,
-                "_partial_errors": partial_errors[:5],
-                "_image_result_keys": list(written_keys),
-                **({"_image_submit_state_unknown": True} if has_unknown_gateway_failure else {}),
-                **({"_unknown_submit_errors": unknown_errors[:5]} if unknown_errors else {}),
-            }
-        elif actual_sizes:
-            task.params = {**(task.params or {}), "_actual_sizes": actual_sizes[:20]}
-        from .generation_state import claim_terminal
+            terminal_task = acquire_image_terminal_boundary(db, task_id)
+            if not terminal_task:
+                db.rollback()
+                unlink_keys(written_keys)
+                return
+            raise_if_cancel_requested(db, terminal_task)
+            final_params = dict(terminal_task.params or {})
+            final_params.update(pixel_lock_params_update)
+            if partial_detail:
+                final_params.update(
+                    {
+                        "_partial": True,
+                        "_requested_n": n,
+                        "_saved_n": saved_count,
+                        "_skipped_n": skipped_n,
+                        "_partial_errors": partial_errors[:5],
+                        "_image_result_keys": list(written_keys),
+                        **({"_image_submit_state_unknown": True} if has_unknown_gateway_failure else {}),
+                        **({"_unknown_submit_errors": unknown_errors[:5]} if unknown_errors else {}),
+                    }
+                )
+            elif actual_sizes:
+                final_params["_actual_sizes"] = actual_sizes[:20]
+            terminal_task.params = final_params
+            db.add_all(pending_assets)
 
-        if not claim_terminal(db, task_id, "succeeded", cost_settled=real_cost):
-            db.rollback()
-            unlink_keys(written_keys)
-            return
-        try:
+            if not claim_terminal(db, task_id, "succeeded", cost_settled=real_cost):
+                db.rollback()
+                unlink_keys(written_keys)
+                return
             credits.settle(
                 db,
                 task.user_id,
@@ -641,13 +680,18 @@ def run_image_task(task_id: int, *, gen_image_fn=None) -> None:
                 commit=False,
             )
             db.commit()
+        except TaskCanceled:
+            db.rollback()
+            unlink_keys(written_keys)
+            raise
         except Exception as e:  # noqa: BLE001
             hold_image_success_for_reconciliation(
                 db,
                 task_id,
-                f"图片本地结算失败:{e}",
+                f"图片本地落账失败:{e}",
                 written_keys=written_keys,
                 saved_count=saved_count,
+                params_update=pixel_lock_params_update,
             )
             raise
         if partial_detail:

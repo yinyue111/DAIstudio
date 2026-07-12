@@ -8,32 +8,28 @@ from __future__ import annotations
 import logging
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import delete, or_, select, update
+from sqlalchemy import delete, null, or_, select, update
 from sqlalchemy.orm import Session
 
 from ..config import settings
-from ..models import AssetReport, AuditLog, GenAsset, GenTask, ParseRecord, UploadedAsset
-from ..redis_client import redis_client
+from ..models import (
+    AssetReport,
+    AuditLog,
+    GenAsset,
+    GenTask,
+    ParseRecord,
+    ReverseOperation,
+    UploadedAsset,
+    UserDraft,
+)
 from . import credits, generation, storage
 from .config_store import get_setting
 from .generation_state import TERMINAL_STATUSES
+from .generation_video_flow import poll_chain_alive as _video_poll_alive
+from .generation_video_flow import video_download_alive as _video_download_alive
 from .media_sidecars import collect_unreferenced_asset_keys, unlink_keys
 
 log = logging.getLogger("retention")
-
-
-def _video_poll_alive(task_id: int) -> bool:
-    try:
-        return bool(redis_client.get(f"video:poll:alive:{task_id}"))
-    except Exception:  # noqa: BLE001
-        return False
-
-
-def _video_download_alive(task_id: int) -> bool:
-    try:
-        return bool(redis_client.get(f"video:download:alive:{task_id}"))
-    except Exception:  # noqa: BLE001
-        return False
 
 
 def _video_waiting_for_download(task: GenTask) -> bool:
@@ -67,6 +63,14 @@ def _video_download_reap_window() -> timedelta:
 def _video_submit_reap_window() -> timedelta:
     seconds = int(settings.video_submit_timeout_seconds or 0)
     return timedelta(seconds=max(300, seconds + 120))
+
+
+def _reverse_reap_window() -> timedelta:
+    # Fine video analysis can spend several minutes extracting keyframes before
+    # the synchronous vision request starts. Keep a conservative floor while
+    # still expanding with any operator-configured gateway timeout.
+    seconds = max(30 * 60, int(settings.reverse_gateway_timeout_seconds or 0) + 5 * 60)
+    return timedelta(seconds=seconds)
 
 
 def _image_inside_reap_window(task: GenTask, now: datetime) -> bool:
@@ -146,6 +150,42 @@ def _purge_table_older_than(db: Session, model, cutoff: datetime, extra=None) ->
     return res.rowcount or 0
 
 
+def _tombstone_named_reverse_operations(db: Session, cutoff: datetime) -> int:
+    """Redact expired caller-keyed rows without changing idempotent replay."""
+    failed = db.execute(
+        update(ReverseOperation)
+        .where(
+            ReverseOperation.created_at < cutoff,
+            ReverseOperation.status == "failed",
+            ReverseOperation.client_request_id.is_not(None),
+            or_(
+                ReverseOperation.asset_url != "",
+                ReverseOperation.error.is_not(None),
+                ReverseOperation.result.is_not(None),
+            ),
+        )
+        .values(asset_url="", error=None, result=null())
+        .execution_options(synchronize_session=False)
+    )
+    succeeded = db.execute(
+        update(ReverseOperation)
+        .where(
+            ReverseOperation.created_at < cutoff,
+            ReverseOperation.status == "succeeded",
+            ReverseOperation.client_request_id.is_not(None),
+            or_(
+                ReverseOperation.asset_url != "",
+                ReverseOperation.error.is_not(None),
+            ),
+        )
+        # The successful result is the public idempotent replay payload.
+        .values(asset_url="", error=None)
+        .execution_options(synchronize_session=False)
+    )
+    db.commit()
+    return (failed.rowcount or 0) + (succeeded.rowcount or 0)
+
+
 def detach_asset_reports(db: Session, asset_id: int) -> int:
     """Preserve report history when an asset row is deleted."""
     res = db.execute(
@@ -185,32 +225,97 @@ def purge_parsed_previews(db: Session, cutoff: datetime, limit: int = 1000) -> i
     return removed
 
 
-def _referenced_upload_urls(db: Session, cutoff: datetime) -> set[str]:
+_TASK_UPLOAD_PARAM_FIELDS = (
+    "reference_image_url",
+    "first_frame_image",
+    "last_frame_image",
+    "style_reference_image",
+    "character_reference_image",
+    "mask_image_url",
+)
+_REFERENCE_QUERY_CHUNK_SIZE = 500
+
+
+def _chunks(values: set[str], size: int = _REFERENCE_QUERY_CHUNK_SIZE):
+    ordered = sorted(values)
+    for start in range(0, len(ordered), size):
+        yield ordered[start : start + size]
+
+
+def _referenced_upload_urls(
+    db: Session,
+    cutoff: datetime,
+    candidate_urls: set[str],
+) -> set[str]:
+    """Find task references only among this purge batch's candidate URLs."""
+    if not candidate_urls:
+        return set()
     refs: set[str] = set()
-    rows = db.execute(
-        select(GenTask.source_asset_url, GenTask.params).where(
-            or_(
-                GenTask.created_at >= cutoff,
-                GenTask.status.in_(("queued", "running", generation.NEEDS_REVIEW)),
+    active = or_(
+        GenTask.created_at >= cutoff,
+        GenTask.status.in_(("queued", "running", generation.NEEDS_REVIEW)),
+    )
+    for chunk in _chunks(candidate_urls):
+        refs.update(
+            value
+            for value in db.execute(
+                select(GenTask.source_asset_url).where(
+                    active,
+                    GenTask.source_asset_url.in_(chunk),
+                )
+            ).scalars()
+            if value
+        )
+        for field in _TASK_UPLOAD_PARAM_FIELDS:
+            value_expr = GenTask.params[field].as_string()
+            refs.update(
+                value
+                for value in db.execute(
+                    select(value_expr).where(active, value_expr.in_(chunk))
+                ).scalars()
+                if value
             )
+    return refs
+
+
+_STUDIO_ASSET_FIELDS = ("assets", "selected", "productAsset", "variationSource")
+_STUDIO_ASSET_URL_FIELDS = (
+    "url",
+    "thumb",
+    "preview_url",
+    "original_url",
+    "original_thumb",
+)
+
+
+def _studio_draft_upload_urls(db: Session, user_ids: set[int]) -> set[tuple[int, str]]:
+    """Return only known Studio asset URLs, scoped to the draft owner."""
+    if not user_ids:
+        return set()
+    refs: set[tuple[int, str]] = set()
+    rows = db.execute(
+        select(UserDraft.user_id, UserDraft.payload).where(
+            UserDraft.key == "studio",
+            UserDraft.user_id.in_(user_ids),
         )
     ).all()
-    for source_asset_url, params in rows:
-        if source_asset_url:
-            refs.add(source_asset_url)
-        task_params = params or {}
-        if not isinstance(task_params, dict):
+    for user_id, payload in rows:
+        workspaces = payload.get("workspaces") if isinstance(payload, dict) else None
+        if not isinstance(workspaces, dict):
             continue
-        for key in (
-            "reference_image_url",
-            "first_frame_image",
-            "last_frame_image",
-            "style_reference_image",
-            "character_reference_image",
-        ):
-            value = task_params.get(key)
-            if value:
-                refs.add(value)
+        for workspace in workspaces.values():
+            if not isinstance(workspace, dict):
+                continue
+            for field in _STUDIO_ASSET_FIELDS:
+                value = workspace.get(field)
+                assets = value if field == "assets" and isinstance(value, list) else [value]
+                for asset in assets:
+                    if not isinstance(asset, dict):
+                        continue
+                    for url_field in _STUDIO_ASSET_URL_FIELDS:
+                        url = asset.get(url_field)
+                        if isinstance(url, str) and url:
+                            refs.add((int(user_id), url))
     return refs
 
 
@@ -250,8 +355,16 @@ def _upload_related_keys(upload_key: str) -> list[str]:
     return keys
 
 
-def _upload_group_is_referenced(upload_key: str, referenced_urls: set[str]) -> bool:
-    return any(storage.upload_api_url(key) in referenced_urls for key in _upload_related_keys(upload_key))
+def _upload_group_is_referenced(
+    row: UploadedAsset,
+    referenced_urls: set[str],
+    studio_draft_urls: set[tuple[int, str]],
+) -> bool:
+    for key in _upload_related_keys(row.key):
+        url = storage.upload_api_url(key)
+        if url in referenced_urls or (int(row.user_id), url) in studio_draft_urls:
+            return True
+    return False
 
 
 def _delete_uploaded_asset_row(db: Session, key: str, unlink_after_commit: list[str]) -> bool:
@@ -284,9 +397,15 @@ def purge_uploaded_assets(db: Session, cutoff: datetime, limit: int = 1000) -> i
     )
     removed = 0
     unlink_after_commit: list[str] = []
-    referenced_urls = _referenced_upload_urls(db, cutoff)
+    candidate_urls = {
+        storage.upload_api_url(key)
+        for row in rows
+        for key in _upload_related_keys(row.key)
+    }
+    referenced_urls = _referenced_upload_urls(db, cutoff, candidate_urls)
+    studio_draft_urls = _studio_draft_upload_urls(db, {int(row.user_id) for row in rows})
     for row in rows:
-        if _upload_group_is_referenced(row.key, referenced_urls):
+        if _upload_group_is_referenced(row, referenced_urls, studio_draft_urls):
             continue
         if _delete_uploaded_asset_row(db, row.key, unlink_after_commit):
             removed += 1
@@ -324,6 +443,19 @@ def purge_all(db: Session) -> dict:
     )
     result["parsed_previews"] = purge_parsed_previews(db, now - timedelta(days=parse_days))
     result["uploads"] = purge_uploaded_assets(db, now - timedelta(days=asset_days))
+    reverse_cutoff = now - timedelta(days=audit_days)
+    # Anonymous calls have no public replay key, so terminal rows can expire.
+    # Caller-keyed rows retain their compact replay/conflict state indefinitely.
+    result["reverse_operations"] = _purge_table_older_than(
+        db,
+        ReverseOperation,
+        reverse_cutoff,
+        ReverseOperation.status.in_(("succeeded", "failed"))
+        & ReverseOperation.client_request_id.is_(None),
+    )
+    result["reverse_operation_tombstones"] = _tombstone_named_reverse_operations(
+        db, reverse_cutoff
+    )
     # audit logs (kept longer for accountability)
     result["audit_logs"] = _purge_table_older_than(
         db, AuditLog, now - timedelta(days=audit_days)
@@ -353,6 +485,75 @@ def reap_stuck_parse_records(db: Session, max_minutes: int | None = None) -> int
         db.commit()
         log.info("reaped %s stuck parse record(s)", count)
     return count
+
+
+def reap_stuck_reverse_operations(db: Session, max_minutes: int | None = None) -> int:
+    """Fail and refund reverse calls abandoned by an API process crash."""
+    window = (
+        timedelta(minutes=max(1, int(max_minutes)))
+        if max_minutes is not None
+        else _reverse_reap_window()
+    )
+    now = datetime.now(timezone.utc)
+    cutoff = now - window
+    operation_ids = list(
+        db.execute(
+            select(ReverseOperation.id).where(
+                ReverseOperation.status == "running",
+                ReverseOperation.updated_at < cutoff,
+            )
+        ).scalars()
+    )
+    reaped = 0
+    for operation_id in operation_ids:
+        try:
+            claimed = db.execute(
+                update(ReverseOperation)
+                .where(
+                    ReverseOperation.id == int(operation_id),
+                    ReverseOperation.status == "running",
+                    ReverseOperation.updated_at < cutoff,
+                )
+                .values(
+                    status="failed",
+                    error="反推任务超时,已自动失败并退回积分",
+                    updated_at=now,
+                )
+                .returning(
+                    ReverseOperation.user_id,
+                    ReverseOperation.charged_credits,
+                )
+                .execution_options(synchronize_session=False)
+            ).first()
+            if claimed is None:
+                db.rollback()
+                continue
+            user_id, charged_credits = claimed
+            charged = int(charged_credits or 0)
+            if charged:
+                db.execute(
+                    update(ReverseOperation)
+                    .where(ReverseOperation.id == int(operation_id))
+                    .values(charged_credits=0)
+                    .execution_options(synchronize_session=False)
+                )
+                credits.refund_consumed(
+                    db,
+                    int(user_id),
+                    charged,
+                    biz_type="reverse",
+                    biz_ref=int(operation_id),
+                    note="stale reverse operation refund",
+                    commit=False,
+                )
+            db.commit()
+            reaped += 1
+        except Exception:  # noqa: BLE001
+            db.rollback()
+            log.exception("failed to reap reverse operation %s", operation_id)
+    if reaped:
+        log.info("reaped %s stale reverse operation(s)", reaped)
+    return reaped
 
 
 def reap_stuck_tasks(db: Session, max_minutes: int = 60) -> int:
@@ -420,12 +621,12 @@ def reap_stuck_tasks(db: Session, max_minutes: int = 60) -> int:
                 error_message = "视频提交超时且未记录请求号,已自动失败并退回额度"
             else:
                 sub = _aware(row["external_submitted_at"])
-                if _video_poll_alive(task_id):
+                if _video_poll_alive(task_id, row["external_task_id"]):
                     continue
                 if row["phase"] == "downloading" and bool(
                     params.get("_video_result_url") or params.get("_video_result_mock")
                 ):
-                    if _video_download_alive(task_id):
+                    if _video_download_alive(task_id, row["external_task_id"]):
                         continue
                     download_started_at = None
                     raw_download_started_at = params.get("_video_download_started_at")

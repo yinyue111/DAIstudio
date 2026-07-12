@@ -8,6 +8,7 @@ from urllib.parse import urlparse
 
 from fastapi import FastAPI, Header, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import text
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
@@ -28,6 +29,7 @@ from .routers import (
     profile,
     prompt,
     prompts,
+    subject_protection,
     tasks,
     uploads,
     v2,
@@ -157,7 +159,7 @@ class BodySizeLimitMiddleware:
             "/api/me/password",
         }:
             return 32 * 1024
-        if path in {"/api/generate", "/api/prompt/reverse", "/api/parse"}:
+        if path in {"/api/generate", "/api/prompt/reverse", "/api/parse", "/api/subject-protection/preview"}:
             return 256 * 1024
         return None
 
@@ -268,7 +270,7 @@ for public_subdir, mount_path in (
     )
 
 for r in (auth.router, me.router, config_router.router, profile.router, parse.router,
-          prompt.router, prompts.router, generate.router, tasks.router, uploads.router, assets.router,
+          prompt.router, prompts.router, subject_protection.router, generate.router, tasks.router, uploads.router, assets.router,
           payments.router, admin.router, ws.router, v2.router):
     app.include_router(r)
 
@@ -292,6 +294,17 @@ def _health_detail() -> dict:
     return {"ok": ok, "mock_mode": settings.effective_mock_mode, "components": components}
 
 
+def _public_readiness(detail: dict) -> dict:
+    return {
+        "ok": bool(detail.get("ok")),
+        "mock_mode": bool(detail.get("mock_mode")),
+        "components": {
+            name: "ok" if status == "ok" else "error"
+            for name, status in (detail.get("components") or {}).items()
+        },
+    }
+
+
 @app.get("/api/health")
 def health():
     """Public liveness. Keep deployment internals off the internet."""
@@ -307,7 +320,11 @@ def live():
 @app.get("/api/ready")
 def ready():
     """Readiness check: app process plus DB/Redis dependencies."""
-    return _health_detail()
+    detail = _health_detail()
+    return JSONResponse(
+        content=_public_readiness(detail),
+        status_code=200 if detail["ok"] else 503,
+    )
 
 
 @app.get("/api/health/detail")

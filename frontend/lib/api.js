@@ -42,20 +42,28 @@ export function wsUrl(path) {
   return `${base.replace(/^http/, "ws")}${path}`;
 }
 
-export function getToken() {
-  if (typeof window === "undefined") return null;
+function clearLegacyToken() {
+  if (typeof window === "undefined") return;
   // Auth moved to an HttpOnly cookie. Clear any legacy bearer token so an XSS
   // cannot keep using an old localStorage credential.
-  window.localStorage.removeItem("token");
+  try {
+    window.localStorage.removeItem("token");
+  } catch (e) {
+    // Storage can be disabled by browser privacy settings; cookie auth must continue.
+  }
+}
+
+export function getToken() {
+  clearLegacyToken();
   return null;
 }
 
 export function setToken(t) {
-  window.localStorage.removeItem("token");
+  clearLegacyToken();
 }
 
 export function clearToken() {
-  window.localStorage.removeItem("token");
+  clearLegacyToken();
 }
 
 let unauthorizedHandler = null;
@@ -214,27 +222,41 @@ export async function assetDownloadObjectUrl(assetId) {
   return URL.createObjectURL(blob);
 }
 
-async function withTimeout(timeoutMs, operation) {
+async function withTimeout(timeoutMs, operation, externalSignal = null) {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  let abortSource = "";
+  const abortFromCaller = () => {
+    if (controller.signal.aborted) return;
+    abortSource = "caller";
+    controller.abort(externalSignal?.reason);
+  };
+  if (externalSignal?.aborted) abortFromCaller();
+  else externalSignal?.addEventListener("abort", abortFromCaller, { once: true });
+  const timer = setTimeout(() => {
+    if (controller.signal.aborted) return;
+    abortSource = "timeout";
+    controller.abort();
+  }, timeoutMs);
   try {
     return await operation(controller.signal);
   } catch (e) {
-    if (e?.name === "AbortError") {
+    if (e?.name === "AbortError" && abortSource === "timeout") {
       throw new Error("请求超时，请稍后重试");
     }
     throw e;
   } finally {
     clearTimeout(timer);
+    externalSignal?.removeEventListener("abort", abortFromCaller);
   }
 }
 
 async function fetchTextWithTimeout(url, options = {}, timeoutMs = DEFAULT_TIMEOUT_MS) {
+  const externalSignal = options.signal || null;
   return withTimeout(timeoutMs, async (signal) => {
     const res = await fetch(url, { ...options, signal });
     const text = await res.text();
     return { res, text };
-  });
+  }, externalSignal);
 }
 
 async function fetchBlobWithTimeout(url, options = {}, timeoutMs = DEFAULT_TIMEOUT_MS) {
@@ -322,7 +344,7 @@ async function request(
   return data;
 }
 
-async function upload(path, formData, { auth = true } = {}) {
+async function upload(path, formData, { auth = true, signal = null } = {}) {
   const headers = {};
   if (auth) {
     const t = getToken();
@@ -335,6 +357,7 @@ async function upload(path, formData, { auth = true } = {}) {
       headers,
       body: formData,
       credentials: "include",
+      signal,
     },
     UPLOAD_TIMEOUT_MS,
   );
@@ -426,15 +449,15 @@ export const api = {
     request("/api/parse", { method: "POST", body: { url }, timeoutMs: PARSE_TIMEOUT_MS }),
   parseStatus: (id) =>
     request(`/api/parse/${id}`, { timeoutMs: DEFAULT_TIMEOUT_MS }),
-  uploadImage: (file) => {
+  uploadImage: (file, options = {}) => {
     const form = new FormData();
     form.append("file", file);
-    return upload("/api/uploads/image", form);
+    return upload("/api/uploads/image", form, options);
   },
-  uploadVideo: (file) => {
+  uploadVideo: (file, options = {}) => {
     const form = new FormData();
     form.append("file", file);
-    return upload("/api/uploads/video", form);
+    return upload("/api/uploads/video", form, options);
   },
   reverse: (
     asset_url,
@@ -447,6 +470,12 @@ export const api = {
     request("/api/prompt/reverse", {
       method: "POST",
       body: { asset_url, target, fallback_image, source_type, video_analysis_preset, client_request_id },
+      timeoutMs: REVERSE_TIMEOUT_MS,
+    }),
+  subjectProtectionPreview: (asset_url, edit_mask_mode = "protect_subject") =>
+    request("/api/subject-protection/preview", {
+      method: "POST",
+      body: { asset_url, edit_mask_mode },
       timeoutMs: REVERSE_TIMEOUT_MS,
     }),
   generate: (payload) =>
@@ -466,8 +495,7 @@ export const api = {
   cancelTask: (taskId) => request(`/api/tasks/${taskId}/cancel`, { method: "POST" }),
   unlock: (assetId) => request(`/api/assets/${assetId}/unlock`, { method: "POST" }),
   playbackTicket: (assetId) => request(`/api/assets/${assetId}/playback-ticket`, { method: "POST" }),
-  playbackUrl: (assetId, ticket) =>
-    `${API_BASE}/api/assets/${assetId}/stream?ticket=${encodeURIComponent(ticket)}`,
+  playbackUrl: (assetId) => `${API_BASE}/api/assets/${assetId}/stream`,
   favoriteAsset: (assetId) => request(`/api/assets/${assetId}/favorite`, { method: "POST" }),
   reportAsset: (assetId, body) =>
     request(`/api/assets/${assetId}/report`, { method: "POST", body }),

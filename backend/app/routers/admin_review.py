@@ -17,7 +17,7 @@ from ..schemas import (
     AssetReportOut,
 )
 from ..services import audit, credits, generation, safe_logging
-from ..services.task_output import build_task_out
+from ..services.task_output import build_task_out, build_task_outs
 from .admin_helpers import age_minutes as _age_minutes
 from .admin_helpers import page as _page
 from .admin_helpers import setting_int as _setting_int
@@ -148,8 +148,8 @@ def list_review_tasks(
         ).scalars()
     )
     out = []
-    for row in rows:
-        item = build_task_out(db, row).model_dump()
+    for row, task_out in zip(rows, build_task_outs(db, rows), strict=True):
+        item = task_out.model_dump()
         age_minutes = _age_minutes(row.created_at)
         item.update({
             "user_id": row.user_id,

@@ -5,10 +5,12 @@ import asyncio
 import io
 import threading
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import httpx
 import pytest
+from fastapi.testclient import TestClient
 from PIL import Image
 
 from app.celery_app import celery_app
@@ -21,6 +23,7 @@ from app.models import (
     AppSetting,
     AssetReport,
     AuditLog,
+    CreditTransaction,
     GenAsset,
     GenTask,
     ModelConfig,
@@ -1958,7 +1961,16 @@ def test_unlocked_final_video_stream_uses_short_lived_ticket(client, make_user, 
     stream = client.get(f"/api/assets/{asset_id}/stream?ticket={ticket}")
     assert stream.status_code == 200, stream.text
     assert stream.headers["content-type"].startswith("video/mp4")
+    assert stream.headers["cache-control"] == "no-store"
     assert stream.content == tiny_mp4
+    replay = client.get(f"/api/assets/{asset_id}/stream?ticket={ticket}")
+    assert replay.status_code == 401
+    bearer_stream = client.get(f"/api/assets/{asset_id}/stream", headers=owner_h)
+    assert bearer_stream.status_code == 200, bearer_stream.text
+    assert bearer_stream.content == tiny_mp4
+    client.cookies.clear()
+    unauthenticated_stream = client.get(f"/api/assets/{asset_id}/stream")
+    assert unauthenticated_stream.status_code == 401
     db = SessionLocal()
     try:
         actions = {
@@ -2127,47 +2139,49 @@ def test_admin_sensitive_actions_allow_logged_in_admin_without_second_password(c
 def test_admin_config_allows_logged_in_admin_without_second_password(client, make_user, auth):
     make_user("13900000089", balance=1000, admin=True)
     h = auth("13900000089")
+    original_image_n = client.get("/api/admin/settings", headers=h).json()["image_n"]
+    try:
+        ok = client.post(
+            "/api/admin/whitelist",
+            json={"phone": "13900000090", "note": "test", "department": "dev"},
+            headers=h,
+        )
+        assert ok.status_code == 200, ok.text
 
-    ok = client.post(
-        "/api/admin/whitelist",
-        json={"phone": "13900000090", "note": "test", "department": "dev"},
-        headers=h,
-    )
-    assert ok.status_code == 200, ok.text
+        delete_ok = client.request(
+            "DELETE",
+            "/api/admin/whitelist/13900000090",
+            json={},
+            headers=h,
+        )
+        assert delete_ok.status_code == 200, delete_ok.text
 
-    delete_ok = client.request(
-        "DELETE",
-        "/api/admin/whitelist/13900000090",
-        json={},
-        headers=h,
-    )
-    assert delete_ok.status_code == 200, delete_ok.text
+        model_ok = client.put(
+            "/api/admin/models",
+            json={
+                "use": "image",
+                "model_id": "mock-image",
+                "cost_credits": 5,
+                "unlock_cost": 5,
+                "enabled": True,
+            },
+            headers=h,
+        )
+        assert model_ok.status_code == 200, model_ok.text
 
-    model_ok = client.put(
-        "/api/admin/models",
-        json={
-            "use": "image",
-            "model_id": "mock-image",
-            "cost_credits": 5,
-            "unlock_cost": 5,
-            "enabled": True,
-        },
-        headers=h,
-    )
-    assert model_ok.status_code == 200, model_ok.text
-
-    settings_ok = client.put(
-        "/api/admin/settings",
-        json={"image_n": 2},
-        headers=h,
-    )
-    assert settings_ok.status_code == 200, settings_ok.text
-    restore_ok = client.put(
-        "/api/admin/settings",
-        json={"image_n": 4},
-        headers=h,
-    )
-    assert restore_ok.status_code == 200, restore_ok.text
+        settings_ok = client.put(
+            "/api/admin/settings",
+            json={"image_n": 2},
+            headers=h,
+        )
+        assert settings_ok.status_code == 200, settings_ok.text
+    finally:
+        restore_ok = client.put(
+            "/api/admin/settings",
+            json={"image_n": original_image_n},
+            headers=h,
+        )
+        assert restore_ok.status_code == 200, restore_ok.text
 
 
 def test_mock_mode_external_reference_does_not_download(client, make_user, auth, monkeypatch):
@@ -2294,6 +2308,482 @@ def test_admin_quota_grant_replays_same_business_fingerprint_with_new_key(client
         db.close()
 
 
+def test_admin_quota_business_replay_survives_redis_fingerprint_failure(
+    client, make_user, auth, monkeypatch
+):
+    make_user("13900000861", balance=1000, admin=True)
+    target = make_user("13900000862", balance=1000)
+    h = auth("13900000861")
+    monkeypatch.setattr(
+        "app.routers.admin_helpers.redis_client.setex",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(ConnectionError("redis unavailable")),
+    )
+    body = {
+        "user_id": target,
+        "amount": 10,
+        "note": "database fingerprint",
+        "idempotency_key": "grant-db-fp-001",
+    }
+    assert client.post("/api/admin/quota/grant", json=body, headers=h).status_code == 200
+    replay = client.post(
+        "/api/admin/quota/grant",
+        json={**body, "idempotency_key": "grant-db-fp-002"},
+        headers=h,
+    )
+    assert replay.status_code == 200, replay.text
+    db = SessionLocal()
+    try:
+        assert db.get(User, target).balance_credits == 1010
+        grants = db.query(CreditTransaction).filter(
+            CreditTransaction.user_id == target,
+            CreditTransaction.type == "grant",
+            CreditTransaction.biz_type == "admin",
+        ).count()
+        assert grants == 1
+    finally:
+        db.close()
+
+
+def test_admin_quota_redis_lock_failures_do_not_break_database_guarantees(
+    client, make_user, auth, monkeypatch
+):
+    make_user("13900000872", balance=1000, admin=True)
+    target = make_user("13900000873", balance=1000)
+    h = auth("13900000872")
+    monkeypatch.setattr(
+        "app.routers.admin_quota.locks.acquire",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(ConnectionError("redis acquire failed")),
+    )
+    monkeypatch.setattr(
+        "app.routers.admin_quota.locks.release",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(ConnectionError("redis release failed")),
+    )
+    body = {
+        "user_id": target,
+        "amount": 10,
+        "note": "redis lock fallback",
+        "idempotency_key": "grant-redis-lock-001",
+    }
+    first = client.post("/api/admin/quota/grant", json=body, headers=h)
+    assert first.status_code == 200, first.text
+    replay = client.post(
+        "/api/admin/quota/grant",
+        json={**body, "idempotency_key": "grant-redis-lock-002"},
+        headers=h,
+    )
+    assert replay.status_code == 200, replay.text
+    assert replay.json()["balance_credits"] == 1010
+
+
+def test_admin_quota_release_failure_cannot_mask_committed_grant(
+    client, make_user, auth, monkeypatch
+):
+    make_user("13900000874", balance=1000, admin=True)
+    target = make_user("13900000875", balance=1000)
+    h = auth("13900000874")
+    monkeypatch.setattr("app.routers.admin_quota.locks.acquire", lambda *_args, **_kwargs: "owned-token")
+    monkeypatch.setattr(
+        "app.routers.admin_quota.locks.release",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(ConnectionError("redis release failed")),
+    )
+    body = {
+        "user_id": target,
+        "amount": 10,
+        "note": "release failure",
+        "idempotency_key": "grant-release-fail-001",
+    }
+    first = client.post("/api/admin/quota/grant", json=body, headers=h)
+    assert first.status_code == 200, first.text
+    replay = client.post("/api/admin/quota/grant", json=body, headers=h)
+    assert replay.status_code == 200, replay.text
+    db = SessionLocal()
+    try:
+        assert db.get(User, target).balance_credits == 1010
+        assert db.query(CreditTransaction).filter(
+            CreditTransaction.user_id == target,
+            CreditTransaction.type == "grant",
+            CreditTransaction.biz_type == "admin",
+        ).count() == 1
+    finally:
+        db.close()
+
+
+def test_admin_quota_postgres_uses_transaction_advisory_lock_without_user_row_lock():
+    from app.routers.admin_helpers import (
+        lock_admin_quota_serialization,
+        quota_grant_advisory_lock_key,
+    )
+
+    class FakeSession:
+        statements = []
+
+        def get_bind(self):
+            return type("Bind", (), {"dialect": type("Dialect", (), {"name": "postgresql"})()})()
+
+        def execute(self, statement, params=None):
+            self.statements.append((str(statement), params))
+
+    db = FakeSession()
+    large_admin_id = 2**40 + 123
+    lock_admin_quota_serialization(db, large_admin_id)
+    lock_key = quota_grant_advisory_lock_key(large_admin_id)
+    assert db.statements == [
+        (
+            "SELECT pg_advisory_xact_lock(:lock_key)",
+            {"lock_key": lock_key},
+        )
+    ]
+    assert -(2**63) <= lock_key < 2**63
+    assert lock_key == quota_grant_advisory_lock_key(large_admin_id)
+    assert lock_key != quota_grant_advisory_lock_key(large_admin_id + 1)
+    assert "FOR UPDATE" not in db.statements[0][0]
+
+
+def test_admin_quota_business_window_expires_but_original_key_remains_idempotent(
+    client, make_user, auth
+):
+    make_user("13900000863", balance=1000, admin=True)
+    target = make_user("13900000864", balance=1000)
+    h = auth("13900000863")
+    body = {
+        "user_id": target,
+        "amount": 10,
+        "note": "repeatable adjustment",
+        "idempotency_key": "grant-window-001",
+    }
+    assert client.post("/api/admin/quota/grant", json=body, headers=h).status_code == 200
+    db = SessionLocal()
+    try:
+        row = db.query(AdminIdempotencyKey).filter_by(key="grant-window-001").one()
+        row.fingerprint_expires_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+        db.commit()
+    finally:
+        db.close()
+    second = client.post(
+        "/api/admin/quota/grant",
+        json={**body, "idempotency_key": "grant-window-002"},
+        headers=h,
+    )
+    assert second.status_code == 200, second.text
+    assert second.json()["balance_credits"] == 1020
+    original_replay = client.post("/api/admin/quota/grant", json=body, headers=h)
+    assert original_replay.status_code == 200
+    assert original_replay.json()["balance_credits"] == 1020
+    db = SessionLocal()
+    try:
+        assert db.query(CreditTransaction).filter(
+            CreditTransaction.user_id == target,
+            CreditTransaction.type == "grant",
+            CreditTransaction.biz_type == "admin",
+        ).count() == 2
+    finally:
+        db.close()
+
+
+def test_admin_quota_reservation_rolls_back_when_grant_crashes(
+    client, make_user, auth, monkeypatch
+):
+    make_user("13900000865", balance=1000, admin=True)
+    target = make_user("13900000866", balance=1000)
+    h = auth("13900000865")
+    body = {
+        "user_id": target,
+        "amount": 10,
+        "note": "crash rollback",
+        "idempotency_key": "grant-crash-001",
+    }
+    original_grant = credits.grant
+    monkeypatch.setattr(
+        "app.routers.admin_quota.credits.grant",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("injected crash")),
+    )
+    with pytest.raises(RuntimeError, match="injected crash"):
+        client.post("/api/admin/quota/grant", json=body, headers=h)
+    db = SessionLocal()
+    try:
+        assert db.get(User, target).balance_credits == 1000
+        assert db.query(AdminIdempotencyKey).filter_by(key="grant-crash-001").count() == 0
+    finally:
+        db.close()
+    monkeypatch.setattr("app.routers.admin_quota.credits.grant", original_grant)
+    retry = client.post("/api/admin/quota/grant", json=body, headers=h)
+    assert retry.status_code == 200, retry.text
+    assert retry.json()["balance_credits"] == 1010
+
+
+def test_admin_quota_rolls_back_real_grant_flush_when_precommit_refresh_crashes(
+    client, make_user, auth, monkeypatch
+):
+    make_user("13900000876", balance=1000, admin=True)
+    target = make_user("13900000877", balance=1000)
+    h = auth("13900000876")
+    body = {
+        "user_id": target,
+        "amount": 10,
+        "note": "post flush crash",
+        "idempotency_key": "grant-post-flush-001",
+    }
+    monkeypatch.setattr(
+        "app.routers.admin_quota._refresh_quota_fingerprint_expiry",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("precommit crash")),
+    )
+    with pytest.raises(RuntimeError, match="precommit crash"):
+        client.post("/api/admin/quota/grant", json=body, headers=h)
+    db = SessionLocal()
+    try:
+        assert db.get(User, target).balance_credits == 1000
+        assert db.query(AdminIdempotencyKey).filter_by(key="grant-post-flush-001").count() == 0
+        assert db.query(CreditTransaction).filter(
+            CreditTransaction.user_id == target,
+            CreditTransaction.type == "grant",
+            CreditTransaction.biz_type == "admin",
+        ).count() == 0
+    finally:
+        db.close()
+
+
+def test_admin_bulk_quota_rolls_back_real_grant_flush_when_precommit_refresh_crashes(
+    client, make_user, auth, monkeypatch
+):
+    make_user("13900000878", balance=1000, admin=True)
+    target = make_user("13900000879", balance=1000)
+    h = auth("13900000878")
+    monkeypatch.setattr(
+        "app.routers.admin_quota._refresh_quota_fingerprint_expiry",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("bulk precommit crash")),
+    )
+    with pytest.raises(RuntimeError, match="bulk precommit crash"):
+        client.post(
+            "/api/admin/quota/bulk-grant",
+            json={
+                "idempotency_key": "bulk-post-flush-001",
+                "items": [{"user_id": target, "amount": 10, "note": "bulk post flush crash"}],
+            },
+            headers=h,
+        )
+    db = SessionLocal()
+    try:
+        assert db.get(User, target).balance_credits == 1000
+        assert db.query(AdminIdempotencyKey).filter_by(key="bulk:bulk-post-flush-001").count() == 0
+        assert db.query(CreditTransaction).filter(
+            CreditTransaction.user_id == target,
+            CreditTransaction.type == "grant",
+            CreditTransaction.biz_type == "admin",
+        ).count() == 0
+    finally:
+        db.close()
+
+
+def test_admin_bulk_quota_fingerprint_expiry_is_refreshed_after_processing(
+    client, make_user, auth, monkeypatch
+):
+    make_user("13900000880", balance=1000, admin=True)
+    target = make_user("13900000881", balance=1000)
+    h = auth("13900000880")
+    marker_expiry = datetime(2026, 7, 12, 1, 10, tzinfo=timezone.utc)
+    final_expiry = datetime(2026, 7, 12, 1, 20, tzinfo=timezone.utc)
+    expiries = iter((marker_expiry, final_expiry))
+    monkeypatch.setattr(
+        "app.routers.admin_helpers.quota_fingerprint_expiry",
+        lambda: next(expiries),
+    )
+    response = client.post(
+        "/api/admin/quota/bulk-grant",
+        json={
+            "idempotency_key": "bulk-expiry-refresh-001",
+            "items": [{"user_id": target, "amount": 10, "note": "expiry refresh"}],
+        },
+        headers=h,
+    )
+    assert response.status_code == 200, response.text
+    db = SessionLocal()
+    try:
+        marker = db.query(AdminIdempotencyKey).filter_by(key="bulk:bulk-expiry-refresh-001").one()
+        actual = marker.fingerprint_expires_at
+        if actual.tzinfo is None:
+            actual = actual.replace(tzinfo=timezone.utc)
+        assert actual == final_expiry
+    finally:
+        db.close()
+
+
+def test_admin_quota_concurrent_business_fingerprint_grants_once(
+    client, make_user, auth, monkeypatch
+):
+    make_user("13900000867", balance=1000, admin=True)
+    target = make_user("13900000868", balance=1000)
+    h = auth("13900000867")
+    monkeypatch.setattr("app.routers.admin_quota.locks.acquire", lambda *_args, **_kwargs: "token")
+    monkeypatch.setattr("app.routers.admin_quota.locks.release", lambda *_args, **_kwargs: None)
+
+    import app.routers.admin_quota as quota_router
+
+    original_lock = quota_router._lock_admin_quota_serialization
+    first_locked = threading.Event()
+    release_first = threading.Event()
+    second_started = threading.Event()
+    call_guard = threading.Lock()
+    calls = 0
+
+    def controlled_lock(db, admin_id):
+        nonlocal calls
+        with call_guard:
+            calls += 1
+            call_number = calls
+            if call_number == 2:
+                second_started.set()
+        original_lock(db, admin_id)
+        if call_number == 1:
+            first_locked.set()
+            assert release_first.wait(timeout=5)
+
+    monkeypatch.setattr(quota_router, "_lock_admin_quota_serialization", controlled_lock)
+    responses = []
+    first_client = TestClient(client.app)
+    second_client = TestClient(client.app)
+
+    def post(thread_client, key):
+        responses.append(
+            thread_client.post(
+                "/api/admin/quota/grant",
+                json={
+                    "user_id": target,
+                    "amount": 10,
+                    "note": "concurrent fingerprint",
+                    "idempotency_key": key,
+                },
+                headers=h,
+            )
+        )
+
+    first = threading.Thread(target=post, args=(first_client, "grant-race-fp-001"))
+    second = threading.Thread(target=post, args=(second_client, "grant-race-fp-002"))
+    try:
+        first.start()
+        assert first_locked.wait(timeout=5)
+        second.start()
+        assert second_started.wait(timeout=5)
+        release_first.set()
+        first.join(timeout=10)
+        second.join(timeout=10)
+        assert not first.is_alive() and not second.is_alive()
+        assert sorted(response.status_code for response in responses) == [200, 200]
+    finally:
+        release_first.set()
+        first_client.close()
+        second_client.close()
+    db = SessionLocal()
+    try:
+        assert db.get(User, target).balance_credits == 1010
+        assert db.query(CreditTransaction).filter(
+            CreditTransaction.user_id == target,
+            CreditTransaction.type == "grant",
+            CreditTransaction.biz_type == "admin",
+        ).count() == 1
+    finally:
+        db.close()
+
+
+def test_admin_quota_single_and_bulk_share_database_daily_limit_lock(
+    client, make_user, auth, monkeypatch
+):
+    make_user("13900000869", balance=1000, admin=True)
+    single_target = make_user("13900000870", balance=1000)
+    bulk_target = make_user("13900000871", balance=1000)
+    h = auth("13900000869")
+    settings_before = client.get("/api/admin/settings", headers=h).json()
+    configured = client.put(
+        "/api/admin/settings",
+        json={"admin_quota_grant_single_limit": 100, "admin_quota_grant_daily_limit": 100},
+        headers=h,
+    )
+    assert configured.status_code == 200, configured.text
+    monkeypatch.setattr("app.routers.admin_quota.locks.acquire", lambda *_args, **_kwargs: "token")
+    monkeypatch.setattr("app.routers.admin_quota.locks.release", lambda *_args, **_kwargs: None)
+
+    import app.routers.admin_quota as quota_router
+
+    original_lock = quota_router._lock_admin_quota_serialization
+    first_locked = threading.Event()
+    release_first = threading.Event()
+    second_started = threading.Event()
+    call_guard = threading.Lock()
+    calls = 0
+
+    def controlled_lock(db, admin_id):
+        nonlocal calls
+        with call_guard:
+            calls += 1
+            call_number = calls
+            if call_number == 2:
+                second_started.set()
+        original_lock(db, admin_id)
+        if call_number == 1:
+            first_locked.set()
+            assert release_first.wait(timeout=5)
+
+    monkeypatch.setattr(quota_router, "_lock_admin_quota_serialization", controlled_lock)
+    responses = {}
+    first_client = TestClient(client.app)
+    second_client = TestClient(client.app)
+
+    def post_single():
+        responses["single"] = first_client.post(
+            "/api/admin/quota/grant",
+            json={
+                "user_id": single_target,
+                "amount": 60,
+                "note": "single daily race",
+                "idempotency_key": "grant-daily-race-001",
+            },
+            headers=h,
+        )
+
+    def post_bulk():
+        responses["bulk"] = second_client.post(
+            "/api/admin/quota/bulk-grant",
+            json={
+                "idempotency_key": "bulk-daily-race-001",
+                "items": [{"user_id": bulk_target, "amount": 60, "note": "bulk daily race"}],
+            },
+            headers=h,
+        )
+
+    first = threading.Thread(target=post_single)
+    second = threading.Thread(target=post_bulk)
+    try:
+        first.start()
+        assert first_locked.wait(timeout=5)
+        second.start()
+        assert second_started.wait(timeout=5)
+        release_first.set()
+        first.join(timeout=10)
+        second.join(timeout=10)
+        assert not first.is_alive() and not second.is_alive()
+        assert responses["single"].status_code == 200
+        assert responses["bulk"].status_code == 200
+        assert responses["bulk"].json()["granted"] == []
+        assert "今日额度发放累计不能超过 100" in responses["bulk"].json()["failed"][0]["error"]
+        db = SessionLocal()
+        try:
+            assert db.get(User, single_target).balance_credits == 1060
+            assert db.get(User, bulk_target).balance_credits == 1000
+        finally:
+            db.close()
+    finally:
+        release_first.set()
+        first_client.close()
+        second_client.close()
+        client.put(
+            "/api/admin/settings",
+            json={
+                "admin_quota_grant_single_limit": settings_before["admin_quota_grant_single_limit"],
+                "admin_quota_grant_daily_limit": settings_before["admin_quota_grant_daily_limit"],
+            },
+            headers=h,
+        )
+
+
 def test_admin_quota_grant_requires_persistent_idempotency_key(client, make_user, auth):
     make_user("13900000097", balance=1000, admin=True)
     target = make_user("13900000098", balance=1000)
@@ -2364,9 +2854,9 @@ def test_admin_quota_grant_respects_configured_single_and_daily_limits(client, m
 
 
 def test_admin_quota_grant_replay_is_not_blocked_by_daily_limit(client, make_user, auth):
-    make_user("13900000281", balance=1000, admin=True)
-    target = make_user("13900000282", balance=1000)
-    h = auth("13900000281")
+    make_user("13900000781", balance=1000, admin=True)
+    target = make_user("13900000782", balance=1000)
+    h = auth("13900000781")
     settings_resp = client.put(
         "/api/admin/settings",
         json={

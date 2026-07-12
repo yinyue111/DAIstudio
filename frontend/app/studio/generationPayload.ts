@@ -1,6 +1,6 @@
 "use client";
 
-import type { AppConfig, Asset, Category, CreationModeKey, SubjectMode, Task } from "../../lib/types";
+import type { AppConfig, Asset, Category, CreationModeKey, ProductPixelLockMode, SubjectMode, Task } from "../../lib/types";
 import { RATIOS } from "./constants";
 import { buildEditNegativePrompt, buildEditPrompt } from "./editPrompt";
 import {
@@ -56,9 +56,11 @@ interface BuildGenerationPayloadInput {
   n: number | string;
   seed?: string;
   editMaskMode?: "protect_subject" | "center_box" | "off";
+  productPixelLockMode?: ProductPixelLockMode;
   vDuration: number | string;
   vResolution: string;
   videoProductLockMode?: "free" | "locked";
+  videoProductTemplate?: string;
 }
 
 function cleanText(value: unknown): string {
@@ -108,9 +110,11 @@ export function buildGenerationPayload({
   n,
   seed = "",
   editMaskMode = "protect_subject",
+  productPixelLockMode = "auto",
   vDuration,
   vResolution,
   videoProductLockMode = "locked",
+  videoProductTemplate = "stable_showcase",
 }: BuildGenerationPayloadInput) {
   const isFinal = stage === "final" && task;
   const effCategory = isFinal ? task.category : category;
@@ -238,6 +242,7 @@ export function buildGenerationPayload({
             ...(subjectModeParam ? { subject_mode: subjectModeParam } : {}),
             ...(variationSource?.id ? { variation_of_asset_id: Number(variationSource.id) } : {}),
             ...(isImageEditMode && productMode ? { edit_mask_mode: editMaskMode || "protect_subject" } : {}),
+            ...(isImageEditMode && productMode ? { product_pixel_lock: editMaskMode === "off" ? "off" : (productPixelLockMode || "auto") } : {}),
             ...(editNegative ? { negative_prompt: editNegative } : {}),
           }
         : {
@@ -251,6 +256,7 @@ export function buildGenerationPayload({
             ...(portraitMode && refImage ? { character_reference_image: refImage } : {}),
             ...(subjectModeParam ? { subject_mode: subjectModeParam } : {}),
             ...(isEditMode && productMode ? { product_lock_mode: videoProductLockMode === "locked" ? "locked" : "free" } : {}),
+            ...(isEditMode && productMode ? { product_video_template: videoProductTemplate || "stable_showcase" } : {}),
             ...(editNegative ? { negative_prompt: editNegative } : {}),
           },
   };

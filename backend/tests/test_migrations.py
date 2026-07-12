@@ -3,6 +3,7 @@ from pathlib import Path
 
 import pytest
 import sqlalchemy as sa
+from sqlalchemy.dialects import postgresql
 
 import app.models  # noqa: F401
 from alembic import command
@@ -116,6 +117,36 @@ def test_migrated_schema_has_core_integrity_constraints(tmp_path, monkeypatch):
         "reserved_amount",
         "real_cost",
     } <= credit_columns
+    admin_columns = {c["name"]: c for c in insp.get_columns("admin_idempotency_keys")}
+    assert admin_columns["business_fingerprint"]["nullable"] is True
+    assert admin_columns["fingerprint_expires_at"]["nullable"] is True
+    admin_indexes = {idx["name"]: idx for idx in insp.get_indexes("admin_idempotency_keys")}
+    business_index = admin_indexes["ix_admin_idempotency_business_window"]
+    assert not business_index["unique"]
+    assert business_index["column_names"] == [
+        "admin_id",
+        "scope",
+        "business_fingerprint",
+        "fingerprint_expires_at",
+    ]
+
+
+def test_0032_admin_quota_business_window_can_downgrade_and_reupgrade(tmp_path, monkeypatch):
+    db_path = tmp_path / "admin-quota-window.db"
+    monkeypatch.setattr(settings, "database_url", f"sqlite:///{db_path}")
+    backend = Path(__file__).resolve().parents[1]
+    cfg = Config(str(backend / "alembic.ini"))
+    cfg.set_main_option("script_location", str(backend / "alembic"))
+    command.upgrade(cfg, "head")
+    engine = sa.create_engine(f"sqlite:///{db_path}")
+    insp = sa.inspect(engine)
+    assert "business_fingerprint" in {c["name"] for c in insp.get_columns("admin_idempotency_keys")}
+    command.downgrade(cfg, "0031_jsonb_model_alignment")
+    insp = sa.inspect(engine)
+    assert "business_fingerprint" not in {c["name"] for c in insp.get_columns("admin_idempotency_keys")}
+    command.upgrade(cfg, "head")
+    insp = sa.inspect(engine)
+    assert "business_fingerprint" in {c["name"] for c in insp.get_columns("admin_idempotency_keys")}
     model_config_indexes = {
         idx["name"]: idx for idx in insp.get_indexes("model_configs")
     }
@@ -151,7 +182,7 @@ def test_migrated_schema_has_core_integrity_constraints(tmp_path, monkeypatch):
             )
 
 
-def test_latest_migration_can_downgrade_and_reupgrade(tmp_path, monkeypatch):
+def test_reverse_recovery_migration_can_downgrade_and_reupgrade(tmp_path, monkeypatch):
     db_path = tmp_path / "rollback-smoke.db"
     monkeypatch.setattr(settings, "database_url", f"sqlite:///{db_path}")
     backend = Path(__file__).resolve().parents[1]
@@ -166,11 +197,20 @@ def test_latest_migration_can_downgrade_and_reupgrade(tmp_path, monkeypatch):
         "ix_audit_logs_created_at",
     }
     assert expected_audit_indexes <= {idx["name"] for idx in sa.inspect(engine).get_indexes("audit_logs")}
-    assert "reverse_operations" in sa.inspect(engine).get_table_names()
-
-    command.downgrade(cfg, "-1")
     insp = sa.inspect(engine)
     assert "reverse_operations" in insp.get_table_names()
+    reverse_columns = {c["name"]: c for c in insp.get_columns("reverse_operations")}
+    assert reverse_columns["client_request_id"]["nullable"] is True
+    reverse_indexes = {idx["name"] for idx in insp.get_indexes("reverse_operations")}
+    assert "ix_reverse_operations_status_updated" in reverse_indexes
+
+    command.downgrade(cfg, "0029_default_image_n_one")
+    insp = sa.inspect(engine)
+    assert "reverse_operations" in insp.get_table_names()
+    reverse_columns = {c["name"]: c for c in insp.get_columns("reverse_operations")}
+    assert reverse_columns["client_request_id"]["nullable"] is False
+    reverse_indexes = {idx["name"] for idx in insp.get_indexes("reverse_operations")}
+    assert "ix_reverse_operations_status_updated" not in reverse_indexes
     assert expected_audit_indexes <= {idx["name"] for idx in insp.get_indexes("audit_logs")}
 
     command.upgrade(cfg, "head")
@@ -178,9 +218,251 @@ def test_latest_migration_can_downgrade_and_reupgrade(tmp_path, monkeypatch):
     insp = sa.inspect(engine)
     assert "user_prompts" in insp.get_table_names()
     assert "reverse_operations" in insp.get_table_names()
+    reverse_columns = {c["name"]: c for c in insp.get_columns("reverse_operations")}
+    assert reverse_columns["client_request_id"]["nullable"] is True
+    reverse_indexes = {idx["name"] for idx in insp.get_indexes("reverse_operations")}
+    assert "ix_reverse_operations_status_updated" in reverse_indexes
     assert expected_audit_indexes <= {idx["name"] for idx in insp.get_indexes("audit_logs")}
     gen_task_checks = {c["name"] for c in insp.get_check_constraints("gen_tasks")}
     assert "ck_gen_tasks_status_valid" in gen_task_checks
+
+
+def test_0030_downgrade_blocks_when_anonymous_reverse_operations_exist(tmp_path, monkeypatch):
+    db_path = tmp_path / "migration-0030-anonymous-reverse.db"
+    monkeypatch.setattr(settings, "database_url", f"sqlite:///{db_path}")
+    backend = Path(__file__).resolve().parents[1]
+    cfg = Config(str(backend / "alembic.ini"))
+    cfg.set_main_option("script_location", str(backend / "alembic"))
+
+    command.upgrade(cfg, "head")
+    engine = sa.create_engine(f"sqlite:///{db_path}")
+    with engine.begin() as conn:
+        conn.execute(
+            sa.text(
+                "insert into users "
+                "(id, phone, password_hash, balance_credits, frozen_credits, is_admin, status) "
+                "values (1, '13900000997', 'hash', 0, 0, 0, 'active')"
+            )
+        )
+        conn.execute(
+            sa.text(
+                "insert into reverse_operations "
+                "(id, user_id, client_request_id, request_fingerprint, target, asset_url, status) "
+                "values (1, 1, NULL, :fingerprint, 'image', 'https://cdn.example.com/a.jpg', 'failed')"
+            ),
+            {"fingerprint": "a" * 64},
+        )
+
+    with pytest.raises(RuntimeError, match="without client_request_id exist"):
+        command.downgrade(cfg, "0029_default_image_n_one")
+
+
+def _load_migration_module(revision: str):
+    path = Path(__file__).resolve().parents[1] / f"alembic/versions/{revision}.py"
+    spec = importlib.util.spec_from_file_location(f"migration_{revision}", path)
+    migration = importlib.util.module_from_spec(spec)
+    assert spec and spec.loader
+    spec.loader.exec_module(migration)
+    return migration
+
+
+def test_0031_aligns_all_legacy_postgres_json_columns_with_jsonb_models(monkeypatch):
+    migration = _load_migration_module("0031_jsonb_model_alignment")
+    calls = []
+    bind = type("Bind", (), {"dialect": type("Dialect", (), {"name": "postgresql"})()})()
+    monkeypatch.setattr(migration.op, "get_bind", lambda: bind)
+    monkeypatch.setattr(
+        migration.op,
+        "alter_column",
+        lambda table, column, **kwargs: calls.append((table, column, kwargs)),
+    )
+
+    migration.upgrade()
+
+    expected = {
+        ("app_settings", "value"),
+        ("audit_logs", "detail"),
+        ("gateway_calls", "detail"),
+        ("gen_tasks", "prompt"),
+        ("gen_tasks", "params"),
+        ("model_configs", "extra"),
+        ("parse_records", "assets"),
+        ("payment_orders", "raw"),
+        ("payment_provider_configs", "public_config"),
+        ("payment_provider_configs", "secret_config"),
+    }
+    assert {(table, column) for table, column, _ in calls} == expected
+    assert all(isinstance(kwargs["existing_type"], postgresql.JSON) for _, _, kwargs in calls)
+    assert all(isinstance(kwargs["type_"], postgresql.JSONB) for _, _, kwargs in calls)
+    assert all(kwargs["postgresql_using"].endswith("::jsonb") for _, _, kwargs in calls)
+
+
+def test_0031_is_a_noop_outside_postgresql(monkeypatch):
+    migration = _load_migration_module("0031_jsonb_model_alignment")
+    bind = type("Bind", (), {"dialect": type("Dialect", (), {"name": "sqlite"})()})()
+    monkeypatch.setattr(migration.op, "get_bind", lambda: bind)
+    monkeypatch.setattr(
+        migration.op,
+        "alter_column",
+        lambda *_args, **_kwargs: pytest.fail("SQLite must not receive PostgreSQL JSONB DDL"),
+    )
+
+    migration.upgrade()
+    migration.downgrade()
+
+
+def test_0022_downgrade_preserves_preexisting_team_package(tmp_path, monkeypatch):
+    db_path = tmp_path / "migration-0022-existing-team.db"
+    monkeypatch.setattr(settings, "database_url", f"sqlite:///{db_path}")
+    backend = Path(__file__).resolve().parents[1]
+    cfg = Config(str(backend / "alembic.ini"))
+    cfg.set_main_option("script_location", str(backend / "alembic"))
+
+    command.upgrade(cfg, "0021_parse_records_running")
+    engine = sa.create_engine(f"sqlite:///{db_path}")
+    expected = {
+        "id": "team",
+        "title": "运营自定义团队包",
+        "amount_cents": 45600,
+        "credits": 6789,
+        "badge": "限时运营",
+        "enabled": 0,
+        "sort_order": 77,
+        "created_at": "2026-01-02 03:04:05",
+        "updated_at": "2026-02-03 04:05:06",
+    }
+    with engine.begin() as conn:
+        conn.execute(
+            sa.text(
+                """
+                INSERT INTO payment_packages
+                    (id, title, amount_cents, credits, badge, enabled, sort_order,
+                     created_at, updated_at)
+                VALUES
+                    (:id, :title, :amount_cents, :credits, :badge, :enabled, :sort_order,
+                     :created_at, :updated_at)
+                """
+            ),
+            expected,
+        )
+
+    command.upgrade(cfg, "0022_credit_pricing_defaults")
+    command.downgrade(cfg, "0021_parse_records_running")
+
+    with engine.connect() as conn:
+        row = conn.execute(
+            sa.text(
+                """
+                SELECT id, title, amount_cents, credits, badge, enabled, sort_order,
+                       created_at, updated_at
+                FROM payment_packages
+                WHERE id = 'team'
+                """
+            )
+        ).mappings().one()
+    assert dict(row) == expected
+
+
+def test_0022_downgrade_preserves_operational_changes_to_seeded_team_package(
+    tmp_path, monkeypatch
+):
+    db_path = tmp_path / "migration-0022-modified-seeded-team.db"
+    monkeypatch.setattr(settings, "database_url", f"sqlite:///{db_path}")
+    backend = Path(__file__).resolve().parents[1]
+    cfg = Config(str(backend / "alembic.ini"))
+    cfg.set_main_option("script_location", str(backend / "alembic"))
+
+    command.upgrade(cfg, "0021_parse_records_running")
+    command.upgrade(cfg, "0022_credit_pricing_defaults")
+    engine = sa.create_engine(f"sqlite:///{db_path}")
+    expected = {
+        "id": "team",
+        "title": "运营调整团队包",
+        "amount_cents": 51800,
+        "credits": 8123,
+        "badge": "运营专享",
+        "enabled": 0,
+        "sort_order": 88,
+        "created_at": "2026-03-04 05:06:07",
+        "updated_at": "2026-04-05 06:07:08",
+    }
+    with engine.begin() as conn:
+        result = conn.execute(
+            sa.text(
+                """
+                UPDATE payment_packages
+                SET title = :title,
+                    amount_cents = :amount_cents,
+                    credits = :credits,
+                    badge = :badge,
+                    enabled = :enabled,
+                    sort_order = :sort_order,
+                    created_at = :created_at,
+                    updated_at = :updated_at
+                WHERE id = :id
+                """
+            ),
+            expected,
+        )
+        assert result.rowcount == 1
+
+    command.downgrade(cfg, "0021_parse_records_running")
+
+    with engine.connect() as conn:
+        row = conn.execute(
+            sa.text(
+                """
+                SELECT id, title, amount_cents, credits, badge, enabled, sort_order,
+                       created_at, updated_at
+                FROM payment_packages
+                WHERE id = 'team'
+                """
+            )
+        ).mappings().one()
+    assert dict(row) == expected
+
+
+def test_0022_empty_database_round_trip_keeps_one_usable_team_package(tmp_path, monkeypatch):
+    db_path = tmp_path / "migration-0022-empty-round-trip.db"
+    monkeypatch.setattr(settings, "database_url", f"sqlite:///{db_path}")
+    backend = Path(__file__).resolve().parents[1]
+    cfg = Config(str(backend / "alembic.ini"))
+    cfg.set_main_option("script_location", str(backend / "alembic"))
+
+    command.upgrade(cfg, "0021_parse_records_running")
+    command.upgrade(cfg, "0022_credit_pricing_defaults")
+    command.downgrade(cfg, "0021_parse_records_running")
+    command.upgrade(cfg, "0022_credit_pricing_defaults")
+
+    engine = sa.create_engine(f"sqlite:///{db_path}")
+    with engine.connect() as conn:
+        rows = conn.execute(
+            sa.text(
+                """
+                SELECT id, title, amount_cents, credits, badge, enabled, sort_order,
+                       created_at, updated_at
+                FROM payment_packages
+                WHERE id = 'team'
+                """
+            )
+        ).mappings().all()
+
+    assert len(rows) == 1
+    team = rows[0]
+    assert {
+        key: team[key]
+        for key in ("id", "title", "amount_cents", "credits", "badge", "enabled", "sort_order")
+    } == {
+        "id": "team",
+        "title": "团队包",
+        "amount_cents": 29900,
+        "credits": 3800,
+        "badge": "团队推荐",
+        "enabled": 1,
+        "sort_order": 40,
+    }
+    assert team["created_at"] is not None
+    assert team["updated_at"] is not None
 
 
 def test_0023_downgrade_blocks_when_canceled_tasks_exist(tmp_path, monkeypatch):

@@ -2,15 +2,29 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime
-from typing import Any, Literal
+from datetime import datetime, timezone
+from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, PlainSerializer, field_validator, model_validator
 
 MAX_MODEL_COST_CREDITS = 1_000_000
 MAX_PAYMENT_AMOUNT_CENTS = 1_000_000_00  # 1,000,000 CNY
 MAX_PAYMENT_PACKAGE_CREDITS = 100_000_000
 MAX_PAYMENT_CREDITS_PER_CENT = 10_000
+
+
+def _serialize_utc_datetime(value: datetime) -> str:
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    else:
+        value = value.astimezone(timezone.utc)
+    return value.isoformat()
+
+
+UtcDateTime = Annotated[
+    datetime,
+    PlainSerializer(_serialize_utc_datetime, return_type=str, when_used="json"),
+]
 
 
 # --- Auth (phone + password) ---
@@ -85,7 +99,7 @@ class UserDraftIn(BaseModel):
 class UserDraftOut(BaseModel):
     key: str
     payload: dict[str, Any] = Field(default_factory=dict)
-    updated_at: datetime | None = None
+    updated_at: UtcDateTime | None = None
 
 
 # --- Parse ---
@@ -181,8 +195,8 @@ class TaskOut(BaseModel):
     final_asset_count: int = 0
     final_cost_estimate: int | None = None
     params: dict[str, Any] = Field(default_factory=dict)
-    created_at: datetime | None = None
-    finished_at: datetime | None = None
+    created_at: UtcDateTime | None = None
+    finished_at: UtcDateTime | None = None
     assets: list[AssetOut] = Field(default_factory=list)
 
 
@@ -199,9 +213,9 @@ class AssetOut(BaseModel):
     width: int | None = None
     height: int | None = None
     duration: int | None = None
-    created_at: datetime | None = None
+    created_at: UtcDateTime | None = None
     # populated by the profile gallery (retention)
-    expires_at: datetime | None = None
+    expires_at: UtcDateTime | None = None
     days_left: int | None = None
     category: str | None = None
     unlock_cost: int = 0
@@ -226,8 +240,8 @@ class AssetReportOut(BaseModel):
     status: str
     handle_note: str | None = None
     handled_by: int | None = None
-    handled_at: datetime | None = None
-    created_at: datetime | None = None
+    handled_at: UtcDateTime | None = None
+    created_at: UtcDateTime | None = None
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -323,8 +337,8 @@ class UserPromptOut(BaseModel):
     favorite: bool
     usage_count: int
     params: dict[str, Any] | None = None
-    created_at: datetime | None = None
-    updated_at: datetime | None = None
+    created_at: UtcDateTime | None = None
+    updated_at: UtcDateTime | None = None
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -367,9 +381,9 @@ class PaymentOrderOut(BaseModel):
     status: str
     code_url: str | None = None
     provider_trade_no: str | None = None
-    expires_at: datetime | None = None
-    paid_at: datetime | None = None
-    created_at: datetime | None = None
+    expires_at: UtcDateTime | None = None
+    paid_at: UtcDateTime | None = None
+    created_at: UtcDateTime | None = None
 
 
 # --- Admin ---
@@ -637,7 +651,7 @@ class AuditOut(BaseModel):
     biz_id: int | None = None
     ip: str | None = None
     detail: dict[str, Any] | None = None
-    created_at: datetime | None = None
+    created_at: UtcDateTime | None = None
 
     model_config = ConfigDict(from_attributes=True)
 

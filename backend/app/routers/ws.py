@@ -26,6 +26,7 @@ log = logging.getLogger("ws")
 _AUTH_RECHECK_EVERY = 15  # re-validate token revocation/disable roughly every 15s
 _DB_STATUS_RECHECK_EVERY = 2  # keep UI close to the committed task state
 _PROGRESS_BLOCK_MS = 5000
+_EVENTS_BLOCK_MS = 5000
 _TICKET_PREFIX = "ws:task-ticket:"
 _EVENT_TICKET_PREFIX = "ws:event-ticket:"
 _CONNECT_RATE_WINDOW_SECONDS = 60
@@ -156,6 +157,9 @@ async def task_progress(websocket: WebSocket, task_id: int, ticket: str = ""):
                 phase = db_phase
             if is_terminal_status(status):
                 percent = 100
+            if not await asyncio.to_thread(_validate_task_ws_access, user_id, tv, task_id):
+                await websocket.close(code=4401)
+                return
             await websocket.send_json(
                 {"task_id": task_id, "status": status, "percent": percent,
                  "phase": phase, "error": error}
@@ -204,9 +208,12 @@ async def user_events(websocket: WebSocket, ticket: str = "", last_id: str = "$"
                 read_user_events,
                 user_id,
                 cursor,
-                block_ms=25000,
+                block_ms=_EVENTS_BLOCK_MS,
                 count=20,
             )
+            if not await asyncio.to_thread(_validate_event_ws_access, user_id, tv):
+                await websocket.close(code=4401)
+                return
             if events:
                 await websocket.send_json({"events": events, "last_id": cursor})
             else:

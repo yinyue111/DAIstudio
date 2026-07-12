@@ -19,7 +19,6 @@ import zipfile
 from pathlib import Path, PurePosixPath
 from typing import NamedTuple
 
-
 MAX_ARTIFACT_BYTES = 120 * 1024 * 1024
 MAX_FRONTEND_PUBLIC_BYTES = 80 * 1024 * 1024
 MAX_SINGLE_FILE_BYTES = 25 * 1024 * 1024
@@ -34,6 +33,7 @@ BLOCKED_DIRS = {
     ".mypy_cache",
     ".tox",
     ".nox",
+    ".playwright-cli",
     ".codex-run",
     "__MACOSX",
     "__pycache__",

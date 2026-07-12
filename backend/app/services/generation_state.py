@@ -20,8 +20,18 @@ class LocalVideoSettlementError(RuntimeError):
     """The provider result was persisted, but local credit settlement failed."""
 
 
-def claim_terminal(db, task_id: int, status: str, *, error: str | None = None,
-                   cost_settled: int | None = None) -> bool:
+def claim_terminal(
+    db,
+    task_id: int,
+    status: str,
+    *,
+    error: str | None = None,
+    cost_settled: int | None = None,
+    expected_status: str | None = None,
+    expected_phase: str | None = None,
+    expected_external_task_id: str | None = None,
+    expected_params: dict | None = None,
+) -> bool:
     """Atomically move a task into a terminal state.
 
     Returns True iff this call performed the transition, which keeps settlement
@@ -37,11 +47,16 @@ def claim_terminal(db, task_id: int, status: str, *, error: str | None = None,
     # Success settlement is allowed to recover a needs_review task during admin
     # reconciliation, but it must never revive a user-canceled task.
     blocked_statuses = ("succeeded", "failed", CANCELED) if status == "succeeded" else TERMINAL_STATUSES
-    res = db.execute(
-        update(GenTask)
-        .where(GenTask.id == task_id, GenTask.status.not_in(blocked_statuses))
-        .values(**values)
-    )
+    conditions = [GenTask.id == task_id, GenTask.status.not_in(blocked_statuses)]
+    if expected_status is not None:
+        conditions.append(GenTask.status == expected_status)
+    if expected_phase is not None:
+        conditions.append(GenTask.phase == expected_phase)
+    if expected_external_task_id is not None:
+        conditions.append(GenTask.external_task_id == expected_external_task_id)
+    if expected_params is not None:
+        conditions.append(GenTask.params == expected_params)
+    res = db.execute(update(GenTask).where(*conditions).values(**values))
     return (res.rowcount or 0) == 1
 
 

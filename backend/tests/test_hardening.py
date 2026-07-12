@@ -1,7 +1,13 @@
 """Hardening: input validation on generate params + server-side reverse switch."""
 
-from app.db import SessionLocal
-from app.models import GatewayCall, GenTask, ParseRecord, User
+import threading
+
+import pytest
+from sqlalchemy import event
+from starlette.websockets import WebSocketDisconnect
+
+from app.db import SessionLocal, engine
+from app.models import CreditTransaction, GatewayCall, GenAsset, GenTask, ParseRecord, User
 from app.services import gateway, generation, storage
 from app.services.progress import set_progress
 
@@ -301,6 +307,560 @@ def test_image_worker_honors_cancel_before_settlement_after_save(client, make_us
         assert task.cost_settled == 0
         assert user.balance_credits == 1000
         assert user.frozen_credits == 0
+    finally:
+        db.close()
+
+
+def test_image_terminal_tx_cancel_wins_after_files_saved(client, make_user, monkeypatch):
+    from app.services import credits
+    from app.services.generation_media import EditMaskResult
+
+    uid = make_user("13900000458", balance=1000)
+    db = SessionLocal()
+    try:
+        task = GenTask(
+            user_id=uid,
+            source_asset_url="http://example.com/product.png",
+            source_type="image",
+            category="image",
+            stage="preview",
+            status="queued",
+            cost_frozen=10,
+            prompt={"final_text": "pixel lock cancel race", "instruction": "replace background"},
+            params={
+                "n": 1,
+                "size": "256x256",
+                "subject_mode": "product",
+                "edit_mask_mode": "protect_subject",
+                "product_pixel_lock": "strict",
+            },
+        )
+        db.add(task)
+        db.flush()
+        credits.freeze(db, uid, 10, biz_ref=task.id, commit=False)
+        db.commit()
+        tid = task.id
+    finally:
+        db.close()
+
+    monkeypatch.setattr(
+        "app.services.generation_image_flow.gateway_reference_image",
+        lambda *_args, **_kwargs: "data:image/png;base64,cmVm",
+    )
+    monkeypatch.setattr(
+        "app.services.generation_image_flow.gateway_image_edit_mask",
+        lambda *_args, **_kwargs: EditMaskResult(
+            data_uri="data:image/png;base64,bWFzaw==",
+            mode="alpha_subject",
+            confidence=1.0,
+            bbox=(0, 0, 31, 31),
+            width=32,
+            height=32,
+            reason="test",
+        ),
+    )
+    monkeypatch.setattr(
+        "app.services.generation_image_flow.composite_product_subject_pixels",
+        lambda _db, _task, raw, *_args, **_kwargs: (
+            raw,
+            {"_product_composite_placement": "test"},
+        ),
+    )
+    monkeypatch.setattr(
+        "app.services.gateway.gen_image",
+        lambda *_args, **_kwargs: [gateway._mock_image("race", "256x256", 0)],
+    )
+
+    files_saved = threading.Event()
+    cancel_committed = threading.Event()
+    cancel_errors: list[BaseException] = []
+    written_keys: list[str] = []
+    original_save_bytes = storage.save_bytes
+    original_save_bytes_named = storage.save_bytes_named
+
+    def request_cancel_after_all_files() -> None:
+        try:
+            assert files_saved.wait(5), "image files were not all saved"
+            race_db = SessionLocal()
+            try:
+                race_task = race_db.get(GenTask, tid)
+                race_task.params = {**(race_task.params or {}), "_cancel_requested": True}
+                race_db.commit()
+            finally:
+                race_db.close()
+        except BaseException as exc:  # noqa: BLE001
+            cancel_errors.append(exc)
+        finally:
+            cancel_committed.set()
+
+    cancel_thread = threading.Thread(target=request_cancel_after_all_files, daemon=True)
+    cancel_thread.start()
+
+    def track_save_bytes(*args, **kwargs):
+        key = original_save_bytes(*args, **kwargs)
+        written_keys.append(key)
+        return key
+
+    def save_model_ref_then_cancel(*args, **kwargs):
+        key = original_save_bytes_named(*args, **kwargs)
+        written_keys.append(key)
+        files_saved.set()
+        assert cancel_committed.wait(5), "cancel transaction did not commit"
+        return key
+
+    monkeypatch.setattr(storage, "save_bytes", track_save_bytes)
+    monkeypatch.setattr(storage, "save_bytes_named", save_model_ref_then_cancel)
+
+    generation.run_image_task(tid)
+    cancel_thread.join(timeout=5)
+
+    assert not cancel_thread.is_alive()
+    assert cancel_errors == []
+    assert len(written_keys) == 3
+    db = SessionLocal()
+    try:
+        task = db.get(GenTask, tid)
+        user = db.get(User, uid)
+        assets = db.query(GenAsset).filter(GenAsset.task_id == tid).all()
+        settlements = (
+            db.query(CreditTransaction)
+            .filter(
+                CreditTransaction.biz_type == "gen_task",
+                CreditTransaction.biz_ref == tid,
+                CreditTransaction.type == "settle",
+            )
+            .all()
+        )
+        assert task.status == "canceled"
+        assert task.cost_settled == 0
+        assert user.balance_credits == 1000
+        assert user.frozen_credits == 0
+        assert assets == []
+        assert settlements == []
+        assert all(not storage.local_path(key).exists() for key in written_keys)
+    finally:
+        db.close()
+
+
+def test_image_terminal_tx_blocks_running_cancel_and_commits_once(
+    client,
+    make_user,
+    monkeypatch,
+):
+    from fastapi import HTTPException
+
+    from app.routers.tasks import cancel_task
+    from app.services import credits
+
+    uid = make_user("13900000459", balance=1000)
+    db = SessionLocal()
+    try:
+        task = GenTask(
+            user_id=uid,
+            category="image",
+            stage="preview",
+            status="queued",
+            cost_frozen=10,
+            prompt={"final_text": "terminal transaction wins"},
+            params={"n": 1, "size": "256x256"},
+        )
+        db.add(task)
+        db.flush()
+        credits.freeze(db, uid, 10, biz_ref=task.id, commit=False)
+        db.commit()
+        tid = task.id
+    finally:
+        db.close()
+
+    monkeypatch.setattr(
+        "app.services.gateway.gen_image",
+        lambda *_args, **_kwargs: [gateway._mock_image("terminal", "256x256", 0)],
+    )
+
+    cancel_sql_started = threading.Event()
+    terminal_boundary_acquired = threading.Event()
+    cancel_thread_ident: dict[str, int | None] = {"value": None}
+    cancel_outcome: list[int] = []
+    cancel_errors: list[BaseException] = []
+    worker_thread_ident = threading.get_ident()
+
+    def observe_cancel_update(_conn, _cursor, statement, _parameters, _context, _executemany):
+        if (
+            threading.get_ident() == cancel_thread_ident["value"]
+            and statement.lstrip().upper().startswith("UPDATE GEN_TASKS")
+        ):
+            cancel_sql_started.set()
+
+    def launch_cancel_after_terminal_boundary(
+        _conn,
+        _cursor,
+        statement,
+        _parameters,
+        _context,
+        _executemany,
+    ):
+        normalized = " ".join(statement.lower().split())
+        if (
+            threading.get_ident() == worker_thread_ident
+            and "update gen_tasks set status=gen_tasks.status" in normalized
+            and not terminal_boundary_acquired.is_set()
+        ):
+            terminal_boundary_acquired.set()
+            cancel_thread.start()
+            assert cancel_sql_started.wait(5), "running cancel did not attempt its UPDATE"
+
+    def attempt_running_cancel() -> None:
+        cancel_thread_ident["value"] = threading.get_ident()
+        cancel_db = SessionLocal()
+        try:
+            cancel_user = cancel_db.get(User, uid)
+            try:
+                result = cancel_task(tid, db=cancel_db, user=cancel_user)
+            except HTTPException as exc:
+                cancel_outcome.append(exc.status_code)
+            else:
+                cancel_outcome.append(200 if result is not None else 204)
+        except BaseException as exc:  # noqa: BLE001
+            cancel_errors.append(exc)
+        finally:
+            cancel_db.close()
+
+    cancel_thread = threading.Thread(target=attempt_running_cancel, daemon=True)
+    settle_calls = 0
+    original_settle = credits.settle
+
+    def settle_after_cancel_update_starts(*args, **kwargs):
+        nonlocal settle_calls
+        settle_calls += 1
+        assert terminal_boundary_acquired.is_set()
+        return original_settle(*args, **kwargs)
+
+    event.listen(engine, "before_cursor_execute", observe_cancel_update)
+    event.listen(engine, "after_cursor_execute", launch_cancel_after_terminal_boundary)
+    monkeypatch.setattr(credits, "settle", settle_after_cancel_update_starts)
+    try:
+        generation.run_image_task(tid)
+        if terminal_boundary_acquired.is_set():
+            cancel_thread.join(timeout=5)
+    finally:
+        event.remove(engine, "after_cursor_execute", launch_cancel_after_terminal_boundary)
+        event.remove(engine, "before_cursor_execute", observe_cancel_update)
+
+    assert terminal_boundary_acquired.is_set()
+    assert not cancel_thread.is_alive()
+    assert cancel_errors == []
+    assert cancel_outcome == [409]
+    assert settle_calls == 1
+    db = SessionLocal()
+    try:
+        task = db.get(GenTask, tid)
+        assets = db.query(GenAsset).filter(GenAsset.task_id == tid).all()
+        settlements = (
+            db.query(CreditTransaction)
+            .filter(
+                CreditTransaction.biz_type == "gen_task",
+                CreditTransaction.biz_ref == tid,
+                CreditTransaction.type == "settle",
+            )
+            .all()
+        )
+        assert task.status == "succeeded"
+        assert not (task.params or {}).get("_cancel_requested")
+        assert task.error is None
+        assert len(assets) == 1
+        assert len(settlements) == 1
+    finally:
+        db.close()
+
+
+def test_image_settlement_failure_preserves_recoverable_assets(client, make_user, monkeypatch):
+    from app.services import credits
+
+    uid = make_user("13900000460", balance=1000)
+    db = SessionLocal()
+    try:
+        task = GenTask(
+            user_id=uid,
+            category="image",
+            stage="preview",
+            status="queued",
+            cost_frozen=10,
+            prompt={"final_text": "recoverable settlement failure"},
+            params={"n": 1, "size": "256x256"},
+        )
+        db.add(task)
+        db.flush()
+        credits.freeze(db, uid, 10, biz_ref=task.id, commit=False)
+        db.commit()
+        tid = task.id
+    finally:
+        db.close()
+
+    monkeypatch.setattr(
+        "app.services.gateway.gen_image",
+        lambda *_args, **_kwargs: [gateway._mock_image("recover", "256x256", 0)],
+    )
+    monkeypatch.setattr(
+        credits,
+        "settle",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("settle exploded")),
+    )
+
+    generation.run_image_task(tid)
+
+    db = SessionLocal()
+    try:
+        task = db.get(GenTask, tid)
+        user = db.get(User, uid)
+        assets = db.query(GenAsset).filter(GenAsset.task_id == tid).all()
+        settlements = (
+            db.query(CreditTransaction)
+            .filter(
+                CreditTransaction.biz_type == "gen_task",
+                CreditTransaction.biz_ref == tid,
+                CreditTransaction.type == "settle",
+            )
+            .all()
+        )
+        result_keys = list((task.params or {}).get("_image_result_keys") or [])
+        assert task.status == "needs_review"
+        assert task.phase == "reconciling"
+        assert task.cost_settled == 0
+        assert "settle exploded" in (task.error or "")
+        assert task.params["_saved_n"] == 1
+        assert len(result_keys) == 3
+        assert {key.split("/", 1)[0] for key in result_keys} == {"hd", "preview", "model_ref"}
+        assert all(storage.local_path(key).exists() for key in result_keys)
+        assert len(assets) == 1
+        assert assets[0].hd_url == storage.public_url(next(key for key in result_keys if key.startswith("hd/")))
+        assert assets[0].preview_url == storage.public_url(
+            next(key for key in result_keys if key.startswith("preview/"))
+        )
+        assert settlements == []
+        assert user.balance_credits == 990
+        assert user.frozen_credits == 10
+    finally:
+        db.close()
+
+
+_PIXEL_LOCK_RECOVERY_META = {
+    "_product_composite_placement": "bbox_match",
+    "_product_composite_source_bbox": [2, 3, 30, 31],
+    "_product_composite_target_bbox": [4, 5, 28, 29],
+    "_product_composite_target_confidence": 0.93,
+}
+
+
+def _create_frozen_pixel_lock_task(make_user, phone: str, *, n: int, frozen: int) -> tuple[int, int]:
+    from app.services import credits
+
+    uid = make_user(phone, balance=1000)
+    db = SessionLocal()
+    try:
+        task = GenTask(
+            user_id=uid,
+            source_asset_url="http://example.com/product.png",
+            source_type="image",
+            category="image",
+            stage="preview",
+            status="queued",
+            cost_frozen=frozen,
+            prompt={"final_text": "pixel lock recovery", "instruction": "replace background"},
+            params={
+                "n": n,
+                "size": "256x256",
+                "subject_mode": "product",
+                "edit_mask_mode": "protect_subject",
+                "product_pixel_lock": "strict",
+            },
+        )
+        db.add(task)
+        db.flush()
+        credits.freeze(db, uid, frozen, biz_ref=task.id, commit=False)
+        db.commit()
+        return uid, task.id
+    finally:
+        db.close()
+
+
+def _mock_pixel_lock_generation(monkeypatch, images) -> None:
+    from app.services.generation_media import EditMaskResult
+
+    monkeypatch.setattr(
+        "app.services.generation_image_flow.gateway_reference_image",
+        lambda *_args, **_kwargs: "data:image/png;base64,cmVm",
+    )
+    monkeypatch.setattr(
+        "app.services.generation_image_flow.gateway_image_edit_mask",
+        lambda *_args, **_kwargs: EditMaskResult(
+            data_uri="data:image/png;base64,bWFzaw==",
+            mode="alpha_subject",
+            confidence=1.0,
+            bbox=(0, 0, 31, 31),
+            width=32,
+            height=32,
+            reason="test",
+        ),
+    )
+    monkeypatch.setattr(
+        "app.services.generation_image_flow.composite_product_subject_pixels",
+        lambda _db, _task, raw, *_args, **_kwargs: (
+            raw,
+            dict(_PIXEL_LOCK_RECOVERY_META),
+        ),
+    )
+    monkeypatch.setattr("app.services.gateway.gen_image", lambda *_args, **_kwargs: images)
+
+
+def _assert_pixel_lock_recovery(task: GenTask, assets: list[GenAsset]) -> None:
+    result_keys = list((task.params or {}).get("_image_result_keys") or [])
+    assert task.status == "needs_review"
+    assert task.phase == "reconciling"
+    assert task.params["_product_pixel_lock"] == "strict"
+    assert task.params["_product_composite_applied_count"] == 1
+    for key, value in _PIXEL_LOCK_RECOVERY_META.items():
+        assert task.params[key] == value
+    assert len(result_keys) == 3
+    assert {key.split("/", 1)[0] for key in result_keys} == {"hd", "preview", "model_ref"}
+    assert all(storage.local_path(key).exists() for key in result_keys)
+    assert len(assets) == 1
+    assert assets[0].hd_url == storage.public_url(next(key for key in result_keys if key.startswith("hd/")))
+    assert assets[0].preview_url == storage.public_url(
+        next(key for key in result_keys if key.startswith("preview/"))
+    )
+
+
+def test_pixel_lock_unknown_submit_preserves_recovery_metadata(client, make_user, monkeypatch):
+    uid, tid = _create_frozen_pixel_lock_task(
+        make_user,
+        "13900000461",
+        n=2,
+        frozen=20,
+    )
+    _mock_pixel_lock_generation(
+        monkeypatch,
+        gateway.ImageBatchResult(
+            [gateway._mock_image("unknown pixel lock", "256x256", 0)],
+            failures=[
+                gateway.ImageSubrequestFailure(
+                    index=1,
+                    message="read timed out",
+                    submit_state_unknown=True,
+                    retryable_refill=False,
+                )
+            ],
+        ),
+    )
+
+    generation.run_image_task(tid)
+
+    db = SessionLocal()
+    try:
+        task = db.get(GenTask, tid)
+        user = db.get(User, uid)
+        assets = db.query(GenAsset).filter(GenAsset.task_id == tid).all()
+        _assert_pixel_lock_recovery(task, assets)
+        assert task.params["_image_submit_state_unknown"] is True
+        assert task.params["_requested_n"] == 2
+        assert task.params["_saved_n"] == 1
+        assert user.balance_credits == 980
+        assert user.frozen_credits == 20
+    finally:
+        db.close()
+
+
+def test_pixel_lock_settlement_failure_preserves_recovery_metadata(
+    client,
+    make_user,
+    monkeypatch,
+):
+    from app.services import credits
+
+    uid, tid = _create_frozen_pixel_lock_task(
+        make_user,
+        "13900000462",
+        n=1,
+        frozen=10,
+    )
+    _mock_pixel_lock_generation(
+        monkeypatch,
+        [gateway._mock_image("settlement pixel lock", "256x256", 0)],
+    )
+    monkeypatch.setattr(
+        credits,
+        "settle",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("settle exploded")),
+    )
+
+    generation.run_image_task(tid)
+
+    db = SessionLocal()
+    try:
+        task = db.get(GenTask, tid)
+        user = db.get(User, uid)
+        assets = db.query(GenAsset).filter(GenAsset.task_id == tid).all()
+        _assert_pixel_lock_recovery(task, assets)
+        assert task.params["_saved_n"] == 1
+        assert "settle exploded" in (task.error or "")
+        assert user.balance_credits == 990
+        assert user.frozen_credits == 10
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize(
+    "failure_point",
+    ["acquire_image_terminal_boundary", "claim_terminal"],
+)
+def test_image_terminal_persistence_error_preserves_recoverable_result(
+    client,
+    make_user,
+    monkeypatch,
+    failure_point,
+):
+    from sqlalchemy.exc import OperationalError
+
+    uid, tid = _create_frozen_pixel_lock_task(
+        make_user,
+        f"1390000046{3 if failure_point == 'acquire_image_terminal_boundary' else 4}",
+        n=1,
+        frozen=10,
+    )
+    _mock_pixel_lock_generation(
+        monkeypatch,
+        [gateway._mock_image(failure_point, "256x256", 0)],
+    )
+
+    def raise_database_error(*_args, **_kwargs):
+        raise OperationalError("UPDATE gen_tasks", {}, RuntimeError(f"{failure_point} failed"))
+
+    monkeypatch.setattr(
+        f"app.services.generation_image_flow.{failure_point}",
+        raise_database_error,
+    )
+
+    generation.run_image_task(tid)
+
+    db = SessionLocal()
+    try:
+        task = db.get(GenTask, tid)
+        user = db.get(User, uid)
+        assets = db.query(GenAsset).filter(GenAsset.task_id == tid).all()
+        settlements = (
+            db.query(CreditTransaction)
+            .filter(
+                CreditTransaction.biz_type == "gen_task",
+                CreditTransaction.biz_ref == tid,
+                CreditTransaction.type == "settle",
+            )
+            .all()
+        )
+        _assert_pixel_lock_recovery(task, assets)
+        assert task.cost_settled == 0
+        assert failure_point in (task.error or "")
+        assert settlements == []
+        assert user.balance_credits == 990
+        assert user.frozen_credits == 10
     finally:
         db.close()
 
@@ -671,6 +1231,103 @@ def test_websocket_connect_rate_limit(client, make_user, auth, monkeypatch):
     except Exception:
         connected = False
     assert not connected
+
+
+def test_event_websocket_drops_event_returned_during_token_revocation(
+    client,
+    make_user,
+    auth,
+    monkeypatch,
+):
+    user_id = make_user("13900000945", balance=1000)
+    headers = auth("13900000945")
+    ticket = client.post("/api/events/ws-ticket", headers=headers).json()["ticket"]
+    reads = 0
+    observed_block_ms = []
+
+    def revoke_while_reading(_user_id, _last_id, *, block_ms, count):
+        nonlocal reads
+        reads += 1
+        if reads > 1:
+            raise WebSocketDisconnect()
+        observed_block_ms.append(block_ms)
+        assert count == 20
+        db = SessionLocal()
+        try:
+            user = db.get(User, user_id)
+            user.token_version += 1
+            db.commit()
+        finally:
+            db.close()
+        return "1-0", [{"id": "1-0", "type": "secret", "payload": {"value": 2}}]
+
+    monkeypatch.setattr("app.routers.ws.read_user_events", revoke_while_reading)
+
+    with client.websocket_connect(f"/ws/events?ticket={ticket}") as ws:
+        with pytest.raises(WebSocketDisconnect) as closed:
+            ws.receive_json()
+
+    assert closed.value.code == 4401
+    assert max(observed_block_ms) <= 5000
+
+
+def test_task_websocket_rechecks_revocation_before_next_status_frame(
+    client,
+    make_user,
+    auth,
+    monkeypatch,
+):
+    user_id = make_user("13900000946", balance=1000)
+    headers = auth("13900000946")
+    db = SessionLocal()
+    try:
+        task = GenTask(
+            user_id=user_id,
+            category="image",
+            stage="preview",
+            prompt={"final_text": "x"},
+            model_use="image",
+            params={"n": 1, "size": "256x256"},
+            status="running",
+            cost_frozen=5,
+            cost_settled=0,
+        )
+        db.add(task)
+        db.commit()
+        db.refresh(task)
+        task_id = task.id
+    finally:
+        db.close()
+
+    set_progress(task_id, 50, "running")
+    waits = 0
+
+    def revoke_before_third_frame(_task_id, _last_id, *, block_ms):
+        nonlocal waits
+        waits += 1
+        assert block_ms == 5000
+        if waits == 2:
+            revoke_db = SessionLocal()
+            try:
+                user = revoke_db.get(User, user_id)
+                user.token_version += 1
+                revoke_db.commit()
+            finally:
+                revoke_db.close()
+        if waits > 2:
+            raise WebSocketDisconnect()
+        return f"{waits}-0", {"percent": 50, "status": "running"}
+
+    monkeypatch.setattr("app.routers.ws.wait_progress_event", revoke_before_third_frame)
+    ticket = client.post(f"/api/tasks/{task_id}/ws-ticket", headers=headers).json()["ticket"]
+
+    with client.websocket_connect(f"/ws/tasks/{task_id}?ticket={ticket}") as ws:
+        assert ws.receive_json()["status"] == "running"
+        assert ws.receive_json()["status"] == "running"
+        with pytest.raises(WebSocketDisconnect) as closed:
+            ws.receive_json()
+
+    assert closed.value.code == 4401
 
 
 def test_generate_rejects_oversized_n(client, make_user, auth):

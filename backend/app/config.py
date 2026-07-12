@@ -7,11 +7,13 @@ to seed those rows on first boot.
 """
 from __future__ import annotations
 
+import math
 from functools import lru_cache
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import yaml
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 BASE_DIR = Path(__file__).resolve().parent.parent  # backend/
@@ -28,6 +30,7 @@ class DatabaseSettings(BaseModel):
 
 class RedisSettings(BaseModel):
     url: str
+    password: str
     max_connections: int
     socket_connect_timeout_seconds: float
     socket_timeout_seconds: float
@@ -168,6 +171,7 @@ class Settings(BaseSettings):
     # --- Datastores ---
     database_url: str = "postgresql+psycopg2://postgres:postgres@localhost:5432/ai_studio"
     redis_url: str = "redis://localhost:6379/0"
+    redis_password: str = ""
     db_pool_size: int = 10
     db_max_overflow: int = 20
     db_pool_timeout_seconds: int = 30
@@ -234,6 +238,7 @@ class Settings(BaseSettings):
     # render — tune down, or run a dedicated video worker, under high load).
     video_poll_max_seconds: int = 7200
     video_poll_interval_seconds: int = 5
+    video_resume_batch_size: int = 100
     video_download_max_attempts: int = 3
     # Provider-rendered videos can be large and remote object storage may be
     # slow after generation completes. Keep the media download timeout wider
@@ -251,6 +256,9 @@ class Settings(BaseSettings):
     celery_task_time_limit_seconds: int = 8100
     celery_task_soft_time_limit_seconds: int = 7800
     celery_worker_shutdown_grace_seconds: int = 600
+    celery_beat_lease_key: str = "celery:beat:owner"
+    celery_beat_lease_ttl_seconds: int = 60
+    celery_beat_lease_refresh_seconds: int = 20
 
     # --- Storage (local filesystem for the bare-metal MVP) ---
     storage_backend: str = "local"  # local | s3
@@ -314,6 +322,9 @@ class Settings(BaseSettings):
     max_image_dim: int = 2048
     max_upload_image_bytes: int = 20 * 1024 * 1024
     max_upload_image_pixels: int = 24_000_000
+    upload_processing_parallelism: int = 2
+    upload_processing_acquire_timeout_seconds: float = 10.0
+    subject_protection_parallelism: int = 2
     max_upload_video_bytes: int = 512 * 1024 * 1024
     user_upload_storage_quota_bytes: int = 2 * 1024 * 1024 * 1024
     payment_notify_max_body_bytes: int = 64 * 1024
@@ -412,6 +423,35 @@ class Settings(BaseSettings):
     def _strip(cls, v: str) -> str:
         return v
 
+    @field_validator("upload_processing_parallelism")
+    @classmethod
+    def _validate_upload_processing_parallelism(cls, value: int) -> int:
+        if value < 1:
+            raise ValueError("upload_processing_parallelism must be at least 1")
+        return value
+
+    @field_validator("upload_processing_acquire_timeout_seconds")
+    @classmethod
+    def _validate_upload_processing_acquire_timeout(cls, value: float) -> float:
+        if not math.isfinite(value) or value <= 0:
+            raise ValueError("upload_processing_acquire_timeout_seconds must be finite and positive")
+        return value
+
+    @field_validator("celery_beat_lease_ttl_seconds", "celery_beat_lease_refresh_seconds")
+    @classmethod
+    def _validate_beat_lease_seconds(cls, value: int) -> int:
+        if value <= 0:
+            raise ValueError("celery beat lease durations must be positive integers")
+        return value
+
+    @model_validator(mode="after")
+    def _validate_datastore_credentials_and_beat_lease(self):
+        if self.redis_password and urlsplit(self.redis_url).password is not None:
+            raise ValueError("configure Redis password in REDIS_PASSWORD or REDIS_URL, not both")
+        if self.celery_beat_lease_refresh_seconds * 3 > self.celery_beat_lease_ttl_seconds:
+            raise ValueError("celery beat lease TTL must be at least three refresh intervals")
+        return self
+
     @property
     def cors_origin_list(self) -> list[str]:
         return [o.strip() for o in self.cors_origins.split(",") if o.strip()]
@@ -451,6 +491,7 @@ class Settings(BaseSettings):
     def redis(self) -> RedisSettings:
         return RedisSettings(
             url=self.redis_url,
+            password=self.redis_password,
             max_connections=self.redis_max_connections,
             socket_connect_timeout_seconds=self.redis_socket_connect_timeout_seconds,
             socket_timeout_seconds=self.redis_socket_timeout_seconds,

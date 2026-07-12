@@ -105,6 +105,33 @@ globalThis.fetch = async () => new Response("{}", { status: 401 });
   assert.equal(result.path, "/login?next=%2Fhistory", "invalid cookies should redirect to login with next path");
 }
 
+globalThis.fetch = async () => new Response("{}", { status: 403 });
+{
+  const result = await middlewareResult("/history", "forbidden-cookie-shape");
+  assert.equal(result.status, 307, "explicitly forbidden sessions should redirect to login");
+  assert.equal(result.path, "/login?next=%2Fhistory");
+}
+
+globalThis.fetch = async () => new Response("database_password=do-not-expose", { status: 503 });
+{
+  const response = await proxy(request("/history", "session-during-outage"));
+  assert.equal(response.status, 200, "an API outage must not be treated as a logged-out session");
+  assert.equal(response.headers.get("location"), null, "an API outage should preserve the current route");
+  assert.doesNotMatch(await response.text(), /database_password|do-not-expose/);
+  assert.doesNotMatch(JSON.stringify([...response.headers]), /database_password|do-not-expose/);
+}
+
+globalThis.fetch = async () => {
+  throw new Error("connect ECONNREFUSED internal-api-token=do-not-expose");
+};
+{
+  const response = await proxy(request("/profile?filter=image", "session-during-network-error"));
+  assert.equal(response.status, 200, "a network failure must not be treated as a logged-out session");
+  assert.equal(response.headers.get("location"), null, "a network failure should preserve the current route");
+  assert.doesNotMatch(await response.text(), /internal-api-token|do-not-expose/);
+  assert.doesNotMatch(JSON.stringify([...response.headers]), /internal-api-token|do-not-expose/);
+}
+
 globalThis.fetch = originalFetch;
 if (originalInternalApiBase === undefined) delete process.env.API_INTERNAL_BASE;
 else process.env.API_INTERNAL_BASE = originalInternalApiBase;

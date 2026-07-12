@@ -12,12 +12,11 @@ import hashlib
 import inspect
 import json
 import logging
-import secrets
 from datetime import datetime, timezone
 from urllib.parse import urlparse
 
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -50,6 +49,10 @@ _REVERSE_RATE_WINDOW = 3600
 REVERSE_IMAGE_REFERENCE_MAX_SIDE = 1024
 REVERSE_IMAGE_REFERENCE_QUALITY = 92
 _assert_text_allowed = assert_text_allowed
+
+
+class ReverseOperationClosed(Exception):
+    """The request lost ownership because recovery already finalized it."""
 
 
 def _looks_like_video_url(url: str) -> bool:
@@ -141,10 +144,6 @@ def _rate_limit(user_id: int) -> None:
         raise HTTPException(429, "反推过于频繁,请稍后再试")
 
 
-def _reverse_biz_ref() -> int:
-    return secrets.randbits(63)
-
-
 def _reverse_request_fingerprint(body: ReverseIn) -> str:
     payload = {
         "asset_url": body.asset_url,
@@ -203,10 +202,8 @@ def _reserve_reverse_operation(
     *,
     user_id: int,
     body: ReverseIn,
-) -> tuple[ReverseOperation | None, ReverseOut | None]:
-    raw_key = (body.client_request_id or "").strip()
-    if not raw_key:
-        return None, None
+) -> tuple[ReverseOperation, ReverseOut | None]:
+    raw_key = (body.client_request_id or "").strip() or None
     fingerprint = _reverse_request_fingerprint(body)
     op = ReverseOperation(
         user_id=user_id,
@@ -223,6 +220,8 @@ def _reserve_reverse_operation(
         return op, None
     except IntegrityError as e:
         db.rollback()
+        if raw_key is None:
+            raise
         existing = db.execute(
             select(ReverseOperation).where(
                 ReverseOperation.user_id == user_id,
@@ -240,39 +239,193 @@ def _reserve_reverse_operation(
         raise HTTPException(409, "该反推请求已失败,请重新发起") from e
 
 
+def _running_reverse_operation_for_update(
+    db: Session,
+    operation_id: int,
+) -> ReverseOperation:
+    operation = db.execute(
+        select(ReverseOperation)
+        .where(
+            ReverseOperation.id == operation_id,
+            ReverseOperation.status == "running",
+        )
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    ).scalar_one_or_none()
+    if operation is None:
+        db.rollback()
+        raise ReverseOperationClosed
+    return operation
+
+
+def _charge_reverse_operation(
+    db: Session,
+    operation_id: int,
+    amount: int,
+    *,
+    note: str,
+) -> None:
+    if amount <= 0:
+        return
+    operation = _running_reverse_operation_for_update(db, operation_id)
+    operation.charged_credits = int(operation.charged_credits or 0) + amount
+    operation.updated_at = datetime.now(timezone.utc)
+    # Establish operation-row ownership before credits.consume locks the user.
+    db.flush()
+    credits.consume(
+        db,
+        operation.user_id,
+        amount,
+        biz_type="reverse",
+        biz_ref=operation.id,
+        note=note,
+        commit=False,
+    )
+    db.commit()
+
+
+def _refund_reverse_operation_charge(
+    db: Session,
+    operation_id: int,
+    amount: int,
+    *,
+    note: str,
+) -> None:
+    if amount <= 0:
+        return
+    operation = _running_reverse_operation_for_update(db, operation_id)
+    charged = int(operation.charged_credits or 0)
+    if amount > charged:
+        db.rollback()
+        raise credits.InsufficientCredits(
+            f"反推扣费记录不足:需要退回 {amount},当前已扣 {charged}"
+        )
+    operation.charged_credits = charged - amount
+    operation.updated_at = datetime.now(timezone.utc)
+    db.flush()
+    credits.refund_consumed(
+        db,
+        operation.user_id,
+        amount,
+        biz_type="reverse",
+        biz_ref=operation.id,
+        note=note,
+        commit=False,
+    )
+    db.commit()
+
+
+def _touch_reverse_operation(
+    db: Session,
+    operation_id: int,
+    *,
+    charged_credits: int,
+) -> bool:
+    claimed = db.execute(
+        update(ReverseOperation)
+        .where(
+            ReverseOperation.id == operation_id,
+            ReverseOperation.status == "running",
+            ReverseOperation.charged_credits == int(charged_credits or 0),
+        )
+        .values(updated_at=datetime.now(timezone.utc))
+        .returning(ReverseOperation.id)
+        .execution_options(synchronize_session=False)
+    ).first()
+    if claimed is None:
+        db.rollback()
+        return False
+    db.commit()
+    return True
+
+
 def _finish_reverse_operation(
     db: Session,
-    op: ReverseOperation | None,
+    operation_id: int,
     *,
     result: dict,
     charged_credits: int,
     reference_count: int,
-) -> None:
-    if not op:
-        return
-    op.status = "succeeded"
-    op.result = {
-        "structured": result.get("structured") or {},
-        "final_text": result.get("final_text") or "",
-    }
-    op.charged_credits = int(charged_credits or 0)
-    op.reference_count = max(1, int(reference_count or 1))
-    op.error = None
-    op.updated_at = datetime.now(timezone.utc)
+) -> bool:
+    claimed = db.execute(
+        update(ReverseOperation)
+        .where(
+            ReverseOperation.id == operation_id,
+            ReverseOperation.status == "running",
+            ReverseOperation.charged_credits == int(charged_credits or 0),
+        )
+        .values(
+            status="succeeded",
+            result={
+                "structured": result.get("structured") or {},
+                "final_text": result.get("final_text") or "",
+            },
+            reference_count=max(1, int(reference_count or 1)),
+            error=None,
+            updated_at=datetime.now(timezone.utc),
+        )
+        .returning(ReverseOperation.id)
+        .execution_options(synchronize_session=False)
+    ).first()
+    if claimed is None:
+        db.rollback()
+        return False
     db.commit()
+    return True
 
 
-def _fail_reverse_operation(db: Session, op: ReverseOperation | None, error: str) -> None:
-    if not op:
-        return
+def _fail_reverse_operation(
+    db: Session,
+    operation_id: int,
+    error: str,
+    *,
+    refund_note: str,
+) -> bool:
     try:
-        op.status = "failed"
-        op.error = str(error or "反推失败")[:1000]
-        op.updated_at = datetime.now(timezone.utc)
+        claimed = db.execute(
+            update(ReverseOperation)
+            .where(
+                ReverseOperation.id == operation_id,
+                ReverseOperation.status == "running",
+            )
+            .values(
+                status="failed",
+                error=str(error or "反推失败")[:1000],
+                updated_at=datetime.now(timezone.utc),
+            )
+            .returning(
+                ReverseOperation.user_id,
+                ReverseOperation.charged_credits,
+            )
+            .execution_options(synchronize_session=False)
+        ).first()
+        if claimed is None:
+            db.rollback()
+            return False
+        user_id, charged_credits = claimed
+        charged = int(charged_credits or 0)
+        if charged:
+            db.execute(
+                update(ReverseOperation)
+                .where(ReverseOperation.id == operation_id)
+                .values(charged_credits=0)
+                .execution_options(synchronize_session=False)
+            )
+            credits.refund_consumed(
+                db,
+                int(user_id),
+                charged,
+                biz_type="reverse",
+                biz_ref=operation_id,
+                note=refund_note,
+                commit=False,
+            )
         db.commit()
+        return True
     except Exception:  # noqa: BLE001
         db.rollback()
-        log.exception("failed to mark reverse operation %s failed", op.id)
+        log.exception("failed to fail and refund reverse operation %s", operation_id)
+        return False
 
 
 def _video_duration_for_reverse(body: ReverseIn, db: Session, user: User) -> float | None:
@@ -334,7 +487,7 @@ def reverse(body: ReverseIn, db: Session = Depends(get_db),
         return replay
 
     precharged = 0
-    biz_ref = _reverse_biz_ref()
+    operation_id = int(operation.id)
     video_preset = normalize_video_analysis_preset(body.video_analysis_preset)
     expected_cost = reverse_cost(body.target, preset=video_preset)
     requested_frame_budget = 1
@@ -345,12 +498,25 @@ def reverse(body: ReverseIn, db: Session = Depends(get_db),
         precharged = expected_cost
         if precharged:
             try:
-                credits.consume(db, user.id, precharged, biz_type="reverse",
-                                biz_ref=biz_ref,
-                                note=f"preauth target={body.target},preset={video_preset},max_refs={precharge_frames}")
+                _charge_reverse_operation(
+                    db,
+                    operation_id,
+                    precharged,
+                    note=(
+                        f"preauth target={body.target},preset={video_preset},"
+                        f"max_refs={precharge_frames}"
+                    ),
+                )
             except credits.InsufficientCredits as e:
-                _fail_reverse_operation(db, operation, str(e))
+                _fail_reverse_operation(
+                    db,
+                    operation_id,
+                    str(e),
+                    refund_note=f"preauth_failed target={body.target}",
+                )
                 raise HTTPException(400, str(e))
+            except ReverseOperationClosed:
+                raise HTTPException(409, "反推请求已被恢复任务关闭,请重新发起") from None
     try:
         refs = _collect_refs(
             body,
@@ -360,45 +526,60 @@ def reverse(body: ReverseIn, db: Session = Depends(get_db),
             video_preset=video_preset,
         )
     except Exception:
-        if precharged:
-            credits.refund_consumed(db, user.id, precharged, biz_type="reverse",
-                                    biz_ref=biz_ref,
-                                    note=f"preauth_refund target={body.target}")
-        _fail_reverse_operation(db, operation, "素材引用解析失败")
+        _fail_reverse_operation(
+            db,
+            operation_id,
+            "素材引用解析失败",
+            refund_note=f"preauth_refund target={body.target}",
+        )
         raise
     cost = expected_cost
     if precharged > cost:
-        credits.refund_consumed(db, user.id, precharged - cost, biz_type="reverse",
-                                biz_ref=biz_ref,
-                                note=f"preauth_adjust target={body.target},refs={len(refs)}")
+        try:
+            _refund_reverse_operation_charge(
+                db,
+                operation_id,
+                precharged - cost,
+                note=f"preauth_adjust target={body.target},refs={len(refs)}",
+            )
+        except ReverseOperationClosed:
+            raise HTTPException(409, "反推请求已被恢复任务关闭,请重新发起") from None
     elif cost > precharged:
         try:
-            credits.consume(db, user.id, cost - precharged, biz_type="reverse",
-                            biz_ref=biz_ref,
-                            note=f"target={body.target},preset={video_preset},refs={len(refs)}")
+            _charge_reverse_operation(
+                db,
+                operation_id,
+                cost - precharged,
+                note=f"target={body.target},preset={video_preset},refs={len(refs)}",
+            )
         except credits.InsufficientCredits as e:
-            if precharged:
-                credits.refund_consumed(db, user.id, precharged, biz_type="reverse",
-                                        biz_ref=biz_ref,
-                                        note=f"preauth_refund target={body.target}")
-            _fail_reverse_operation(db, operation, str(e))
+            _fail_reverse_operation(
+                db,
+                operation_id,
+                str(e),
+                refund_note=f"preauth_refund target={body.target}",
+            )
             raise HTTPException(400, str(e))
+        except ReverseOperationClosed:
+            raise HTTPException(409, "反推请求已被恢复任务关闭,请重新发起") from None
+    if not _touch_reverse_operation(
+        db,
+        operation_id,
+        charged_credits=cost,
+    ):
+        raise HTTPException(409, "反推请求已被恢复任务关闭,请重新发起")
     try:
         kwargs = {"target": body.target}
         if _accepts_gateway_config(gateway.reverse_prompt):
             kwargs["gateway_config"] = runtime_config_for_model(model, "vision")
         result = gateway.reverse_prompt(refs, model.model_id, **kwargs)
     except HTTPException as e:
-        if cost:
-            credits.refund_consumed(
-                db,
-                user.id,
-                cost,
-                biz_type="reverse",
-                biz_ref=biz_ref,
-                note=f"failed target={body.target},refs={len(refs)}",
-            )
-        _fail_reverse_operation(db, operation, str(e.detail))
+        _fail_reverse_operation(
+            db,
+            operation_id,
+            str(e.detail),
+            refund_note=f"failed target={body.target},refs={len(refs)}",
+        )
         usage.record_call(db, kind="reverse", model_id=model.model_id,
                           user_id=user.id, status="failed",
                           detail={"target": body.target, "cost": cost,
@@ -406,11 +587,12 @@ def reverse(body: ReverseIn, db: Session = Depends(get_db),
                                   "error": str(e.detail)[:200]})
         raise
     except gateway.GatewayError as e:
-        if cost:
-            credits.refund_consumed(db, user.id, cost, biz_type="reverse",
-                                    biz_ref=biz_ref,
-                                    note=f"failed target={body.target},refs={len(refs)}")
-        _fail_reverse_operation(db, operation, str(e))
+        _fail_reverse_operation(
+            db,
+            operation_id,
+            str(e),
+            refund_note=f"failed target={body.target},refs={len(refs)}",
+        )
         usage.record_call(db, kind="reverse", model_id=model.model_id,
                           user_id=user.id, status="failed",
                           detail={"target": body.target, "cost": cost,
@@ -421,11 +603,12 @@ def reverse(body: ReverseIn, db: Session = Depends(get_db),
             message = "反推失败:视觉模型响应超时,请先切换到快速/标准分析后重试"
         raise HTTPException(502, message)
     except Exception as e:  # noqa: BLE001
-        if cost:
-            credits.refund_consumed(db, user.id, cost, biz_type="reverse",
-                                    biz_ref=biz_ref,
-                                    note=f"failed target={body.target},refs={len(refs)}")
-        _fail_reverse_operation(db, operation, str(e))
+        _fail_reverse_operation(
+            db,
+            operation_id,
+            str(e),
+            refund_note=f"failed target={body.target},refs={len(refs)}",
+        )
         usage.record_call(db, kind="reverse", model_id=model.model_id,
                           user_id=user.id, status="failed",
                           detail={"target": body.target, "cost": cost,
@@ -436,16 +619,12 @@ def reverse(body: ReverseIn, db: Session = Depends(get_db),
     try:
         _assert_text_allowed(db, result.get("structured"), result.get("final_text"))
     except HTTPException:
-        if cost:
-            credits.refund_consumed(
-                db,
-                user.id,
-                cost,
-                biz_type="reverse",
-                biz_ref=biz_ref,
-                note=f"blocked_output target={body.target},refs={len(refs)}",
-            )
-        _fail_reverse_operation(db, operation, "反推结果被内容安全策略拦截")
+        _fail_reverse_operation(
+            db,
+            operation_id,
+            "反推结果被内容安全策略拦截",
+            refund_note=f"blocked_output target={body.target},refs={len(refs)}",
+        )
         usage.record_call(
             db,
             kind="reverse",
@@ -469,13 +648,15 @@ def reverse(body: ReverseIn, db: Session = Depends(get_db),
                       usage=result.get("usage"),
                       detail={"target": body.target, "preset": video_preset,
                               "frames": len(refs), "cost": cost})
-    _finish_reverse_operation(
+    finished = _finish_reverse_operation(
         db,
-        operation,
+        operation_id,
         result=result,
         charged_credits=cost,
         reference_count=max(1, len(refs)),
     )
+    if not finished:
+        raise HTTPException(409, "反推请求已被恢复任务关闭,请重新发起")
     try:
         if body.target == "video":
             history_title = "视频反推提示词"

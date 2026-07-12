@@ -8,8 +8,10 @@ still depend on local filesystem paths.
 from __future__ import annotations
 
 import os
+import stat
 import tempfile
 import uuid
+from collections.abc import Callable
 from functools import lru_cache
 from pathlib import Path
 from typing import BinaryIO
@@ -91,6 +93,40 @@ def _validate_key(key: str) -> str:
     return key
 
 
+def _atomic_publish(target: Path, write_content: Callable[[BinaryIO], object]) -> None:
+    temp_path: Path | None = None
+    try:
+        for _ in range(tempfile.TMP_MAX):
+            candidate = target.parent / f".storage-{uuid.uuid4().hex}.tmp"
+            try:
+                temp_file = open(candidate, "xb")
+            except FileExistsError:
+                continue
+            temp_path = candidate
+            break
+        else:
+            raise FileExistsError("无法创建临时存储文件")
+
+        with temp_file:
+            write_content(temp_file)
+            try:
+                target_mode = stat.S_IMODE(target.stat().st_mode)
+            except FileNotFoundError:
+                pass
+            else:
+                temp_file.flush()
+                os.fchmod(temp_file.fileno(), target_mode)
+        os.replace(temp_path, target)
+        temp_path = None
+    except BaseException as publish_error:
+        if temp_path is not None:
+            try:
+                temp_path.unlink(missing_ok=True)
+            except Exception as cleanup_error:
+                raise publish_error from cleanup_error
+        raise
+
+
 def save_bytes(data: bytes, subdir: str, ext: str) -> str:
     """Save bytes and return the relative key (subdir/filename)."""
     name = f"{uuid.uuid4().hex}.{ext.lstrip('.')}"
@@ -99,8 +135,7 @@ def save_bytes(data: bytes, subdir: str, ext: str) -> str:
         _s3_client().put_object(Bucket=settings.storage.s3_bucket, Key=key, Body=data)
         return key
     _ensure(subdir)
-    with open(ROOT / key, "wb") as f:
-        f.write(data)
+    _atomic_publish(ROOT / key, lambda file_obj: file_obj.write(data))
     return key
 
 
@@ -114,8 +149,7 @@ def save_bytes_named(data: bytes, subdir: str, filename: str) -> str:
         _s3_client().put_object(Bucket=settings.storage.s3_bucket, Key=key, Body=data)
         return key
     _ensure(subdir)
-    with open(ROOT / key, "wb") as f:
-        f.write(data)
+    _atomic_publish(ROOT / key, lambda file_obj: file_obj.write(data))
     return key
 
 
@@ -128,12 +162,16 @@ def save_file(path: Path, subdir: str, ext: str) -> str:
         return key
     _ensure(subdir)
     target = ROOT / key
-    with open(path, "rb") as src, open(target, "wb") as dst:
-        while True:
-            chunk = src.read(1024 * 1024)
-            if not chunk:
-                break
-            dst.write(chunk)
+
+    def copy_content(dst: BinaryIO) -> None:
+        with open(path, "rb") as src:
+            while True:
+                chunk = src.read(1024 * 1024)
+                if not chunk:
+                    break
+                dst.write(chunk)
+
+    _atomic_publish(target, copy_content)
     return key
 
 

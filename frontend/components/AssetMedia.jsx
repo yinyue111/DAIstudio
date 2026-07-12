@@ -61,6 +61,7 @@ function mediaAllowlistOrigins() {
 export function safeAssetMediaSrc(src) {
   const value = String(src || "").trim();
   if (!value) return "";
+  if (value.includes("\\")) return "";
   if (value.startsWith("//")) return "";
   if (value.startsWith("blob:") || value.startsWith("/")) return value;
   if (typeof window === "undefined") return "";
@@ -190,16 +191,7 @@ export default function AssetMedia({
       };
     }
     if (asset.type !== "video") return;
-    api.playbackTicket(asset.id)
-      .then((res) => {
-        if (!cancelled) setPlaybackUrl(api.playbackUrl(asset.id, res.ticket));
-      })
-      .catch((e) => {
-        if (!cancelled) {
-          setError(e.message || "视频加载失败");
-          if (onError) onError(e);
-        }
-      });
+    setPlaybackUrl(api.playbackUrl(asset.id));
     return () => {
       cancelled = true;
     };

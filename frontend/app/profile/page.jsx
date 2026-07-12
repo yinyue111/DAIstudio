@@ -4,6 +4,8 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { api, clearToken, downloadBlob, loginPath } from "../../lib/api";
 import { redirectOnAuthError, reportBackgroundError, showError } from "../../lib/errorHandling";
+import { localDateRangeToProfileAssetParams } from "../../lib/datetime";
+import { saveStudioUserDraft } from "../../lib/studioSession";
 import Nav from "../../components/Nav";
 import { useToast } from "../../components/ToastProvider";
 import AssetMedia, {
@@ -75,7 +77,10 @@ export default function ProfilePage() {
   }, [assets]);
 
   function paramsFor(f) {
-    const base = { ...assetFilters };
+    const base = {
+      ...assetFilters,
+      ...localDateRangeToProfileAssetParams(assetFilters.created_from, assetFilters.created_to),
+    };
     if (f === "fav") return { ...base, favorite: true };
     if (f === "image" || f === "video") return { ...base, type: f };
     return base;
@@ -256,7 +261,7 @@ export default function ProfilePage() {
       return;
     }
     try {
-      window.localStorage.setItem(STUDIO_VARIATION_DRAFT_KEY, JSON.stringify({
+      const saved = saveStudioUserDraft(window.localStorage, STUDIO_VARIATION_DRAFT_KEY, me?.id, {
         asset: {
           ...asset,
           type: "image",
@@ -264,7 +269,8 @@ export default function ProfilePage() {
           thumb: asset.preview_url || asset.thumb || sourceUrl,
         },
         prompt: "基于这张图生成同主体、同构图、同光线和同广告质感的近似变体；保留主体结构、产品文字、Logo、比例和核心视觉，只做轻微差异化。",
-      }));
+      });
+      if (!saved) throw new Error("无法保存当前用户的变体草稿");
       router.push("/");
     } catch (e) {
       setMsg(e.message || "创建变体草稿失败");

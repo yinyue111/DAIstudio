@@ -107,6 +107,24 @@ export interface AdminUsersQuery {
   offset?: number;
 }
 
+export type EditMaskMode = "protect_subject" | "center_box" | "off";
+export type ProductPixelLockMode = "auto" | "strict" | "off";
+
+export interface SubjectProtectionPreview {
+  mode: "alpha_subject" | "auto_subject" | "center_box" | "none";
+  confidence: number;
+  bbox: number[] | null;
+  width: number;
+  height: number;
+  mask_data_uri: string | null;
+  will_send_mask: boolean;
+  pixel_lock_recommended: boolean;
+  risk_level: "low" | "medium" | "high";
+  title: string;
+  message: string;
+  recommendations: string[];
+}
+
 export function wsUrl(path: string): string;
 export function getToken(): string | null;
 export function setToken(token: string | null): void;
@@ -135,8 +153,8 @@ export const api: {
   logout(): Promise<unknown>;
   parse(url: string): Promise<unknown>;
   parseStatus(id: number | string): Promise<unknown>;
-  uploadImage(file: File): Promise<Asset>;
-  uploadVideo(file: File): Promise<Asset>;
+  uploadImage(file: File, options?: { signal?: AbortSignal }): Promise<Asset>;
+  uploadVideo(file: File, options?: { signal?: AbortSignal }): Promise<Asset>;
   reverse(
     asset_url: string,
     target?: ReverseTarget,
@@ -145,6 +163,7 @@ export const api: {
     video_analysis_preset?: string | null,
     client_request_id?: string | null,
   ): Promise<unknown>;
+  subjectProtectionPreview(asset_url: string, edit_mask_mode?: EditMaskMode): Promise<SubjectProtectionPreview>;
   generate(payload: GeneratePayload): Promise<Task>;
   task(id: number | string): Promise<Task>;
   taskWsTicket(id: number | string): Promise<{ ticket: string; expires_in: number }>;
@@ -153,7 +172,7 @@ export const api: {
   cancelTask(taskId: number | string): Promise<Task>;
   unlock(assetId: number | string): Promise<Asset>;
   playbackTicket(assetId: number | string): Promise<unknown>;
-  playbackUrl(assetId: number | string, ticket: string): string;
+  playbackUrl(assetId: number | string): string;
   favoriteAsset(assetId: number | string): Promise<Asset>;
   reportAsset(assetId: number | string, body: Record<string, unknown>): Promise<unknown>;
   deleteAsset(assetId: number | string): Promise<unknown>;

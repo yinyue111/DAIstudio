@@ -4,6 +4,22 @@ import { useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { api, downloadBlob, setUnauthorizedHandler } from "../lib/api";
 import { errorMessage, redirectOnAuthError, reportBackgroundError, showError } from "../lib/errorHandling";
+import {
+  applyStudioVariationTransferState,
+  canApplyStudioPromptTransfer,
+  createLatestOnlyDraftWriter,
+  createLatestOnlyStudioOwnerRequest,
+  createStudioDraftClock,
+  createStudioOwnerRequestContext,
+  createStudioOwnerSessionCoordinator,
+  mergeStudioDraftMetadataLayers,
+  mergeStudioLiveDraftState,
+  mergeStudioWorkspaceLayers,
+  readStudioUserDraft,
+  removeStudioUserDraft,
+  saveStudioUserDraft,
+} from "../lib/studioSession";
+import { startSubjectProtectionPreview } from "../lib/studioSubjectProtection";
 import Nav from "../components/Nav";
 import { canDownloadAsset, isAssetTakenDown } from "../components/AssetMedia";
 import AssetWindowControls from "../components/AssetWindowControls";
@@ -45,6 +61,14 @@ import {
 import { buildStudioDerivedViewState, modelEnabledForConfig, studioCreationFacts } from "./studio/viewModel";
 
 function parsePromptDraft(raw) {
+  if (raw && typeof raw === "object") {
+    return {
+      prompt: String(raw.prompt || ""),
+      category: String(raw.category || ""),
+      creationMode: String(raw.creationMode || ""),
+      savedAt: Number(raw.savedAt || 0),
+    };
+  }
   try {
     const parsed = JSON.parse(raw);
     if (parsed && typeof parsed === "object") {
@@ -103,9 +127,20 @@ export default function Home() {
   const loadWorksSeqRef = useRef(0);
   const taskRef = useRef(null);
   const workspacesRef = useRef(null);
-  const draftSyncTimerRef = useRef(null);
   const cloudDraftLoadedRef = useRef(false);
-  const restoredLocalDraftAtRef = useRef(0);
+  const studioInitSeqRef = useRef(0);
+  const studioDraftClockRef = useRef(null);
+  const studioOwnerSessionCoordinatorRef = useRef(null);
+  const studioOwnerSessionRef = useRef(null);
+  const latestMeRequestRef = useRef(null);
+  const assetOwnerRequestContextRef = useRef(null);
+  const studioOwnerUserIdRef = useRef("");
+  const initialStudioUiStateRef = useRef(null);
+  const cloudDraftWriterRef = useRef(null);
+  const studioUiStateRef = useRef(null);
+  const variationRestoreContextRef = useRef(null);
+  const subjectProfilePendingRequestRef = useRef(null);
+  const subjectProfileResultCacheRef = useRef(null);
   const {
     workspaces,
     setWorkspaces,
@@ -119,14 +154,55 @@ export default function Home() {
     setN,
     setSeed,
     setEditMaskMode,
+    setProductPixelLockMode,
     setVDuration,
     setVResolution,
     setVideoProductLockMode,
+    setVideoProductTemplate,
     setVideoAnalysisPreset,
     setStructured,
     setNegativeTouched,
     setPromptDirty,
   } = useStudioWorkspaceState({ creationMode, modes: CREATION_MODES });
+  if (!studioDraftClockRef.current) {
+    studioDraftClockRef.current = createStudioDraftClock();
+  }
+  if (!studioOwnerSessionCoordinatorRef.current) {
+    studioOwnerSessionCoordinatorRef.current = createStudioOwnerSessionCoordinator({
+      clock: studioDraftClockRef.current,
+    });
+  }
+  if (!latestMeRequestRef.current) {
+    latestMeRequestRef.current = createLatestOnlyStudioOwnerRequest(
+      () => studioOwnerSessionRef.current,
+    );
+  }
+  if (!assetOwnerRequestContextRef.current) {
+    assetOwnerRequestContextRef.current = createStudioOwnerRequestContext(
+      () => studioOwnerSessionRef.current,
+    );
+  }
+  if (!initialStudioUiStateRef.current) {
+    initialStudioUiStateRef.current = {
+      workspaces,
+      creationMode,
+      showNegative,
+      refOpen,
+      structOpen,
+    };
+  }
+  if (!cloudDraftWriterRef.current) {
+    cloudDraftWriterRef.current = createLatestOnlyDraftWriter(
+      (draft) => api.saveDraft("studio", draft),
+    );
+  }
+  studioUiStateRef.current = {
+    workspaces,
+    creationMode,
+    showNegative,
+    refOpen,
+    structOpen,
+  };
   const {
     prompt,
     negative,
@@ -137,9 +213,11 @@ export default function Home() {
     n,
     seed,
     editMaskMode,
+    productPixelLockMode = "auto",
     vDuration,
     vResolution,
     videoProductLockMode,
+    videoProductTemplate = "stable_showcase",
     videoAnalysisPreset,
     url,
     parsing,
@@ -151,6 +229,9 @@ export default function Home() {
     productProfile,
     productProfileSource,
     productProfiling,
+    subjectProtection = null,
+    subjectProtectionLoading = false,
+    subjectProtectionSource = "",
     variationSource,
     structured,
     structuredSource,
@@ -166,74 +247,225 @@ export default function Home() {
     productGenerationMode,
     portraitGenerationMode,
   } = studioCreationFacts({ creationMode, imageEditProductMode, editSubjectMode });
+  const productAssetSignature = assetSignature(productAsset);
 
   useEffect(() => {
     workspacesRef.current = workspaces;
   }, [workspaces]);
 
+  function studioAdminImagePatch(config = cfg) {
+    const patch = {};
+    const defaults = config?.defaults || {};
+    if (defaults.image_n) patch.n = Number(defaults.image_n);
+    if (defaults.image_size) {
+      const ratioKey = ratioKeyForSize(defaults.image_size);
+      if (ratioKey) patch.ratio = ratioKey;
+      patch.imageQuality = qualityKeyForSize(defaults.image_size);
+    }
+    return patch;
+  }
+
+  function cleanStudioOwnerBaseline(config = cfg) {
+    const initial = initialStudioUiStateRef.current;
+    return {
+      ...initial,
+      workspaces: mergeStudioWorkspaceLayers(initial.workspaces, {
+        adminImagePatch: studioAdminImagePatch(config),
+      }),
+    };
+  }
+
+  function resetStudioOwnerWorkspace(baseline) {
+    latestMeRequestRef.current.invalidate();
+    assetOwnerRequestContextRef.current.invalidate();
+    loadWorksSeqRef.current += 1;
+    resetOwnerTracking();
+    resetOwnerReferenceParsing();
+    resetOwnerMediaUpload();
+    resetOwnerGenerationSubmit();
+    workspacesRef.current = baseline.workspaces;
+    studioUiStateRef.current = baseline;
+    setWorkspaces(baseline.workspaces);
+    setCreationMode(baseline.creationMode);
+    setShowNegative(baseline.showNegative);
+    setRefOpen(baseline.refOpen);
+    setStructOpen(baseline.structOpen);
+    taskRef.current = null;
+    setWorks(null);
+    setWorksError("");
+    setLightbox(null);
+    busyAssetIdsRef.current.clear();
+    setBusyAssetIds(new Set());
+    setMsg("");
+  }
+
+  async function initializeStudioOwnerSession(u, ownerSession, baseline) {
+    let localDraft = null;
+    let promptDraft = null;
+    let variationDraft = null;
+    try {
+      localDraft = readStudioUserDraft(window.localStorage, STUDIO_SESSION_DRAFT_KEY, u?.id);
+      promptDraft = readStudioUserDraft(window.localStorage, STUDIO_DRAFT_PROMPT_KEY, u?.id);
+      variationDraft = readStudioUserDraft(window.localStorage, STUDIO_VARIATION_DRAFT_KEY, u?.id);
+    } catch (e) {
+      reportBackgroundError(e, "restore scoped studio drafts");
+    }
+
+    let cloudDraft = null;
+    try {
+      const row = await api.getDraft("studio");
+      cloudDraft = row?.payload?.workspaces ? row.payload : null;
+    } catch (e) {
+      reportBackgroundError(e, "load studio cloud draft");
+    }
+
+    return ownerSession.commit(() => {
+      cloudDraftLoadedRef.current = true;
+      const restoredWorkspaces = mergeStudioWorkspaceLayers(baseline.workspaces, {
+        localDraft,
+        cloudDraft,
+      });
+      const currentState = studioUiStateRef.current || baseline;
+      const restoredMetadata = mergeStudioDraftMetadataLayers(localDraft, cloudDraft);
+      const validModes = new Set(CREATION_MODES.map((item) => item.key));
+      if (
+        Object.prototype.hasOwnProperty.call(restoredMetadata, "creationMode")
+        && !validModes.has(restoredMetadata.creationMode)
+      ) {
+        delete restoredMetadata.creationMode;
+      }
+      for (const field of ["showNegative", "refOpen"]) {
+        if (Object.prototype.hasOwnProperty.call(restoredMetadata, field)) {
+          restoredMetadata[field] = !!restoredMetadata[field];
+        }
+      }
+      if (Object.prototype.hasOwnProperty.call(restoredMetadata, "structOpen")) {
+        restoredMetadata.structOpen = restoredMetadata.structOpen !== false;
+      }
+      const nextState = mergeStudioLiveDraftState(baseline, currentState, {
+        restoredWorkspaces,
+        restoredMetadata,
+      });
+      setWorkspaces((current) => mergeStudioLiveDraftState(
+        baseline,
+        { ...currentState, workspaces: current },
+        { restoredWorkspaces, restoredMetadata },
+      ).workspaces);
+      setCreationMode(nextState.creationMode);
+      setShowNegative(nextState.showNegative);
+      setRefOpen(nextState.refOpen);
+      setStructOpen(nextState.structOpen);
+
+      if (localDraft) {
+        removeStudioUserDraft(window.localStorage, STUDIO_SESSION_DRAFT_KEY, u?.id);
+      }
+
+      const promptTransferPresent = !!promptDraft;
+      let promptTransferApplied = false;
+      let variationTransferApplied = false;
+      if (promptDraft) {
+        const parsedDraft = parsePromptDraft(promptDraft);
+        const draftMode = promptDraftMode(parsedDraft);
+        promptTransferApplied = canApplyStudioPromptTransfer(baseline, currentState, draftMode);
+        if (promptTransferApplied) {
+          setCreationMode(draftMode);
+          setWorkspacePatch({
+            prompt: parsedDraft.prompt,
+            promptDirty: true,
+            promptSourceSignature: "",
+          }, draftMode);
+        }
+        removeStudioUserDraft(window.localStorage, STUDIO_DRAFT_PROMPT_KEY, u?.id);
+      }
+      if (!promptTransferPresent && variationDraft) {
+        variationRestoreContextRef.current = { baseline, current: currentState };
+        try {
+          if (variationDraft && applyVariationDraft(variationDraft)) {
+            removeStudioUserDraft(window.localStorage, STUDIO_VARIATION_DRAFT_KEY, u?.id);
+            variationTransferApplied = true;
+          }
+        } finally {
+          variationRestoreContextRef.current = null;
+        }
+      }
+      ownerSession.observeRestore({
+        localDraft,
+        cloudDraft,
+        promptDraft,
+        promptTransferApplied,
+        variationDraft,
+        variationTransferApplied,
+      });
+    });
+  }
+
   useEffect(() => {
-    setUnauthorizedHandler(() => saveStudioSessionDraft("auth_expired"));
+    const ownerUserId = String(me?.id ?? "").trim();
+    const previousOwnerUserId = studioOwnerUserIdRef.current;
+    if (!ownerUserId) {
+      if (previousOwnerUserId) {
+        const seq = ++studioInitSeqRef.current;
+        studioOwnerSessionCoordinatorRef.current.cancelScheduled();
+        cloudDraftLoadedRef.current = false;
+        studioOwnerSessionRef.current = studioOwnerSessionCoordinatorRef.current.bindOwner("", seq);
+        studioOwnerUserIdRef.current = "";
+        resetStudioOwnerWorkspace(cleanStudioOwnerBaseline());
+      }
+      cloudDraftWriterRef.current.setOwner(null);
+      return undefined;
+    }
+    if (ownerUserId === previousOwnerUserId && studioOwnerSessionRef.current?.isCurrent()) {
+      cloudDraftWriterRef.current.setOwner(ownerUserId);
+      return () => cloudDraftWriterRef.current.cancelOwner(ownerUserId);
+    }
+
+    const seq = ++studioInitSeqRef.current;
+    studioOwnerSessionCoordinatorRef.current.cancelScheduled();
+    cloudDraftLoadedRef.current = false;
+    if (previousOwnerUserId) cloudDraftWriterRef.current.cancelOwner(previousOwnerUserId);
+    cloudDraftWriterRef.current.setOwner(ownerUserId);
+    const baseline = cleanStudioOwnerBaseline();
+    resetStudioOwnerWorkspace(baseline);
+    studioOwnerUserIdRef.current = ownerUserId;
+    const ownerSession = studioOwnerSessionCoordinatorRef.current.bindOwner(me?.id, seq);
+    studioOwnerSessionRef.current = ownerSession;
+    initializeStudioOwnerSession(me, ownerSession, baseline)
+      .catch((e) => showError(setMsg, e, "初始化创作工作台失败"));
+    loadWorks({ restoreActive: true });
+    return () => cloudDraftWriterRef.current.cancelOwner(ownerUserId);
+  }, [me?.id]);
+
+  useEffect(() => {
+    setUnauthorizedHandler(() => saveStudioSessionDraft("auth_expired", { persistCloud: false }));
     return () => setUnauthorizedHandler(null);
   }, [creationMode, showNegative, refOpen, structOpen, me?.id]);
 
   useEffect(() => {
-    api.me().then((u) => {
-      setMe(u);
-      loadStudioCloudDraft();
-    }).catch((e) => redirectOnAuthError(e, router, setMsg, "studio session probe"));
-    api.config().then((c) => {
-      setCfg(c);
-      // honour admin defaults so the values we submit match the backend config
-      const d = c.defaults || {};
-      const patch = {};
-      if (d.image_n) patch.n = Number(d.image_n);
-      if (d.image_size) {
-        const rk = ratioKeyForSize(d.image_size);
-        if (rk) patch.ratio = rk;
-        patch.imageQuality = qualityKeyForSize(d.image_size);
+    let canceled = false;
+
+    async function initializeStudioSession() {
+      const [meResult, configResult] = await Promise.allSettled([api.me(), api.config()]);
+      if (canceled) return;
+
+      if (configResult.status === "fulfilled") {
+        setCfg(configResult.value);
+      } else {
+        showError(setMsg, configResult.reason, "加载创作配置失败");
       }
-      if (Object.keys(patch).length) {
-        setWorkspaces((prev) => Object.fromEntries(
-          Object.entries(prev).map(([mode, current]) => [
-            mode,
-            mode === "image" || mode === "image_edit" ? { ...current, ...patch } : current,
-          ]),
-        ));
+
+      if (meResult.status === "rejected") {
+        redirectOnAuthError(meResult.reason, router, setMsg, "studio session probe");
+        return;
       }
-    }).catch((e) => showError(setMsg, e, "加载创作配置失败"));
-    loadWorks({ restoreActive: true });
-    try {
-      const draftRaw = window.localStorage.getItem(STUDIO_DRAFT_PROMPT_KEY);
-      if (draftRaw) {
-        const parsedDraft = parsePromptDraft(draftRaw);
-        const draftMode = promptDraftMode(parsedDraft);
-        setCreationMode(draftMode);
-        setWorkspacePatch({
-          prompt: parsedDraft.prompt,
-          promptDirty: true,
-          promptSourceSignature: "",
-        }, draftMode);
-        restoredLocalDraftAtRef.current = Number(parsedDraft.savedAt || Date.now());
-        window.localStorage.removeItem(STUDIO_DRAFT_PROMPT_KEY);
-      }
-      const variationDraft = window.localStorage.getItem(STUDIO_VARIATION_DRAFT_KEY);
-      if (variationDraft) {
-        if (applyVariationDraft(JSON.parse(variationDraft))) {
-          window.localStorage.removeItem(STUDIO_VARIATION_DRAFT_KEY);
-        }
-      }
-      const sessionDraft = window.localStorage.getItem(STUDIO_SESSION_DRAFT_KEY);
-      if (sessionDraft) {
-        window.localStorage.removeItem(STUDIO_SESSION_DRAFT_KEY);
-        const parsedDraft = JSON.parse(sessionDraft);
-        restoredLocalDraftAtRef.current = Number(parsedDraft.savedAt || Date.now());
-        restoreStudioSessionDraft(parsedDraft);
-      }
-    } catch (e) {
-      reportBackgroundError(e, "restore studio draft");
+      setMe(meResult.value);
     }
+
+    initializeStudioSession().catch((e) => showError(setMsg, e, "初始化创作工作台失败"));
     return () => {
-      if (draftSyncTimerRef.current) window.clearTimeout(draftSyncTimerRef.current);
+      canceled = true;
+      const seq = ++studioInitSeqRef.current;
+      studioOwnerSessionCoordinatorRef.current.cancelScheduled();
+      studioOwnerSessionCoordinatorRef.current.bindOwner("", seq);
       stopAllTracking();
       revokeUploadedObjectUrls();
       revokeProductObjectUrls();
@@ -242,13 +474,13 @@ export default function Home() {
 
   useEffect(() => {
     if (!me?.id || !cloudDraftLoadedRef.current) return undefined;
-    if (draftSyncTimerRef.current) window.clearTimeout(draftSyncTimerRef.current);
-    draftSyncTimerRef.current = window.setTimeout(() => {
-      syncStudioDraftToCloud("auto").catch((e) => reportBackgroundError(e, "sync studio cloud draft"));
+    const ownerSession = studioOwnerSessionRef.current;
+    if (!ownerSession?.isCurrent() || ownerSession.ownerUserId !== String(me.id)) return undefined;
+    studioOwnerSessionCoordinatorRef.current.schedule(ownerSession, () => {
+      syncStudioDraftToCloud("auto", ownerSession)
+        .catch((e) => reportBackgroundError(e, "sync studio cloud draft"));
     }, 1600);
-    return () => {
-      if (draftSyncTimerRef.current) window.clearTimeout(draftSyncTimerRef.current);
-    };
+    return () => studioOwnerSessionCoordinatorRef.current.cancelScheduled();
   }, [me?.id, workspaces, creationMode, showNegative, refOpen, structOpen]);
 
   useEffect(() => {
@@ -258,10 +490,92 @@ export default function Home() {
   }, [category, ratio]);
 
   useEffect(() => {
+    const mode = creationMode;
+    const shouldPreview = (
+      isImageEditMode
+      && productGenerationMode
+      && !portraitGenerationMode
+      && productAsset?.url
+    );
+    if (!shouldPreview) {
+      setWorkspacePatch({
+        subjectProtection: null,
+        subjectProtectionLoading: false,
+        subjectProtectionSource: "",
+      }, mode);
+      return undefined;
+    }
+    const requestedMode = editMaskMode || "protect_subject";
+    const source = `${productAssetSignature}|${requestedMode}`;
+    setWorkspacePatch({
+      subjectProtectionLoading: true,
+      subjectProtectionSource: source,
+    }, mode);
+    const request = startSubjectProtectionPreview({
+      load: () => api.subjectProtectionPreview(productAsset.url, requestedMode),
+      onSuccess: (preview) => {
+        setWorkspacePatch((current) => {
+          const stillCurrent = (
+            assetSignature(current.productAsset) === productAssetSignature
+            && (current.editMaskMode || "protect_subject") === requestedMode
+          );
+          if (!stillCurrent) return {};
+          return {
+            subjectProtection: preview,
+            subjectProtectionLoading: false,
+            subjectProtectionSource: source,
+          };
+        }, mode);
+      },
+      onError: (e) => {
+        reportBackgroundError(e, "subject protection preview");
+        setWorkspacePatch((current) => {
+          const stillCurrent = (
+            assetSignature(current.productAsset) === productAssetSignature
+            && (current.editMaskMode || "protect_subject") === requestedMode
+          );
+          if (!stillCurrent) return {};
+          return {
+            subjectProtection: {
+              mode: "none",
+              confidence: 0,
+              bbox: null,
+              width: 0,
+              height: 0,
+              mask_data_uri: null,
+              will_send_mask: false,
+              pixel_lock_recommended: false,
+              risk_level: "high",
+              title: "主体保护预检失败",
+              message: errorMessage(e, "无法预检主体保护，请稍后重试或使用透明 PNG。"),
+              recommendations: ["可先继续生成，但产品文字和边缘稳定性会下降。"],
+            },
+            subjectProtectionLoading: false,
+            subjectProtectionSource: source,
+          };
+        }, mode);
+      },
+    });
+    return request.cancel;
+  }, [
+    creationMode,
+    isImageEditMode,
+    productGenerationMode,
+    portraitGenerationMode,
+    productAssetSignature,
+    productAsset?.url,
+    editMaskMode,
+  ]);
+
+  useEffect(() => {
     setPromptSaveCategory(category === "video" ? "video" : "image");
   }, [category]);
 
-  function refreshMe() { api.me().then(setMe).catch((e) => reportBackgroundError(e, "refresh current user")); }
+  function refreshMe() {
+    return latestMeRequestRef.current
+      .run(() => api.me(), setMe)
+      .catch((e) => reportBackgroundError(e, "refresh current user"));
+  }
 
   const {
     task,
@@ -281,11 +595,13 @@ export default function Home() {
     refreshActiveTask,
     cancelActiveTask,
     stopAllTracking,
+    resetOwnerTracking,
   } = useTaskTracking({
     setCreationMode,
     setMsg,
     refreshMe,
     loadWorks,
+    getOwnerSession: () => studioOwnerSessionRef.current,
   });
 
   useEffect(() => {
@@ -304,6 +620,7 @@ export default function Home() {
     doParse,
     doReverse,
     lastReversePromptRef,
+    resetOwnerReferenceParsing,
   } = useReferenceParsing({
     creationMode,
     category,
@@ -325,6 +642,7 @@ export default function Home() {
     setRefOpen,
     refreshMe,
     revokeUploadedObjectUrlsRef,
+    getOwnerSession: () => studioOwnerSessionRef.current,
   });
 
   const {
@@ -336,6 +654,7 @@ export default function Home() {
     revokeUploadedObjectUrls,
     revokeProductObjectUrl,
     revokeProductObjectUrls,
+    resetOwnerMediaUpload,
     doUploadImage,
     doUploadProductImage,
     doUploadVideo,
@@ -355,11 +674,15 @@ export default function Home() {
     bumpReverseRequest,
     isModeVisible,
     selectAssetForMode,
+    subjectProfilePendingRequestRef,
+    subjectProfileResultCacheRef,
+    getOwnerSession: () => studioOwnerSessionRef.current,
   });
 
   const {
     submitting,
     submit,
+    resetOwnerGenerationSubmit,
   } = useGenerationSubmit({
     cfg,
     task,
@@ -388,19 +711,24 @@ export default function Home() {
     n,
     seed,
     editMaskMode,
+    productPixelLockMode,
     vDuration,
     vResolution,
     videoProductLockMode,
+    videoProductTemplate,
     resultsRef,
-	    modelEnabled,
-	    setMsg,
-	    setTask,
-	    setRunningSnapshot,
+    modelEnabled,
+    setMsg,
+    setTask,
+    setRunningSnapshot,
     setTrackingLost,
     setWorkspacePatch,
     trackBackgroundTask,
     refreshMe,
     startTracking,
+    subjectProfilePendingRequestRef,
+    subjectProfileResultCacheRef,
+    getOwnerSession: () => studioOwnerSessionRef.current,
   });
 
   useEffect(() => {
@@ -438,7 +766,9 @@ export default function Home() {
       vDuration: current.vDuration || 5,
       vResolution: current.vResolution || "720p",
       editMaskMode: current.editMaskMode || "protect_subject",
+      productPixelLockMode: current.productPixelLockMode || "auto",
       videoProductLockMode: current.videoProductLockMode || "locked",
+      videoProductTemplate: current.videoProductTemplate || "stable_showcase",
       videoAnalysisPreset: current.videoAnalysisPreset || "standard",
       url: current.url || "",
       assets: (current.assets || []).map(sanitizeAssetForDraft).filter(Boolean).slice(0, 12),
@@ -456,6 +786,9 @@ export default function Home() {
       uploading: false,
       reversing: false,
       productProfiling: false,
+      subjectProtection: null,
+      subjectProtectionLoading: false,
+      subjectProtectionSource: "",
     };
   }
 
@@ -464,10 +797,11 @@ export default function Home() {
     const savedWorkspaces = Object.fromEntries(
       Object.entries(snapshot || {}).map(([mode, current]) => [mode, sanitizeWorkspaceForDraft(current)]),
     );
+    const savedAt = studioDraftClockRef.current.next();
     return {
       version: 1,
       reason,
-      savedAt: Date.now(),
+      savedAt,
       creationMode,
       showNegative,
       refOpen,
@@ -477,55 +811,27 @@ export default function Home() {
     };
   }
 
-  function saveStudioSessionDraft(reason = "manual") {
+  function saveStudioSessionDraft(reason = "manual", { persistCloud = true } = {}) {
     if (typeof window === "undefined") return;
     try {
       const draft = buildStudioSessionDraft(reason);
-      window.localStorage.setItem(STUDIO_SESSION_DRAFT_KEY, JSON.stringify(draft));
-      if (me?.id) {
-        api.saveDraft("studio", draft).catch((e) => reportBackgroundError(e, "save studio cloud draft"));
+      saveStudioUserDraft(window.localStorage, STUDIO_SESSION_DRAFT_KEY, me?.id, draft);
+      if (persistCloud && me?.id) {
+        const queued = cloudDraftWriterRef.current(draft, me?.id);
+        queued.catch((e) => reportBackgroundError(e, "save studio cloud draft"));
+        return queued;
       }
     } catch (e) {
       reportBackgroundError(e, "save studio session draft");
     }
   }
 
-  async function syncStudioDraftToCloud(reason = "manual") {
-    if (!me?.id) return;
-    await api.saveDraft("studio", buildStudioSessionDraft(reason));
-  }
-
-  async function loadStudioCloudDraft() {
-    try {
-      const row = await api.getDraft("studio");
-      cloudDraftLoadedRef.current = true;
-      const draft = row?.payload;
-      if (!draft?.workspaces) return;
-      const remoteSavedAt = Number(draft.savedAt || 0);
-      if (restoredLocalDraftAtRef.current && remoteSavedAt <= restoredLocalDraftAtRef.current) return;
-      restoreStudioSessionDraft({ ...draft, reason: draft.reason || "cloud" });
-    } catch (e) {
-      cloudDraftLoadedRef.current = true;
-      reportBackgroundError(e, "load studio cloud draft");
-    }
-  }
-
-  function restoreStudioSessionDraft(draft) {
-    if (!draft?.workspaces || typeof draft.workspaces !== "object") return;
-    const validModes = new Set(CREATION_MODES.map((item) => item.key));
-    const restored = Object.fromEntries(
-      Object.entries(draft.workspaces)
-        .filter(([mode, current]) => validModes.has(mode) && current)
-        .map(([mode, current]) => [mode, { ...current }]),
+  function syncStudioDraftToCloud(reason = "manual", ownerSession = studioOwnerSessionRef.current) {
+    if (!ownerSession?.isCurrent()) return Promise.resolve();
+    return cloudDraftWriterRef.current(
+      buildStudioSessionDraft(reason),
+      ownerSession.ownerUserId,
     );
-    if (!Object.keys(restored).length) return;
-    setWorkspaces((prev) => ({ ...prev, ...restored }));
-    if (validModes.has(draft.creationMode)) setCreationMode(draft.creationMode);
-    setShowNegative(!!draft.showNegative);
-    setRefOpen(!!draft.refOpen);
-    setStructOpen(draft.structOpen !== false);
-    setMsg("已恢复上次登录过期前的工作台草稿。");
-    notify.info(draft.reason === "cloud" ? "已恢复云端工作台草稿。" : "已恢复上次工作台草稿。");
   }
 
   function switchCreationMode(kind) {
@@ -577,6 +883,9 @@ export default function Home() {
       productProfile: null,
       productProfileSource: "",
       productProfiling: false,
+      subjectProtection: null,
+      subjectProtectionLoading: false,
+      subjectProtectionSource: "",
       variationSource: null,
     });
     if (productUploadInputRef.current) productUploadInputRef.current.value = "";
@@ -735,8 +1044,7 @@ export default function Home() {
       thumb: asset.preview_url || asset.thumb || sourceUrl,
     };
     const dims = asset.width && asset.height ? nearestRatio(asset.width, asset.height, RATIOS) : "1:1";
-    setCreationMode("image_edit");
-    setWorkspacePatch({
+    const workspacePatch = {
       prompt: draft.prompt || "基于这张图生成同主体、同构图、同光线和同广告质感的近似变体；保留主体结构、产品文字、Logo、比例和核心视觉，只做轻微差异化。",
       negative: "",
       imageEditProductMode: false,
@@ -754,15 +1062,44 @@ export default function Home() {
       promptDirty: true,
       negativeTouched: false,
       ratio: dims,
-    }, "image_edit");
-    setStructOpen(false);
-    setRefOpen(false);
-    setShowNegative(false);
+    };
+    const liveState = studioUiStateRef.current || {
+      workspaces: { image_edit: workspace },
+      creationMode,
+      showNegative,
+      refOpen,
+      structOpen,
+    };
+    const restoreContext = variationRestoreContextRef.current || {
+      baseline: liveState,
+      current: liveState,
+    };
+    const transition = applyStudioVariationTransferState(
+      restoreContext.baseline,
+      restoreContext.current,
+      {
+        metadataPatch: {
+          creationMode: "image_edit",
+          showNegative: false,
+          refOpen: false,
+          structOpen: false,
+        },
+        workspacePatch,
+      },
+    );
+    if (!transition.applied) return false;
+    setCreationMode(transition.state.creationMode);
+    setWorkspacePatch(transition.workspacePatch, "image_edit");
+    setStructOpen(transition.state.structOpen);
+    setRefOpen(transition.state.refOpen);
+    setShowNegative(transition.state.showNegative);
     setMsg("已带入历史图片，可直接生成变体，也可以先微调提示词。");
     return true;
   }
 
   async function unlock(asset) {
+    const ownerRequest = assetOwnerRequestContextRef.current.capture();
+    if (!ownerRequest.isCurrent()) return;
     if (busyAssetIdsRef.current.has(asset.id)) return;
     const cost = Number(asset.unlock_cost ?? cfg?.models?.[asset.type]?.unlock_cost ?? 0);
     const balance = Number(me?.balance_credits ?? 0);
@@ -771,18 +1108,35 @@ export default function Home() {
     setBusyAssetIds(new Set(busyAssetIdsRef.current));
     try {
       const updated = await api.unlock(asset.id);
-      if (task) api.task(task.id).then(setTask).catch((e) => reportBackgroundError(e, "refresh active task after unlock"));
-      if (lightbox && lightbox.id === asset.id) setLightbox(updated);
-      refreshMe(); loadWorks();
+      if (!ownerRequest.isCurrent()) return;
+      const capturedTaskId = task?.id;
+      if (capturedTaskId) {
+        api.task(capturedTaskId)
+          .then((nextTask) => ownerRequest.commit(() => setTask(
+            (prev) => prev?.id === capturedTaskId ? nextTask : prev,
+          )))
+          .catch((e) => {
+            if (ownerRequest.isCurrent()) reportBackgroundError(e, "refresh active task after unlock");
+          });
+      }
+      ownerRequest.commit(() => {
+        if (lightbox && lightbox.id === asset.id) setLightbox(updated);
+        refreshMe();
+        loadWorks();
+      });
     } catch (e) {
-      setMsg(e.message);
+      ownerRequest.commit(() => setMsg(e.message));
     } finally {
-      busyAssetIdsRef.current.delete(asset.id);
-      setBusyAssetIds(new Set(busyAssetIdsRef.current));
+      ownerRequest.commit(() => {
+        busyAssetIdsRef.current.delete(asset.id);
+        setBusyAssetIds(new Set(busyAssetIdsRef.current));
+      });
     }
   }
 
   async function download(asset) {
+    const ownerRequest = assetOwnerRequestContextRef.current.capture();
+    if (!ownerRequest.isCurrent()) return;
     if (busyAssetIdsRef.current.has(asset.id)) return;
     if (!canDownloadAsset(asset)) {
       setMsg(isAssetTakenDown(asset) ? "素材已下架，不能继续下载。" : "请先解锁后再下载。");
@@ -795,12 +1149,14 @@ export default function Home() {
         `/api/assets/${asset.id}/download`,
         asset.type === "video" ? `asset-${asset.id}.mp4` : undefined,
       );
-      setMsg(`已开始下载 ${filename}`);
+      ownerRequest.commit(() => setMsg(`已开始下载 ${filename}`));
     } catch (e) {
-      setMsg(e.message);
+      ownerRequest.commit(() => setMsg(e.message));
     } finally {
-      busyAssetIdsRef.current.delete(asset.id);
-      setBusyAssetIds(new Set(busyAssetIdsRef.current));
+      ownerRequest.commit(() => {
+        busyAssetIdsRef.current.delete(asset.id);
+        setBusyAssetIds(new Set(busyAssetIdsRef.current));
+      });
     }
   }
 
@@ -963,12 +1319,18 @@ export default function Home() {
                     portraitGenerationMode={portraitGenerationMode}
                     videoProductLockMode={videoProductLockMode}
                     onVideoProductLockModeChange={setVideoProductLockMode}
+                    videoProductTemplate={videoProductTemplate}
+                    onVideoProductTemplateChange={setVideoProductTemplate}
                     showNegative={showNegative}
                     onToggleNegative={() => setShowNegative((s) => !s)}
                     seed={seed}
                     onSeedChange={setSeed}
                     editMaskMode={editMaskMode}
                     onEditMaskModeChange={setEditMaskMode}
+                    productPixelLockMode={productPixelLockMode}
+                    onProductPixelLockModeChange={setProductPixelLockMode}
+                    subjectProtection={subjectProtection}
+                    subjectProtectionLoading={subjectProtectionLoading}
                     negative={negative}
                     onNegativeChange={setNegative}
                     onNegativeTouched={setNegativeTouched}

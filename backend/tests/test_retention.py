@@ -3,7 +3,18 @@ from datetime import datetime, timedelta, timezone
 
 from app.config import settings
 from app.db import SessionLocal
-from app.models import AssetReport, GenAsset, GenTask, ParseRecord, UploadedAsset, User
+from app.models import (
+    AssetReport,
+    CreditTransaction,
+    GenAsset,
+    GenTask,
+    ParseRecord,
+    ReverseOperation,
+    UploadedAsset,
+    User,
+    UserDraft,
+)
+from app.routers import prompt
 from app.services import credits, retention, storage
 
 
@@ -476,6 +487,108 @@ def test_purge_all_does_not_delete_generation_tasks(client, make_user, monkeypat
         db.close()
 
 
+def test_purge_all_expires_anonymous_and_tombstones_named_reverse_operations(
+    client,
+    make_user,
+    monkeypatch,
+):
+    uid = make_user("13900000456", balance=100)
+    now = datetime.now(timezone.utc)
+    old = now - timedelta(days=91)
+    db = SessionLocal()
+    operation_ids: list[int] = []
+    try:
+        operations = [
+            ReverseOperation(
+                user_id=uid,
+                client_request_id=client_request_id,
+                request_fingerprint=character * 64,
+                target="image",
+                asset_url=f"https://cdn.example.com/{index}.jpg",
+                status=status,
+                result=result,
+                error=error,
+                created_at=created_at,
+                updated_at=created_at,
+            )
+            for index, (
+                status,
+                character,
+                created_at,
+                client_request_id,
+                result,
+                error,
+            ) in enumerate(
+                (
+                    ("succeeded", "a", old, None, {"final_text": "anonymous"}, None),
+                    ("failed", "b", old, None, None, "anonymous failure"),
+                    ("running", "c", old, None, None, None),
+                    ("succeeded", "d", now, None, {"final_text": "recent"}, None),
+                    (
+                        "succeeded",
+                        "e",
+                        old,
+                        "reverse-retention-success",
+                        {"structured": {"subject": "x"}, "final_text": "named replay"},
+                        None,
+                    ),
+                    (
+                        "failed",
+                        "f",
+                        old,
+                        "reverse-retention-failure",
+                        {"provider": "sensitive"},
+                        "provider secret",
+                    ),
+                )
+            )
+        ]
+        db.add_all(operations)
+        db.commit()
+        operation_ids = [operation.id for operation in operations]
+
+        monkeypatch.setattr(
+            retention,
+            "get_setting",
+            lambda _db, key, default=None: 90 if key == "audit_retention_days" else default,
+        )
+
+        result = retention.purge_all(db)
+
+        assert result["reverse_operations"] == 2
+        assert result["reverse_operation_tombstones"] == 2
+        assert db.get(ReverseOperation, operation_ids[0]) is None
+        assert db.get(ReverseOperation, operation_ids[1]) is None
+        assert db.get(ReverseOperation, operation_ids[2]).status == "running"
+        assert db.get(ReverseOperation, operation_ids[3]).status == "succeeded"
+        named_success = db.get(ReverseOperation, operation_ids[4])
+        assert named_success.status == "succeeded"
+        assert named_success.asset_url == ""
+        assert named_success.result == {
+            "structured": {"subject": "x"},
+            "final_text": "named replay",
+        }
+        replay = prompt._reverse_operation_response(named_success)
+        assert replay.final_text == "named replay"
+        named_failure = db.get(ReverseOperation, operation_ids[5])
+        assert named_failure.status == "failed"
+        assert named_failure.asset_url == ""
+        assert named_failure.error is None
+        assert named_failure.result is None
+
+        repeated = retention.purge_all(db)
+        assert repeated["reverse_operations"] == 0
+        assert repeated["reverse_operation_tombstones"] == 0
+    finally:
+        db.rollback()
+        if operation_ids:
+            db.query(ReverseOperation).filter(
+                ReverseOperation.id.in_(operation_ids)
+            ).delete(synchronize_session=False)
+            db.commit()
+        db.close()
+
+
 def test_purge_uploaded_assets_keeps_recent_params_reference(client, make_user):
     uid = make_user("13900000433", balance=1000)
     upload_key = storage.save_bytes_named(b"upload", "upload", "retention-json-ref.png")
@@ -504,6 +617,171 @@ def test_purge_uploaded_assets_keeps_recent_params_reference(client, make_user):
         assert retention.purge_uploaded_assets(db, cutoff) == 0
         assert db.get(UploadedAsset, upload_key) is not None
         assert storage.local_path(upload_key).exists()
+    finally:
+        db.close()
+
+
+def test_purge_uploaded_assets_keeps_recent_mask_reference(client, make_user):
+    uid = make_user("13900000463", balance=1000)
+    upload_key = storage.save_bytes_named(b"upload", "upload", "retention-mask-ref.png")
+    db = SessionLocal()
+    try:
+        old = datetime.now(timezone.utc) - timedelta(days=40)
+        cutoff = datetime.now(timezone.utc) - timedelta(days=30)
+        db.add(UploadedAsset(
+            key=upload_key,
+            user_id=uid,
+            mime="image/png",
+            bytes=6,
+            original_filename="mask.png",
+            created_at=old,
+        ))
+        db.add(GenTask(
+            user_id=uid,
+            category="image",
+            stage="preview",
+            status="succeeded",
+            params={"mask_image_url": storage.upload_api_url(upload_key)},
+            created_at=datetime.now(timezone.utc) - timedelta(days=1),
+        ))
+        db.commit()
+
+        assert retention.purge_uploaded_assets(db, cutoff) == 0
+        assert db.get(UploadedAsset, upload_key) is not None
+    finally:
+        db.close()
+
+
+def test_referenced_upload_urls_is_candidate_scoped_and_chunked(client, make_user):
+    uid = make_user("13900000468", balance=1000)
+    cutoff = datetime.now(timezone.utc) - timedelta(days=30)
+    candidate_urls = {
+        storage.upload_api_url(f"upload/retention-candidate-{index}.png")
+        for index in range(1205)
+    }
+    referenced_candidate = storage.upload_api_url("upload/retention-candidate-1204.png")
+    unrelated_url = storage.upload_api_url("upload/retention-unrelated.png")
+    db = SessionLocal()
+    try:
+        db.add_all(
+            [
+                GenTask(
+                    user_id=uid,
+                    category="image",
+                    stage="preview",
+                    status="succeeded",
+                    params={"reference_image_url": unrelated_url, "padding": "x" * 1000},
+                    created_at=datetime.now(timezone.utc) - timedelta(days=1),
+                )
+                for _ in range(250)
+            ]
+        )
+        db.add(GenTask(
+            user_id=uid,
+            category="image",
+            stage="preview",
+            status="succeeded",
+            params={"mask_image_url": referenced_candidate},
+            created_at=datetime.now(timezone.utc) - timedelta(days=1),
+        ))
+        db.commit()
+
+        refs = retention._referenced_upload_urls(db, cutoff, candidate_urls)
+        assert refs == {referenced_candidate}
+    finally:
+        db.close()
+
+
+def test_purge_uploaded_assets_keeps_same_owner_studio_draft_upload_group(
+    client,
+    make_user,
+):
+    uid = make_user("13900000464", balance=1000)
+    stem = "retention-studio-ref"
+    upload_key = storage.save_bytes_named(b"upload", "upload", f"{stem}.png")
+    preview_key = storage.save_bytes_named(b"preview", "upload_preview", f"{stem}.png")
+    model_ref_key = storage.save_bytes_named(b"model-ref", "upload_model_ref", f"{stem}.jpg")
+    db = SessionLocal()
+    try:
+        old = datetime.now(timezone.utc) - timedelta(days=40)
+        cutoff = datetime.now(timezone.utc) - timedelta(days=30)
+        for key in (upload_key, preview_key, model_ref_key):
+            db.add(UploadedAsset(key=key, user_id=uid, created_at=old))
+        db.add(UserDraft(
+            user_id=uid,
+            key="studio",
+            payload={
+                "workspaces": {
+                    "image_edit": {
+                        "assets": [],
+                        "selected": {"url": storage.upload_api_url(preview_key)},
+                    }
+                }
+            },
+        ))
+        db.commit()
+
+        assert retention.purge_uploaded_assets(db, cutoff) == 0
+        for key in (upload_key, preview_key, model_ref_key):
+            assert db.get(UploadedAsset, key) is not None
+            assert storage.local_path(key).exists()
+    finally:
+        db.close()
+
+
+def test_studio_draft_cannot_pin_another_users_upload(client, make_user):
+    owner_id = make_user("13900000465", balance=1000)
+    attacker_id = make_user("13900000466", balance=1000)
+    upload_key = storage.save_bytes_named(b"upload", "upload", "retention-cross-owner.png")
+    db = SessionLocal()
+    try:
+        old = datetime.now(timezone.utc) - timedelta(days=40)
+        cutoff = datetime.now(timezone.utc) - timedelta(days=30)
+        db.add(UploadedAsset(key=upload_key, user_id=owner_id, created_at=old))
+        db.add(UserDraft(
+            user_id=attacker_id,
+            key="studio",
+            payload={
+                "workspaces": {
+                    "image": {
+                        "productAsset": {"original_url": storage.upload_api_url(upload_key)},
+                    }
+                }
+            },
+        ))
+        db.commit()
+
+        assert retention.purge_uploaded_assets(db, cutoff) == 1
+        assert db.get(UploadedAsset, upload_key) is None
+        assert not storage.local_path(upload_key).exists()
+    finally:
+        db.close()
+
+
+def test_replaced_studio_draft_reference_no_longer_pins_upload(client, make_user):
+    uid = make_user("13900000467", balance=1000)
+    upload_key = storage.save_bytes_named(b"upload", "upload", "retention-replaced-draft.png")
+    db = SessionLocal()
+    try:
+        old = datetime.now(timezone.utc) - timedelta(days=40)
+        cutoff = datetime.now(timezone.utc) - timedelta(days=30)
+        db.add(UploadedAsset(key=upload_key, user_id=uid, created_at=old))
+        draft = UserDraft(
+            user_id=uid,
+            key="studio",
+            payload={
+                "workspaces": {
+                    "image": {"variationSource": {"thumb": storage.upload_api_url(upload_key)}}
+                }
+            },
+        )
+        db.add(draft)
+        db.commit()
+        draft.payload = {"workspaces": {"image": {"variationSource": None}}}
+        db.commit()
+
+        assert retention.purge_uploaded_assets(db, cutoff) == 1
+        assert db.get(UploadedAsset, upload_key) is None
     finally:
         db.close()
 
@@ -587,6 +865,296 @@ def test_reap_stuck_parse_records_fails_queued_and_running(client, make_user):
         assert db.get(ParseRecord, ids["recent_running"]).status == "running"
         assert db.get(ParseRecord, ids["done"]).status == "done"
     finally:
+        db.close()
+
+
+def test_reap_stale_reverse_operation_refunds_charge_once(client, make_user):
+    uid = make_user("13900000452", balance=100)
+    db = SessionLocal()
+    try:
+        old = datetime.now(timezone.utc) - timedelta(minutes=30)
+        operation = ReverseOperation(
+            user_id=uid,
+            client_request_id=None,
+            request_fingerprint="a" * 64,
+            target="image",
+            asset_url="https://cdn.example.com/stale.jpg",
+            status="running",
+            charged_credits=2,
+            created_at=old,
+            updated_at=old,
+        )
+        db.add(operation)
+        db.commit()
+        operation_id = operation.id
+        credits.consume(db, uid, 2, biz_type="reverse", biz_ref=operation_id)
+
+        assert retention.reap_stuck_reverse_operations(db, max_minutes=15) == 1
+        assert retention.reap_stuck_reverse_operations(db, max_minutes=15) == 0
+
+        db.expire_all()
+        reaped = db.get(ReverseOperation, operation_id)
+        assert reaped.status == "failed"
+        assert reaped.charged_credits == 0
+        assert "超时" in (reaped.error or "")
+        assert db.get(User, uid).balance_credits == 100
+        refunds = db.query(CreditTransaction).filter_by(
+            user_id=uid,
+            biz_type="reverse",
+            biz_ref=operation_id,
+            type="refund",
+        ).count()
+        assert refunds == 1
+    finally:
+        db.close()
+
+
+def test_reap_stale_reverse_operation_does_not_refund_concurrent_success(
+    client,
+    make_user,
+    monkeypatch,
+):
+    uid = make_user("13900000453", balance=100)
+    db = SessionLocal()
+    original_execute = db.execute
+    success_committed = {"done": False}
+    try:
+        old = datetime.now(timezone.utc) - timedelta(minutes=30)
+        operation = ReverseOperation(
+            user_id=uid,
+            client_request_id="reverse-race-success",
+            request_fingerprint="b" * 64,
+            target="image",
+            asset_url="https://cdn.example.com/race.jpg",
+            status="running",
+            charged_credits=2,
+            created_at=old,
+            updated_at=old,
+        )
+        db.add(operation)
+        db.commit()
+        operation_id = operation.id
+        credits.consume(db, uid, 2, biz_type="reverse", biz_ref=operation_id)
+
+        def execute_with_concurrent_success(statement, *args, **kwargs):
+            if (
+                not success_committed["done"]
+                and getattr(statement, "is_update", False)
+                and getattr(getattr(statement, "table", None), "name", None) == "reverse_operations"
+            ):
+                success_committed["done"] = True
+                operation.status = "succeeded"
+                operation.result = {"structured": {"主体": "x"}, "final_text": "x"}
+                operation.updated_at = datetime.now(timezone.utc)
+                db.commit()
+            return original_execute(statement, *args, **kwargs)
+
+        monkeypatch.setattr(db, "execute", execute_with_concurrent_success)
+
+        assert retention.reap_stuck_reverse_operations(db, max_minutes=15) == 0
+
+        db.expire_all()
+        completed = db.get(ReverseOperation, operation_id)
+        assert completed.status == "succeeded"
+        assert completed.charged_credits == 2
+        assert db.get(User, uid).balance_credits == 98
+        assert db.query(CreditTransaction).filter_by(
+            user_id=uid,
+            biz_type="reverse",
+            biz_ref=operation_id,
+            type="refund",
+        ).count() == 0
+    finally:
+        db.close()
+
+
+def test_reap_stale_uncharged_reverse_operation_fails_without_refund(client, make_user):
+    uid = make_user("13900000454", balance=100)
+    db = SessionLocal()
+    try:
+        old = datetime.now(timezone.utc) - timedelta(minutes=30)
+        operation = ReverseOperation(
+            user_id=uid,
+            client_request_id=None,
+            request_fingerprint="c" * 64,
+            target="image",
+            asset_url="https://cdn.example.com/uncharged.jpg",
+            status="running",
+            charged_credits=0,
+            created_at=old,
+            updated_at=old,
+        )
+        db.add(operation)
+        db.commit()
+        operation_id = operation.id
+
+        assert retention.reap_stuck_reverse_operations(db, max_minutes=15) == 1
+
+        db.expire_all()
+        failed = db.get(ReverseOperation, operation_id)
+        assert failed.status == "failed"
+        assert failed.charged_credits == 0
+        assert db.get(User, uid).balance_credits == 100
+        assert db.query(CreditTransaction).filter_by(
+            user_id=uid,
+            biz_type="reverse",
+            biz_ref=operation_id,
+            type="refund",
+        ).count() == 0
+    finally:
+        db.close()
+
+
+def test_reap_reverse_operation_rechecks_freshness_when_claiming(client, make_user, monkeypatch):
+    uid = make_user("13900000455", balance=100)
+    db = SessionLocal()
+    original_execute = db.execute
+    refreshed = {"done": False}
+    try:
+        old = datetime.now(timezone.utc) - timedelta(minutes=30)
+        operation = ReverseOperation(
+            user_id=uid,
+            client_request_id=None,
+            request_fingerprint="d" * 64,
+            target="image",
+            asset_url="https://cdn.example.com/refreshed.jpg",
+            status="running",
+            charged_credits=0,
+            created_at=old,
+            updated_at=old,
+        )
+        db.add(operation)
+        db.commit()
+        operation_id = operation.id
+
+        def execute_with_concurrent_refresh(statement, *args, **kwargs):
+            if (
+                not refreshed["done"]
+                and getattr(statement, "is_update", False)
+                and getattr(getattr(statement, "table", None), "name", None) == "reverse_operations"
+            ):
+                refreshed["done"] = True
+                operation.updated_at = datetime.now(timezone.utc)
+                db.commit()
+            return original_execute(statement, *args, **kwargs)
+
+        monkeypatch.setattr(db, "execute", execute_with_concurrent_refresh)
+
+        assert retention.reap_stuck_reverse_operations(db, max_minutes=15) == 0
+
+        db.expire_all()
+        assert db.get(ReverseOperation, operation_id).status == "running"
+    finally:
+        db.close()
+
+
+def test_reverse_reap_default_window_exceeds_gateway_timeout(monkeypatch):
+    monkeypatch.setattr(settings, "reverse_gateway_timeout_seconds", 40 * 60)
+
+    assert retention._reverse_reap_window() > timedelta(minutes=40)
+
+
+def test_reverse_reap_explicit_window_overrides_gateway_default(client, make_user, monkeypatch):
+    uid = make_user("13900000457", balance=100)
+    monkeypatch.setattr(settings, "reverse_gateway_timeout_seconds", 2 * 60 * 60)
+    db = SessionLocal()
+    try:
+        old = datetime.now(timezone.utc) - timedelta(minutes=10)
+        operation = ReverseOperation(
+            user_id=uid,
+            client_request_id=None,
+            request_fingerprint="f" * 64,
+            target="image",
+            asset_url="https://cdn.example.com/override.jpg",
+            status="running",
+            created_at=old,
+            updated_at=old,
+        )
+        db.add(operation)
+        db.commit()
+        operation_id = operation.id
+
+        assert retention.reap_stuck_reverse_operations(db, max_minutes=5) == 1
+        db.expire_all()
+        assert db.get(ReverseOperation, operation_id).status == "failed"
+    finally:
+        db.close()
+
+
+def test_reverse_reap_refund_failure_rolls_back_only_that_operation(
+    client,
+    make_user,
+    monkeypatch,
+):
+    successful_uid = make_user("13900000958", balance=100)
+    failing_uid = make_user("13900000959", balance=100)
+    db = SessionLocal()
+    operation_ids: list[int] = []
+    try:
+        old = datetime.now(timezone.utc) - timedelta(minutes=30)
+        successful = ReverseOperation(
+            user_id=successful_uid,
+            client_request_id=None,
+            request_fingerprint="1" * 64,
+            target="image",
+            asset_url="https://cdn.example.com/refund-ok.jpg",
+            status="running",
+            charged_credits=2,
+            created_at=old,
+            updated_at=old,
+        )
+        failing = ReverseOperation(
+            user_id=failing_uid,
+            client_request_id=None,
+            request_fingerprint="2" * 64,
+            target="image",
+            asset_url="https://cdn.example.com/refund-fail.jpg",
+            status="running",
+            charged_credits=2,
+            created_at=old,
+            updated_at=old,
+        )
+        db.add_all([successful, failing])
+        db.commit()
+        successful_id = successful.id
+        failing_id = failing.id
+        operation_ids = [successful_id, failing_id]
+        credits.consume(db, successful_uid, 2, biz_type="reverse", biz_ref=successful_id)
+        credits.consume(db, failing_uid, 2, biz_type="reverse", biz_ref=failing_id)
+
+        original_refund = retention.credits.refund_consumed
+
+        def refund_with_one_failure(db, user_id, amount, **kwargs):
+            if kwargs.get("biz_ref") == failing_id:
+                raise RuntimeError("refund unavailable")
+            return original_refund(db, user_id, amount, **kwargs)
+
+        monkeypatch.setattr(retention.credits, "refund_consumed", refund_with_one_failure)
+
+        assert retention.reap_stuck_reverse_operations(db, max_minutes=15) == 1
+
+        db.expire_all()
+        completed = db.get(ReverseOperation, successful_id)
+        unchanged = db.get(ReverseOperation, failing_id)
+        assert completed.status == "failed"
+        assert completed.charged_credits == 0
+        assert db.get(User, successful_uid).balance_credits == 100
+        assert unchanged.status == "running"
+        assert unchanged.charged_credits == 2
+        assert db.get(User, failing_uid).balance_credits == 98
+        assert db.query(CreditTransaction).filter_by(
+            user_id=failing_uid,
+            biz_type="reverse",
+            biz_ref=failing_id,
+            type="refund",
+        ).count() == 0
+    finally:
+        db.rollback()
+        if operation_ids:
+            db.query(ReverseOperation).filter(
+                ReverseOperation.id.in_(operation_ids)
+            ).delete(synchronize_session=False)
+            db.commit()
         db.close()
 
 

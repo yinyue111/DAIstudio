@@ -23,14 +23,13 @@ def test_release_artifact_checker_allows_clean_source_tree(tmp_path):
 
 
 def test_release_artifact_checker_rejects_runtime_tree_entries(tmp_path):
-    root = tmp_path / "src"
-    root.mkdir()
-    for rel in [
+    for index, rel in enumerate([
         "backend/.env",
         "frontend/.env.local",
         ".codex/config.json",
         ".agents/state.json",
         ".git/config",
+        ".playwright-cli/page.yml",
         "__MACOSX/._README.md",
         "frontend/node_modules/pkg/index.js",
         "frontend/.next/server/app.js",
@@ -42,12 +41,14 @@ def test_release_artifact_checker_rejects_runtime_tree_entries(tmp_path):
         ".coverage",
         "backend/celerybeat-schedule.db",
         "backend/certs/payment.key.example",
-    ]:
+    ]):
+        root = tmp_path / f"src-{index}"
+        root.mkdir()
         path = root / rel
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("blocked\n", encoding="utf-8")
 
-    assert check_release_artifact.main(["check_release_artifact.py", str(root)]) == 1
+        assert check_release_artifact.main(["check_release_artifact.py", str(root)]) == 1
 
 
 def test_release_artifact_checker_rejects_tree_symlinks(tmp_path):

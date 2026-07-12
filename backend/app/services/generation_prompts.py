@@ -137,6 +137,39 @@ _LOCKED_PRODUCT_VIDEO_USER_REWRITES = (
         "背景水花或光影点缀且不遮挡包装、Logo和文字",
     ),
 )
+_PRODUCT_VIDEO_TEMPLATE_PROMPTS = {
+    "stable_showcase": (
+        "产品视频模板：稳定陈列。产品正面文字面保持朝向镜头，主体固定在画面中心，"
+        "只让背景光影、台面反射、轻微景深和慢速转场产生变化。"
+    ),
+    "slow_push": (
+        "产品视频模板：慢速推近。镜头做低速推近或轻微拉远，产品不旋转、不翻面，"
+        "包装正面、Logo和主要文字保持清晰可读。"
+    ),
+    "handheld_display": (
+        "产品视频模板：手持展示。手部只扶住产品边缘或底部，不遮挡Logo、包装文字、抽口和关键结构，"
+        "动作缓慢稳定，产品始终是画面主角。"
+    ),
+    "background_motion": (
+        "产品视频模板：背景动效。产品保持稳定完整入镜，动态主要发生在背景光线、道具、烟雾、"
+        "布景或台面反射上，前景元素不得盖住包装正面。"
+    ),
+    "soft_splash": (
+        "产品视频模板：轻水花。水花、泡沫或颗粒只能围绕产品底部和背景边缘运动，"
+        "不得覆盖Logo、包装文字、正面标签和产品轮廓。"
+    ),
+}
+
+
+def _product_video_template_prompt(template: str | None, *, locked: bool) -> str:
+    key = str(template or "stable_showcase").lower().strip()
+    text = _PRODUCT_VIDEO_TEMPLATE_PROMPTS.get(key) or _PRODUCT_VIDEO_TEMPLATE_PROMPTS["stable_showcase"]
+    if locked:
+        return text
+    return (
+        f"{text} 自由运动模式可以保留更多角度变化，但仍需让上传产品替换参考视频原主体，"
+        "避免参考商品、人物或品牌回流。"
+    )
 
 
 def is_product_generation_task(task: GenTask) -> bool:
@@ -191,6 +224,7 @@ def _rewrite_transfer_motion(
     product: bool = False,
     portrait: bool = False,
     product_lock_mode: str = "locked",
+    product_video_template: str = "stable_showcase",
 ) -> str:
     text = _normalise_prompt_fragment(value)
     if not text:
@@ -202,11 +236,13 @@ def _rewrite_transfer_motion(
                 "复用参考片的展示节奏、入镜顺序、稳定特写、慢速推拉和卖点展示等可迁移动作；"
                 "文字保真模式下保持完整包装、Logo和主要文字始终在画面内，避免裁切主体、"
                 "侧面展示或快速旋转；不要生成参考片里的原商品、原品牌、人物或服装。"
+                f"{_product_video_template_prompt(product_video_template, locked=True)}"
             )
         return (
             "上传产品作为唯一视频主体，替换参考片中的原主体/原商品/人物；"
             "复用参考片的展示节奏、入镜顺序、角度切换、慢速推拉、稳定特写和卖点展示等可迁移动作；"
             "不要生成参考片里的原商品、原品牌、人物或服装。"
+            f"{_product_video_template_prompt(product_video_template, locked=False)}"
         )
     if portrait:
         return (
@@ -289,6 +325,7 @@ def _style_transfer_generation_prompt(
     portrait: bool = False,
     is_video: bool = False,
     product_lock_mode: str = "locked",
+    product_video_template: str = "stable_showcase",
 ) -> str:
     """Keep only transferable visual style fields for product/person edits.
 
@@ -310,11 +347,13 @@ def _style_transfer_generation_prompt(
                 product=product,
                 portrait=portrait,
                 product_lock_mode=product_lock_mode,
+                product_video_template=product_video_template,
             )
         elif product and is_video and product_lock_mode != "free" and key == "镜头运动":
             fragment = (
                 "固定正面或轻微推拉镜头，稳定展示上传产品，保持完整包装、Logo和主要文字始终在画面内，"
                 "避免环绕、旋转、侧面展示、强运动模糊或裁切主体。"
+                f"{_product_video_template_prompt(product_video_template, locked=True)}"
             )
         elif product:
             fragment = _rewrite_product_style_fragment(key, prompt_obj.get(key), is_video=is_video)
@@ -389,6 +428,7 @@ def compact_generation_prompt_text(
     )
     if product or portrait:
         product_lock_mode = str((params or {}).get("product_lock_mode") or "locked").lower()
+        product_video_template = str((params or {}).get("product_video_template") or "stable_showcase").lower()
         source = _style_transfer_generation_prompt(
             prompt_obj,
             fallback,
@@ -396,6 +436,7 @@ def compact_generation_prompt_text(
             portrait=portrait,
             is_video=is_video,
             product_lock_mode=product_lock_mode,
+            product_video_template=product_video_template,
         )
     else:
         source = _structured_generation_prompt(prompt_obj, fallback)
@@ -438,12 +479,14 @@ def compact_generation_prompt_text(
                 "文字保真模式下采用固定正面、慢速轻推/轻拉、稳定特写或克制转场，"
                 "保持完整包装、Logo 和主要文字始终在画面内，避免裁切主体、侧面展示、快速旋转、"
                 "强运动模糊、遮挡包装文字或产品正面离焦。"
+                f"{_product_video_template_prompt(product_video_template, locked=True)}"
             )
         elif is_video:
             prefix += (
                 "产品生成需保持同一商品、Logo、包装结构、品牌色、文字和材质细节稳定；"
                 "视频镜头让产品文字面尽量正对镜头，采用慢速推拉或克制转场，"
                 "避免快速旋转、强运动模糊、遮挡包装文字、裁切主体或产品正面离焦。"
+                f"{_product_video_template_prompt(product_video_template, locked=False)}"
             )
         else:
             prefix += (

@@ -1,15 +1,28 @@
 """Recoverable video lifecycle: non-blocking submit + self-polling + crash recovery."""
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 
 import pytest
 from billiard.exceptions import SoftTimeLimitExceeded
+from sqlalchemy import event
 
-from app.db import SessionLocal
-from app.models import GatewayCall, GenAsset, GenTask, UploadedAsset, User
+from app import tasks as app_tasks
+from app.db import SessionLocal, engine
+from app.models import (
+    AppSetting,
+    CreditTransaction,
+    GatewayCall,
+    GenAsset,
+    GenTask,
+    UploadedAsset,
+    User,
+)
 from app.services import (
     credits,
     gateway,
     generation,
+    generation_common,
     generation_video_download,
     generation_video_flow,
     generation_video_submit,
@@ -17,7 +30,7 @@ from app.services import (
     storage,
     video_frames,
 )
-from app.services.config_store import set_setting
+from app.services.config_store import get_setting, set_setting
 
 
 @pytest.fixture(autouse=True)
@@ -81,6 +94,14 @@ def test_video_preview_completes_via_poll(client, make_user, auth):
     t = client.get(f"/api/tasks/{tid}", headers=h).json()
     assert t["status"] == "succeeded", t
     assert len(t["assets"]) == 1
+    asset = t["assets"][0]
+    assert "/media/video_preview/" in asset["preview_url"]
+    assert asset["preview_url"].endswith(".mp4")
+    assert asset["width"] == 640
+    assert asset["height"] == 360
+    downloaded = client.get(f"/api/assets/{asset['id']}/download", headers=h)
+    assert downloaded.status_code == 200
+    assert downloaded.content[4:8] == b"ftyp"
     # the state machine persisted the external submission for DB-side recovery
     db = SessionLocal()
     try:
@@ -194,6 +215,489 @@ def test_video_submit_unknown_state_holds_for_review_without_refund(
         db.close()
 
 
+def test_video_submit_cancel_during_provider_call_preserves_cancel_and_refunds(
+    client,
+    make_user,
+    auth,
+):
+    uid = make_user("13900000987", balance=1000, admin=True)
+    h = auth("13900000987")
+    _config_video(client, h)
+    db = SessionLocal()
+    try:
+        task = GenTask(
+            user_id=uid,
+            category="video",
+            stage="preview",
+            status="queued",
+            prompt={"final_text": "cancel while provider is submitting"},
+            params={"duration": 2},
+            cost_frozen=5,
+        )
+        db.add(task)
+        db.flush()
+        task_id = task.id
+        credits.freeze(db, uid, 5, biz_ref=task_id, commit=False)
+        db.commit()
+    finally:
+        db.close()
+
+    queued_polls = []
+    queued_downloads = []
+
+    def cancel_then_return(*_args, **_kwargs):
+        cancel_db = SessionLocal()
+        try:
+            current = cancel_db.get(GenTask, task_id)
+            current.params = {**(current.params or {}), "_cancel_requested": True}
+            cancel_db.commit()
+        finally:
+            cancel_db.close()
+        return "ext-canceled-in-flight"
+
+    generation_video_submit.start_video_task(
+        task_id,
+        submit_video_fn=cancel_then_return,
+        try_enqueue_poll_fn=lambda *args, **kwargs: queued_polls.append((args, kwargs)),
+        try_enqueue_video_download_fn=lambda *args, **kwargs: queued_downloads.append((args, kwargs)),
+    )
+
+    verify_db = SessionLocal()
+    try:
+        task = verify_db.get(GenTask, task_id)
+        user = verify_db.get(User, uid)
+        assert task.status == "canceled"
+        assert task.external_task_id == "ext-canceled-in-flight"
+        assert (task.params or {}).get("_cancel_requested") is True
+        assert task.cost_settled == 0
+        assert user.balance_credits == 1000
+        assert user.frozen_credits == 0
+        assert verify_db.query(GenAsset).filter(GenAsset.task_id == task_id).count() == 0
+        assert verify_db.query(CreditTransaction).filter(
+            CreditTransaction.biz_type == "gen_task",
+            CreditTransaction.biz_ref == task_id,
+            CreditTransaction.type == "settle",
+        ).count() == 0
+        assert verify_db.query(CreditTransaction).filter(
+            CreditTransaction.biz_type == "gen_task",
+            CreditTransaction.biz_ref == task_id,
+            CreditTransaction.type == "refund",
+        ).count() == 1
+    finally:
+        verify_db.close()
+    assert queued_polls == []
+    assert queued_downloads == []
+
+
+def test_unknown_video_submit_recovery_honors_fresh_cancel_request(
+    client,
+    make_user,
+    monkeypatch,
+):
+    uid = make_user("13900000988", balance=1000)
+    db = SessionLocal()
+    try:
+        task = GenTask(
+            user_id=uid,
+            category="video",
+            stage="preview",
+            status="running",
+            phase="submitting",
+            prompt={"final_text": "unknown submit cancel"},
+            params={"duration": 2, "_video_request_id": "video-unknown-cancel"},
+            cost_frozen=5,
+        )
+        db.add(task)
+        db.flush()
+        task_id = task.id
+        credits.freeze(db, uid, 5, biz_ref=task_id, commit=False)
+        db.commit()
+
+        def cancel_then_find(*_args, **_kwargs):
+            cancel_db = SessionLocal()
+            try:
+                current = cancel_db.get(GenTask, task_id)
+                current.params = {**(current.params or {}), "_cancel_requested": True}
+                cancel_db.commit()
+            finally:
+                cancel_db.close()
+            return {
+                "external_task_id": "ext-unknown-canceled",
+                "status": "processing",
+            }
+
+        monkeypatch.setattr(
+            generation_video_submit,
+            "find_video_by_request_id_with_model_config",
+            cancel_then_find,
+        )
+        recovered = generation_video_submit.recover_unknown_submit_by_request_id(
+            db,
+            task,
+            object(),
+            dict(task.params or {}),
+            {"request_id": "video-unknown-cancel", "duration": 2},
+        )
+        assert recovered is False
+    finally:
+        db.close()
+
+    verify_db = SessionLocal()
+    try:
+        task = verify_db.get(GenTask, task_id)
+        user = verify_db.get(User, uid)
+        assert task.status == "canceled"
+        assert task.external_task_id == "ext-unknown-canceled"
+        assert (task.params or {}).get("_cancel_requested") is True
+        assert user.balance_credits == 1000
+        assert user.frozen_credits == 0
+    finally:
+        verify_db.close()
+
+
+def test_video_submit_cancel_refund_failure_keeps_external_recovery_anchor(
+    client,
+    make_user,
+    auth,
+    monkeypatch,
+):
+    uid = make_user("13900000989", balance=1000, admin=True)
+    h = auth("13900000989")
+    _config_video(client, h)
+    db = SessionLocal()
+    try:
+        task = GenTask(
+            user_id=uid,
+            category="video",
+            stage="preview",
+            status="queued",
+            prompt={"final_text": "cancel refund failure"},
+            params={"duration": 2},
+            cost_frozen=5,
+        )
+        db.add(task)
+        db.flush()
+        task_id = task.id
+        credits.freeze(db, uid, 5, biz_ref=task_id, commit=False)
+        db.commit()
+    finally:
+        db.close()
+
+    def cancel_then_return(*_args, **_kwargs):
+        cancel_db = SessionLocal()
+        try:
+            current = cancel_db.get(GenTask, task_id)
+            current.params = {**(current.params or {}), "_cancel_requested": True}
+            cancel_db.commit()
+        finally:
+            cancel_db.close()
+        return "ext-cancel-refund-failed"
+
+    monkeypatch.setattr(
+        generation_video_submit.credits,
+        "refund",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("refund unavailable")),
+    )
+    queued_polls = []
+    generation_video_submit.start_video_task(
+        task_id,
+        submit_video_fn=cancel_then_return,
+        try_enqueue_poll_fn=lambda *args, **kwargs: queued_polls.append((args, kwargs)),
+    )
+
+    verify_db = SessionLocal()
+    try:
+        task = verify_db.get(GenTask, task_id)
+        user = verify_db.get(User, uid)
+        assert task.status == "needs_review"
+        assert task.phase == "reconciling"
+        assert task.external_task_id == "ext-cancel-refund-failed"
+        assert (task.params or {}).get("_cancel_requested") is True
+        assert "取消退款失败" in (task.error or "")
+        assert user.balance_credits == 995
+        assert user.frozen_credits == 5
+        assert verify_db.query(CreditTransaction).filter(
+            CreditTransaction.biz_type == "gen_task",
+            CreditTransaction.biz_ref == task_id,
+            CreditTransaction.type.in_(("refund", "settle")),
+        ).count() == 0
+    finally:
+        verify_db.close()
+    assert queued_polls == []
+
+
+@pytest.mark.parametrize(
+    ("provider_status", "result_url"),
+    [
+        (None, None),
+        ("succeeded", "https://provider.example/result.mp4"),
+    ],
+)
+def test_video_submit_cancel_crash_after_external_commit_stays_non_executable(
+    client,
+    make_user,
+    monkeypatch,
+    provider_status,
+    result_url,
+):
+    uid = make_user(
+        "13900000992" if provider_status is None else "13900000993",
+        balance=1000,
+    )
+    db = SessionLocal()
+    try:
+        task = GenTask(
+            user_id=uid,
+            category="video",
+            stage="preview",
+            status="running",
+            phase="submitting",
+            prompt={"final_text": "crash after external anchor"},
+            params={
+                "duration": 2,
+                "_video_request_id": "video-crash-anchor",
+                "_cancel_requested": True,
+            },
+            cost_frozen=5,
+        )
+        db.add(task)
+        db.flush()
+        task_id = task.id
+        credits.freeze(db, uid, 5, biz_ref=task_id, commit=False)
+        db.commit()
+
+        real_refund = generation_video_submit.credits.refund
+        monkeypatch.setattr(
+            generation_video_submit.credits,
+            "refund",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(KeyboardInterrupt()),
+        )
+        with pytest.raises(KeyboardInterrupt):
+            generation_video_submit.persist_video_submit_result(
+                db,
+                task_id,
+                request_id="video-crash-anchor",
+                external_task_id="ext-crash-anchor",
+                submitted_params={"duration": 2, "request_id": "video-crash-anchor"},
+                provider_status=provider_status,
+                result_url=result_url,
+            )
+    finally:
+        db.close()
+
+    monkeypatch.setattr(generation_video_submit.credits, "refund", real_refund)
+
+    queued_polls = []
+    queued_downloads = []
+    monkeypatch.setattr(generation, "_try_enqueue_poll", lambda *args: queued_polls.append(args))
+    monkeypatch.setattr(
+        generation,
+        "_enqueue_video_download",
+        lambda *args, **kwargs: queued_downloads.append((args, kwargs)),
+    )
+    recovery_db = SessionLocal()
+    try:
+        assert generation.resume_stuck_videos(recovery_db) == 1
+        assert generation.resume_stuck_videos(recovery_db) == 0
+    finally:
+        recovery_db.close()
+    assert queued_polls == []
+    assert queued_downloads == []
+
+    generation_video_submit.poll_video_once(
+        task_id,
+        poll_video_fn=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("reconciling cancel must not poll provider")
+        ),
+    )
+    generation_video_download.run_video_download_task(
+        task_id,
+        expected_external_task_id="ext-crash-anchor",
+        get_model_config_fn=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("reconciling cancel must not download")
+        ),
+    )
+
+    verify_db = SessionLocal()
+    try:
+        task = verify_db.get(GenTask, task_id)
+        user = verify_db.get(User, uid)
+        assert task.status == "canceled"
+        assert task.phase == "reconciling"
+        assert task.external_task_id == "ext-crash-anchor"
+        assert (task.params or {}).get("_cancel_requested") is True
+        if result_url:
+            assert (task.params or {}).get("_video_result_url") == result_url
+        assert user.balance_credits == 1000
+        assert user.frozen_credits == 0
+        assert verify_db.query(GenAsset).filter(GenAsset.task_id == task_id).count() == 0
+        assert verify_db.query(CreditTransaction).filter(
+            CreditTransaction.biz_type == "gen_task",
+            CreditTransaction.biz_ref == task_id,
+            CreditTransaction.type == "refund",
+        ).count() == 1
+        assert verify_db.query(CreditTransaction).filter(
+            CreditTransaction.biz_type == "gen_task",
+            CreditTransaction.biz_ref == task_id,
+            CreditTransaction.type == "settle",
+        ).count() == 0
+    finally:
+        verify_db.close()
+
+
+def test_video_cancel_recovery_refund_failure_enters_admin_review(
+    client,
+    make_user,
+    auth,
+    monkeypatch,
+):
+    make_user("13900000994", balance=1000, admin=True)
+    admin_headers = auth("13900000994")
+    uid = make_user("13900000995", balance=1000)
+    db = SessionLocal()
+    try:
+        task = GenTask(
+            user_id=uid,
+            category="video",
+            stage="preview",
+            status="running",
+            phase="reconciling",
+            external_task_id="ext-cancel-recovery-fail",
+            params={"_cancel_requested": True, "_video_request_id": "cancel-recovery-fail"},
+            cost_frozen=5,
+        )
+        db.add(task)
+        db.flush()
+        task_id = task.id
+        credits.freeze(db, uid, 5, biz_ref=task_id, commit=False)
+        db.commit()
+    finally:
+        db.close()
+
+    monkeypatch.setattr(
+        generation.credits,
+        "refund",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("refund unavailable")),
+    )
+    recovery_db = SessionLocal()
+    try:
+        assert generation.resume_stuck_videos(recovery_db) == 1
+        assert generation.resume_stuck_videos(recovery_db) == 0
+    finally:
+        recovery_db.close()
+
+    verify_db = SessionLocal()
+    try:
+        task = verify_db.get(GenTask, task_id)
+        user = verify_db.get(User, uid)
+        assert task.status == "needs_review"
+        assert task.phase == "reconciling"
+        assert task.external_task_id == "ext-cancel-recovery-fail"
+        assert (task.params or {}).get("_cancel_requested") is True
+        assert user.balance_credits == 995
+        assert user.frozen_credits == 5
+    finally:
+        verify_db.close()
+
+    listed = client.get("/api/admin/tasks/review", headers=admin_headers)
+    assert listed.status_code == 200, listed.text
+    assert any(item["id"] == task_id for item in listed.json())
+
+
+def test_video_resume_ignores_reconciling_task_without_cancel(client, make_user):
+    uid = make_user("13900000996", balance=1000)
+    db = SessionLocal()
+    try:
+        task = GenTask(
+            user_id=uid,
+            category="video",
+            stage="preview",
+            status="running",
+            phase="reconciling",
+            external_task_id="ext-admin-reconciling",
+            params={"_video_request_id": "admin-reconciling"},
+        )
+        db.add(task)
+        db.commit()
+        task_id = task.id
+        assert generation.resume_stuck_videos(db) == 0
+        db.refresh(task)
+        assert task.id == task_id
+        assert task.status == "running"
+        assert task.phase == "reconciling"
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize("lookup_outcome", ["miss", "error"])
+def test_stale_unknown_submit_lookup_cannot_hold_replacement_for_review(
+    client,
+    make_user,
+    auth,
+    monkeypatch,
+    lookup_outcome,
+):
+    uid = make_user(f"1390000099{0 if lookup_outcome == 'miss' else 1}", balance=1000, admin=True)
+    h = auth(f"1390000099{0 if lookup_outcome == 'miss' else 1}")
+    _config_video(client, h)
+    db = SessionLocal()
+    try:
+        task = GenTask(
+            user_id=uid,
+            category="video",
+            stage="preview",
+            status="queued",
+            prompt={"final_text": "stale unknown lookup"},
+            params={"duration": 2},
+            cost_frozen=5,
+        )
+        db.add(task)
+        db.flush()
+        task_id = task.id
+        credits.freeze(db, uid, 5, biz_ref=task_id, commit=False)
+        db.commit()
+    finally:
+        db.close()
+
+    def replace_then_lookup(*_args, **_kwargs):
+        replace_db = SessionLocal()
+        try:
+            current = replace_db.get(GenTask, task_id)
+            current.params = {**(current.params or {}), "replacement": True}
+            current.external_task_id = "ext-replacement"
+            current.phase = "polling"
+            replace_db.commit()
+        finally:
+            replace_db.close()
+        if lookup_outcome == "error":
+            raise RuntimeError("lookup unavailable")
+        return None
+
+    monkeypatch.setattr(
+        generation_video_submit,
+        "find_video_by_request_id_with_model_config",
+        replace_then_lookup,
+    )
+    generation_video_submit.start_video_task(
+        task_id,
+        submit_video_fn=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("submit accepted state unknown")
+        ),
+        try_enqueue_poll_fn=lambda *_args, **_kwargs: None,
+    )
+
+    verify_db = SessionLocal()
+    try:
+        task = verify_db.get(GenTask, task_id)
+        assert task.status == "running"
+        assert task.phase == "polling"
+        assert task.external_task_id == "ext-replacement"
+        assert (task.params or {}).get("replacement") is True
+        assert not (task.params or {}).get("_video_submit_state_unknown")
+    finally:
+        verify_db.close()
+
+
 def test_video_unknown_submit_recovers_by_request_id(
     client,
     make_user,
@@ -289,7 +793,7 @@ def test_video_submit_persists_external_id_before_usage_side_effects(
     generation_video_submit.start_video_task(
         tid,
         submit_video_fn=lambda *_args, **_kwargs: "ext-committed-before-usage",
-        try_enqueue_poll_fn=lambda task_id: queued_polls.append(task_id),
+        try_enqueue_poll_fn=lambda task_id, *_args: queued_polls.append(task_id),
     )
 
     db = SessionLocal()
@@ -300,6 +804,128 @@ def test_video_submit_persists_external_id_before_usage_side_effects(
         assert row.external_task_id == "ext-committed-before-usage"
         assert row.external_submitted_at is not None
         assert queued_polls == [tid]
+    finally:
+        db.close()
+
+
+def test_stale_generate_delivery_skips_reconciling_task(client, make_user):
+    uid = make_user("13790000101", balance=1000, admin=True)
+    tid = _stranded_video(uid, "stale-generate-reconciling")
+    db = SessionLocal()
+    try:
+        task = db.get(GenTask, tid)
+        task.phase = "reconciling"
+        db.commit()
+    finally:
+        db.close()
+
+    queued_polls = []
+    queued_downloads = []
+    generation_video_submit.start_video_task(
+        tid,
+        submit_video_fn=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("stale generate delivery must not submit again")
+        ),
+        try_enqueue_poll_fn=lambda task_id, *_args: queued_polls.append(task_id),
+        try_enqueue_video_download_fn=lambda _db, task_id, **_kwargs: queued_downloads.append(task_id),
+    )
+
+    assert queued_polls == []
+    assert queued_downloads == []
+    db = SessionLocal()
+    try:
+        task = db.get(GenTask, tid)
+        assert task.status == "running"
+        assert task.phase == "reconciling"
+    finally:
+        db.close()
+
+
+def test_stale_generate_delivery_resumes_persisted_download(client, make_user):
+    uid = make_user("13790000102", balance=1000, admin=True)
+    tid = _stranded_video(uid, "stale-generate-downloading")
+    db = SessionLocal()
+    try:
+        task = db.get(GenTask, tid)
+        task.phase = "downloading"
+        task.params = {
+            **(task.params or {}),
+            "_video_result_url": "https://cdn.example.com/stale-generate.mp4",
+        }
+        db.commit()
+    finally:
+        db.close()
+
+    queued_polls = []
+    queued_downloads = []
+    generation_video_submit.start_video_task(
+        tid,
+        submit_video_fn=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("stale generate delivery must not submit again")
+        ),
+        try_enqueue_poll_fn=lambda task_id, *_args: queued_polls.append(task_id),
+        try_enqueue_video_download_fn=lambda _db, task_id, **_kwargs: queued_downloads.append(task_id),
+    )
+
+    assert queued_polls == []
+    assert queued_downloads == [tid]
+    db = SessionLocal()
+    try:
+        assert db.get(GenTask, tid).phase == "downloading"
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize("phase", ["downloading", "submitting", "rendering"])
+def test_stale_generate_delivery_skips_non_executable_external_phase(
+    client,
+    make_user,
+    phase,
+):
+    phone = {
+        "downloading": "13790000110",
+        "submitting": "13790000113",
+        "rendering": "13790000114",
+    }[phase]
+    uid = make_user(phone, balance=1000, admin=True)
+    db = SessionLocal()
+    try:
+        task = GenTask(
+            user_id=uid,
+            category="video",
+            stage="preview",
+            status="running",
+            phase=phase,
+            external_task_id=f"stale-generate-{phase}",
+            external_submitted_at=datetime.now(timezone.utc),
+            cost_frozen=0,
+            params={"duration": 2},
+        )
+        db.add(task)
+        db.commit()
+        tid = task.id
+    finally:
+        db.close()
+
+    queued_polls = []
+    queued_downloads = []
+    generation_video_submit.start_video_task(
+        tid,
+        submit_video_fn=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("stale generate delivery must not submit again")
+        ),
+        try_enqueue_poll_fn=lambda task_id, *_args: queued_polls.append(task_id),
+        try_enqueue_video_download_fn=lambda _db, task_id, **_kwargs: queued_downloads.append(task_id),
+    )
+
+    assert queued_polls == []
+    assert queued_downloads == []
+    db = SessionLocal()
+    try:
+        task = db.get(GenTask, tid)
+        assert task.status == "running"
+        assert task.phase == phase
+        assert task.params == {"duration": 2}
     finally:
         db.close()
 
@@ -747,6 +1373,47 @@ def test_admin_can_list_needs_review_tasks(client, make_user, auth):
     assert listed["review_overdue"] is True
 
 
+def test_admin_review_list_batches_asset_queries(client, make_user, auth):
+    uid = make_user("13900000975", balance=1000, admin=True)
+    h = auth("13900000975")
+    db = SessionLocal()
+    try:
+        db.add_all([
+            GenTask(
+                user_id=uid,
+                category="image",
+                stage="preview",
+                status="needs_review",
+                phase="reconciling",
+                cost_frozen=5,
+                cost_settled=0,
+                error="待人工复核",
+                params={"n": 1},
+            )
+            for _ in range(3)
+        ])
+        db.commit()
+    finally:
+        db.close()
+
+    asset_selects = 0
+
+    def _count_asset_selects(_conn, _cursor, statement, _parameters, _context, _executemany):
+        nonlocal asset_selects
+        if "FROM gen_assets" in statement and statement.lstrip().upper().startswith("SELECT"):
+            asset_selects += 1
+
+    event.listen(engine, "before_cursor_execute", _count_asset_selects)
+    try:
+        response = client.get("/api/admin/tasks/review?limit=3", headers=h)
+    finally:
+        event.remove(engine, "before_cursor_execute", _count_asset_selects)
+
+    assert response.status_code == 200, response.text
+    assert len(response.json()) == 3
+    assert asset_selects == 1
+
+
 def test_preview_task_includes_final_summary_outside_current_page(client, make_user, auth):
     uid = make_user("13900000977", balance=1000, admin=True)
     h = auth("13900000977")
@@ -904,7 +1571,7 @@ def test_video_download_failure_retries_without_repolling(client, make_user, aut
         db.close()
     assert calls == {"poll": 1, "download": 0}
 
-    generation.run_video_download_task(tid)
+    generation.run_video_download_task(tid, "ext-done")
     db = SessionLocal()
     try:
         task = db.get(GenTask, tid)
@@ -914,7 +1581,7 @@ def test_video_download_failure_retries_without_repolling(client, make_user, aut
     finally:
         db.close()
 
-    generation.run_video_download_task(tid)
+    generation.run_video_download_task(tid, "ext-done")
     t = client.get(f"/api/tasks/{tid}", headers=h).json()
     assert t["status"] == "succeeded", t
     assert len(t["assets"]) == 1
@@ -954,6 +1621,927 @@ def test_poll_video_success_only_enqueues_download(client, make_user, auth, monk
         db.close()
 
 
+def test_poll_video_success_does_not_revive_concurrent_needs_review_transition(
+    client,
+    make_user,
+    auth,
+):
+    uid = make_user("13790000115", balance=1000, admin=True)
+    h = auth("13790000115")
+    _config_video(client, h)
+    tid = _stranded_video(uid, "concurrent-needs-review")
+    queued_downloads = []
+
+    def _poll_after_review_transition(*_args, **_kwargs):
+        concurrent_db = SessionLocal()
+        try:
+            task = concurrent_db.get(GenTask, tid)
+            task.status = "needs_review"
+            task.phase = "reconciling"
+            task.error = "manual review won race"
+            concurrent_db.commit()
+        finally:
+            concurrent_db.close()
+        return {"status": "succeeded", "url": "https://cdn.example.com/raced.mp4"}
+
+    generation_video_submit.poll_video_once(
+        tid,
+        poll_video_fn=_poll_after_review_transition,
+        try_enqueue_video_download_fn=lambda _db, task_id, **_kwargs: queued_downloads.append(task_id),
+    )
+
+    assert queued_downloads == []
+    db = SessionLocal()
+    try:
+        task = db.get(GenTask, tid)
+        assert task.status == "needs_review"
+        assert task.phase == "reconciling"
+        assert task.error == "manual review won race"
+        assert "_video_result_url" not in (task.params or {})
+    finally:
+        db.close()
+
+
+def test_poll_video_failed_does_not_override_concurrent_download_winner(
+    client,
+    make_user,
+    auth,
+):
+    uid = make_user("13790000116", balance=1000, admin=True)
+    h = auth("13790000116")
+    _config_video(client, h)
+    tid = _stranded_video(uid, "failed-after-download-winner")
+    db = SessionLocal()
+    try:
+        user = db.get(User, uid)
+        balance_after_freeze = user.balance_credits
+        frozen_after_freeze = user.frozen_credits
+    finally:
+        db.close()
+
+    def _poll_after_download_winner(*_args, **_kwargs):
+        concurrent_db = SessionLocal()
+        try:
+            task = concurrent_db.get(GenTask, tid)
+            task.phase = "downloading"
+            task.params = {
+                **(task.params or {}),
+                "_video_result_url": "https://cdn.example.com/winner.mp4",
+            }
+            concurrent_db.commit()
+        finally:
+            concurrent_db.close()
+        return {"status": "failed", "error": "stale provider failure"}
+
+    generation_video_submit.poll_video_once(
+        tid,
+        poll_video_fn=_poll_after_download_winner,
+        try_enqueue_video_download_fn=lambda _db, _task_id, **_kwargs: None,
+    )
+
+    db = SessionLocal()
+    try:
+        task = db.get(GenTask, tid)
+        user = db.get(User, uid)
+        assert task.status == "running"
+        assert task.phase == "downloading"
+        assert task.params["_video_result_url"] == "https://cdn.example.com/winner.mp4"
+        assert user.balance_credits == balance_after_freeze
+        assert user.frozen_credits == frozen_after_freeze
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize(
+    ("outcome", "phone"),
+    [
+        ("error", "13790000117"),
+        ("soft_timeout", "13790000118"),
+        ("running", "13790000119"),
+    ],
+)
+def test_poll_video_does_not_take_over_replaced_external_task(
+    client,
+    make_user,
+    auth,
+    outcome,
+    phone,
+):
+    uid = make_user(phone, balance=1000, admin=True)
+    h = auth(phone)
+    _config_video(client, h)
+    original_external_task_id = f"replaced-before-{outcome}"
+    replacement_external_task_id = f"replacement-{outcome}"
+    tid = _stranded_video(uid, original_external_task_id)
+    queued_polls = []
+
+    def _poll_after_external_replacement(*_args, **_kwargs):
+        concurrent_db = SessionLocal()
+        try:
+            task = concurrent_db.get(GenTask, tid)
+            task.external_task_id = replacement_external_task_id
+            concurrent_db.commit()
+        finally:
+            concurrent_db.close()
+        if outcome == "error":
+            raise RuntimeError("stale poll network error")
+        if outcome == "soft_timeout":
+            raise SoftTimeLimitExceeded()
+        return {"status": "running"}
+
+    generation_video_submit.poll_video_once(
+        tid,
+        poll_video_fn=_poll_after_external_replacement,
+        try_enqueue_poll_fn=lambda task_id, *_args: queued_polls.append(task_id),
+    )
+
+    assert queued_polls == []
+    assert generation_video_flow.poll_chain_alive(tid, original_external_task_id)
+    assert not generation_video_flow.poll_chain_alive(tid, replacement_external_task_id)
+    assert generation_video_flow.bump_poll_errors(tid, original_external_task_id) == 1
+    assert generation_video_flow.bump_poll_errors(tid, replacement_external_task_id) == 1
+    db = SessionLocal()
+    try:
+        task = db.get(GenTask, tid)
+        assert task.status == "running"
+        assert task.phase == "polling"
+        assert task.external_task_id == replacement_external_task_id
+        assert task.error is None
+        assert "_video_poll_state_unknown" not in (task.params or {})
+    finally:
+        db.close()
+
+
+def test_stale_poll_heartbeat_after_replacement_does_not_mask_current_generation(client):
+    task_id = 9_100_001
+    old_external_task_id = "stale-poll-generation"
+    current_external_task_id = "current-poll-generation"
+
+    generation_video_flow.mark_poll_alive(task_id, current_external_task_id)
+    generation_video_flow.mark_poll_alive(task_id, old_external_task_id)
+
+    assert generation_video_flow.poll_chain_alive(task_id, current_external_task_id)
+    generation_video_flow.clear_poll_alive(task_id, old_external_task_id)
+    assert generation_video_flow.poll_chain_alive(task_id, current_external_task_id)
+
+
+def test_stale_download_heartbeat_after_replacement_does_not_mask_current_generation(client):
+    task_id = 9_100_002
+    old_external_task_id = "stale-download-generation"
+    current_external_task_id = "current-download-generation"
+
+    generation_video_flow.mark_video_download_alive(task_id, current_external_task_id)
+    generation_video_flow.mark_video_download_alive(task_id, old_external_task_id)
+
+    assert generation_video_flow.video_download_alive(task_id, current_external_task_id)
+    generation_video_flow.clear_video_download_alive(task_id, old_external_task_id)
+    assert generation_video_flow.video_download_alive(task_id, current_external_task_id)
+
+
+def test_stale_video_download_timeout_does_not_reconcile_replacement(
+    client,
+    make_user,
+    auth,
+    monkeypatch,
+):
+    uid = make_user("13790000129", balance=1000, admin=True)
+    h = auth("13790000129")
+    _config_video(client, h)
+    old_external_task_id = "stale-download-timeout-old"
+    replacement_external_task_id = "stale-download-timeout-replacement"
+    replacement_params = {
+        "duration": 4,
+        "_video_result_url": "https://cdn.example.com/replacement-timeout.mp4",
+        "replacement_generation": True,
+    }
+    tid = _stranded_video(uid, old_external_task_id)
+    db = SessionLocal()
+    try:
+        task = db.get(GenTask, tid)
+        task.phase = "downloading"
+        task.params = {
+            "duration": 2,
+            "_video_result_url": "https://cdn.example.com/stale-timeout.mp4",
+        }
+        db.commit()
+        user = db.get(User, uid)
+        balance_after_freeze = user.balance_credits
+        frozen_after_freeze = user.frozen_credits
+    finally:
+        db.close()
+
+    def _replace_generation_then_timeout(*_args, **_kwargs):
+        concurrent_db = SessionLocal()
+        try:
+            task = concurrent_db.get(GenTask, tid)
+            task.external_task_id = replacement_external_task_id
+            task.phase = "downloading"
+            task.params = replacement_params
+            concurrent_db.commit()
+        finally:
+            concurrent_db.close()
+        raise SoftTimeLimitExceeded()
+
+    monkeypatch.setattr(
+        "app.services.gateway.download_to_storage",
+        _replace_generation_then_timeout,
+    )
+
+    generation.run_video_download_task(tid, old_external_task_id)
+
+    db = SessionLocal()
+    try:
+        task = db.get(GenTask, tid)
+        user = db.get(User, uid)
+        assert task.status == "running"
+        assert task.phase == "downloading"
+        assert task.external_task_id == replacement_external_task_id
+        assert task.params == replacement_params
+        assert task.error is None
+        assert user.balance_credits == balance_after_freeze
+        assert user.frozen_credits == frozen_after_freeze
+    finally:
+        db.close()
+
+
+def test_stale_video_download_success_does_not_finalize_replacement(
+    client,
+    make_user,
+    auth,
+    monkeypatch,
+    tiny_mp4,
+):
+    uid = make_user("13790000130", balance=1000, admin=True)
+    h = auth("13790000130")
+    _config_video(client, h)
+    old_external_task_id = "stale-download-success-old"
+    replacement_external_task_id = "stale-download-success-replacement"
+    replacement_params = {
+        "duration": 4,
+        "_video_result_url": "https://cdn.example.com/replacement-success.mp4",
+        "replacement_generation": True,
+    }
+    tid = _stranded_video(uid, old_external_task_id)
+    db = SessionLocal()
+    try:
+        task = db.get(GenTask, tid)
+        task.phase = "downloading"
+        task.params = {
+            "duration": 2,
+            "_video_result_url": "https://cdn.example.com/stale-success.mp4",
+        }
+        db.commit()
+        user = db.get(User, uid)
+        balance_after_freeze = user.balance_credits
+        frozen_after_freeze = user.frozen_credits
+    finally:
+        db.close()
+
+    written_keys = []
+
+    def _save_then_replace_generation(_url, subdir, ext, **_kwargs):
+        key = storage.save_bytes(tiny_mp4, subdir, ext)
+        written_keys.append(key)
+        concurrent_db = SessionLocal()
+        try:
+            task = concurrent_db.get(GenTask, tid)
+            task.external_task_id = replacement_external_task_id
+            task.phase = "downloading"
+            task.params = replacement_params
+            concurrent_db.commit()
+        finally:
+            concurrent_db.close()
+        return key
+
+    monkeypatch.setattr(
+        "app.services.gateway.download_to_storage",
+        _save_then_replace_generation,
+    )
+
+    generation.run_video_download_task(tid, old_external_task_id)
+
+    db = SessionLocal()
+    try:
+        task = db.get(GenTask, tid)
+        user = db.get(User, uid)
+        assert task.status == "running"
+        assert task.phase == "downloading"
+        assert task.external_task_id == replacement_external_task_id
+        assert task.params == replacement_params
+        assert task.error is None
+        assert db.query(GenAsset).filter(GenAsset.task_id == tid).count() == 0
+        assert user.balance_credits == balance_after_freeze
+        assert user.frozen_credits == frozen_after_freeze
+        credit_types = [
+            row.type
+            for row in db.query(CreditTransaction)
+            .filter(CreditTransaction.biz_ref == tid)
+            .order_by(CreditTransaction.id)
+        ]
+        assert credit_types == ["freeze"]
+    finally:
+        db.close()
+    assert written_keys
+    assert all(not storage.local_path(key).exists() for key in written_keys)
+
+
+def test_stale_queued_video_download_delivery_does_not_run_replacement(
+    client,
+    make_user,
+    auth,
+    monkeypatch,
+):
+    uid = make_user("13790000131", balance=1000, admin=True)
+    h = auth("13790000131")
+    _config_video(client, h)
+    old_external_task_id = "stale-queued-download-old"
+    replacement_external_task_id = "stale-queued-download-replacement"
+    replacement_params = {
+        "duration": 4,
+        "_video_result_url": "https://cdn.example.com/replacement-queued.mp4",
+        "replacement_generation": True,
+    }
+    tid = _stranded_video(uid, old_external_task_id)
+    db = SessionLocal()
+    try:
+        task = db.get(GenTask, tid)
+        task.phase = "downloading"
+        task.params = {
+            "duration": 2,
+            "_video_result_url": "https://cdn.example.com/stale-queued.mp4",
+        }
+        db.commit()
+        user = db.get(User, uid)
+        balance_after_freeze = user.balance_credits
+        frozen_after_freeze = user.frozen_credits
+    finally:
+        db.close()
+
+    queued = {}
+    monkeypatch.setattr(generation_video_flow, "local_worker_shutting_down", lambda: False)
+    monkeypatch.setattr(
+        app_tasks.download_video_task,
+        "apply_async",
+        lambda *, args, kwargs, **options: queued.update(
+            {"args": args, "kwargs": kwargs, "options": options}
+        ),
+    )
+    generation_video_flow.enqueue_video_download(
+        tid,
+        external_task_id=old_external_task_id,
+    )
+    assert queued["args"] == (tid, old_external_task_id)
+    assert queued["kwargs"] == {}
+
+    concurrent_db = SessionLocal()
+    try:
+        task = concurrent_db.get(GenTask, tid)
+        task.external_task_id = replacement_external_task_id
+        task.params = replacement_params
+        concurrent_db.commit()
+    finally:
+        concurrent_db.close()
+
+    monkeypatch.setattr(
+        "app.services.gateway.download_to_storage",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("stale queued delivery must not download replacement")
+        ),
+    )
+    model_loads = []
+    monkeypatch.setattr(
+        generation,
+        "get_model_config",
+        lambda *_args, **_kwargs: model_loads.append(True),
+    )
+    app_tasks.download_video_task.run(*queued["args"], **queued["kwargs"])
+    assert model_loads == []
+
+    db = SessionLocal()
+    try:
+        task = db.get(GenTask, tid)
+        user = db.get(User, uid)
+        assert task.status == "running"
+        assert task.phase == "downloading"
+        assert task.external_task_id == replacement_external_task_id
+        assert task.params == replacement_params
+        assert task.error is None
+        assert db.query(GenAsset).filter(GenAsset.task_id == tid).count() == 0
+        assert user.balance_credits == balance_after_freeze
+        assert user.frozen_credits == frozen_after_freeze
+    finally:
+        db.close()
+
+
+def test_video_download_pre_capture_error_does_not_hold_task(
+    client,
+    make_user,
+    auth,
+    monkeypatch,
+):
+    uid = make_user("13790000132", balance=1000, admin=True)
+    h = auth("13790000132")
+    _config_video(client, h)
+    external_task_id = "download-pre-capture-error"
+    tid = _stranded_video(uid, external_task_id)
+    db = SessionLocal()
+    try:
+        task = db.get(GenTask, tid)
+        task.phase = "downloading"
+        task.params = {
+            "duration": 2,
+            "_video_result_url": "https://cdn.example.com/pre-capture.mp4",
+        }
+        db.commit()
+        original_params = dict(task.params)
+    finally:
+        db.close()
+
+    hold_calls = []
+
+    class BrokenSession:
+        def get(self, *_args, **_kwargs):
+            raise RuntimeError("database read failed before identity capture")
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(generation_video_download, "SessionLocal", BrokenSession)
+    monkeypatch.setattr(
+        generation_video_download,
+        "hold_video_download_for_reconciliation",
+        lambda *_args, **_kwargs: hold_calls.append((_args, _kwargs)),
+    )
+
+    generation_video_download.run_video_download_task(
+        tid,
+        expected_external_task_id=external_task_id,
+    )
+
+    assert hold_calls == []
+    db = SessionLocal()
+    try:
+        task = db.get(GenTask, tid)
+        assert task.status == "running"
+        assert task.phase == "downloading"
+        assert task.external_task_id == external_task_id
+        assert task.params == original_params
+        assert task.error is None
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize("attempts", [0, generation._VIDEO_DOWNLOAD_MAX_ATTEMPTS - 1])
+def test_stale_video_download_generic_error_does_not_mutate_replacement(
+    client,
+    make_user,
+    auth,
+    monkeypatch,
+    attempts,
+):
+    phone = "13790000133" if attempts == 0 else "13790000134"
+    uid = make_user(phone, balance=1000, admin=True)
+    h = auth(phone)
+    _config_video(client, h)
+    old_external_task_id = f"stale-generic-error-old-{attempts}"
+    replacement_external_task_id = f"stale-generic-error-replacement-{attempts}"
+    replacement_params = {
+        "duration": 4,
+        "_video_result_url": f"https://cdn.example.com/replacement-error-{attempts}.mp4",
+        "replacement_generation": True,
+    }
+    tid = _stranded_video(uid, old_external_task_id)
+    db = SessionLocal()
+    try:
+        task = db.get(GenTask, tid)
+        task.phase = "downloading"
+        task.params = {
+            "duration": 2,
+            "_video_result_url": "https://cdn.example.com/stale-error.mp4",
+            "_video_download_attempts": attempts,
+        }
+        db.commit()
+        user = db.get(User, uid)
+        balance_after_freeze = user.balance_credits
+        frozen_after_freeze = user.frozen_credits
+    finally:
+        db.close()
+
+    def _replace_generation_then_error(*_args, **_kwargs):
+        concurrent_db = SessionLocal()
+        try:
+            task = concurrent_db.get(GenTask, tid)
+            task.external_task_id = replacement_external_task_id
+            task.params = replacement_params
+            concurrent_db.commit()
+        finally:
+            concurrent_db.close()
+        raise RuntimeError("generic stale download failure")
+
+    queued = []
+    monkeypatch.setattr("app.services.gateway.download_to_storage", _replace_generation_then_error)
+    monkeypatch.setattr(
+        generation,
+        "_enqueue_video_download",
+        lambda task_id, **kwargs: queued.append((task_id, kwargs.get("external_task_id"))),
+    )
+
+    generation.run_video_download_task(tid, old_external_task_id)
+
+    db = SessionLocal()
+    try:
+        task = db.get(GenTask, tid)
+        user = db.get(User, uid)
+        assert task.status == "running"
+        assert task.phase == "downloading"
+        assert task.external_task_id == replacement_external_task_id
+        assert task.params == replacement_params
+        assert task.error is None
+        assert db.query(GenAsset).filter(GenAsset.task_id == tid).count() == 0
+        assert user.balance_credits == balance_after_freeze
+        assert user.frozen_credits == frozen_after_freeze
+    finally:
+        db.close()
+    if attempts == 0:
+        assert queued == [(tid, old_external_task_id)]
+    else:
+        assert queued == []
+
+
+def test_stale_video_download_model_loader_result_does_not_hold_replacement(
+    client,
+    make_user,
+    auth,
+):
+    uid = make_user("13790000135", balance=1000, admin=True)
+    h = auth("13790000135")
+    _config_video(client, h)
+    old_external_task_id = "stale-model-loader-old"
+    replacement_external_task_id = "stale-model-loader-replacement"
+    replacement_params = {
+        "duration": 4,
+        "_video_result_url": "https://cdn.example.com/replacement-model.mp4",
+        "replacement_generation": True,
+    }
+    tid = _stranded_video(uid, old_external_task_id)
+    db = SessionLocal()
+    try:
+        task = db.get(GenTask, tid)
+        task.phase = "downloading"
+        task.params = {
+            "duration": 2,
+            "_video_result_url": "https://cdn.example.com/stale-model.mp4",
+        }
+        db.commit()
+        user = db.get(User, uid)
+        balance_after_freeze = user.balance_credits
+        frozen_after_freeze = user.frozen_credits
+    finally:
+        db.close()
+
+    def _replace_generation_then_return_no_model(*_args, **_kwargs):
+        concurrent_db = SessionLocal()
+        try:
+            task = concurrent_db.get(GenTask, tid)
+            task.external_task_id = replacement_external_task_id
+            task.params = replacement_params
+            concurrent_db.commit()
+        finally:
+            concurrent_db.close()
+        return None
+
+    generation_video_download.run_video_download_task(
+        tid,
+        expected_external_task_id=old_external_task_id,
+        get_model_config_fn=_replace_generation_then_return_no_model,
+    )
+
+    db = SessionLocal()
+    try:
+        task = db.get(GenTask, tid)
+        user = db.get(User, uid)
+        assert task.status == "running"
+        assert task.phase == "downloading"
+        assert task.external_task_id == replacement_external_task_id
+        assert task.params == replacement_params
+        assert task.error is None
+        assert user.balance_credits == balance_after_freeze
+        assert user.frozen_credits == frozen_after_freeze
+    finally:
+        db.close()
+
+
+def test_stale_video_download_snapshot_error_does_not_hold_replacement(
+    client,
+    make_user,
+    auth,
+    monkeypatch,
+):
+    uid = make_user("13790000136", balance=1000, admin=True)
+    h = auth("13790000136")
+    _config_video(client, h)
+    old_external_task_id = "stale-snapshot-old"
+    replacement_external_task_id = "stale-snapshot-replacement"
+    replacement_params = {
+        "duration": 4,
+        "_video_result_url": "https://cdn.example.com/replacement-snapshot.mp4",
+        "replacement_generation": True,
+    }
+    tid = _stranded_video(uid, old_external_task_id)
+    db = SessionLocal()
+    try:
+        task = db.get(GenTask, tid)
+        task.phase = "downloading"
+        task.params = {
+            "duration": 2,
+            "_video_result_url": "https://cdn.example.com/stale-snapshot.mp4",
+        }
+        db.commit()
+        user = db.get(User, uid)
+        balance_after_freeze = user.balance_credits
+        frozen_after_freeze = user.frozen_credits
+    finally:
+        db.close()
+
+    def _replace_generation_then_raise_snapshot_error(*_args, **_kwargs):
+        concurrent_db = SessionLocal()
+        try:
+            task = concurrent_db.get(GenTask, tid)
+            task.external_task_id = replacement_external_task_id
+            task.params = replacement_params
+            concurrent_db.commit()
+        finally:
+            concurrent_db.close()
+        raise RuntimeError("snapshot resolution failed after replacement")
+
+    monkeypatch.setattr(
+        generation_video_download,
+        "model_from_snapshot",
+        _replace_generation_then_raise_snapshot_error,
+    )
+    generation_video_download.run_video_download_task(
+        tid,
+        expected_external_task_id=old_external_task_id,
+        get_model_config_fn=generation.get_model_config,
+    )
+
+    db = SessionLocal()
+    try:
+        task = db.get(GenTask, tid)
+        user = db.get(User, uid)
+        assert task.status == "running"
+        assert task.phase == "downloading"
+        assert task.external_task_id == replacement_external_task_id
+        assert task.params == replacement_params
+        assert task.error is None
+        assert user.balance_credits == balance_after_freeze
+        assert user.frozen_credits == frozen_after_freeze
+    finally:
+        db.close()
+
+
+def test_poll_video_rechecks_external_id_after_final_heartbeat(
+    client,
+    make_user,
+    auth,
+    monkeypatch,
+):
+    uid = make_user("13790000124", balance=1000, admin=True)
+    h = auth("13790000124")
+    _config_video(client, h)
+    original_external_task_id = "final-heartbeat-old"
+    replacement_external_task_id = "final-heartbeat-replacement"
+    tid = _stranded_video(uid, original_external_task_id)
+    queued_polls = []
+    progress_updates = []
+    provider_calls = []
+    mark_calls = 0
+    real_mark_poll_alive = generation_video_flow.mark_poll_alive
+
+    def _replace_after_final_mark(task_id, external_task_id=None):
+        nonlocal mark_calls
+        mark_calls += 1
+        real_mark_poll_alive(task_id, external_task_id or original_external_task_id)
+        if mark_calls != 2:
+            return
+        concurrent_db = SessionLocal()
+        try:
+            task = concurrent_db.get(GenTask, tid)
+            task.external_task_id = replacement_external_task_id
+            concurrent_db.commit()
+        finally:
+            concurrent_db.close()
+
+    monkeypatch.setattr(generation_video_submit, "mark_poll_alive", _replace_after_final_mark)
+    monkeypatch.setattr(
+        generation_video_submit,
+        "set_progress",
+        lambda task_id, percent, status: progress_updates.append((task_id, percent, status)),
+    )
+
+    generation_video_submit.poll_video_once(
+        tid,
+        poll_video_fn=lambda *_args, **_kwargs: provider_calls.append(tid)
+        or {"status": "running"},
+        try_enqueue_poll_fn=lambda task_id, *_args: queued_polls.append(task_id),
+    )
+
+    assert provider_calls == [tid]
+    assert mark_calls == 2
+    assert queued_polls == []
+    assert progress_updates == []
+    assert not generation_video_flow.poll_chain_alive(tid, replacement_external_task_id)
+    db = SessionLocal()
+    try:
+        task = db.get(GenTask, tid)
+        assert task.status == "running"
+        assert task.phase == "polling"
+        assert task.external_task_id == replacement_external_task_id
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize(
+    ("winner_status", "winner_phase", "phone"),
+    [
+        ("needs_review", "reconciling", "13790000120"),
+        ("canceled", None, "13790000121"),
+    ],
+)
+def test_poll_video_success_cas_does_not_revive_post_refresh_winner(
+    client,
+    make_user,
+    auth,
+    monkeypatch,
+    winner_status,
+    winner_phase,
+    phone,
+):
+    uid = make_user(phone, balance=1000, admin=True)
+    h = auth(phone)
+    _config_video(client, h)
+    tid = _stranded_video(uid, f"post-refresh-{winner_status}")
+    real_persist = generation_video_submit.persist_video_download_result
+    queued_downloads = []
+
+    def _persist_after_concurrent_transition(db, task, result):
+        concurrent_db = SessionLocal()
+        try:
+            current = concurrent_db.get(GenTask, tid)
+            current.status = winner_status
+            current.phase = winner_phase
+            current.error = "concurrent state won"
+            concurrent_db.commit()
+        finally:
+            concurrent_db.close()
+        return real_persist(db, task, result)
+
+    monkeypatch.setattr(
+        generation_video_submit,
+        "persist_video_download_result",
+        _persist_after_concurrent_transition,
+    )
+    generation_video_submit.poll_video_once(
+        tid,
+        poll_video_fn=lambda *_args, **_kwargs: {
+            "status": "succeeded",
+            "url": "https://cdn.example.com/loser.mp4",
+        },
+        try_enqueue_video_download_fn=lambda _db, task_id, **_kwargs: queued_downloads.append(task_id),
+    )
+
+    assert queued_downloads == []
+    db = SessionLocal()
+    try:
+        task = db.get(GenTask, tid)
+        assert task.status == winner_status
+        assert task.phase == winner_phase
+        assert task.error == "concurrent state won"
+        assert "_video_result_url" not in (task.params or {})
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize(
+    ("handoff_source", "phone"),
+    [
+        ("existing", "13790000122"),
+        ("cas_loser", "13790000123"),
+    ],
+)
+def test_download_handoff_enqueue_failure_does_not_change_winner_state(
+    client,
+    make_user,
+    auth,
+    monkeypatch,
+    handoff_source,
+    phone,
+):
+    uid = make_user(phone, balance=1000, admin=True)
+    h = auth(phone)
+    _config_video(client, h)
+    tid = _stranded_video(uid, f"handoff-{handoff_source}")
+    winner_url = f"https://cdn.example.com/{handoff_source}-winner.mp4"
+
+    def _set_download_winner():
+        concurrent_db = SessionLocal()
+        try:
+            task = concurrent_db.get(GenTask, tid)
+            task.phase = "downloading"
+            task.params = {**(task.params or {}), "_video_result_url": winner_url}
+            concurrent_db.commit()
+        finally:
+            concurrent_db.close()
+
+    if handoff_source == "existing":
+        _set_download_winner()
+    else:
+        real_persist = generation_video_submit.persist_video_download_result
+
+        def _persist_after_download_winner(db, task, result):
+            _set_download_winner()
+            return real_persist(db, task, result)
+
+        monkeypatch.setattr(
+            generation_video_submit,
+            "persist_video_download_result",
+            _persist_after_download_winner,
+        )
+
+    if handoff_source == "existing":
+        monkeypatch.setattr(
+            generation,
+            "_enqueue_video_download",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                RuntimeError("redundant handoff enqueue failed")
+            ),
+        )
+        generation.poll_video_once(tid)
+    else:
+        generation_video_submit.poll_video_once(
+            tid,
+            poll_video_fn=lambda *_args, **_kwargs: {
+                "status": "succeeded",
+                "url": "https://cdn.example.com/loser.mp4",
+            },
+            try_enqueue_video_download_fn=lambda _db, _task_id, **_kwargs: (_ for _ in ()).throw(
+                RuntimeError("redundant handoff enqueue failed")
+            ),
+        )
+
+    db = SessionLocal()
+    try:
+        task = db.get(GenTask, tid)
+        assert task.status == "running"
+        assert task.phase == "downloading"
+        assert task.params["_video_result_url"] == winner_url
+        assert task.error is None
+    finally:
+        db.close()
+
+
+def test_stale_poll_delivery_skips_reconciling_task(client, make_user):
+    uid = make_user("13790000103", balance=1000, admin=True)
+    tid = _stranded_video(uid, "stale-poll-reconciling")
+    db = SessionLocal()
+    try:
+        task = db.get(GenTask, tid)
+        task.phase = "reconciling"
+        db.commit()
+    finally:
+        db.close()
+
+    provider_calls = []
+    model_loads = []
+    queued_polls = []
+    queued_downloads = []
+
+    def _fail_model_load(_db, use):
+        model_loads.append(use)
+        raise AssertionError("stale poll must return before model loading")
+
+    generation_video_submit.poll_video_once(
+        tid,
+        get_model_config_fn=_fail_model_load,
+        poll_video_fn=lambda *_args, **_kwargs: provider_calls.append(tid)
+        or {"status": "running"},
+        try_enqueue_poll_fn=lambda task_id, *_args: queued_polls.append(task_id),
+        try_enqueue_video_download_fn=lambda _db, task_id, **_kwargs: queued_downloads.append(task_id),
+    )
+
+    assert provider_calls == []
+    assert model_loads == []
+    assert queued_polls == []
+    assert queued_downloads == []
+    db = SessionLocal()
+    try:
+        task = db.get(GenTask, tid)
+        assert task.status == "running"
+        assert task.phase == "reconciling"
+    finally:
+        db.close()
+
+
 def test_split_poll_video_uses_default_download_enqueue(client, make_user, auth, monkeypatch):
     uid = make_user("13900000971", balance=1000, admin=True)
     h = auth("13900000971")
@@ -985,7 +2573,11 @@ def test_split_poll_soft_timeout_holds_for_review(client, make_user, auth, monke
     _config_video(client, h)
     tid = _stranded_video(uid, "ext-soft-poll")
     queued_polls = []
-    monkeypatch.setattr(generation_video_submit, "enqueue_poll", lambda task_id: queued_polls.append(task_id))
+    monkeypatch.setattr(
+        generation_video_submit,
+        "enqueue_poll",
+        lambda task_id, *_args: queued_polls.append(task_id),
+    )
 
     def timeout_poll(*_args, **_kwargs):
         raise SoftTimeLimitExceeded()
@@ -1045,6 +2637,54 @@ def test_poll_video_success_enqueue_failure_holds_for_review(client, make_user, 
         db.close()
 
 
+def test_poll_video_success_enqueue_failure_does_not_hold_replacement_generation(
+    client,
+    make_user,
+    auth,
+    monkeypatch,
+):
+    uid = make_user("13790000125", balance=1000, admin=True)
+    h = auth("13790000125")
+    _config_video(client, h)
+    old_external_task_id = "enqueue-owner-old"
+    replacement_external_task_id = "enqueue-owner-replacement"
+    replacement_url = "https://cdn.example.com/replacement.mp4"
+    tid = _stranded_video(uid, old_external_task_id)
+    monkeypatch.setattr(
+        "app.services.gateway.poll_video",
+        lambda *_args, **_kwargs: {
+            "status": "succeeded",
+            "url": "https://cdn.example.com/old-owner.mp4",
+        },
+    )
+
+    def _replace_generation_then_fail(_task_id, **_kwargs):
+        concurrent_db = SessionLocal()
+        try:
+            task = concurrent_db.get(GenTask, tid)
+            task.external_task_id = replacement_external_task_id
+            task.params = {**(task.params or {}), "_video_result_url": replacement_url}
+            concurrent_db.commit()
+        finally:
+            concurrent_db.close()
+        raise RuntimeError("broker failed after replacement")
+
+    monkeypatch.setattr(generation, "_enqueue_video_download", _replace_generation_then_fail)
+
+    generation.poll_video_once(tid)
+
+    db = SessionLocal()
+    try:
+        task = db.get(GenTask, tid)
+        assert task.status == "running"
+        assert task.phase == "downloading"
+        assert task.external_task_id == replacement_external_task_id
+        assert task.params["_video_result_url"] == replacement_url
+        assert task.error is None
+    finally:
+        db.close()
+
+
 def test_video_download_uses_persisted_provider_usage_for_settlement(
     client,
     make_user,
@@ -1089,7 +2729,7 @@ def test_video_download_uses_persisted_provider_usage_for_settlement(
     finally:
         db.close()
 
-    generation.run_video_download_task(tid)
+    generation.run_video_download_task(tid, "ext-usage")
 
     t = client.get(f"/api/tasks/{tid}", headers=h).json()
     assert t["status"] == "succeeded", t
@@ -1131,7 +2771,7 @@ def test_video_download_final_failure_holds_for_review(client, make_user, monkey
         db.close()
 
     generation.poll_video_once(tid)
-    generation.run_video_download_task(tid)
+    generation.run_video_download_task(tid, "ext-last-download-fail")
 
     db = SessionLocal()
     try:
@@ -1164,7 +2804,7 @@ def test_video_poll_transient_errors_hold_after_consecutive_limit(client, make_u
         "app.services.gateway.poll_video",
         lambda *_a, **_k: (_ for _ in ()).throw(gateway.GatewayError("temporary 503", transient=True)),
     )
-    monkeypatch.setattr(generation, "_try_enqueue_poll", lambda _task_id: None)
+    monkeypatch.setattr(generation, "_try_enqueue_poll", lambda _task_id, *_args: None)
 
     for _ in range(generation._POLL_MAX_CONSEC_ERRORS):
         generation.poll_video_once(tid)
@@ -1234,7 +2874,10 @@ def test_split_video_download_soft_timeout_holds_for_review(client, make_user, a
         lambda *_a, **_k: (_ for _ in ()).throw(SoftTimeLimitExceeded()),
     )
 
-    generation_video_download.run_video_download_task(tid)
+    generation_video_download.run_video_download_task(
+        tid,
+        expected_external_task_id="ext-soft-download",
+    )
 
     assert queued_downloads == []
     db = SessionLocal()
@@ -1254,9 +2897,10 @@ def test_download_lock_loser_does_not_refresh_alive_key(client, make_user, auth,
     uid = make_user("13900000981", balance=1000, admin=True)
     h = auth("13900000981")
     _config_video(client, h)
-    tid = _stranded_video(uid, "ext-lock-no-heartbeat")
-    generation._mark_video_download_alive(tid)
-    generation_video_flow.redis_client.delete(f"video:download:alive:{tid}")
+    external_task_id = "ext-lock-no-heartbeat"
+    tid = _stranded_video(uid, external_task_id)
+    generation._mark_video_download_alive(tid, external_task_id)
+    generation_video_flow.clear_video_download_alive(tid, external_task_id)
     monkeypatch.setattr(
         "app.services.generation.locks.acquire",
         lambda key, ttl=None: None if key.startswith("video:download:lock:") else "token",
@@ -1275,7 +2919,7 @@ def test_download_lock_loser_does_not_refresh_alive_key(client, make_user, auth,
             model,
             {"status": "succeeded", "url": "https://cdn.example.com/ok.mp4"},
         ) is False
-        assert not generation._video_download_alive(tid)
+        assert not generation._video_download_alive(tid, external_task_id)
     finally:
         db.close()
 
@@ -1332,7 +2976,7 @@ def test_resume_skips_healthy_chain(client, make_user, auth):
     tid = _stranded_video(uid, "mock-healthy")
 
     # a live chain marks itself alive -> recovery must leave it untouched
-    generation._mark_poll_alive(tid)
+    generation._mark_poll_alive(tid, "mock-healthy")
     db = SessionLocal()
     try:
         generation.resume_stuck_videos(db)
@@ -1345,6 +2989,838 @@ def test_resume_skips_healthy_chain(client, make_user, auth):
         assert db.get(GenTask, tid).status == "running"
     finally:
         db.close()
+
+
+def test_video_recovery_cursor_advances_past_healthy_batch(client, make_user, monkeypatch):
+    uid = make_user("13790000104", balance=1000, admin=True)
+    set_setting_db = SessionLocal()
+    try:
+        set_setting(set_setting_db, "video_resume_cursor", 0)
+    finally:
+        set_setting_db.close()
+
+    healthy_ids = []
+    db = SessionLocal()
+    try:
+        tasks = [
+            GenTask(
+                user_id=uid,
+                category="video",
+                stage="preview",
+                status="running",
+                phase="polling",
+                external_task_id=f"healthy-recovery-{index}",
+                external_submitted_at=datetime.now(timezone.utc),
+                cost_frozen=0,
+                params={"duration": 2},
+            )
+            for index in range(101)
+        ]
+        db.add_all(tasks)
+        db.commit()
+        healthy_ids = [task.id for task in tasks[:100]]
+        stale_id = tasks[100].id
+    finally:
+        db.close()
+
+    for index, task_id in enumerate(healthy_ids):
+        generation._mark_poll_alive(task_id, f"healthy-recovery-{index}")
+    queued = []
+    monkeypatch.setattr(generation, "_try_enqueue_poll", lambda task_id, *_args: queued.append(task_id))
+
+    db = SessionLocal()
+    try:
+        assert generation.resume_stuck_videos(db) == 0
+        assert generation.resume_stuck_videos(db) == 1
+    finally:
+        db.close()
+
+    assert queued == [stale_id]
+
+
+def test_video_recovery_clamps_configured_batch_to_one_thousand(
+    client,
+    make_user,
+    monkeypatch,
+):
+    uid = make_user("13790000111", balance=1000, admin=True)
+    monkeypatch.setattr(generation.settings, "video_resume_batch_size", 5000)
+    set_setting_db = SessionLocal()
+    try:
+        set_setting(set_setting_db, "video_resume_cursor", 0)
+    finally:
+        set_setting_db.close()
+
+    db = SessionLocal()
+    try:
+        tasks = [
+            GenTask(
+                user_id=uid,
+                category="video",
+                stage="preview",
+                status="running",
+                phase="reconciling",
+                external_task_id=f"clamped-recovery-{index}",
+                external_submitted_at=datetime.now(timezone.utc),
+                cost_frozen=0,
+                params={"duration": 2},
+            )
+            for index in range(1001)
+        ]
+        db.add_all(tasks)
+        db.commit()
+        last_candidate_id = tasks[-1].id
+    finally:
+        db.close()
+
+    examined_ids = []
+    monkeypatch.setattr(generation.locks, "acquire", lambda *_args, **_kwargs: "test-owner")
+    monkeypatch.setattr(generation.locks, "refresh", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(generation.locks, "release", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        generation,
+        "_video_task_action",
+        lambda task: examined_ids.append(task.id) or None,
+    )
+    db = SessionLocal()
+    try:
+        assert generation.resume_stuck_videos(db) == 0
+    finally:
+        db.close()
+
+    assert len(examined_ids) == 1000
+    assert len(set(examined_ids)) == 1000
+    state_db = SessionLocal()
+    try:
+        state = state_db.get(AppSetting, "video_resume_cursor").value
+        assert state["v"] == examined_ids[-1]
+        assert state["high_water"] == last_candidate_id
+    finally:
+        state_db.close()
+
+
+def test_video_recovery_empty_cycle_persists_zero_cursor(client):
+    state_db = SessionLocal()
+    try:
+        state = state_db.get(AppSetting, "video_resume_cursor")
+        if state is None:
+            state = AppSetting(key="video_resume_cursor")
+            state_db.add(state)
+        state.value = {"v": 123, "high_water": 123, "owner": "old-owner"}
+        state_db.commit()
+    finally:
+        state_db.close()
+
+    db = SessionLocal()
+    try:
+        assert generation.resume_stuck_videos(db) == 0
+    finally:
+        db.close()
+
+    verify_db = SessionLocal()
+    try:
+        state = verify_db.get(AppSetting, "video_resume_cursor").value
+        assert state["v"] == 0
+        assert state["high_water"] == 0
+    finally:
+        verify_db.close()
+
+
+def test_video_recovery_sparse_cycle_restarts_from_zero_after_tail(
+    client,
+    make_user,
+    monkeypatch,
+):
+    uid = make_user("13790000112", balance=1000, admin=True)
+    monkeypatch.setattr(generation.settings, "video_resume_batch_size", 10)
+    set_setting_db = SessionLocal()
+    try:
+        set_setting(set_setting_db, "video_resume_cursor", 0)
+    finally:
+        set_setting_db.close()
+
+    db = SessionLocal()
+    try:
+        first = GenTask(
+            user_id=uid,
+            category="video",
+            stage="preview",
+            status="running",
+            phase="polling",
+            external_task_id="sparse-first",
+            external_submitted_at=datetime.now(timezone.utc),
+            cost_frozen=0,
+            params={"duration": 2},
+        )
+        db.add(first)
+        db.flush()
+        first_id = first.id
+        db.add_all([
+            GenTask(
+                user_id=uid,
+                category="image",
+                stage="preview",
+                status="running",
+                phase="rendering",
+                cost_frozen=0,
+                params={"n": 1},
+            ),
+            GenTask(
+                user_id=uid,
+                category="video",
+                stage="preview",
+                status="running",
+                phase="polling",
+                external_task_id=None,
+                cost_frozen=0,
+                params={"duration": 2},
+            ),
+        ])
+        db.flush()
+        second = GenTask(
+            user_id=uid,
+            category="video",
+            stage="preview",
+            status="running",
+            phase="polling",
+            external_task_id="sparse-second",
+            external_submitted_at=datetime.now(timezone.utc),
+            cost_frozen=0,
+            params={"duration": 2},
+        )
+        db.add(second)
+        db.commit()
+        second_id = second.id
+    finally:
+        db.close()
+
+    assert second_id > first_id + 1
+    generation._mark_poll_alive(first_id, "sparse-first")
+    generation._mark_poll_alive(second_id, "sparse-second")
+    queued = []
+    monkeypatch.setattr(generation, "_try_enqueue_poll", lambda task_id, *_args: queued.append(task_id))
+    db = SessionLocal()
+    try:
+        assert generation.resume_stuck_videos(db) == 0
+    finally:
+        db.close()
+
+    state_db = SessionLocal()
+    try:
+        state = state_db.get(AppSetting, "video_resume_cursor").value
+        assert state["v"] == second_id
+        assert state["high_water"] == second_id
+    finally:
+        state_db.close()
+
+    generation_video_flow.clear_poll_alive(first_id, "sparse-first")
+    db = SessionLocal()
+    try:
+        assert generation.resume_stuck_videos(db) == 1
+    finally:
+        db.close()
+
+    assert queued == [first_id]
+    state_db = SessionLocal()
+    try:
+        state = state_db.get(AppSetting, "video_resume_cursor").value
+        assert state["v"] == second_id
+        assert state["high_water"] == second_id
+    finally:
+        state_db.close()
+
+
+def test_video_recovery_cycle_revisits_old_ids_during_sustained_inserts(
+    client,
+    make_user,
+    monkeypatch,
+):
+    uid = make_user("13790000105", balance=1000, admin=True)
+    monkeypatch.setattr(generation.settings, "video_resume_batch_size", 2)
+    set_setting_db = SessionLocal()
+    try:
+        set_setting(set_setting_db, "video_resume_cursor", 0)
+    finally:
+        set_setting_db.close()
+
+    def _add_healthy_tasks(prefix, count):
+        db = SessionLocal()
+        try:
+            tasks = [
+                GenTask(
+                    user_id=uid,
+                    category="video",
+                    stage="preview",
+                    status="running",
+                    phase="polling",
+                    external_task_id=f"{prefix}-{index}",
+                    external_submitted_at=datetime.now(timezone.utc),
+                    cost_frozen=0,
+                    params={"duration": 2},
+                )
+                for index in range(count)
+            ]
+            db.add_all(tasks)
+            db.commit()
+            ids = [task.id for task in tasks]
+        finally:
+            db.close()
+        for index, task_id in enumerate(ids):
+            generation._mark_poll_alive(task_id, f"{prefix}-{index}")
+        return ids
+
+    original_ids = _add_healthy_tasks("cycle-original", 4)
+    queued = []
+    monkeypatch.setattr(generation, "_try_enqueue_poll", lambda task_id, *_args: queued.append(task_id))
+    db = SessionLocal()
+    try:
+        assert generation.resume_stuck_videos(db) == 0
+    finally:
+        db.close()
+
+    generation_video_flow.clear_poll_alive(original_ids[0], "cycle-original-0")
+    _add_healthy_tasks("cycle-new-a", 2)
+    db = SessionLocal()
+    try:
+        assert generation.resume_stuck_videos(db) == 0
+    finally:
+        db.close()
+    assert queued == []
+
+    _add_healthy_tasks("cycle-new-b", 2)
+    db = SessionLocal()
+    try:
+        assert generation.resume_stuck_videos(db) == 1
+    finally:
+        db.close()
+    assert queued == [original_ids[0]]
+
+
+def test_video_recovery_rechecks_phase_after_lock(client, make_user, monkeypatch):
+    uid = make_user("13790000106", balance=1000, admin=True)
+    tid = _stranded_video(uid, "phase-changed-after-scan")
+    set_setting_db = SessionLocal()
+    try:
+        set_setting(set_setting_db, "video_resume_cursor", 0)
+    finally:
+        set_setting_db.close()
+
+    real_acquire = generation.locks.acquire
+    phase_changed = False
+
+    def _change_phase_after_candidate_scan(key, ttl=None):
+        nonlocal phase_changed
+        token = real_acquire(key, ttl=ttl)
+        if key == f"video:resume:{tid}" and token and not phase_changed:
+            phase_changed = True
+            concurrent_db = SessionLocal()
+            try:
+                current = concurrent_db.get(GenTask, tid)
+                current.phase = "reconciling"
+                concurrent_db.commit()
+            finally:
+                concurrent_db.close()
+        return token
+
+    queued = []
+    monkeypatch.setattr(generation.locks, "acquire", _change_phase_after_candidate_scan)
+    monkeypatch.setattr(generation, "_try_enqueue_poll", lambda task_id, *_args: queued.append(task_id))
+    db = SessionLocal()
+    try:
+        resumed = generation.resume_stuck_videos(db)
+    finally:
+        db.close()
+
+    assert phase_changed is True
+    assert resumed == 0
+    assert queued == []
+    db = SessionLocal()
+    try:
+        assert db.get(GenTask, tid).phase == "reconciling"
+    finally:
+        db.close()
+
+
+def test_video_recovery_expired_owner_cannot_claim_successor_db_state(client, monkeypatch):
+    expired_token = "video-recovery-expired-owner-a"
+    successor_token = "video-recovery-successor-owner-b"
+    successor_state = {
+        "v": 777,
+        "high_water": 999,
+        "owner": successor_token,
+        "version": 41,
+    }
+    state_db = SessionLocal()
+    try:
+        state = state_db.get(AppSetting, "video_resume_cursor")
+        if state is None:
+            state = AppSetting(key="video_resume_cursor")
+            state_db.add(state)
+        state.value = successor_state
+        state_db.commit()
+    finally:
+        state_db.close()
+    generation.locks.redis_client.set("video:resume:scan", successor_token, ex=600)
+
+    monkeypatch.setattr(generation.locks, "acquire", lambda *_args, **_kwargs: expired_token)
+    db = SessionLocal()
+    try:
+        assert generation.resume_stuck_videos(db) == 0
+    finally:
+        db.close()
+
+    verify_db = SessionLocal()
+    try:
+        assert verify_db.get(AppSetting, "video_resume_cursor").value == successor_state
+    finally:
+        verify_db.close()
+    assert generation.locks.redis_client.get("video:resume:scan") == successor_token
+
+
+def test_video_recovery_claim_cas_rejects_successor_before_sql_executes(
+    client,
+    make_user,
+    monkeypatch,
+):
+    uid = make_user("13790000107", balance=1000, admin=True)
+    tid = _stranded_video(uid, "cursor-claim-cas")
+    state_db = SessionLocal()
+    try:
+        state = state_db.get(AppSetting, "video_resume_cursor")
+        if state is None:
+            state = AppSetting(key="video_resume_cursor")
+            state_db.add(state)
+        state.value = {"v": 0, "high_water": tid, "owner": "video-recovery-old-owner"}
+        state_db.commit()
+    finally:
+        state_db.close()
+
+    successor_token = "video-recovery-successor-before-cas"
+    successor_state = {
+        "v": 701,
+        "high_water": 909,
+        "owner": successor_token,
+    }
+    injected = False
+    refresh_calls = 0
+    real_refresh = generation.locks.refresh
+
+    def _count_refreshes(key, token, ttl):
+        nonlocal refresh_calls
+        refresh_calls += 1
+        return real_refresh(key, token, ttl)
+
+    def _successor_before_claim_update(_conn, _cursor, statement, _params, _ctx, _many):
+        nonlocal injected
+        normalized = " ".join(str(statement).split())
+        if (
+            injected
+            or not normalized.startswith("UPDATE app_settings")
+            or "app_settings.value =" not in normalized
+        ):
+            return
+        injected = True
+        generation.locks.redis_client.set("video:resume:scan", successor_token, ex=600)
+        successor_db = SessionLocal()
+        try:
+            state = successor_db.get(AppSetting, "video_resume_cursor")
+            state.value = successor_state
+            successor_db.commit()
+        finally:
+            successor_db.close()
+
+    queued = []
+    monkeypatch.setattr(generation.locks, "refresh", _count_refreshes)
+    monkeypatch.setattr(generation, "_try_enqueue_poll", lambda task_id, *_args: queued.append(task_id))
+    event.listen(engine, "before_cursor_execute", _successor_before_claim_update)
+    db = SessionLocal()
+    try:
+        assert generation.resume_stuck_videos(db) == 0
+    finally:
+        db.close()
+        event.remove(engine, "before_cursor_execute", _successor_before_claim_update)
+
+    verify_db = SessionLocal()
+    try:
+        assert verify_db.get(AppSetting, "video_resume_cursor").value == successor_state
+    finally:
+        verify_db.close()
+    assert injected is True
+    assert refresh_calls >= 1
+    assert queued == []
+    assert generation.locks.redis_client.get("video:resume:scan") == successor_token
+
+
+def test_video_recovery_stops_when_successor_takes_over_after_claim_commit(
+    client,
+    make_user,
+    monkeypatch,
+):
+    uid = make_user("13790000108", balance=1000, admin=True)
+    _stranded_video(uid, "cursor-after-claim")
+    state_db = SessionLocal()
+    try:
+        set_setting(state_db, "video_resume_cursor", 0)
+    finally:
+        state_db.close()
+
+    successor_token = "video-recovery-successor-after-claim"
+    successor_state = {
+        "v": 811,
+        "high_water": 977,
+        "owner": successor_token,
+    }
+    refresh_calls = 0
+    candidate_selects = 0
+    real_refresh = generation.locks.refresh
+
+    def _successor_after_claim_commit(key, token, ttl):
+        nonlocal refresh_calls
+        refresh_calls += 1
+        if refresh_calls == 2:
+            generation.locks.redis_client.set(key, successor_token, ex=600)
+            successor_db = SessionLocal()
+            try:
+                state = successor_db.get(AppSetting, "video_resume_cursor")
+                state.value = successor_state
+                successor_db.commit()
+            finally:
+                successor_db.close()
+        return real_refresh(key, token, ttl)
+
+    def _count_candidate_selects(_conn, _cursor, statement, _params, _ctx, _many):
+        nonlocal candidate_selects
+        normalized = " ".join(str(statement).split())
+        if normalized.startswith("SELECT") and "FROM gen_tasks" in normalized:
+            candidate_selects += 1
+
+    queued = []
+    monkeypatch.setattr(generation.locks, "refresh", _successor_after_claim_commit)
+    monkeypatch.setattr(generation, "_try_enqueue_poll", lambda task_id, *_args: queued.append(task_id))
+    event.listen(engine, "before_cursor_execute", _count_candidate_selects)
+    db = SessionLocal()
+    try:
+        assert generation.resume_stuck_videos(db) == 0
+    finally:
+        db.close()
+        event.remove(engine, "before_cursor_execute", _count_candidate_selects)
+
+    verify_db = SessionLocal()
+    try:
+        assert verify_db.get(AppSetting, "video_resume_cursor").value == successor_state
+    finally:
+        verify_db.close()
+    assert refresh_calls == 2
+    assert candidate_selects == 0
+    assert queued == []
+    assert generation.locks.redis_client.get("video:resume:scan") == successor_token
+
+
+def test_video_recovery_cursor_fence_rejects_successor_after_final_refresh(
+    client,
+    make_user,
+    monkeypatch,
+):
+    uid = make_user("13790000109", balance=1000, admin=True)
+    _stranded_video(uid, "cursor-final-refresh")
+    set_setting_db = SessionLocal()
+    try:
+        set_setting(set_setting_db, "video_resume_cursor", 0)
+    finally:
+        set_setting_db.close()
+
+    queued = []
+    successor_token = "video-recovery-successor"
+    refresh_calls = 0
+    takeover_done = False
+    real_refresh = generation.locks.refresh
+
+    def _refresh_then_successor_takes_over(key, token, ttl):
+        nonlocal refresh_calls, takeover_done
+        refresh_calls += 1
+        refreshed = real_refresh(key, token, ttl)
+        if queued and not takeover_done:
+            takeover_done = True
+            generation.locks.redis_client.set(key, successor_token, ex=ttl)
+            successor_db = SessionLocal()
+            try:
+                state = successor_db.get(AppSetting, "video_resume_cursor")
+                state.value = {
+                    "v": 987654,
+                    "high_water": 987654,
+                    "owner": successor_token,
+                }
+                successor_db.commit()
+            finally:
+                successor_db.close()
+        return refreshed
+
+    monkeypatch.setattr(generation, "_try_enqueue_poll", lambda task_id, *_args: queued.append(task_id))
+    monkeypatch.setattr(generation.locks, "refresh", _refresh_then_successor_takes_over)
+    db = SessionLocal()
+    try:
+        generation.resume_stuck_videos(db)
+    finally:
+        db.close()
+
+    verify_db = SessionLocal()
+    try:
+        assert get_setting(verify_db, "video_resume_cursor", None) == 987654
+        assert verify_db.get(AppSetting, "video_resume_cursor").value == {
+            "v": 987654,
+            "high_water": 987654,
+            "owner": successor_token,
+        }
+    finally:
+        verify_db.close()
+    assert refresh_calls >= 1
+    assert generation.locks.redis_client.get("video:resume:scan") == successor_token
+
+
+def test_concurrent_video_recovery_claims_only_one_poll_chain(client, make_user, monkeypatch):
+    uid = make_user("13900000998", balance=1000, admin=True)
+    tid = _stranded_video(uid, "concurrent-recovery")
+    enqueue_lock = threading.Lock()
+    release_first = threading.Event()
+    first_enqueue_started = threading.Event()
+    one_recovery_finished = threading.Event()
+    queued = []
+
+    def _slow_first_enqueue(task_id, *_args):
+        with enqueue_lock:
+            queued.append(task_id)
+            is_first = len(queued) == 1
+        if is_first:
+            first_enqueue_started.set()
+            assert release_first.wait(timeout=5)
+
+    monkeypatch.setattr(generation, "_poll_chain_alive", lambda _task_id, *_args: False)
+    monkeypatch.setattr(generation, "_try_enqueue_poll", _slow_first_enqueue)
+
+    def _resume_once():
+        db = SessionLocal()
+        try:
+            return generation.resume_stuck_videos(db)
+        finally:
+            db.close()
+            one_recovery_finished.set()
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(_resume_once) for _ in range(2)]
+        assert first_enqueue_started.wait(timeout=5)
+        assert one_recovery_finished.wait(timeout=5)
+        release_first.set()
+        results = [future.result(timeout=5) for future in futures]
+
+    assert queued == [tid]
+    assert sorted(results) == [0, 1]
+
+
+def test_video_recovery_limits_each_scan_batch(client, make_user, monkeypatch):
+    uid = make_user("13900000999", balance=1000, admin=True)
+    db = SessionLocal()
+    try:
+        db.add_all([
+            GenTask(
+                user_id=uid,
+                category="video",
+                stage="preview",
+                status="running",
+                phase="polling",
+                external_task_id=f"batch-recovery-{index}",
+                external_submitted_at=datetime.now(timezone.utc),
+                cost_frozen=0,
+                params={"duration": 2},
+            )
+            for index in range(101)
+        ])
+        db.commit()
+    finally:
+        db.close()
+
+    queued = []
+    monkeypatch.setattr(generation, "_poll_chain_alive", lambda _task_id, *_args: False)
+    monkeypatch.setattr(generation, "_video_download_alive", lambda _task_id, *_args: False)
+    monkeypatch.setattr(generation, "_mark_poll_alive", lambda _task_id, *_args: None)
+    monkeypatch.setattr(generation, "_try_enqueue_poll", lambda task_id, *_args: queued.append(task_id))
+    db = SessionLocal()
+    try:
+        resumed = generation.resume_stuck_videos(db)
+    finally:
+        db.close()
+
+    assert resumed == 100
+    assert len(queued) == 100
+
+
+def test_video_recovery_download_enqueue_failure_stays_retryable(
+    client,
+    make_user,
+    monkeypatch,
+):
+    uid = make_user("13790000126", balance=1000, admin=True)
+    db = SessionLocal()
+    try:
+        set_setting(db, "video_resume_cursor", 0)
+        task = GenTask(
+            user_id=uid,
+            category="video",
+            stage="preview",
+            status="running",
+            phase="downloading",
+            external_task_id="recovery-download-retry",
+            external_submitted_at=datetime.now(timezone.utc),
+            cost_frozen=0,
+            params={
+                "duration": 2,
+                "_video_result_url": "https://cdn.example.com/recovery-retry.mp4",
+            },
+        )
+        db.add(task)
+        db.commit()
+        tid = task.id
+    finally:
+        db.close()
+
+    attempts = []
+
+    def _fail_once(task_id, **_kwargs):
+        attempts.append(task_id)
+        if len(attempts) == 1:
+            raise RuntimeError("broker temporarily unavailable")
+
+    monkeypatch.setattr(generation, "_enqueue_video_download", _fail_once)
+    first_db = SessionLocal()
+    try:
+        assert generation.resume_stuck_videos(first_db) == 0
+    finally:
+        first_db.close()
+
+    verify_db = SessionLocal()
+    try:
+        task = verify_db.get(GenTask, tid)
+        assert task.status == "running"
+        assert task.phase == "downloading"
+        assert task.error is None
+        assert not generation._video_download_alive(tid, "recovery-download-retry")
+    finally:
+        verify_db.close()
+
+    second_db = SessionLocal()
+    try:
+        assert generation.resume_stuck_videos(second_db) == 1
+    finally:
+        second_db.close()
+
+    assert attempts == [tid, tid]
+    assert generation._video_download_alive(tid, "recovery-download-retry")
+
+
+def test_fail_and_refund_fallback_does_not_overwrite_replacement_generation(
+    client,
+    make_user,
+    monkeypatch,
+):
+    uid = make_user("13790000127", balance=1000, admin=True)
+    old_external_task_id = "refund-fallback-old"
+    replacement_external_task_id = "refund-fallback-replacement"
+    tid = _stranded_video(uid, old_external_task_id)
+
+    def _replace_generation_then_fail(db, *_args, **_kwargs):
+        db.rollback()
+        concurrent_db = SessionLocal()
+        try:
+            task = concurrent_db.get(GenTask, tid)
+            task.phase = "downloading"
+            task.external_task_id = replacement_external_task_id
+            task.params = {
+                **(task.params or {}),
+                "_video_result_url": "https://cdn.example.com/refund-replacement.mp4",
+            }
+            concurrent_db.commit()
+        finally:
+            concurrent_db.close()
+        raise RuntimeError("refund commit path failed")
+
+    monkeypatch.setattr(generation_common.credits, "refund", _replace_generation_then_fail)
+    db = SessionLocal()
+    try:
+        generation_common.fail_and_refund(
+            db,
+            tid,
+            "stale provider failure",
+            expected_status="running",
+            expected_phase="polling",
+            expected_external_task_id=old_external_task_id,
+        )
+    finally:
+        db.close()
+
+    verify_db = SessionLocal()
+    try:
+        task = verify_db.get(GenTask, tid)
+        assert task.status == "running"
+        assert task.phase == "downloading"
+        assert task.external_task_id == replacement_external_task_id
+        assert task.error is None
+        user = verify_db.get(User, uid)
+        assert user.balance_credits == 995
+        assert user.frozen_credits == 5
+    finally:
+        verify_db.close()
+
+
+def test_mark_needs_review_params_update_uses_observed_params_cas(
+    client,
+    make_user,
+):
+    uid = make_user("13790000128", balance=1000, admin=True)
+    old_external_task_id = "params-cas-old"
+    tid = _stranded_video(uid, old_external_task_id)
+    replacement_params = {"duration": 2, "concurrent_winner": True}
+    injected = False
+
+    def _replace_params_before_review_update(_conn, _cursor, statement, _params, _ctx, _many):
+        nonlocal injected
+        normalized = " ".join(str(statement).split())
+        if injected or not normalized.startswith("UPDATE gen_tasks SET"):
+            return
+        injected = True
+        concurrent_db = SessionLocal()
+        try:
+            task = concurrent_db.get(GenTask, tid)
+            task.params = replacement_params
+            concurrent_db.commit()
+        finally:
+            concurrent_db.close()
+
+    event.listen(engine, "before_cursor_execute", _replace_params_before_review_update)
+    db = SessionLocal()
+    try:
+        changed = generation_common.mark_needs_review(
+            db,
+            tid,
+            "stale review",
+            params_update={"review_marker": True},
+            expected_status="running",
+            expected_phase="polling",
+            expected_external_task_id=old_external_task_id,
+        )
+    finally:
+        db.close()
+        event.remove(engine, "before_cursor_execute", _replace_params_before_review_update)
+
+    assert injected is True
+    assert changed is False
+    verify_db = SessionLocal()
+    try:
+        task = verify_db.get(GenTask, tid)
+        assert task.status == "running"
+        assert task.phase == "polling"
+        assert task.params == replacement_params
+        assert task.error is None
+    finally:
+        verify_db.close()
 
 
 def test_reaper_skips_active_video_download(client, make_user, auth):
@@ -1370,7 +3846,7 @@ def test_reaper_skips_active_video_download(client, make_user, auth):
         credits.freeze(db, uid, 5, biz_ref=t.id, commit=False)
         db.commit()
         tid = t.id
-        generation._mark_video_download_alive(tid)
+        generation._mark_video_download_alive(tid, "ext-downloading")
 
         assert retention.reap_stuck_tasks(db, max_minutes=60) == 0
         db.refresh(t)
@@ -1689,7 +4165,7 @@ def test_video_download_local_settlement_failure_holds_for_review(
 
     generation.poll_video_once(tid)
     monkeypatch.setattr(credits, "settle", fail_settle)
-    generation.run_video_download_task(tid)
+    generation.run_video_download_task(tid, "ext-settle-fail")
     monkeypatch.setattr(credits, "settle", original_settle)
 
     db = SessionLocal()
@@ -1736,7 +4212,7 @@ def test_video_download_model_config_error_holds_for_review(client, make_user, a
         db.close()
 
     monkeypatch.setattr(generation, "get_model_config", lambda *_args, **_kwargs: None)
-    generation.run_video_download_task(tid)
+    generation.run_video_download_task(tid, "ext-downloaded-config-missing")
 
     db = SessionLocal()
     try:

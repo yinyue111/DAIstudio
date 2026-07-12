@@ -30,6 +30,7 @@ import httpx
 from ..config import settings
 from . import locks, storage
 from .gateway_mocks import mock_image as _mock_image
+from .gateway_mocks import mock_video as mock_video
 from .gateway_mocks import mock_video_preview_image as mock_video_preview_image
 from .gateway_prompting import mock_reverse as _mock_reverse
 from .gateway_prompting import parse_structured as _parse_structured

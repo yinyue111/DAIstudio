@@ -118,6 +118,13 @@ class AdminIdempotencyKey(Base):
     __table_args__ = (
         CheckConstraint("scope in ('quota_grant')", name="ck_admin_idempotency_scope_valid"),
         Index("uq_admin_idempotency_scope_key", "admin_id", "scope", "key", unique=True),
+        Index(
+            "ix_admin_idempotency_business_window",
+            "admin_id",
+            "scope",
+            "business_fingerprint",
+            "fingerprint_expires_at",
+        ),
     )
 
     id: Mapped[int] = mapped_column(BigIntPK, primary_key=True, autoincrement=True)
@@ -127,6 +134,8 @@ class AdminIdempotencyKey(Base):
     target_user_id: Mapped[int | None] = mapped_column(BigInteger)
     amount: Mapped[int | None] = mapped_column(BigInteger)
     note: Mapped[str | None] = mapped_column(String(255))
+    business_fingerprint: Mapped[str | None] = mapped_column(String(64))
+    fingerprint_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
@@ -252,11 +261,12 @@ class ReverseOperation(Base):
         ),
         Index("uq_reverse_operations_user_client_request_id", "user_id", "client_request_id", unique=True),
         Index("ix_reverse_operations_user_created", "user_id", "created_at"),
+        Index("ix_reverse_operations_status_updated", "status", "updated_at"),
     )
 
     id: Mapped[int] = mapped_column(BigIntPK, primary_key=True, autoincrement=True)
     user_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("users.id"), index=True)
-    client_request_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    client_request_id: Mapped[str | None] = mapped_column(String(128))
     request_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
     target: Mapped[str] = mapped_column(String(32), nullable=False)
     asset_url: Mapped[str] = mapped_column(Text, nullable=False)
