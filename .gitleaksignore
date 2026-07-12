@@ -1,0 +1,7 @@
+# Intentional fake secret fixtures used to verify output redaction.
+47584c1d2a6a1f5a79996284d0afc773064ee1c6:backend/tests/test_security.py:generic-api-key:2746
+5c85c93e8c874302b46bd87ebcc9b4d39bb8b0d3:backend/tests/test_online_update.py:generic-api-key:238
+a24521c5432ce4e123ebb5b6941a1871af6efb8b:backend/tests/test_online_update.py:generic-api-key:333
+
+# Source code that wraps configured key material with PEM boundary markers.
+18aa2ee819bdfecaec1d6218cce082948a415b71:backend/app/services/payments.py:private-key:156

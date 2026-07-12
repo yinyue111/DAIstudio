@@ -2743,7 +2743,7 @@ def test_admin_quota_single_and_bulk_share_database_daily_limit_lock(
         responses["bulk"] = second_client.post(
             "/api/admin/quota/bulk-grant",
             json={
-                "idempotency_key": "bulk-daily-race-001",
+                "idempotency_key": "bulk-daily-race-001",  # gitleaks:allow
                 "items": [{"user_id": bulk_target, "amount": 60, "note": "bulk daily race"}],
             },
             headers=h,

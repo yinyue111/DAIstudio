@@ -736,7 +736,7 @@ def test_online_update_redacts_secrets_from_command_output():
 
     text = (
         "remote=https://ghp_abcdefghijklmnopqrstuvwxyz012345@example.com/repo.git\n"
-        "api_key=sk-abcdef1234567890 token=ark-abcdef1234567890 password=hunter2 "
+        "api_key=sk-abcdef1234567890 token=ark-abcdef1234567890 password=hunter2 "  # gitleaks:allow
         "github_pat_1234567890abcdef\n"
         "ALIPAY_PRIVATE_KEY=-----BEGIN PRIVATE KEY-----abc123-----END PRIVATE KEY-----\n"
         "WECHAT_PAY_PRIVATE_KEY=wx-secret\n"

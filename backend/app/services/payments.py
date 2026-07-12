@@ -179,7 +179,7 @@ def _normalise_private_pem(pem: str) -> str:
     text = _normalise_pem_text(pem)
     if "-----BEGIN" in text:
         return text
-    return "-----BEGIN PRIVATE KEY-----\n" + _wrap_pem_body(text) + "\n-----END PRIVATE KEY-----"
+    return "-----BEGIN PRIVATE KEY-----\n" + _wrap_pem_body(text) + "\n-----END PRIVATE KEY-----"  # gitleaks:allow
 
 
 def _normalise_public_pem(pem: str) -> str:

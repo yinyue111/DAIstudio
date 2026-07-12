@@ -20,7 +20,11 @@ COPY requirements.txt .
 RUN pip install -r requirements.txt
 # Dynamic-page scraping (XHS and other lazy-loaded sites) needs Chromium inside
 # the container; installed to a shared path so the non-root runtime user can use it.
-RUN python -m playwright install --with-deps chromium
+# Keep OS packages and the browser download in separate layers so a transient
+# download failure can reuse the dependency layer on retry.
+RUN python -m playwright install-deps chromium
+ARG PLAYWRIGHT_DOWNLOAD_HOST
+RUN python -m playwright install chromium
 
 # Run as a non-root user. The named `media` volume mounted at /app/storage
 # inherits this ownership on first creation (Docker copies image dir perms).
