@@ -65,11 +65,13 @@ docker-down: ## Stop the stack
 
 compose-check: ## Validate docker compose rendering with required placeholders
 	POSTGRES_PASSWORD="$${POSTGRES_PASSWORD:-release-check-postgres-password}" \
+		REDIS_PASSWORD="$${REDIS_PASSWORD:-release-check-redis-password}" \
 		BACKEND_ENV_FILE="$${BACKEND_ENV_FILE:-./backend/.env.example}" \
 		docker compose config --quiet
 
 docker-build-check: ## Build backend/frontend Docker images without starting services
 	POSTGRES_PASSWORD="$${POSTGRES_PASSWORD:-release-check-postgres-password}" \
+		REDIS_PASSWORD="$${REDIS_PASSWORD:-release-check-redis-password}" \
 		BACKEND_ENV_FILE="$${BACKEND_ENV_FILE:-./backend/.env.example}" \
 		docker compose build api worker worker_image worker_video worker_video_download worker_parse beat frontend
 
