@@ -25,9 +25,9 @@ echo "worker parallelism script test passed"
 
 critical_cmd="$(WORKER_ROLE=critical "$ROOT/scripts/run_worker.sh" --print-command)"
 case "$critical_cmd" in
-  *"--pool=solo"*"--concurrency=2"*"default\\,payment\\,video_poll\\,cleanup"*) ;;
+  *"--pool=threads"*"--concurrency=2"*"default\\,payment\\,video_poll\\,cleanup"*) ;;
   *)
-    echo "expected critical worker role to use solo pool and isolate short queues, got: $critical_cmd" >&2
+    echo "expected critical worker role to use threads concurrency=2 and isolate short queues, got: $critical_cmd" >&2
     exit 1
     ;;
 esac

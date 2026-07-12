@@ -2,6 +2,7 @@
 
 import { useEffect, useRef } from "react";
 import { api } from "../lib/api";
+import { createStudioOwnerRequestContext } from "../lib/studioSession";
 import {
   PARSE_POLL_INTERVAL_MS,
   PARSE_POLL_TIMEOUT_MS,
@@ -56,6 +57,7 @@ export default function useReferenceParsing({
   setRefOpen,
   refreshMe,
   revokeUploadedObjectUrlsRef,
+  getOwnerSession,
 }) {
   const selectedByModeRef = useRef({});
   const refVersionRef = useRef({});
@@ -65,8 +67,16 @@ export default function useReferenceParsing({
   const lastReversePromptRef = useRef({});
   const creationModeRef = useRef("image");
   const urlByModeRef = useRef({});
+  const getOwnerSessionRef = useRef(getOwnerSession);
+  const ownerRequestContextRef = useRef(null);
 
   urlByModeRef.current[creationMode] = String(url || "").trim();
+  getOwnerSessionRef.current = getOwnerSession;
+  if (!ownerRequestContextRef.current) {
+    ownerRequestContextRef.current = createStudioOwnerRequestContext(
+      () => getOwnerSessionRef.current?.(),
+    );
+  }
 
   useEffect(() => {
     creationModeRef.current = creationMode;
@@ -142,11 +152,14 @@ export default function useReferenceParsing({
     }
   }
 
-  async function waitForParseResult(initial, refVersion, mode, targetUrl) {
+  async function waitForParseResult(initial, refVersion, mode, targetUrl, ownerRequest) {
     let current = initial;
     const startedAt = Date.now();
     while (current?.status === "queued" || current?.status === "running") {
-      if (!isParseStillCurrent(mode, refVersion, targetUrl)) return null;
+      if (
+        !ownerRequest.isCurrent()
+        || !isParseStillCurrent(mode, refVersion, targetUrl)
+      ) return null;
       if (Date.now() - startedAt > PARSE_POLL_TIMEOUT_MS) {
         return {
           ...current,
@@ -156,7 +169,10 @@ export default function useReferenceParsing({
         };
       }
       await sleep(PARSE_POLL_INTERVAL_MS);
-      if (!isParseStillCurrent(mode, refVersion, targetUrl)) return null;
+      if (
+        !ownerRequest.isCurrent()
+        || !isParseStillCurrent(mode, refVersion, targetUrl)
+      ) return null;
       current = await api.parseStatus(current.id);
     }
     return current;
@@ -164,6 +180,7 @@ export default function useReferenceParsing({
 
   async function doParse() {
     if (!url.trim() || parsing) return;
+    const ownerRequest = ownerRequestContextRef.current.capture();
     const mode = creationMode;
     const targetUrl = url.trim();
     const reqId = bumpParseRequest(mode);
@@ -187,8 +204,12 @@ export default function useReferenceParsing({
     setRefOpen(true);
     try {
       const first = await api.parse(targetUrl);
-      const result = await waitForParseResult(first, refVersion, mode, targetUrl);
-      if (!isParseStillCurrent(mode, refVersion, targetUrl)) return;
+      if (!ownerRequest.isCurrent()) return;
+      const result = await waitForParseResult(first, refVersion, mode, targetUrl, ownerRequest);
+      if (
+        !ownerRequest.isCurrent()
+        || !isParseStillCurrent(mode, refVersion, targetUrl)
+      ) return;
       if (!result) return;
       if (result.pending_timeout) {
         setMsg(result.error || "抓取仍在后台处理中，稍后刷新。");
@@ -199,9 +220,16 @@ export default function useReferenceParsing({
       setWorkspacePatch({ assets: result.assets || [] }, mode);
       if (!result.assets?.length && isModeVisible(mode)) setMsg("未在该页面发现可用素材");
     } catch (e) {
-      if (isRefVersionCurrent(mode, refVersion) && isModeVisible(mode)) setMsg(e.message);
+      if (
+        ownerRequest.isCurrent()
+        && isRefVersionCurrent(mode, refVersion)
+        && isModeVisible(mode)
+      ) setMsg(e.message);
     } finally {
-      if (isRequestCurrent(parseRequestRef, mode, reqId)) setWorkspacePatch({ parsing: false }, mode);
+      if (
+        ownerRequest.isCurrent()
+        && isRequestCurrent(parseRequestRef, mode, reqId)
+      ) setWorkspacePatch({ parsing: false }, mode);
     }
   }
 
@@ -211,6 +239,7 @@ export default function useReferenceParsing({
 
   async function doReverse() {
     if (!selected) return;
+    const ownerRequest = ownerRequestContextRef.current.capture();
     const mode = creationMode;
     const targetCategory = category;
     const targetVideoPreset = videoAnalysisPreset;
@@ -222,7 +251,8 @@ export default function useReferenceParsing({
     const reqId = bumpReverseRequest(mode);
     let clientRequestId = null;
     const isCurrent = () => (
-      isRequestCurrent(reverseRequestRef, mode, reqId)
+      ownerRequest.isCurrent()
+      && isRequestCurrent(reverseRequestRef, mode, reqId)
       && assetSignature(selectedByModeRef.current[mode]) === targetSignature
     );
     setWorkspacePatch({ reversing: true }, mode);
@@ -251,15 +281,19 @@ export default function useReferenceParsing({
         isVideo ? targetVideoPreset : null,
         clientRequestId,
       );
-      clearPendingReverseRequest(pendingReverseRequestRef, clientRequestId);
       if (!isCurrent()) return;
+      clearPendingReverseRequest(pendingReverseRequestRef, clientRequestId);
       const structured = result.structured || {};
       const reversePrompt = isEditMode
         ? composeStyleTransferPrompt(structured, result.final_text || "", {
             video: targetCategory === "video",
             subject: subjectMode,
           })
-        : composePromptFromStructured(structured, result.final_text || "");
+        : composePromptFromStructured(
+            structured,
+            result.final_text || "",
+            { preferFallback: true },
+          );
       lastReversePromptRef.current[mode] = {
         prompt: reversePrompt,
         structured,
@@ -288,11 +322,24 @@ export default function useReferenceParsing({
       }
       refreshMe();
     } catch (e) {
-      if (!isRequestTimeoutError(e)) clearPendingReverseRequest(pendingReverseRequestRef, clientRequestId);
+      if (isCurrent() && !isRequestTimeoutError(e)) {
+        clearPendingReverseRequest(pendingReverseRequestRef, clientRequestId);
+      }
       if (isCurrent() && isModeVisible(mode)) setMsg(e.message);
     } finally {
-      if (isRequestCurrent(reverseRequestRef, mode, reqId)) setWorkspacePatch({ reversing: false }, mode);
+      if (isCurrent()) setWorkspacePatch({ reversing: false }, mode);
     }
+  }
+
+  function resetOwnerReferenceParsing() {
+    ownerRequestContextRef.current.invalidate();
+    selectedByModeRef.current = {};
+    refVersionRef.current = {};
+    parseRequestRef.current = {};
+    reverseRequestRef.current = {};
+    pendingReverseRequestRef.current = {};
+    lastReversePromptRef.current = {};
+    urlByModeRef.current = {};
   }
 
   return {
@@ -307,5 +354,6 @@ export default function useReferenceParsing({
     doParse,
     doReverse,
     lastReversePromptRef,
+    resetOwnerReferenceParsing,
   };
 }

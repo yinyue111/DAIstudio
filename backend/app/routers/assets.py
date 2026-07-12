@@ -16,7 +16,7 @@ from starlette.background import BackgroundTask
 
 from ..config import settings
 from ..db import get_db
-from ..deps import get_client_ip, get_current_user
+from ..deps import get_client_ip, get_current_user, resolve_token_user
 from ..models import AssetReport, GenAsset, GenTask, User
 from ..redis_client import redis_client
 from ..schemas import (
@@ -27,7 +27,8 @@ from ..schemas import (
     AssetReportIn,
     AssetReportOut,
 )
-from ..services import audit, credits, gateway, storage
+from ..security import decode_access_token
+from ..services import audit, credits, gateway, locks, storage
 from ..services.asset_output import (
     is_generated_asset_task,
     is_settled_generated_asset_task,
@@ -35,10 +36,19 @@ from ..services.asset_output import (
     unlock_cost_for_asset,
 )
 from ..services.media_sidecars import collect_unreferenced_asset_keys, unlink_keys
+from ..services.rate_limit import incr_window
 from ..services.retention import detach_asset_reports
 
 router = APIRouter(prefix="/api/assets", tags=["assets"])
 _PLAYBACK_TICKET_TTL_SECONDS = 600
+_BATCH_DOWNLOAD_MAX_ITEMS = 30
+_BATCH_DOWNLOAD_MAX_VIDEO_ITEMS = 5
+_BATCH_DOWNLOAD_MAX_BYTES = 512 * 1024 * 1024
+_BATCH_DOWNLOAD_RATE_LIMIT = 12
+_BATCH_DOWNLOAD_RATE_WINDOW_SECONDS = 3600
+_BATCH_DOWNLOAD_PARALLELISM = 2
+_BATCH_DOWNLOAD_SLOT_TTL_SECONDS = 900
+_BATCH_DOWNLOAD_SEMAPHORE_KEY = "semaphore:asset-batch-download"
 _IMAGE_SIGNATURES = (
     (b"\xff\xd8\xff", "image/jpeg", "jpg"),
     (b"\x89PNG\r\n\x1a\n", "image/png", "png"),
@@ -52,7 +62,8 @@ def _download_media_info(asset: GenAsset, path: Path) -> tuple[str, str]:
     if asset.type == "video":
         return "video/mp4", "mp4"
     try:
-        head = path.read_bytes()[:16]
+        with path.open("rb") as stream:
+            head = stream.read(16)
     except OSError:
         head = b""
     for signature, media_type, ext in _IMAGE_SIGNATURES:
@@ -65,6 +76,54 @@ def _external_download_policy(asset: GenAsset) -> tuple[int, tuple[str, ...]]:
     if asset.type == "video":
         return int(settings.video_download_max_bytes), ("video/", "application/octet-stream")
     return int(settings.generated_image_max_bytes), ("image/",)
+
+
+def _consume_redis_key(key: str) -> str | None:
+    getdel = getattr(redis_client, "getdel", None)
+    if callable(getdel):
+        return getdel(key)
+    value = redis_client.get(key)
+    if value is not None:
+        redis_client.delete(key)
+    return value
+
+
+def _request_user_from_cookie_or_bearer(request: Request, db: Session) -> User | None:
+    token = None
+    authorization = request.headers.get("authorization")
+    if authorization and authorization.lower().startswith("bearer "):
+        token = authorization.split(" ", 1)[1].strip()
+    if not token:
+        token = request.cookies.get(settings.auth_cookie_name)
+    if not token:
+        return None
+    decoded = decode_access_token(token)
+    if not decoded:
+        return None
+    user_id, token_version = decoded
+    return resolve_token_user(db, user_id, token_version)
+
+
+def _user_from_playback_ticket(asset_id: int, ticket: str | None, db: Session) -> User | None:
+    if not ticket:
+        return None
+    key = f"asset:playback:{ticket}"
+    raw = _consume_redis_key(key)
+    if not raw:
+        raise HTTPException(401, "播放凭证已过期,请重新打开预览")
+    try:
+        user_id_s, asset_id_s, token_version_s = str(raw).split(":", 2)
+        user_id = int(user_id_s)
+        ticket_asset_id = int(asset_id_s)
+        token_version = int(token_version_s)
+    except (TypeError, ValueError):
+        raise HTTPException(401, "播放凭证无效")
+    if ticket_asset_id != asset_id:
+        raise HTTPException(404, "素材不存在")
+    user = db.get(User, user_id)
+    if not user or user.token_version != token_version or user.status != "active":
+        raise HTTPException(401, "播放凭证无效")
+    return user
 
 
 def _unlocked_owner_asset(db: Session, asset_id: int, user: User) -> GenAsset:
@@ -133,13 +192,16 @@ def batch_delete_assets(
     return AssetBatchDeleteOut(deleted=deleted, failed=failed)
 
 
-@router.post("/batch/download")
-def batch_download_assets(
+def _build_batch_download_response(
     body: AssetBatchIn,
     request: Request,
-    db: Session = Depends(get_db),
-    user: User = Depends(get_current_user),
+    db: Session,
+    user: User,
 ):
+    if len(body.asset_ids) > _BATCH_DOWNLOAD_MAX_ITEMS:
+        raise HTTPException(413, f"单次最多打包 {_BATCH_DOWNLOAD_MAX_ITEMS} 个素材")
+    video_count = 0
+    total_bytes = 0
     tmp = tempfile.NamedTemporaryFile(prefix="assets-", suffix=".zip", delete=False)
     tmp_path = Path(tmp.name)
     tmp.close()
@@ -151,6 +213,10 @@ def batch_download_assets(
                 external_tmp: Path | None = None
                 try:
                     asset = _unlocked_owner_asset(db, asset_id, user)
+                    if asset.type == "video":
+                        video_count += 1
+                        if video_count > _BATCH_DOWNLOAD_MAX_VIDEO_ITEMS:
+                            raise HTTPException(413, f"单次最多打包 {_BATCH_DOWNLOAD_MAX_VIDEO_ITEMS} 个视频")
                     url = asset.hd_url or asset.preview_url
                     key = storage.key_from_url(url)
                     if key:
@@ -164,10 +230,13 @@ def batch_download_assets(
                         ) as f:
                             external_tmp = Path(f.name)
                         max_bytes, allowed_content_types = _external_download_policy(asset)
+                        remaining_bytes = _BATCH_DOWNLOAD_MAX_BYTES - total_bytes
+                        if remaining_bytes <= 0:
+                            raise HTTPException(413, "打包文件过大,请减少素材数量后重试")
                         gateway.download_to_path(
                             url,
                             external_tmp,
-                            max_bytes=max_bytes,
+                            max_bytes=min(max_bytes, remaining_bytes),
                             allowed_content_types=allowed_content_types,
                             timeout_seconds=(
                                 int(settings.video_download_timeout_seconds)
@@ -178,6 +247,13 @@ def batch_download_assets(
                         path = external_tmp
                     else:
                         raise HTTPException(404, "资源不存在")
+                    try:
+                        item_size = path.stat().st_size
+                    except OSError:
+                        item_size = 0
+                    total_bytes += max(0, int(item_size))
+                    if total_bytes > _BATCH_DOWNLOAD_MAX_BYTES:
+                        raise HTTPException(413, "打包文件过大,请减少素材数量后重试")
                     media_type, ext = _download_media_info(asset, path)
                     name = f"asset-{asset.id}.{ext}"
                     if name in zf.namelist():
@@ -185,6 +261,8 @@ def batch_download_assets(
                     zf.write(path, arcname=name)
                     added += 1
                 except HTTPException as e:
+                    if e.status_code == 413:
+                        raise
                     skipped.append({"id": asset_id, "error": str(e.detail)})
                 except Exception as e:  # noqa: BLE001
                     skipped.append({"id": asset_id, "error": str(e)[:120] or "打包失败"})
@@ -219,6 +297,36 @@ def batch_download_assets(
     except Exception:
         tmp_path.unlink(missing_ok=True)
         raise
+
+
+@router.post("/batch/download")
+def batch_download_assets(
+    body: AssetBatchIn,
+    request: Request,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    rate = incr_window(
+        f"asset:batch-download-rate:{user.id}",
+        _BATCH_DOWNLOAD_RATE_WINDOW_SECONDS,
+    )
+    if rate > _BATCH_DOWNLOAD_RATE_LIMIT:
+        raise HTTPException(429, "打包下载过于频繁,请稍后再试")
+
+    slot = locks.RedisSemaphore(
+        _BATCH_DOWNLOAD_SEMAPHORE_KEY,
+        limit=_BATCH_DOWNLOAD_PARALLELISM,
+        ttl=_BATCH_DOWNLOAD_SLOT_TTL_SECONDS,
+        wait_timeout=0,
+    )
+    try:
+        slot.__enter__()
+    except TimeoutError:
+        raise HTTPException(429, "打包下载任务繁忙,请稍后再试") from None
+    try:
+        return _build_batch_download_response(body, request, db, user)
+    finally:
+        slot.__exit__(None, None, None)
 
 
 @router.post("/{asset_id}/unlock", response_model=AssetOut)
@@ -361,24 +469,19 @@ def create_playback_ticket(
 
 
 @router.get("/{asset_id}/stream")
-def stream(asset_id: int, ticket: str, request: Request, db: Session = Depends(get_db)):
-    raw = redis_client.get(f"asset:playback:{ticket}")
-    if not raw:
-        raise HTTPException(401, "播放凭证已过期,请重新打开预览")
-    try:
-        user_id_s, asset_id_s, token_version_s = str(raw).split(":", 2)
-        user_id = int(user_id_s)
-        ticket_asset_id = int(asset_id_s)
-        token_version = int(token_version_s)
-    except (TypeError, ValueError):
-        redis_client.delete(f"asset:playback:{ticket}")
-        raise HTTPException(401, "播放凭证无效")
-    if ticket_asset_id != asset_id:
-        raise HTTPException(404, "素材不存在")
-    user = db.get(User, user_id)
-    if not user or user.token_version != token_version or user.status != "active":
-        redis_client.delete(f"asset:playback:{ticket}")
-        raise HTTPException(401, "播放凭证无效")
+def stream(
+    asset_id: int,
+    request: Request,
+    ticket: str | None = None,
+    db: Session = Depends(get_db),
+):
+    user = (
+        _user_from_playback_ticket(asset_id, ticket, db)
+        if ticket
+        else _request_user_from_cookie_or_bearer(request, db)
+    )
+    if user is None:
+        raise HTTPException(401, "请登录后预览视频")
     asset = _unlocked_owner_asset(db, asset_id, user)
     if asset.type != "video":
         raise HTTPException(400, "仅视频素材支持在线播放")
@@ -392,7 +495,7 @@ def stream(asset_id: int, ticket: str, request: Request, db: Session = Depends(g
         ip=get_client_ip(request),
         detail={"type": asset.type, "task_id": asset.task_id},
     )
-    return FileResponse(str(path), media_type="video/mp4")
+    return FileResponse(str(path), media_type="video/mp4", headers={"Cache-Control": "no-store"})
 
 
 @router.post("/{asset_id}/favorite", response_model=AssetOut)

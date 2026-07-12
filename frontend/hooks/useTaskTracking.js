@@ -3,6 +3,10 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api, wsUrl } from "../lib/api";
 import { reportBackgroundError } from "../lib/errorHandling";
+import {
+  createStudioOwnerRequestContext,
+  createStudioTaskActionContext,
+} from "../lib/studioSession";
 import { RATIOS } from "../app/studio/constants";
 import { assetDims, isTerminalTaskStatus, nearestRatio, videoRatioOptions } from "../app/studio/helpers";
 
@@ -36,6 +40,7 @@ export default function useTaskTracking({
   setMsg,
   refreshMe,
   loadWorks,
+  getOwnerSession,
 }) {
   const [task, setTask] = useState(null);
   const [runningSnapshot, setRunningSnapshot] = useState(null);
@@ -48,6 +53,29 @@ export default function useTaskTracking({
   const backgroundTrackersRef = useRef(new Map());
   const activeIdRef = useRef(null);
   const trackingRunRef = useRef(0);
+  const taskStateRef = useRef(null);
+  const getOwnerSessionRef = useRef(getOwnerSession);
+  const ownerRequestContextRef = useRef(null);
+
+  getOwnerSessionRef.current = getOwnerSession;
+  if (!ownerRequestContextRef.current) {
+    ownerRequestContextRef.current = createStudioOwnerRequestContext(
+      () => getOwnerSessionRef.current?.(),
+    );
+  }
+
+  const setTrackedTask = useCallback((nextTask) => {
+    if (typeof nextTask === "function") {
+      setTask((previousTask) => {
+        const resolvedTask = nextTask(previousTask);
+        taskStateRef.current = resolvedTask;
+        return resolvedTask;
+      });
+      return;
+    }
+    taskStateRef.current = nextTask;
+    setTask(nextTask);
+  }, []);
 
   const upsertBackgroundTask = useCallback((nextTask) => {
     if (!nextTask?.id) return;
@@ -85,11 +113,20 @@ export default function useTaskTracking({
     }
   }, []);
 
-  const startPolling = useCallback((id, runId = trackingRunRef.current) => {
+  const startPolling = useCallback((
+    id,
+    runId = trackingRunRef.current,
+    ownerRequest = ownerRequestContextRef.current.capture(),
+  ) => {
     if (pollRef.current) clearTimeout(pollRef.current);
     let fails = 0;
     let stopped = false;
-    const isCurrent = () => !stopped && trackingRunRef.current === runId && activeIdRef.current === id;
+    const isCurrent = () => (
+      !stopped
+      && trackingRunRef.current === runId
+      && activeIdRef.current === id
+      && ownerRequest.isCurrent()
+    );
     const schedule = (nextTask = null) => {
       const intervalMs = nextTask?.category === "video"
         ? ACTIVE_VIDEO_POLL_INTERVAL_MS
@@ -111,17 +148,18 @@ export default function useTaskTracking({
         fails = 0;
         if (!isCurrent()) return;
         if (isTerminalTaskStatus(nextTask.status)) {
-          setTask({ ...nextTask, progress: 100 });
+          setTrackedTask({ ...nextTask, progress: 100 });
           setTrackingLost(false);
           stop();
           refreshMe();
           loadWorks();
         } else {
-          setTask(nextTask);
+          setTrackedTask(nextTask);
           setTrackingLost(false);
           schedule(nextTask);
         }
       } catch (e) {
+        if (!isCurrent()) return;
         if (++fails >= 5) {
           stop();
           setTrackingLost(true);
@@ -132,18 +170,23 @@ export default function useTaskTracking({
       }
     };
     tick();
-  }, [loadWorks, refreshMe, setMsg]);
+  }, [loadWorks, refreshMe, setMsg, setTrackedTask]);
 
   const startTracking = useCallback(async (id) => {
+    const ownerRequest = ownerRequestContextRef.current.capture();
     stopActiveTracking();
     const runId = ++trackingRunRef.current;
     activeIdRef.current = id;
     setTrackingLost(false);
     let done = false;
-    const isCurrent = () => trackingRunRef.current === runId && activeIdRef.current === id;
+    const isCurrent = () => (
+      trackingRunRef.current === runId
+      && activeIdRef.current === id
+      && ownerRequest.isCurrent()
+    );
 
     const fallbackToPolling = () => {
-      if (!done && isCurrent()) startPolling(id, runId);
+      if (!done && isCurrent()) startPolling(id, runId, ownerRequest);
     };
 
     const scheduleReconnect = (attempt) => {
@@ -190,7 +233,7 @@ export default function useTaskTracking({
             return;
           }
           const terminal = isTerminalTaskStatus(data.status);
-          setTask((prev) => (
+          setTrackedTask((prev) => (
             prev && prev.id === id
               ? { ...prev, status: data.status, progress: terminal ? 100 : data.percent, error: data.error || prev.error }
               : prev
@@ -200,7 +243,7 @@ export default function useTaskTracking({
             done = true;
             api.task(id).then((nextTask) => {
               if (!isCurrent()) return;
-              setTask(nextTask);
+              setTrackedTask(nextTask);
             }).catch((e) => reportBackgroundError(e, "refresh terminal task after websocket"));
             refreshMe();
             loadWorks();
@@ -215,13 +258,15 @@ export default function useTaskTracking({
     };
 
     connect(0);
-  }, [loadWorks, refreshMe, startPolling, stopActiveTracking]);
+  }, [loadWorks, refreshMe, setTrackedTask, startPolling, stopActiveTracking]);
 
   const startBackgroundTracking = useCallback((target) => {
+    const ownerRequest = ownerRequestContextRef.current.capture();
     const id = typeof target === "object" ? target?.id : target;
     if (!id) return () => {};
-    if (typeof target === "object") upsertBackgroundTask(target);
     let stopped = false;
+    const isCurrent = () => !stopped && ownerRequest.isCurrent();
+    if (typeof target === "object") upsertBackgroundTask(target);
     let timer = null;
     let failures = 0;
     const stop = () => {
@@ -229,12 +274,12 @@ export default function useTaskTracking({
       if (timer) clearTimeout(timer);
     };
     const schedule = () => {
-      if (!stopped) timer = setTimeout(tick, 3000);
+      if (isCurrent()) timer = setTimeout(tick, 3000);
     };
     const tick = async () => {
       try {
         const nextTask = await api.task(id);
-        if (stopped) return;
+        if (!isCurrent()) return;
         failures = 0;
         upsertBackgroundTask(nextTask);
         if (isTerminalTaskStatus(nextTask.status)) {
@@ -245,6 +290,7 @@ export default function useTaskTracking({
           return;
         }
       } catch (e) {
+        if (!isCurrent()) return;
         failures += 1;
         if (failures >= 5) {
           stop();
@@ -273,12 +319,15 @@ export default function useTaskTracking({
 
   const cancelBackgroundTask = useCallback(async (id) => {
     if (!id) return;
+    const ownerRequest = ownerRequestContextRef.current.capture();
     try {
       const nextTask = await api.cancelTask(id);
+      if (!ownerRequest.isCurrent()) return;
       upsertBackgroundTask(nextTask);
       refreshMe();
       loadWorks();
     } catch (e) {
+      if (!ownerRequest.isCurrent()) return;
       upsertBackgroundTask({
         id,
         category: "image",
@@ -290,7 +339,7 @@ export default function useTaskTracking({
   }, [loadWorks, refreshMe, upsertBackgroundTask]);
 
   const restoreActiveTaskFromList = useCallback((list) => {
-    if (task && !isTerminalTaskStatus(task.status)) return;
+    if (taskStateRef.current && !isTerminalTaskStatus(taskStateRef.current.status)) return;
     const active = (list || []).find((item) => (
       item
       && !isTerminalTaskStatus(item.status)
@@ -304,7 +353,7 @@ export default function useTaskTracking({
         : (active.category === "video" ? "video" : "image")
     );
     setCreationMode(restoredMode);
-    setTask(active);
+    setTrackedTask(active);
     setTrackingLost(false);
     const dims = assetDims(active.assets?.[0]);
     const activeRatioOptions = active.category === "video" ? videoRatioOptions() : RATIOS;
@@ -317,50 +366,77 @@ export default function useTaskTracking({
       ratio: activeRatio || activeRatioOptions[0],
     });
     startTracking(active.id);
-  }, [setCreationMode, startTracking, task]);
+  }, [setCreationMode, setTrackedTask, startTracking]);
 
   const refreshActiveTask = useCallback(async () => {
-    if (!task?.id) return;
+    const currentTask = taskStateRef.current;
+    const ownerRequest = ownerRequestContextRef.current.capture();
+    if (!currentTask?.id) return;
+    const taskAction = createStudioTaskActionContext(
+      currentTask.id,
+      () => taskStateRef.current?.id,
+    );
     setMsg("");
     try {
-      const nextTask = await api.task(task.id);
-      setTask(nextTask);
-      setTrackingLost(false);
-      if (!isTerminalTaskStatus(nextTask.status)) startTracking(nextTask.id);
-      else {
-        refreshMe();
-        loadWorks();
-      }
+      const nextTask = await api.task(currentTask.id);
+      ownerRequest.commit(() => taskAction.commit(() => {
+        setTrackedTask(nextTask);
+        setTrackingLost(false);
+        if (!isTerminalTaskStatus(nextTask.status)) startTracking(nextTask.id);
+        else {
+          refreshMe();
+          loadWorks();
+        }
+      }));
     } catch (e) {
-      setMsg(e.message);
+      ownerRequest.commit(() => taskAction.commit(() => setMsg(e.message)));
     }
-  }, [loadWorks, refreshMe, setMsg, startTracking, task]);
+  }, [loadWorks, refreshMe, setMsg, setTrackedTask, startTracking]);
 
   const cancelActiveTask = useCallback(async () => {
-    if (!task) return;
-    if (!["queued", "running"].includes(task.status)) return;
-    const runningTask = task.status === "running";
+    const currentTask = taskStateRef.current;
+    const ownerRequest = ownerRequestContextRef.current.capture();
+    if (!currentTask) return;
+    const taskAction = createStudioTaskActionContext(
+      currentTask.id,
+      () => taskStateRef.current?.id,
+    );
+    if (!["queued", "running"].includes(currentTask.status)) return;
+    const runningTask = currentTask.status === "running";
     const text = runningTask
       ? "确认提交取消请求？运行中的任务会在安全阶段停止；如果外部网关已接收，可能无法中途取消。"
       : "确认取消这个排队任务？已冻结积分会退回。";
     if (!window.confirm(text)) return;
     setMsg("");
     try {
-      const nextTask = await api.cancelTask(task.id);
-      setTask(nextTask);
-      setTrackingLost(false);
-      refreshMe();
-      loadWorks();
+      const nextTask = await api.cancelTask(currentTask.id);
+      ownerRequest.commit(() => taskAction.commit(() => {
+        setTrackedTask(nextTask);
+        setTrackingLost(false);
+        refreshMe();
+        loadWorks();
+      }));
     } catch (e) {
-      setMsg(e.message);
+      ownerRequest.commit(() => taskAction.commit(() => setMsg(e.message)));
     }
-  }, [loadWorks, refreshMe, setMsg, task]);
+  }, [loadWorks, refreshMe, setMsg, setTrackedTask]);
 
   const stopAllTracking = useCallback(() => {
     stopActiveTracking();
     backgroundTrackersRef.current.forEach((stop) => stop());
     backgroundTrackersRef.current.clear();
   }, [stopActiveTracking]);
+
+  const resetOwnerTracking = useCallback(() => {
+    ownerRequestContextRef.current.invalidate();
+    stopAllTracking();
+    activeIdRef.current = null;
+    taskStateRef.current = null;
+    setTask(null);
+    setRunningSnapshot(null);
+    setTrackingLost(false);
+    setBackgroundTasks([]);
+  }, [stopAllTracking]);
 
   useEffect(() => stopAllTracking, [stopAllTracking]);
 
@@ -370,7 +446,7 @@ export default function useTaskTracking({
 
   return {
     task,
-    setTask,
+    setTask: setTrackedTask,
     runningSnapshot,
     setRunningSnapshot,
     trackingLost,
@@ -387,5 +463,6 @@ export default function useTaskTracking({
     refreshActiveTask,
     cancelActiveTask,
     stopAllTracking,
+    resetOwnerTracking,
   };
 }

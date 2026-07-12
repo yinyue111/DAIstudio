@@ -30,9 +30,10 @@ VALID_PROVIDERS = {
     "baidu_qianfan",
     "tencent_hunyuan",
     "yinyue",
+    "anthropic",
     "custom_openai",
 }
-VALID_GATEWAY_FORMATS = {"openai", "ark"}
+VALID_GATEWAY_FORMATS = {"openai", "ark", "anthropic"}
 
 PROVIDER_PRESETS: dict[str, dict[str, str]] = {
     "openai": {
@@ -89,6 +90,11 @@ PROVIDER_PRESETS: dict[str, dict[str, str]] = {
         "label": "yinyue",
         "base_url": "",
         "gateway_format": "openai",
+    },
+    "anthropic": {
+        "label": "Anthropic-Compatible",
+        "base_url": "https://api.anthropic.com",
+        "gateway_format": "anthropic",
     },
     "custom_openai": {
         "label": "自定义 OpenAI-Compatible",
@@ -189,7 +195,13 @@ def normalise_gateway_format(value: str | None, provider: str | None, use: str |
     text = str(value or "").strip()
     if not text:
         preset = provider_preset(provider).get("gateway_format")
-        text = preset or ("ark" if use == "video" and provider == "volcengine_ark" else "openai")
+        text = preset or (
+            "anthropic"
+            if use == "prompt"
+            else "ark"
+            if use == "video" and provider == "volcengine_ark"
+            else "openai"
+        )
     if text not in VALID_GATEWAY_FORMATS:
         raise ModelGatewayConfigError("模型网关格式非法")
     return text
@@ -298,6 +310,15 @@ def model_to_admin_dict(row: ModelConfig) -> dict[str, Any]:
 
 
 def _env_runtime_config(use: str) -> RuntimeGatewayConfig:
+    if use == "prompt":
+        return RuntimeGatewayConfig(
+            use=use,
+            provider="anthropic",
+            base_url=(settings.anthropic_base_url or "").rstrip("/"),
+            api_key=settings.anthropic_auth_token or "",
+            gateway_format="anthropic",
+            source="env",
+        )
     if use == "video":
         return RuntimeGatewayConfig(
             use=use,

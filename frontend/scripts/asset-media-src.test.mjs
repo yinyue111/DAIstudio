@@ -11,6 +11,17 @@ globalThis.window = {
 const { assetPreviewSrc, safeAssetMediaSrc } = await import("../components/AssetMedia.jsx");
 
 assert.equal(
+  safeAssetMediaSrc("/media/preview/example.png"),
+  "/media/preview/example.png",
+  "ordinary platform-relative media paths should remain available",
+);
+assert.equal(
+  safeAssetMediaSrc("blob:http://127.0.0.1:3002/local-preview"),
+  "blob:http://127.0.0.1:3002/local-preview",
+  "local object URL previews should remain available",
+);
+
+assert.equal(
   safeAssetMediaSrc("http://localhost:8000/media/preview/example.png"),
   "http://127.0.0.1:8000/media/preview/example.png",
   "loopback platform media URLs should follow the resolved API origin",
@@ -41,6 +52,16 @@ assert.equal(
   safeAssetMediaSrc("//evil.example/media/preview/example.png"),
   "",
   "protocol-relative external media URLs must not be treated as platform paths",
+);
+assert.equal(
+  safeAssetMediaSrc("\\\\evil.example/media/preview/example.png"),
+  "",
+  "backslash authority URLs must not be treated as same-origin media",
+);
+assert.equal(
+  safeAssetMediaSrc("/\\evil.example/media/preview/example.png"),
+  "",
+  "slash-backslash authority URLs must not bypass the media allowlist",
 );
 assert.equal(safeAssetMediaSrc("javascript:alert(1)"), "");
 

@@ -32,6 +32,10 @@ jobs:
         with:
           python-version: "3.11"
           cache: pip
+      - name: Install media tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ffmpeg
       - name: Install deps
         run: pip install -r requirements.txt -r requirements-dev.txt
       - name: Syntax compile
@@ -122,7 +126,9 @@ jobs:
       - name: Validate compose config
         run: docker compose config --quiet
         env:
+          BACKEND_ENV_FILE: ./backend/.env.example
           POSTGRES_PASSWORD: ci-postgres-password
+          REDIS_PASSWORD: ci-redis-password
           METRICS_TOKEN: ci-metrics-token
           PAYMENT_CONFIG_SECRET: ci-payment-config-secret-32-bytes-long
           SMS_PROVIDER: http
@@ -130,7 +136,9 @@ jobs:
       - name: Build production images
         run: docker compose build api frontend
         env:
+          BACKEND_ENV_FILE: ./backend/.env.example
           POSTGRES_PASSWORD: ci-postgres-password
+          REDIS_PASSWORD: ci-redis-password
           NEXT_TELEMETRY_DISABLED: "1"
 
   release-artifact:

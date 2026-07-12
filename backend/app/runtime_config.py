@@ -114,6 +114,7 @@ def validate_runtime_config() -> None:
         raise RuntimeError("生产环境(DEBUG=false)必须设置 MOCK_MODE=false")
     if not settings.debug:
         _validate_configured_egress_url("GATEWAY_BASE_URL", settings.gateway_base_url)
+        _validate_configured_egress_url("ANTHROPIC_BASE_URL", settings.anthropic_base_url)
         _validate_configured_egress_url("VIDEO_GATEWAY_BASE_URL", settings.video_gateway_base_url)
         if settings.sms_provider == "http":
             _validate_configured_egress_url("SMS_HTTP_URL", settings.sms_http_url)
@@ -175,12 +176,19 @@ def validate_model_gateway_rows(db) -> None:
     """Fail fast on unsafe DB-configured model base URLs in production."""
     if settings.debug:
         return
+    anthropic_base_configured = bool(str(settings.anthropic_base_url or "").strip())
+    anthropic_token_configured = bool(str(settings.anthropic_auth_token or "").strip())
+    if anthropic_base_configured != anthropic_token_configured:
+        raise RuntimeError(
+            "生产环境提示词优化网关配置不完整。"
+            "ANTHROPIC_BASE_URL 和 ANTHROPIC_AUTH_TOKEN 必须同时配置,或同时清空后使用后台模型配置。"
+        )
     from sqlalchemy import select
 
     from .models import ModelConfig
 
     rows = list(db.execute(select(ModelConfig)).scalars())
-    required_uses = {"vision", "image", "video"}
+    required_uses = {"vision", "image", "video", "prompt"}
     configured_uses = {str(row.use or "") for row in rows}
     missing_uses = sorted(required_uses - configured_uses)
     if missing_uses:
@@ -202,7 +210,9 @@ def validate_model_gateway_rows(db) -> None:
         if not row.enabled:
             continue
         has_db_gateway = bool(row.base_url and row.api_key_encrypted)
-        if row.use == "video":
+        if row.use == "prompt":
+            has_env_gateway = anthropic_base_configured and anthropic_token_configured
+        elif row.use == "video":
             has_env_gateway = bool(settings.video_base and settings.video_key)
         else:
             has_env_gateway = bool(settings.gateway_base_url and settings.gateway_api_key)

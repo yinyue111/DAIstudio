@@ -30,6 +30,7 @@ import httpx
 from ..config import settings
 from . import locks, storage
 from .gateway_mocks import mock_image as _mock_image
+from .gateway_mocks import mock_video as mock_video
 from .gateway_mocks import mock_video_preview_image as mock_video_preview_image
 from .gateway_prompting import mock_reverse as _mock_reverse
 from .gateway_prompting import parse_structured as _parse_structured
@@ -121,6 +122,12 @@ def _gateway_error_message(status_code: int, text: str) -> tuple[str, str]:
 
 def _auth(config: RuntimeGatewayConfig | None = None) -> dict:
     key = config.api_key if config is not None else settings.gateway_api_key
+    if config is not None and config.gateway_format == "anthropic":
+        return {
+            "x-api-key": key,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+        }
     return {"Authorization": f"Bearer {key}"}
 
 
@@ -368,7 +375,10 @@ def reverse_prompt(image_refs, vision_model_id: str, target: str = "image",
         payload,
         timeout=int(settings.reverse_gateway_timeout_seconds or 150),
         config=gateway_config,
-        retries=0,
+        # Reverse/profile analysis is safe to replay. Absorb brief upstream
+        # 429/5xx/connectivity blips instead of blocking image generation on
+        # the first transient failure.
+        retries=settings.gateway_max_retries,
     )
     latency_ms = int((time.time() - t0) * 1000)
     content_text = data["choices"][0]["message"]["content"]
@@ -376,6 +386,101 @@ def reverse_prompt(image_refs, vision_model_id: str, target: str = "image",
     result["usage"] = data.get("usage")  # {prompt_tokens, completion_tokens, total_tokens}
     result["latency_ms"] = latency_ms
     return result
+
+
+def optimize_prompt(
+    prompt: str,
+    model_id: str,
+    *,
+    category: str = "image",
+    product_mode: bool = False,
+    gateway_config: RuntimeGatewayConfig | None = None,
+) -> dict:
+    """Rewrite a user-authored generation prompt without changing its intent."""
+    _ensure_gateway_configured(gateway_config, "提示词优化")
+    source = str(prompt or "").strip()
+    if _gateway_mock(gateway_config):
+        prefix = (
+            "产品商业视频" if product_mode and category == "video"
+            else "产品商业图片" if product_mode
+            else "视频" if category == "video"
+            else "图片"
+        )
+        return {"prompt": f"{prefix}生成：{source}", "usage": None, "latency_ms": 0}
+    if product_mode:
+        focus = (
+            "这是产品图片生成提示词。补强产品主体、SKU一致性、包装结构、材质、Logo与可见文字保真、"
+            "完整入镜、商业构图、产品与场景的空间关系和光线。"
+            if category == "image" else
+            "这是产品视频生成提示词。补强产品主体、SKU一致性、包装结构、材质、Logo与可见文字保真、"
+            "镜头运动、展示节奏、产品完整入镜，并避免快速旋转、遮挡和文字模糊。"
+        )
+        focus += (
+            "不得凭空新增参考图或用户输入中不存在的纸巾、花瓶、植物及其他道具；"
+            "参考图已有道具仅可保留并与产品、台面和场景自然融合，不得增殖、放大、悬浮或突兀贴附。"
+        )
+    else:
+        focus = (
+            "这是图片生成提示词，补全主体、场景、构图、光线、色调、材质和画面质感。"
+            if category == "image" else
+            "这是视频生成提示词，补全主体、场景、镜头运动、动作、节奏、光线和画面质感。"
+        )
+    system = (
+        "你是专业的中文生成式视觉提示词编辑器。保持用户原始意图、主体数量、品牌名、文字、动作和禁改项，"
+        "删除空话与同义重复，补足真正影响生成结果的视觉信息。只输出优化后的单段中文提示词，不解释、不加标题、"
+        "不使用Markdown，控制在180-350个中文字符。" + focus
+    )
+    t0 = time.time()
+    if gateway_config is not None and gateway_config.gateway_format == "anthropic":
+        data = _post(
+            "/messages",
+            {
+                "model": model_id,
+                "max_tokens": 4096,
+                "system": system,
+                "messages": [{"role": "user", "content": source}],
+                "temperature": 0.25,
+            },
+            timeout=90,
+            config=gateway_config,
+            retries=0,
+        )
+        content = data.get("content", "")
+    else:
+        data = _post(
+            "/chat/completions",
+            {
+                "model": model_id,
+                "messages": [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": source},
+                ],
+                "temperature": 0.25,
+            },
+            timeout=90,
+            config=gateway_config,
+            retries=0,
+        )
+        content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+    if isinstance(content, list):
+        content = "".join(str(item.get("text") or "") for item in content if isinstance(item, dict))
+    optimized = str(content or "").strip().strip("`").strip()
+    if not optimized:
+        raise GatewayError("提示词优化模型返回了空结果")
+    usage_data = data.get("usage")
+    if isinstance(usage_data, dict) and "input_tokens" in usage_data:
+        prompt_tokens = int(usage_data.get("input_tokens") or 0)
+        completion_tokens = int(usage_data.get("output_tokens") or 0)
+        usage_data = {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": prompt_tokens + completion_tokens,
+        }
+    return {
+        "prompt": optimized[:1200],
+        "usage": usage_data,
+        "latency_ms": int((time.time() - t0) * 1000),
+    }
 
 
 

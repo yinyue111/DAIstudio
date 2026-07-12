@@ -118,6 +118,13 @@ class AdminIdempotencyKey(Base):
     __table_args__ = (
         CheckConstraint("scope in ('quota_grant')", name="ck_admin_idempotency_scope_valid"),
         Index("uq_admin_idempotency_scope_key", "admin_id", "scope", "key", unique=True),
+        Index(
+            "ix_admin_idempotency_business_window",
+            "admin_id",
+            "scope",
+            "business_fingerprint",
+            "fingerprint_expires_at",
+        ),
     )
 
     id: Mapped[int] = mapped_column(BigIntPK, primary_key=True, autoincrement=True)
@@ -127,6 +134,8 @@ class AdminIdempotencyKey(Base):
     target_user_id: Mapped[int | None] = mapped_column(BigInteger)
     amount: Mapped[int | None] = mapped_column(BigInteger)
     note: Mapped[str | None] = mapped_column(String(255))
+    business_fingerprint: Mapped[str | None] = mapped_column(String(64))
+    fingerprint_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
@@ -252,11 +261,12 @@ class ReverseOperation(Base):
         ),
         Index("uq_reverse_operations_user_client_request_id", "user_id", "client_request_id", unique=True),
         Index("ix_reverse_operations_user_created", "user_id", "created_at"),
+        Index("ix_reverse_operations_status_updated", "status", "updated_at"),
     )
 
     id: Mapped[int] = mapped_column(BigIntPK, primary_key=True, autoincrement=True)
     user_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("users.id"), index=True)
-    client_request_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    client_request_id: Mapped[str | None] = mapped_column(String(128))
     request_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
     target: Mapped[str] = mapped_column(String(32), nullable=False)
     asset_url: Mapped[str] = mapped_column(Text, nullable=False)
@@ -452,7 +462,7 @@ class GatewayCall(Base):
     __tablename__ = "gateway_calls"
     __table_args__ = (
         CheckConstraint(
-            "kind in ('reverse', 'image', 'video_submit', 'video_poll', 'video_download')",
+            "kind in ('reverse', 'prompt_optimize', 'image', 'video_submit', 'video_poll', 'video_download')",
             name="ck_gateway_calls_kind_valid",
         ),
         CheckConstraint("status IS NULL OR status in ('ok', 'failed')", name="ck_gateway_calls_status_valid"),
@@ -468,7 +478,7 @@ class GatewayCall(Base):
     id: Mapped[int] = mapped_column(BigIntPK, primary_key=True, autoincrement=True)
     user_id: Mapped[int | None] = mapped_column(BigInteger, index=True)
     task_id: Mapped[int | None] = mapped_column(BigInteger, index=True)
-    kind: Mapped[str] = mapped_column(String(16))  # reverse/image/video_submit/video_poll
+    kind: Mapped[str] = mapped_column(String(16))  # reverse/prompt_optimize/image/video_*
     model_id: Mapped[str | None] = mapped_column(String(128))
     status: Mapped[str | None] = mapped_column(String(16))  # ok/failed
     latency_ms: Mapped[int | None] = mapped_column(Integer)
@@ -504,9 +514,9 @@ class ModelConfig(Base):
     __tablename__ = "model_configs"
     __table_args__ = (
         Index("ix_model_configs_use", "use", unique=True),
-        CheckConstraint("use in ('vision', 'image', 'video')", name="ck_model_configs_use_valid"),
+        CheckConstraint("use in ('vision', 'image', 'video', 'prompt')", name="ck_model_configs_use_valid"),
         CheckConstraint(
-            "gateway_format IS NULL OR gateway_format in ('openai', 'ark')",
+            "gateway_format IS NULL OR gateway_format in ('openai', 'ark', 'anthropic')",
             name="ck_model_configs_gateway_format_valid",
         ),
         CheckConstraint("cost_credits >= 0", name="ck_model_configs_cost_credits_nonnegative"),
@@ -514,12 +524,12 @@ class ModelConfig(Base):
     )
 
     id: Mapped[int] = mapped_column(BigIntPK, primary_key=True, autoincrement=True)
-    use: Mapped[str] = mapped_column(String(16), nullable=False)  # vision/image/video
+    use: Mapped[str] = mapped_column(String(16), nullable=False)  # vision/image/video/prompt
     model_id: Mapped[str] = mapped_column(String(128), nullable=False)
     provider: Mapped[str | None] = mapped_column(String(32))
     base_url: Mapped[str | None] = mapped_column(String(512))
     api_key_encrypted: Mapped[str | None] = mapped_column(Text)
-    gateway_format: Mapped[str | None] = mapped_column(String(16))  # openai | ark
+    gateway_format: Mapped[str | None] = mapped_column(String(16))  # openai | ark | anthropic
     cost_credits: Mapped[int] = mapped_column(BigInteger, default=1)  # cost to run / freeze
     unlock_cost: Mapped[int] = mapped_column(BigInteger, default=0)  # extra cost to unlock HD
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)

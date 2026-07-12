@@ -23,6 +23,8 @@ venv/
 .mypy_cache/
 .tox/
 .nox/
+.playwright-cli/
+output/playwright/
 .codex-run/
 .codex/
 .agents/

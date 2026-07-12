@@ -62,6 +62,8 @@ export default function StudioReferencePanel({
   const productGenerationMode = subjectMode === "product";
   const portraitGenerationMode = subjectMode === "portrait";
   const productActionBusy = Boolean(uploading || productBusy);
+  const imageUploadTargetsProduct = isImageEditMode && productGenerationMode && !productAsset;
+  const imageUploadLabel = imageUploadTargetsProduct ? "上传产品主体" : isImageEditMode ? "上传风格参考图" : "上传图片";
   const modeTitle = isEditMode
     ? (creationMode === "video_edit" ? (portraitGenerationMode ? "视频人物重构" : "图生视频重构") : "图片编辑")
     : (category === "video" ? "视频参考" : "链接反推");
@@ -322,11 +324,11 @@ export default function StudioReferencePanel({
           <div className="grid grid-cols-2 gap-2">
             <button
               type="button"
-              onClick={() => imageUploadInputRef.current?.click()}
-              disabled={uploading}
+              onClick={() => (imageUploadTargetsProduct ? productUploadInputRef : imageUploadInputRef).current?.click()}
+              disabled={imageUploadTargetsProduct ? productActionBusy : uploading}
               className="btn-secondary btn-sm justify-center border-line2 bg-white/[0.08]"
             >
-              {uploading ? "上传中…" : "上传图片"}
+              {uploading ? "上传中…" : imageUploadLabel}
             </button>
             <button
               type="button"

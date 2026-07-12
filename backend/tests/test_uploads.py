@@ -1,18 +1,25 @@
+import asyncio
 import base64
 import io
+import os
+import stat
 import subprocess
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
 from urllib.parse import urlparse
 
+import pytest
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 from PIL import Image, ImageDraw
 
 from app.config import settings
 from app.db import SessionLocal
 from app.main import app
-from app.models import AuditLog, GenAsset, GenTask, ModelConfig, UploadedAsset
-from app.services import generation_media
+from app.models import AuditLog, GatewayCall, GenAsset, GenTask, ModelConfig, UploadedAsset, User
+from app.services import generation_media, storage
 from app.services.gateway import _mock_image
 from app.services.watermark import make_model_reference
 
@@ -44,6 +51,14 @@ def _transparent_product_png_bytes(size=(160, 120)):
     for y in range(30, 95):
         for x in range(45, 120):
             px[x, y] = (40, 110, 210, 255)
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def _incidental_alpha_png_bytes(size=(160, 120)):
+    img = Image.new("RGBA", size, (255, 255, 255, 255))
+    img.putpixel((0, 0), (255, 255, 255, 0))
     buf = io.BytesIO()
     img.save(buf, format="PNG")
     return buf.getvalue()
@@ -96,6 +111,267 @@ def _mp4_bytes(tmp_path):
         timeout=10,
     )
     return out.read_bytes()
+
+
+class _PartialWriteFailure:
+    def __init__(self, file_obj):
+        self._file_obj = file_obj
+
+    def __enter__(self):
+        self._file_obj.__enter__()
+        return self
+
+    def __exit__(self, exc_type, exc, traceback):
+        return self._file_obj.__exit__(exc_type, exc, traceback)
+
+    def __getattr__(self, name):
+        return getattr(self._file_obj, name)
+
+    def write(self, data):
+        partial_size = max(1, len(data) // 2)
+        self._file_obj.write(data[:partial_size])
+        self._file_obj.flush()
+        raise OSError("simulated partial write failure")
+
+
+class _TrackingSemaphore:
+    def __init__(self, value=1):
+        self._semaphore = threading.BoundedSemaphore(value)
+        self._lock = threading.Lock()
+        self.active = 0
+        self.acquire_started = threading.Event()
+
+    def acquire(self, blocking=True, timeout=None):
+        self.acquire_started.set()
+        if timeout is None:
+            acquired = self._semaphore.acquire(blocking)
+        else:
+            acquired = self._semaphore.acquire(blocking, timeout)
+        if acquired:
+            with self._lock:
+                self.active += 1
+        return acquired
+
+    def release(self):
+        with self._lock:
+            self.active -= 1
+        self._semaphore.release()
+
+    def is_active(self):
+        with self._lock:
+            return self.active > 0
+
+
+def _fail_storage_writes_after_partial_write(monkeypatch, directory):
+    real_open = open
+    real_named_temporary_file = storage.tempfile.NamedTemporaryFile
+    resolved_directory = directory.resolve()
+
+    def failing_open(file, mode="r", *args, **kwargs):
+        file_obj = real_open(file, mode, *args, **kwargs)
+        path = Path(file)
+        if any(flag in mode for flag in ("w", "x", "a")) and path.parent.resolve() == resolved_directory:
+            return _PartialWriteFailure(file_obj)
+        return file_obj
+
+    def failing_named_temporary_file(*args, **kwargs):
+        file_obj = real_named_temporary_file(*args, **kwargs)
+        temp_directory = kwargs.get("dir")
+        if temp_directory is not None and Path(temp_directory).resolve() == resolved_directory:
+            return _PartialWriteFailure(file_obj)
+        return file_obj
+
+    monkeypatch.setattr(storage, "open", failing_open, raising=False)
+    monkeypatch.setattr(storage.tempfile, "NamedTemporaryFile", failing_named_temporary_file)
+
+
+def _configure_local_storage(monkeypatch, tmp_path):
+    root = tmp_path / "storage"
+    monkeypatch.setattr(storage, "ROOT", root)
+    monkeypatch.setattr(storage.settings, "storage_backend", "local")
+    return root
+
+
+def test_save_bytes_new_file_uses_process_umask_permissions(monkeypatch, tmp_path):
+    root = _configure_local_storage(monkeypatch, tmp_path)
+    root.mkdir()
+    control = root / "control.bin"
+    previous_umask = os.umask(0o027)
+    try:
+        with open(control, "wb") as file_obj:
+            file_obj.write(b"control")
+        key = storage.save_bytes(b"payload", "upload", "bin")
+    finally:
+        os.umask(previous_umask)
+
+    assert stat.S_IMODE((root / key).stat().st_mode) == stat.S_IMODE(control.stat().st_mode)
+
+
+def test_save_bytes_named_overwrite_preserves_permission_bits(monkeypatch, tmp_path):
+    root = _configure_local_storage(monkeypatch, tmp_path)
+    destination = root / "upload"
+    destination.mkdir(parents=True)
+    target = destination / "stable.png"
+    target.write_bytes(b"old payload")
+    target.chmod(0o640)
+
+    storage.save_bytes_named(b"new payload", "upload", target.name)
+
+    assert target.read_bytes() == b"new payload"
+    assert stat.S_IMODE(target.stat().st_mode) == 0o640
+
+
+def test_save_bytes_named_overwrite_preserves_setid_permission_bits(monkeypatch, tmp_path):
+    root = _configure_local_storage(monkeypatch, tmp_path)
+    destination = root / "upload"
+    destination.mkdir(parents=True)
+    target = destination / "stable-setid.png"
+    target.write_bytes(b"old payload")
+    target.chmod(0o6755)
+    assert stat.S_IMODE(target.stat().st_mode) == 0o6755
+
+    storage.save_bytes_named(b"new payload", "upload", target.name)
+
+    assert target.read_bytes() == b"new payload"
+    assert stat.S_IMODE(target.stat().st_mode) == 0o6755
+
+
+def test_save_bytes_named_supports_name_max_filename(monkeypatch, tmp_path):
+    root = _configure_local_storage(monkeypatch, tmp_path)
+    destination = root / "upload"
+    destination.mkdir(parents=True)
+    try:
+        name_max = os.pathconf(destination, "PC_NAME_MAX")
+    except (OSError, ValueError):
+        pytest.skip("filesystem does not expose PC_NAME_MAX")
+    suffix = ".png"
+    filename = "a" * (name_max - len(suffix)) + suffix
+    assert len(os.fsencode(filename)) == name_max
+    target = destination / filename
+    target.write_bytes(b"control")
+    target.unlink()
+
+    key = storage.save_bytes_named(b"payload", "upload", filename)
+
+    assert key == f"upload/{filename}"
+    assert target.read_bytes() == b"payload"
+
+
+def test_save_bytes_named_replace_failure_preserves_target(monkeypatch, tmp_path):
+    class ReplaceFailure(OSError):
+        pass
+
+    root = _configure_local_storage(monkeypatch, tmp_path)
+    destination = root / "upload"
+    destination.mkdir(parents=True)
+    target = destination / "stable.png"
+    target.write_bytes(b"old payload")
+    target.chmod(0o640)
+
+    def fail_replace(_source, _target):
+        raise ReplaceFailure("simulated replace failure")
+
+    monkeypatch.setattr(storage.os, "replace", fail_replace)
+
+    with pytest.raises(ReplaceFailure, match="simulated replace failure"):
+        storage.save_bytes_named(b"new payload", "upload", target.name)
+
+    assert target.read_bytes() == b"old payload"
+    assert stat.S_IMODE(target.stat().st_mode) == 0o640
+    assert list(destination.iterdir()) == [target]
+
+
+def test_cleanup_failure_does_not_mask_replace_failure(monkeypatch, tmp_path):
+    class ReplaceFailure(OSError):
+        pass
+
+    class CleanupFailure(OSError):
+        pass
+
+    root = _configure_local_storage(monkeypatch, tmp_path)
+    target = root / "upload" / "stable.png"
+    target.parent.mkdir(parents=True)
+    target.write_bytes(b"old payload")
+    real_unlink = Path.unlink
+    cleanup_failed = False
+
+    def fail_replace(_source, _target):
+        raise ReplaceFailure("simulated replace failure")
+
+    def fail_first_temp_cleanup(path, *args, **kwargs):
+        nonlocal cleanup_failed
+        if path.suffix == ".tmp" and not cleanup_failed:
+            cleanup_failed = True
+            raise CleanupFailure("simulated cleanup failure")
+        return real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(storage.os, "replace", fail_replace)
+    monkeypatch.setattr(Path, "unlink", fail_first_temp_cleanup)
+
+    with pytest.raises(ReplaceFailure, match="simulated replace failure") as exc_info:
+        storage.save_bytes_named(b"new payload", "upload", target.name)
+
+    assert isinstance(exc_info.value.__cause__, CleanupFailure)
+    assert target.read_bytes() == b"old payload"
+
+
+def test_save_bytes_partial_write_does_not_publish_target(monkeypatch, tmp_path):
+    root = tmp_path / "storage"
+    destination = root / "upload"
+    monkeypatch.setattr(storage, "ROOT", root)
+    monkeypatch.setattr(storage.settings, "storage_backend", "local")
+    monkeypatch.setattr(
+        storage.uuid,
+        "uuid4",
+        lambda: SimpleNamespace(hex="11111111111111111111111111111111"),
+    )
+    _fail_storage_writes_after_partial_write(monkeypatch, destination)
+
+    with pytest.raises(OSError, match="simulated partial write failure"):
+        storage.save_bytes(b"complete payload", "upload", "bin")
+
+    target = destination / "11111111111111111111111111111111.bin"
+    assert not target.exists()
+    assert list(destination.iterdir()) == []
+
+
+def test_save_bytes_named_partial_write_preserves_existing_target(monkeypatch, tmp_path):
+    root = tmp_path / "storage"
+    destination = root / "upload"
+    destination.mkdir(parents=True)
+    target = destination / "stable.png"
+    target.write_bytes(b"previous complete payload")
+    monkeypatch.setattr(storage, "ROOT", root)
+    monkeypatch.setattr(storage.settings, "storage_backend", "local")
+    _fail_storage_writes_after_partial_write(monkeypatch, destination)
+
+    with pytest.raises(OSError, match="simulated partial write failure"):
+        storage.save_bytes_named(b"replacement payload", "upload", target.name)
+
+    assert target.read_bytes() == b"previous complete payload"
+    assert list(destination.iterdir()) == [target]
+
+
+def test_save_file_partial_write_does_not_publish_target(monkeypatch, tmp_path):
+    root = tmp_path / "storage"
+    destination = root / "upload_video"
+    source = tmp_path / "source.mp4"
+    source.write_bytes(b"complete video payload")
+    monkeypatch.setattr(storage, "ROOT", root)
+    monkeypatch.setattr(storage.settings, "storage_backend", "local")
+    monkeypatch.setattr(
+        storage.uuid,
+        "uuid4",
+        lambda: SimpleNamespace(hex="22222222222222222222222222222222"),
+    )
+    _fail_storage_writes_after_partial_write(monkeypatch, destination)
+
+    with pytest.raises(OSError, match="simulated partial write failure"):
+        storage.save_file(source, "upload_video", "mp4")
+
+    target = destination / "22222222222222222222222222222222.mp4"
+    assert not target.exists()
+    assert list(destination.iterdir()) == []
 
 
 def _enable_multi_image_edit():
@@ -156,14 +432,17 @@ def test_upload_image_runs_cpu_image_processing_off_event_loop(client, make_user
     make_user("13900000253", balance=1000)
     h = auth("13900000253")
     calls = []
+    cleanup_callbacks = []
 
-    async def fake_to_thread(func, *args, **kwargs):
+    async def fake_run_upload_thread(func, *args, on_cancel_result=None, **kwargs):
         calls.append(getattr(func, "__name__", str(func)))
+        if on_cancel_result is not None:
+            cleanup_callbacks.append((getattr(func, "__name__", str(func)), on_cancel_result))
         return func(*args, **kwargs)
 
     from app.routers import uploads
 
-    monkeypatch.setattr(uploads, "asyncio", SimpleNamespace(to_thread=fake_to_thread), raising=False)
+    monkeypatch.setattr(uploads, "_run_upload_thread", fake_run_upload_thread)
 
     r = client.post(
         "/api/uploads/image",
@@ -175,6 +454,364 @@ def test_upload_image_runs_cpu_image_processing_off_event_loop(client, make_user
     assert "_normalize_image_upload" in calls
     assert "make_image_preview" in calls
     assert "make_model_reference" in calls
+    assert calls.count("save_bytes_named") == 3
+    assert [name for name, _callback in cleanup_callbacks] == [
+        "save_bytes_named",
+        "save_bytes_named",
+        "save_bytes_named",
+    ]
+
+
+def test_upload_processing_slot_cancelled_while_waiting_does_not_leak_permit(monkeypatch):
+    from app.routers import uploads
+
+    semaphore = _TrackingSemaphore(1)
+    assert semaphore.acquire(False)
+    semaphore.acquire_started.clear()
+    monkeypatch.setattr(uploads, "_UPLOAD_PROCESSING_SEMAPHORE", semaphore)
+
+    async def scenario():
+        entered = False
+
+        async def waiter():
+            nonlocal entered
+            async with uploads._upload_processing_slot():
+                entered = True
+
+        task = asyncio.create_task(waiter())
+        assert await asyncio.to_thread(semaphore.acquire_started.wait, 2)
+        task.cancel()
+        semaphore.release()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert entered is False
+
+    asyncio.run(scenario())
+    assert semaphore.acquire(False)
+    assert not semaphore.acquire(False)
+    semaphore.release()
+
+
+def test_upload_processing_slot_keeps_permit_until_cancelled_thread_finishes(monkeypatch):
+    from app.routers import uploads
+
+    semaphore = _TrackingSemaphore(1)
+    worker_started = threading.Event()
+    allow_worker_exit = threading.Event()
+    cancellation_cleanup_started = asyncio.Event()
+    monkeypatch.setattr(uploads, "_UPLOAD_PROCESSING_SEMAPHORE", semaphore)
+    real_finish_after_cancel = uploads._finish_thread_task_after_cancel
+
+    async def tracked_finish_after_cancel(*args, **kwargs):
+        cancellation_cleanup_started.set()
+        return await real_finish_after_cancel(*args, **kwargs)
+
+    monkeypatch.setattr(uploads, "_finish_thread_task_after_cancel", tracked_finish_after_cancel)
+
+    def blocking_worker():
+        worker_started.set()
+        assert allow_worker_exit.wait(timeout=5)
+
+    async def scenario():
+        async def run_worker():
+            async with uploads._upload_processing_slot():
+                await uploads._run_upload_thread(blocking_worker)
+
+        task = asyncio.create_task(run_worker())
+        assert await asyncio.to_thread(worker_started.wait, 2)
+        task.cancel()
+        await cancellation_cleanup_started.wait()
+        assert not semaphore.acquire(False)
+        allow_worker_exit.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(scenario())
+    assert semaphore.acquire(False)
+    semaphore.release()
+
+
+def test_upload_processing_slot_returns_503_when_acquire_times_out(monkeypatch):
+    from app.routers import uploads
+
+    class TimedOutSemaphore:
+        def __init__(self):
+            self.release_called = False
+
+        def acquire(self, blocking=True, timeout=None):
+            assert blocking is True
+            assert timeout == uploads.settings.upload_processing_acquire_timeout_seconds
+            return False
+
+        def release(self):
+            self.release_called = True
+
+    semaphore = TimedOutSemaphore()
+    monkeypatch.setattr(uploads, "_UPLOAD_PROCESSING_SEMAPHORE", semaphore)
+
+    async def scenario():
+        with pytest.raises(HTTPException) as exc_info:
+            async with uploads._upload_processing_slot():
+                raise AssertionError("timed-out slot must not enter its body")
+        assert exc_info.value.status_code == 503
+        assert "媒体处理繁忙" in str(exc_info.value.detail)
+
+    asyncio.run(scenario())
+    assert semaphore.release_called is False
+
+
+def test_cancelled_upload_stream_removes_partial_raw_temp_file(monkeypatch, tmp_path):
+    from app.routers import uploads
+
+    raw_path = tmp_path / "partial.mp4"
+    second_read_started = asyncio.Event()
+
+    class FakeTempFile:
+        name = str(raw_path)
+
+        def close(self):
+            pass
+
+    class BlockingUpload:
+        def __init__(self):
+            self.read_count = 0
+
+        async def read(self, _size):
+            self.read_count += 1
+            if self.read_count == 1:
+                return b"partial"
+            second_read_started.set()
+            await asyncio.Event().wait()
+
+    monkeypatch.setattr(uploads.tempfile, "NamedTemporaryFile", lambda **_kwargs: FakeTempFile())
+
+    async def scenario():
+        task = asyncio.create_task(
+            uploads._save_upload_stream_to_temp(BlockingUpload(), "mp4", limit=1024)
+        )
+        await second_read_started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(scenario())
+    assert not raw_path.exists()
+
+
+def test_cancelled_video_sanitize_removes_completed_result_temp(monkeypatch, tmp_path):
+    from app.routers import uploads
+
+    sanitizer_started = threading.Event()
+    allow_sanitizer_return = threading.Event()
+    sanitized_path = tmp_path / "cancelled-sanitized.mp4"
+    raw_path = tmp_path / "raw.mp4"
+    raw_path.write_bytes(b"raw")
+
+    def sanitizer(_path):
+        sanitizer_started.set()
+        assert allow_sanitizer_return.wait(timeout=5)
+        sanitized_path.write_bytes(b"sanitized")
+        return sanitized_path, 32, 48, 1.0, None
+
+    async def scenario():
+        task = asyncio.create_task(
+            uploads._run_upload_thread(
+                sanitizer,
+                raw_path,
+                on_cancel_result=lambda result: result[0].unlink(missing_ok=True),
+            )
+        )
+        assert await asyncio.to_thread(sanitizer_started.wait, 2)
+        task.cancel()
+        allow_sanitizer_return.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(scenario())
+    assert not sanitized_path.exists()
+
+
+def test_cancelled_video_storage_removes_completed_persisted_key(monkeypatch, tmp_path):
+    from app.routers import uploads
+
+    save_started = threading.Event()
+    allow_save_return = threading.Event()
+    stored_path = tmp_path / "upload_video" / "cancelled.mp4"
+    key = "upload_video/cancelled.mp4"
+
+    def save_file():
+        stored_path.parent.mkdir(parents=True, exist_ok=True)
+        stored_path.write_bytes(b"persisted")
+        save_started.set()
+        assert allow_save_return.wait(timeout=5)
+        return key
+
+    monkeypatch.setattr(uploads.storage, "local_path", lambda value: tmp_path / value)
+
+    async def scenario():
+        task = asyncio.create_task(
+            uploads._run_upload_thread(
+                save_file,
+                on_cancel_result=lambda result: uploads._cleanup_storage_keys(result),
+            )
+        )
+        assert await asyncio.to_thread(save_started.wait, 2)
+        task.cancel()
+        allow_save_return.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(scenario())
+    assert not stored_path.exists()
+
+
+def test_upload_image_holds_processing_slot_through_storage_and_commit(
+    client, make_user, auth, monkeypatch
+):
+    make_user("13900000255", balance=1000)
+    headers = auth("13900000255")
+    from app.routers import uploads
+
+    semaphore = _TrackingSemaphore(1)
+    monkeypatch.setattr(uploads, "_UPLOAD_PROCESSING_SEMAPHORE", semaphore)
+    real_save = uploads.storage.save_bytes_named
+    real_commit = uploads.Session.commit
+
+    def checked_save(*args, **kwargs):
+        assert semaphore.is_active()
+        return real_save(*args, **kwargs)
+
+    def checked_commit(session, *args, **kwargs):
+        if any(isinstance(row, UploadedAsset) for row in session.new):
+            assert semaphore.is_active()
+        return real_commit(session, *args, **kwargs)
+
+    monkeypatch.setattr(uploads.storage, "save_bytes_named", checked_save)
+    monkeypatch.setattr(uploads.Session, "commit", checked_commit)
+
+    response = client.post(
+        "/api/uploads/image",
+        files={"file": ("gated.png", _png_bytes(), "image/png")},
+        headers=headers,
+    )
+    assert response.status_code == 200, response.text
+
+
+def test_upload_video_holds_processing_slot_through_temp_storage_poster_and_commit(
+    client, make_user, auth, monkeypatch, tmp_path
+):
+    make_user("13900000256", balance=1000)
+    headers = auth("13900000256")
+    from app.routers import uploads
+
+    semaphore = _TrackingSemaphore(1)
+    monkeypatch.setattr(uploads, "_UPLOAD_PROCESSING_SEMAPHORE", semaphore)
+    real_stream = uploads._save_upload_stream_to_temp
+    real_save_file = uploads.storage.save_file
+    real_save_bytes = uploads.storage.save_bytes_named
+    real_commit = uploads.Session.commit
+
+    async def checked_stream(*args, **kwargs):
+        assert semaphore.is_active()
+        return await real_stream(*args, **kwargs)
+
+    def fake_sanitize(_raw_path):
+        assert semaphore.is_active()
+        sanitized = tmp_path / "sanitized.mp4"
+        sanitized.write_bytes(b"sanitized-video")
+        return sanitized, 32, 48, 1.0, b"poster"
+
+    def checked_save_file(*args, **kwargs):
+        assert semaphore.is_active()
+        return real_save_file(*args, **kwargs)
+
+    def checked_save_bytes(*args, **kwargs):
+        assert semaphore.is_active()
+        return real_save_bytes(*args, **kwargs)
+
+    def checked_commit(session, *args, **kwargs):
+        if any(isinstance(row, UploadedAsset) for row in session.new):
+            assert semaphore.is_active()
+        return real_commit(session, *args, **kwargs)
+
+    monkeypatch.setattr(uploads, "_save_upload_stream_to_temp", checked_stream)
+    monkeypatch.setattr(uploads, "_sanitize_video_and_poster", fake_sanitize)
+    monkeypatch.setattr(uploads.storage, "save_file", checked_save_file)
+    monkeypatch.setattr(uploads.storage, "save_bytes_named", checked_save_bytes)
+    monkeypatch.setattr(uploads.Session, "commit", checked_commit)
+
+    response = client.post(
+        "/api/uploads/video",
+        files={"file": ("gated.mp4", b"raw-video", "video/mp4")},
+        headers=headers,
+    )
+    assert response.status_code == 200, response.text
+
+
+def test_upload_image_processing_respects_global_parallelism(client, make_user, auth, monkeypatch):
+    make_user("13900000254", balance=1000)
+    headers = auth("13900000254")
+    active = 0
+    peak = 0
+    state_lock = threading.Lock()
+    two_entered = threading.Event()
+    third_entered = threading.Event()
+    third_acquire_started = threading.Event()
+    release_processing = threading.Event()
+
+    from app.routers import uploads
+
+    class CountingSemaphore(_TrackingSemaphore):
+        def __init__(self):
+            super().__init__(2)
+            self._acquire_count = 0
+            self._count_lock = threading.Lock()
+
+        def acquire(self, blocking=True, timeout=None):
+            with self._count_lock:
+                self._acquire_count += 1
+                if self._acquire_count >= 3:
+                    third_acquire_started.set()
+            return super().acquire(blocking, timeout)
+
+    monkeypatch.setattr(uploads, "_UPLOAD_PROCESSING_SEMAPHORE", CountingSemaphore())
+    real_normalize = uploads._normalize_image_upload
+
+    def _blocking_normalize(data):
+        nonlocal active, peak
+        with state_lock:
+            active += 1
+            peak = max(peak, active)
+            if active >= 2:
+                two_entered.set()
+            if active >= 3:
+                third_entered.set()
+        try:
+            assert release_processing.wait(timeout=5)
+            return real_normalize(data)
+        finally:
+            with state_lock:
+                active -= 1
+
+    monkeypatch.setattr(uploads, "_normalize_image_upload", _blocking_normalize)
+
+    def _upload(index):
+        return client.post(
+            "/api/uploads/image",
+            files={"file": (f"ref-{index}.png", _png_bytes(), "image/png")},
+            headers=headers,
+        )
+
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        futures = [pool.submit(_upload, index) for index in range(3)]
+        assert two_entered.wait(timeout=5)
+        assert third_acquire_started.wait(timeout=5)
+        assert not third_entered.is_set()
+        release_processing.set()
+        responses = [future.result(timeout=10) for future in futures]
+
+    assert all(response.status_code == 200 for response in responses)
+    assert peak == 2
 
 
 def test_upload_image_sanitizes_long_original_filename(client, make_user, auth):
@@ -383,6 +1020,349 @@ def test_uploaded_image_can_drive_reference_edit_generation(
     assert seen["size"] == "512x1024"
 
 
+def test_structured_portrait_reference_without_instruction_uses_image_edit(
+    client, make_user, auth, monkeypatch
+):
+    make_user("13900001970", balance=1000)
+    h = auth("13900001970")
+
+    source = client.post(
+        "/api/uploads/image",
+        files={
+            "file": (
+                "source-portrait.png",
+                _png_bytes(size=(1200, 2000), color=(20, 120, 200)),
+                "image/png",
+            )
+        },
+        headers=h,
+    )
+    assert source.status_code == 200, source.text
+    explicit_reference = client.post(
+        "/api/uploads/image",
+        files={
+            "file": (
+                "explicit-landscape.png",
+                _png_bytes(size=(2000, 1200), color=(180, 80, 40)),
+                "image/png",
+            )
+        },
+        headers=h,
+    )
+    assert explicit_reference.status_code == 200, explicit_reference.text
+    seen = {}
+
+    def fake_gen_image(prompt, image_model_id, n=4, size="1024x1024",
+                       reference_image_url=None, edit_path=None, extra_payload=None):
+        seen["reference_image_url"] = reference_image_url
+        seen["edit_path"] = edit_path
+        seen["extra_payload"] = extra_payload
+        return [_mock_image(prompt, "256x256", 0)]
+
+    monkeypatch.setattr("app.services.gateway.gen_image", fake_gen_image)
+
+    r = client.post("/api/generate", json={
+        "source_asset_url": source.json()["url"],
+        "source_type": "image",
+        "category": "image",
+        "stage": "preview",
+        "prompt": {
+            "final_text": (
+                "保持参考人物斜向后仰坐姿、低机位仰拍与近距离透视，前景自然放大；"
+                "服装为非婚纱的冰晶有机雕塑结构；左上大面积柔光，暗部保留冷蓝层次；"
+                "低对比柔雾与宽泛光晕，抬升黑位，低锐化、非 HDR。"
+            ),
+            "图像类型": "人物图",
+        },
+        "params": {
+            "n": 1,
+            "size": "1024x1024",
+            "reference_image_url": explicit_reference.json()["url"],
+            "negative_prompt": "用户自定义负向词",
+        },
+    }, headers=h)
+
+    assert r.status_code == 200, r.text
+    task = r.json()
+    assert task["cost_frozen"] == 20
+    assert seen["reference_image_url"].startswith("data:image/jpeg;base64,")
+    ref_bytes = base64.b64decode(seen["reference_image_url"].split(",", 1)[1])
+    ref_img = Image.open(io.BytesIO(ref_bytes))
+    assert max(ref_img.size) == 1536
+    assert ref_img.width > ref_img.height
+    assert seen["edit_path"] == "/v1/images/edits"
+    assert "用户自定义负向词" in seen["extra_payload"]["negative_prompt"]
+    assert "主动瘦身" in seen["extra_payload"]["negative_prompt"]
+    assert "HDR" in seen["extra_payload"]["negative_prompt"]
+
+    db = SessionLocal()
+    try:
+        call = db.query(GatewayCall).filter(
+            GatewayCall.task_id == task["id"],
+            GatewayCall.kind == "image",
+            GatewayCall.status == "ok",
+        ).order_by(GatewayCall.id.desc()).first()
+        assert call is not None
+        assert call.detail["mode"] == "edit"
+    finally:
+        db.close()
+
+
+def test_character_reference_image_alone_uses_image_edit(
+    client, make_user, auth, monkeypatch
+):
+    make_user("13900001976", balance=1000)
+    h = auth("13900001976")
+    source = client.post(
+        "/api/uploads/image",
+        files={"file": ("character.png", _png_bytes(size=(1200, 1600)), "image/png")},
+        headers=h,
+    )
+    assert source.status_code == 200, source.text
+    seen = {}
+
+    def fake_gen_image(prompt, image_model_id, n=4, size="1024x1024",
+                       reference_image_url=None, edit_path=None, extra_payload=None):
+        seen["reference_image_url"] = reference_image_url
+        seen["edit_path"] = edit_path
+        return [_mock_image(prompt, "256x256", 0)]
+
+    monkeypatch.setattr("app.services.gateway.gen_image", fake_gen_image)
+
+    r = client.post("/api/generate", json={
+        "source_type": "image",
+        "category": "image",
+        "stage": "preview",
+        "prompt": {
+            "final_text": "保持上传人物的身份、身体轮廓、坐姿和柔和侧光",
+            "图像类型": "人物图",
+        },
+        "params": {
+            "n": 1,
+            "size": "1024x1024",
+            "subject_mode": "portrait",
+            "character_reference_image": source.json()["url"],
+        },
+    }, headers=h)
+
+    assert r.status_code == 200, r.text
+    assert r.json()["cost_frozen"] == 20
+    assert seen["reference_image_url"].startswith("data:image/jpeg;base64,")
+    assert seen["edit_path"] == "/v1/images/edits"
+
+
+def test_portrait_negative_prompt_ignores_stale_wedding_and_contact_fields(
+    client, make_user, auth, monkeypatch
+):
+    make_user("13900001975", balance=1000)
+    h = auth("13900001975")
+    source = client.post(
+        "/api/uploads/image",
+        files={"file": ("portrait.png", _png_bytes(size=(1200, 1600)), "image/png")},
+        headers=h,
+    )
+    assert source.status_code == 200, source.text
+    seen = {}
+
+    def fake_gen_image(prompt, image_model_id, n=4, size="1024x1024",
+                       reference_image_url=None, edit_path=None, extra_payload=None):
+        seen["prompt"] = prompt
+        seen["negative_prompt"] = extra_payload["negative_prompt"]
+        return [_mock_image(prompt, "256x256", 0)]
+
+    monkeypatch.setattr("app.services.gateway.gen_image", fake_gen_image)
+    canonical = (
+        "保持参考人物斜向后仰坐姿、低机位近距离透视和服装覆盖下的原始身体轮廓；"
+        "使用冰晶有机雕塑礼服、左上大面积柔光、冷蓝暗部、柔雾与宽泛光晕。"
+    )
+
+    r = client.post("/api/generate", json={
+        "source_asset_url": source.json()["url"],
+        "source_type": "image",
+        "category": "image",
+        "stage": "preview",
+        "prompt": {
+            "final_text": canonical,
+            "user_instruction": canonical,
+            "图像类型": "人物图",
+            "服装结构": "旧解析：白色婚纱和通用蕾丝",
+            "妆发五官": "旧解析：浅色隐形眼镜",
+        },
+        "params": {
+            "n": 1,
+            "size": "1024x1024",
+            "reference_image_url": source.json()["url"],
+        },
+    }, headers=h)
+
+    assert r.status_code == 200, r.text
+    assert canonical.rstrip("。") in seen["prompt"]
+    assert "旧解析" not in seen["prompt"]
+    assert "通用婚纱蕾丝" in seen["negative_prompt"]
+    assert "浅色隐形眼镜" in seen["negative_prompt"]
+
+
+def test_portrait_negative_prompt_uses_effective_lighting_instead_of_guard_text(
+    client, make_user, auth, monkeypatch
+):
+    make_user("13900001979", balance=1000)
+    h = auth("13900001979")
+    source = client.post(
+        "/api/uploads/image",
+        files={"file": ("portrait.png", _png_bytes(size=(1200, 1600)), "image/png")},
+        headers=h,
+    )
+    assert source.status_code == 200, source.text
+    seen = {}
+
+    def fake_gen_image(prompt, image_model_id, n=4, size="1024x1024",
+                       reference_image_url=None, edit_path=None, extra_payload=None):
+        seen["negative_prompt"] = extra_payload["negative_prompt"]
+        return [_mock_image(prompt, "256x256", 0)]
+
+    monkeypatch.setattr("app.services.gateway.gen_image", fake_gen_image)
+    canonical = (
+        "成年职业人像，人物直立居中，白色婚纱与浅色隐形眼镜；"
+        "使用硬质影棚主光、高锐度 HDR 和深黑高对比阴影，明确无柔雾、无柔焦、"
+        "无光晕、无高光扩散。"
+    )
+
+    r = client.post("/api/generate", json={
+        "source_asset_url": source.json()["url"],
+        "source_type": "image",
+        "category": "image",
+        "stage": "preview",
+        "prompt": {
+            "final_text": canonical,
+            "user_instruction": canonical,
+            "图像类型": "人物图",
+            "光线": "旧解析：左上大面积柔光，暗部保留冷蓝层次",
+            "后期质感": "旧解析：低对比柔雾、宽泛光晕、低锐化、非 HDR",
+        },
+        "params": {
+            "n": 1,
+            "size": "1024x1024",
+            "reference_image_url": source.json()["url"],
+        },
+    }, headers=h)
+
+    assert r.status_code == 200, r.text
+    for term in ("暗部死黑", "柔雾丢失", "光晕丢失", "HDR", "硬锐化"):
+        assert term not in seen["negative_prompt"]
+
+
+def test_plain_text_portrait_without_reference_does_not_claim_uploaded_identity(
+    client, make_user, auth, monkeypatch
+):
+    make_user("13900001973", balance=1000)
+    h = auth("13900001973")
+    seen = {}
+
+    def fake_gen_image(prompt, image_model_id, n=4, size="1024x1024",
+                       reference_image_url=None, edit_path=None, extra_payload=None):
+        seen["prompt"] = prompt
+        seen["reference_image_url"] = reference_image_url
+        seen["edit_path"] = edit_path
+        seen["negative_prompt"] = extra_payload["negative_prompt"]
+        return [_mock_image(prompt, "256x256", 0)]
+
+    monkeypatch.setattr("app.services.gateway.gen_image", fake_gen_image)
+
+    r = client.post("/api/generate", json={
+        "source_type": "image",
+        "category": "image",
+        "stage": "preview",
+        "prompt": {
+            "final_text": (
+                "成年职业人像，人物直立居中，穿白色婚纱，使用硬质影棚主光和清晰锐利的 HDR 质感，"
+                "保持自然五官、完整服装与干净背景。"
+            ),
+            "图像类型": "人物图",
+        },
+        "params": {"n": 1, "size": "1024x1024", "subject_mode": "portrait"},
+    }, headers=h)
+
+    assert r.status_code == 200, r.text
+    assert r.json()["cost_frozen"] == 15
+    assert seen["reference_image_url"] is None
+    assert seen["edit_path"] == "/v1/images/edits"
+    assert "上传人像照片是唯一人物身份来源" not in seen["prompt"]
+    assert seen["negative_prompt"] is None
+
+
+def test_image_reference_fails_instead_of_falling_back_without_edit_endpoint(
+    client, make_user, auth, monkeypatch
+):
+    make_user("13900001974", balance=1000)
+    h = auth("13900001974")
+    source = client.post(
+        "/api/uploads/image",
+        files={"file": ("portrait.png", _png_bytes(size=(1200, 1600)), "image/png")},
+        headers=h,
+    )
+    assert source.status_code == 200, source.text
+    called = {"value": False}
+
+    def fake_gen_image(*_args, **_kwargs):
+        called["value"] = True
+        return [_mock_image("unexpected", "256x256", 0)]
+
+    monkeypatch.setattr("app.services.gateway.gen_image", fake_gen_image)
+    monkeypatch.setattr("app.services.generation_image_flow.settings.image_edit_path", "")
+
+    r = client.post("/api/generate", json={
+        "source_asset_url": source.json()["url"],
+        "source_type": "image",
+        "category": "image",
+        "stage": "preview",
+        "prompt": {
+            "final_text": "保持参考人物的低机位后仰坐姿和柔雾光影",
+            "instruction": "保持参考人物的低机位后仰坐姿和柔雾光影",
+        },
+        "params": {
+            "n": 1,
+            "size": "1024x1024",
+            "reference_image_url": source.json()["url"],
+        },
+    }, headers=h)
+
+    assert r.status_code == 200, r.text
+    task = client.get(f"/api/tasks/{r.json()['id']}", headers=h).json()
+    assert task["status"] == "failed"
+    assert task["error"] == "图片生成失败，已退回冻结积分，请稍后重试"
+    assert client.get("/api/me", headers=h).json()["balance_credits"] == 1000
+    assert called["value"] is False
+
+
+@pytest.mark.parametrize(
+    "reference_value",
+    [123, {"url": "https://example.com/reference.png"}],
+)
+def test_image_reference_url_rejects_non_string_value(
+    client, make_user, auth, reference_value
+):
+    make_user("13900001971", balance=1000)
+    h = auth("13900001971")
+
+    r = client.post("/api/generate", json={
+        "source_type": "image",
+        "category": "image",
+        "stage": "preview",
+        "prompt": {
+            "final_text": "保持参考人物、姿态、机位和光影关系",
+            "图像类型": "人物图",
+        },
+        "params": {
+            "n": 1,
+            "size": "1024x1024",
+            "reference_image_url": reference_value,
+        },
+    }, headers=h)
+
+    assert r.status_code == 400, r.text
+    assert "reference_image_url 非法" in r.text
+
+
 def test_uploaded_large_image_edit_uses_high_resolution_original(
     client, make_user, auth, monkeypatch
 ):
@@ -465,11 +1445,60 @@ def test_product_image_edit_uses_larger_reference_and_server_fidelity_guard(
     assert r.status_code == 200, r.text
 
     assert "产品高保真硬约束" in seen["prompt"]
-    assert "包装文字" in seen["prompt"]
-    assert "逐字逐形保持原图" in seen["prompt"]
+    assert "Logo、标签版式和可见文字" in seen["prompt"]
+    assert len(seen["prompt"]) <= 800
     ref_bytes = base64.b64decode(seen["reference_image_url"].split(",", 1)[1])
     ref_img = Image.open(io.BytesIO(ref_bytes))
     assert max(ref_img.size) == 1536
+
+
+def test_product_negative_prompt_wins_when_metadata_also_marks_portrait(
+    client, make_user, auth, monkeypatch
+):
+    make_user("13900001972", balance=1000)
+    h = auth("13900001972")
+    seen = {}
+
+    def fake_gen_image(prompt, image_model_id, n=4, size="1024x1024",
+                       reference_image_url=None, edit_path=None, extra_payload=None):
+        seen["prompt"] = prompt
+        seen["negative_prompt"] = extra_payload["negative_prompt"]
+        return [_mock_image(prompt, "256x256", 0)]
+
+    monkeypatch.setattr("app.services.gateway.gen_image", fake_gen_image)
+
+    r = client.post("/api/generate", json={
+        "source_asset_url": "https://example.com/product.png",
+        "source_type": "image",
+        "source_asset_meta": {
+            "product_generation_mode": True,
+            "portrait_generation_mode": True,
+        },
+        "category": "image",
+        "stage": "preview",
+        "prompt": {
+            "final_text": "move this product into a premium studio ad",
+            "instruction": "move this product into a premium studio ad",
+            "图像类型": "人物+产品混合图",
+        },
+        "params": {
+            "n": 1,
+            "size": "1024x1024",
+            "subject_mode": "product",
+            "edit_mask_mode": "off",
+            "negative_prompt": "用户自定义负向词",
+        },
+    }, headers=h)
+
+    assert r.status_code == 200, r.text
+    assert "用户自定义负向词" in seen["negative_prompt"]
+    assert "产品残缺" in seen["negative_prompt"]
+    assert "主动瘦身" not in seen["negative_prompt"]
+    assert "产品高保真硬约束" in seen["prompt"]
+    assert "人像高保真硬约束" not in seen["prompt"]
+    assert "上传人像照片作为唯一人物身份" not in seen["prompt"]
+    assert "品牌 Lookbook" not in seen["prompt"]
+    assert "不得主动瘦身" not in seen["prompt"]
 
 
 def test_product_image_edit_auto_generates_mask_for_inpaint(
@@ -704,6 +1733,179 @@ def test_auto_subject_mask_handles_common_white_product_shapes():
         assert bbox_iou(result.bbox, expected) >= 0.82, (name, result.bbox, expected)
 
 
+def test_auto_subject_mask_preserves_hang_tab_holes():
+    img = Image.new("RGB", (800, 800), (255, 255, 255))
+    draw = ImageDraw.Draw(img)
+    draw.rectangle((290, 150, 515, 285), fill=(248, 248, 246), outline=(226, 226, 222), width=3)
+    draw.polygon(
+        [(205, 280), (555, 280), (600, 335), (600, 650), (210, 650), (175, 335)],
+        fill=(247, 247, 244),
+        outline=(223, 223, 219),
+    )
+    draw.ellipse((345, 190, 385, 230), fill=(255, 255, 255), outline=(232, 232, 228), width=2)
+    draw.ellipse((425, 190, 465, 230), fill=(255, 255, 255), outline=(232, 232, 228), width=2)
+    draw.rectangle((275, 390, 485, 470), fill=(25, 25, 25))
+
+    result = generation_media._auto_subject_mask(img.convert("RGBA"))
+
+    assert result.mode == "auto_subject"
+    assert result.confidence >= generation_media.EDIT_MASK_SEND_CONFIDENCE
+    assert _mask_alpha_at(result.data_uri, 365, 210) < 20
+    assert _mask_alpha_at(result.data_uri, 445, 210) < 20
+    assert _mask_alpha_at(result.data_uri, 330, 330) > 200
+
+
+def test_auto_subject_mask_ignores_isolated_soft_pack_background_detail():
+    img = Image.new("RGB", (800, 800), (255, 255, 255))
+    draw = ImageDraw.Draw(img)
+    draw.polygon(
+        [(130, 250), (500, 205), (690, 285), (720, 565), (640, 640), (120, 595), (80, 360)],
+        fill=(248, 248, 246),
+        outline=(224, 224, 220),
+    )
+    draw.line((145, 255, 500, 210), fill=(224, 224, 220), width=4)
+    draw.rectangle((230, 360, 510, 435), outline=(35, 35, 35), width=3)
+    draw.line((640, 220, 672, 220), fill=(235, 235, 232), width=2)
+
+    result = generation_media._auto_subject_mask(img.convert("RGBA"))
+
+    assert result.mode == "auto_subject"
+    assert result.confidence >= generation_media.EDIT_MASK_SEND_CONFIDENCE
+    assert _mask_alpha_at(result.data_uri, 400, 350) > 200
+    assert _mask_alpha_at(result.data_uri, 655, 220) < 20
+
+
+def test_auto_subject_mask_rejects_weak_candidate_touching_any_frame_edge():
+    img = Image.new("RGB", (512, 512), (255, 255, 255))
+    ImageDraw.Draw(img).rectangle((0, 150, 205, 410), fill=(235, 235, 232))
+
+    result = generation_media._auto_subject_mask(img.convert("RGBA"))
+
+    assert result.mode == "none"
+    assert result.data_uri is None
+    assert result.reason == "edge_connected_foreground"
+
+
+def test_auto_subject_mask_does_not_treat_a_dark_label_as_the_whole_white_box():
+    img = Image.new("RGB", (800, 800), (255, 255, 255))
+    draw = ImageDraw.Draw(img)
+    draw.rectangle((170, 120, 630, 680), fill=(254, 254, 254), outline=(252, 252, 252), width=2)
+    draw.rectangle((285, 345, 515, 420), fill=(25, 25, 25))
+
+    result = generation_media._auto_subject_mask(img.convert("RGBA"))
+
+    assert result.mode == "none"
+    assert result.data_uri is None
+    assert result.reason == "label_only_candidate"
+
+
+def test_subject_protection_preview_reports_alpha_mask_and_requires_owner(client, make_user, auth):
+    make_user("13900001976", balance=1000)
+    make_user("13900001977", balance=1000)
+    owner_h = auth("13900001976")
+    other_h = auth("13900001977")
+
+    up = client.post(
+        "/api/uploads/image",
+        files={"file": ("product.png", _transparent_product_png_bytes(), "image/png")},
+        headers=owner_h,
+    )
+    assert up.status_code == 200, up.text
+    asset = up.json()
+
+    preview = client.post(
+        "/api/subject-protection/preview",
+        json={"asset_url": asset["url"], "edit_mask_mode": "protect_subject"},
+        headers=owner_h,
+    )
+    assert preview.status_code == 200, preview.text
+    data = preview.json()
+    assert data["mode"] == "alpha_subject"
+    assert data["risk_level"] == "low"
+    assert data["will_send_mask"] is True
+    assert data["pixel_lock_recommended"] is True
+    assert data["reason"] == "alpha_channel"
+    assert data["mask_data_uri"].startswith("data:image/png;base64,")
+
+    other_preview = client.post(
+        "/api/subject-protection/preview",
+        json={"asset_url": asset["url"], "edit_mask_mode": "protect_subject"},
+        headers=other_h,
+    )
+    assert other_preview.status_code == 404
+
+
+def test_subject_protection_preview_ignores_incidental_alpha_pixels(client, make_user, auth):
+    make_user("13900001979", balance=1000)
+    h = auth("13900001979")
+    up = client.post(
+        "/api/uploads/image",
+        files={"file": ("ordinary.png", _incidental_alpha_png_bytes(), "image/png")},
+        headers=h,
+    )
+    assert up.status_code == 200, up.text
+
+    preview = client.post(
+        "/api/subject-protection/preview",
+        json={"asset_url": up.json()["url"], "edit_mask_mode": "protect_subject"},
+        headers=h,
+    )
+
+    assert preview.status_code == 200, preview.text
+    data = preview.json()
+    assert data["mode"] == "none"
+    assert data["will_send_mask"] is False
+    assert data["reason"] == "no_foreground"
+
+
+def test_subject_protection_preview_distinguishes_auto_center_and_off(client, make_user, auth):
+    make_user("13900001978", balance=1000)
+    h = auth("13900001978")
+
+    up = client.post(
+        "/api/uploads/image",
+        files={"file": ("product.png", _white_bg_product_png_bytes(), "image/png")},
+        headers=h,
+    )
+    assert up.status_code == 200, up.text
+    asset = up.json()
+
+    auto_preview = client.post(
+        "/api/subject-protection/preview",
+        json={"asset_url": asset["url"], "edit_mask_mode": "protect_subject"},
+        headers=h,
+    )
+    assert auto_preview.status_code == 200, auto_preview.text
+    auto_data = auto_preview.json()
+    assert auto_data["mode"] == "auto_subject"
+    assert auto_data["will_send_mask"] is True
+    assert auto_data["risk_level"] == "medium"
+    assert auto_data["pixel_lock_recommended"] is False
+
+    center_preview = client.post(
+        "/api/subject-protection/preview",
+        json={"asset_url": asset["url"], "edit_mask_mode": "center_box"},
+        headers=h,
+    )
+    assert center_preview.status_code == 200, center_preview.text
+    center_data = center_preview.json()
+    assert center_data["mode"] == "center_box"
+    assert center_data["risk_level"] == "medium"
+    assert center_data["will_send_mask"] is True
+    assert "不等于真正识别产品主体" in center_data["message"]
+
+    off_preview = client.post(
+        "/api/subject-protection/preview",
+        json={"asset_url": asset["url"], "edit_mask_mode": "off"},
+        headers=h,
+    )
+    assert off_preview.status_code == 200, off_preview.text
+    off_data = off_preview.json()
+    assert off_data["mode"] == "none"
+    assert off_data["risk_level"] == "high"
+    assert off_data["will_send_mask"] is False
+
+
 def test_product_image_edit_strict_lock_composites_original_subject_pixels(
     client, make_user, auth, monkeypatch
 ):
@@ -762,7 +1964,9 @@ def test_product_image_edit_strict_lock_composites_original_subject_pixels(
         assert asset_row is not None
         hd_key = asset_row.hd_url.rsplit("/media/", 1)[1]
         hd = Image.open(Path(settings.storage_dir) / hd_key)
-        r_px, g_px, b_px = hd.convert("RGB").getpixel((128, 128))
+        # Pixel lock preserves the source reference placement instead of
+        # following a product-like region hallucinated in the result image.
+        r_px, g_px, b_px = hd.convert("RGB").getpixel((60, 128))
         assert r_px > 140
         assert g_px < 110
         assert b_px < 110
@@ -770,7 +1974,7 @@ def test_product_image_edit_strict_lock_composites_original_subject_pixels(
         db.close()
 
 
-def test_product_image_edit_rgb_auto_mask_composites_high_confidence_subject_by_default(
+def test_product_image_edit_rgb_auto_mask_does_not_composite_subject_by_default(
     client, make_user, auth, monkeypatch
 ):
     uid = make_user("13900001974", balance=1000)
@@ -818,8 +2022,84 @@ def test_product_image_edit_rgb_auto_mask_composites_high_confidence_subject_by_
         )
         assert task is not None
         assert task.params["_edit_mask_sent"] is True
-        assert task.params["_product_pixel_lock"] == "auto_subject"
+        assert task.params["_edit_mask_sent"] is True
+        assert "_product_composite_applied_count" not in task.params
+    finally:
+        db.close()
+
+
+def test_product_pixel_lock_does_not_follow_result_side_false_subject(
+    client, make_user, auth, monkeypatch
+):
+    uid = make_user("13900001975", balance=1000)
+    h = auth("13900001975")
+    up = client.post(
+        "/api/uploads/image",
+        files={"file": ("product.png", _white_bg_product_png_bytes(), "image/png")},
+        headers=h,
+    )
+    assert up.status_code == 200, up.text
+    asset = up.json()
+
+    monkeypatch.setattr(
+        "app.services.gateway.gen_image",
+        lambda *args, **kwargs: [_repainted_product_scene_bytes()],
+    )
+    real_auto_subject_mask = generation_media._auto_subject_mask
+    mask_calls = 0
+
+    def false_result_subject_after_source(image):
+        nonlocal mask_calls
+        mask_calls += 1
+        if mask_calls == 1:
+            return real_auto_subject_mask(image)
+        return generation_media.EditMaskResult(
+            data_uri=None,
+            mode="auto_subject",
+            confidence=0.88,
+            bbox=(8, 8, 88, 88),
+            width=image.width,
+            height=image.height,
+            reason="false_result_subject",
+        )
+
+    monkeypatch.setattr(generation_media, "_auto_subject_mask", false_result_subject_after_source)
+
+    r = client.post("/api/generate", json={
+        "source_asset_url": asset["url"],
+        "source_type": "image",
+        "source_asset_meta": {
+            "selected_type": "image",
+            "mode": "image_edit",
+            "product_generation_mode": True,
+        },
+        "category": "image",
+        "stage": "preview",
+        "prompt": {
+            "final_text": "put this product into a forest scene",
+            "instruction": "put this product into a forest scene",
+        },
+        "params": {
+            "n": 1,
+            "size": "1024x1024",
+            "edit_mask_mode": "protect_subject",
+            "product_pixel_lock": "strict",
+        },
+    }, headers=h)
+    assert r.status_code == 200, r.text
+
+    db = SessionLocal()
+    try:
+        task = (
+            db.query(GenTask)
+            .filter(GenTask.user_id == uid)
+            .order_by(GenTask.id.desc())
+            .first()
+        )
+        assert task is not None
         assert task.params["_product_composite_applied_count"] == 1
+        assert task.params["_product_composite_placement"] == "source_scaled_bbox"
+        assert task.params["_product_composite_target_bbox"] != [8, 8, 88, 88]
     finally:
         db.close()
 
@@ -884,8 +2164,8 @@ def test_product_image_edit_alpha_mask_records_high_confidence_subject_protectio
 def test_product_image_edit_auto_mask_failure_does_not_send_center_box_fallback(
     client, make_user, auth, monkeypatch
 ):
-    uid = make_user("13900001975", balance=1000)
-    h = auth("13900001975")
+    uid = make_user("13900001980", balance=1000)
+    h = auth("13900001980")
 
     up = client.post(
         "/api/uploads/image",
@@ -894,11 +2174,12 @@ def test_product_image_edit_auto_mask_failure_does_not_send_center_box_fallback(
     )
     assert up.status_code == 200, up.text
     asset = up.json()
-    seen = {}
+    generated = False
 
     def fake_gen_image(prompt, image_model_id, n=4, size="1024x1024",
                        reference_image_url=None, edit_path=None, extra_payload=None):
-        seen["extra_payload"] = extra_payload or {}
+        nonlocal generated
+        generated = True
         return [_mock_image(prompt, "256x256", 0)]
 
     monkeypatch.setattr("app.services.gateway.gen_image", fake_gen_image)
@@ -920,7 +2201,7 @@ def test_product_image_edit_auto_mask_failure_does_not_send_center_box_fallback(
         "params": {"n": 1, "size": "1024x1024", "edit_mask_mode": "protect_subject"},
     }, headers=h)
     assert r.status_code == 200, r.text
-    assert "mask" not in seen["extra_payload"]
+    assert generated is False
 
     db = SessionLocal()
     try:
@@ -933,6 +2214,11 @@ def test_product_image_edit_auto_mask_failure_does_not_send_center_box_fallback(
         assert task is not None
         assert task.params["_edit_mask_mode"] == "none"
         assert task.params["_edit_mask_sent"] is False
+        assert task.status == "failed"
+        assert "产品主体保护未能可靠识别" in task.error
+        user = db.get(User, uid)
+        assert user.balance_credits == 1000
+        assert user.frozen_credits == 0
     finally:
         db.close()
 
@@ -1087,7 +2373,8 @@ def test_portrait_image_edit_accepts_character_reference_and_server_fidelity_gua
     assert r.status_code == 200, r.text
 
     assert "人像高保真硬约束" in seen["prompt"]
-    assert "上传人像照片是唯一人物身份来源" in seen["prompt"]
+    assert "上传人像是唯一人物身份" in seen["prompt"]
+    assert len(seen["prompt"]) <= 800
     assert seen["reference_image_url"].startswith("data:image/jpeg;base64,")
 
 
@@ -1614,14 +2901,17 @@ def test_upload_video_runs_probe_off_event_loop(client, make_user, auth, monkeyp
     make_user("13900001909", balance=1000)
     h = auth("13900001909")
     calls = []
+    cleanup_callbacks = []
 
-    async def fake_to_thread(func, *args, **kwargs):
+    async def fake_run_upload_thread(func, *args, on_cancel_result=None, **kwargs):
         calls.append(getattr(func, "__name__", str(func)))
+        if on_cancel_result is not None:
+            cleanup_callbacks.append((getattr(func, "__name__", str(func)), on_cancel_result))
         return func(*args, **kwargs)
 
     from app.routers import uploads
 
-    monkeypatch.setattr(uploads, "asyncio", SimpleNamespace(to_thread=fake_to_thread), raising=False)
+    monkeypatch.setattr(uploads, "_run_upload_thread", fake_run_upload_thread)
 
     r = client.post(
         "/api/uploads/video",
@@ -1631,6 +2921,11 @@ def test_upload_video_runs_probe_off_event_loop(client, make_user, auth, monkeyp
 
     assert r.status_code == 200, r.text
     assert "_sanitize_video_and_poster" in calls
+    assert {name for name, _callback in cleanup_callbacks} == {
+        "_sanitize_video_and_poster",
+        "save_file",
+        "save_bytes_named",
+    }
 
 
 def test_upload_video_rejects_when_ffprobe_missing(client, make_user, auth, monkeypatch, tmp_path):

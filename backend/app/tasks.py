@@ -107,9 +107,13 @@ def poll_video_task(self, task_id: int) -> None:
 
 
 @celery_app.task(name="download.video", bind=True, max_retries=0)
-def download_video_task(self, task_id: int) -> None:
+def download_video_task(
+    self,
+    task_id: int,
+    expected_external_task_id: str | None = None,
+) -> None:
     try:
-        generation.run_video_download_task(task_id)
+        generation.run_video_download_task(task_id, expected_external_task_id)
     except SoftTimeLimitExceeded:
         _fail_generation_soft_timeout(task_id, category="video")
 
@@ -164,6 +168,19 @@ def reap_stuck_parse_records_task() -> int:
     db = SessionLocal()
     try:
         return retention.reap_stuck_parse_records(db)
+    finally:
+        db.close()
+
+
+@celery_app.task(name="cleanup.reap_reverse")
+def reap_stuck_reverse_operations_task() -> int:
+    """Refund reverse calls abandoned by an API process crash."""
+    from .db import SessionLocal
+    from .services import retention
+
+    db = SessionLocal()
+    try:
+        return retention.reap_stuck_reverse_operations(db)
     finally:
         db.close()
 

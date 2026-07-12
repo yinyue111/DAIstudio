@@ -10,6 +10,7 @@ import re
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from ..config import settings
@@ -60,9 +61,10 @@ def _sms_required_for_registration(db: Session) -> bool:
 
 
 def _registration_allowed_without_sms() -> bool:
-    # When SMS auth is disabled by an administrator, users can register with
-    # phone + password only. If SMS is enabled, code verification gates signup.
-    return True
+    # Password-only signup is a local/development convenience. In production,
+    # disabling SMS must not silently turn registration into an unverified
+    # public endpoint that can bypass per-user limits by creating accounts.
+    return bool(settings.debug)
 
 
 def _issue_login_response(response: Response, user: User) -> TokenOut:
@@ -115,7 +117,13 @@ def register(body: RegisterIn, request: Request, response: Response, db: Session
         last_login_at=datetime.now(timezone.utc),
     )
     db.add(user)
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        audit.log(db, user_id=None, action="register_denied", ip=get_client_ip(request),
+                  detail={"phone": phone, "reason": "already_registered_race"})
+        raise HTTPException(400, _REGISTER_GATE_ERROR)
     db.refresh(user)
 
     audit.log(db, user_id=user.id, action="register", ip=get_client_ip(request))

@@ -7,6 +7,12 @@ import Nav from "../../components/Nav";
 import { useToast } from "../../components/ToastProvider";
 import { api, loginPath, wsUrl } from "../../lib/api";
 import { reportBackgroundError } from "../../lib/errorHandling";
+import {
+  createPaymentOrderPoller,
+  selectMonotonicPaymentOrder,
+  selectMonotonicPaymentOrders,
+  shouldStopPaymentOrderPoll,
+} from "./polling";
 import { paymentStatusStyle, paymentStatusText } from "./status";
 
 const PROVIDERS = [
@@ -50,7 +56,7 @@ export default function RechargePage() {
         setPaymentEnabled(enabled);
         setPackages(pkgs);
         setProviders(readyProviders);
-        setOrders(rows);
+        replaceOrdersMonotonically(rows);
         const pending = rows.find((o) => o.status === "pending" && o.code_url);
         if (pending) {
           const seq = createOrderSeqRef.current;
@@ -75,7 +81,7 @@ export default function RechargePage() {
         notify.error(e.message || "充值页加载失败");
       });
     return () => {
-      if (pollRef.current) clearInterval(pollRef.current);
+      if (pollRef.current) pollRef.current.stop();
       if (eventWsRef.current) eventWsRef.current.close();
     };
   }, []);
@@ -100,9 +106,14 @@ export default function RechargePage() {
             api.paymentOrder(orderNo)
               .then((next) => {
                 patchOrder(next);
-                if (activeOrderRef.current?.order_no === orderNo) setActiveOrder(next);
+                if (activeOrderRef.current?.order_no === orderNo) {
+                  if (shouldStopPaymentOrderPoll(activeOrderRef.current, next) && pollRef.current) {
+                    pollRef.current.stop();
+                  }
+                  updateActiveOrder(next);
+                }
                 api.me().then(setMe).catch((e) => reportBackgroundError(e, "refresh current user after payment event"));
-                api.paymentOrders(12).then(setOrders).catch((e) => reportBackgroundError(e, "refresh payment orders after event"));
+                api.paymentOrders(12).then(replaceOrdersMonotonically).catch((e) => reportBackgroundError(e, "refresh payment orders after event"));
                 notify.success("支付成功，积分已到账。");
               })
               .catch((e) => reportBackgroundError(e, "load paid payment order from event"));
@@ -131,66 +142,54 @@ export default function RechargePage() {
 
   useEffect(() => {
     if (pollRef.current) {
-      clearInterval(pollRef.current);
+      pollRef.current.stop();
       pollRef.current = null;
     }
     if (!activeOrder || activeOrder.status !== "pending") return;
-    let stopped = false;
     const orderNo = activeOrder.order_no;
     const seq = createOrderSeqRef.current;
-    const poll = async () => {
-      if (stopped) return;
-      try {
-        const next = await api.paymentOrder(orderNo);
-        patchOrder(next);
+    pollFailuresRef.current = 0;
+    const poller = createPaymentOrderPoller({
+      request: () => api.paymentOrder(orderNo),
+      onResult: (next) => {
         if (
-          stopped
-          || seq !== createOrderSeqRef.current
+          seq !== createOrderSeqRef.current
           || activeOrderRef.current?.order_no !== orderNo
         ) {
-          return;
+          return false;
         }
         pollFailuresRef.current = 0;
         setMsg("");
-        setActiveOrder(next);
+        patchOrder(next);
+        const applied = updateActiveOrder(next);
+        if (!applied) return activeOrderRef.current?.status === "pending";
         if (next.status === "paid") {
           notify.success("支付成功，积分已到账。");
           api.me().then(setMe).catch((e) => reportBackgroundError(e, "refresh current user after paid order poll"));
-          api.paymentOrders(12).then(setOrders).catch((e) => reportBackgroundError(e, "refresh payment orders after paid poll"));
+          api.paymentOrders(12).then(replaceOrdersMonotonically).catch((e) => reportBackgroundError(e, "refresh payment orders after paid poll"));
         } else if (next.status !== "pending") {
-          api.paymentOrders(12).then(setOrders).catch((e) => reportBackgroundError(e, "refresh payment orders after terminal poll"));
+          api.paymentOrders(12).then(replaceOrdersMonotonically).catch((e) => reportBackgroundError(e, "refresh payment orders after terminal poll"));
         }
-        if (next.status !== "pending" && pollRef.current) {
-          clearInterval(pollRef.current);
-          pollRef.current = null;
-        }
-      } catch (e) {
+        return next.status === "pending";
+      },
+      onError: (e) => {
         if (
-          stopped
-          || seq !== createOrderSeqRef.current
+          seq !== createOrderSeqRef.current
           || activeOrderRef.current?.order_no !== orderNo
         ) {
-          return;
+          return false;
         }
         pollFailuresRef.current += 1;
         const retryDelay = pollFailuresRef.current >= 5 ? "自动检查会降低频率继续进行。" : "正在继续自动检查。";
         setMsg(`${e.message}。${retryDelay}`);
         notify.warn(`${e.message}。${retryDelay}`, { duration: 5000 });
-      }
-    };
-    pollFailuresRef.current = 0;
-    pollRef.current = setInterval(() => {
-      const failures = pollFailuresRef.current;
-      if (failures >= 5 && failures % 6 !== 0) {
-        pollFailuresRef.current += 1;
-        return;
-      }
-      poll();
-    }, 2500);
+        return pollFailuresRef.current >= 5 ? 15000 : true;
+      },
+    });
+    pollRef.current = poller;
     return () => {
-      stopped = true;
-      if (pollRef.current) clearInterval(pollRef.current);
-      pollRef.current = null;
+      poller.stop();
+      if (pollRef.current === poller) pollRef.current = null;
     };
   }, [activeOrder?.order_no, activeOrder?.status]);
 
@@ -250,24 +249,47 @@ export default function RechargePage() {
   }, [activeOrder]);
 
   function patchOrder(next) {
-    setOrders((rows) => [next, ...rows.filter((r) => r.order_no !== next.order_no)].slice(0, 12));
+    setOrders((rows) => {
+      const current = rows.find((row) => row.order_no === next.order_no);
+      const selected = selectMonotonicPaymentOrder(current, next);
+      if (selected === current) return rows;
+      return [selected, ...rows.filter((row) => row.order_no !== next.order_no)].slice(0, 12);
+    });
+  }
+
+  function replaceOrdersMonotonically(nextRows) {
+    setOrders((currentRows) => selectMonotonicPaymentOrders(currentRows, nextRows));
+  }
+
+  function updateActiveOrder(next) {
+    const current = activeOrderRef.current;
+    const selected = selectMonotonicPaymentOrder(current, next);
+    if (selected === current) return false;
+    activeOrderRef.current = selected;
+    setActiveOrder(selected);
+    return true;
+  }
+
+  function clearActiveOrder() {
+    activeOrderRef.current = null;
+    setActiveOrder(null);
   }
 
   async function refreshOrders() {
     const seq = createOrderSeqRef.current;
     const currentOrderNo = activeOrderRef.current?.order_no;
     const rows = await api.paymentOrders(12);
-    setOrders(rows);
+    replaceOrdersMonotonically(rows);
     if (currentOrderNo && seq === createOrderSeqRef.current && activeOrderRef.current?.order_no === currentOrderNo) {
       const current = rows.find((o) => o.order_no === currentOrderNo);
-      if (current) setActiveOrder(current);
+      if (current) updateActiveOrder(current);
     }
     return rows;
   }
 
   function clearPendingOrderForNewSelection() {
     createOrderSeqRef.current += 1;
-    setActiveOrder(null);
+    clearActiveOrder();
     setQrImage("");
   }
 
@@ -289,7 +311,7 @@ export default function RechargePage() {
         && providerRef.current === orderProvider
         && packageIdRef.current === orderPackageId
       ) {
-        setActiveOrder(order);
+        updateActiveOrder(order);
       }
     } catch (e) {
       setMsg(e.message);
@@ -310,7 +332,10 @@ export default function RechargePage() {
       const paid = await api.mockPayOrder(orderNo);
       patchOrder(paid);
       if (seq === createOrderSeqRef.current && activeOrderRef.current?.order_no === orderNo) {
-        setActiveOrder(paid);
+        if (shouldStopPaymentOrderPoll(activeOrderRef.current, paid) && pollRef.current) {
+          pollRef.current.stop();
+        }
+        updateActiveOrder(paid);
       }
       api.me().then(setMe).catch((err) => reportBackgroundError(err, "refresh current user after mock pay"));
       notify.success("模拟支付成功，积分已到账。");
@@ -332,7 +357,10 @@ export default function RechargePage() {
       const next = await api.paymentOrder(orderNo);
       patchOrder(next);
       if (seq === createOrderSeqRef.current && activeOrderRef.current?.order_no === orderNo) {
-        setActiveOrder(next);
+        if (shouldStopPaymentOrderPoll(activeOrderRef.current, next) && pollRef.current) {
+          pollRef.current.stop();
+        }
+        updateActiveOrder(next);
       }
       refreshOrders().catch((err) => reportBackgroundError(err, "refresh orders after active order refresh"));
       if (next.status === "paid") {
@@ -356,7 +384,7 @@ export default function RechargePage() {
     try {
       const next = await api.paymentOrder(orderNo);
       patchOrder(next);
-      if (seq === createOrderSeqRef.current) setActiveOrder(next);
+      if (seq === createOrderSeqRef.current) updateActiveOrder(next);
       if (next.status === "paid") api.me().then(setMe).catch((err) => reportBackgroundError(err, "refresh current user after viewing paid order"));
     } catch (e) {
       setMsg(e.message);

@@ -7,6 +7,7 @@ import PromptLibraryBrowser, { STUDIO_DRAFT_PROMPT_KEY } from "../../components/
 import { useToast } from "../../components/ToastProvider";
 import { api } from "../../lib/api";
 import { redirectOnAuthError, reportBackgroundError } from "../../lib/errorHandling";
+import { saveStudioUserDraft } from "../../lib/studioSession";
 
 export default function PromptsPage() {
   const router = useRouter();
@@ -50,22 +51,27 @@ export default function PromptsPage() {
     }
   }
 
-  function usePrompt(item) {
+  function usePrompt(item, { trackUsage = true } = {}) {
     try {
-      window.localStorage.setItem(STUDIO_DRAFT_PROMPT_KEY, JSON.stringify({
+      const saved = saveStudioUserDraft(window.localStorage, STUDIO_DRAFT_PROMPT_KEY, me?.id, {
         prompt: item.prompt || "",
         category: item.category || "general",
         creationMode: item.category === "video" ? "video" : "image",
         savedAt: Date.now(),
-      }));
+      });
+      if (!saved) throw new Error("无法保存当前用户的提示词草稿");
     } catch (e) {
       reportBackgroundError(e, "save prompt draft");
     }
-    if (item.id) {
+    if (trackUsage && Number.isInteger(item.id)) {
       api.updatePromptHistory(item.id, { increment_usage: true })
         .catch((e) => reportBackgroundError(e, "increment prompt usage"));
     }
     router.push("/");
+  }
+
+  function useSystemPrompt(item) {
+    usePrompt(item, { trackUsage: false });
   }
 
   async function copyPrompt(item) {
@@ -190,7 +196,7 @@ export default function PromptsPage() {
             description="按分类和关键词筛选平台内置参考，点击套用会写入创作页输入框。"
             primaryLabel="套用"
             secondaryLabel="复制"
-            onPrimary={usePrompt}
+            onPrimary={useSystemPrompt}
             onSecondary={copyPrompt}
           />
         ) : (

@@ -112,6 +112,8 @@ CORS_ORIGINS=http://localhost:3000,http://127.0.0.1:3000
 ```env
 GATEWAY_BASE_URL=https://your-openai-compatible-gateway
 GATEWAY_API_KEY=<provider-api-key>
+ANTHROPIC_BASE_URL=https://your-anthropic-compatible-gateway
+ANTHROPIC_AUTH_TOKEN=<prompt-optimizer-api-key>
 VIDEO_GATEWAY_BASE_URL=https://ark.cn-beijing.volces.com/api/v3
 VIDEO_GATEWAY_API_KEY=<ark-api-key>
 VIDEO_GATEWAY_FORMAT=ark
@@ -168,17 +170,20 @@ PUBLIC_BASE_URL=https://dream.aiwuq.cn
 CORS_ORIGINS=https://dream.aiwuq.cn
 PAYMENT_FRONTEND_BASE_URL=https://dream.aiwuq.cn
 TRUSTED_PROXY_IPS=127.0.0.1
+ANTHROPIC_BASE_URL=https://your-anthropic-compatible-gateway
+ANTHROPIC_AUTH_TOKEN=<prompt-optimizer-api-key>
 ```
 
 `TRUSTED_PROXY_IPS` 只能填写真正转发到 API 的反代来源 IP。按本文档的 nginx 配置，API 只监听宿主机 `127.0.0.1:8000`，所以生产默认只信任 `127.0.0.1`。不要直接信任整个 Docker 私网网段，否则同网络内其他容器可能伪造 `X-Forwarded-For`。
 
-然后在 shell 或根目录 `.env` 中设置 Compose 需要插值的数据库密码：
+然后在 shell 或根目录 `.env` 中设置 Compose 需要插值的数据库和 Redis 密码：
 
 ```bash
 export POSTGRES_PASSWORD='<strong-postgres-password>'
+export REDIS_PASSWORD='<strong-redis-password>'
 ```
 
-`DEBUG`、`PUBLIC_BASE_URL`、`CORS_ORIGINS`、`TRUSTED_PROXY_IPS`、短信、支付、模型网关和在线升级等后端应用配置都只写入 `backend/.env.production`。Compose 默认通过 `BACKEND_ENV_FILE=./backend/.env.production` 读取它们；宿主 shell/根目录 `.env` 只用于 `POSTGRES_PASSWORD`、端口和前端构建参数，避免覆盖后端应用配置。若你使用其他文件名，启动时显式设置 `BACKEND_ENV_FILE=/path/to/backend.env`。
+`DEBUG`、`PUBLIC_BASE_URL`、`CORS_ORIGINS`、`TRUSTED_PROXY_IPS`、短信、支付、模型网关和在线升级等后端应用配置都只写入 `backend/.env.production`。Compose 默认通过 `BACKEND_ENV_FILE=./backend/.env.production` 读取它们；宿主 shell/根目录 `.env` 只用于 `POSTGRES_PASSWORD`、`REDIS_PASSWORD`、端口和前端构建参数，避免覆盖后端应用配置。若你使用其他文件名，启动时显式设置 `BACKEND_ENV_FILE=/path/to/backend.env`。
 
 ### 2. 启动全栈
 
@@ -239,7 +244,7 @@ deploy/nginx/dream.aiwuq.cn.conf
 
 系统支持两种模型配置来源：
 
-1. 环境变量兜底：`GATEWAY_BASE_URL`、`GATEWAY_API_KEY`、`VIDEO_GATEWAY_*`
+1. 环境变量兜底：`GATEWAY_BASE_URL`、`GATEWAY_API_KEY`、`ANTHROPIC_*`、`VIDEO_GATEWAY_*`
 2. 管理后台动态配置：模型用途、提供商、Base URL、API Key、模型 ID、积分价格、额外参数
 
 管理后台的模型用途：
@@ -249,6 +254,7 @@ deploy/nginx/dream.aiwuq.cn.conf
 | `vision` | 图片/视频参考素材反推提示词 |
 | `image` | 图片生成与图片编辑 |
 | `video` | 视频生成、预览和完整渲染 |
+| `prompt` | 直接输入提示词优化，默认走独立 Anthropic 兼容网关 |
 
 后台保存的 API Key 会使用 `MODEL_CONFIG_SECRET` 加密；如果未单独配置，则回退使用 `PAYMENT_CONFIG_SECRET`。生产环境不要把真实 API Key 提交到仓库。
 
@@ -455,6 +461,7 @@ SMS_TEMPLATE_CODE=<your-template-code>
 | `CORS_ORIGINS` | 前端允许来源 |
 | `TRUSTED_PROXY_IPS` | 可传递 `X-Forwarded-For` 的反代 IP |
 | `GATEWAY_BASE_URL` / `GATEWAY_API_KEY` | OpenAI 兼容模型网关兜底配置 |
+| `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN` | 提示词优化专用 Anthropic 兼容网关兜底配置 |
 | `VIDEO_GATEWAY_BASE_URL` / `VIDEO_GATEWAY_API_KEY` | 视频模型网关兜底配置 |
 | `MODEL_CONFIG_SECRET` | 加密后台保存的模型 API Key |
 | `PAYMENT_CONFIG_SECRET` | 加密后台保存的支付密钥 |

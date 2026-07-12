@@ -1,6 +1,6 @@
 "use client";
 
-import type { AppConfig, Asset, Category, CreationModeKey, SubjectMode, Task } from "../../lib/types";
+import type { AppConfig, Asset, Category, CreationModeKey, ProductPixelLockMode, SubjectMode, Task } from "../../lib/types";
 import { RATIOS } from "./constants";
 import { buildEditNegativePrompt, buildEditPrompt } from "./editPrompt";
 import {
@@ -12,6 +12,7 @@ import {
   composePromptFromStructured,
   composeStyleTransferPrompt,
   imageSizeFor,
+  shouldUseImageReference,
   styleTransferStructured,
   videoDurationLimit,
   videoRatioOptions,
@@ -56,9 +57,11 @@ interface BuildGenerationPayloadInput {
   n: number | string;
   seed?: string;
   editMaskMode?: "protect_subject" | "center_box" | "off";
+  productPixelLockMode?: ProductPixelLockMode;
   vDuration: number | string;
   vResolution: string;
   videoProductLockMode?: "free" | "locked";
+  videoProductTemplate?: string;
 }
 
 function cleanText(value: unknown): string {
@@ -108,11 +111,13 @@ export function buildGenerationPayload({
   n,
   seed = "",
   editMaskMode = "protect_subject",
+  productPixelLockMode = "auto",
   vDuration,
   vResolution,
   videoProductLockMode = "locked",
+  videoProductTemplate = "stable_showcase",
 }: BuildGenerationPayloadInput) {
-  const isFinal = stage === "final" && task;
+  const isFinal = stage === "final" && Boolean(task);
   const effCategory = isFinal ? task.category : category;
   const parentParams = isFinal ? (task?.params || {}) : {};
   const finalRatioKey = parentParams.target_ratio || parentParams.ratio || ratio;
@@ -167,8 +172,8 @@ export function buildGenerationPayload({
     : composePromptFromStructured(effectiveStructured);
   const baseFinalText = (
     promptDirty
-      ? [structuredText, promptText].filter(Boolean).join("；")
-      : (structuredText || promptText)
+      ? (promptText || structuredText)
+      : (isEditMode ? (structuredText || promptText) : (promptText || structuredText))
   ) || "生成同风格的新素材";
   const profiledBaseFinalText = (
     isEditMode
@@ -189,9 +194,12 @@ export function buildGenerationPayload({
     })
     : baseFinalText;
 
-  const useRefImage = !isFinal && sourceAsset && sourceAsset.type === "image" && (
-    isEditMode || Object.keys(effectiveStructured).length === 0
-  );
+  const useRefImage = shouldUseImageReference({
+    isFinal,
+    sourceAsset,
+    isEditMode,
+    structured: effectiveStructured,
+  });
   const useRefVideo = !isFinal && sourceAsset && sourceAsset.type === "video" && Object.keys(effectiveStructured).length === 0;
   const sourceAssetMeta = sourceAsset ? {
     ...buildSourceAssetMeta(sourceAsset),
@@ -221,7 +229,7 @@ export function buildGenerationPayload({
     prompt: {
       ...(Object.keys(promptStructured).length ? promptStructured : {}),
       ...(subjectProfileText && (productMode || portraitMode) ? { [subjectProfileLabel]: subjectProfileText } : {}),
-      ...(isEditMode && promptDirty && promptText ? { user_instruction: promptText } : {}),
+      ...(promptDirty && promptText ? { user_instruction: promptText } : {}),
       final_text: finalText,
       ...(useRefImage ? { instruction: finalText || promptText || "参考所选图生成同款风格的新素材" } : {}),
       ...(useRefVideo ? { instruction: promptText || "参考所选视频的主体、动作和镜头节奏生成同款视频" } : {}),
@@ -233,11 +241,13 @@ export function buildGenerationPayload({
             size: imageSize,
             ...(dims ? { reference_width: dims.width, reference_height: dims.height } : {}),
             ...(seed !== "" ? { seed: Number(seed) } : {}),
+            ...(useRefImage && refImage ? { reference_image_url: refImage } : {}),
             ...(styleReferenceUrl ? { style_reference_image: styleReferenceUrl } : {}),
             ...(portraitMode && refImage ? { character_reference_image: refImage } : {}),
             ...(subjectModeParam ? { subject_mode: subjectModeParam } : {}),
             ...(variationSource?.id ? { variation_of_asset_id: Number(variationSource.id) } : {}),
             ...(isImageEditMode && productMode ? { edit_mask_mode: editMaskMode || "protect_subject" } : {}),
+            ...(isImageEditMode && productMode ? { product_pixel_lock: editMaskMode === "off" ? "off" : (productPixelLockMode || "auto") } : {}),
             ...(editNegative ? { negative_prompt: editNegative } : {}),
           }
         : {
@@ -251,6 +261,7 @@ export function buildGenerationPayload({
             ...(portraitMode && refImage ? { character_reference_image: refImage } : {}),
             ...(subjectModeParam ? { subject_mode: subjectModeParam } : {}),
             ...(isEditMode && productMode ? { product_lock_mode: videoProductLockMode === "locked" ? "locked" : "free" } : {}),
+            ...(isEditMode && productMode ? { product_video_template: videoProductTemplate || "stable_showcase" } : {}),
             ...(editNegative ? { negative_prompt: editNegative } : {}),
           },
   };

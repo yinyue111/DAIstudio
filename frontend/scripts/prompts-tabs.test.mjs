@@ -28,6 +28,16 @@ assert.match(
   /title="系统提示词"/,
   "the built-in prompt library should be labeled as system prompts",
 );
+assert.match(
+  source,
+  /function useSystemPrompt\(item\) \{\s*usePrompt\(item, \{ trackUsage: false \}\);\s*\}/,
+  "system prompts should be applied without updating numeric prompt-history ids",
+);
+assert.match(
+  source,
+  /onPrimary=\{useSystemPrompt\}/,
+  "the built-in prompt library should use the non-tracking apply handler",
+);
 
 const browserSource = readFileSync(join(root, "components/PromptLibraryBrowser.jsx"), "utf8");
 

@@ -2,15 +2,29 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime
-from typing import Any, Literal
+from datetime import datetime, timezone
+from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, PlainSerializer, field_validator, model_validator
 
 MAX_MODEL_COST_CREDITS = 1_000_000
 MAX_PAYMENT_AMOUNT_CENTS = 1_000_000_00  # 1,000,000 CNY
 MAX_PAYMENT_PACKAGE_CREDITS = 100_000_000
 MAX_PAYMENT_CREDITS_PER_CENT = 10_000
+
+
+def _serialize_utc_datetime(value: datetime) -> str:
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    else:
+        value = value.astimezone(timezone.utc)
+    return value.isoformat()
+
+
+UtcDateTime = Annotated[
+    datetime,
+    PlainSerializer(_serialize_utc_datetime, return_type=str, when_used="json"),
+]
 
 
 # --- Auth (phone + password) ---
@@ -85,7 +99,7 @@ class UserDraftIn(BaseModel):
 class UserDraftOut(BaseModel):
     key: str
     payload: dict[str, Any] = Field(default_factory=dict)
-    updated_at: datetime | None = None
+    updated_at: UtcDateTime | None = None
 
 
 # --- Parse ---
@@ -134,6 +148,22 @@ class ReverseOut(BaseModel):
     reference_count: int = 1
 
 
+class PromptOptimizeIn(BaseModel):
+    prompt: str = Field(min_length=1, max_length=4000)
+    category: Literal["image", "video"] = "image"
+    product_mode: bool = False
+
+    @field_validator("prompt", mode="before")
+    @classmethod
+    def _strip_prompt(cls, value):
+        return value.strip() if isinstance(value, str) else value
+
+
+class PromptOptimizeOut(BaseModel):
+    prompt: str
+    model_id: str
+
+
 # --- Generate ---
 class GenerateIn(BaseModel):
     # optional: pure text-to-image needs no reference; only set when generating
@@ -161,6 +191,12 @@ class TaskOut(BaseModel):
     parent_task_id: int | None = None
     status: str
     model_use: str | None = None
+    model_id: str | None = None
+    model_provider: str | None = None
+    prompt_text: str | None = None
+    prompt_text_source: Literal["generation", "request"] | None = None
+    request_prompt_text: str | None = None
+    generation_prompt_text: str | None = None
     cost_frozen: int
     cost_settled: int
     error: str | None = None
@@ -181,8 +217,8 @@ class TaskOut(BaseModel):
     final_asset_count: int = 0
     final_cost_estimate: int | None = None
     params: dict[str, Any] = Field(default_factory=dict)
-    created_at: datetime | None = None
-    finished_at: datetime | None = None
+    created_at: UtcDateTime | None = None
+    finished_at: UtcDateTime | None = None
     assets: list[AssetOut] = Field(default_factory=list)
 
 
@@ -199,9 +235,9 @@ class AssetOut(BaseModel):
     width: int | None = None
     height: int | None = None
     duration: int | None = None
-    created_at: datetime | None = None
+    created_at: UtcDateTime | None = None
     # populated by the profile gallery (retention)
-    expires_at: datetime | None = None
+    expires_at: UtcDateTime | None = None
     days_left: int | None = None
     category: str | None = None
     unlock_cost: int = 0
@@ -226,8 +262,8 @@ class AssetReportOut(BaseModel):
     status: str
     handle_note: str | None = None
     handled_by: int | None = None
-    handled_at: datetime | None = None
-    created_at: datetime | None = None
+    handled_at: UtcDateTime | None = None
+    created_at: UtcDateTime | None = None
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -323,8 +359,8 @@ class UserPromptOut(BaseModel):
     favorite: bool
     usage_count: int
     params: dict[str, Any] | None = None
-    created_at: datetime | None = None
-    updated_at: datetime | None = None
+    created_at: UtcDateTime | None = None
+    updated_at: UtcDateTime | None = None
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -367,9 +403,9 @@ class PaymentOrderOut(BaseModel):
     status: str
     code_url: str | None = None
     provider_trade_no: str | None = None
-    expires_at: datetime | None = None
-    paid_at: datetime | None = None
-    created_at: datetime | None = None
+    expires_at: UtcDateTime | None = None
+    paid_at: UtcDateTime | None = None
+    created_at: UtcDateTime | None = None
 
 
 # --- Admin ---
@@ -420,7 +456,7 @@ class UserStatusIn(BaseModel):
 class ModelConfigIn(BaseModel):
     model_config = ConfigDict(protected_namespaces=())
 
-    use: Literal["vision", "image", "video"]
+    use: Literal["vision", "image", "video", "prompt"]
     model_id: str = Field(min_length=1, max_length=128)
     provider: Literal[
         "openai",
@@ -434,12 +470,13 @@ class ModelConfigIn(BaseModel):
         "baidu_qianfan",
         "tencent_hunyuan",
         "yinyue",
+        "anthropic",
         "custom_openai",
     ] | None = None
     base_url: str | None = Field(default=None, max_length=512)
     api_key: str | None = Field(default=None, max_length=4096)
     api_key_clear: bool = False
-    gateway_format: Literal["openai", "ark"] | None = None
+    gateway_format: Literal["openai", "ark", "anthropic"] | None = None
     cost_credits: int = Field(ge=1, le=MAX_MODEL_COST_CREDITS)
     unlock_cost: int = Field(default=0, ge=0, le=MAX_MODEL_COST_CREDITS)
     enabled: bool = True
@@ -480,7 +517,7 @@ class ModelConfigIn(BaseModel):
 
 
 class ModelProbeIn(BaseModel):
-    use: Literal["vision", "image", "video"] | None = None
+    use: Literal["vision", "image", "video", "prompt"] | None = None
     provider: Literal[
         "openai",
         "volcengine_ark",
@@ -493,11 +530,12 @@ class ModelProbeIn(BaseModel):
         "baidu_qianfan",
         "tencent_hunyuan",
         "yinyue",
+        "anthropic",
         "custom_openai",
     ] | None = None
     base_url: str | None = Field(default=None, max_length=512)
     api_key: str | None = Field(default=None, max_length=4096)
-    gateway_format: Literal["openai", "ark"] | None = None
+    gateway_format: Literal["openai", "ark", "anthropic"] | None = None
 
     @field_validator("base_url")
     @classmethod
@@ -637,7 +675,7 @@ class AuditOut(BaseModel):
     biz_id: int | None = None
     ip: str | None = None
     detail: dict[str, Any] | None = None
-    created_at: datetime | None = None
+    created_at: UtcDateTime | None = None
 
     model_config = ConfigDict(from_attributes=True)
 

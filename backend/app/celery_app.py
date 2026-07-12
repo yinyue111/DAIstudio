@@ -1,7 +1,10 @@
 """Celery app (Redis as broker + result backend)."""
 from __future__ import annotations
 
+import atexit
 import logging
+import os
+import threading
 
 from celery import Celery
 from celery.schedules import crontab
@@ -11,8 +14,9 @@ from kombu import Queue
 from .config import settings
 from .db import SessionLocal
 from .observability import reset_request_id, set_request_id
-from .redis_client import redis_client, redis_connection_kwargs
+from .redis_client import celery_redis_url, redis_client, redis_connection_kwargs
 from .runtime_config import validate_model_gateway_rows, validate_runtime_config
+from .services import locks
 from .services.config_store import seed_from_yaml
 
 logger = logging.getLogger(__name__)
@@ -28,11 +32,14 @@ _redis_transport_options = {
     "visibility_timeout": _celery_settings.visibility_timeout_seconds,
 }
 _worker_shutting_down = False
+_beat_lease_token: str | None = None
+_beat_lease_stop = threading.Event()
+_beat_lease_thread: threading.Thread | None = None
 
 celery_app = Celery(
     "ai_studio",
-    broker=_redis_settings.url,
-    backend=_redis_settings.url,
+    broker=celery_redis_url(),
+    backend=celery_redis_url(),
 )
 
 celery_app.conf.update(
@@ -87,6 +94,11 @@ celery_app.conf.update(
         # fail parse jobs whose worker message disappeared
         "reap-stuck-parse-records": {
             "task": "cleanup.reap_parse",
+            "schedule": crontab(minute="*/10"),
+        },
+        # refund synchronous reverse calls abandoned by an API process crash
+        "reap-stuck-reverse-operations": {
+            "task": "cleanup.reap_reverse",
             "schedule": crontab(minute="*/10"),
         },
         # resume in-flight video renders whose poll chain died (worker crash)
@@ -152,6 +164,67 @@ def _validate_worker_runtime_config_signal(**_kwargs) -> None:
 @beat_init.connect
 def _validate_beat_runtime_config(**_kwargs) -> None:
     _validate_worker_runtime_config()
+    _start_beat_lease()
+
+
+def _beat_lease_loop(*, stop_event: threading.Event, token: str, exit_process=os._exit) -> None:
+    refresh_seconds = int(settings.celery_beat_lease_refresh_seconds)
+    ttl_seconds = int(settings.celery_beat_lease_ttl_seconds)
+    while not stop_event.wait(refresh_seconds):
+        try:
+            refreshed = locks.refresh(settings.celery_beat_lease_key, token, ttl_seconds)
+        except Exception:  # noqa: BLE001
+            logger.critical("celery beat lease refresh raised; stopping", exc_info=True)
+            refreshed = False
+        if stop_event.is_set():
+            return
+        if not refreshed:
+            logger.critical("celery beat lost its distributed owner lease; stopping")
+            exit_process(1)
+            return
+
+
+def _start_beat_lease() -> str:
+    global _beat_lease_thread, _beat_lease_token
+    if _beat_lease_token is not None:
+        return _beat_lease_token
+    ttl_seconds = int(settings.celery_beat_lease_ttl_seconds)
+    token = locks.acquire(settings.celery_beat_lease_key, ttl=ttl_seconds)
+    if not token:
+        raise RuntimeError("another celery beat scheduler is already active")
+    _beat_lease_token = token
+    _beat_lease_stop.clear()
+    _beat_lease_thread = threading.Thread(
+        target=_beat_lease_loop,
+        kwargs={"stop_event": _beat_lease_stop, "token": token},
+        name="celery-beat-owner-lease",
+        daemon=True,
+    )
+    try:
+        _beat_lease_thread.start()
+    except Exception:
+        _beat_lease_thread = None
+        _beat_lease_token = None
+        locks.release(settings.celery_beat_lease_key, token)
+        raise
+    return token
+
+
+def _stop_beat_lease() -> None:
+    global _beat_lease_thread, _beat_lease_token
+    token = _beat_lease_token
+    _beat_lease_stop.set()
+    thread = _beat_lease_thread
+    if thread is not None and thread is not threading.current_thread() and thread.is_alive():
+        thread.join(timeout=int(settings.celery_beat_lease_ttl_seconds))
+    thread_stopped = thread is None or not thread.is_alive()
+    _beat_lease_thread = None
+    _beat_lease_token = None
+    if token and thread_stopped:
+        locks.release(settings.celery_beat_lease_key, token)
+
+
+atexit.register(_stop_beat_lease)
 
 
 @worker_shutting_down.connect

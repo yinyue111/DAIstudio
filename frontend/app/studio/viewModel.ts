@@ -7,6 +7,7 @@ import {
   estimateImageCredits,
   estimateVideoFinalCredits,
   imageSizeFor,
+  shouldUseImageReference,
   videoDurationLimit,
   videoRatioOptions,
 } from "./helpers";
@@ -80,13 +81,23 @@ export function buildStudioDerivedViewState({
   const videoDuration = boundedVideoDuration(vDuration, maxVideoDuration);
   const currentImageSize = imageSizeFor(ratioOption, imageQuality, cfg?.image_size_max_dim || 2048);
   const taskParams = task?.params || {};
+  const imageReferenceSource = isEditMode ? productAsset : selected;
+  const usesImageReference = shouldUseImageReference({
+    sourceAsset: imageReferenceSource,
+    isEditMode,
+    structured,
+  });
   const videoFinalCost = Number(task?.final_cost_estimate || 0)
     || estimateVideoFinalCredits(cfg, {
       resolution: taskParams.target_resolution || taskParams.resolution || vResolution,
       duration: taskParams.target_duration || taskParams.duration || videoDuration,
     });
   const estCost = category === "image"
-    ? estimateImageCredits(cfg, { size: currentImageSize, count: imageCount, edit: isEditMode })
+    ? estimateImageCredits(cfg, {
+        size: currentImageSize,
+        count: imageCount,
+        edit: isEditMode || usesImageReference,
+      })
     : videoFinalCost;
   const currentModelEnabled = modelEnabledForConfig(cfg, creationMode);
   const currentGatewayMock = cfg?.gateways?.[category]?.mock_mode ?? cfg?.mock_mode;

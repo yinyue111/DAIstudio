@@ -51,9 +51,9 @@ async function hasValidSession(request) {
       },
       cache: "no-store",
     });
-    return response.ok;
+    return response.status !== 401 && response.status !== 403;
   } catch (_err) {
-    return false;
+    return true;
   }
 }
 

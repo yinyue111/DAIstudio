@@ -3,6 +3,7 @@
 import {
   IMAGE_QUALITY_PRESETS,
   VIDEO_DURATION_PRESETS,
+  VIDEO_PRODUCT_TEMPLATES,
   VIDEO_QUALITIES,
 } from "../app/studio/constants";
 import { boundedImageCount, boundedVideoDuration, formatDuration } from "../app/studio/helpers";
@@ -30,12 +31,18 @@ export default function StudioGenerationControls({
   portraitGenerationMode = false,
   videoProductLockMode = "locked",
   onVideoProductLockModeChange,
+  videoProductTemplate = "stable_showcase",
+  onVideoProductTemplateChange,
   showNegative,
   onToggleNegative,
   seed,
   onSeedChange,
   editMaskMode = "protect_subject",
   onEditMaskModeChange,
+  productPixelLockMode = "auto",
+  onProductPixelLockModeChange,
+  subjectProtection = null,
+  subjectProtectionLoading = false,
   negative,
   onNegativeChange,
   onNegativeTouched,
@@ -64,7 +71,55 @@ export default function StudioGenerationControls({
       status: "整图编辑",
     },
   ];
+  const pixelLockOptions = [
+    {
+      key: "auto",
+      label: "自动像素锁",
+      hint: "仅透明 PNG 自动锁回原产品像素；普通 JPG/PNG 只发送主体蒙版，避免白底被误贴进新场景。",
+      status: "透明 PNG 自动锁定",
+    },
+    {
+      key: "strict",
+      label: "强制像素锁",
+      hint: "只要蒙版可用就强制锁回原产品像素，最适合包装文字和 Logo，但边缘融合可能更硬。",
+      status: "优先文字保真",
+    },
+    {
+      key: "off",
+      label: "关闭像素锁",
+      hint: "只依赖模型和蒙版编辑，画面更自然，但包装文字和 Logo 更容易漂移。",
+      status: "仅模型编辑",
+    },
+  ];
   const editMaskStatus = editMaskOptions.find((option) => option.key === editMaskMode)?.status || "自动识别主体";
+  const pixelLockDisabled = editMaskMode === "off";
+  const pixelLockStatus = pixelLockDisabled
+    ? "整图编辑不锁像素"
+    : pixelLockOptions.find((option) => option.key === productPixelLockMode)?.status || "透明 PNG 自动锁定";
+  const pixelLockTip = subjectProtection?.pixel_lock_recommended
+    ? "当前图片建议开启像素锁，能更稳地保留产品文字和 Logo。"
+    : subjectProtection && !subjectProtectionLoading
+      ? "当前主体识别置信度有限，自动模式会避免低置信硬锁。"
+      : "上传产品图后会结合预检结果决定是否锁回原产品像素。";
+  const riskClass = subjectProtection?.risk_level === "low"
+    ? "border-aqua/25 bg-aqua/10 text-aqua"
+    : subjectProtection?.risk_level === "medium"
+      ? "border-warn/25 bg-warn/10 text-warn"
+      : "border-rose/25 bg-rose/10 text-rose";
+  const subjectProtectionStatus = subjectProtectionLoading
+    ? "识别中"
+    : !subjectProtection
+      ? "待上传"
+      : subjectProtection.will_send_mask
+        ? `置信度 ${Math.round((subjectProtection.confidence || 0) * 100)}%`
+        : subjectProtection.title === "整图编辑"
+          ? "已关闭"
+          : String(subjectProtection.title || "").includes("失败")
+            ? "识别失败"
+            : "未识别主体";
+  const subjectProtectionStatusClass = subjectProtectionLoading || !subjectProtection
+    ? "border-line bg-white/5 text-fog"
+    : riskClass;
   const applyVideoProductMode = (mode) => {
     onVideoProductLockModeChange?.(mode);
     if (mode === "locked") {
@@ -171,6 +226,65 @@ export default function StudioGenerationControls({
                     </button>
                   ))}
                 </div>
+                <div className="mt-3 rounded-lg border border-line bg-base/35 p-2">
+                  <div className="flex min-w-0 items-center justify-between gap-3">
+                    <span className="text-xs font-semibold text-mist">像素锁</span>
+                    <span className="min-w-0 truncate text-right text-xs text-fog">{pixelLockStatus}</span>
+                  </div>
+                  <div className={`${scrollPillRowClass} mt-2`}>
+                    {pixelLockOptions.map((option) => (
+                      <button
+                        key={option.key}
+                        type="button"
+                        onClick={() => onProductPixelLockModeChange?.(option.key)}
+                        title={option.hint}
+                        disabled={pixelLockDisabled}
+                        className={`chip shrink-0 disabled:cursor-not-allowed disabled:opacity-45 ${!pixelLockDisabled && productPixelLockMode === option.key ? "chip-active" : ""}`}
+                      >
+                        {option.label}
+                      </button>
+                    ))}
+                  </div>
+                  <p className="mt-1 text-xs leading-relaxed text-fog">{pixelLockTip}</p>
+                </div>
+                <div className="mt-2 rounded-lg border border-line bg-base/35 p-2">
+                  <div className="flex min-w-0 items-center justify-between gap-2">
+                    <span className="text-xs font-semibold text-mist">主体保护预检</span>
+                    <span className={`shrink-0 rounded-full border px-2 py-0.5 text-[11px] ${subjectProtectionStatusClass}`}>
+                      {subjectProtectionStatus}
+                    </span>
+                  </div>
+                  {subjectProtectionLoading ? (
+                    <p className="mt-1 text-xs leading-relaxed text-fog">正在检查产品主体区域，生成前会提示当前图片是否适合主体保护。</p>
+                  ) : subjectProtection ? (
+                    <div className="mt-2 grid min-w-0 gap-2 sm:grid-cols-[72px_minmax(0,1fr)]">
+                      {subjectProtection.mask_data_uri ? (
+                        <div className="flex h-[68px] w-[68px] items-center justify-center rounded-md border border-line bg-black/20">
+                          <img
+                            src={subjectProtection.mask_data_uri}
+                            alt="主体保护蒙版预览"
+                            className="max-h-[62px] max-w-[62px] object-contain"
+                          />
+                        </div>
+                      ) : (
+                        <div className="flex h-[68px] w-[68px] items-center justify-center rounded-md border border-line bg-white/[0.03] text-center text-[11px] leading-tight text-fog">
+                          无蒙版
+                        </div>
+                      )}
+                      <div className="min-w-0">
+                        <p className="text-xs font-medium text-mist">{subjectProtection.title}</p>
+                        <p className="mt-1 text-xs leading-relaxed text-fog">{subjectProtection.message}</p>
+                        {subjectProtection.recommendations?.length ? (
+                          <p className="mt-1 text-xs leading-relaxed text-fog">
+                            {subjectProtection.recommendations.slice(0, 2).join(" ")}
+                          </p>
+                        ) : null}
+                      </div>
+                    </div>
+                  ) : (
+                    <p className="mt-1 text-xs leading-relaxed text-fog">上传产品图后会自动检查主体保护能力。</p>
+                  )}
+                </div>
               </div>
             )}
           </div>
@@ -250,6 +364,27 @@ export default function StudioGenerationControls({
                 <p className="mt-2 text-xs leading-relaxed text-fog">
                   包装小字多的产品建议使用高清正面图或透明 PNG；文字保真模式会使用更克制的镜头。自由运动模式下，快速旋转、泼溅和运动模糊会增加文字乱码概率。
                 </p>
+                <div className="mt-3">
+                  <div className="flex min-w-0 items-center justify-between gap-3">
+                    <span className={controlLabelClass}>产品模板</span>
+                    <span className="min-w-0 truncate text-right text-xs text-fog">
+                      {VIDEO_PRODUCT_TEMPLATES.find((item) => item.key === videoProductTemplate)?.label || "稳定陈列"}
+                    </span>
+                  </div>
+                  <div className={`${scrollPillRowClass} mt-2`}>
+                    {VIDEO_PRODUCT_TEMPLATES.map((option) => (
+                      <button
+                        key={option.key}
+                        type="button"
+                        onClick={() => onVideoProductTemplateChange?.(option.key)}
+                        title={option.hint}
+                        className={`chip shrink-0 ${videoProductTemplate === option.key ? "chip-active" : ""}`}
+                      >
+                        {option.label}
+                      </button>
+                    ))}
+                  </div>
+                </div>
               </div>
             )}
           </div>

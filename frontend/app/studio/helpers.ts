@@ -60,8 +60,13 @@ export function buildSourceAssetMeta(asset) {
   };
 }
 
-export function composePromptFromStructured(structured, fallbackText = "") {
+export function composePromptFromStructured(
+  structured,
+  fallbackText = "",
+  { preferFallback = false } = {},
+) {
   const fallback = String(fallbackText || "").trim();
+  if (preferFallback && fallback) return fallback;
   if (!structured || !Object.keys(structured).length) return fallback;
   const finalText = String(structured.final_text || structured["final_text"] || fallbackText || "").trim();
   const order = [
@@ -77,6 +82,27 @@ export function composePromptFromStructured(structured, fallbackText = "") {
   let text = parts.join(", ");
   if (structured["标签"]) text += (text ? ", " : "") + structured["标签"];
   return text.trim() || finalText;
+}
+
+export function isStructuredPortrait(structured) {
+  return String(structured?.["图像类型"] || "").includes("人物");
+}
+
+export function shouldUseImageReference({
+  isFinal = false,
+  sourceAsset = null,
+  isEditMode = false,
+  structured = {},
+} = {}) {
+  return Boolean(
+    !isFinal
+    && sourceAsset?.type === "image"
+    && (
+      isEditMode
+      || Object.keys(structured || {}).length === 0
+      || isStructuredPortrait(structured)
+    )
+  );
 }
 
 const IMAGE_STYLE_TRANSFER_KEYS = [

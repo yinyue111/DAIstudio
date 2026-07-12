@@ -11,6 +11,8 @@ const mediaUploadSource = readFileSync(join(root, "hooks/useMediaUpload.js"), "u
 const referenceParsingSource = readFileSync(join(root, "hooks/useReferenceParsing.js"), "utf8");
 const taskTrackingSource = readFileSync(join(root, "hooks/useTaskTracking.js"), "utf8");
 const studioResultsSource = readFileSync(join(root, "app/studio/StudioResults.jsx"), "utf8");
+const promptWorkspaceSource = readFileSync(join(root, "app/studio/StudioPromptWorkspace.jsx"), "utf8");
+const workspaceResetSource = readFileSync(join(root, "app/studio/workspaceReset.ts"), "utf8");
 const promptsPageSource = readFileSync(join(root, "app/prompts/page.jsx"), "utf8");
 const toastSource = readFileSync(join(root, "components/ToastProvider.jsx"), "utf8");
 
@@ -61,7 +63,7 @@ assert.match(
 );
 assert.match(
   taskTrackingSource,
-  /startPolling\(id,\s*runId\)/,
+  /startPolling\(id,\s*runId(?:,\s*(?:ownerSession|ownerRequest))?\)/,
   "websocket fallback should pass the current tracking generation into polling",
 );
 assert.match(
@@ -80,6 +82,41 @@ assert.match(
   "studio should let users save reverse prompt output to their prompt library",
 );
 assert.match(
+  promptWorkspaceSource,
+  /onClick=\{onClearWorkspace\}[\s\S]*title="清空提示词、上传素材和反推结果"/,
+  "prompt controls should expose a full workspace clear action after prompt optimization",
+);
+assert.match(
+  workspaceResetSource,
+  /prompt: ""[\s\S]*assets: \[\][\s\S]*selected: null[\s\S]*productAsset: null[\s\S]*productProfile: null[\s\S]*structured: \{\}/,
+  "workspace clear should remove prompts, uploads, selected references, subject profiles and reverse dimensions",
+);
+assert.match(
+  pageSource,
+  /for \(const \{ key: mode \} of CREATION_MODES\)[\s\S]*invalidatePromptOptimization\(mode\);[\s\S]*resetOwnerReferenceParsing\(\);[\s\S]*resetOwnerMediaUpload\(\);/,
+  "workspace clear should invalidate stale optimizer, reverse and upload responses",
+);
+assert.match(
+  pageSource,
+  /setWorkspacePatch\(\{[\s\S]*prompt: optimized[\s\S]*\}, mode\);/,
+  "prompt optimization should write back to the mode where the request started",
+);
+assert.match(
+  referenceParsingSource,
+  /function resetOwnerReferenceParsing\(\)[\s\S]*lastReversePromptRef\.current = \{\}/,
+  "workspace clear should remove hidden reverse-result metadata for every mode",
+);
+assert.match(
+  mediaUploadSource,
+  /function resetOwnerMediaUpload\(\)[\s\S]*abortAll\(\)[\s\S]*revokeUploadedObjectUrls\(\)[\s\S]*revokeProductObjectUrls\(\)/,
+  "workspace clear should abort active uploads and revoke every local preview URL",
+);
+assert.match(
+  mediaUploadSource,
+  /function resetOwnerMediaUpload\(\)[\s\S]*resetInput\(imageUploadInputRef\)[\s\S]*resetInput\(productUploadInputRef\)[\s\S]*resetInput\(videoUploadInputRef\)/,
+  "workspace clear should reset file inputs so the same file can be uploaded again",
+);
+assert.match(
   studioResultsSource,
   /内容审核中|管理员已收到/,
   "needs_review tasks should tell the user that the result is under review",
@@ -96,7 +133,7 @@ assert.match(
 );
 assert.match(
   pageSource,
-  /if \(applyVariationDraft\(JSON\.parse\(variationDraft\)\)\) \{\s*window\.localStorage\.removeItem\(STUDIO_VARIATION_DRAFT_KEY\);/s,
+  /if \(variationDraft && applyVariationDraft\(variationDraft\)\) \{\s*removeStudioUserDraft\(window\.localStorage, STUDIO_VARIATION_DRAFT_KEY, u\?\.id\);/s,
   "variation draft should only be removed after successful recovery",
 );
 assert.match(
@@ -106,7 +143,7 @@ assert.match(
 );
 assert.match(
   promptsPageSource,
-  /JSON\.stringify\(\{[\s\S]*category:\s*item\.category/,
+  /saveStudioUserDraft\([\s\S]*category:\s*item\.category/,
   "prompt library handoff should preserve prompt category for video prompts",
 );
 assert.match(
@@ -124,10 +161,11 @@ assert.match(
   /CREATION_MODES\.some\(\(item\) => item\.key === draft\.creationMode\)/,
   "structured prompt drafts should validate mode keys against creation-mode objects",
 );
-assert.match(
-  pageSource,
-  /restoredLocalDraftAtRef\.current = Number\(parsedDraft\.savedAt \|\| Date\.now\(\)\)/,
-  "prompt library handoff should block older cloud workspace drafts from overriding the selected prompt",
+const cloudDraftLoadIndex = pageSource.indexOf('const row = await api.getDraft("studio")');
+const promptTransferApplyIndex = pageSource.indexOf("if (promptDraft)");
+assert.ok(
+  cloudDraftLoadIndex >= 0 && promptTransferApplyIndex > cloudDraftLoadIndex,
+  "prompt-library handoff must apply after cloud initialization so an older cloud workspace cannot override the selected prompt",
 );
 assert.match(
   toastSource,

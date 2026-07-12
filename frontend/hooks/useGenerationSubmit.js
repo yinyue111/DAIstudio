@@ -2,6 +2,7 @@
 
 import { useRef, useState } from "react";
 import { api } from "../lib/api";
+import { createStudioOwnerRequestContext } from "../lib/studioSession";
 import { buildGenerationPayload } from "../app/studio/generationPayload";
 import { classifyGenerationError } from "../lib/errorHandling";
 import {
@@ -12,6 +13,12 @@ import {
 } from "../app/studio/generationRequestId";
 import { shouldBlockNewGeneration } from "../app/studio/taskConcurrency";
 import { assetSignature, isRequestTimeoutError, isTerminalTaskStatus } from "../app/studio/helpers";
+import {
+  buildSubjectProfileRequestIdentity,
+  cacheSubjectProfileResult,
+  normalizeSubjectProfileResult,
+  readCachedSubjectProfileResult,
+} from "../lib/studioSubjectProfile";
 
 export default function useGenerationSubmit({
   cfg,
@@ -41,9 +48,11 @@ export default function useGenerationSubmit({
   n,
   seed,
   editMaskMode,
+  productPixelLockMode,
   vDuration,
   vResolution,
   videoProductLockMode,
+  videoProductTemplate,
   resultsRef,
   modelEnabled,
   setMsg,
@@ -54,13 +63,28 @@ export default function useGenerationSubmit({
   trackBackgroundTask,
   refreshMe,
   startTracking,
+  getOwnerSession,
+  subjectProfilePendingRequestRef = null,
+  subjectProfileResultCacheRef = null,
 }) {
   const [submitting, setSubmitting] = useState(false);
   const pendingGenerateRequestRef = useRef(null);
-  const pendingProfileReverseRequestRef = useRef(null);
+  const fallbackSubjectProfilePendingRequestRef = useRef(null);
+  const fallbackSubjectProfileResultCacheRef = useRef(null);
+  const pendingProfileReverseRequestRef = subjectProfilePendingRequestRef || fallbackSubjectProfilePendingRequestRef;
+  const profileResultCacheRef = subjectProfileResultCacheRef || fallbackSubjectProfileResultCacheRef;
   const productAssetSignatureByModeRef = useRef({});
+  const ownerRequestRef = useRef(0);
+  const getOwnerSessionRef = useRef(getOwnerSession);
+  const ownerRequestContextRef = useRef(null);
 
   productAssetSignatureByModeRef.current[creationMode] = assetSignature(productAsset);
+  getOwnerSessionRef.current = getOwnerSession;
+  if (!ownerRequestContextRef.current) {
+    ownerRequestContextRef.current = createStudioOwnerRequestContext(
+      () => getOwnerSessionRef.current?.(),
+    );
+  }
 
   function scrollToResults() {
     if (typeof window === "undefined") return;
@@ -89,7 +113,15 @@ export default function useGenerationSubmit({
       return;
     }
     if (isEditMode && !productAsset) {
-      setMsg(isImageEditMode ? "请先上传要编辑的图片" : "请先上传产品主体图片");
+      setMsg(
+        subjectMode === "portrait"
+          ? "请先上传人物照片"
+          : subjectMode === "product"
+            ? "请先上传产品主体图片"
+            : isImageEditMode
+              ? "请先上传要编辑的图片"
+              : "请先上传主体图片",
+      );
       return;
     }
     if (isEditMode && !String(prompt || "").trim() && Object.keys(structured || {}).length === 0) {
@@ -103,6 +135,12 @@ export default function useGenerationSubmit({
 
     setSubmitting(true);
     setMsg("");
+    const ownerRequest = ownerRequestContextRef.current.capture();
+    const ownerRequestId = ++ownerRequestRef.current;
+    const isCurrent = () => (
+      ownerRequest.isCurrent()
+      && ownerRequestRef.current === ownerRequestId
+    );
     let requestId = null;
     try {
       const effCategory = category;
@@ -123,63 +161,84 @@ export default function useGenerationSubmit({
       );
       if (needsSubjectProfile && (!resolvedProductProfile || resolvedProductProfileSource !== productSignature)) {
         setWorkspacePatch?.({ productProfiling: true, productProfile: null, productProfileSource: "" }, creationMode);
-        const profileRequestId = generateReverseClientRequestId(
-          pendingProfileReverseRequestRef,
-          `${creationMode}-profile`,
-          JSON.stringify({
-            url: productAsset.url,
-            sourceType: "image",
-            target: "product_profile",
-            subjectMode,
-          }),
+        const requestIdentity = buildSubjectProfileRequestIdentity({
+          mode: creationMode,
+          subjectMode,
+          assetUrl: productAsset.url,
+          assetSignature: productSignature,
+        });
+        const cachedProfile = readCachedSubjectProfileResult(
+          profileResultCacheRef,
+          requestIdentity,
         );
-        try {
-          const profile = await api.reverse(
-            productAsset.url,
-            "product_profile",
-            null,
-            "image",
-            null,
-            profileRequestId,
-          );
-          clearPendingReverseRequest(pendingProfileReverseRequestRef, profileRequestId);
-          if (!isProductAssetStillCurrent()) {
-            setWorkspacePatch?.({ productProfiling: false }, creationMode);
-            setMsg("主体图片已变更，请重新点击生成。");
-            clearPendingGenerateRequest(pendingGenerateRequestRef, requestId);
-            return;
-          }
-          resolvedProductProfile = {
-            structured: profile?.structured || {},
-            final_text: profile?.final_text || "",
-          };
+        if (cachedProfile) {
+          resolvedProductProfile = cachedProfile;
           resolvedProductProfileSource = productSignature;
           setWorkspacePatch?.({
             productProfile: resolvedProductProfile,
             productProfileSource: resolvedProductProfileSource,
             productProfiling: false,
           }, creationMode);
-          refreshMe();
-        } catch (e) {
-          if (!isRequestTimeoutError(e)) {
+        } else {
+          const profileRequestId = generateReverseClientRequestId(
+            pendingProfileReverseRequestRef,
+            requestIdentity.scope,
+            requestIdentity.signature,
+          );
+          try {
+            const profile = await api.reverse(
+              productAsset.url,
+              "product_profile",
+              null,
+              "image",
+              null,
+              profileRequestId,
+            );
+            if (!isCurrent()) return;
+            if (!isProductAssetStillCurrent()) {
+              clearPendingReverseRequest(pendingProfileReverseRequestRef, profileRequestId);
+              setWorkspacePatch?.({ productProfiling: false }, creationMode);
+              setMsg("主体图片已变更，请重新点击生成。");
+              clearPendingGenerateRequest(pendingGenerateRequestRef, requestId);
+              return;
+            }
             clearPendingReverseRequest(pendingProfileReverseRequestRef, profileRequestId);
-          }
-          if (!isProductAssetStillCurrent()) {
-            setWorkspacePatch?.({ productProfiling: false }, creationMode);
-            setMsg("主体图片已变更，请重新点击生成。");
+            resolvedProductProfile = normalizeSubjectProfileResult(profile);
+            cacheSubjectProfileResult(
+              profileResultCacheRef,
+              requestIdentity,
+              profileRequestId,
+              resolvedProductProfile,
+            );
+            resolvedProductProfileSource = productSignature;
+            setWorkspacePatch?.({
+              productProfile: resolvedProductProfile,
+              productProfileSource: resolvedProductProfileSource,
+              productProfiling: false,
+            }, creationMode);
+            refreshMe();
+          } catch (e) {
+            if (!isCurrent()) return;
+            if (!isRequestTimeoutError(e)) {
+              clearPendingReverseRequest(pendingProfileReverseRequestRef, profileRequestId);
+            }
+            if (!isProductAssetStillCurrent()) {
+              setWorkspacePatch?.({ productProfiling: false }, creationMode);
+              setMsg("主体图片已变更，请重新点击生成。");
+              clearPendingGenerateRequest(pendingGenerateRequestRef, requestId);
+              return;
+            }
+            resolvedProductProfile = null;
+            resolvedProductProfileSource = "";
+            setWorkspacePatch?.({
+              productProfile: null,
+              productProfileSource: "",
+              productProfiling: false,
+            }, creationMode);
+            setMsg(`主体档案识别失败，请重新点击生成或更换更清晰的主体图片后再试：${e.message}`);
             clearPendingGenerateRequest(pendingGenerateRequestRef, requestId);
             return;
           }
-          resolvedProductProfile = null;
-          resolvedProductProfileSource = "";
-          setWorkspacePatch?.({
-            productProfile: null,
-            productProfileSource: "",
-            productProfiling: false,
-          }, creationMode);
-          setMsg(`主体档案识别失败，请重新点击生成或更换更清晰的主体图片后再试：${e.message}`);
-          clearPendingGenerateRequest(pendingGenerateRequestRef, requestId);
-          return;
         }
       }
       if (isEditMode && productAsset?.url && !isProductAssetStillCurrent()) {
@@ -212,9 +271,11 @@ export default function useGenerationSubmit({
         n,
         seed,
         editMaskMode,
+        productPixelLockMode,
         vDuration,
         vResolution,
         videoProductLockMode,
+        videoProductTemplate,
       });
       payload.client_request_id = generateClientRequestId(
         pendingGenerateRequestRef,
@@ -224,6 +285,7 @@ export default function useGenerationSubmit({
       requestId = payload.client_request_id;
 
       const nextTask = await api.generate(payload);
+      if (!isCurrent()) return;
       clearPendingGenerateRequest(pendingGenerateRequestRef, requestId);
       const previousTask = task;
       if (
@@ -245,6 +307,7 @@ export default function useGenerationSubmit({
       refreshMe();
       startTracking(nextTask.id);
     } catch (e) {
+      if (!isCurrent()) return;
       if (isRequestTimeoutError(e)) {
         setMsg(`${e.message}。任务可能已提交，重新点击会复用同一次请求，避免重复扣费。`);
       } else {
@@ -252,12 +315,23 @@ export default function useGenerationSubmit({
         setMsg(classifyGenerationError(e, { category }).message);
       }
     } finally {
-      setSubmitting(false);
+      if (isCurrent()) setSubmitting(false);
     }
+  }
+
+  function resetOwnerGenerationSubmit() {
+    ownerRequestContextRef.current.invalidate();
+    ownerRequestRef.current += 1;
+    pendingGenerateRequestRef.current = null;
+    pendingProfileReverseRequestRef.current = null;
+    profileResultCacheRef.current = null;
+    productAssetSignatureByModeRef.current = {};
+    setSubmitting(false);
   }
 
   return {
     submitting,
     submit,
+    resetOwnerGenerationSubmit,
   };
 }

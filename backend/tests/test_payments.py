@@ -1,12 +1,13 @@
 from datetime import datetime, timedelta, timezone
 
 import pytest
+from sqlalchemy import event
 
 from app.config import settings
-from app.db import SessionLocal
-from app.models import PaymentOrder, PaymentProviderConfig
+from app.db import SessionLocal, engine
+from app.models import AppSetting, CreditTransaction, PaymentOrder, PaymentProviderConfig, User
 from app.services import payment_config, payments
-from app.services.config_store import set_setting
+from app.services.config_store import get_setting, set_setting
 from app.services.user_events import read_user_events
 
 
@@ -81,6 +82,11 @@ def test_payment_packages_and_create_order(client, make_user, auth):
     assert order["credits"] == 100
     assert order["amount_cents"] == 990
     assert order["code_url"]
+    created_at = datetime.fromisoformat(order["created_at"])
+    expires_at = datetime.fromisoformat(order["expires_at"])
+    assert created_at.utcoffset() == timedelta(0)
+    assert expires_at.utcoffset() == timedelta(0)
+    assert expires_at > created_at
 
     got = client.get(f"/api/payments/orders/{order['order_no']}", headers=h)
     assert got.status_code == 200
@@ -1260,6 +1266,119 @@ def test_payment_reconcile_closes_provider_closed_pending_order(client, make_use
     assert client.get("/api/me", headers=h).json()["balance_credits"] == 100
 
 
+def test_payment_reconcile_does_not_close_order_paid_by_concurrent_callback(
+    client, make_user, auth, monkeypatch
+):
+    _set_payment_enabled(True)
+    _clear_unpaid_payment_orders()
+    make_user("13900000290", balance=100)
+    h = auth("13900000290")
+    order = client.post("/api/payments/orders", json={
+        "provider": "alipay",
+        "package_id": "starter",
+    }, headers=h).json()
+
+    def _closed_after_callback(_db, row):
+        callback_db = SessionLocal()
+        try:
+            payments.mark_paid(
+                callback_db,
+                row.order_no,
+                provider="alipay",
+                provider_trade_no="ali_callback_won_before_close",
+                raw={"verified_provider_notify": True},
+                allow_expired=True,
+            )
+        finally:
+            callback_db.close()
+        return {"status": payments.CLOSED, "raw": {"trade_status": "TRADE_CLOSED"}}
+
+    monkeypatch.setattr("app.services.payments._query_provider_order", _closed_after_callback)
+    db = SessionLocal()
+    try:
+        stats = payments.reconcile_pending_orders(db)
+    finally:
+        db.close()
+
+    verify_db = SessionLocal()
+    try:
+        persisted = verify_db.query(PaymentOrder).filter(
+            PaymentOrder.order_no == order["order_no"]
+        ).one()
+        user = verify_db.query(User).filter(User.phone == "13900000290").one()
+        grants = verify_db.query(CreditTransaction).filter(
+            CreditTransaction.biz_type == "payment",
+            CreditTransaction.biz_ref == persisted.id,
+            CreditTransaction.type == "grant",
+        ).count()
+        assert persisted.status == payments.PAID
+        assert persisted.provider_trade_no == "ali_callback_won_before_close"
+        assert user.balance_credits == 200
+        assert grants == 1
+    finally:
+        verify_db.close()
+    assert stats["closed"] == 0
+    assert stats["errors"] == 0
+
+
+def test_payment_reconcile_paid_result_reloads_concurrent_callback_state(
+    client, make_user, auth, monkeypatch
+):
+    _set_payment_enabled(True)
+    _clear_unpaid_payment_orders()
+    make_user("13900000291", balance=100)
+    h = auth("13900000291")
+    order = client.post("/api/payments/orders", json={
+        "provider": "alipay",
+        "package_id": "starter",
+    }, headers=h).json()
+
+    def _paid_after_callback(_db, row):
+        callback_db = SessionLocal()
+        try:
+            payments.mark_paid(
+                callback_db,
+                row.order_no,
+                provider="alipay",
+                provider_trade_no="ali_callback_won_before_paid_query",
+                raw={"verified_provider_notify": True},
+                allow_expired=True,
+            )
+        finally:
+            callback_db.close()
+        return {
+            "status": payments.PAID,
+            "provider_trade_no": "ali_callback_won_before_paid_query",
+            "raw": {"trade_status": "TRADE_SUCCESS"},
+        }
+
+    monkeypatch.setattr("app.services.payments._query_provider_order", _paid_after_callback)
+    db = SessionLocal()
+    try:
+        stats = payments.reconcile_pending_orders(db)
+    finally:
+        db.close()
+
+    verify_db = SessionLocal()
+    try:
+        persisted = verify_db.query(PaymentOrder).filter(
+            PaymentOrder.order_no == order["order_no"]
+        ).one()
+        user = verify_db.query(User).filter(User.phone == "13900000291").one()
+        grants = verify_db.query(CreditTransaction).filter(
+            CreditTransaction.biz_type == "payment",
+            CreditTransaction.biz_ref == persisted.id,
+            CreditTransaction.type == "grant",
+        ).count()
+        assert persisted.status == payments.PAID
+        assert user.balance_credits == 200
+        assert grants == 1
+    finally:
+        verify_db.close()
+    assert stats["paid"] == 0
+    assert stats["errors"] == 0
+
+
 def test_payment_reconcile_records_errors_without_crashing(client, make_user, auth, monkeypatch):
     _set_payment_enabled(True)
     _clear_unpaid_payment_orders()
@@ -1283,6 +1402,607 @@ def test_payment_reconcile_records_errors_without_crashing(client, make_user, au
         assert row.status == payments.PENDING
     finally:
         db.close()
+
+
+def test_payment_reconcile_rotates_past_oldest_pending_batch(client, make_user, auth, monkeypatch):
+    _set_payment_enabled(True)
+    _clear_unpaid_payment_orders()
+    set_setting_db = SessionLocal()
+    try:
+        set_setting(set_setting_db, "payment_reconcile_cursor", 0)
+    finally:
+        set_setting_db.close()
+
+    order_nos = []
+    for suffix in range(3):
+        phone = f"1390000027{suffix}"
+        make_user(phone, balance=100)
+        headers = auth(phone)
+        order_nos.append(client.post("/api/payments/orders", json={
+            "provider": "alipay",
+            "package_id": "starter",
+        }, headers=headers).json()["order_no"])
+
+    queried = []
+
+    def _pending(_db, row):
+        queried.append(row.order_no)
+        return {"status": payments.PENDING, "raw": {}}
+
+    monkeypatch.setattr(settings, "payment_reconcile_max_orders", 2)
+    monkeypatch.setattr("app.services.payments._query_provider_order", _pending)
+    db = SessionLocal()
+    try:
+        first = payments.reconcile_pending_orders(db)
+        first_batch = list(queried)
+        queried.clear()
+        second = payments.reconcile_pending_orders(db)
+        second_batch = list(queried)
+    finally:
+        db.close()
+
+    assert first["checked"] == 2
+    assert first_batch == order_nos[:2]
+    assert second["checked"] == 2
+    assert second_batch[0] == order_nos[2]
+
+
+def test_payment_reconcile_rechecks_old_ids_while_new_orders_keep_arriving(
+    client, make_user, auth, monkeypatch
+):
+    _set_payment_enabled(True)
+    _clear_unpaid_payment_orders()
+    cursor_db = SessionLocal()
+    try:
+        set_setting(cursor_db, "payment_reconcile_cursor", 0)
+    finally:
+        cursor_db.close()
+
+    next_phone = 280
+
+    def _create_order():
+        nonlocal next_phone
+        phone = f"1390000{next_phone:04d}"
+        next_phone += 1
+        make_user(phone, balance=100)
+        return client.post("/api/payments/orders", json={
+            "provider": "alipay",
+            "package_id": "starter",
+        }, headers=auth(phone)).json()["order_no"]
+
+    oldest = [_create_order(), _create_order()]
+    queried = []
+
+    def _pending(_db, row):
+        queried.append(row.order_no)
+        return {"status": payments.PENDING, "raw": {}}
+
+    monkeypatch.setattr(settings, "payment_reconcile_max_orders", 2)
+    monkeypatch.setattr("app.services.payments._query_provider_order", _pending)
+    db = SessionLocal()
+    try:
+        first = payments.reconcile_pending_orders(db)
+        assert first["checked"] == 2
+        assert queried == oldest
+        queried.clear()
+
+        later_batches = []
+        for _ in range(3):
+            _create_order()
+            _create_order()
+            payments.reconcile_pending_orders(db)
+            later_batches.append(list(queried))
+            queried.clear()
+    finally:
+        db.close()
+
+    assert any(order_no in batch for batch in later_batches for order_no in oldest)
+
+
+def test_payment_reconcile_wrap_keeps_order_ids_unique_within_batch(
+    client, make_user, auth, monkeypatch
+):
+    _set_payment_enabled(True)
+    _clear_unpaid_payment_orders()
+    order_nos = []
+    for suffix in range(2):
+        phone = f"1390000028{suffix}"
+        make_user(phone, balance=100)
+        order_nos.append(client.post("/api/payments/orders", json={
+            "provider": "alipay",
+            "package_id": "starter",
+        }, headers=auth(phone)).json()["order_no"])
+
+    state_db = SessionLocal()
+    try:
+        rows = state_db.query(PaymentOrder).filter(
+            PaymentOrder.order_no.in_(order_nos)
+        ).order_by(PaymentOrder.id.asc()).all()
+        state = state_db.get(AppSetting, payments._RECONCILE_CURSOR_SETTING)
+        if state is None:
+            state = AppSetting(key=payments._RECONCILE_CURSOR_SETTING)
+            state_db.add(state)
+        state.value = {
+            "v": rows[0].id,
+            "high_water": rows[1].id,
+            "owner": "previous-owner",
+        }
+        state_db.commit()
+    finally:
+        state_db.close()
+
+    queried = []
+    monkeypatch.setattr(settings, "payment_reconcile_max_orders", 3)
+    monkeypatch.setattr(
+        "app.services.payments._query_provider_order",
+        lambda _db, row: queried.append(row.order_no) or {
+            "status": payments.PENDING,
+            "raw": {},
+        },
+    )
+    db = SessionLocal()
+    try:
+        stats = payments.reconcile_pending_orders(db)
+    finally:
+        db.close()
+
+    assert stats["checked"] == 2
+    assert queried == [order_nos[1], order_nos[0]]
+    assert len(queried) == len(set(queried))
+
+
+def test_payment_reconcile_does_not_persist_cursor_after_partial_batch_loses_lock(
+    client, make_user, auth, monkeypatch
+):
+    _set_payment_enabled(True)
+    _clear_unpaid_payment_orders()
+    cursor_db = SessionLocal()
+    try:
+        set_setting(cursor_db, "payment_reconcile_cursor", 0)
+    finally:
+        cursor_db.close()
+
+    order_nos = []
+    for suffix in range(2):
+        phone = f"1390000027{suffix + 4}"
+        make_user(phone, balance=100)
+        headers = auth(phone)
+        order_nos.append(client.post("/api/payments/orders", json={
+            "provider": "alipay",
+            "package_id": "starter",
+        }, headers=headers).json()["order_no"])
+
+    queried = []
+    successor_token = "payment-reconcile-successor-partial"
+
+    def _pending_after_takeover(_db, row):
+        queried.append(row.order_no)
+        payments.locks.redis_client.set(
+            payments._RECONCILE_LOCK_KEY,
+            successor_token,
+            ex=600,
+        )
+        return {"status": payments.PENDING, "raw": {}}
+
+    monkeypatch.setattr(settings, "payment_reconcile_max_orders", 2)
+    monkeypatch.setattr("app.services.payments._query_provider_order", _pending_after_takeover)
+    db = SessionLocal()
+    try:
+        stats = payments.reconcile_pending_orders(db)
+    finally:
+        db.close()
+
+    assert stats["checked"] == 1
+    assert stats["errors"] == 1
+    assert queried == order_nos[:1]
+    cursor_db = SessionLocal()
+    try:
+        assert get_setting(cursor_db, "payment_reconcile_cursor", None) == 0
+    finally:
+        cursor_db.close()
+    assert payments.locks.redis_client.get(payments._RECONCILE_LOCK_KEY) == successor_token
+
+
+def test_payment_reconcile_does_not_persist_cursor_when_last_order_loses_lock(
+    client, make_user, auth, monkeypatch
+):
+    _set_payment_enabled(True)
+    _clear_unpaid_payment_orders()
+    cursor_db = SessionLocal()
+    try:
+        set_setting(cursor_db, "payment_reconcile_cursor", 0)
+    finally:
+        cursor_db.close()
+
+    make_user("13900000276", balance=100)
+    headers = auth("13900000276")
+    order_no = client.post("/api/payments/orders", json={
+        "provider": "alipay",
+        "package_id": "starter",
+    }, headers=headers).json()["order_no"]
+    queried = []
+    successor_token = "payment-reconcile-successor-last"
+
+    def _pending_after_takeover(_db, row):
+        queried.append(row.order_no)
+        payments.locks.redis_client.set(
+            payments._RECONCILE_LOCK_KEY,
+            successor_token,
+            ex=600,
+        )
+        return {"status": payments.PENDING, "raw": {}}
+
+    monkeypatch.setattr(settings, "payment_reconcile_max_orders", 1)
+    monkeypatch.setattr("app.services.payments._query_provider_order", _pending_after_takeover)
+    db = SessionLocal()
+    try:
+        stats = payments.reconcile_pending_orders(db)
+    finally:
+        db.close()
+
+    assert stats["checked"] == 1
+    assert stats["errors"] == 1
+    assert queried == [order_no]
+    cursor_db = SessionLocal()
+    try:
+        assert get_setting(cursor_db, "payment_reconcile_cursor", None) == 0
+    finally:
+        cursor_db.close()
+    assert payments.locks.redis_client.get(payments._RECONCILE_LOCK_KEY) == successor_token
+
+
+def test_payment_reconcile_cursor_fence_rejects_stale_owner_after_final_refresh(
+    client, make_user, auth, monkeypatch
+):
+    _set_payment_enabled(True)
+    _clear_unpaid_payment_orders()
+    cursor_db = SessionLocal()
+    try:
+        set_setting(cursor_db, "payment_reconcile_cursor", 0)
+    finally:
+        cursor_db.close()
+
+    make_user("13900000277", balance=100)
+    headers = auth("13900000277")
+    client.post("/api/payments/orders", json={
+        "provider": "alipay",
+        "package_id": "starter",
+    }, headers=headers)
+
+    real_refresh = payments.locks.refresh
+    refresh_calls = 0
+    successor_token = "payment-reconcile-successor-after-refresh"
+
+    def _refresh_then_successor_takes_over(key, token, ttl):
+        nonlocal refresh_calls
+        refreshed = real_refresh(key, token, ttl)
+        refresh_calls += 1
+        if refresh_calls == 4:
+            payments.locks.redis_client.set(key, successor_token, ex=600)
+            successor_db = SessionLocal()
+            try:
+                state = successor_db.get(AppSetting, payments._RECONCILE_CURSOR_SETTING)
+                state.value = {
+                    "v": 999,
+                    "high_water": 999,
+                    "owner": successor_token,
+                }
+                successor_db.commit()
+            finally:
+                successor_db.close()
+        return refreshed
+
+    monkeypatch.setattr(payments.locks, "refresh", _refresh_then_successor_takes_over)
+    monkeypatch.setattr(
+        "app.services.payments._query_provider_order",
+        lambda _db, _row: {"status": payments.PENDING, "raw": {}},
+    )
+    db = SessionLocal()
+    try:
+        payments.reconcile_pending_orders(db)
+    finally:
+        db.close()
+
+    verify_db = SessionLocal()
+    try:
+        state = verify_db.get(AppSetting, payments._RECONCILE_CURSOR_SETTING)
+        assert state.value == {
+            "v": 999,
+            "high_water": 999,
+            "owner": successor_token,
+        }
+    finally:
+        verify_db.close()
+    assert payments.locks.redis_client.get(payments._RECONCILE_LOCK_KEY) == successor_token
+
+
+def test_payment_reconcile_expired_owner_cannot_claim_successor_db_state(
+    client, monkeypatch
+):
+    _set_payment_enabled(True)
+    expired_token = "payment-reconcile-expired-owner-a"
+    successor_token = "payment-reconcile-successor-owner-b"
+    state_db = SessionLocal()
+    try:
+        state = state_db.get(AppSetting, payments._RECONCILE_CURSOR_SETTING)
+        if state is None:
+            state = AppSetting(key=payments._RECONCILE_CURSOR_SETTING)
+            state_db.add(state)
+        state.value = {
+            "v": 777,
+            "high_water": 999,
+            "owner": successor_token,
+            "version": 41,
+        }
+        state_db.commit()
+    finally:
+        state_db.close()
+    payments.locks.redis_client.set(
+        payments._RECONCILE_LOCK_KEY,
+        successor_token,
+        ex=600,
+    )
+
+    queried = []
+    monkeypatch.setattr(
+        payments.locks,
+        "acquire",
+        lambda *_args, **_kwargs: expired_token,
+    )
+    monkeypatch.setattr(
+        "app.services.payments._query_provider_order",
+        lambda _db, row: queried.append(row.order_no) or {
+            "status": payments.PENDING,
+            "raw": {},
+        },
+    )
+    db = SessionLocal()
+    try:
+        stats = payments.reconcile_pending_orders(db)
+    finally:
+        db.close()
+
+    verify_db = SessionLocal()
+    try:
+        state = verify_db.get(AppSetting, payments._RECONCILE_CURSOR_SETTING)
+        assert state.value == {
+            "v": 777,
+            "high_water": 999,
+            "owner": successor_token,
+            "version": 41,
+        }
+    finally:
+        verify_db.close()
+    assert queried == []
+    assert stats["checked"] == 0
+    assert stats["errors"] == 1
+    assert payments.locks.redis_client.get(payments._RECONCILE_LOCK_KEY) == successor_token
+
+
+def test_payment_reconcile_claim_cas_rejects_successor_update_before_sql_executes(
+    client, make_user, auth, monkeypatch
+):
+    _set_payment_enabled(True)
+    _clear_unpaid_payment_orders()
+    make_user("13900000292", balance=100)
+    order_no = client.post("/api/payments/orders", json={
+        "provider": "alipay",
+        "package_id": "starter",
+    }, headers=auth("13900000292")).json()["order_no"]
+    state_db = SessionLocal()
+    try:
+        order = state_db.query(PaymentOrder).filter(
+            PaymentOrder.order_no == order_no
+        ).one()
+        state = state_db.get(AppSetting, payments._RECONCILE_CURSOR_SETTING)
+        if state is None:
+            state = AppSetting(key=payments._RECONCILE_CURSOR_SETTING)
+            state_db.add(state)
+        state.value = {
+            "v": 0,
+            "high_water": order.id,
+            "owner": "payment-reconcile-owner-before-a",
+        }
+        state_db.commit()
+    finally:
+        state_db.close()
+
+    successor_token = "payment-reconcile-successor-before-cas"
+    successor_state = {
+        "v": 701,
+        "high_water": 909,
+        "owner": successor_token,
+    }
+    injected = False
+
+    def _successor_before_claim_update(_conn, _cursor, statement, _params, _ctx, _many):
+        nonlocal injected
+        normalized = " ".join(str(statement).split())
+        if (
+            injected
+            or not normalized.startswith("UPDATE app_settings")
+            or "app_settings.value =" not in normalized
+        ):
+            return
+        injected = True
+        payments.locks.redis_client.set(
+            payments._RECONCILE_LOCK_KEY,
+            successor_token,
+            ex=600,
+        )
+        successor_db = SessionLocal()
+        try:
+            state = successor_db.get(AppSetting, payments._RECONCILE_CURSOR_SETTING)
+            state.value = successor_state
+            successor_db.commit()
+        finally:
+            successor_db.close()
+
+    queried = []
+    monkeypatch.setattr(
+        "app.services.payments._query_provider_order",
+        lambda _db, row: queried.append(row.order_no) or {
+            "status": payments.PENDING,
+            "raw": {},
+        },
+    )
+    event.listen(engine, "before_cursor_execute", _successor_before_claim_update)
+    db = SessionLocal()
+    try:
+        stats = payments.reconcile_pending_orders(db)
+    finally:
+        db.close()
+        event.remove(engine, "before_cursor_execute", _successor_before_claim_update)
+
+    verify_db = SessionLocal()
+    try:
+        state = verify_db.get(AppSetting, payments._RECONCILE_CURSOR_SETTING)
+        assert state.value == successor_state
+    finally:
+        verify_db.close()
+    assert injected is True
+    assert queried == []
+    assert stats["checked"] == 0
+    assert stats["errors"] == 1
+    assert payments.locks.redis_client.get(payments._RECONCILE_LOCK_KEY) == successor_token
+
+
+def test_payment_reconcile_stops_when_successor_takes_over_after_claim_commit(
+    client, make_user, auth, monkeypatch
+):
+    _set_payment_enabled(True)
+    _clear_unpaid_payment_orders()
+    make_user("13900000293", balance=100)
+    order_no = client.post("/api/payments/orders", json={
+        "provider": "alipay",
+        "package_id": "starter",
+    }, headers=auth("13900000293")).json()["order_no"]
+    state_db = SessionLocal()
+    try:
+        order = state_db.query(PaymentOrder).filter(
+            PaymentOrder.order_no == order_no
+        ).one()
+        state = state_db.get(AppSetting, payments._RECONCILE_CURSOR_SETTING)
+        if state is None:
+            state = AppSetting(key=payments._RECONCILE_CURSOR_SETTING)
+            state_db.add(state)
+        state.value = {
+            "v": 0,
+            "high_water": order.id,
+            "owner": "payment-reconcile-owner-before-claim",
+        }
+        state_db.commit()
+    finally:
+        state_db.close()
+
+    real_refresh = payments.locks.refresh
+    refresh_calls = 0
+    successor_token = "payment-reconcile-successor-after-claim"
+    successor_state = {
+        "v": 811,
+        "high_water": 977,
+        "owner": successor_token,
+    }
+
+    def _successor_after_claim_commit(key, token, ttl):
+        nonlocal refresh_calls
+        refresh_calls += 1
+        if refresh_calls == 2:
+            payments.locks.redis_client.set(key, successor_token, ex=600)
+            successor_db = SessionLocal()
+            try:
+                state = successor_db.get(AppSetting, payments._RECONCILE_CURSOR_SETTING)
+                state.value = successor_state
+                successor_db.commit()
+            finally:
+                successor_db.close()
+        return real_refresh(key, token, ttl)
+
+    queried = []
+    monkeypatch.setattr(payments.locks, "refresh", _successor_after_claim_commit)
+    monkeypatch.setattr(
+        "app.services.payments._query_provider_order",
+        lambda _db, row: queried.append(row.order_no) or {
+            "status": payments.PENDING,
+            "raw": {},
+        },
+    )
+    db = SessionLocal()
+    try:
+        stats = payments.reconcile_pending_orders(db)
+    finally:
+        db.close()
+
+    verify_db = SessionLocal()
+    try:
+        state = verify_db.get(AppSetting, payments._RECONCILE_CURSOR_SETTING)
+        assert state.value == successor_state
+    finally:
+        verify_db.close()
+    assert refresh_calls == 2
+    assert queried == []
+    assert stats["checked"] == 0
+    assert stats["errors"] == 1
+    assert payments.locks.redis_client.get(payments._RECONCILE_LOCK_KEY) == successor_token
+
+
+def test_payment_reconcile_counts_cursor_persist_failure_as_error(
+    client, make_user, auth, monkeypatch
+):
+    _set_payment_enabled(True)
+    _clear_unpaid_payment_orders()
+    make_user("13900000278", balance=100)
+    headers = auth("13900000278")
+    client.post("/api/payments/orders", json={
+        "provider": "alipay",
+        "package_id": "starter",
+    }, headers=headers)
+
+    monkeypatch.setattr(
+        "app.services.payments._query_provider_order",
+        lambda _db, _row: {"status": payments.PENDING, "raw": {}},
+    )
+    monkeypatch.setattr(
+        payments,
+        "_persist_reconcile_state",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("cursor write failed")),
+        raising=False,
+    )
+    db = SessionLocal()
+    try:
+        stats = payments.reconcile_pending_orders(db)
+    finally:
+        db.close()
+
+    assert stats["checked"] == 1
+    assert stats["errors"] == 1
+
+
+def test_payment_reconcile_skips_when_global_lock_is_held(client, make_user, auth, monkeypatch):
+    _set_payment_enabled(True)
+    _clear_unpaid_payment_orders()
+    make_user("13900000273", balance=100)
+    headers = auth("13900000273")
+    client.post("/api/payments/orders", json={
+        "provider": "alipay",
+        "package_id": "starter",
+    }, headers=headers)
+
+    queried = []
+    monkeypatch.setattr(payments.locks, "acquire", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        "app.services.payments._query_provider_order",
+        lambda _db, row: queried.append(row.order_no) or {"status": payments.PENDING, "raw": {}},
+    )
+    db = SessionLocal()
+    try:
+        stats = payments.reconcile_pending_orders(db)
+    finally:
+        db.close()
+
+    assert stats["checked"] == 0
+    assert stats["errors"] == 0
+    assert queried == []
 
 
 def test_admin_payment_provider_rejects_unofficial_gateway_url(client, make_user, auth):

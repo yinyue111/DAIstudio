@@ -51,7 +51,7 @@ export function Models() {
         ...r,
         provider: r.provider || "",
         base_url: r.base_url || "",
-        gateway_format: r.gateway_format || (r.use === "video" ? "ark" : "openai"),
+        gateway_format: r.gateway_format || (r.use === "prompt" ? "anthropic" : r.use === "video" ? "ark" : "openai"),
         api_key: "",
         api_key_clear: false,
         probeModels: [],
@@ -252,6 +252,7 @@ export function Models() {
                   onChange={(e) => set(i, "gateway_format", e.target.value)}>
                   <option value="openai">OpenAI-Compatible</option>
                   <option value="ark">火山方舟 Ark</option>
+                  <option value="anthropic">Anthropic Messages</option>
                 </select>
               </label>
               <label className="grid gap-1 text-xs text-fog md:col-span-2">

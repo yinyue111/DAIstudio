@@ -195,6 +195,11 @@ function EditPromptPanel({
   onPromptDirty,
   onAppendPrompt,
   onTogglePromptLibrary,
+  onOptimizePrompt,
+  canOptimizePrompt,
+  optimizingPrompt,
+  onClearWorkspace,
+  canClearWorkspace,
   onSubmitPreview,
 }) {
   const chips = promptChipsForEditMode({ isImageEditMode, portraitGenerationMode, productGenerationMode });
@@ -237,6 +242,24 @@ function EditPromptPanel({
           className={`chip ${promptLibraryOpen ? "chip-active" : ""}`}
         >
           提示词库
+        </button>
+        <button
+          type="button"
+          onClick={onOptimizePrompt}
+          disabled={!canOptimizePrompt || optimizingPrompt}
+          className="chip disabled:cursor-not-allowed disabled:opacity-45"
+          title="使用独立模型优化当前直接输入的提示词"
+        >
+          {optimizingPrompt ? "优化中…" : "✦ 优化提示词"}
+        </button>
+        <button
+          type="button"
+          onClick={onClearWorkspace}
+          disabled={!canClearWorkspace}
+          className="chip disabled:cursor-not-allowed disabled:opacity-45"
+          title="清空提示词、上传素材和反推结果"
+        >
+          ✕ 清空
         </button>
       </div>
     </div>
@@ -306,6 +329,11 @@ function DefaultPromptPanel({
   onPromptChange,
   onPromptDirty,
   onTogglePromptLibrary,
+  onOptimizePrompt,
+  canOptimizePrompt,
+  optimizingPrompt,
+  onClearWorkspace,
+  canClearWorkspace,
   onSubmitPreview,
 }) {
   return (
@@ -347,19 +375,24 @@ function DefaultPromptPanel({
         >
           提示词库
         </button>
-        {prompt && (
-          <button
-            type="button"
-            onClick={() => {
-              onPromptChange("");
-              onPromptDirty(true);
-            }}
-            className="chip ml-auto"
-            title="清空提示词"
-          >
-            ✕ 清空
-          </button>
-        )}
+        <button
+          type="button"
+          onClick={onOptimizePrompt}
+          disabled={!canOptimizePrompt || optimizingPrompt}
+          className="chip disabled:cursor-not-allowed disabled:opacity-45"
+          title="使用独立模型优化当前直接输入的提示词"
+        >
+          {optimizingPrompt ? "优化中…" : "✦ 优化提示词"}
+        </button>
+        <button
+          type="button"
+          onClick={onClearWorkspace}
+          disabled={!canClearWorkspace}
+          className="chip disabled:cursor-not-allowed disabled:opacity-45"
+          title="清空提示词、上传素材和反推结果"
+        >
+          ✕ 清空
+        </button>
       </div>
     </>
   );
@@ -382,6 +415,11 @@ export default function StudioPromptWorkspace({
   onPromptDirty,
   onAppendPrompt,
   onTogglePromptLibrary,
+  onOptimizePrompt,
+  canOptimizePrompt,
+  optimizingPrompt,
+  onClearWorkspace,
+  canClearWorkspace,
   onSubjectModeChange,
   onRecompose,
   onSubmitPreview,
@@ -395,6 +433,11 @@ export default function StudioPromptWorkspace({
         onPromptChange={onPromptChange}
         onPromptDirty={onPromptDirty}
         onTogglePromptLibrary={onTogglePromptLibrary}
+        onOptimizePrompt={onOptimizePrompt}
+        canOptimizePrompt={canOptimizePrompt}
+        optimizingPrompt={optimizingPrompt}
+        onClearWorkspace={onClearWorkspace}
+        canClearWorkspace={canClearWorkspace}
         onSubmitPreview={onSubmitPreview}
       />
     );
@@ -424,6 +467,11 @@ export default function StudioPromptWorkspace({
         onPromptDirty={onPromptDirty}
         onAppendPrompt={onAppendPrompt}
         onTogglePromptLibrary={onTogglePromptLibrary}
+        onOptimizePrompt={onOptimizePrompt}
+        canOptimizePrompt={canOptimizePrompt}
+        optimizingPrompt={optimizingPrompt}
+        onClearWorkspace={onClearWorkspace}
+        canClearWorkspace={canClearWorkspace}
         onSubmitPreview={onSubmitPreview}
       />
 

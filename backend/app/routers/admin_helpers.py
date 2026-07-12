@@ -4,10 +4,10 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from fastapi import Depends, HTTPException, Request
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -177,8 +177,57 @@ def quota_bulk_grant_fingerprint(body: QuotaBulkGrantIn) -> str:
         }
         for item in body.items
     ]
-    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    encoded = json.dumps(
+        {"kind": "bulk", "version": 1, "items": payload},
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def quota_grant_business_fingerprint(body: QuotaGrantIn, note: str) -> str:
+    encoded = json.dumps(
+        {
+            "kind": "single",
+            "version": 1,
+            "user_id": int(body.user_id),
+            "amount": int(body.amount),
+            "note": note,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def quota_fingerprint_expiry() -> datetime:
+    return datetime.now(timezone.utc) + timedelta(seconds=QUOTA_GRANT_REPLAY_WINDOW_SECONDS)
+
+
+def quota_grant_advisory_lock_key(admin_id: int) -> int:
+    digest = hashlib.blake2b(
+        f"admin-quota:{int(admin_id)}".encode("ascii"),
+        digest_size=8,
+    ).digest()
+    return int.from_bytes(digest, byteorder="big", signed=True)
+
+
+def lock_admin_quota_serialization(db: Session, admin_id: int) -> None:
+    if db.get_bind().dialect.name == "sqlite":
+        result = db.execute(
+            update(User)
+            .where(User.id == admin_id)
+            .values(token_version=User.token_version)
+        )
+        if result.rowcount != 1:
+            raise HTTPException(404, "管理员不存在")
+        return
+    db.execute(
+        text("SELECT pg_advisory_xact_lock(:lock_key)"),
+        {"lock_key": quota_grant_advisory_lock_key(admin_id)},
+    )
 
 
 def reserve_quota_bulk_grant_idempotency(
@@ -189,7 +238,21 @@ def reserve_quota_bulk_grant_idempotency(
 ) -> tuple[str, bool]:
     raw = quota_bulk_grant_idempotency_raw(body)
     marker_key = f"bulk:{raw}"
-    marker_note = f"bulk:{quota_bulk_grant_fingerprint(body)}"
+    fingerprint = quota_bulk_grant_fingerprint(body)
+    marker_note = f"bulk:{fingerprint}"
+    now = datetime.now(timezone.utc)
+    active = db.execute(
+        select(AdminIdempotencyKey).where(
+            AdminIdempotencyKey.admin_id == admin_id,
+            AdminIdempotencyKey.scope == "quota_grant",
+            AdminIdempotencyKey.business_fingerprint == fingerprint,
+            AdminIdempotencyKey.fingerprint_expires_at > now,
+        )
+    ).scalar_one_or_none()
+    if active is not None:
+        if (active.note or "") != marker_note or not active.key.startswith("bulk:"):
+            raise HTTPException(409, "额度发放业务指纹冲突")
+        return active.key.removeprefix("bulk:"), False
     try:
         db.add(
             AdminIdempotencyKey(
@@ -198,6 +261,8 @@ def reserve_quota_bulk_grant_idempotency(
                 key=marker_key,
                 amount=0,
                 note=marker_note,
+                business_fingerprint=fingerprint,
+                fingerprint_expires_at=quota_fingerprint_expiry(),
             )
         )
         db.flush()
@@ -233,6 +298,7 @@ def reserve_quota_grant_idempotency(
     note: str,
 ) -> tuple[str, bool]:
     raw = quota_grant_idempotency_raw(body)
+    fingerprint = quota_grant_business_fingerprint(body, note)
     try:
         db.add(
             AdminIdempotencyKey(
@@ -242,6 +308,8 @@ def reserve_quota_grant_idempotency(
                 target_user_id=body.user_id,
                 amount=body.amount,
                 note=note,
+                business_fingerprint=fingerprint,
+                fingerprint_expires_at=quota_fingerprint_expiry(),
             )
         )
         db.flush()
@@ -272,7 +340,10 @@ def quota_grant_fingerprint(admin_id: int, body: QuotaGrantIn, note: str) -> str
 
 def remember_quota_grant_fingerprint(admin_id: int, body: QuotaGrantIn, note: str, idem_key: str) -> None:
     fingerprint_key = quota_grant_fingerprint(admin_id, body, note)
-    redis_client.setex(fingerprint_key, QUOTA_GRANT_REPLAY_WINDOW_SECONDS, idem_key)
+    try:
+        redis_client.setex(fingerprint_key, QUOTA_GRANT_REPLAY_WINDOW_SECONDS, idem_key)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def replay_quota_grant(
@@ -302,25 +373,31 @@ def replay_quota_grant(
                     raise HTTPException(404, "用户不存在")
                 return user
             raise HTTPException(409, "幂等键已用于不同额度发放请求")
-    fingerprint_key = quota_grant_fingerprint(admin_id, body, note)
-    previous_key = redis_client.get(fingerprint_key)
-    if previous_key and previous_key != raw_key:
-        existing = db.execute(
-            select(AdminIdempotencyKey).where(
-                AdminIdempotencyKey.admin_id == admin_id,
-                AdminIdempotencyKey.scope == "quota_grant",
-                AdminIdempotencyKey.key == str(previous_key),
-                AdminIdempotencyKey.target_user_id == body.user_id,
-                AdminIdempotencyKey.amount == body.amount,
-                AdminIdempotencyKey.note == note,
-            )
-        ).scalar_one_or_none()
-        if existing:
-            user = db.get(User, body.user_id)
-            if not user:
-                raise HTTPException(404, "用户不存在")
-            return user
+    fingerprint = quota_grant_business_fingerprint(body, note)
+    existing = db.execute(
+        select(AdminIdempotencyKey).where(
+            AdminIdempotencyKey.admin_id == admin_id,
+            AdminIdempotencyKey.scope == "quota_grant",
+            AdminIdempotencyKey.business_fingerprint == fingerprint,
+            AdminIdempotencyKey.fingerprint_expires_at > datetime.now(timezone.utc),
+        )
+    ).scalar_one_or_none()
+    if existing:
+        if (
+            int(existing.target_user_id or 0) != int(body.user_id)
+            or int(existing.amount or 0) != int(body.amount)
+            or (existing.note or "") != note
+        ):
+            raise HTTPException(409, "额度发放业务指纹冲突")
+        user = db.get(User, body.user_id)
+        if not user:
+            raise HTTPException(404, "用户不存在")
+        return user
     return None
+
+
+def refresh_quota_fingerprint_expiry(row: AdminIdempotencyKey) -> None:
+    row.fingerprint_expires_at = quota_fingerprint_expiry()
 
 
 def setting_int(db: Session, key: str, default: int) -> int:

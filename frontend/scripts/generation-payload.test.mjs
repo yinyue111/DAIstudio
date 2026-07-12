@@ -5,6 +5,8 @@ import { fileURLToPath } from "node:url";
 
 import { buildGenerationPayload } from "../app/studio/generationPayload.ts";
 import { MAX_VIDEO_DURATION_SECONDS, VIDEO_DURATION_PRESETS } from "../app/studio/constants.ts";
+import { buildStudioDerivedViewState } from "../app/studio/viewModel.ts";
+import { composePromptFromStructured } from "../app/studio/helpers.ts";
 import {
   PENDING_GENERATE_STORAGE_KEY,
   PENDING_REVERSE_STORAGE_KEY,
@@ -43,6 +45,23 @@ assert.deepEqual(
   VIDEO_DURATION_PRESETS.map((item) => item.seconds),
   [5, 8, 10, 15],
   "video duration presets should stop at the 15s generation limit",
+);
+
+const canonicalReversePrompt = "参考图复刻：成年人物后仰斜坐，腰腿高度低机位向上约15度，35-45mm近距离透视；保持服装覆盖下较饱满胸廓、自然腰线、较宽胯部与近镜大腿，左前上方大面积柔光、冷紫轮廓光、抬升黑位和宽范围高光扩散。";
+assert.equal(
+  composePromptFromStructured(
+    {
+      "图像类型": "人物图",
+      "主体": "成年女性模特坐姿",
+      "人物比例": "纤细修长的7.5头身",
+      "构图": "竖版9:16，主体占画幅82%",
+      "光线": "左前上方大面积柔光",
+    },
+    canonicalReversePrompt,
+    { preferFallback: true },
+  ),
+  canonicalReversePrompt,
+  "reverse parsing should preserve the API final_text instead of rebuilding every structured field",
 );
 
 const productAsset = {
@@ -107,12 +126,14 @@ assert.equal(productEdit.payload.source_asset_url, productAsset.url);
 assert.equal(productEdit.payload.params.subject_mode, "product");
 assert.equal(productEdit.payload.params.style_reference_image, styleAsset.url);
 assert.equal(productEdit.payload.params.edit_mask_mode, "protect_subject");
+assert.equal(productEdit.payload.params.product_pixel_lock, "auto");
 assert.equal(productEdit.payload.params.n, 4);
 assert.match(productEdit.payload.prompt["产品身份档案"], /DAMAH 黑魔法全棉棉柔巾/);
 assert.match(productEdit.payload.prompt.final_text, /DAMAH 黑魔法全棉棉柔巾/);
 assert.match(productEdit.payload.prompt.final_text, /200抽/);
 assert.match(productEdit.payload.prompt.final_text, /唯一产品身份/);
-assert.match(productEdit.payload.prompt.final_text, /包装上的品牌名/);
+assert.match(productEdit.payload.prompt.final_text, /Logo和可见文字/);
+assert.ok(productEdit.payload.prompt.final_text.length <= 450);
 assert.equal(productEdit.payload.prompt["场景背景"], "高端浴室台面");
 assert.equal(productEdit.payload.prompt["光线"], "柔和自然光");
 assert.equal(productEdit.payload.prompt["主体"], undefined);
@@ -149,12 +170,96 @@ const staleReversePrompt = buildGenerationPayload(staleReversePromptArgs);
 assert.doesNotMatch(staleReversePrompt.payload.prompt.final_text, /旧参考 A/);
 assert.match(staleReversePrompt.payload.prompt.final_text, /生成同风格的新素材/);
 
+const structuredPortraitReference = buildGenerationPayload({
+  ...staleReversePromptArgs,
+  prompt: canonicalReversePrompt,
+  promptSourceSignature: "image|http://localhost:8000/api/uploads/upload/style.jpg|",
+  selected: styleAsset,
+  structured: {
+    "图像类型": "人物图",
+    "主体": "成年人物后仰斜坐",
+    "人物比例": "服装覆盖下胸廓较饱满，腰线自然，近镜大腿受透视放大",
+    "构图": "竖版9:16，主体占画幅82%，前景占25%",
+    "视角镜头": "腰腿高度低机位向上约15度，35-45mm近距离透视",
+    "光线": "左前上方大面积柔光，右后冷紫轮廓光",
+  },
+  structuredSource: "image|http://localhost:8000/api/uploads/upload/style.jpg|",
+  ratio: "9:16",
+});
+
+assert.equal(structuredPortraitReference.payload.prompt.final_text, canonicalReversePrompt);
+assert.equal(structuredPortraitReference.payload.prompt.instruction, canonicalReversePrompt);
+assert.equal(structuredPortraitReference.payload.params.reference_image_url, styleAsset.url);
+assert.equal(structuredPortraitReference.payload.params.subject_mode, undefined);
+
+const portraitReferencePricing = buildStudioDerivedViewState({
+  cfg: {
+    image_size_max_dim: 2048,
+    image_n_max: 8,
+    models: { image: { cost_credits: 15 } },
+    pricing: {
+      image: {
+        unit_costs: { "1k": 15 },
+        edit_unit_costs: { "1k": 20 },
+      },
+    },
+  },
+  creationMode: "image",
+  category: "image",
+  isEditMode: false,
+  isImageEditMode: false,
+  subjectMode: "general",
+  productGenerationMode: false,
+  portraitGenerationMode: false,
+  task: null,
+  submitting: false,
+  selected: styleAsset,
+  productAsset: null,
+  structured: structuredPortraitReference.effectiveStructured,
+  prompt: canonicalReversePrompt,
+  ratio: "9:16",
+  imageQuality: "1k",
+  n: 1,
+  vDuration: 5,
+  vResolution: "720p",
+  videoAnalysisPreset: "standard",
+});
+
+assert.equal(
+  portraitReferencePricing.estCost,
+  20,
+  "a structured portrait reference should display image-edit pricing before submit",
+);
+
 const userEditedPrompt = buildGenerationPayload({
   ...staleReversePromptArgs,
   prompt: "用户手写的新提示词需要保留",
   promptDirty: true,
 });
 assert.match(userEditedPrompt.payload.prompt.final_text, /用户手写的新提示词需要保留/);
+
+const shortEditedPortraitPrompt = buildGenerationPayload({
+  ...staleReversePromptArgs,
+  prompt: "保持低机位后仰坐姿和原图柔雾光影",
+  promptDirty: true,
+  promptSourceSignature: "image|http://localhost:8000/api/uploads/upload/style.jpg|",
+  structured: structuredPortraitReference.effectiveStructured,
+  structuredSource: "image|http://localhost:8000/api/uploads/upload/style.jpg|",
+});
+assert.equal(
+  shortEditedPortraitPrompt.payload.prompt.final_text,
+  "保持低机位后仰坐姿和原图柔雾光影",
+  "a user-edited canonical prompt should not be prefixed with every structured field",
+);
+assert.equal(
+  shortEditedPortraitPrompt.payload.prompt.instruction,
+  "保持低机位后仰坐姿和原图柔雾光影",
+);
+assert.equal(
+  shortEditedPortraitPrompt.payload.prompt.user_instruction,
+  "保持低机位后仰坐姿和原图柔雾光影",
+  "a dirty prompt should explicitly mark the user's canonical override",
+);
 
 const productEditMaskOff = buildGenerationPayload({
   ...productEditArgs,
@@ -166,6 +271,7 @@ const productEditMaskOff = buildGenerationPayload({
 });
 
 assert.equal(productEditMaskOff.payload.params.edit_mask_mode, "off");
+assert.equal(productEditMaskOff.payload.params.product_pixel_lock, "off");
 
 const productEditCenterBox = buildGenerationPayload({
   ...productEditArgs,
@@ -174,9 +280,11 @@ const productEditCenterBox = buildGenerationPayload({
   imageQuality: "1k",
   n: 1,
   editMaskMode: "center_box",
+  productPixelLockMode: "strict",
 });
 
 assert.equal(productEditCenterBox.payload.params.edit_mask_mode, "center_box");
+assert.equal(productEditCenterBox.payload.params.product_pixel_lock, "strict");
 
 const variationSource = {
   id: 991,
@@ -236,12 +344,45 @@ const portraitEdit = buildGenerationPayload({
 
 assert.equal(portraitEdit.payload.params.subject_mode, "portrait");
 assert.equal(portraitEdit.payload.params.character_reference_image, productAsset.url);
-assert.match(portraitEdit.payload.prompt.final_text, /人像照片作为唯一人物身份/);
+assert.match(portraitEdit.payload.prompt.final_text, /上传人像是唯一人物身份/);
+assert.ok(portraitEdit.payload.prompt.final_text.length <= 450);
 assert.match(portraitEdit.payload.prompt.final_text, /专业商业人像/);
 assert.doesNotMatch(portraitEdit.payload.prompt.final_text, /严格按照用户提示词执行局部或整体编辑/);
 assert.match(portraitEdit.payload.params.negative_prompt, /身份不一致/);
 assert.match(portraitEdit.payload.params.negative_prompt, /幼态成人化/);
 assert.match(portraitEdit.payload.params.negative_prompt, /低机位身体凝视/);
+
+const dirtyPortraitCanonical = "保持低机位后仰坐姿，使用硬质影棚主光、高锐度 HDR，明确无柔雾、无光晕。";
+const dirtyPortraitEdit = buildGenerationPayload({
+  stage: "preview",
+  cfg: { image_size_max_dim: 2048, image_n_max: 8 },
+  category: "image",
+  creationMode: "image_edit",
+  isEditMode: true,
+  isImageEditMode: true,
+  subjectMode: "portrait",
+  prompt: dirtyPortraitCanonical,
+  promptDirty: true,
+  selected: styleAsset,
+  productAsset,
+  structured: {
+    "图像类型": "人物图",
+    "光线": "旧解析：左上大面积柔光、非 HDR",
+    "后期质感": "旧解析：低对比柔雾与宽泛光晕",
+  },
+  structuredSource: "image|http://localhost:8000/api/uploads/upload/style.jpg|",
+  ratio: "2:3",
+  imageQuality: "1k",
+  n: 1,
+  seed: "",
+  vDuration: 5,
+  vResolution: "720p",
+});
+
+assert.match(dirtyPortraitEdit.payload.prompt.final_text, /硬质影棚主光、高锐度 HDR/);
+assert.doesNotMatch(dirtyPortraitEdit.payload.prompt.final_text, /旧解析/);
+assert.doesNotMatch(dirtyPortraitEdit.payload.prompt.final_text, /左上大面积柔光、非 HDR/);
+assert.equal(dirtyPortraitEdit.payload.prompt.user_instruction, dirtyPortraitCanonical);
 
 const finalVideo = buildGenerationPayload({
   stage: "final",
@@ -328,6 +469,7 @@ const productVideoEditArgs = {
   vDuration: 5,
   vResolution: "720p",
   videoProductLockMode: "free",
+  videoProductTemplate: "soft_splash",
 };
 const productVideoEditFree = buildGenerationPayload(productVideoEditArgs);
 
@@ -336,6 +478,7 @@ assert.equal(productVideoEditFree.payload.stage, "final");
 assert.equal(productVideoEditFree.payload.parent_task_id, null);
 assert.equal(productVideoEditFree.payload.params.subject_mode, "product");
 assert.equal(productVideoEditFree.payload.params.product_lock_mode, "free");
+assert.equal(productVideoEditFree.payload.params.product_video_template, "soft_splash");
 assert.equal(productVideoEditFree.payload.params.reference_image_url, productAsset.url);
 assert.equal(productVideoEditFree.payload.prompt["场景背景"], "暖棕色广告棚景和金色沙粒台面");
 assert.match(productVideoEditFree.payload.prompt["主体动作"], /上传产品作为唯一视频主体/);
@@ -358,16 +501,20 @@ assert.match(productVideoEditFree.payload.params.negative_prompt, /产品正面�
 const productVideoEditLocked = buildGenerationPayload({
   ...productVideoEditArgs,
   videoProductLockMode: "locked",
+  videoProductTemplate: "slow_push",
 });
 
 assert.equal(productVideoEditLocked.payload.params.product_lock_mode, "locked");
+assert.equal(productVideoEditLocked.payload.params.product_video_template, "slow_push");
 
 const productVideoEditDefault = buildGenerationPayload({
   ...productVideoEditArgs,
   videoProductLockMode: undefined,
+  videoProductTemplate: undefined,
 });
 
 assert.equal(productVideoEditDefault.payload.params.product_lock_mode, "locked");
+assert.equal(productVideoEditDefault.payload.params.product_video_template, "stable_showcase");
 
 const fakeStorage = new Map();
 const storage = {
@@ -382,29 +529,378 @@ const firstId = generateClientRequestId(ref, "preview", "sig-a", {
   randomId: () => "fixed",
 });
 assert.equal(firstId, "studio-preview-fixed");
-assert.equal(generateClientRequestId(ref, "preview", "sig-a", { storage, now: () => 1100, randomId: () => "other" }), firstId);
+const secondId = generateClientRequestId(ref, "preview", "sig-b", {
+  storage,
+  now: () => 1100,
+  randomId: () => "second",
+});
+assert.equal(secondId, "studio-preview-second");
+assert.equal(
+  generateClientRequestId(ref, "preview", "sig-a", { storage, now: () => 1200, randomId: () => "retry-a" }),
+  firstId,
+  "retrying generation A after generation B starts should reuse A's original request id",
+);
 ref.current = null;
-assert.equal(generateClientRequestId(ref, "preview", "sig-a", { storage, now: () => 1200, randomId: () => "other" }), firstId);
-clearPendingGenerateRequest(ref, firstId, { storage });
+assert.equal(
+  generateClientRequestId(ref, "preview", "sig-b", { storage, now: () => 1300, randomId: () => "stored-b" }),
+  secondId,
+  "generation B should remain reusable from session storage",
+);
+clearPendingGenerateRequest(ref, firstId, { storage, now: () => 1350 });
+ref.current = null;
+assert.equal(
+  generateClientRequestId(ref, "preview", "sig-b", { storage, now: () => 1400, randomId: () => "after-clear-b" }),
+  secondId,
+  "clearing generation A should preserve generation B",
+);
+const replacementFirstId = generateClientRequestId(
+  ref,
+  "preview",
+  "sig-a",
+  { storage, now: () => 1500, randomId: () => "after-clear-a" },
+);
+assert.equal(
+  replacementFirstId,
+  "studio-preview-after-clear-a",
+  "clearing generation A should remove only A",
+);
+clearPendingGenerateRequest(ref, secondId, { storage, now: () => 1600 });
+clearPendingGenerateRequest(ref, replacementFirstId, { storage, now: () => 1650 });
 assert.equal(fakeStorage.has(PENDING_GENERATE_STORAGE_KEY), false);
 
 const reverseRef = { current: null };
 const reverseId = generateReverseClientRequestId(reverseRef, "image", "asset-a", {
   storage,
-  now: () => 1300,
+  now: () => 2000,
   randomId: () => "rev-fixed",
 });
 assert.equal(reverseId, "studio-reverse-image-rev-fixed");
+const secondReverseId = generateReverseClientRequestId(reverseRef, "image", "asset-b", {
+  storage,
+  now: () => 2100,
+  randomId: () => "rev-second",
+});
+assert.equal(secondReverseId, "studio-reverse-image-rev-second");
 assert.equal(
-  generateReverseClientRequestId(reverseRef, "image", "asset-a", { storage, now: () => 1400, randomId: () => "rev-other" }),
+  generateReverseClientRequestId(reverseRef, "image", "asset-a", { storage, now: () => 2200, randomId: () => "rev-retry-a" }),
   reverseId,
+  "retrying reverse A after reverse B starts should reuse A's original request id",
 );
 reverseRef.current = null;
 assert.equal(
-  generateReverseClientRequestId(reverseRef, "image", "asset-a", { storage, now: () => 1500, randomId: () => "rev-other" }),
-  reverseId,
+  generateReverseClientRequestId(reverseRef, "image", "asset-b", { storage, now: () => 2300, randomId: () => "rev-stored-b" }),
+  secondReverseId,
+  "reverse B should remain reusable from session storage",
 );
-clearPendingReverseRequest(reverseRef, reverseId, { storage });
+clearPendingReverseRequest(reverseRef, reverseId, { storage, now: () => 2350 });
+reverseRef.current = null;
+assert.equal(
+  generateReverseClientRequestId(reverseRef, "image", "asset-b", { storage, now: () => 2400, randomId: () => "rev-after-clear-b" }),
+  secondReverseId,
+  "clearing reverse A should preserve reverse B",
+);
+const replacementReverseId = generateReverseClientRequestId(
+  reverseRef,
+  "image",
+  "asset-a",
+  { storage, now: () => 2500, randomId: () => "rev-after-clear-a" },
+);
+assert.equal(
+  replacementReverseId,
+  "studio-reverse-image-rev-after-clear-a",
+  "clearing reverse A should remove only A",
+);
+clearPendingReverseRequest(reverseRef, secondReverseId, { storage, now: () => 2600 });
+clearPendingReverseRequest(reverseRef, replacementReverseId, { storage, now: () => 2650 });
 assert.equal(fakeStorage.has(PENDING_REVERSE_STORAGE_KEY), false);
+
+const sharedReverseStorageData = new Map();
+const sharedReverseStorage = {
+  getItem: (key) => sharedReverseStorageData.get(key) ?? null,
+  setItem: (key, value) => sharedReverseStorageData.set(key, value),
+  removeItem: (key) => sharedReverseStorageData.delete(key),
+};
+const firstSharedReverseRef = { current: null };
+const staleSharedReverseRef = { current: null };
+const clearedSharedReverseId = generateReverseClientRequestId(
+  firstSharedReverseRef,
+  "image",
+  "shared-clear-a",
+  { storage: sharedReverseStorage, now: () => 2700, randomId: () => "shared-clear-a" },
+);
+generateReverseClientRequestId(
+  staleSharedReverseRef,
+  "image",
+  "shared-keep-b",
+  { storage: sharedReverseStorage, now: () => 2800, randomId: () => "shared-keep-b" },
+);
+clearPendingReverseRequest(firstSharedReverseRef, clearedSharedReverseId, {
+  storage: sharedReverseStorage,
+  now: () => 2900,
+});
+generateReverseClientRequestId(
+  staleSharedReverseRef,
+  "image",
+  "shared-new-c",
+  { storage: sharedReverseStorage, now: () => 3000, randomId: () => "shared-new-c" },
+);
+assert.equal(
+  generateReverseClientRequestId(
+    { current: null },
+    "image",
+    "shared-clear-a",
+    { storage: sharedReverseStorage, now: () => 3100, randomId: () => "shared-clear-a-replacement" },
+  ),
+  "studio-reverse-image-shared-clear-a-replacement",
+  "a stale ref must not write a request id back after another ref clears it from shared storage",
+);
+
+const unassignedClearStorageData = new Map();
+const unassignedClearStorage = {
+  getItem: (key) => unassignedClearStorageData.get(key) ?? null,
+  setItem: (key, value) => unassignedClearStorageData.set(key, value),
+  removeItem: (key) => unassignedClearStorageData.delete(key),
+};
+const unassignedClearRef = { current: null };
+const preservedGenerateId = generateClientRequestId(unassignedClearRef, "preview", "preserve-existing", {
+  storage: unassignedClearStorage,
+  now: () => 3200,
+  randomId: () => "preserve-existing",
+});
+clearPendingGenerateRequest(unassignedClearRef, null, { storage: unassignedClearStorage, now: () => 3300 });
+assert.equal(
+  generateClientRequestId(unassignedClearRef, "preview", "preserve-existing", {
+    storage: unassignedClearStorage,
+    now: () => 3400,
+    randomId: () => "preserve-existing-replacement",
+  }),
+  preservedGenerateId,
+  "clearing an unassigned request id must not erase unrelated pending generation ids",
+);
+
+const staleStorageData = new Map();
+let staleStorageWritesBlocked = false;
+const staleStorage = {
+  getItem: (key) => staleStorageData.get(key) ?? null,
+  setItem: (key, value) => {
+    if (staleStorageWritesBlocked) throw new Error("storage writes blocked");
+    staleStorageData.set(key, value);
+  },
+  removeItem: (key) => {
+    if (staleStorageWritesBlocked) throw new Error("storage removes blocked");
+    staleStorageData.delete(key);
+  },
+};
+const staleStorageRef = { current: null };
+const staleStorageA = generateClientRequestId(staleStorageRef, "preview", "stale-a", {
+  storage: staleStorage,
+  now: () => 3000,
+  randomId: () => "stale-a",
+});
+const staleStorageB = generateClientRequestId(staleStorageRef, "preview", "stale-b", {
+  storage: staleStorage,
+  now: () => 3100,
+  randomId: () => "stale-b",
+});
+staleStorageWritesBlocked = true;
+clearPendingGenerateRequest(staleStorageRef, staleStorageA, { storage: staleStorage, now: () => 3200 });
+const replacementStaleStorageA = generateClientRequestId(staleStorageRef, "preview", "stale-a", {
+  storage: staleStorage,
+  now: () => 3300,
+  randomId: () => "replacement-stale-a",
+});
+assert.equal(
+  replacementStaleStorageA,
+  "studio-preview-replacement-stale-a",
+  "a failed storage write must not let stale storage resurrect a cleared request",
+);
+assert.equal(
+  generateClientRequestId(staleStorageRef, "preview", "stale-b", {
+    storage: staleStorage,
+    now: () => 3400,
+    randomId: () => "replacement-stale-b",
+  }),
+  staleStorageB,
+  "disabling stale storage should preserve other in-memory pending requests",
+);
+staleStorageWritesBlocked = false;
+assert.equal(
+  generateClientRequestId({ current: null }, "preview", "stale-a", {
+    storage: staleStorage,
+    now: () => 3450,
+    randomId: () => "recovered-stale-a",
+  }),
+  replacementStaleStorageA,
+  "a new ref must reuse the in-memory replacement instead of reviving stale storage after a write failure",
+);
+staleStorageWritesBlocked = true;
+clearPendingGenerateRequest(staleStorageRef, staleStorageB, { storage: staleStorage, now: () => 3500 });
+assert.equal(
+  generateClientRequestId(staleStorageRef, "preview", "stale-b", {
+    storage: staleStorage,
+    now: () => 3600,
+    randomId: () => "after-failed-remove",
+  }),
+  "studio-preview-after-failed-remove",
+  "a failed storage remove must keep stale storage disabled for the current ref",
+);
+
+const ttlStorageData = new Map();
+const ttlStorage = {
+  getItem: (key) => ttlStorageData.get(key) ?? null,
+  setItem: (key, value) => ttlStorageData.set(key, value),
+  removeItem: (key) => ttlStorageData.delete(key),
+};
+const ttlRef = { current: null };
+const ttlStart = 10_000;
+const ttlRequestA = generateClientRequestId(ttlRef, "preview", "ttl-a", {
+  storage: ttlStorage,
+  now: () => ttlStart,
+  randomId: () => "ttl-a",
+});
+const ttlRequestB = generateClientRequestId(ttlRef, "preview", "ttl-b", {
+  storage: ttlStorage,
+  now: () => ttlStart + 60 * 60 * 1000,
+  randomId: () => "ttl-b",
+});
+ttlRef.current = null;
+assert.equal(
+  generateClientRequestId(ttlRef, "preview", "ttl-a", {
+    storage: ttlStorage,
+    now: () => ttlStart + 2 * 60 * 60 * 1000 + 1,
+    randomId: () => "ttl-a-expired",
+  }),
+  "studio-preview-ttl-a-expired",
+  "expired pending request ids should not be reused",
+);
+assert.equal(
+  generateClientRequestId(ttlRef, "preview", "ttl-b", {
+    storage: ttlStorage,
+    now: () => ttlStart + 2 * 60 * 60 * 1000 + 2,
+    randomId: () => "ttl-b-replacement",
+  }),
+  ttlRequestB,
+  "unexpired pending request ids should survive cleanup of expired peers",
+);
+assert.notEqual(ttlRequestA, "studio-preview-ttl-a-expired");
+
+const boundedRef = { current: null };
+const boundedIds = [];
+for (let index = 0; index < 17; index += 1) {
+  boundedIds.push(generateClientRequestId(boundedRef, "preview", `bounded-${index}`, {
+    storage: null,
+    now: () => 20_000 + index,
+    randomId: () => `bounded-${index}`,
+  }));
+}
+assert.equal(
+  generateClientRequestId(boundedRef, "preview", "bounded-1", {
+    storage: null,
+    now: () => 21_000,
+    randomId: () => "bounded-1-replacement",
+  }),
+  boundedIds[1],
+  "the newest 16 pending request ids should remain reusable",
+);
+assert.equal(
+  generateClientRequestId(boundedRef, "preview", "bounded-0", {
+    storage: null,
+    now: () => 21_001,
+    randomId: () => "bounded-0-replacement",
+  }),
+  "studio-preview-bounded-0-replacement",
+  "the oldest pending request id should be evicted after the collection reaches 16 entries",
+);
+
+const legacyStorageData = new Map([
+  [PENDING_GENERATE_STORAGE_KEY, JSON.stringify({
+    scope: "preview",
+    signature: "legacy-single",
+    id: "studio-preview-legacy-single",
+    createdAt: 30_000,
+  })],
+]);
+const legacyStorage = {
+  getItem: (key) => legacyStorageData.get(key) ?? null,
+  setItem: (key, value) => legacyStorageData.set(key, value),
+  removeItem: (key) => legacyStorageData.delete(key),
+};
+assert.equal(
+  generateClientRequestId({ current: null }, "preview", "legacy-single", {
+    storage: legacyStorage,
+    now: () => 30_100,
+    randomId: () => "legacy-replacement",
+  }),
+  "studio-preview-legacy-single",
+  "legacy single-record JSON should remain reusable",
+);
+
+const throwingStorage = {
+  getItem: () => { throw new Error("storage reads blocked"); },
+  setItem: () => { throw new Error("storage writes blocked"); },
+  removeItem: () => { throw new Error("storage removes blocked"); },
+};
+const throwingStorageRef = { current: null };
+const throwingStorageA = generateReverseClientRequestId(throwingStorageRef, "image", "throw-a", {
+  storage: throwingStorage,
+  now: () => 40_000,
+  randomId: () => "throw-a",
+});
+const throwingStorageB = generateReverseClientRequestId(throwingStorageRef, "image", "throw-b", {
+  storage: throwingStorage,
+  now: () => 40_100,
+  randomId: () => "throw-b",
+});
+assert.equal(
+  generateReverseClientRequestId(throwingStorageRef, "image", "throw-a", {
+    storage: throwingStorage,
+    now: () => 40_200,
+    randomId: () => "throw-a-retry",
+  }),
+  throwingStorageA,
+  "request ids should remain reusable in memory when storage reads and writes throw",
+);
+clearPendingReverseRequest(throwingStorageRef, throwingStorageA, { storage: throwingStorage, now: () => 40_300 });
+assert.equal(
+  generateReverseClientRequestId(throwingStorageRef, "image", "throw-a", {
+    storage: throwingStorage,
+    now: () => 40_400,
+    randomId: () => "throw-a-replacement",
+  }),
+  "studio-reverse-image-throw-a-replacement",
+);
+assert.equal(
+  generateReverseClientRequestId(throwingStorageRef, "image", "throw-b", {
+    storage: throwingStorage,
+    now: () => 40_500,
+    randomId: () => "throw-b-replacement",
+  }),
+  throwingStorageB,
+);
+clearPendingReverseRequest(throwingStorageRef, throwingStorageB, { storage: throwingStorage, now: () => 40_600 });
+
+const removeFailureStorageData = new Map();
+const removeFailureStorage = {
+  getItem: (key) => removeFailureStorageData.get(key) ?? null,
+  setItem: (key, value) => removeFailureStorageData.set(key, value),
+  removeItem: () => { throw new Error("storage removes blocked"); },
+};
+const removeFailureRef = { current: null };
+const removeFailureId = generateClientRequestId(removeFailureRef, "preview", "remove-failure", {
+  storage: removeFailureStorage,
+  now: () => 50_000,
+  randomId: () => "remove-failure",
+});
+clearPendingGenerateRequest(removeFailureRef, removeFailureId, { storage: removeFailureStorage, now: () => 50_100 });
+assert.equal(
+  generateClientRequestId(removeFailureRef, "preview", "remove-failure", {
+    storage: removeFailureStorage,
+    now: () => 50_200,
+    randomId: () => "after-remove-failure",
+  }),
+  "studio-preview-after-remove-failure",
+  "a failed storage remove must not resurrect the cleared in-memory request",
+);
+assert.notEqual(removeFailureId, "studio-preview-after-remove-failure");
 
 console.log("generation payload tests passed");

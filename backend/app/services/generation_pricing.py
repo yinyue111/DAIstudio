@@ -110,8 +110,7 @@ def image_quality_tier(size: str | None) -> str:
 def is_edit_or_subject_task(params: dict | None, source_type: str | None = None) -> bool:
     del source_type
     params = params or {}
-    subject_mode = str(params.get("subject_mode") or "").strip().lower()
-    if subject_mode in {"product", "portrait"}:
+    if str(params.get("subject_mode") or "").strip().lower() == "product":
         return True
     if params.get("style_reference_image") or params.get("character_reference_image"):
         return True

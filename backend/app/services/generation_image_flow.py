@@ -24,6 +24,7 @@ from .generation_common import (
 )
 from .generation_media import (
     EDIT_MASK_SEND_CONFIDENCE,
+    SubjectProtectionBusy,
     closest_image_size,
     composite_product_subject_pixels,
     final_prompt,
@@ -34,11 +35,14 @@ from .generation_media import (
 from .generation_model_runtime import gen_image_with_model_config, model_from_snapshot
 from .generation_prompts import (
     generation_prompt_for_model,
+    is_portrait_generation_task,
     is_product_generation_task,
+    portrait_image_negative_prompt,
+    portrait_negative_prompt_evidence,
     product_fidelity_prompt,
     product_image_negative_prompt,
 )
-from .generation_state import NEEDS_REVIEW
+from .generation_state import NEEDS_REVIEW, claim_terminal
 from .generation_state import TERMINAL_STATUSES as TERMINAL_STATUSES
 from .generation_video_flow import unlink_keys
 from .progress import set_progress
@@ -48,6 +52,37 @@ log = logging.getLogger("generation")
 
 IMAGE_EDIT_REFERENCE_MAX_SIDE = 1024
 IMAGE_PRODUCT_EDIT_REFERENCE_MAX_SIDE = 1536
+IMAGE_PORTRAIT_EDIT_REFERENCE_MAX_SIDE = 1536
+IMAGE_EDIT_MASK_RETRY_DELAY_SECONDS = 0.12
+
+
+class ProductProtectionUnavailable(RuntimeError):
+    """Product edit protection could not be applied reliably."""
+
+
+def acquire_image_terminal_boundary(db, task_id: int) -> GenTask | None:
+    """Serialize image success with running-task cancellation."""
+    if db.get_bind().dialect.name == "sqlite":
+        claimed = db.execute(
+            update(GenTask)
+            .where(GenTask.id == task_id, GenTask.status == "running")
+            .values(status=GenTask.status)
+        ).rowcount
+        if (claimed or 0) != 1:
+            return None
+        task = db.get(GenTask, task_id, populate_existing=True)
+    else:
+        task = db.execute(
+            select(GenTask)
+            .where(GenTask.id == task_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        ).scalar_one_or_none()
+        if not task or task.status != "running":
+            return None
+    if task:
+        db.refresh(task)
+    return task
 
 
 def image_review_has_local_results(task: GenTask) -> bool:
@@ -127,13 +162,14 @@ def hold_image_success_for_reconciliation(
     *,
     written_keys: list[str] | None = None,
     saved_count: int | None = None,
+    params_update: dict | None = None,
 ) -> None:
     """Hold provider-success image tasks when local accounting failed."""
     db.rollback()
     task = db.get(GenTask, task_id)
     if not task:
         return
-    params = dict(task.params or {})
+    params = {**(task.params or {}), **(params_update or {})}
     if written_keys:
         params["_image_result_keys"] = list(written_keys)
     if saved_count is not None:
@@ -160,13 +196,14 @@ def hold_image_submit_unknown_for_reconciliation(
     written_keys: list[str] | None = None,
     saved_count: int | None = None,
     requested_count: int | None = None,
+    params_update: dict | None = None,
 ) -> None:
     """Hold image batches when at least one upstream submit may still finish."""
     db.rollback()
     task = db.get(GenTask, task_id)
     if not task:
         return
-    params = dict(task.params or {})
+    params = {**(task.params or {}), **(params_update or {})}
     if written_keys:
         params["_image_result_keys"] = list(written_keys)
     if saved_count is not None:
@@ -197,6 +234,11 @@ def hold_image_submit_unknown_for_reconciliation(
 
 
 def public_image_error(exc: Exception) -> str:
+    if isinstance(exc, ProductProtectionUnavailable):
+        return (
+            "产品主体保护未能可靠识别或应用蒙版，已停止本次生成并退回冻结积分。"
+            "请稍后重试，或重新上传主体清晰、背景对比明显的产品图。"
+        )
     message = str(exc)
     lowered = message.lower()
     if "timed out" in lowered or "timeout" in lowered or "超时" in message:
@@ -266,12 +308,16 @@ def run_image_task(task_id: int, *, gen_image_fn=None) -> None:
         n = int((task.params or {}).get("n") or get_setting(db, "image_n", 1))
         params = task.params or {}
         is_product = is_product_generation_task(task)
+        is_portrait = is_portrait_generation_task(task)
         fallback_size = get_setting(db, "image_size", "1024x1024")
         ref_w, ref_h = reference_dimensions(task)
         size = params.get("size") or closest_image_size(ref_w, ref_h, fallback_size)
         prompt = final_prompt(task)
         prompt = generation_prompt_for_model(prompt, task)
         prompt = product_fidelity_prompt(prompt, task)
+        params["_generation_prompt"] = prompt
+        task.params = dict(params)
+        db.commit()
 
         set_progress(task_id, 30, "running")
         raise_if_cancel_requested(db, db.get(GenTask, task_id))
@@ -280,13 +326,24 @@ def run_image_task(task_id: int, *, gen_image_fn=None) -> None:
         reference_max_side = (
             IMAGE_PRODUCT_EDIT_REFERENCE_MAX_SIDE
             if is_product
-            else IMAGE_EDIT_REFERENCE_MAX_SIDE
+            else (
+                IMAGE_PORTRAIT_EDIT_REFERENCE_MAX_SIDE
+                if is_portrait
+                else IMAGE_EDIT_REFERENCE_MAX_SIDE
+            )
         )
-        if (task.prompt or {}).get("instruction") and task.source_type == "image":
+        explicit_reference_url = (
+            params.get("reference_image_url")
+            or params.get("character_reference_image")
+        )
+        should_load_reference = bool(explicit_reference_url) or (
+            bool((task.prompt or {}).get("instruction")) and task.source_type == "image"
+        )
+        if should_load_reference:
             ref = gateway_reference_image(
                 db,
                 task,
-                task.source_asset_url,
+                explicit_reference_url or task.source_asset_url,
                 max_side=reference_max_side,
                 prefer_original_upload=True,
                 quality=92,
@@ -307,12 +364,21 @@ def run_image_task(task_id: int, *, gen_image_fn=None) -> None:
                 if style_ref:
                     edit_refs = [ref, style_ref]
         edit_path = (model.extra or {}).get("edit_path", settings.image_edit_path) or None
+        if ref and not edit_path:
+            raise RuntimeError("参考图生成需要配置图片编辑接口")
         extra_payload = {
             "seed": params.get("seed"),
             "negative_prompt": (
                 product_image_negative_prompt(params.get("negative_prompt") or params.get("negative"))
                 if is_product
-                else (params.get("negative_prompt") or params.get("negative"))
+                else (
+                    portrait_image_negative_prompt(
+                        params.get("negative_prompt") or params.get("negative"),
+                        portrait_negative_prompt_evidence(task),
+                    )
+                    if is_portrait
+                    else (params.get("negative_prompt") or params.get("negative"))
+                )
             ),
             "edit_payload_format": (model.extra or {}).get("edit_payload_format"),
         }
@@ -329,17 +395,33 @@ def run_image_task(task_id: int, *, gen_image_fn=None) -> None:
         )
         if is_product and ref and edit_path and edit_mask_mode != "off":
             mask_source = params.get("mask_image_url") or task.source_asset_url
-            try:
-                mask_result = gateway_image_edit_mask(
-                    db,
-                    task,
-                    mask_source,
-                    max_side=reference_max_side,
-                    edit_mask_mode=edit_mask_mode or "protect_subject",
-                )
-            except Exception as e:  # noqa: BLE001
-                log.warning("image task %s edit mask skipped: %s", task_id, e)
+            mask_failure_source = ""
+            for mask_attempt in range(2):
+                try:
+                    mask_result = gateway_image_edit_mask(
+                        db,
+                        task,
+                        mask_source,
+                        max_side=reference_max_side,
+                        edit_mask_mode=edit_mask_mode or "protect_subject",
+                    )
+                    break
+                except SubjectProtectionBusy as e:
+                    if mask_attempt == 0:
+                        log.info("image task %s edit mask busy; retrying once", task_id)
+                        time.sleep(IMAGE_EDIT_MASK_RETRY_DELAY_SECONDS)
+                        continue
+                    mask_failure_source = "generation_mask_busy"
+                    log.warning("image task %s edit mask skipped after retry: %s", task_id, e)
+                except Exception as e:  # noqa: BLE001
+                    if mask_attempt == 0:
+                        log.info("image task %s edit mask failed; retrying once: %s", task_id, e)
+                        time.sleep(IMAGE_EDIT_MASK_RETRY_DELAY_SECONDS)
+                        continue
+                    mask_failure_source = "generation_mask_error"
+                    log.warning("image task %s edit mask skipped after retry: %s", task_id, e)
                 mask_result = None
+                break
             if mask_result:
                 should_send_mask = bool(mask_result.data_uri) and (
                     (
@@ -360,22 +442,35 @@ def run_image_task(task_id: int, *, gen_image_fn=None) -> None:
                 db.commit()
                 if should_send_mask:
                     extra_payload["mask"] = mask_result.data_uri
+                else:
+                    raise ProductProtectionUnavailable(
+                        "产品主体保护置信度不足，未向图片网关发送蒙版"
+                    )
                 if product_pixel_lock_mode in {"strict", "on", "true", "1"}:
                     product_pixel_lock_label = "strict"
                     product_pixel_lock = product_pixel_lock and should_send_mask
                 else:
-                    product_pixel_lock_label = "auto_subject" if mask_result.mode == "auto_subject" else "auto_alpha"
+                    product_pixel_lock_label = "auto_alpha" if mask_result.mode == "alpha_subject" else "auto_mask_only"
                     product_pixel_lock = (
                         product_pixel_lock
                         and should_send_mask
-                        and (
-                            mask_result.mode == "alpha_subject"
-                            or (
-                                mask_result.mode == "auto_subject"
-                                and mask_result.confidence >= 0.78
-                            )
-                        )
+                        and mask_result.mode == "alpha_subject"
                     )
+            else:
+                task.params = {
+                    **(task.params or {}),
+                    "_edit_mask_mode": "none",
+                    "_edit_mask_confidence": 0.0,
+                    "_edit_mask_bbox": None,
+                    "_edit_mask_source": mask_failure_source or "generation_mask_unavailable",
+                    "_edit_mask_requested_mode": edit_mask_mode or "protect_subject",
+                    "_edit_mask_sent": False,
+                }
+                db.commit()
+                raise ProductProtectionUnavailable(
+                    "产品主体保护蒙版生成失败："
+                    f"{mask_failure_source or 'generation_mask_unavailable'}"
+                )
         elif product_pixel_lock:
             product_pixel_lock = False
         if product_pixel_lock and not mask_result:
@@ -465,7 +560,9 @@ def run_image_task(task_id: int, *, gen_image_fn=None) -> None:
         returned_sizes: list[str] = []
         product_composite_count = 0
         product_composite_meta: dict | None = None
+        pending_assets: list[GenAsset] = []
         for raw in images:
+            item_keys: list[str] = []
             try:
                 if product_pixel_lock and mask_result:
                     try:
@@ -493,14 +590,17 @@ def run_image_task(task_id: int, *, gen_image_fn=None) -> None:
                     max_pixels=int(settings.generated_image_max_pixels),
                 )
                 hd_key = storage.save_bytes(raw, "hd", image_ext(raw))
+                item_keys.append(hd_key)
                 pv_key = storage.save_bytes(preview_png, "preview", "png")
+                item_keys.append(pv_key)
                 model_ref_key = storage.save_bytes_named(
                     model_ref_jpeg,
                     "model_ref",
                     pv_key.split("/", 1)[1].rsplit(".", 1)[0] + ".jpg",
                 )
-                written_keys += [hd_key, pv_key, model_ref_key]
-                db.add(
+                item_keys.append(model_ref_key)
+                written_keys.extend(item_keys)
+                pending_assets.append(
                     GenAsset(
                         task_id=task.id,
                         user_id=task.user_id,
@@ -516,16 +616,18 @@ def run_image_task(task_id: int, *, gen_image_fn=None) -> None:
                 saved_count += 1
                 actual_sizes.append(f"{hd_w}x{hd_h}")
             except Exception as e:  # noqa: BLE001
+                unlink_keys(item_keys)
                 image_errors.append(str(e)[:300])
                 log.warning("image task %s skipped one invalid image: %s", task_id, e)
-        if product_pixel_lock:
-            task.params = {
-                **(task.params or {}),
+        pixel_lock_params_update = (
+            {
                 "_product_pixel_lock": product_pixel_lock_label,
                 "_product_composite_applied_count": product_composite_count,
                 **(product_composite_meta or {}),
             }
-            db.commit()
+            if product_pixel_lock
+            else {}
+        )
         if saved_count <= 0:
             usage.record_call(
                 db,
@@ -603,35 +705,40 @@ def run_image_task(task_id: int, *, gen_image_fn=None) -> None:
                 written_keys=written_keys,
                 saved_count=saved_count,
                 requested_count=n,
+                params_update=pixel_lock_params_update,
             )
             return
         try:
-            raise_if_cancel_requested(db, db.get(GenTask, task_id, populate_existing=True))
-        except TaskCanceled:
-            db.rollback()
-            unlink_keys(written_keys)
-            raise
-        if partial_detail:
-            task.params = {
-                **(task.params or {}),
-                "_partial": True,
-                "_requested_n": n,
-                "_saved_n": saved_count,
-                "_skipped_n": skipped_n,
-                "_partial_errors": partial_errors[:5],
-                "_image_result_keys": list(written_keys),
-                **({"_image_submit_state_unknown": True} if has_unknown_gateway_failure else {}),
-                **({"_unknown_submit_errors": unknown_errors[:5]} if unknown_errors else {}),
-            }
-        elif actual_sizes:
-            task.params = {**(task.params or {}), "_actual_sizes": actual_sizes[:20]}
-        from .generation_state import claim_terminal
+            terminal_task = acquire_image_terminal_boundary(db, task_id)
+            if not terminal_task:
+                db.rollback()
+                unlink_keys(written_keys)
+                return
+            raise_if_cancel_requested(db, terminal_task)
+            final_params = dict(terminal_task.params or {})
+            final_params.update(pixel_lock_params_update)
+            if partial_detail:
+                final_params.update(
+                    {
+                        "_partial": True,
+                        "_requested_n": n,
+                        "_saved_n": saved_count,
+                        "_skipped_n": skipped_n,
+                        "_partial_errors": partial_errors[:5],
+                        "_image_result_keys": list(written_keys),
+                        **({"_image_submit_state_unknown": True} if has_unknown_gateway_failure else {}),
+                        **({"_unknown_submit_errors": unknown_errors[:5]} if unknown_errors else {}),
+                    }
+                )
+            elif actual_sizes:
+                final_params["_actual_sizes"] = actual_sizes[:20]
+            terminal_task.params = final_params
+            db.add_all(pending_assets)
 
-        if not claim_terminal(db, task_id, "succeeded", cost_settled=real_cost):
-            db.rollback()
-            unlink_keys(written_keys)
-            return
-        try:
+            if not claim_terminal(db, task_id, "succeeded", cost_settled=real_cost):
+                db.rollback()
+                unlink_keys(written_keys)
+                return
             credits.settle(
                 db,
                 task.user_id,
@@ -641,13 +748,18 @@ def run_image_task(task_id: int, *, gen_image_fn=None) -> None:
                 commit=False,
             )
             db.commit()
+        except TaskCanceled:
+            db.rollback()
+            unlink_keys(written_keys)
+            raise
         except Exception as e:  # noqa: BLE001
             hold_image_success_for_reconciliation(
                 db,
                 task_id,
-                f"图片本地结算失败:{e}",
+                f"图片本地落账失败:{e}",
                 written_keys=written_keys,
                 saved_count=saved_count,
+                params_update=pixel_lock_params_update,
             )
             raise
         if partial_detail:

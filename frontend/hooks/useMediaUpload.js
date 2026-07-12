@@ -1,8 +1,15 @@
 "use client";
 
-import { useRef } from "react";
+import { useEffect, useRef } from "react";
 import { api } from "../lib/api";
+import { createAbortableRequestRegistry } from "../lib/abortableRequestRegistry";
+import { createStudioOwnerRequestContext } from "../lib/studioSession";
 import { assetSignature, isRequestTimeoutError } from "../app/studio/helpers";
+import {
+  buildSubjectProfileRequestIdentity,
+  cacheSubjectProfileResult,
+  normalizeSubjectProfileResult,
+} from "../lib/studioSubjectProfile";
 import {
   clearPendingReverseRequest,
   generateReverseClientRequestId,
@@ -46,6 +53,9 @@ export default function useMediaUpload({
   bumpReverseRequest,
   isModeVisible,
   selectAssetForMode,
+  getOwnerSession,
+  subjectProfilePendingRequestRef = null,
+  subjectProfileResultCacheRef = null,
 }) {
   const uploadRequestRef = useRef({});
   const productUploadRequestRef = useRef({});
@@ -54,7 +64,23 @@ export default function useMediaUpload({
   const videoUploadInputRef = useRef(null);
   const objectUrlsByModeRef = useRef({});
   const productObjectUrlsRef = useRef({});
-  const pendingProfileReverseRequestRef = useRef(null);
+  const fallbackSubjectProfilePendingRequestRef = useRef(null);
+  const fallbackSubjectProfileResultCacheRef = useRef(null);
+  const getOwnerSessionRef = useRef(getOwnerSession);
+  const ownerRequestContextRef = useRef(null);
+  const activeUploadRequestsRef = useRef(null);
+  const pendingProfileReverseRequestRef = subjectProfilePendingRequestRef || fallbackSubjectProfilePendingRequestRef;
+  const profileResultCacheRef = subjectProfileResultCacheRef || fallbackSubjectProfileResultCacheRef;
+
+  getOwnerSessionRef.current = getOwnerSession;
+  if (!ownerRequestContextRef.current) {
+    ownerRequestContextRef.current = createStudioOwnerRequestContext(
+      () => getOwnerSessionRef.current?.(),
+    );
+  }
+  if (!activeUploadRequestsRef.current) {
+    activeUploadRequestsRef.current = createAbortableRequestRegistry();
+  }
 
   function uploadLimitExceeded(file, kind) {
     const fallback = kind === "video" ? DEFAULT_MAX_UPLOAD_VIDEO_BYTES : DEFAULT_MAX_UPLOAD_IMAGE_BYTES;
@@ -121,19 +147,20 @@ export default function useMediaUpload({
     setRefOpen(true);
   }
 
-  async function prefetchProductProfile(mode, asset, uploadReqId) {
+  async function prefetchProductProfile(mode, asset, uploadReqId, ownerRequest) {
     if (!isEditMode || !asset?.url || !["product", "portrait"].includes(subjectMode)) return;
     const signature = assetSignature(asset);
     setWorkspacePatch({ productProfiling: true, productProfile: null, productProfileSource: "" }, mode);
+    const requestIdentity = buildSubjectProfileRequestIdentity({
+      mode,
+      subjectMode,
+      assetUrl: asset.url,
+      assetSignature: signature,
+    });
     const profileRequestId = generateReverseClientRequestId(
       pendingProfileReverseRequestRef,
-      `${mode}-profile-prefetch`,
-      JSON.stringify({
-        url: asset.url,
-        sourceType: "image",
-        target: "product_profile",
-        subjectMode,
-      }),
+      requestIdentity.scope,
+      requestIdentity.signature,
     );
     try {
       const profile = await api.reverse(
@@ -144,21 +171,33 @@ export default function useMediaUpload({
         null,
         profileRequestId,
       );
+      const resolvedProfile = normalizeSubjectProfileResult(profile);
+      if (
+        !ownerRequest.isCurrent()
+        || !isRequestCurrent(productUploadRequestRef, mode, uploadReqId)
+      ) {
+        return;
+      }
       clearPendingReverseRequest(pendingProfileReverseRequestRef, profileRequestId);
-      if (!isRequestCurrent(productUploadRequestRef, mode, uploadReqId)) return;
+      cacheSubjectProfileResult(
+        profileResultCacheRef,
+        requestIdentity,
+        profileRequestId,
+        resolvedProfile,
+      );
       setWorkspacePatch({
-        productProfile: {
-          structured: profile?.structured || {},
-          final_text: profile?.final_text || "",
-        },
+        productProfile: resolvedProfile,
         productProfileSource: signature,
         productProfiling: false,
       }, mode);
     } catch (e) {
+      if (
+        !ownerRequest.isCurrent()
+        || !isRequestCurrent(productUploadRequestRef, mode, uploadReqId)
+      ) return;
       if (!isRequestTimeoutError(e)) {
         clearPendingReverseRequest(pendingProfileReverseRequestRef, profileRequestId);
       }
-      if (!isRequestCurrent(productUploadRequestRef, mode, uploadReqId)) return;
       setWorkspacePatch({
         productProfile: null,
         productProfileSource: "",
@@ -170,6 +209,7 @@ export default function useMediaUpload({
 
   async function doUploadImage(file) {
     if (!file || uploading) return;
+    const ownerRequest = ownerRequestContextRef.current.capture();
     const mode = creationMode;
     if (!file.type?.startsWith("image/")) {
       setMsg("请选择图片文件");
@@ -185,16 +225,25 @@ export default function useMediaUpload({
     bumpReverseRequest(mode);
     setMsg("");
     setWorkspacePatch({ uploading: true }, mode);
+    const uploadRequest = activeUploadRequestsRef.current.capture();
     try {
-      const uploaded = await api.uploadImage(file);
-      if (!isRefVersionCurrent(mode, refVersion)) return;
+      const uploaded = await api.uploadImage(file, { signal: uploadRequest.signal });
+      if (!ownerRequest.isCurrent() || !isRefVersionCurrent(mode, refVersion)) return;
       const { previewUrl, asset } = buildDisplayAsset(uploaded, file);
       rememberUploadedObjectUrl(mode, previewUrl);
       assignUploadedReferenceAsset(mode, asset);
     } catch (e) {
-      if (isRefVersionCurrent(mode, refVersion) && isModeVisible(mode)) setMsg(e.message);
+      if (
+        ownerRequest.isCurrent()
+        && isRefVersionCurrent(mode, refVersion)
+        && isModeVisible(mode)
+      ) setMsg(e.message);
     } finally {
-      if (isRequestCurrent(uploadRequestRef, mode, reqId)) {
+      uploadRequest.release();
+      if (
+        ownerRequest.isCurrent()
+        && isRequestCurrent(uploadRequestRef, mode, reqId)
+      ) {
         setWorkspacePatch({ uploading: false }, mode);
         resetInput(imageUploadInputRef);
       }
@@ -203,6 +252,7 @@ export default function useMediaUpload({
 
   async function doUploadProductImage(file) {
     if (!file || uploading) return;
+    const ownerRequest = ownerRequestContextRef.current.capture();
     const mode = creationMode;
     if (!file.type?.startsWith("image/")) {
       setMsg("请选择产品图片文件");
@@ -217,9 +267,13 @@ export default function useMediaUpload({
     const productReqId = bumpRequest(productUploadRequestRef, mode);
     setMsg("");
     setWorkspacePatch({ uploading: true }, mode);
+    const uploadRequest = activeUploadRequestsRef.current.capture();
     try {
-      const uploaded = await api.uploadImage(file);
-      if (!isRequestCurrent(productUploadRequestRef, mode, productReqId)) return;
+      const uploaded = await api.uploadImage(file, { signal: uploadRequest.signal });
+      if (
+        !ownerRequest.isCurrent()
+        || !isRequestCurrent(productUploadRequestRef, mode, productReqId)
+      ) return;
       const { previewUrl, asset } = buildDisplayAsset(uploaded, file);
       if (!isRequestCurrent(productUploadRequestRef, mode, productReqId)) {
         URL.revokeObjectURL(previewUrl);
@@ -232,14 +286,21 @@ export default function useMediaUpload({
         productProfile: null,
         productProfileSource: "",
         productProfiling: false,
+        subjectProtection: null,
+        subjectProtectionLoading: true,
+        subjectProtectionSource: "",
         variationSource: null,
       }, mode);
       setRefOpen(true);
-      prefetchProductProfile(mode, asset, productReqId);
+      prefetchProductProfile(mode, asset, productReqId, ownerRequest);
     } catch (e) {
-      if (isModeVisible(mode)) setMsg(e.message);
+      if (ownerRequest.isCurrent() && isModeVisible(mode)) setMsg(e.message);
     } finally {
-      if (isRequestCurrent(uploadRequestRef, mode, reqId)) {
+      uploadRequest.release();
+      if (
+        ownerRequest.isCurrent()
+        && isRequestCurrent(uploadRequestRef, mode, reqId)
+      ) {
         setWorkspacePatch({ uploading: false }, mode);
         resetInput(productUploadInputRef);
       }
@@ -248,6 +309,7 @@ export default function useMediaUpload({
 
   async function doUploadVideo(file) {
     if (!file || uploading) return;
+    const ownerRequest = ownerRequestContextRef.current.capture();
     const mode = creationMode;
     const targetMode = !isEditMode && category !== "video" ? "video" : mode;
     if (!file.type?.startsWith("video/")) {
@@ -265,21 +327,51 @@ export default function useMediaUpload({
     setMsg("");
     if (targetMode !== mode) setCreationMode(targetMode);
     setWorkspacePatch({ uploading: true }, targetMode);
+    const uploadRequest = activeUploadRequestsRef.current.capture();
     try {
-      const uploaded = await api.uploadVideo(file);
-      if (!isRefVersionCurrent(targetMode, refVersion)) return;
+      const uploaded = await api.uploadVideo(file, { signal: uploadRequest.signal });
+      if (
+        !ownerRequest.isCurrent()
+        || !isRefVersionCurrent(targetMode, refVersion)
+      ) return;
       const { previewUrl, asset } = buildDisplayAsset(uploaded, file, { thumb: uploaded.thumb });
       rememberUploadedObjectUrl(targetMode, previewUrl);
       assignUploadedReferenceAsset(targetMode, asset);
     } catch (e) {
-      if (isRefVersionCurrent(targetMode, refVersion) && isModeVisible(targetMode)) setMsg(e.message);
+      if (
+        ownerRequest.isCurrent()
+        && isRefVersionCurrent(targetMode, refVersion)
+        && isModeVisible(targetMode)
+      ) setMsg(e.message);
     } finally {
-      if (isRequestCurrent(uploadRequestRef, targetMode, reqId)) {
+      uploadRequest.release();
+      if (
+        ownerRequest.isCurrent()
+        && isRequestCurrent(uploadRequestRef, targetMode, reqId)
+      ) {
         setWorkspacePatch({ uploading: false }, targetMode);
         resetInput(videoUploadInputRef);
       }
     }
   }
+
+  function resetOwnerMediaUpload() {
+    activeUploadRequestsRef.current.abortAll();
+    ownerRequestContextRef.current.invalidate();
+    uploadRequestRef.current = {};
+    productUploadRequestRef.current = {};
+    pendingProfileReverseRequestRef.current = null;
+    profileResultCacheRef.current = null;
+    revokeUploadedObjectUrls();
+    revokeProductObjectUrls();
+    resetInput(imageUploadInputRef);
+    resetInput(productUploadInputRef);
+    resetInput(videoUploadInputRef);
+  }
+
+  useEffect(() => () => {
+    resetOwnerMediaUpload();
+  }, []);
 
   return {
     imageUploadInputRef,
@@ -290,6 +382,7 @@ export default function useMediaUpload({
     revokeUploadedObjectUrls,
     revokeProductObjectUrl,
     revokeProductObjectUrls,
+    resetOwnerMediaUpload,
     doUploadImage,
     doUploadProductImage,
     doUploadVideo,

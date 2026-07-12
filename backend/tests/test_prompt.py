@@ -1,11 +1,13 @@
+from datetime import datetime, timedelta, timezone
+
 import pytest
 from fastapi import HTTPException
 
 from app.db import SessionLocal
-from app.models import ModelConfig, ReverseOperation, User, UserPrompt
+from app.models import CreditTransaction, ModelConfig, ReverseOperation, User, UserPrompt
 from app.routers import prompt
 from app.schemas import ReverseIn
-from app.services import config_store, gateway, gateway_prompting
+from app.services import config_store, gateway, gateway_prompting, retention
 
 
 class _Model:
@@ -40,6 +42,19 @@ def test_reverse_image_template_captures_commercial_material_dimensions():
     assert "商业人像" in template
     assert "品牌 Lookbook" in template
     assert "不得写三围尺寸" in template
+    assert "解剖比例与镜头透视畸变分开记录" in template
+    assert "不得默认写成纤细修长、7.5 头身或长颈" in template
+    assert "机位高度、主体距离、仰角" in template
+    assert "近镜前景放大" in template
+    assert "人物自身左/右" in template
+    assert "画面左/右" in template
+    assert "不得臆造婚纱蕾丝" in template
+    assert "不得臆造浅色隐形眼镜" in template
+    assert (
+        "姿态重心/整体轮廓/视角镜头 → 妆发五官/服装结构/服装覆盖 "
+        "→ 光线/材质纹理/后期质感"
+    ) in template
+    assert "控制在 180-300 个中文字符" in template
     assert "不要写成普通美图描述" in template
     assert '"身材曲线"' not in template
     assert '"尺码三围"' not in template
@@ -77,8 +92,9 @@ def test_reverse_rejects_video_url_before_gateway(monkeypatch):
     assert "反推只支持图片素材" in exc.value.detail
 
 
-def test_reverse_source_type_video_uses_video_template_without_suffix(monkeypatch):
+def test_reverse_source_type_video_uses_video_template_without_suffix(client, make_user, monkeypatch):
     seen = {}
+    uid = make_user("13800000011", balance=100)
 
     monkeypatch.setattr(prompt, "get_model_config", lambda db, use: _Model())
     monkeypatch.setattr(prompt, "get_setting", lambda db, key, default=None: True)
@@ -93,24 +109,29 @@ def test_reverse_source_type_video_uses_video_template_without_suffix(monkeypatc
 
     monkeypatch.setattr(gateway, "reverse_prompt", fake_reverse)
 
-    out = prompt.reverse(
-        ReverseIn(
-            asset_url="https://cdn.example.com/video-stream?id=1",
-            target="video",
-            source_type="video",
-            fallback_image="https://cdn.example.com/cover.png",
-        ),
-        db=object(),
-        user=User(id=2, phone="13800000001", status="active", balance_credits=100),
-    )
+    db = SessionLocal()
+    try:
+        out = prompt.reverse(
+            ReverseIn(
+                asset_url="https://cdn.example.com/video-stream?id=1",
+                target="video",
+                source_type="video",
+                fallback_image="https://cdn.example.com/cover.png",
+            ),
+            db=db,
+            user=db.get(User, uid),
+        )
+    finally:
+        db.close()
 
     assert out.final_text == "x"
     assert seen["target"] == "video"
     assert seen["refs"] == ["data:image/png;base64,abc"]
 
 
-def test_reverse_product_profile_uses_single_image_ref(monkeypatch):
+def test_reverse_product_profile_uses_single_image_ref(client, make_user, monkeypatch):
     seen = {}
+    uid = make_user("13800000012", balance=100)
 
     monkeypatch.setattr(prompt, "get_model_config", lambda db, use: _Model())
     monkeypatch.setattr(prompt, "get_setting", lambda db, key, default=None: True)
@@ -129,15 +150,19 @@ def test_reverse_product_profile_uses_single_image_ref(monkeypatch):
 
     monkeypatch.setattr(gateway, "reverse_prompt", fake_reverse)
 
-    out = prompt.reverse(
-        ReverseIn(
-            asset_url="https://cdn.example.com/product.jpg",
-            target="product_profile",
-            source_type="image",
-        ),
-        db=object(),
-        user=User(id=3, phone="13800000002", status="active", balance_credits=100),
-    )
+    db = SessionLocal()
+    try:
+        out = prompt.reverse(
+            ReverseIn(
+                asset_url="https://cdn.example.com/product.jpg",
+                target="product_profile",
+                source_type="image",
+            ),
+            db=db,
+            user=db.get(User, uid),
+        )
+    finally:
+        db.close()
 
     assert out.charged_credits == 2
     assert out.reference_count == 1
@@ -347,6 +372,92 @@ def test_reverse_client_request_id_replays_without_double_charge(client, make_us
         db.close()
 
 
+def test_reverse_without_client_request_id_persists_operation_and_uses_it_for_billing(
+    client,
+    make_user,
+    auth,
+    monkeypatch,
+):
+    uid = make_user("13800000008", balance=100)
+    headers = auth("13800000008")
+    monkeypatch.setattr(prompt, "assert_safe_user_asset_url", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(prompt, "_assert_text_allowed", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        prompt,
+        "_collect_refs",
+        lambda *_args, **_kwargs: ["data:image/jpeg;base64,a"],
+    )
+    monkeypatch.setattr(
+        gateway,
+        "reverse_prompt",
+        lambda *_args, **_kwargs: {
+            "structured": {"主体": "x"},
+            "final_text": "x",
+            "usage": {"total_tokens": 10},
+        },
+    )
+    monkeypatch.setattr(prompt.usage, "record_call", lambda *_args, **_kwargs: None)
+
+    response = client.post(
+        "/api/prompt/reverse",
+        json={"asset_url": "https://cdn.example.com/no-id.jpg", "target": "image"},
+        headers=headers,
+    )
+
+    assert response.status_code == 200, response.text
+    db = SessionLocal()
+    try:
+        operation = db.query(ReverseOperation).filter_by(user_id=uid).one()
+        assert operation.client_request_id is None
+        assert operation.status == "succeeded"
+        assert operation.charged_credits == 2
+        charge = db.query(CreditTransaction).filter_by(
+            user_id=uid,
+            biz_type="reverse",
+            type="consume",
+        ).one()
+        assert charge.biz_ref == operation.id
+        assert db.get(User, uid).balance_credits == 98
+    finally:
+        db.close()
+
+
+def test_reverse_charge_rejects_terminal_operation(client, make_user):
+    uid = make_user("13800000013", balance=100)
+    db = SessionLocal()
+    try:
+        operation = ReverseOperation(
+            user_id=uid,
+            client_request_id=None,
+            request_fingerprint="e" * 64,
+            target="image",
+            asset_url="https://cdn.example.com/terminal.jpg",
+            status="failed",
+        )
+        db.add(operation)
+        db.commit()
+        operation_id = operation.id
+
+        with pytest.raises(prompt.ReverseOperationClosed):
+            prompt._charge_reverse_operation(
+                db,
+                operation_id,
+                2,
+                note="must not charge terminal operation",
+            )
+
+        db.expire_all()
+        assert db.get(ReverseOperation, operation_id).charged_credits == 0
+        assert db.get(User, uid).balance_credits == 100
+        assert db.query(CreditTransaction).filter_by(
+            user_id=uid,
+            biz_type="reverse",
+            biz_ref=operation_id,
+        ).count() == 0
+    finally:
+        db.close()
+
+
 def test_reverse_client_request_id_rejects_different_payload(client, make_user, auth, monkeypatch):
     make_user("13800000006", balance=100)
     headers = auth("13800000006")
@@ -405,6 +516,115 @@ def test_reverse_http_exception_refunds_and_marks_operation_failed(client, make_
         assert db.get(User, uid).balance_credits == 100
         op = db.query(ReverseOperation).filter_by(client_request_id="reverse-retry-003").one()
         assert op.status == "failed"
+        assert op.charged_credits == 0
         assert "provider rejected" in (op.error or "")
+        assert db.query(CreditTransaction).filter_by(
+            user_id=uid,
+            biz_type="reverse",
+            biz_ref=op.id,
+            type="refund",
+        ).count() == 1
+    finally:
+        db.close()
+
+
+def test_reverse_failure_refund_error_rolls_back_operation_state(client, make_user, monkeypatch):
+    uid = make_user("13800000014", balance=100)
+    db = SessionLocal()
+    try:
+        operation = ReverseOperation(
+            user_id=uid,
+            client_request_id=None,
+            request_fingerprint="f" * 64,
+            target="image",
+            asset_url="https://cdn.example.com/refund-error.jpg",
+            status="running",
+            charged_credits=2,
+        )
+        db.add(operation)
+        db.commit()
+        operation_id = operation.id
+        prompt.credits.consume(
+            db,
+            uid,
+            2,
+            biz_type="reverse",
+            biz_ref=operation_id,
+        )
+
+        def fail_refund(*_args, **_kwargs):
+            raise RuntimeError("refund unavailable")
+
+        monkeypatch.setattr(prompt.credits, "refund_consumed", fail_refund)
+
+        assert prompt._fail_reverse_operation(
+            db,
+            operation_id,
+            "gateway failed",
+            refund_note="failed reverse refund",
+        ) is False
+
+        db.expire_all()
+        unchanged = db.get(ReverseOperation, operation_id)
+        assert unchanged.status == "running"
+        assert unchanged.charged_credits == 2
+        assert db.get(User, uid).balance_credits == 98
+        assert db.query(CreditTransaction).filter_by(
+            user_id=uid,
+            biz_type="reverse",
+            biz_ref=operation_id,
+            type="refund",
+        ).count() == 0
+    finally:
+        db.close()
+
+
+def test_reverse_completion_cannot_overwrite_stale_refund(client, make_user, auth, monkeypatch):
+    uid = make_user("13800000009", balance=100)
+    headers = auth("13800000009")
+    monkeypatch.setattr(prompt, "assert_safe_user_asset_url", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(prompt, "_assert_text_allowed", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(prompt, "_collect_refs", lambda *_args, **_kwargs: ["data:image/jpeg;base64,a"])
+    monkeypatch.setattr(prompt.usage, "record_call", lambda *_args, **_kwargs: None)
+
+    def reverse_after_reaper(*_args, **_kwargs):
+        reaper_db = SessionLocal()
+        try:
+            operation = reaper_db.query(ReverseOperation).filter_by(
+                client_request_id="reverse-race-refund"
+            ).one()
+            operation.updated_at = datetime.now(timezone.utc) - timedelta(minutes=30)
+            reaper_db.commit()
+            assert retention.reap_stuck_reverse_operations(reaper_db, max_minutes=15) == 1
+        finally:
+            reaper_db.close()
+        return {
+            "structured": {"主体": "x"},
+            "final_text": "x",
+            "usage": {"total_tokens": 10},
+        }
+
+    monkeypatch.setattr(gateway, "reverse_prompt", reverse_after_reaper)
+
+    response = client.post(
+        "/api/prompt/reverse",
+        json={
+            "client_request_id": "reverse-race-refund",
+            "asset_url": "https://cdn.example.com/race-refund.jpg",
+            "target": "image",
+        },
+        headers=headers,
+    )
+
+    assert response.status_code == 409, response.text
+    db = SessionLocal()
+    try:
+        operation = db.query(ReverseOperation).filter_by(
+            client_request_id="reverse-race-refund"
+        ).one()
+        assert operation.status == "failed"
+        assert operation.charged_credits == 0
+        assert db.get(User, uid).balance_credits == 100
+        assert db.query(UserPrompt).filter_by(user_id=uid, source="reverse").count() == 0
     finally:
         db.close()

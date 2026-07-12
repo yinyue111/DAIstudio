@@ -106,7 +106,7 @@ export default function LoginPage() {
         return;
       }
       setSmsCooldown(Number(r.retry_after || 60));
-      setMsg(r.code ? `验证码已发送，本地测试码: ${r.code}` : "验证码已发送");
+      setMsg("验证码已发送");
     } catch (e) {
       if (e.retryAfter) setSmsCooldown(e.retryAfter);
       setMsg(e.message);
