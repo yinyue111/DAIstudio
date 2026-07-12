@@ -172,9 +172,7 @@ export function buildGenerationPayload({
     : composePromptFromStructured(effectiveStructured);
   const baseFinalText = (
     promptDirty
-      ? (isEditMode
-          ? [structuredText, promptText].filter(Boolean).join("；")
-          : (promptText || structuredText))
+      ? (promptText || structuredText)
       : (isEditMode ? (structuredText || promptText) : (promptText || structuredText))
   ) || "生成同风格的新素材";
   const profiledBaseFinalText = (

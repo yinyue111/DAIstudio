@@ -986,16 +986,34 @@ def test_portrait_generation_prompt_reframes_body_language_safely():
     assert "品牌 Lookbook" in out
     assert "体态线条" in out
     assert "服装结构" in out
-    assert "平视或自然时尚摄影视角" in out
+    assert "低机位商业摄影视角" in out
     assert "服装覆盖自然得体" in out
     assert "性感" not in out
     assert "挑逗" not in out
     assert "胸大臀翘" not in out
     assert "胸部特写" not in out
-    assert "低机位" not in out
+    assert "低机位展示" not in out
     assert "湿身诱惑" not in out
     assert "成人写真" not in out
     assert "三围" not in out
+
+
+def test_portrait_generation_prompt_preserves_safe_low_angle_showcase():
+    canonical = (
+        "成年模特专业商业人像，采用腰至大腿高度的低机位展示服装结构与坐姿重心，"
+        "35mm 近距离透视让前景自然放大、躯干自然缩短；服装完整覆盖，"
+        "保持参考图胸廓、腰线、胯宽和四肢比例，画面自然得体。"
+    )
+
+    out = compact_generation_prompt_text(
+        {"图像类型": "人物图", "final_text": canonical},
+        {"subject_mode": "portrait"},
+        canonical,
+    )
+
+    assert "低机位" in out
+    assert "平视或自然时尚摄影视角" not in out
+    assert "身体局部凝视" in out
 
 
 def test_portrait_generation_prompt_preserves_clothed_body_silhouette_without_measurements():

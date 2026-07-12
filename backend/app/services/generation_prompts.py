@@ -95,7 +95,7 @@ _GENERATION_PROMPT_SENSITIVE_PATTERNS = (
     (re.compile(r"胸部特写|臀部特写|身体局部特写|突出胸部|突出臀部|私密部位"), "避免身体局部凝视"),
     (re.compile(r"高露肤|大面积露肤|裸露|半裸|暴露|低胸|透视装|湿身诱惑|衣服滑落"), "服装覆盖自然得体"),
     (re.compile(r"少女感|萝莉|幼态性感|可爱性感|青春诱惑"), "成年、成熟自然、不幼态"),
-    (re.compile(r"低机位展示"), "平视或自然时尚摄影视角"),
+    (re.compile(r"低机位展示"), "低机位商业摄影视角"),
     (re.compile(r"暧昧灯光|私密暧昧|昏暗暧昧"), "柔和明亮的情绪光线"),
     (re.compile(r"画面百分比坐标|百分比坐标"), "画面位置"),
     (re.compile(r"\s+"), " "),
@@ -337,6 +337,13 @@ def _explicit_canonical_matches(prompt_obj: dict, fallback: str) -> bool:
     )
 
 
+def _effective_canonical_prompt(prompt_obj: dict, fallback: str) -> str:
+    return _meaningful_canonical_prompt(
+        fallback,
+        allow_short=_explicit_canonical_matches(prompt_obj, fallback),
+    )
+
+
 def _has_subject_profile(prompt_obj: dict) -> bool:
     return any(_normalise_prompt_fragment(prompt_obj.get(key)) for key in _SUBJECT_PROFILE_KEYS)
 
@@ -442,10 +449,7 @@ def portrait_negative_prompt_evidence(task: GenTask) -> str:
     """Return only user/reverse evidence that can justify portrait negatives."""
     prompt_obj = task.prompt if isinstance(task.prompt, dict) else {}
     fallback = str(prompt_obj.get("final_text") or prompt_obj.get("instruction") or "")
-    canonical = _meaningful_canonical_prompt(
-        fallback,
-        allow_short=_explicit_canonical_matches(prompt_obj, fallback),
-    )
+    canonical = _effective_canonical_prompt(prompt_obj, fallback)
     if canonical:
         return canonical
     for key in (*_USER_INSTRUCTION_KEYS, "instruction"):
@@ -575,10 +579,7 @@ def compact_generation_prompt_text(
     portrait_reference = portrait_mode and bool(
         (params or {}).get("_has_image_reference") or _params_have_image_reference(params)
     )
-    canonical = _meaningful_canonical_prompt(
-        fallback,
-        allow_short=_explicit_canonical_matches(prompt_obj, fallback),
-    )
+    canonical = _effective_canonical_prompt(prompt_obj, fallback)
     if canonical and not product and not (portrait_mode and _has_subject_profile(prompt_obj)):
         source = canonical
     elif product or portrait_mode:
@@ -671,6 +672,14 @@ def _merge_negative_terms(value: str | None, terms: tuple[str, ...]) -> str:
     return "，".join(parts)
 
 
+def _prompt_requests_trait(prompt_text: str, requested_pattern: str, rejected_pattern: str) -> bool:
+    return bool(re.search(requested_pattern, prompt_text, re.IGNORECASE)) and not re.search(
+        rejected_pattern,
+        prompt_text,
+        re.IGNORECASE,
+    )
+
+
 def product_image_negative_prompt(value: str | None = None) -> str:
     """Merge product-completeness guards into image negative prompts."""
     cleaned = _REFERENCE_PRODUCT_NOUN_RE.sub("上传产品", str(value or ""))
@@ -717,32 +726,28 @@ def portrait_image_negative_prompt(value: str | None = None, prompt: str | None 
         terms.extend(("硬质影棚光", "平坦阴影"))
     if re.search(r"暗部.{0,16}层次|抬升黑位|抬起黑位|暗部不死黑", prompt_text, re.IGNORECASE):
         terms.append("暗部死黑")
-    haze_requested = bool(re.search(r"柔雾|雾化", prompt_text, re.IGNORECASE)) and not re.search(
+    haze_requested = _prompt_requests_trait(
+        prompt_text,
+        r"柔雾|雾化",
         r"(?:无|非|不要|不使用|去除|取消)(?:任何)?(?:柔雾|雾化)|"
         r"(?:避免|不得)(?:出现|使用|加入|添加|产生|保留)(?:柔雾|雾化)|"
         r"no\s+(?:haze|mist)",
-        prompt_text,
-        re.IGNORECASE,
     )
-    soft_focus_requested = bool(
-        re.search(r"柔焦|soft\s*focus", prompt_text, re.IGNORECASE)
-    ) and not re.search(
+    soft_focus_requested = _prompt_requests_trait(
+        prompt_text,
+        r"柔焦|soft\s*focus",
         r"(?:无|非|不要|不使用|去除|取消)(?:任何)?柔焦|"
         r"(?:避免|不得)(?:出现|使用|加入|添加|产生|保留)柔焦|"
         r"no\s+soft\s*focus",
-        prompt_text,
-        re.IGNORECASE,
     )
     if haze_requested or soft_focus_requested:
         terms.append("柔雾丢失")
-    halo_requested = bool(
-        re.search(r"光晕|高光扩散|bloom|halation", prompt_text, re.IGNORECASE)
-    ) and not re.search(
+    halo_requested = _prompt_requests_trait(
+        prompt_text,
+        r"光晕|高光扩散|bloom|halation",
         r"(?:无|非|不要|不使用|去除|取消)(?:任何)?(?:光晕|高光扩散|bloom|halation)|"
         r"(?:避免|不得)(?:出现|使用|加入|添加|产生|保留)(?:光晕|高光扩散|bloom|halation)|"
         r"no\s+(?:bloom|halation)",
-        prompt_text,
-        re.IGNORECASE,
     )
     if halo_requested:
         terms.append("光晕丢失")

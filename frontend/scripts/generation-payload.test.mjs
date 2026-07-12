@@ -350,6 +350,38 @@ assert.match(portraitEdit.payload.params.negative_prompt, /身份不一致/);
 assert.match(portraitEdit.payload.params.negative_prompt, /幼态成人化/);
 assert.match(portraitEdit.payload.params.negative_prompt, /低机位身体凝视/);
 
+const dirtyPortraitCanonical = "保持低机位后仰坐姿，使用硬质影棚主光、高锐度 HDR，明确无柔雾、无光晕。";
+const dirtyPortraitEdit = buildGenerationPayload({
+  stage: "preview",
+  cfg: { image_size_max_dim: 2048, image_n_max: 8 },
+  category: "image",
+  creationMode: "image_edit",
+  isEditMode: true,
+  isImageEditMode: true,
+  subjectMode: "portrait",
+  prompt: dirtyPortraitCanonical,
+  promptDirty: true,
+  selected: styleAsset,
+  productAsset,
+  structured: {
+    "图像类型": "人物图",
+    "光线": "旧解析：左上大面积柔光、非 HDR",
+    "后期质感": "旧解析：低对比柔雾与宽泛光晕",
+  },
+  structuredSource: "image|http://localhost:8000/api/uploads/upload/style.jpg|",
+  ratio: "2:3",
+  imageQuality: "1k",
+  n: 1,
+  seed: "",
+  vDuration: 5,
+  vResolution: "720p",
+});
+
+assert.match(dirtyPortraitEdit.payload.prompt.final_text, /硬质影棚主光、高锐度 HDR/);
+assert.doesNotMatch(dirtyPortraitEdit.payload.prompt.final_text, /旧解析/);
+assert.doesNotMatch(dirtyPortraitEdit.payload.prompt.final_text, /左上大面积柔光、非 HDR/);
+assert.equal(dirtyPortraitEdit.payload.prompt.user_instruction, dirtyPortraitCanonical);
+
 const finalVideo = buildGenerationPayload({
   stage: "final",
   task: {
