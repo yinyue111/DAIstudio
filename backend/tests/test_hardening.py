@@ -1640,15 +1640,8 @@ def test_reverse_portrait_prompt_is_compacted_for_image_gateway(client, make_use
     assert "52%" in sent
     assert "18%" in sent
     negative = seen["extra_payload"]["negative_prompt"]
-    assert "主动瘦身" in negative
-    assert "硬质影棚光" in negative
-    assert "平坦阴影" in negative
-    assert "前景透视丢失" not in negative
-    assert "通用婚纱蕾丝" not in negative
-    assert "柔雾丢失" not in negative
-    assert "光晕丢失" not in negative
-    assert "HDR" not in negative
-    assert "硬锐化" not in negative
+    assert negative is None
+    assert "上传人像照片是唯一人物身份来源" not in sent
     db = SessionLocal()
     try:
         stored = db.get(GenTask, r.json()["id"])

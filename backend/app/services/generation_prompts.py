@@ -188,39 +188,57 @@ def _product_video_template_prompt(template: str | None, *, locked: bool) -> str
     )
 
 
-def is_product_generation_task(task: GenTask) -> bool:
+def _truthy_subject_flag(value) -> bool:
+    return str(value).lower() in {"true", "1", "yes"}
+
+
+def _subject_mode_from_params(params: dict | None) -> str:
+    params = params or {}
+    direct_mode = str(params.get("subject_mode") or "").lower()
+    trace = params.get("_source_trace")
+    trace_mode = str(trace.get("subject_mode") or "").lower() if isinstance(trace, dict) else ""
+    if direct_mode == "product" or trace_mode == "product":
+        return "product"
+    if isinstance(trace, dict) and _truthy_subject_flag(trace.get("product_generation_mode")):
+        return "product"
+    if direct_mode == "portrait" or trace_mode == "portrait":
+        return "portrait"
+    if isinstance(trace, dict) and _truthy_subject_flag(trace.get("portrait_generation_mode")):
+        return "portrait"
+    return ""
+
+
+def _params_have_image_reference(params: dict | None) -> bool:
+    params = params or {}
+    return bool(params.get("reference_image_url") or params.get("character_reference_image"))
+
+
+def _task_has_image_reference(task: GenTask) -> bool:
     params = task.params or {}
-    if str(params.get("subject_mode") or "").lower() == "product":
+    if _params_have_image_reference(params):
         return True
-    trace = (task.params or {}).get("_source_trace")
-    if not isinstance(trace, dict):
-        return False
-    return str(trace.get("product_generation_mode")).lower() in {"true", "1", "yes"}
+    prompt_obj = task.prompt if isinstance(task.prompt, dict) else {}
+    return bool(
+        getattr(task, "source_type", None) == "image"
+        and getattr(task, "source_asset_url", None)
+        and prompt_obj.get("instruction")
+    )
+
+
+def is_product_generation_task(task: GenTask) -> bool:
+    return _task_has_image_reference(task) and _subject_mode_from_params(task.params) == "product"
 
 
 def is_portrait_generation_task(task: GenTask) -> bool:
     if is_product_generation_task(task):
         return False
-    params = task.params or {}
-    if str(params.get("subject_mode") or "").lower() == "portrait":
-        return True
-    trace = params.get("_source_trace")
-    if isinstance(trace, dict) and (
-        str(trace.get("portrait_generation_mode")).lower() in {"true", "1", "yes"}
-        or str(trace.get("subject_mode") or "").lower() == "portrait"
-    ):
-        return True
+    if not _task_has_image_reference(task):
+        return False
     prompt_obj = task.prompt if isinstance(task.prompt, dict) else {}
-    has_reference = bool(
-        params.get("reference_image_url")
-        or params.get("character_reference_image")
-        or (
-            getattr(task, "source_type", None) == "image"
-            and getattr(task, "source_asset_url", None)
-            and prompt_obj.get("instruction")
-        )
+    return (
+        _subject_mode_from_params(task.params) == "portrait"
+        or "人物" in str(prompt_obj.get("图像类型") or "")
     )
-    return has_reference and "人物" in str(prompt_obj.get("图像类型") or "")
 
 
 def product_fidelity_prompt(prompt: str, task: GenTask) -> str:
@@ -282,14 +300,21 @@ def _compact_prompt_field(key: str, value) -> str:
     return text[:limit].rstrip(" ,，;；。")
 
 
-def _meaningful_canonical_prompt(value) -> str:
+def _meaningful_canonical_prompt(value, *, allow_short: bool = False) -> str:
     text = _normalise_prompt_fragment(value)
-    if len(text) < CANONICAL_FINAL_TEXT_MIN_CHARS:
+    if not text:
         return ""
     compact = re.sub(r"[\s,，;；。.!！?？:：]+", "", text).lower()
     if compact in {"参考图复刻", "参考片复刻", "同款复刻", "samestylehighquality"}:
         return ""
+    if len(text) < CANONICAL_FINAL_TEXT_MIN_CHARS and not allow_short:
+        return ""
     return text
+
+
+def _explicit_instruction_matches(prompt_obj: dict, fallback: str) -> bool:
+    instruction = _normalise_prompt_fragment(prompt_obj.get("instruction"))
+    return bool(instruction and instruction == _normalise_prompt_fragment(fallback))
 
 
 def _has_subject_profile(prompt_obj: dict) -> bool:
@@ -375,7 +400,10 @@ def _rewrite_product_style_fragment(key: str, value, *, is_video: bool = False) 
 
 
 def _structured_generation_prompt(prompt_obj: dict, fallback: str) -> str:
-    canonical = _meaningful_canonical_prompt(fallback)
+    canonical = _meaningful_canonical_prompt(
+        fallback,
+        allow_short=_explicit_instruction_matches(prompt_obj, fallback),
+    )
     if canonical:
         return canonical
     parts: list[str] = []
@@ -474,32 +502,23 @@ def _trim_generation_prompt(text: str, *, max_chars: int = GENERATION_PROMPT_MAX
 
 
 def _is_portrait_prompt(prompt_obj: dict, params: dict | None) -> bool:
-    subject_mode = str((params or {}).get("subject_mode") or "").lower()
+    subject_mode = _subject_mode_from_params(params)
     image_type = str(prompt_obj.get("图像类型") or "")
-    source_trace = (params or {}).get("_source_trace")
-    trace_mode = ""
-    if isinstance(source_trace, dict):
-        trace_mode = str(source_trace.get("subject_mode") or "").lower()
-    return subject_mode == "portrait" or trace_mode == "portrait" or "人物" in image_type
+    if subject_mode:
+        return subject_mode == "portrait"
+    return "人物" in image_type
 
 
 def _is_product_prompt(prompt_obj: dict, params: dict | None) -> bool:
-    subject_mode = str((params or {}).get("subject_mode") or "").lower()
+    subject_mode = _subject_mode_from_params(params)
     image_type = str(prompt_obj.get("图像类型") or "")
-    source_trace = (params or {}).get("_source_trace")
-    trace_mode = ""
-    if isinstance(source_trace, dict):
-        trace_mode = str(source_trace.get("subject_mode") or "").lower()
-    return subject_mode == "product" or trace_mode == "product" or "产品" in image_type
+    if subject_mode:
+        return subject_mode == "product"
+    return "产品" in image_type
 
 
 def _has_explicit_subject_mode(params: dict | None, mode: str) -> bool:
-    subject_mode = str((params or {}).get("subject_mode") or "").lower()
-    source_trace = (params or {}).get("_source_trace")
-    trace_mode = ""
-    if isinstance(source_trace, dict):
-        trace_mode = str(source_trace.get("subject_mode") or "").lower()
-    return subject_mode == mode or trace_mode == mode
+    return _subject_mode_from_params(params) == mode
 
 
 def compact_generation_prompt_text(
@@ -519,11 +538,17 @@ def compact_generation_prompt_text(
         key in (params or {})
         for key in ("duration", "target_duration", "resolution", "target_resolution", "product_lock_mode")
     )
-    portrait_transfer = portrait and _has_explicit_subject_mode(params, "portrait")
-    canonical = _meaningful_canonical_prompt(fallback)
-    if canonical and not product and not (portrait_transfer and _has_subject_profile(prompt_obj)):
+    portrait_mode = portrait and _has_explicit_subject_mode(params, "portrait")
+    portrait_reference = portrait_mode and bool(
+        (params or {}).get("_has_image_reference") or _params_have_image_reference(params)
+    )
+    canonical = _meaningful_canonical_prompt(
+        fallback,
+        allow_short=_explicit_instruction_matches(prompt_obj, fallback),
+    )
+    if canonical and not product and not (portrait_mode and _has_subject_profile(prompt_obj)):
         source = canonical
-    elif product or portrait_transfer:
+    elif product or portrait_mode:
         product_lock_mode = str((params or {}).get("product_lock_mode") or "locked").lower()
         product_video_template = str((params or {}).get("product_video_template") or "stable_showcase").lower()
         source = _style_transfer_generation_prompt(
@@ -552,7 +577,7 @@ def compact_generation_prompt_text(
                 "背景道具和商业广告质感；不要生成参考图里的商品、品牌、Logo、包装或文字。"
             )
     elif portrait:
-        if portrait_transfer:
+        if portrait_reference:
             prefix = (
                 "生成版提示词：以上传人像照片作为唯一人物身份，参考图只迁移场景、构图、光影、妆造氛围、"
                 "动作与镜头语言；不得混入参考图人物身份。"
@@ -627,8 +652,34 @@ def portrait_image_negative_prompt(value: str | None = None, prompt: str | None 
         terms.append("直立居中姿态")
     if re.search(r"低机位|仰拍|近距离透视|前景.{0,12}放大|透视.{0,12}缩短", prompt_text, re.IGNORECASE):
         terms.append("前景透视丢失")
-    if re.search(r"非婚纱|不是婚纱|避免.{0,8}婚纱|不得.{0,8}婚纱", prompt_text, re.IGNORECASE):
+    wedding_rejected = re.search(
+        r"非婚纱|不是婚纱|避免.{0,8}婚纱|不得.{0,8}婚纱",
+        prompt_text,
+        re.IGNORECASE,
+    )
+    wedding_requested = re.search(
+        r"白色婚纱|婚纱礼服|新娘|bridal|wedding\s*dress",
+        prompt_text,
+        re.IGNORECASE,
+    )
+    if wedding_rejected or not wedding_requested:
         terms.append("通用婚纱蕾丝")
+    light_contacts_rejected = re.search(
+        r"无美瞳|非美瞳|不得.{0,12}(?:浅色|美瞳|隐形眼镜)|"
+        r"避免.{0,12}(?:浅色|美瞳|隐形眼镜)|深色.{0,6}(?:眼睛|虹膜)|"
+        r"(?:眼睛|虹膜).{0,6}深色",
+        prompt_text,
+        re.IGNORECASE,
+    )
+    light_contacts_requested = re.search(
+        r"浅色(?:隐形眼镜|美瞳|眼睛|虹膜)|"
+        r"(?:蓝色|绿色|灰色|琥珀色|金色)(?:眼睛|虹膜|美瞳)|"
+        r"light[-\s]?(?:colored\s+)?eyes|blue\s+eyes|green\s+eyes|gray\s+eyes",
+        prompt_text,
+        re.IGNORECASE,
+    )
+    if light_contacts_rejected or not light_contacts_requested:
+        terms.append("浅色隐形眼镜")
     if re.search(r"柔光|大面积光源|低对比|柔和阴影", prompt_text, re.IGNORECASE):
         terms.extend(("硬质影棚光", "平坦阴影"))
     if re.search(r"暗部.{0,16}层次|抬升黑位|抬起黑位|暗部不死黑", prompt_text, re.IGNORECASE):
@@ -673,6 +724,7 @@ def generation_prompt_for_model(prompt: str, task: GenTask) -> str:
     """Compact reverse-analysis text into a generation-safe image prompt."""
     params = dict(task.params or {})
     params["_category"] = task.category
+    params["_has_image_reference"] = _task_has_image_reference(task)
     explicit_portrait = is_portrait_generation_task(task)
     return compact_generation_prompt_text(
         task.prompt or {},

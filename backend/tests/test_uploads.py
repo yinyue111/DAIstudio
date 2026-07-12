@@ -1128,7 +1128,7 @@ def test_plain_text_portrait_without_reference_does_not_claim_uploaded_identity(
             ),
             "图像类型": "人物图",
         },
-        "params": {"n": 1, "size": "1024x1024"},
+        "params": {"n": 1, "size": "1024x1024", "subject_mode": "portrait"},
     }, headers=h)
 
     assert r.status_code == 200, r.text
@@ -1137,6 +1137,51 @@ def test_plain_text_portrait_without_reference_does_not_claim_uploaded_identity(
     assert seen["edit_path"] == "/v1/images/edits"
     assert "上传人像照片是唯一人物身份来源" not in seen["prompt"]
     assert seen["negative_prompt"] is None
+
+
+def test_portrait_reference_fails_instead_of_falling_back_without_edit_endpoint(
+    client, make_user, auth, monkeypatch
+):
+    make_user("13900001974", balance=1000)
+    h = auth("13900001974")
+    source = client.post(
+        "/api/uploads/image",
+        files={"file": ("portrait.png", _png_bytes(size=(1200, 1600)), "image/png")},
+        headers=h,
+    )
+    assert source.status_code == 200, source.text
+    called = {"value": False}
+
+    def fake_gen_image(*_args, **_kwargs):
+        called["value"] = True
+        return [_mock_image("unexpected", "256x256", 0)]
+
+    monkeypatch.setattr("app.services.gateway.gen_image", fake_gen_image)
+    monkeypatch.setattr("app.services.generation_image_flow.settings.image_edit_path", "")
+
+    r = client.post("/api/generate", json={
+        "source_asset_url": source.json()["url"],
+        "source_type": "image",
+        "category": "image",
+        "stage": "preview",
+        "prompt": {
+            "final_text": "保持参考人物的低机位后仰坐姿和柔雾光影",
+            "instruction": "保持参考人物的低机位后仰坐姿和柔雾光影",
+            "图像类型": "人物图",
+        },
+        "params": {
+            "n": 1,
+            "size": "1024x1024",
+            "reference_image_url": source.json()["url"],
+        },
+    }, headers=h)
+
+    assert r.status_code == 200, r.text
+    task = client.get(f"/api/tasks/{r.json()['id']}", headers=h).json()
+    assert task["status"] == "failed"
+    assert task["error"] == "图片生成失败，已退回冻结积分，请稍后重试"
+    assert client.get("/api/me", headers=h).json()["balance_credits"] == 1000
+    assert called["value"] is False
 
 
 @pytest.mark.parametrize(

@@ -237,6 +237,24 @@ const userEditedPrompt = buildGenerationPayload({
 });
 assert.match(userEditedPrompt.payload.prompt.final_text, /用户手写的新提示词需要保留/);
 
+const shortEditedPortraitPrompt = buildGenerationPayload({
+  ...staleReversePromptArgs,
+  prompt: "保持低机位后仰坐姿和原图柔雾光影",
+  promptDirty: true,
+  promptSourceSignature: "image|http://localhost:8000/api/uploads/upload/style.jpg|",
+  structured: structuredPortraitReference.effectiveStructured,
+  structuredSource: "image|http://localhost:8000/api/uploads/upload/style.jpg|",
+});
+assert.equal(
+  shortEditedPortraitPrompt.payload.prompt.final_text,
+  "保持低机位后仰坐姿和原图柔雾光影",
+  "a user-edited canonical prompt should not be prefixed with every structured field",
+);
+assert.equal(
+  shortEditedPortraitPrompt.payload.prompt.instruction,
+  "保持低机位后仰坐姿和原图柔雾光影",
+);
+
 const productEditMaskOff = buildGenerationPayload({
   ...productEditArgs,
   prompt: "整体换成插画风格",

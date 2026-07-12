@@ -776,7 +776,7 @@ def test_portrait_image_negative_prompt_merges_fidelity_guards_without_duplicate
 def test_portrait_image_negative_prompt_does_not_force_reference_specific_style():
     out = portrait_image_negative_prompt(
         "多余肢体",
-        "成年职业人像，直立居中，白色婚纱，硬质影棚光，高锐度 HDR。",
+        "成年职业人像，直立居中，白色婚纱，浅色隐形眼镜，硬质影棚光，高锐度 HDR。",
     )
 
     assert "主动瘦身" in out
@@ -796,6 +796,16 @@ def test_portrait_image_negative_prompt_does_not_force_reference_specific_style(
         assert term not in out
 
 
+def test_portrait_image_negative_prompt_blocks_unsupported_wedding_and_light_contacts():
+    out = portrait_image_negative_prompt(
+        "多余肢体",
+        "成年人物穿冰晶有机雕塑礼服，深色自然眼睛，低机位后仰坐姿。",
+    )
+
+    assert "通用婚纱蕾丝" in out
+    assert "浅色隐形眼镜" in out
+
+
 def test_structured_portrait_task_is_detected_when_reference_is_present():
     task = SimpleNamespace(
         params={
@@ -813,7 +823,12 @@ def test_structured_portrait_task_is_detected_when_reference_is_present():
 
 def test_structured_portrait_without_reference_is_not_reference_fidelity_task():
     task = SimpleNamespace(
-        params={"n": 1, "size": "576x1024"},
+        params={
+            "n": 1,
+            "size": "576x1024",
+            "subject_mode": "portrait",
+            "_source_trace": {"portrait_generation_mode": True, "subject_mode": "portrait"},
+        },
         prompt={"图像类型": "人物图", "final_text": "成年职业人像，直立居中，硬质影棚光"},
         source_type="image",
         source_asset_url=None,
@@ -1005,6 +1020,28 @@ def test_portrait_generation_prompt_prefers_meaningful_canonical_final_text():
     assert "斜向后仰坐姿" in out
     assert "宽泛光晕与柔雾" in out
     assert "直立居中" not in out
+    assert "7.5 头身" not in out
+    assert "正面硬质影棚光" not in out
+
+
+def test_portrait_generation_prompt_preserves_short_explicit_reference_instruction():
+    canonical = "保持低机位后仰坐姿和原图柔雾光影"
+    prompt = {
+        "图像类型": "人物图",
+        "主体": "成年女性直立居中",
+        "人物比例": "7.5 头身，长颈，长腿",
+        "光线": "正面硬质影棚光，高反差 HDR",
+        "final_text": canonical,
+        "instruction": canonical,
+    }
+
+    out = compact_generation_prompt_text(
+        prompt,
+        {"reference_image_url": "https://example.com/ref.png"},
+        canonical,
+    )
+
+    assert canonical in out
     assert "7.5 头身" not in out
     assert "正面硬质影棚光" not in out
 

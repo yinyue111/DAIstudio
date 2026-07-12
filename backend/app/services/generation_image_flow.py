@@ -58,6 +58,7 @@ PORTRAIT_NEGATIVE_EVIDENCE_KEYS = (
     "身材体态",
     "体态线条",
     "服装结构",
+    "妆发五官",
     "视角镜头",
     "光线",
     "后期质感",
@@ -363,6 +364,8 @@ def run_image_task(task_id: int, *, gen_image_fn=None) -> None:
                 if style_ref:
                     edit_refs = [ref, style_ref]
         edit_path = (model.extra or {}).get("edit_path", settings.image_edit_path) or None
+        if ref and is_portrait and not edit_path:
+            raise RuntimeError("人物参考图生成需要配置图片编辑接口")
         extra_payload = {
             "seed": params.get("seed"),
             "negative_prompt": (
