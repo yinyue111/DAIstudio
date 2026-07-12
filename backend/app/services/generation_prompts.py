@@ -23,9 +23,9 @@ PORTRAIT_FIDELITY_GUARD = (
     "人像高保真硬约束：上传人像照片是唯一人物身份来源，必须完整保留同一个人的脸型、五官比例、"
     "眼睛、鼻子、嘴型、发际线、发型特征、肤色、年龄感、性别和可识别身份；同时保持参考人物在"
     "服装覆盖下可见的整体身体轮廓，包括肩宽、胸廓饱满度、躯干长度、自然腰线、胯宽、四肢比例、"
-    "姿态重心和胸腰胯过渡，不得主动瘦身、增大、缩小、拉长或重塑体型；不得替换成参考"
-    "素材中的人物，不得混合两个人的长相，不得改变面部结构、年龄、性别或关键身份特征。只允许迁移"
-    "参考素材的场景、构图、光线、色调、服化道、动作节奏、镜头语言和广告质感；整体表达必须保持"
+    "姿态重心和胸腰胯过渡，不得主动瘦身、增大、缩小、拉长或重塑体型；不得混合两个人的长相，"
+    "不得改变面部结构、年龄、性别或关键身份特征。若另有独立风格参考素材，不得混入其中的人物身份；"
+    "独立风格参考只用于迁移场景、构图、光线、色调、服化道、动作节奏、镜头语言和广告质感；整体表达必须保持"
     "成年、自然、得体、专业商业人像或角色设定语境，避免未成年感、夸张身体展示姿态、身体局部凝视、"
     "私密成人化意图；严格复刻原图主光方向、软硬程度、明暗对比、脸部与服装高光落点、补光关系、"
     "阴影浓度、暗部色彩层次、材质反射和柔雾/高光扩散强度；如风格迁移与人物保真冲突，优先保证"
@@ -312,9 +312,14 @@ def _meaningful_canonical_prompt(value, *, allow_short: bool = False) -> str:
     return text
 
 
-def _explicit_instruction_matches(prompt_obj: dict, fallback: str) -> bool:
-    instruction = _normalise_prompt_fragment(prompt_obj.get("instruction"))
-    return bool(instruction and instruction == _normalise_prompt_fragment(fallback))
+def _explicit_canonical_matches(prompt_obj: dict, fallback: str) -> bool:
+    target = _normalise_prompt_fragment(fallback)
+    if not target:
+        return False
+    return any(
+        _normalise_prompt_fragment(prompt_obj.get(key)) == target
+        for key in ("instruction", "user_instruction")
+    )
 
 
 def _has_subject_profile(prompt_obj: dict) -> bool:
@@ -402,7 +407,7 @@ def _rewrite_product_style_fragment(key: str, value, *, is_video: bool = False) 
 def _structured_generation_prompt(prompt_obj: dict, fallback: str) -> str:
     canonical = _meaningful_canonical_prompt(
         fallback,
-        allow_short=_explicit_instruction_matches(prompt_obj, fallback),
+        allow_short=_explicit_canonical_matches(prompt_obj, fallback),
     )
     if canonical:
         return canonical
@@ -544,7 +549,7 @@ def compact_generation_prompt_text(
     )
     canonical = _meaningful_canonical_prompt(
         fallback,
-        allow_short=_explicit_instruction_matches(prompt_obj, fallback),
+        allow_short=_explicit_canonical_matches(prompt_obj, fallback),
     )
     if canonical and not product and not (portrait_mode and _has_subject_profile(prompt_obj)):
         source = canonical

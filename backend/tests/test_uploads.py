@@ -1100,6 +1100,57 @@ def test_structured_portrait_reference_without_instruction_uses_image_edit(
         db.close()
 
 
+def test_portrait_negative_prompt_ignores_stale_wedding_and_contact_fields(
+    client, make_user, auth, monkeypatch
+):
+    make_user("13900001975", balance=1000)
+    h = auth("13900001975")
+    source = client.post(
+        "/api/uploads/image",
+        files={"file": ("portrait.png", _png_bytes(size=(1200, 1600)), "image/png")},
+        headers=h,
+    )
+    assert source.status_code == 200, source.text
+    seen = {}
+
+    def fake_gen_image(prompt, image_model_id, n=4, size="1024x1024",
+                       reference_image_url=None, edit_path=None, extra_payload=None):
+        seen["prompt"] = prompt
+        seen["negative_prompt"] = extra_payload["negative_prompt"]
+        return [_mock_image(prompt, "256x256", 0)]
+
+    monkeypatch.setattr("app.services.gateway.gen_image", fake_gen_image)
+    canonical = (
+        "保持参考人物斜向后仰坐姿、低机位近距离透视和服装覆盖下的原始身体轮廓；"
+        "使用冰晶有机雕塑礼服、左上大面积柔光、冷蓝暗部、柔雾与宽泛光晕。"
+    )
+
+    r = client.post("/api/generate", json={
+        "source_asset_url": source.json()["url"],
+        "source_type": "image",
+        "category": "image",
+        "stage": "preview",
+        "prompt": {
+            "final_text": canonical,
+            "user_instruction": canonical,
+            "图像类型": "人物图",
+            "服装结构": "旧解析：白色婚纱和通用蕾丝",
+            "妆发五官": "旧解析：浅色隐形眼镜",
+        },
+        "params": {
+            "n": 1,
+            "size": "1024x1024",
+            "reference_image_url": source.json()["url"],
+        },
+    }, headers=h)
+
+    assert r.status_code == 200, r.text
+    assert canonical.rstrip("。") in seen["prompt"]
+    assert "旧解析" not in seen["prompt"]
+    assert "通用婚纱蕾丝" in seen["negative_prompt"]
+    assert "浅色隐形眼镜" in seen["negative_prompt"]
+
+
 def test_plain_text_portrait_without_reference_does_not_claim_uploaded_identity(
     client, make_user, auth, monkeypatch
 ):
@@ -1139,7 +1190,7 @@ def test_plain_text_portrait_without_reference_does_not_claim_uploaded_identity(
     assert seen["negative_prompt"] is None
 
 
-def test_portrait_reference_fails_instead_of_falling_back_without_edit_endpoint(
+def test_image_reference_fails_instead_of_falling_back_without_edit_endpoint(
     client, make_user, auth, monkeypatch
 ):
     make_user("13900001974", balance=1000)
@@ -1167,7 +1218,6 @@ def test_portrait_reference_fails_instead_of_falling_back_without_edit_endpoint(
         "prompt": {
             "final_text": "保持参考人物的低机位后仰坐姿和柔雾光影",
             "instruction": "保持参考人物的低机位后仰坐姿和柔雾光影",
-            "图像类型": "人物图",
         },
         "params": {
             "n": 1,

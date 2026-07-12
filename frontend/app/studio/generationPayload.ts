@@ -231,7 +231,7 @@ export function buildGenerationPayload({
     prompt: {
       ...(Object.keys(promptStructured).length ? promptStructured : {}),
       ...(subjectProfileText && (productMode || portraitMode) ? { [subjectProfileLabel]: subjectProfileText } : {}),
-      ...(isEditMode && promptDirty && promptText ? { user_instruction: promptText } : {}),
+      ...(promptDirty && promptText ? { user_instruction: promptText } : {}),
       final_text: finalText,
       ...(useRefImage ? { instruction: finalText || promptText || "参考所选图生成同款风格的新素材" } : {}),
       ...(useRefVideo ? { instruction: promptText || "参考所选视频的主体、动作和镜头节奏生成同款视频" } : {}),

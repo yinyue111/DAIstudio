@@ -51,18 +51,6 @@ log = logging.getLogger("generation")
 IMAGE_EDIT_REFERENCE_MAX_SIDE = 1024
 IMAGE_PRODUCT_EDIT_REFERENCE_MAX_SIDE = 1536
 IMAGE_PORTRAIT_EDIT_REFERENCE_MAX_SIDE = 1536
-PORTRAIT_NEGATIVE_EVIDENCE_KEYS = (
-    "final_text",
-    "主体",
-    "人物比例",
-    "身材体态",
-    "体态线条",
-    "服装结构",
-    "妆发五官",
-    "视角镜头",
-    "光线",
-    "后期质感",
-)
 
 
 def acquire_image_terminal_boundary(db, task_id: int) -> GenTask | None:
@@ -315,12 +303,6 @@ def run_image_task(task_id: int, *, gen_image_fn=None) -> None:
         prompt = final_prompt(task)
         prompt = generation_prompt_for_model(prompt, task)
         prompt = product_fidelity_prompt(prompt, task)
-        prompt_obj = task.prompt if isinstance(task.prompt, dict) else {}
-        portrait_negative_evidence = "；".join(
-            str(prompt_obj.get(key) or "")
-            for key in PORTRAIT_NEGATIVE_EVIDENCE_KEYS
-            if prompt_obj.get(key)
-        )
 
         set_progress(task_id, 30, "running")
         raise_if_cancel_requested(db, db.get(GenTask, task_id))
@@ -364,8 +346,8 @@ def run_image_task(task_id: int, *, gen_image_fn=None) -> None:
                 if style_ref:
                     edit_refs = [ref, style_ref]
         edit_path = (model.extra or {}).get("edit_path", settings.image_edit_path) or None
-        if ref and is_portrait and not edit_path:
-            raise RuntimeError("人物参考图生成需要配置图片编辑接口")
+        if ref and not edit_path:
+            raise RuntimeError("参考图生成需要配置图片编辑接口")
         extra_payload = {
             "seed": params.get("seed"),
             "negative_prompt": (
@@ -374,7 +356,7 @@ def run_image_task(task_id: int, *, gen_image_fn=None) -> None:
                 else (
                     portrait_image_negative_prompt(
                         params.get("negative_prompt") or params.get("negative"),
-                        portrait_negative_evidence,
+                        prompt,
                     )
                     if is_portrait
                     else (params.get("negative_prompt") or params.get("negative"))

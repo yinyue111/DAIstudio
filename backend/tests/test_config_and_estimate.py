@@ -28,6 +28,7 @@ from app.services.generation_prompts import (
     generation_prompt_for_model,
     is_portrait_generation_task,
     portrait_image_negative_prompt,
+    product_fidelity_prompt,
     product_image_negative_prompt,
 )
 from app.services.generation_request import estimate_generation_cost, validate_generation_params
@@ -821,6 +822,25 @@ def test_structured_portrait_task_is_detected_when_reference_is_present():
     assert is_portrait_generation_task(task) is True
 
 
+def test_direct_portrait_reference_guard_does_not_reject_the_reference_person():
+    reference_url = "http://localhost:8000/media/preview/portrait.png"
+    task = SimpleNamespace(
+        params={"reference_image_url": reference_url},
+        prompt={
+            "图像类型": "人物图",
+            "final_text": "保持参考人物的低机位后仰坐姿和柔雾光影",
+        },
+        source_type="image",
+        source_asset_url=reference_url,
+    )
+
+    out = product_fidelity_prompt("严格复刻原图人物身份、姿态和光影。", task)
+
+    assert "上传人像照片是唯一人物身份来源" in out
+    assert "不得替换成参考素材中的人物" not in out
+    assert "若另有独立风格参考素材" in out
+
+
 def test_structured_portrait_without_reference_is_not_reference_fidelity_task():
     task = SimpleNamespace(
         params={
@@ -1024,7 +1044,7 @@ def test_portrait_generation_prompt_prefers_meaningful_canonical_final_text():
     assert "正面硬质影棚光" not in out
 
 
-def test_portrait_generation_prompt_preserves_short_explicit_reference_instruction():
+def test_portrait_generation_prompt_preserves_short_canonical_without_duplicate_instruction():
     canonical = "保持低机位后仰坐姿和原图柔雾光影"
     prompt = {
         "图像类型": "人物图",
@@ -1032,7 +1052,7 @@ def test_portrait_generation_prompt_preserves_short_explicit_reference_instructi
         "人物比例": "7.5 头身，长颈，长腿",
         "光线": "正面硬质影棚光，高反差 HDR",
         "final_text": canonical,
-        "instruction": canonical,
+        "user_instruction": canonical,
     }
 
     out = compact_generation_prompt_text(

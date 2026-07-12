@@ -254,6 +254,11 @@ assert.equal(
   shortEditedPortraitPrompt.payload.prompt.instruction,
   "保持低机位后仰坐姿和原图柔雾光影",
 );
+assert.equal(
+  shortEditedPortraitPrompt.payload.prompt.user_instruction,
+  "保持低机位后仰坐姿和原图柔雾光影",
+  "a dirty prompt should explicitly mark the user's canonical override",
+);
 
 const productEditMaskOff = buildGenerationPayload({
   ...productEditArgs,
