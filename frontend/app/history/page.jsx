@@ -25,6 +25,8 @@ function srcOf(a) {
 }
 
 const TERMINAL_STATUSES = new Set(["succeeded", "failed", "needs_review", "canceled"]);
+const TASK_POLL_INTERVAL_MS = 3000;
+const TASK_POLL_MAX_BACKOFF_MS = 30000;
 
 function isTerminalStatus(status) {
   return TERMINAL_STATUSES.has(status);
@@ -162,13 +164,16 @@ export default function HistoryPage() {
   function trackTask(taskId) {
     let stopped = false;
     let failures = 0;
+    let failureReported = false;
     let timer = null;
     const tick = async () => {
       if (stopped) return;
+      let nextDelay = TASK_POLL_INTERVAL_MS;
       try {
         const task = await api.task(taskId);
         if (stopped) return;
         failures = 0;
+        failureReported = false;
         upsertTask(task);
         if (isTerminalStatus(task.status)) {
           const stop = trackersRef.current.get(task.id);
@@ -182,14 +187,16 @@ export default function HistoryPage() {
       } catch (e) {
         if (stopped) return;
         failures += 1;
-        if (failures >= 5) {
-          setMsg(`连续获取任务状态失败: ${e.message}`);
-          stopped = true;
-          trackersRef.current.delete(taskId);
-          return;
+        nextDelay = Math.min(
+          TASK_POLL_MAX_BACKOFF_MS,
+          TASK_POLL_INTERVAL_MS * (2 ** Math.min(failures, 4)),
+        );
+        if (failures >= 5 && !failureReported) {
+          failureReported = true;
+          setMsg(`任务状态暂时无法同步，正在自动重试: ${e.message}`);
         }
       }
-      if (!stopped) timer = setTimeout(tick, 3000);
+      if (!stopped) timer = setTimeout(tick, nextDelay);
     };
     tick();
     return () => {
@@ -334,6 +341,7 @@ export default function HistoryPage() {
         ) : (
           <div className="space-y-4">
             {tasks.map((t) => {
+              const promptRecords = taskPromptRecords(t);
               return (
               <div key={t.id} className="card p-4 animate-fadeup">
                 <div className="mb-3 flex flex-wrap items-center gap-2 text-sm">
@@ -343,6 +351,22 @@ export default function HistoryPage() {
                   <span className="ml-auto text-xs text-fog">
                     {formatLocalDateTime(t.created_at)} · 结算 {t.cost_settled}
                   </span>
+                </div>
+                <div className="mb-3 flex min-w-0 flex-wrap items-start gap-x-4 gap-y-2 border-b border-line/70 pb-3 text-xs">
+                  <p className="min-w-0 text-fog">
+                    <span className="mr-2 text-mist">模型</span>
+                    <span className="break-all text-snow">{taskModelLabel(t)}</span>
+                  </p>
+                  {promptRecords.map((record) => (
+                    <details key={record.key} className="min-w-0 flex-1 basis-full sm:basis-auto">
+                      <summary className="w-fit cursor-pointer select-none text-mist transition hover:text-snow">
+                        查看{record.label}
+                      </summary>
+                      <p className="mt-2 max-h-48 overflow-y-auto whitespace-pre-wrap break-words rounded-md bg-black/20 px-3 py-2 leading-5 text-fog">
+                        {record.text}
+                      </p>
+                    </details>
+                  ))}
                 </div>
                 {t.partial && (
                   <div className="mb-3 rounded-lg bg-warn/10 px-3 py-2 text-xs text-warn">
@@ -518,6 +542,37 @@ function taskSummaryLabel(t) {
     return `${count || requested || 1} 张图片`;
   }
   return "视频";
+}
+
+function taskModelLabel(task) {
+  const model = String(task?.model_id || "").trim();
+  const provider = String(task?.model_provider || "").trim();
+  if (model && provider && provider.toLowerCase() !== model.toLowerCase()) return `${model} · ${provider}`;
+  return model || provider || "未记录（历史任务）";
+}
+
+function taskPromptLabel(task) {
+  if (task?.prompt_text_source === "generation") return "最终生成提示词";
+  if (task?.prompt_text_source === "request") return "原始请求提示词";
+  return "提示词记录";
+}
+
+function taskPromptRecords(task) {
+  const requestPrompt = String(task?.request_prompt_text || "").trim();
+  const generationPrompt = String(task?.generation_prompt_text || "").trim();
+  const records = [];
+  if (requestPrompt) {
+    records.push({ key: "request", label: "原始请求提示词", text: requestPrompt });
+  }
+  if (generationPrompt) {
+    records.push({ key: "generation", label: "最终生成提示词", text: generationPrompt });
+  }
+  if (records.length) return records;
+  return [{
+    key: "legacy",
+    label: taskPromptLabel(task),
+    text: task?.prompt_text || "该历史任务未保存可展示的提示词。",
+  }];
 }
 
 function mediaAspectStyle(a) {

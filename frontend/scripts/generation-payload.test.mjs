@@ -132,7 +132,8 @@ assert.match(productEdit.payload.prompt["产品身份档案"], /DAMAH 黑魔法�
 assert.match(productEdit.payload.prompt.final_text, /DAMAH 黑魔法全棉棉柔巾/);
 assert.match(productEdit.payload.prompt.final_text, /200抽/);
 assert.match(productEdit.payload.prompt.final_text, /唯一产品身份/);
-assert.match(productEdit.payload.prompt.final_text, /包装上的品牌名/);
+assert.match(productEdit.payload.prompt.final_text, /Logo和可见文字/);
+assert.ok(productEdit.payload.prompt.final_text.length <= 450);
 assert.equal(productEdit.payload.prompt["场景背景"], "高端浴室台面");
 assert.equal(productEdit.payload.prompt["光线"], "柔和自然光");
 assert.equal(productEdit.payload.prompt["主体"], undefined);
@@ -343,7 +344,8 @@ const portraitEdit = buildGenerationPayload({
 
 assert.equal(portraitEdit.payload.params.subject_mode, "portrait");
 assert.equal(portraitEdit.payload.params.character_reference_image, productAsset.url);
-assert.match(portraitEdit.payload.prompt.final_text, /人像照片作为唯一人物身份/);
+assert.match(portraitEdit.payload.prompt.final_text, /上传人像是唯一人物身份/);
+assert.ok(portraitEdit.payload.prompt.final_text.length <= 450);
 assert.match(portraitEdit.payload.prompt.final_text, /专业商业人像/);
 assert.doesNotMatch(portraitEdit.payload.prompt.final_text, /严格按照用户提示词执行局部或整体编辑/);
 assert.match(portraitEdit.payload.params.negative_prompt, /身份不一致/);

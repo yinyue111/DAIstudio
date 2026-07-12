@@ -747,6 +747,126 @@ def test_product_image_negative_prompt_sanitizes_reference_product_terms():
     assert "产品被裁切" in out
 
 
+def test_tissue_product_prompt_keeps_dispensed_sheet_attached_and_subtle():
+    reference_url = "http://localhost:8000/api/uploads/upload/damah-tissue.png"
+    task = SimpleNamespace(
+        params={"subject_mode": "product", "reference_image_url": reference_url},
+        prompt={
+            "产品身份档案": "白色长方体软包抽取式纸巾，顶部中央为真实抽口",
+            "final_text": "高端纸巾商业海报，一角微微抽出一张纸巾",
+        },
+        source_type="image",
+        source_asset_url=reference_url,
+    )
+
+    out = product_fidelity_prompt(task.prompt["final_text"], task)
+    negative = product_image_negative_prompt()
+
+    assert "仅一张纸巾从包装原有抽口连续伸出" in out
+    assert "根部收束并与抽口自然连接" in out
+    assert "多张纸巾花束状炸开" in negative
+    assert "纸巾与抽口断裂" in negative
+
+
+def test_non_tissue_product_prompt_does_not_add_tissue_structure_guard():
+    reference_url = "http://localhost:8000/api/uploads/upload/bottle.png"
+    task = SimpleNamespace(
+        params={"subject_mode": "product", "reference_image_url": reference_url},
+        prompt={"产品身份档案": "透明玻璃香水瓶", "final_text": "高端香水商业海报"},
+        source_type="image",
+        source_asset_url=reference_url,
+    )
+
+    out = product_fidelity_prompt(task.prompt["final_text"], task)
+
+    assert "仅一张纸巾" not in out
+
+
+def test_tissue_word_without_dispensing_evidence_does_not_invent_a_sheet():
+    reference_url = "http://localhost:8000/api/uploads/upload/bottle.png"
+    task = SimpleNamespace(
+        params={"subject_mode": "product", "reference_image_url": reference_url},
+        prompt={
+            "产品身份档案": "透明玻璃香水瓶，金属瓶盖",
+            "final_text": "高端香水商业海报，不要在产品上添加纸巾或其他道具",
+        },
+        source_type="image",
+        source_asset_url=reference_url,
+    )
+
+    out = product_fidelity_prompt(task.prompt["final_text"], task)
+
+    assert "抽取结构约束" not in out
+    assert "仅一张纸巾从包装原有抽口连续伸出" not in out
+
+
+def test_tissue_product_logo_visibility_does_not_invent_a_dispensed_sheet():
+    reference_url = "http://localhost:8000/api/uploads/upload/tissue-pack.png"
+    task = SimpleNamespace(
+        params={"subject_mode": "product", "reference_image_url": reference_url},
+        prompt={
+            "产品身份档案": "白色软包抽取式纸巾，顶部中央为真实抽口",
+            "final_text": "产品完整入镜，完整露出 Logo 和包装正面",
+        },
+        source_type="image",
+        source_asset_url=reference_url,
+    )
+
+    out = product_fidelity_prompt(task.prompt["final_text"], task)
+
+    assert "抽取结构约束" not in out
+    assert "仅一张纸巾从包装原有抽口连续伸出" not in out
+
+
+@pytest.mark.parametrize(
+    "final_text",
+    [
+        "产品完整入镜，完整露出 Logo 和包装正面",
+        "纸巾包装完整露出品牌文字",
+    ],
+)
+def test_tissue_profile_in_compact_model_prompt_does_not_invent_a_dispensed_sheet(final_text):
+    reference_url = "http://localhost:8000/api/uploads/upload/tissue-pack.png"
+    task = SimpleNamespace(
+        category="image",
+        params={"subject_mode": "product", "reference_image_url": reference_url},
+        prompt={
+            "产品身份档案": "白色软包抽取式纸巾，顶部中央为真实抽口",
+            "final_text": final_text,
+            "instruction": final_text,
+        },
+        source_type="image",
+        source_asset_url=reference_url,
+    )
+
+    compact = generation_prompt_for_model(task.prompt["final_text"], task)
+    out = product_fidelity_prompt(compact, task)
+
+    assert "抽取式纸巾" in compact
+    assert "抽取结构约束" not in out
+    assert "仅一张纸巾从包装原有抽口连续伸出" not in out
+
+
+def test_explicit_tissue_exposure_in_compact_model_prompt_keeps_dispensing_guard():
+    reference_url = "http://localhost:8000/api/uploads/upload/tissue-pack.png"
+    task = SimpleNamespace(
+        category="image",
+        params={"subject_mode": "product", "reference_image_url": reference_url},
+        prompt={
+            "产品身份档案": "白色软包抽取式纸巾，顶部中央为真实抽口",
+            "final_text": "仅从抽口露出一张纸巾，保持自然连接",
+        },
+        source_type="image",
+        source_asset_url=reference_url,
+    )
+
+    compact = generation_prompt_for_model(task.prompt["final_text"], task)
+    out = product_fidelity_prompt(compact, task)
+
+    assert "抽取结构约束" in out
+    assert "仅一张纸巾从包装原有抽口连续伸出" in out
+
+
 def test_portrait_image_negative_prompt_merges_fidelity_guards_without_duplicates():
     prompt = (
         "成年女性斜向后仰坐姿，低机位仰拍与近距离透视，前景自然放大；"
@@ -836,9 +956,9 @@ def test_direct_portrait_reference_guard_does_not_reject_the_reference_person():
 
     out = product_fidelity_prompt("严格复刻原图人物身份、姿态和光影。", task)
 
-    assert "上传人像照片是唯一人物身份来源" in out
+    assert "上传人像是唯一人物身份" in out
     assert "不得替换成参考素材中的人物" not in out
-    assert "若另有独立风格参考素材" in out
+    assert "风格参考只迁移场景" in out
 
 
 def test_structured_portrait_without_reference_is_not_reference_fidelity_task():
@@ -1177,7 +1297,7 @@ def test_portrait_generation_prompt_prioritizes_reference_lighting_and_finish_wh
 
     out = compact_generation_prompt_text(prompt, {}, prompt["final_text"])
 
-    assert len(out) <= 1500
+    assert len(out) <= 800
     assert "左上四十五度大面积柔光" in out
     assert "脸部与胸衣有柔和珠光高光" in out
     assert "暗部保留冷蓝黑层次" in out

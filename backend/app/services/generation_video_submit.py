@@ -639,10 +639,11 @@ def start_video_task(
             prompt = generation_prompt_for_model(prompt, task)
             prompt = product_fidelity_prompt(prompt, task)
             original_params = dict(task.params or {})
+            original_params["_generation_prompt"] = prompt
             if not original_params.get("_video_request_id"):
                 original_params["_video_request_id"] = f"video-{task.id}-{uuid4().hex}"
-                task.params = original_params
-                db.commit()
+            task.params = original_params
+            db.commit()
             params = video_submit_params(db, task)
             params.setdefault("request_id", original_params["_video_request_id"])
             raise_if_cancel_requested(db, db.get(GenTask, task_id))

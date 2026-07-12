@@ -221,6 +221,30 @@ def _alpha_subject_mask(img: Image.Image, alpha: Image.Image) -> EditMaskResult:
     )
 
 
+def _has_usable_alpha_cutout(alpha: Image.Image) -> bool:
+    """Reject incidental transparent pixels from otherwise ordinary PNGs."""
+    w, h = alpha.size
+    data = alpha.tobytes()
+    total = len(data)
+    if total <= 0:
+        return False
+    transparent = sum(1 for value in data if value <= 8)
+    if transparent < max(16, int(round(total * 0.005))):
+        return False
+
+    border_total = 0
+    border_transparent = 0
+    for x in range(w):
+        for idx in (x, (h - 1) * w + x):
+            border_total += 1
+            border_transparent += int(data[idx] <= 8)
+    for y in range(1, max(1, h - 1)):
+        for idx in (y * w, y * w + (w - 1)):
+            border_total += 1
+            border_transparent += int(data[idx] <= 8)
+    return border_transparent >= max(4, int(round(border_total * 0.02)))
+
+
 def _border_samples(rgb: Image.Image) -> list[tuple[int, int, int]]:
     w, h = rgb.size
     px = rgb.load()
@@ -313,6 +337,122 @@ def _largest_component_mask(mask: Image.Image) -> tuple[Image.Image | None, tupl
     for idx in best:
         out[idx] = 255
     return Image.frombytes("L", (w, h), bytes(out)), best_bbox, len(best)
+
+
+def _carve_background_regions(
+    subject: Image.Image,
+    rgb: Image.Image,
+    *,
+    bg: tuple[int, int, int],
+    bg_noise: float,
+) -> Image.Image:
+    """Remove exterior background leaks and compact see-through product holes."""
+    w, h = subject.size
+    total = w * h
+    if total <= 0:
+        return subject
+    subject_data = subject.tobytes()
+    rgb_data = rgb.tobytes()
+    threshold = max(3, min(10, int(round(bg_noise * 0.5)) + 3))
+    background_like = bytearray(total)
+    for idx in range(total):
+        base = idx * 3
+        if max(
+            abs(rgb_data[base] - bg[0]),
+            abs(rgb_data[base + 1] - bg[1]),
+            abs(rgb_data[base + 2] - bg[2]),
+        ) <= threshold:
+            background_like[idx] = 1
+
+    exterior = bytearray(total)
+    stack: list[int] = []
+
+    def push(idx: int) -> None:
+        if background_like[idx] and not exterior[idx]:
+            exterior[idx] = 1
+            stack.append(idx)
+
+    for x in range(w):
+        push(x)
+        push((h - 1) * w + x)
+    for y in range(h):
+        push(y * w)
+        push(y * w + (w - 1))
+    while stack:
+        idx = stack.pop()
+        x = idx % w
+        y = idx // w
+        if x > 0:
+            push(idx - 1)
+        if x + 1 < w:
+            push(idx + 1)
+        if y > 0:
+            push(idx - w)
+        if y + 1 < h:
+            push(idx + w)
+
+    out = bytearray(subject_data)
+    for idx, is_exterior in enumerate(exterior):
+        if is_exterior:
+            out[idx] = 0
+
+    seen = bytearray(exterior)
+    min_hole_area = max(24, int(round(total * 0.00008)))
+    max_hole_area = max(min_hole_area, int(round(total * 0.012)))
+    for start, value in enumerate(background_like):
+        if not value or seen[start]:
+            continue
+        component = [start]
+        seen[start] = 1
+        cells: list[int] = []
+        min_x = max_x = start % w
+        min_y = max_y = start // w
+        while component:
+            idx = component.pop()
+            cells.append(idx)
+            x = idx % w
+            y = idx // w
+            min_x = min(min_x, x)
+            max_x = max(max_x, x)
+            min_y = min(min_y, y)
+            max_y = max(max_y, y)
+            if x > 0:
+                nxt = idx - 1
+                if background_like[nxt] and not seen[nxt]:
+                    seen[nxt] = 1
+                    component.append(nxt)
+            if x + 1 < w:
+                nxt = idx + 1
+                if background_like[nxt] and not seen[nxt]:
+                    seen[nxt] = 1
+                    component.append(nxt)
+            if y > 0:
+                nxt = idx - w
+                if background_like[nxt] and not seen[nxt]:
+                    seen[nxt] = 1
+                    component.append(nxt)
+            if y + 1 < h:
+                nxt = idx + w
+                if background_like[nxt] and not seen[nxt]:
+                    seen[nxt] = 1
+                    component.append(nxt)
+        area = len(cells)
+        bbox_w = max_x - min_x + 1
+        bbox_h = max_y - min_y + 1
+        fill_ratio = area / max(1, bbox_w * bbox_h)
+        masked_ratio = sum(1 for idx in cells if out[idx]) / max(1, area)
+        aspect = bbox_w / max(1, bbox_h)
+        if (
+            min_hole_area <= area <= max_hole_area
+            and bbox_w >= 5
+            and bbox_h >= 5
+            and 0.25 <= aspect <= 4.0
+            and fill_ratio >= 0.55
+            and masked_ratio >= 0.80
+        ):
+            for idx in cells:
+                out[idx] = 0
+    return Image.frombytes("L", (w, h), bytes(out))
 
 
 def _odd_kernel_size(value: int, *, minimum: int = 3, maximum: int | None = None) -> int:
@@ -554,7 +694,7 @@ def _bright_neutral_subject_mask(rgb: Image.Image) -> tuple[Image.Image | None, 
         bbox_ratio = _bbox_area(bbox) / max(1, w * h)
         aspect = bbox_w / max(1, bbox_h)
         center_y = (min_y + max_y) / 2 / max(1, h)
-        touches_edge = min_y <= 2 or max_y >= h - 3 or (min_x <= 2 and max_x >= w - 3)
+        touches_edge = min_y <= 2 or max_y >= h - 3 or min_x <= 2 or max_x >= w - 3
         if (
             touches_edge
             or area_ratio < 0.008
@@ -653,9 +793,43 @@ def _auto_subject_mask(img: Image.Image) -> EditMaskResult:
                 "foreground_too_large",
             )
     subject_alpha = _refine_auto_subject_alpha(component)
-    bbox = _exclusive_bbox_to_inclusive(subject_alpha.getbbox())
-    if not bbox:
+    subject_alpha = _carve_background_regions(
+        subject_alpha,
+        rgb,
+        bg=bg,
+        bg_noise=bg_noise,
+    )
+    clean_component, bbox, area = _largest_component_mask(subject_alpha)
+    if clean_component is None or bbox is None:
         return EditMaskResult(None, "none", 0.0, None, source_size[0], source_size[1], "empty_subject")
+    subject_alpha = clean_component
+    area_ratio = area / max(1, w * h)
+    bbox_area = _bbox_area(bbox)
+    bbox_ratio = bbox_area / max(1, w * h)
+    touches_edge = bbox[0] <= 1 or bbox[1] <= 1 or bbox[2] >= w - 2 or bbox[3] >= h - 2
+    bbox_w = bbox[2] - bbox[0] + 1
+    bbox_h = bbox[3] - bbox[1] + 1
+    solidity = area / max(1, bbox_area)
+    aspect = bbox_w / max(1, bbox_h)
+    if (
+        span_subject is None
+        and bg_noise <= 12
+        and bg_sat <= 24
+        and max(bg) >= 245
+        and area_ratio < 0.05
+        and bbox_ratio < 0.06
+        and solidity >= 0.68
+        and aspect >= 1.8
+    ):
+        return EditMaskResult(
+            None,
+            "none",
+            0.42,
+            _scale_bbox(bbox, from_size=(w, h), to_size=source_size),
+            source_size[0],
+            source_size[1],
+            "label_only_candidate",
+        )
     confidence = 0.62
     if bg_noise <= 12:
         confidence += 0.12
@@ -695,6 +869,16 @@ def _auto_subject_mask(img: Image.Image) -> EditMaskResult:
                         height=source_size[1],
                         reason="bright_neutral_subject",
                     )
+    if touches_edge:
+        return EditMaskResult(
+            None,
+            "none",
+            min(confidence, 0.55),
+            _scale_bbox(bbox, from_size=(w, h), to_size=source_size),
+            source_size[0],
+            source_size[1],
+            "edge_connected_foreground",
+        )
     if confidence < EDIT_MASK_SEND_CONFIDENCE:
         return EditMaskResult(
             None,
@@ -755,7 +939,7 @@ def gateway_image_edit_mask(
                 Image.Resampling.LANCZOS,
             )
         alpha = img.getchannel("A")
-        if alpha.getextrema()[0] < 255:
+        if _has_usable_alpha_cutout(alpha):
             return _alpha_subject_mask(img, alpha)
         if str(edit_mask_mode or "").lower().strip() == "center_box":
             return _center_box_mask(img, reason="explicit_center_box")
@@ -852,23 +1036,14 @@ def composite_product_subject_pixels(
     scaled_source_bbox = _scale_bbox(source_bbox, from_size=source_img.size, to_size=result_img.size)
     if not scaled_source_bbox:
         return None
+    # The edit mask defines where the protected product belongs. Re-detecting a
+    # subject in the generated scene is unsafe: bright props, mist, stone
+    # pedestals, or the model's own duplicate product can become the target and
+    # produce a shifted/scaled second package. Keep the source-space placement
+    # deterministic and let only the surrounding pixels come from the model.
     target_bbox = scaled_source_bbox
     placement_method = "source_scaled_bbox"
     target_confidence = 0.0
-    target_mask = _auto_subject_mask(result_img)
-    if target_mask.mode == "auto_subject" and target_mask.confidence >= 0.55 and target_mask.bbox:
-        target_area_ratio = _bbox_area(target_mask.bbox) / max(1, result_img.width * result_img.height)
-        scaled_area_ratio = _bbox_area(scaled_source_bbox) / max(1, result_img.width * result_img.height)
-        # Reject natural-background false positives that swallow most of the
-        # frame. A good result-side product bbox should be close to the source
-        # placement or at least similarly sized.
-        if (
-            0.015 <= target_area_ratio <= 0.70
-            and target_area_ratio <= max(0.72, scaled_area_ratio * 2.8)
-        ):
-            target_bbox = target_mask.bbox
-            placement_method = "result_subject_bbox"
-            target_confidence = float(target_mask.confidence)
 
     sx1, sy1, sx2, sy2 = source_bbox
     source_crop = source_img.crop((sx1, sy1, sx2 + 1, sy2 + 1))
@@ -883,14 +1058,6 @@ def composite_product_subject_pixels(
     alpha_layer = alpha_crop.resize((paste_w, paste_h), Image.Resampling.LANCZOS)
     feather = max(1, int(round(min(paste_w, paste_h) * 0.004)))
     alpha_layer = alpha_layer.filter(ImageFilter.GaussianBlur(feather))
-    if placement_method == "result_subject_bbox" and target_mask.data_uri:
-        target_alpha = _mask_alpha_from_data_uri(target_mask.data_uri)
-        if target_alpha is not None and target_alpha.size == result_img.size:
-            target_clip = target_alpha.crop((tx1, ty1, tx2 + 1, ty2 + 1))
-            target_clip = target_clip.resize((paste_w, paste_h), Image.Resampling.LANCZOS)
-            target_clip = target_clip.filter(ImageFilter.GaussianBlur(feather))
-            alpha_layer = ImageChops.multiply(alpha_layer, target_clip)
-
     canvas = result_img.copy()
     canvas.paste(source_layer, (tx1, ty1), alpha_layer)
     return _jpeg_bytes(canvas), {

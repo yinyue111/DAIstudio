@@ -1,4 +1,4 @@
-FROM python:3.11-slim
+FROM python:3.11-slim-bookworm
 
 ENV PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
@@ -10,7 +10,9 @@ WORKDIR /app
 # Minimal system deps (libpq for psycopg, curl for healthcheck, git + ssh for
 # optional admin online updates, ffmpeg for
 # sampling keyframes from reference videos in the reverse-prompt step).
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN sed -i 's|http://deb.debian.org|https://deb.debian.org|g' /etc/apt/sources.list.d/debian.sources \
+    && apt-get -o Acquire::Retries=5 update \
+    && apt-get -o Acquire::Retries=5 install -y --no-install-recommends \
     build-essential libpq-dev curl git openssh-client ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 

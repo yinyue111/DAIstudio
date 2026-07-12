@@ -635,3 +635,41 @@ def test_0022_preserves_existing_sqlite_json_string_extra(monkeypatch):
     assert row[0] == 99
     assert row[1] == 7
     assert row[2] == '{"submit_path": "/custom/submit", "preview_cost": 5}'
+
+
+def test_0033_seeds_prompt_without_copying_vision_gateway(tmp_path, monkeypatch):
+    db_path = tmp_path / "prompt-seed.db"
+    monkeypatch.setattr(settings, "database_url", f"sqlite:///{db_path}")
+    backend = Path(__file__).resolve().parents[1]
+    cfg = Config(str(backend / "alembic.ini"))
+    cfg.set_main_option("script_location", str(backend / "alembic"))
+    command.upgrade(cfg, "0032_admin_quota_business_window")
+
+    engine = sa.create_engine(f"sqlite:///{db_path}")
+    with engine.begin() as conn:
+        conn.execute(
+            sa.text(
+                """
+                INSERT INTO model_configs (
+                    use, model_id, provider, base_url, api_key_encrypted, gateway_format,
+                    cost_credits, unlock_cost, enabled
+                ) VALUES (
+                    'vision', 'vision-model', 'openai', 'https://vision.example.com/v1',
+                    'encrypted-vision-key', 'openai', 2, 0, 1
+                )
+                """
+            )
+        )
+
+    command.upgrade(cfg, "0033_prompt_optimizer_model")
+    with engine.connect() as conn:
+        row = conn.execute(
+            sa.text(
+                """
+                SELECT provider, base_url, api_key_encrypted, gateway_format
+                FROM model_configs WHERE use = 'prompt'
+                """
+            )
+        ).one()
+
+    assert tuple(row) == (None, None, None, None)

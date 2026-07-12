@@ -24,6 +24,7 @@ from .generation_common import (
 )
 from .generation_media import (
     EDIT_MASK_SEND_CONFIDENCE,
+    SubjectProtectionBusy,
     closest_image_size,
     composite_product_subject_pixels,
     final_prompt,
@@ -52,6 +53,11 @@ log = logging.getLogger("generation")
 IMAGE_EDIT_REFERENCE_MAX_SIDE = 1024
 IMAGE_PRODUCT_EDIT_REFERENCE_MAX_SIDE = 1536
 IMAGE_PORTRAIT_EDIT_REFERENCE_MAX_SIDE = 1536
+IMAGE_EDIT_MASK_RETRY_DELAY_SECONDS = 0.12
+
+
+class ProductProtectionUnavailable(RuntimeError):
+    """Product edit protection could not be applied reliably."""
 
 
 def acquire_image_terminal_boundary(db, task_id: int) -> GenTask | None:
@@ -228,6 +234,11 @@ def hold_image_submit_unknown_for_reconciliation(
 
 
 def public_image_error(exc: Exception) -> str:
+    if isinstance(exc, ProductProtectionUnavailable):
+        return (
+            "产品主体保护未能可靠识别或应用蒙版，已停止本次生成并退回冻结积分。"
+            "请稍后重试，或重新上传主体清晰、背景对比明显的产品图。"
+        )
     message = str(exc)
     lowered = message.lower()
     if "timed out" in lowered or "timeout" in lowered or "超时" in message:
@@ -304,6 +315,9 @@ def run_image_task(task_id: int, *, gen_image_fn=None) -> None:
         prompt = final_prompt(task)
         prompt = generation_prompt_for_model(prompt, task)
         prompt = product_fidelity_prompt(prompt, task)
+        params["_generation_prompt"] = prompt
+        task.params = dict(params)
+        db.commit()
 
         set_progress(task_id, 30, "running")
         raise_if_cancel_requested(db, db.get(GenTask, task_id))
@@ -381,17 +395,33 @@ def run_image_task(task_id: int, *, gen_image_fn=None) -> None:
         )
         if is_product and ref and edit_path and edit_mask_mode != "off":
             mask_source = params.get("mask_image_url") or task.source_asset_url
-            try:
-                mask_result = gateway_image_edit_mask(
-                    db,
-                    task,
-                    mask_source,
-                    max_side=reference_max_side,
-                    edit_mask_mode=edit_mask_mode or "protect_subject",
-                )
-            except Exception as e:  # noqa: BLE001
-                log.warning("image task %s edit mask skipped: %s", task_id, e)
+            mask_failure_source = ""
+            for mask_attempt in range(2):
+                try:
+                    mask_result = gateway_image_edit_mask(
+                        db,
+                        task,
+                        mask_source,
+                        max_side=reference_max_side,
+                        edit_mask_mode=edit_mask_mode or "protect_subject",
+                    )
+                    break
+                except SubjectProtectionBusy as e:
+                    if mask_attempt == 0:
+                        log.info("image task %s edit mask busy; retrying once", task_id)
+                        time.sleep(IMAGE_EDIT_MASK_RETRY_DELAY_SECONDS)
+                        continue
+                    mask_failure_source = "generation_mask_busy"
+                    log.warning("image task %s edit mask skipped after retry: %s", task_id, e)
+                except Exception as e:  # noqa: BLE001
+                    if mask_attempt == 0:
+                        log.info("image task %s edit mask failed; retrying once: %s", task_id, e)
+                        time.sleep(IMAGE_EDIT_MASK_RETRY_DELAY_SECONDS)
+                        continue
+                    mask_failure_source = "generation_mask_error"
+                    log.warning("image task %s edit mask skipped after retry: %s", task_id, e)
                 mask_result = None
+                break
             if mask_result:
                 should_send_mask = bool(mask_result.data_uri) and (
                     (
@@ -412,22 +442,35 @@ def run_image_task(task_id: int, *, gen_image_fn=None) -> None:
                 db.commit()
                 if should_send_mask:
                     extra_payload["mask"] = mask_result.data_uri
+                else:
+                    raise ProductProtectionUnavailable(
+                        "产品主体保护置信度不足，未向图片网关发送蒙版"
+                    )
                 if product_pixel_lock_mode in {"strict", "on", "true", "1"}:
                     product_pixel_lock_label = "strict"
                     product_pixel_lock = product_pixel_lock and should_send_mask
                 else:
-                    product_pixel_lock_label = "auto_subject" if mask_result.mode == "auto_subject" else "auto_alpha"
+                    product_pixel_lock_label = "auto_alpha" if mask_result.mode == "alpha_subject" else "auto_mask_only"
                     product_pixel_lock = (
                         product_pixel_lock
                         and should_send_mask
-                        and (
-                            mask_result.mode == "alpha_subject"
-                            or (
-                                mask_result.mode == "auto_subject"
-                                and mask_result.confidence >= 0.78
-                            )
-                        )
+                        and mask_result.mode == "alpha_subject"
                     )
+            else:
+                task.params = {
+                    **(task.params or {}),
+                    "_edit_mask_mode": "none",
+                    "_edit_mask_confidence": 0.0,
+                    "_edit_mask_bbox": None,
+                    "_edit_mask_source": mask_failure_source or "generation_mask_unavailable",
+                    "_edit_mask_requested_mode": edit_mask_mode or "protect_subject",
+                    "_edit_mask_sent": False,
+                }
+                db.commit()
+                raise ProductProtectionUnavailable(
+                    "产品主体保护蒙版生成失败："
+                    f"{mask_failure_source or 'generation_mask_unavailable'}"
+                )
         elif product_pixel_lock:
             product_pixel_lock = False
         if product_pixel_lock and not mask_result:

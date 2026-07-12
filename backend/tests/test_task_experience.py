@@ -40,6 +40,85 @@ def test_task_output_includes_standard_error_type(client, make_user, auth):
     assert body["error_message"] == body["error"]
 
 
+def test_task_output_includes_saved_prompt_and_model_snapshot(client, make_user, auth):
+    uid = make_user("13900009112", balance=1000)
+    h = auth("13900009112")
+    db = SessionLocal()
+    try:
+        task = GenTask(
+            user_id=uid,
+            category="image",
+            stage="preview",
+            status="succeeded",
+            prompt={"final_text": "用户提交的产品提示词"},
+            params={
+                "_generation_prompt": "实际发送给模型的最终提示词",
+                "_model_snapshot": {"model_id": "gpt-image-test", "provider": "openai"},
+            },
+            model_use="image",
+            cost_frozen=10,
+            cost_settled=10,
+            finished_at=datetime.now(timezone.utc),
+        )
+        db.add(task)
+        db.commit()
+        task_id = task.id
+    finally:
+        db.close()
+
+    body = client.get(f"/api/tasks/{task_id}", headers=h).json()
+
+    assert body["prompt_text"] == "实际发送给模型的最终提示词"
+    assert body["prompt_text_source"] == "generation"
+    assert body["request_prompt_text"] == "用户提交的产品提示词"
+    assert body["generation_prompt_text"] == "实际发送给模型的最终提示词"
+    assert body["model_id"] == "gpt-image-test"
+    assert body["model_provider"] == "openai"
+
+
+def test_task_output_marks_legacy_request_prompt_and_recovers_gateway_model(client, make_user, auth):
+    uid = make_user("13900009113", balance=1000)
+    h = auth("13900009113")
+    db = SessionLocal()
+    try:
+        task = GenTask(
+            user_id=uid,
+            category="image",
+            stage="preview",
+            status="succeeded",
+            prompt={"final_text": "旧任务只保存了用户原始请求"},
+            params={},
+            model_use="image",
+            cost_frozen=10,
+            cost_settled=10,
+            finished_at=datetime.now(timezone.utc),
+        )
+        db.add(task)
+        db.flush()
+        db.add(
+            GatewayCall(
+                user_id=uid,
+                task_id=task.id,
+                kind="image",
+                model_id="legacy-image-model",
+                status="ok",
+            )
+        )
+        db.commit()
+        task_id = task.id
+    finally:
+        db.close()
+
+    body = client.get(f"/api/tasks/{task_id}", headers=h).json()
+
+    assert body["prompt_text"] == "旧任务只保存了用户原始请求"
+    assert body["prompt_text_source"] == "request"
+    assert body["request_prompt_text"] == "旧任务只保存了用户原始请求"
+    assert body["generation_prompt_text"] is None
+    assert body["model_id"] == "legacy-image-model"
+    assert body["model_provider"] is None
+
+
 def test_needs_review_task_output_keeps_reconciliation_error_type(client, make_user, auth):
     uid = make_user("13900009111", balance=1000)
     h = auth("13900009111")

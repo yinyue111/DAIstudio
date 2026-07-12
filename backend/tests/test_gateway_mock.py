@@ -688,7 +688,7 @@ def test_reverse_uses_per_model_gateway_config(monkeypatch):
     assert seen["path"] == "/chat/completions"
     assert seen["timeout"] == settings.reverse_gateway_timeout_seconds
     assert seen["config"] is cfg
-    assert seen["retries"] == 0
+    assert seen["retries"] == settings.gateway_max_retries
     assert seen["payload"]["model"] == "vision-model"
 
 

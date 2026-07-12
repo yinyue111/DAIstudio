@@ -286,6 +286,9 @@ export default function useMediaUpload({
         productProfile: null,
         productProfileSource: "",
         productProfiling: false,
+        subjectProtection: null,
+        subjectProtectionLoading: true,
+        subjectProtectionSource: "",
         variationSource: null,
       }, mode);
       setRefOpen(true);

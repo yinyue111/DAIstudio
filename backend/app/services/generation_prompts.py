@@ -6,33 +6,41 @@ import re
 from ..models import GenTask
 
 PRODUCT_FIDELITY_GUARD = (
-    "产品高保真硬约束：上传产品图是唯一产品身份来源，产品主体、Logo、包装结构、品牌色、形状、"
-    "材质、比例、标签版式、表面纹理和所有可见文字必须完整保留；包装上的品牌名、Logo、中文、"
-    "英文、韩文、数字、装饰图案、标签位置和排版必须逐字逐形保持原图，不得翻译、改写、补写、"
-    "删减、重排、风格化、模糊或替换。只允许改变背景、台面、道具、光线、构图、阴影和广告质感；"
-    "图片生成时产品必须作为完整主体清晰入镜，包装正面、顶部、底部、左右边缘、抽口、盖子、提手、"
-    "外盒轮廓和所有关键结构都必须可见且连续；画面四周保留安全边距，不得裁切产品、生成半截产品、"
-    "缺失边角、压扁盒体、破坏开口结构，或让草叶、水花、道具、前景虚化遮挡包装和文字；"
-    "产品边缘必须自然融入真实拍摄场景，不得出现贴纸式白边、抠图描边、剪纸轮廓或悬浮贴片感；"
-    "视频生成时必须用上传产品替换参考片中的原主体、原商品、原品牌或人物，参考片只提供镜头语言、"
-    "展示节奏、可迁移动作、场景和广告质感；视频镜头需让产品文字面尽量正对镜头，完整包装、Logo"
-    "和主要文字应始终留在画面内，避免快速旋转、侧面展示、裁切包装、强运动模糊、遮挡包装文字或"
-    "产品正面离焦；如风格迁移与产品保真冲突，优先保证产品和包装文字不变。"
+    "产品高保真硬约束：上传产品是唯一产品身份，保持同一SKU的外形、比例、包装结构、品牌色、"
+    "材质纹理、Logo、标签版式和可见文字，不得改写、翻译或替换。只可改变背景、道具、光线、"
+    "构图和广告质感；产品须清晰完整入镜并保留安全边距，不得裁切、遮挡、变形、重复或出现抠图白边。"
+    "视频中用上传产品替换参考主体，尽量让文字面朝向镜头并避免快速旋转和运动模糊。冲突时产品保真优先。"
+)
+TISSUE_DISPENSING_GUARD = (
+    "抽取结构约束：仅一张纸巾从包装原有抽口连续伸出，根部收束并与抽口自然连接；"
+    "露出高度克制、宽度与抽口匹配，只保留少量柔软自然褶皱，不得形成大团、多层花束状或悬浮插入感。"
+)
+_TISSUE_PRODUCT_RE = re.compile(r"纸巾|抽纸|柔巾|湿巾|棉柔巾|tissue", re.IGNORECASE)
+_TISSUE_DISPENSING_ACTION_RE = re.compile(
+    r"(?:抽出|抽取(?!式)|抽拉(?!式)|拉出|伸出).{0,12}"
+    r"(?:一张|单张|少量|一角)?(?:纸巾|抽纸|柔巾|湿巾|棉柔巾)|"
+    r"抽.{0,6}(?:一张|单张|少量|一角)(?:纸巾|抽纸|柔巾|湿巾|棉柔巾)|"
+    r"(?:一张|单张|少量|一角)(?:纸巾|抽纸|柔巾|湿巾|棉柔巾)?.{0,12}"
+    r"(?:被)?(?:抽出|抽取(?!式)|拉出|伸出|露出)|"
+    r"(?:纸巾|抽纸|柔巾|湿巾|棉柔巾).{0,8}从(?:包装)?抽口.{0,8}(?:伸出|露出)|"
+    r"从(?:包装)?抽口.{0,8}(?:抽出|伸出|露出).{0,8}"
+    r"(?:一张|单张|少量|一角)?(?:纸巾|抽纸|柔巾|湿巾|棉柔巾)?|"
+    r"露出.{0,8}(?:一张|单张|少量|一角)?(?:纸巾|抽纸|柔巾|湿巾|棉柔巾)|"
+    r"dispens(?:e|ing|ed)?|pull(?:ing|ed)?\s+(?:out\s+)?(?:a\s+)?tissue",
+    re.IGNORECASE,
+)
+_TISSUE_DISPENSING_NEGATION_RE = re.compile(
+    r"(?:不要|不得|禁止|避免|无需|无须|不应).{0,16}(?:纸巾|抽出|抽取|拉出|伸出|露出|dispens|pull)",
+    re.IGNORECASE,
 )
 PORTRAIT_FIDELITY_GUARD = (
-    "人像高保真硬约束：上传人像照片是唯一人物身份来源，必须完整保留同一个人的脸型、五官比例、"
-    "眼睛、鼻子、嘴型、发际线、发型特征、肤色、年龄感、性别和可识别身份；同时保持参考人物在"
-    "服装覆盖下可见的整体身体轮廓，包括肩宽、胸廓饱满度、躯干长度、自然腰线、胯宽、四肢比例、"
-    "姿态重心和胸腰胯过渡，不得主动瘦身、增大、缩小、拉长或重塑体型；不得混合两个人的长相，"
-    "不得改变面部结构、年龄、性别或关键身份特征。若另有独立风格参考素材，不得混入其中的人物身份；"
-    "独立风格参考只用于迁移场景、构图、光线、色调、服化道、动作节奏、镜头语言和广告质感；整体表达必须保持"
-    "成年、自然、得体、专业商业人像或角色设定语境，避免未成年感、夸张身体展示姿态、身体局部凝视、"
-    "私密成人化意图；严格复刻原图主光方向、软硬程度、明暗对比、脸部与服装高光落点、补光关系、"
-    "阴影浓度、暗部色彩层次、材质反射和柔雾/高光扩散强度；如风格迁移与人物保真冲突，优先保证"
-    "人物身份、身体轮廓比例、面部结构、自然表情和原图光影关系稳定。"
+    "人像高保真硬约束：上传人像是唯一人物身份，保持同一个人的脸型、五官比例、发际线、发型、"
+    "肤色、年龄感和可识别特征；保持服装覆盖下可见的肩宽、胸廓、腰胯、四肢比例与姿态重心，"
+    "不得主动瘦身、拉长或重塑体型。风格参考只迁移场景、构图、服化道、动作、镜头与广告质感，"
+    "不得混入参考人物身份。保持原图主光方向、明暗关系、高光阴影和材质反射；表达成年、自然、得体。"
+    "冲突时人物身份、身体比例和光影关系优先。"
 )
-GENERATION_PROMPT_MIN_CHARS = 1000
-GENERATION_PROMPT_MAX_CHARS = 1500
+GENERATION_PROMPT_MAX_CHARS = 800
 CANONICAL_FINAL_TEXT_MIN_CHARS = 80
 _GENERATION_PROMPT_KEEP_KEYS = (
     "图像类型", "反推重点", "主体", "人像意图", "人物比例", "身材体态", "身材曲线",
@@ -50,9 +58,15 @@ _STYLE_TRANSFER_KEEP_KEYS = (
 )
 _STYLE_TRANSFER_MOTION_KEYS = {"可迁移主体动作", "主体动作", "产品展示方式"}
 _REFERENCE_PRODUCT_NOUN_RE = re.compile(
-    r"KaHi|Estee\s+Lauder|Advanced\s+Night\s+Repair|Eau\s+de\s+Toilette|"
+    r"KaHi|Kahf|Dior|Estee\s+Lauder|Advanced\s+Night\s+Repair|Eau\s+de\s+Toilette|"
     r"skincare\s+bottle|dropper\s+bottle|bottle|香水瓶|香水|瓶身|瓶盖|滴管瓶|护肤瓶|"
     r"参考商品|参考产品|原商品|原产品",
+    re.IGNORECASE,
+)
+_REFERENCE_PRODUCT_DETAIL_RE = re.compile(
+    r"(?:玻璃|金属|塑料)(?:瓶身|瓶肩|瓶颈|瓶盖|结构|高光|反射|质感)|"
+    r"瓶肩|瓶颈|滴管|喷头|香水液体|玻璃高光|玻璃结构|"
+    r"主体占(?:画幅|画面|构图)?(?:约)?\s*\d{1,2}(?:\.\d+)?\s*%",
     re.IGNORECASE,
 )
 _USER_INSTRUCTION_KEYS = ("user_instruction", "补充要求", "编辑要求", "生成要求")
@@ -150,6 +164,16 @@ PRODUCT_IMAGE_NEGATIVE_TERMS = (
     "白色光晕",
     "剪纸边缘",
     "悬浮贴纸感",
+    "重复产品",
+    "双层包装",
+    "产品轮廓复制",
+    "产品下方额外白色底板",
+    "白色承托片",
+    "包装下方重影",
+    "多张纸巾花束状炸开",
+    "纸巾与抽口断裂",
+    "纸巾悬浮或穿模",
+    "超大纸巾团遮挡包装",
 )
 PORTRAIT_IMAGE_BASE_NEGATIVE_TERMS = (
     "主动瘦身",
@@ -256,6 +280,20 @@ def is_portrait_generation_task(task: GenTask) -> bool:
     )
 
 
+def _tissue_dispensing_requested(prompt_obj: dict) -> bool:
+    identity_evidence = " ".join(str(prompt_obj.get(key) or "") for key in _SUBJECT_PROFILE_KEYS)
+    if not _TISSUE_PRODUCT_RE.search(identity_evidence):
+        return False
+    request_texts = [
+        str(prompt_obj.get(key) or "").strip()
+        for key in ("final_text", "instruction", *_USER_INSTRUCTION_KEYS)
+    ]
+    request_texts = [text for text in dict.fromkeys(request_texts) if text]
+    if any(_TISSUE_DISPENSING_NEGATION_RE.search(text) for text in request_texts):
+        return False
+    return any(_TISSUE_DISPENSING_ACTION_RE.search(text) for text in request_texts)
+
+
 def product_fidelity_prompt(prompt: str, task: GenTask) -> str:
     if is_portrait_generation_task(task):
         text = str(prompt or "")
@@ -265,9 +303,13 @@ def product_fidelity_prompt(prompt: str, task: GenTask) -> str:
     if not is_product_generation_task(task):
         return prompt
     text = str(prompt or "")
+    prompt_obj = task.prompt if isinstance(task.prompt, dict) else {}
+    tissue_guard = TISSUE_DISPENSING_GUARD if _tissue_dispensing_requested(prompt_obj) else ""
     if "产品高保真硬约束" in text:
-        return text
-    return f"{PRODUCT_FIDELITY_GUARD}{text}"
+        if tissue_guard and "抽取结构约束" not in text:
+            text = f"{text}{tissue_guard}"
+        return _trim_generation_prompt(text)
+    return _trim_generation_prompt(f"{PRODUCT_FIDELITY_GUARD}{tissue_guard}{text}")
 
 
 def _normalise_prompt_fragment(value) -> str:
@@ -411,6 +453,7 @@ def _rewrite_product_style_fragment(key: str, value, *, is_video: bool = False) 
         )
     if key in {"构图", "视角构图"}:
         cleaned = _REFERENCE_PRODUCT_NOUN_RE.sub("上传产品", text)
+        cleaned = _REFERENCE_PRODUCT_DETAIL_RE.sub("上传产品对应结构与材质", cleaned)
         return (
             "上传产品为画面唯一视觉中心，完整入镜，四周保留安全边距，包装正面、顶部、底部、"
             "左右边缘、抽口/盖子/提手和外盒轮廓都可见；主体占画幅约55%-75%。"
@@ -419,8 +462,10 @@ def _rewrite_product_style_fragment(key: str, value, *, is_video: bool = False) 
     if key == "场景背景":
         cleaned = re.sub(r"前景[^；。]*覆盖[^；。]*[；。]?", "前景元素只围绕产品底部和边缘，", text)
         cleaned = _REFERENCE_PRODUCT_NOUN_RE.sub("上传产品", cleaned)
+        cleaned = _REFERENCE_PRODUCT_DETAIL_RE.sub("上传产品对应结构与材质", cleaned)
         return f"{cleaned} 前景草叶、水花、道具和虚化元素不得遮挡上传产品包装、Logo和主要文字。"
     cleaned = _REFERENCE_PRODUCT_NOUN_RE.sub("上传产品", text)
+    cleaned = _REFERENCE_PRODUCT_DETAIL_RE.sub("上传产品对应结构与材质", cleaned)
     if key in {"主体动作", "可迁移主体动作", "产品展示方式"} and not is_video:
         return "上传产品保持静态完整展示，只迁移参考素材的商业展示氛围和视觉节奏。"
     return cleaned
@@ -525,16 +570,30 @@ def _trim_generation_prompt(text: str, *, max_chars: int = GENERATION_PROMPT_MAX
     if len(value) <= max_chars:
         return value
     sentences = re.split(r"(?<=[。；;.!?！？])", value)
-    out = ""
+    head_budget = int(max_chars * 0.68)
+    head: list[str] = []
+    head_len = 0
     for sentence in sentences:
         sentence = sentence.strip()
         if not sentence:
             continue
-        if len(out) + len(sentence) > max_chars:
+        if head_len + len(sentence) > head_budget:
             break
-        out += sentence
-    if len(out) >= GENERATION_PROMPT_MIN_CHARS:
-        return out.strip()
+        head.append(sentence)
+        head_len += len(sentence)
+    tail_budget = max_chars - head_len - 1
+    tail: list[str] = []
+    tail_len = 0
+    for sentence in reversed(sentences[len(head):]):
+        sentence = sentence.strip()
+        if not sentence:
+            continue
+        if tail_len + len(sentence) > tail_budget:
+            continue
+        tail.append(sentence)
+        tail_len += len(sentence)
+    if tail:
+        return f"{''.join(head)}…{''.join(reversed(tail))}".rstrip(" ,，;；。")
     return value[:max_chars].rstrip(" ,，;；。")
 
 
@@ -683,6 +742,7 @@ def _prompt_requests_trait(prompt_text: str, requested_pattern: str, rejected_pa
 def product_image_negative_prompt(value: str | None = None) -> str:
     """Merge product-completeness guards into image negative prompts."""
     cleaned = _REFERENCE_PRODUCT_NOUN_RE.sub("上传产品", str(value or ""))
+    cleaned = _REFERENCE_PRODUCT_DETAIL_RE.sub("上传产品结构或材质异常", cleaned)
     return _merge_negative_terms(cleaned, PRODUCT_IMAGE_NEGATIVE_TERMS)
 
 

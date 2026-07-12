@@ -10,6 +10,12 @@
 # on 2026-06-16.
 
 models:
+  - use: prompt        # 直接输入提示词优化 (Anthropic /v1/messages)
+    model_id: gemini-3.5-flash-low
+    cost_credits: 1
+    unlock_cost: 0
+    enabled: true
+
   - use: vision        # 反推:图 -> 结构化提示词  (/v1/chat/completions)
     model_id: gpt-5.5
     cost_credits: 2

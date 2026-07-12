@@ -51,9 +51,10 @@ def test_reverse_image_template_captures_commercial_material_dimensions():
     assert "不得臆造婚纱蕾丝" in template
     assert "不得臆造浅色隐形眼镜" in template
     assert (
-        "人物图 final_text 的优先顺序必须是姿态重心/整体轮廓/视角镜头 "
-        "→ 妆发五官/服装结构 → 光线/材质纹理/后期质感"
+        "姿态重心/整体轮廓/视角镜头 → 妆发五官/服装结构/服装覆盖 "
+        "→ 光线/材质纹理/后期质感"
     ) in template
+    assert "控制在 180-300 个中文字符" in template
     assert "不要写成普通美图描述" in template
     assert '"身材曲线"' not in template
     assert '"尺码三围"' not in template

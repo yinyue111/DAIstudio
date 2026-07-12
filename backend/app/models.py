@@ -462,7 +462,7 @@ class GatewayCall(Base):
     __tablename__ = "gateway_calls"
     __table_args__ = (
         CheckConstraint(
-            "kind in ('reverse', 'image', 'video_submit', 'video_poll', 'video_download')",
+            "kind in ('reverse', 'prompt_optimize', 'image', 'video_submit', 'video_poll', 'video_download')",
             name="ck_gateway_calls_kind_valid",
         ),
         CheckConstraint("status IS NULL OR status in ('ok', 'failed')", name="ck_gateway_calls_status_valid"),
@@ -478,7 +478,7 @@ class GatewayCall(Base):
     id: Mapped[int] = mapped_column(BigIntPK, primary_key=True, autoincrement=True)
     user_id: Mapped[int | None] = mapped_column(BigInteger, index=True)
     task_id: Mapped[int | None] = mapped_column(BigInteger, index=True)
-    kind: Mapped[str] = mapped_column(String(16))  # reverse/image/video_submit/video_poll
+    kind: Mapped[str] = mapped_column(String(16))  # reverse/prompt_optimize/image/video_*
     model_id: Mapped[str | None] = mapped_column(String(128))
     status: Mapped[str | None] = mapped_column(String(16))  # ok/failed
     latency_ms: Mapped[int | None] = mapped_column(Integer)
@@ -514,9 +514,9 @@ class ModelConfig(Base):
     __tablename__ = "model_configs"
     __table_args__ = (
         Index("ix_model_configs_use", "use", unique=True),
-        CheckConstraint("use in ('vision', 'image', 'video')", name="ck_model_configs_use_valid"),
+        CheckConstraint("use in ('vision', 'image', 'video', 'prompt')", name="ck_model_configs_use_valid"),
         CheckConstraint(
-            "gateway_format IS NULL OR gateway_format in ('openai', 'ark')",
+            "gateway_format IS NULL OR gateway_format in ('openai', 'ark', 'anthropic')",
             name="ck_model_configs_gateway_format_valid",
         ),
         CheckConstraint("cost_credits >= 0", name="ck_model_configs_cost_credits_nonnegative"),
@@ -524,12 +524,12 @@ class ModelConfig(Base):
     )
 
     id: Mapped[int] = mapped_column(BigIntPK, primary_key=True, autoincrement=True)
-    use: Mapped[str] = mapped_column(String(16), nullable=False)  # vision/image/video
+    use: Mapped[str] = mapped_column(String(16), nullable=False)  # vision/image/video/prompt
     model_id: Mapped[str] = mapped_column(String(128), nullable=False)
     provider: Mapped[str | None] = mapped_column(String(32))
     base_url: Mapped[str | None] = mapped_column(String(512))
     api_key_encrypted: Mapped[str | None] = mapped_column(Text)
-    gateway_format: Mapped[str | None] = mapped_column(String(16))  # openai | ark
+    gateway_format: Mapped[str | None] = mapped_column(String(16))  # openai | ark | anthropic
     cost_credits: Mapped[int] = mapped_column(BigInteger, default=1)  # cost to run / freeze
     unlock_cost: Mapped[int] = mapped_column(BigInteger, default=0)  # extra cost to unlock HD
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)

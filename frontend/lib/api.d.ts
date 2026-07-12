@@ -45,6 +45,13 @@ export interface Task {
   category: "image" | "video";
   stage: "preview" | "final";
   status: TaskStatus;
+  model_use?: string | null;
+  model_id?: string | null;
+  model_provider?: string | null;
+  prompt_text?: string | null;
+  prompt_text_source?: "generation" | "request" | null;
+  request_prompt_text?: string | null;
+  generation_prompt_text?: string | null;
   parent_task_id?: number | null;
   percent?: number;
   progress?: number;
@@ -112,6 +119,7 @@ export type ProductPixelLockMode = "auto" | "strict" | "off";
 
 export interface SubjectProtectionPreview {
   mode: "alpha_subject" | "auto_subject" | "center_box" | "none";
+  reason?: string | null;
   confidence: number;
   bbox: number[] | null;
   width: number;
@@ -163,6 +171,11 @@ export const api: {
     video_analysis_preset?: string | null,
     client_request_id?: string | null,
   ): Promise<unknown>;
+  optimizePrompt(
+    prompt: string,
+    category?: "image" | "video",
+    product_mode?: boolean,
+  ): Promise<{ prompt: string; model_id: string }>;
   subjectProtectionPreview(asset_url: string, edit_mask_mode?: EditMaskMode): Promise<SubjectProtectionPreview>;
   generate(payload: GeneratePayload): Promise<Task>;
   task(id: number | string): Promise<Task>;

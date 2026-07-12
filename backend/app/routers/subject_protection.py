@@ -29,6 +29,7 @@ class SubjectProtectionPreviewIn(BaseModel):
 
 class SubjectProtectionPreviewOut(BaseModel):
     mode: str
+    reason: str | None
     confidence: float
     bbox: list[int] | None
     width: int
@@ -85,18 +86,11 @@ def _preview_message(
             ["主体必须居中且占画面主体区域。", "如果背景也在中心区域，会被一起保护，场景变化会变少。"],
         )
     if result.mode == "auto_subject" and will_send_mask:
-        if result.confidence >= 0.78:
-            return (
-                "low",
-                "自动主体保护较稳",
-                "已识别出产品主体并会发送蒙版，优先重绘背景和场景。",
-                ["包装小字多时建议开启产品像素锁定或上传透明 PNG。"],
-            )
         return (
             "medium",
             "自动主体保护可用",
-            "已识别出产品主体并会发送蒙版，但边缘置信度一般，细小文字仍可能漂移。",
-            ["产品边缘复杂或白底白产品时，建议检查生成结果或改用透明 PNG。"],
+            "已识别出产品主体并会发送蒙版，但普通图片的白底和细边缘可能误判，自动模式不会回贴原图像素。",
+            ["白底白产品或包装小字多时，优先上传透明 PNG。", "只有确认蒙版边缘准确时才使用强制像素锁。"],
         )
     return (
         "high",
@@ -116,6 +110,7 @@ def _preview_payload(result: EditMaskResult | None, requested_mode: str) -> Subj
     confidence = round(float(result.confidence), 3) if result else 0.0
     return SubjectProtectionPreviewOut(
         mode=result.mode if result else "none",
+        reason=result.reason if result else None,
         confidence=confidence,
         bbox=list(result.bbox) if result and result.bbox else None,
         width=int(result.width) if result else 0,
@@ -124,8 +119,7 @@ def _preview_payload(result: EditMaskResult | None, requested_mode: str) -> Subj
         will_send_mask=will_send,
         pixel_lock_recommended=bool(
             result
-            and result.mode in {"alpha_subject", "auto_subject"}
-            and result.confidence >= 0.78
+            and result.mode == "alpha_subject"
             and will_send
         ),
         risk_level=risk,

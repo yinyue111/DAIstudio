@@ -2,12 +2,17 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import {
+  clearAllWorkspaceContent,
+  clearWorkspaceContent,
+} from "../app/studio/workspaceReset.ts";
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const pageSource = readFileSync(join(root, "app/page.jsx"), "utf8");
 const mediaUploadSource = readFileSync(join(root, "hooks/useMediaUpload.js"), "utf8");
 const workspaceStateSource = readFileSync(join(root, "hooks/useStudioWorkspaceState.js"), "utf8");
 const promptWorkspaceSource = readFileSync(join(root, "app/studio/StudioPromptWorkspace.jsx"), "utf8");
+const referencePanelSource = readFileSync(join(root, "app/studio/StudioReferencePanel.jsx"), "utf8");
 const constantsSource = readFileSync(join(root, "app/studio/constants.ts"), "utf8");
 const editPromptSource = readFileSync(join(root, "app/studio/editPrompt.ts"), "utf8");
 const generationPayloadSource = readFileSync(join(root, "app/studio/generationPayload.ts"), "utf8");
@@ -19,6 +24,55 @@ const generationControlsSource = readFileSync(join(root, "components/StudioGener
 const studioSource = `${pageSource}\n${workspaceStateSource}\n${promptWorkspaceSource}\n${editPromptSource}\n${generationPayloadSource}\n${referenceParsingSource}\n${viewModelSource}\n${constantsSource}\n${generationControlsSource}`;
 const subjectProtectionModule = await import("../lib/studioSubjectProtection.js").catch(() => ({}));
 const { startSubjectProtectionPreview } = subjectProtectionModule;
+
+const clearedWorkspace = clearWorkspaceContent({
+  prompt: "旧提示词",
+  negative: "旧负向词",
+  assets: [{ id: 1 }],
+  selected: { id: 1 },
+  productAsset: { id: 2 },
+  productProfile: { final_text: "旧主体档案" },
+  structured: { 主体: "旧反推主体" },
+  ratio: "3:4",
+});
+assert.equal(clearedWorkspace.prompt, "");
+assert.equal(clearedWorkspace.negative, "");
+assert.deepEqual(clearedWorkspace.assets, []);
+assert.equal(clearedWorkspace.selected, null);
+assert.equal(clearedWorkspace.productAsset, null);
+assert.equal(clearedWorkspace.productProfile, null);
+assert.deepEqual(clearedWorkspace.structured, {});
+assert.equal(clearedWorkspace.ratio, "3:4", "clear should preserve generation settings");
+
+const clearedWorkspaces = clearAllWorkspaceContent({
+  image: {
+    prompt: "文生图旧提示词",
+    assets: [{ id: 1 }],
+    selected: { id: 1 },
+    ratio: "16:9",
+  },
+  video_edit: {
+    prompt: "图生视频旧提示词",
+    productAsset: { id: 2 },
+    productProfile: { final_text: "旧主体档案" },
+    structured: { 主体: "旧反推主体" },
+    vDuration: 10,
+  },
+});
+assert.equal(clearedWorkspaces.image.prompt, "");
+assert.deepEqual(clearedWorkspaces.image.assets, []);
+assert.equal(clearedWorkspaces.image.selected, null);
+assert.equal(clearedWorkspaces.image.ratio, "16:9", "clear all should preserve image settings");
+assert.equal(clearedWorkspaces.video_edit.prompt, "");
+assert.equal(clearedWorkspaces.video_edit.productAsset, null);
+assert.equal(clearedWorkspaces.video_edit.productProfile, null);
+assert.deepEqual(clearedWorkspaces.video_edit.structured, {});
+assert.equal(clearedWorkspaces.video_edit.vDuration, 10, "clear all should preserve video settings");
+assert.match(
+  pageSource,
+  /function clearCurrentWorkspace\(\)[\s\S]*resetOwnerReferenceParsing\(\)[\s\S]*resetOwnerMediaUpload\(\)[\s\S]*setWorkspaces\(clearAllWorkspaceContent\)/,
+  "clear should cancel all mode requests, revoke local previews, and clear every workspace",
+);
 
 assert.equal(
   typeof startSubjectProtectionPreview,
@@ -112,6 +166,45 @@ function deferred() {
 
   assert.deepEqual(values, ["sync success"], "a synchronous preview result should reach onSuccess");
   assert.deepEqual(errors, [failure], "a synchronous preview failure should reach onError");
+}
+
+{
+  let attempts = 0;
+  const writes = [];
+  const busy = Object.assign(new Error("主体保护处理繁忙"), { status: 429 });
+  const request = startSubjectProtectionPreview({
+    load: () => {
+      attempts += 1;
+      return attempts === 1 ? Promise.reject(busy) : Promise.resolve("recovered");
+    },
+    onSuccess: (value) => writes.push(`success:${value}`),
+    onError: (error) => writes.push(`error:${error.message}`),
+    retryDelayMs: 0,
+  });
+
+  await request.settled;
+  assert.equal(attempts, 2, "a transient subject-protection failure should retry once");
+  assert.deepEqual(writes, ["success:recovered"]);
+}
+
+{
+  const pending = deferred();
+  let aborted = false;
+  const abortablePromise = pending.promise;
+  abortablePromise.cancel = () => {
+    aborted = true;
+    pending.reject(Object.assign(new Error("aborted"), { name: "AbortError" }));
+  };
+  const request = startSubjectProtectionPreview({
+    load: () => abortablePromise,
+    onSuccess: () => assert.fail("a canceled preview must not report success"),
+    onError: () => assert.fail("a canceled preview must not report an error"),
+  });
+
+  await Promise.resolve();
+  request.cancel();
+  assert.equal(aborted, true, "canceling a preview should abort its active request");
+  await request.settled;
 }
 
 for (const field of [
@@ -235,6 +328,11 @@ assert.match(
   generationSubmitSource,
   /isProductAssetStillCurrent/,
   "generation submit should abort if product profiling returns for a replaced subject image",
+);
+assert.match(
+  generationSubmitSource,
+  /subjectMode === "portrait"[\s\S]*请先上传人物照片[\s\S]*subjectMode === "product"[\s\S]*请先上传产品主体图片/,
+  "missing edit sources should produce subject-specific guidance",
 );
 assert.match(
   pageSource,
@@ -368,9 +466,64 @@ assert.match(
   "product image editing controls should show subject-protection preflight status",
 );
 assert.match(
+  generationControlsSource,
+  /!subjectProtection\s*\?\s*"待上传"/,
+  "an empty subject-protection state should be shown as waiting for upload",
+);
+assert.match(
+  referencePanelSource,
+  /const imageUploadTargetsProduct = isImageEditMode && productGenerationMode && !productAsset/,
+  "the generic image action should target the product slot until a product exists",
+);
+assert.match(
+  referencePanelSource,
+  /imageUploadTargetsProduct \? productUploadInputRef : imageUploadInputRef/,
+  "the product-first image action should open the product upload input",
+);
+assert.match(
+  referencePanelSource,
+  /imageUploadTargetsProduct \? "上传产品主体" : isImageEditMode \? "上传风格参考图" : "上传图片"/,
+  "product and style-reference upload actions should have explicit labels",
+);
+const productUploadPatch = mediaUploadSource.match(
+  /setWorkspacePatch\(\{\s*productAsset: asset,([\s\S]*?)\}, mode\);/,
+);
+assert.ok(productUploadPatch, "product upload should update the product workspace");
+for (const staleField of [
+  "subjectProtection: null",
+  "subjectProtectionLoading: true",
+  'subjectProtectionSource: ""',
+]) {
+  assert.ok(
+    productUploadPatch[1].includes(staleField),
+    `product replacement should reset ${staleField}`,
+  );
+}
+const apiSource = readFileSync(join(root, "lib/api.js"), "utf8");
+assert.match(
+  apiSource,
+  /subjectProtectionPreview:[\s\S]*?new AbortController\(\)[\s\S]*?promise\.cancel = \(\) => controller\.abort\(\)/,
+  "subject-protection API requests should expose real AbortController cancellation",
+);
+assert.match(
   pageSource,
   /videoProductLockMode:\s*current\.videoProductLockMode \|\| "locked"/,
   "restored workspaces without a lock mode should use text-fidelity lock mode",
+);
+assert.match(
+  pageSource,
+  /const missingRequiredSource = isEditMode && !productAsset/,
+  "edit generation should treat its source image as a required input",
+);
+assert.match(
+  pageSource,
+  /disabled=\{missingRequiredSource \|\| generationSubmitDisabled/,
+  "generation must stay disabled until the required product or portrait source is uploaded",
+);
+assert.match(
+  pageSource,
+  /missingRequiredSource \? missingRequiredSourceLabel : submitLabel/,
+  "the disabled submit button should explain which source image is missing",
 );
 assert.doesNotMatch(
   pageSource,
@@ -464,15 +617,12 @@ assert.match(
 );
 
 for (const phrase of [
-  "包装文字逐字保留",
-  "产品表面像素视为锁定图层",
-  "逐字逐形保持原图",
-  "不得翻译、改写、补写、删减、重排、风格化、模糊或替换",
-  "若风格迁移和产品保真冲突，优先保证产品主体与包装文字完全不变",
+  "Logo和可见文字",
+  "产品与包装文字保真优先",
   "产品正面文字被重排",
   "顶部文字被改写",
   "保留人像身份",
-  "人像照片作为唯一人物身份",
+  "上传人像是唯一人物身份",
   "人物重构",
   "当前为人物参考驱动重构，非逐帧换脸",
 ]) {

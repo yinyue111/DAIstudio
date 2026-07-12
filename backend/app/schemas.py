@@ -148,6 +148,22 @@ class ReverseOut(BaseModel):
     reference_count: int = 1
 
 
+class PromptOptimizeIn(BaseModel):
+    prompt: str = Field(min_length=1, max_length=4000)
+    category: Literal["image", "video"] = "image"
+    product_mode: bool = False
+
+    @field_validator("prompt", mode="before")
+    @classmethod
+    def _strip_prompt(cls, value):
+        return value.strip() if isinstance(value, str) else value
+
+
+class PromptOptimizeOut(BaseModel):
+    prompt: str
+    model_id: str
+
+
 # --- Generate ---
 class GenerateIn(BaseModel):
     # optional: pure text-to-image needs no reference; only set when generating
@@ -175,6 +191,12 @@ class TaskOut(BaseModel):
     parent_task_id: int | None = None
     status: str
     model_use: str | None = None
+    model_id: str | None = None
+    model_provider: str | None = None
+    prompt_text: str | None = None
+    prompt_text_source: Literal["generation", "request"] | None = None
+    request_prompt_text: str | None = None
+    generation_prompt_text: str | None = None
     cost_frozen: int
     cost_settled: int
     error: str | None = None
@@ -434,7 +456,7 @@ class UserStatusIn(BaseModel):
 class ModelConfigIn(BaseModel):
     model_config = ConfigDict(protected_namespaces=())
 
-    use: Literal["vision", "image", "video"]
+    use: Literal["vision", "image", "video", "prompt"]
     model_id: str = Field(min_length=1, max_length=128)
     provider: Literal[
         "openai",
@@ -448,12 +470,13 @@ class ModelConfigIn(BaseModel):
         "baidu_qianfan",
         "tencent_hunyuan",
         "yinyue",
+        "anthropic",
         "custom_openai",
     ] | None = None
     base_url: str | None = Field(default=None, max_length=512)
     api_key: str | None = Field(default=None, max_length=4096)
     api_key_clear: bool = False
-    gateway_format: Literal["openai", "ark"] | None = None
+    gateway_format: Literal["openai", "ark", "anthropic"] | None = None
     cost_credits: int = Field(ge=1, le=MAX_MODEL_COST_CREDITS)
     unlock_cost: int = Field(default=0, ge=0, le=MAX_MODEL_COST_CREDITS)
     enabled: bool = True
@@ -494,7 +517,7 @@ class ModelConfigIn(BaseModel):
 
 
 class ModelProbeIn(BaseModel):
-    use: Literal["vision", "image", "video"] | None = None
+    use: Literal["vision", "image", "video", "prompt"] | None = None
     provider: Literal[
         "openai",
         "volcengine_ark",
@@ -507,11 +530,12 @@ class ModelProbeIn(BaseModel):
         "baidu_qianfan",
         "tencent_hunyuan",
         "yinyue",
+        "anthropic",
         "custom_openai",
     ] | None = None
     base_url: str | None = Field(default=None, max_length=512)
     api_key: str | None = Field(default=None, max_length=4096)
-    gateway_format: Literal["openai", "ark"] | None = None
+    gateway_format: Literal["openai", "ark", "anthropic"] | None = None
 
     @field_validator("base_url")
     @classmethod

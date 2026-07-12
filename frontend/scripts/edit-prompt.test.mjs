@@ -8,11 +8,11 @@ const productPrompt = buildEditPrompt("小红书浴室场景，柔光，干净�
 });
 
 assert.match(productPrompt, /唯一产品身份/);
-assert.match(productPrompt, /包装上的品牌名/);
+assert.match(productPrompt, /Logo和可见文字/);
 assert.match(productPrompt, /完整入镜/);
-assert.match(productPrompt, /半截产品/);
 assert.match(productPrompt, /只用于迁移场景/);
 assert.match(productPrompt, /迁移要求：小红书浴室场景/);
+assert.ok(productPrompt.length <= 450, `product prompt too long: ${productPrompt.length}`);
 
 const portraitVideoPrompt = buildEditPrompt("参考视频的走位和镜头节奏", {
   subject: "portrait",
@@ -21,8 +21,9 @@ const portraitVideoPrompt = buildEditPrompt("参考视频的走位和镜头节�
 });
 
 assert.match(portraitVideoPrompt, /唯一人物身份参考/);
-assert.match(portraitVideoPrompt, /不把参考视频里的人物身份迁移过来/);
-assert.match(portraitVideoPrompt, /面部结构和自然表情完全稳定/);
+assert.match(portraitVideoPrompt, /不迁移参考视频里的人物身份/);
+assert.match(portraitVideoPrompt, /人物身份和身体比例/);
+assert.ok(portraitVideoPrompt.length <= 450, `portrait prompt too long: ${portraitVideoPrompt.length}`);
 
 const generalPrompt = buildEditPrompt("把背景换成纯白棚拍", { generalEdit: true });
 assert.match(generalPrompt, /严格按照用户提示词执行/);

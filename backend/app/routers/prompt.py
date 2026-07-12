@@ -24,7 +24,7 @@ from ..config import settings
 from ..db import get_db
 from ..deps import get_current_user
 from ..models import ReverseOperation, User
-from ..schemas import ReverseIn, ReverseOut
+from ..schemas import PromptOptimizeIn, PromptOptimizeOut, ReverseIn, ReverseOut
 from ..services import asset_refs, credits, gateway, storage, usage, video_frames
 from ..services.config_store import get_model_config, get_setting
 from ..services.content_safety import assert_text_allowed
@@ -46,6 +46,7 @@ _VIDEO_EXTS = (".mp4", ".webm", ".mov")
 _UNSUPPORTED_VIDEO_EXTS = (".m3u8",)
 _REVERSE_RATE_LIMIT = 30
 _REVERSE_RATE_WINDOW = 3600
+_OPTIMIZE_RATE_LIMIT = 60
 REVERSE_IMAGE_REFERENCE_MAX_SIDE = 1024
 REVERSE_IMAGE_REFERENCE_QUALITY = 92
 _assert_text_allowed = assert_text_allowed
@@ -53,6 +54,81 @@ _assert_text_allowed = assert_text_allowed
 
 class ReverseOperationClosed(Exception):
     """The request lost ownership because recovery already finalized it."""
+
+
+@router.post("/optimize", response_model=PromptOptimizeOut)
+def optimize_prompt_text(
+    body: PromptOptimizeIn,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    source = body.prompt.strip()
+    _assert_text_allowed(db, source)
+    count = incr_window(f"prompt_optimize:{user.id}", _REVERSE_RATE_WINDOW)
+    if count > _OPTIMIZE_RATE_LIMIT:
+        raise HTTPException(429, "提示词优化过于频繁，请稍后再试")
+    model = get_model_config(db, "prompt")
+    if model is None or not model.enabled:
+        raise HTTPException(503, "提示词优化模型未启用")
+    cost = max(0, int(model.cost_credits or 0))
+    if cost:
+        try:
+            credits.consume(
+                db,
+                user.id,
+                cost,
+                biz_type="prompt_optimize",
+                note=f"model={model.model_id}",
+            )
+        except credits.InsufficientCredits as e:
+            raise HTTPException(400, str(e)) from e
+    try:
+        result = gateway.optimize_prompt(
+            source,
+            model.model_id,
+            category=body.category,
+            product_mode=body.product_mode,
+            gateway_config=runtime_config_for_model(model, "prompt"),
+        )
+        optimized = str(result.get("prompt") or "").strip()
+        if not optimized:
+            raise gateway.GatewayError("提示词优化模型返回了空结果")
+        _assert_text_allowed(db, optimized)
+    except Exception as e:
+        usage.record_call(
+            db,
+            kind="prompt_optimize",
+            model_id=model.model_id,
+            user_id=user.id,
+            status="failed",
+            detail={
+                "category": body.category,
+                "product_mode": body.product_mode,
+                "error": str(e)[:300],
+            },
+        )
+        if cost:
+            credits.refund_consumed(
+                db,
+                user.id,
+                cost,
+                biz_type="prompt_optimize",
+                note=f"failed model={model.model_id}",
+            )
+        if isinstance(e, gateway.GatewayError):
+            raise HTTPException(502, f"提示词优化失败：{e}") from e
+        raise
+    usage.record_call(
+        db,
+        kind="prompt_optimize",
+        model_id=model.model_id,
+        user_id=user.id,
+        status="ok",
+        latency_ms=result.get("latency_ms"),
+        usage=result.get("usage"),
+        detail={"category": body.category, "product_mode": body.product_mode},
+    )
+    return PromptOptimizeOut(prompt=optimized, model_id=model.model_id)
 
 
 def _looks_like_video_url(url: str) -> bool:

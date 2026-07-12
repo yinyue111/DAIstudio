@@ -1630,7 +1630,7 @@ def test_reverse_portrait_prompt_is_compacted_for_image_gateway(client, make_use
     }, headers=h)
     assert r.status_code == 200, r.text
     sent = seen["prompt"]
-    assert len(sent) <= 1500
+    assert len(sent) <= 800
     assert "生成版提示词" in sent
     assert "主体" in sent and "构图" in sent and "光线" in sent and "风格" in sent
     assert "三围" not in sent

@@ -4,7 +4,7 @@ from __future__ import annotations
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from ..models import GenAsset, GenTask
+from ..models import GatewayCall, GenAsset, GenTask
 from ..schemas import TaskOut
 from .asset_output import to_asset_out
 from .error_codes import task_error_type
@@ -70,6 +70,34 @@ def _decorate_error(out: TaskOut, task: GenTask) -> None:
     out.error_type = task_error_type(task.params, task.error, status=task.status)
 
 
+def _decorate_generation_details(
+    out: TaskOut,
+    task: GenTask,
+    *,
+    gateway_model_id: str | None = None,
+) -> None:
+    params = task.params or {}
+    snapshot = params.get("_model_snapshot") if isinstance(params.get("_model_snapshot"), dict) else {}
+    prompt_obj = task.prompt if isinstance(task.prompt, dict) else {}
+    generation_prompt = str(params.get("_generation_prompt") or "").strip()
+    request_prompt = str(prompt_obj.get("final_text") or prompt_obj.get("instruction") or "").strip()
+    out.request_prompt_text = request_prompt or None
+    out.generation_prompt_text = generation_prompt or None
+    out.prompt_text = generation_prompt or request_prompt or None
+    out.prompt_text_source = "generation" if generation_prompt else ("request" if request_prompt else None)
+    out.model_id = str(snapshot.get("model_id") or gateway_model_id or "").strip() or None
+    out.model_provider = str(snapshot.get("provider") or "").strip() or None
+
+
+def _gateway_model_for_task(db: Session, task_id: int) -> str | None:
+    return db.execute(
+        select(GatewayCall.model_id)
+        .where(GatewayCall.task_id == task_id, GatewayCall.model_id.is_not(None))
+        .order_by(GatewayCall.id.desc())
+        .limit(1)
+    ).scalar_one_or_none()
+
+
 def _decorate_eta(db: Session, out: TaskOut, task: GenTask) -> None:
     eta = video_eta_for_task(db, task)
     if not eta:
@@ -129,6 +157,7 @@ def build_task_out(db: Session, task: GenTask) -> TaskOut:
     out.progress = _progress_for(task)
     _decorate_partial(out, task)
     _decorate_error(out, task)
+    _decorate_generation_details(out, task, gateway_model_id=_gateway_model_for_task(db, task.id))
     _decorate_eta(db, out, task)
     _set_final_cost_estimate(out, task)
     if task.category == "video" and task.stage == "preview":
@@ -166,6 +195,16 @@ def build_task_outs(db: Session, tasks: list[GenTask]) -> list[TaskOut]:
         ).scalars()
         for a in rows:
             by_task.setdefault(a.task_id, []).append(a)
+    gateway_model_by_task: dict[int, str] = {}
+    if ids:
+        gateway_rows = db.execute(
+            select(GatewayCall.task_id, GatewayCall.model_id)
+            .where(GatewayCall.task_id.in_(ids), GatewayCall.model_id.is_not(None))
+            .order_by(GatewayCall.id.desc())
+        ).all()
+        for task_id, model_id in gateway_rows:
+            if task_id is not None and model_id:
+                gateway_model_by_task.setdefault(int(task_id), str(model_id))
     preview_ids = [
         t.id
         for t in tasks
@@ -208,6 +247,7 @@ def build_task_outs(db: Session, tasks: list[GenTask]) -> list[TaskOut]:
         out.progress = _progress_for(t)
         _decorate_partial(out, t)
         _decorate_error(out, t)
+        _decorate_generation_details(out, t, gateway_model_id=gateway_model_by_task.get(t.id))
         _decorate_eta(db, out, t)
         _set_final_cost_estimate(out, t)
         _set_final_summary(

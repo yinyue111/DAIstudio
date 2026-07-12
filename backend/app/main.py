@@ -159,7 +159,13 @@ class BodySizeLimitMiddleware:
             "/api/me/password",
         }:
             return 32 * 1024
-        if path in {"/api/generate", "/api/prompt/reverse", "/api/parse", "/api/subject-protection/preview"}:
+        if path in {
+            "/api/generate",
+            "/api/prompt/reverse",
+            "/api/prompt/optimize",
+            "/api/parse",
+            "/api/subject-protection/preview",
+        }:
             return 256 * 1024
         return None
 

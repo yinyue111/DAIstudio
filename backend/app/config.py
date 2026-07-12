@@ -200,6 +200,11 @@ class Settings(BaseSettings):
     # --- Model gateway (your existing gateway) ---
     gateway_base_url: str = ""
     gateway_api_key: str = ""
+    # Dedicated Anthropic-compatible gateway for direct prompt optimization.
+    # Keep this separate from the vision/image key: providers may issue
+    # different credentials even when both gateways share a host.
+    anthropic_base_url: str = ""
+    anthropic_auth_token: str = ""
     gateway_timeout_seconds: int = 120
     gateway_max_retries: int = 2
     # Vision reverse-prompt calls can include multiple keyframes and may take

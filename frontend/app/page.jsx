@@ -59,6 +59,11 @@ import {
   videoRatioOptions,
 } from "./studio/helpers";
 import { buildStudioDerivedViewState, modelEnabledForConfig, studioCreationFacts } from "./studio/viewModel";
+import {
+  isPromptOptimizationResultCurrent,
+  promptOptimizationContextKey,
+} from "./studio/promptOptimization";
+import { clearAllWorkspaceContent } from "./studio/workspaceReset";
 
 function parsePromptDraft(raw) {
   if (raw && typeof raw === "object") {
@@ -105,6 +110,7 @@ export default function Home() {
   const [promptSaveTitle, setPromptSaveTitle] = useState("");
   const [promptSaveCategory, setPromptSaveCategory] = useState("image");
   const [promptSaveFavorite, setPromptSaveFavorite] = useState(false);
+  const [optimizingPromptMode, setOptimizingPromptMode] = useState("");
 
   // reference (paste link -> reverse) state
   const [refOpen, setRefOpen] = useState(false);
@@ -141,6 +147,8 @@ export default function Home() {
   const variationRestoreContextRef = useRef(null);
   const subjectProfilePendingRequestRef = useRef(null);
   const subjectProfileResultCacheRef = useRef(null);
+  const optimizePromptRequestRef = useRef({});
+  const optimizePromptContextRef = useRef({});
   const {
     workspaces,
     setWorkspaces,
@@ -247,6 +255,15 @@ export default function Home() {
     productGenerationMode,
     portraitGenerationMode,
   } = studioCreationFacts({ creationMode, imageEditProductMode, editSubjectMode });
+  const optimizingPrompt = optimizingPromptMode === creationMode;
+  const currentPromptOptimizationContextKey = promptOptimizationContextKey({
+    creationMode,
+    category,
+    subjectMode,
+    productGenerationMode,
+    promptText: prompt,
+  });
+  optimizePromptContextRef.current[creationMode] = currentPromptOptimizationContextKey;
   const productAssetSignature = assetSignature(productAsset);
 
   useEffect(() => {
@@ -842,6 +859,7 @@ export default function Home() {
       return;
     }
     setMsg("");
+    invalidatePromptOptimization(creationMode);
     setCreationMode(kind);
   }
 
@@ -953,6 +971,77 @@ export default function Home() {
     });
   }
 
+  async function optimizeDirectPrompt() {
+    const source = String(prompt || "").trim();
+    if (!source || !promptDirty || optimizingPrompt) return;
+    const mode = creationMode;
+    const requestId = (optimizePromptRequestRef.current[mode] || 0) + 1;
+    optimizePromptRequestRef.current[mode] = requestId;
+    const request = { id: requestId, contextKey: currentPromptOptimizationContextKey };
+    setOptimizingPromptMode(mode);
+    try {
+      const result = await api.optimizePrompt(source, category, productGenerationMode);
+      if (!isPromptOptimizationResultCurrent(
+        request,
+        optimizePromptRequestRef.current[mode],
+        optimizePromptContextRef.current[mode],
+      )) return;
+      const optimized = String(result?.prompt || "").trim();
+      if (!optimized) throw new Error("优化模型未返回有效提示词");
+      setWorkspacePatch({
+        prompt: optimized,
+        promptDirty: true,
+        promptSourceSignature: "",
+      }, mode);
+      setMsg(`提示词已优化 · ${result.model_id || "gemini-3.5-flash-low"}`);
+      notify.success("提示词已优化，可继续修改或直接生成。 ");
+    } catch (e) {
+      if (!isPromptOptimizationResultCurrent(
+        request,
+        optimizePromptRequestRef.current[mode],
+        optimizePromptContextRef.current[mode],
+      )) return;
+      const text = errorMessage(e, "提示词优化失败，请稍后重试");
+      setMsg(text);
+      notify.error(text);
+    } finally {
+      if (requestId === optimizePromptRequestRef.current[mode]) {
+        setOptimizingPromptMode((current) => (current === mode ? "" : current));
+      }
+    }
+  }
+
+  function invalidatePromptOptimization(mode = creationMode) {
+    optimizePromptRequestRef.current[mode] = (optimizePromptRequestRef.current[mode] || 0) + 1;
+    setOptimizingPromptMode((current) => (current === mode ? "" : current));
+  }
+
+  function updatePromptFromUser(valueOrUpdater) {
+    invalidatePromptOptimization();
+    setPrompt(valueOrUpdater);
+  }
+
+  function changeEditSubjectMode(value) {
+    invalidatePromptOptimization();
+    setEditSubjectMode(value);
+  }
+
+  function clearCurrentWorkspace() {
+    for (const { key: mode } of CREATION_MODES) {
+      invalidatePromptOptimization(mode);
+    }
+    resetOwnerReferenceParsing();
+    resetOwnerMediaUpload();
+    subjectProfilePendingRequestRef.current = null;
+    subjectProfileResultCacheRef.current = null;
+    variationRestoreContextRef.current = null;
+    optimizePromptContextRef.current = {};
+    setWorkspaces(clearAllWorkspaceContent);
+    setPromptLibraryOpen(false);
+    setStructOpen(true);
+    setMsg("");
+  }
+
   async function saveReversePromptToLibrary() {
     const text = String(prompt || "").trim();
     if (!text) {
@@ -987,7 +1076,7 @@ export default function Home() {
   function applyLibraryPrompt(text, mode = "replace") {
     const next = String(text || "").trim();
     if (!next) return;
-    setPrompt((current) => {
+    updatePromptFromUser((current) => {
       if (mode !== "append" || !current.trim()) return next;
       return `${current.trim()}\n\n${next}`;
     });
@@ -1202,6 +1291,12 @@ export default function Home() {
     vResolution,
     videoAnalysisPreset,
   });
+  const missingRequiredSource = isEditMode && !productAsset;
+  const missingRequiredSourceLabel = portraitGenerationMode
+    ? "请先上传人物"
+    : productGenerationMode
+      ? "请先上传产品"
+      : "请先上传图片";
 
   function renderSubmitBar(variant = "desktop") {
     const isMobile = variant === "mobile";
@@ -1219,19 +1314,20 @@ export default function Home() {
         </p>
         <button
           onClick={() => submit(category === "video" ? "final" : "preview")}
-          disabled={generationSubmitDisabled({
+          disabled={missingRequiredSource || generationSubmitDisabled({
             submitting,
             busy: parsing || uploading || reversing || productProfiling,
             currentTask: task,
             nextCategory: category,
             currentModelEnabled,
           })}
+          title={missingRequiredSource ? `${missingRequiredSourceLabel}后再生成` : undefined}
           className="btn-primary btn-lg min-w-28 shrink-0 px-4 sm:min-w-32 sm:px-6"
         >
           {(submitting || running) && (
             <span className="h-4 w-4 shrink-0 animate-spin rounded-full border-2 border-white/35 border-t-white" aria-hidden />
           )}
-          {submitLabel}
+          {missingRequiredSource ? missingRequiredSourceLabel : submitLabel}
         </button>
       </div>
     );
@@ -1287,11 +1383,32 @@ export default function Home() {
                   promptLibraryOpen={promptLibraryOpen}
                   readySteps={editReadySteps}
                   editStyleKeys={editStyleKeys}
-                  onPromptChange={setPrompt}
+                  onPromptChange={updatePromptFromUser}
                   onPromptDirty={setPromptDirty}
                   onAppendPrompt={(text) => applyLibraryPrompt(text, "append")}
                   onTogglePromptLibrary={() => setPromptLibraryOpen((open) => !open)}
-                  onSubjectModeChange={setEditSubjectMode}
+                  onOptimizePrompt={optimizeDirectPrompt}
+                  canOptimizePrompt={Boolean(prompt.trim() && promptDirty)}
+                  optimizingPrompt={optimizingPrompt}
+                  onClearWorkspace={clearCurrentWorkspace}
+                  canClearWorkspace={Boolean(
+                    prompt.trim()
+                    || negative.trim()
+                    || url.trim()
+                    || selected
+                    || productAsset
+                    || assets.length
+                    || Object.keys(structured || {}).length
+                    || productProfile
+                    || variationSource
+                    || parsing
+                    || uploading
+                    || reversing
+                    || productProfiling
+                    || subjectProtection
+                    || optimizingPrompt
+                  )}
+                  onSubjectModeChange={changeEditSubjectMode}
                   onRecompose={recompose}
                   onSubmitPreview={() => submit(category === "video" ? "final" : "preview")}
                 />

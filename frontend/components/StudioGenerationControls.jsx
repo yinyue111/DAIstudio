@@ -75,8 +75,8 @@ export default function StudioGenerationControls({
     {
       key: "auto",
       label: "自动像素锁",
-      hint: "透明 PNG 或高置信主体识别时，把原产品像素锁回生成图，兼顾自然度和 Logo/文字保真。",
-      status: "高置信时锁定",
+      hint: "仅透明 PNG 自动锁回原产品像素；普通 JPG/PNG 只发送主体蒙版，避免白底被误贴进新场景。",
+      status: "透明 PNG 自动锁定",
     },
     {
       key: "strict",
@@ -95,7 +95,7 @@ export default function StudioGenerationControls({
   const pixelLockDisabled = editMaskMode === "off";
   const pixelLockStatus = pixelLockDisabled
     ? "整图编辑不锁像素"
-    : pixelLockOptions.find((option) => option.key === productPixelLockMode)?.status || "高置信时锁定";
+    : pixelLockOptions.find((option) => option.key === productPixelLockMode)?.status || "透明 PNG 自动锁定";
   const pixelLockTip = subjectProtection?.pixel_lock_recommended
     ? "当前图片建议开启像素锁，能更稳地保留产品文字和 Logo。"
     : subjectProtection && !subjectProtectionLoading
@@ -106,6 +106,20 @@ export default function StudioGenerationControls({
     : subjectProtection?.risk_level === "medium"
       ? "border-warn/25 bg-warn/10 text-warn"
       : "border-rose/25 bg-rose/10 text-rose";
+  const subjectProtectionStatus = subjectProtectionLoading
+    ? "识别中"
+    : !subjectProtection
+      ? "待上传"
+      : subjectProtection.will_send_mask
+        ? `置信度 ${Math.round((subjectProtection.confidence || 0) * 100)}%`
+        : subjectProtection.title === "整图编辑"
+          ? "已关闭"
+          : String(subjectProtection.title || "").includes("失败")
+            ? "识别失败"
+            : "未识别主体";
+  const subjectProtectionStatusClass = subjectProtectionLoading || !subjectProtection
+    ? "border-line bg-white/5 text-fog"
+    : riskClass;
   const applyVideoProductMode = (mode) => {
     onVideoProductLockModeChange?.(mode);
     if (mode === "locked") {
@@ -236,12 +250,8 @@ export default function StudioGenerationControls({
                 <div className="mt-2 rounded-lg border border-line bg-base/35 p-2">
                   <div className="flex min-w-0 items-center justify-between gap-2">
                     <span className="text-xs font-semibold text-mist">主体保护预检</span>
-                    <span className={`shrink-0 rounded-full border px-2 py-0.5 text-[11px] ${subjectProtectionLoading ? "border-line bg-white/5 text-fog" : riskClass}`}>
-                      {subjectProtectionLoading
-                        ? "识别中"
-                        : subjectProtection?.will_send_mask
-                          ? `置信度 ${Math.round((subjectProtection.confidence || 0) * 100)}%`
-                          : "未发送蒙版"}
+                    <span className={`shrink-0 rounded-full border px-2 py-0.5 text-[11px] ${subjectProtectionStatusClass}`}>
+                      {subjectProtectionStatus}
                     </span>
                   </div>
                   {subjectProtectionLoading ? (

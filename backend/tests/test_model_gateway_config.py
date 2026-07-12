@@ -1,9 +1,17 @@
 """Admin-configured model providers and model probing."""
 
+import pytest
+
+from app.config import settings
 from app.db import SessionLocal
 from app.models import GenTask, ModelConfig
+from app.runtime_config import validate_model_gateway_rows
 from app.services import gateway
-from app.services.model_gateway_config import decrypt_row_api_key
+from app.services.model_gateway_config import (
+    _env_runtime_config,
+    decrypt_row_api_key,
+    normalise_gateway_format,
+)
 
 
 def test_admin_model_config_encrypts_and_masks_api_key(client, make_user, auth):
@@ -42,6 +50,83 @@ def test_admin_model_config_encrypts_and_masks_api_key(client, make_user, auth):
         assert decrypt_row_api_key(row) == "sk-model-secret"
     finally:
         db.close()
+
+
+def test_prompt_env_gateway_is_independent_from_vision_credentials(monkeypatch):
+    monkeypatch.setattr(settings, "gateway_base_url", "https://vision.example.com/v1")
+    monkeypatch.setattr(settings, "gateway_api_key", "vision-key")
+    monkeypatch.setattr(settings, "anthropic_base_url", "https://prompt.example.com/antigravity")
+    monkeypatch.setattr(settings, "anthropic_auth_token", "prompt-key")
+
+    config = _env_runtime_config("prompt")
+
+    assert config.provider == "anthropic"
+    assert config.base_url == "https://prompt.example.com/antigravity"
+    assert config.api_key == "prompt-key"
+    assert config.gateway_format == "anthropic"
+
+
+def test_prompt_gateway_defaults_to_anthropic_messages_format():
+    assert normalise_gateway_format(None, None, "prompt") == "anthropic"
+
+
+def test_models_yaml_seeds_prompt_optimizer_model(client):
+    with SessionLocal() as db:
+        row = db.query(ModelConfig).filter(ModelConfig.use == "prompt").one()
+
+        assert row.model_id == "gemini-3.5-flash-low"
+        assert row.cost_credits == 1
+        assert row.enabled is True
+
+
+def test_production_accepts_complete_anthropic_env_gateway(client, monkeypatch):
+    monkeypatch.setattr(settings, "debug", False)
+    monkeypatch.setattr(settings, "gateway_base_url", "https://vision.example.com/v1")
+    monkeypatch.setattr(settings, "gateway_api_key", "vision-key")
+    monkeypatch.setattr(settings, "video_gateway_base_url", "https://video.example.com/v1")
+    monkeypatch.setattr(settings, "video_gateway_api_key", "video-key")
+    monkeypatch.setattr(settings, "anthropic_base_url", "https://prompt.example.com/antigravity")
+    monkeypatch.setattr(settings, "anthropic_auth_token", "prompt-key")
+
+    with SessionLocal() as db:
+        for row in db.query(ModelConfig).all():
+            row.base_url = None
+            row.api_key_encrypted = None
+        try:
+            validate_model_gateway_rows(db)
+        finally:
+            db.rollback()
+
+
+@pytest.mark.parametrize(
+    ("base_url", "auth_token"),
+    [
+        ("https://prompt.example.com/antigravity", ""),
+        ("", "prompt-key"),
+    ],
+)
+def test_production_rejects_partial_anthropic_env_gateway(
+    client,
+    monkeypatch,
+    base_url,
+    auth_token,
+):
+    monkeypatch.setattr(settings, "debug", False)
+    monkeypatch.setattr(settings, "anthropic_base_url", base_url)
+    monkeypatch.setattr(settings, "anthropic_auth_token", auth_token)
+
+    with SessionLocal() as db:
+        prompt = db.query(ModelConfig).filter(ModelConfig.use == "prompt").one()
+        prompt.base_url = None
+        prompt.api_key_encrypted = None
+        try:
+            with pytest.raises(
+                RuntimeError,
+                match="ANTHROPIC_BASE_URL 和 ANTHROPIC_AUTH_TOKEN 必须同时配置",
+            ):
+                validate_model_gateway_rows(db)
+        finally:
+            db.rollback()
 
 
 def test_admin_model_config_empty_key_keeps_existing_secret(client, make_user, auth):

@@ -18,7 +18,7 @@ from PIL import Image, ImageDraw
 from app.config import settings
 from app.db import SessionLocal
 from app.main import app
-from app.models import AuditLog, GatewayCall, GenAsset, GenTask, ModelConfig, UploadedAsset
+from app.models import AuditLog, GatewayCall, GenAsset, GenTask, ModelConfig, UploadedAsset, User
 from app.services import generation_media, storage
 from app.services.gateway import _mock_image
 from app.services.watermark import make_model_reference
@@ -51,6 +51,14 @@ def _transparent_product_png_bytes(size=(160, 120)):
     for y in range(30, 95):
         for x in range(45, 120):
             px[x, y] = (40, 110, 210, 255)
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def _incidental_alpha_png_bytes(size=(160, 120)):
+    img = Image.new("RGBA", size, (255, 255, 255, 255))
+    img.putpixel((0, 0), (255, 255, 255, 0))
     buf = io.BytesIO()
     img.save(buf, format="PNG")
     return buf.getvalue()
@@ -1437,8 +1445,8 @@ def test_product_image_edit_uses_larger_reference_and_server_fidelity_guard(
     assert r.status_code == 200, r.text
 
     assert "产品高保真硬约束" in seen["prompt"]
-    assert "包装文字" in seen["prompt"]
-    assert "逐字逐形保持原图" in seen["prompt"]
+    assert "Logo、标签版式和可见文字" in seen["prompt"]
+    assert len(seen["prompt"]) <= 800
     ref_bytes = base64.b64decode(seen["reference_image_url"].split(",", 1)[1])
     ref_img = Image.open(io.BytesIO(ref_bytes))
     assert max(ref_img.size) == 1536
@@ -1725,6 +1733,72 @@ def test_auto_subject_mask_handles_common_white_product_shapes():
         assert bbox_iou(result.bbox, expected) >= 0.82, (name, result.bbox, expected)
 
 
+def test_auto_subject_mask_preserves_hang_tab_holes():
+    img = Image.new("RGB", (800, 800), (255, 255, 255))
+    draw = ImageDraw.Draw(img)
+    draw.rectangle((290, 150, 515, 285), fill=(248, 248, 246), outline=(226, 226, 222), width=3)
+    draw.polygon(
+        [(205, 280), (555, 280), (600, 335), (600, 650), (210, 650), (175, 335)],
+        fill=(247, 247, 244),
+        outline=(223, 223, 219),
+    )
+    draw.ellipse((345, 190, 385, 230), fill=(255, 255, 255), outline=(232, 232, 228), width=2)
+    draw.ellipse((425, 190, 465, 230), fill=(255, 255, 255), outline=(232, 232, 228), width=2)
+    draw.rectangle((275, 390, 485, 470), fill=(25, 25, 25))
+
+    result = generation_media._auto_subject_mask(img.convert("RGBA"))
+
+    assert result.mode == "auto_subject"
+    assert result.confidence >= generation_media.EDIT_MASK_SEND_CONFIDENCE
+    assert _mask_alpha_at(result.data_uri, 365, 210) < 20
+    assert _mask_alpha_at(result.data_uri, 445, 210) < 20
+    assert _mask_alpha_at(result.data_uri, 330, 330) > 200
+
+
+def test_auto_subject_mask_ignores_isolated_soft_pack_background_detail():
+    img = Image.new("RGB", (800, 800), (255, 255, 255))
+    draw = ImageDraw.Draw(img)
+    draw.polygon(
+        [(130, 250), (500, 205), (690, 285), (720, 565), (640, 640), (120, 595), (80, 360)],
+        fill=(248, 248, 246),
+        outline=(224, 224, 220),
+    )
+    draw.line((145, 255, 500, 210), fill=(224, 224, 220), width=4)
+    draw.rectangle((230, 360, 510, 435), outline=(35, 35, 35), width=3)
+    draw.line((640, 220, 672, 220), fill=(235, 235, 232), width=2)
+
+    result = generation_media._auto_subject_mask(img.convert("RGBA"))
+
+    assert result.mode == "auto_subject"
+    assert result.confidence >= generation_media.EDIT_MASK_SEND_CONFIDENCE
+    assert _mask_alpha_at(result.data_uri, 400, 350) > 200
+    assert _mask_alpha_at(result.data_uri, 655, 220) < 20
+
+
+def test_auto_subject_mask_rejects_weak_candidate_touching_any_frame_edge():
+    img = Image.new("RGB", (512, 512), (255, 255, 255))
+    ImageDraw.Draw(img).rectangle((0, 150, 205, 410), fill=(235, 235, 232))
+
+    result = generation_media._auto_subject_mask(img.convert("RGBA"))
+
+    assert result.mode == "none"
+    assert result.data_uri is None
+    assert result.reason == "edge_connected_foreground"
+
+
+def test_auto_subject_mask_does_not_treat_a_dark_label_as_the_whole_white_box():
+    img = Image.new("RGB", (800, 800), (255, 255, 255))
+    draw = ImageDraw.Draw(img)
+    draw.rectangle((170, 120, 630, 680), fill=(254, 254, 254), outline=(252, 252, 252), width=2)
+    draw.rectangle((285, 345, 515, 420), fill=(25, 25, 25))
+
+    result = generation_media._auto_subject_mask(img.convert("RGBA"))
+
+    assert result.mode == "none"
+    assert result.data_uri is None
+    assert result.reason == "label_only_candidate"
+
+
 def test_subject_protection_preview_reports_alpha_mask_and_requires_owner(client, make_user, auth):
     make_user("13900001976", balance=1000)
     make_user("13900001977", balance=1000)
@@ -1750,6 +1824,7 @@ def test_subject_protection_preview_reports_alpha_mask_and_requires_owner(client
     assert data["risk_level"] == "low"
     assert data["will_send_mask"] is True
     assert data["pixel_lock_recommended"] is True
+    assert data["reason"] == "alpha_channel"
     assert data["mask_data_uri"].startswith("data:image/png;base64,")
 
     other_preview = client.post(
@@ -1758,6 +1833,29 @@ def test_subject_protection_preview_reports_alpha_mask_and_requires_owner(client
         headers=other_h,
     )
     assert other_preview.status_code == 404
+
+
+def test_subject_protection_preview_ignores_incidental_alpha_pixels(client, make_user, auth):
+    make_user("13900001979", balance=1000)
+    h = auth("13900001979")
+    up = client.post(
+        "/api/uploads/image",
+        files={"file": ("ordinary.png", _incidental_alpha_png_bytes(), "image/png")},
+        headers=h,
+    )
+    assert up.status_code == 200, up.text
+
+    preview = client.post(
+        "/api/subject-protection/preview",
+        json={"asset_url": up.json()["url"], "edit_mask_mode": "protect_subject"},
+        headers=h,
+    )
+
+    assert preview.status_code == 200, preview.text
+    data = preview.json()
+    assert data["mode"] == "none"
+    assert data["will_send_mask"] is False
+    assert data["reason"] == "no_foreground"
 
 
 def test_subject_protection_preview_distinguishes_auto_center_and_off(client, make_user, auth):
@@ -1781,7 +1879,8 @@ def test_subject_protection_preview_distinguishes_auto_center_and_off(client, ma
     auto_data = auto_preview.json()
     assert auto_data["mode"] == "auto_subject"
     assert auto_data["will_send_mask"] is True
-    assert auto_data["risk_level"] in {"low", "medium"}
+    assert auto_data["risk_level"] == "medium"
+    assert auto_data["pixel_lock_recommended"] is False
 
     center_preview = client.post(
         "/api/subject-protection/preview",
@@ -1865,7 +1964,9 @@ def test_product_image_edit_strict_lock_composites_original_subject_pixels(
         assert asset_row is not None
         hd_key = asset_row.hd_url.rsplit("/media/", 1)[1]
         hd = Image.open(Path(settings.storage_dir) / hd_key)
-        r_px, g_px, b_px = hd.convert("RGB").getpixel((128, 128))
+        # Pixel lock preserves the source reference placement instead of
+        # following a product-like region hallucinated in the result image.
+        r_px, g_px, b_px = hd.convert("RGB").getpixel((60, 128))
         assert r_px > 140
         assert g_px < 110
         assert b_px < 110
@@ -1873,7 +1974,7 @@ def test_product_image_edit_strict_lock_composites_original_subject_pixels(
         db.close()
 
 
-def test_product_image_edit_rgb_auto_mask_composites_high_confidence_subject_by_default(
+def test_product_image_edit_rgb_auto_mask_does_not_composite_subject_by_default(
     client, make_user, auth, monkeypatch
 ):
     uid = make_user("13900001974", balance=1000)
@@ -1921,8 +2022,84 @@ def test_product_image_edit_rgb_auto_mask_composites_high_confidence_subject_by_
         )
         assert task is not None
         assert task.params["_edit_mask_sent"] is True
-        assert task.params["_product_pixel_lock"] == "auto_subject"
+        assert task.params["_edit_mask_sent"] is True
+        assert "_product_composite_applied_count" not in task.params
+    finally:
+        db.close()
+
+
+def test_product_pixel_lock_does_not_follow_result_side_false_subject(
+    client, make_user, auth, monkeypatch
+):
+    uid = make_user("13900001975", balance=1000)
+    h = auth("13900001975")
+    up = client.post(
+        "/api/uploads/image",
+        files={"file": ("product.png", _white_bg_product_png_bytes(), "image/png")},
+        headers=h,
+    )
+    assert up.status_code == 200, up.text
+    asset = up.json()
+
+    monkeypatch.setattr(
+        "app.services.gateway.gen_image",
+        lambda *args, **kwargs: [_repainted_product_scene_bytes()],
+    )
+    real_auto_subject_mask = generation_media._auto_subject_mask
+    mask_calls = 0
+
+    def false_result_subject_after_source(image):
+        nonlocal mask_calls
+        mask_calls += 1
+        if mask_calls == 1:
+            return real_auto_subject_mask(image)
+        return generation_media.EditMaskResult(
+            data_uri=None,
+            mode="auto_subject",
+            confidence=0.88,
+            bbox=(8, 8, 88, 88),
+            width=image.width,
+            height=image.height,
+            reason="false_result_subject",
+        )
+
+    monkeypatch.setattr(generation_media, "_auto_subject_mask", false_result_subject_after_source)
+
+    r = client.post("/api/generate", json={
+        "source_asset_url": asset["url"],
+        "source_type": "image",
+        "source_asset_meta": {
+            "selected_type": "image",
+            "mode": "image_edit",
+            "product_generation_mode": True,
+        },
+        "category": "image",
+        "stage": "preview",
+        "prompt": {
+            "final_text": "put this product into a forest scene",
+            "instruction": "put this product into a forest scene",
+        },
+        "params": {
+            "n": 1,
+            "size": "1024x1024",
+            "edit_mask_mode": "protect_subject",
+            "product_pixel_lock": "strict",
+        },
+    }, headers=h)
+    assert r.status_code == 200, r.text
+
+    db = SessionLocal()
+    try:
+        task = (
+            db.query(GenTask)
+            .filter(GenTask.user_id == uid)
+            .order_by(GenTask.id.desc())
+            .first()
+        )
+        assert task is not None
         assert task.params["_product_composite_applied_count"] == 1
+        assert task.params["_product_composite_placement"] == "source_scaled_bbox"
+        assert task.params["_product_composite_target_bbox"] != [8, 8, 88, 88]
     finally:
         db.close()
 
@@ -1987,8 +2164,8 @@ def test_product_image_edit_alpha_mask_records_high_confidence_subject_protectio
 def test_product_image_edit_auto_mask_failure_does_not_send_center_box_fallback(
     client, make_user, auth, monkeypatch
 ):
-    uid = make_user("13900001975", balance=1000)
-    h = auth("13900001975")
+    uid = make_user("13900001980", balance=1000)
+    h = auth("13900001980")
 
     up = client.post(
         "/api/uploads/image",
@@ -1997,11 +2174,12 @@ def test_product_image_edit_auto_mask_failure_does_not_send_center_box_fallback(
     )
     assert up.status_code == 200, up.text
     asset = up.json()
-    seen = {}
+    generated = False
 
     def fake_gen_image(prompt, image_model_id, n=4, size="1024x1024",
                        reference_image_url=None, edit_path=None, extra_payload=None):
-        seen["extra_payload"] = extra_payload or {}
+        nonlocal generated
+        generated = True
         return [_mock_image(prompt, "256x256", 0)]
 
     monkeypatch.setattr("app.services.gateway.gen_image", fake_gen_image)
@@ -2023,7 +2201,7 @@ def test_product_image_edit_auto_mask_failure_does_not_send_center_box_fallback(
         "params": {"n": 1, "size": "1024x1024", "edit_mask_mode": "protect_subject"},
     }, headers=h)
     assert r.status_code == 200, r.text
-    assert "mask" not in seen["extra_payload"]
+    assert generated is False
 
     db = SessionLocal()
     try:
@@ -2036,6 +2214,11 @@ def test_product_image_edit_auto_mask_failure_does_not_send_center_box_fallback(
         assert task is not None
         assert task.params["_edit_mask_mode"] == "none"
         assert task.params["_edit_mask_sent"] is False
+        assert task.status == "failed"
+        assert "产品主体保护未能可靠识别" in task.error
+        user = db.get(User, uid)
+        assert user.balance_credits == 1000
+        assert user.frozen_credits == 0
     finally:
         db.close()
 
@@ -2190,7 +2373,8 @@ def test_portrait_image_edit_accepts_character_reference_and_server_fidelity_gua
     assert r.status_code == 200, r.text
 
     assert "人像高保真硬约束" in seen["prompt"]
-    assert "上传人像照片是唯一人物身份来源" in seen["prompt"]
+    assert "上传人像是唯一人物身份" in seen["prompt"]
+    assert len(seen["prompt"]) <= 800
     assert seen["reference_image_url"].startswith("data:image/jpeg;base64,")
 
 

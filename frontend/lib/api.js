@@ -299,7 +299,14 @@ function errorTextToMessage(text, status, fallback = "请求失败") {
 
 async function request(
   path,
-  { method = "GET", body, auth = true, timeoutMs = DEFAULT_TIMEOUT_MS, redirectOn401 = true } = {},
+  {
+    method = "GET",
+    body,
+    auth = true,
+    timeoutMs = DEFAULT_TIMEOUT_MS,
+    redirectOn401 = true,
+    signal = null,
+  } = {},
 ) {
   const headers = { "Content-Type": "application/json" };
   if (auth) {
@@ -313,6 +320,7 @@ async function request(
       headers,
       body: body ? JSON.stringify(body) : undefined,
       credentials: "include",
+      signal,
     },
     timeoutMs,
   );
@@ -472,12 +480,23 @@ export const api = {
       body: { asset_url, target, fallback_image, source_type, video_analysis_preset, client_request_id },
       timeoutMs: REVERSE_TIMEOUT_MS,
     }),
-  subjectProtectionPreview: (asset_url, edit_mask_mode = "protect_subject") =>
-    request("/api/subject-protection/preview", {
+  optimizePrompt: (prompt, category = "image", product_mode = false) =>
+    request("/api/prompt/optimize", {
+      method: "POST",
+      body: { prompt, category, product_mode },
+      timeoutMs: REVERSE_TIMEOUT_MS,
+    }),
+  subjectProtectionPreview: (asset_url, edit_mask_mode = "protect_subject") => {
+    const controller = new AbortController();
+    const promise = request("/api/subject-protection/preview", {
       method: "POST",
       body: { asset_url, edit_mask_mode },
       timeoutMs: REVERSE_TIMEOUT_MS,
-    }),
+      signal: controller.signal,
+    });
+    promise.cancel = () => controller.abort();
+    return promise;
+  },
   generate: (payload) =>
     request("/api/generate", { method: "POST", body: payload, timeoutMs: GENERATE_TIMEOUT_MS }),
   task: (id) => request(`/api/tasks/${id}`),

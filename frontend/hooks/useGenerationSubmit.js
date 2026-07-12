@@ -113,7 +113,15 @@ export default function useGenerationSubmit({
       return;
     }
     if (isEditMode && !productAsset) {
-      setMsg(isImageEditMode ? "请先上传要编辑的图片" : "请先上传产品主体图片");
+      setMsg(
+        subjectMode === "portrait"
+          ? "请先上传人物照片"
+          : subjectMode === "product"
+            ? "请先上传产品主体图片"
+            : isImageEditMode
+              ? "请先上传要编辑的图片"
+              : "请先上传主体图片",
+      );
       return;
     }
     if (isEditMode && !String(prompt || "").trim() && Object.keys(structured || {}).length === 0) {
