@@ -23,6 +23,7 @@ from ..services.generation import (
     assert_model_snapshot_compatible,
     model_snapshot,
 )
+from ..services.generation_media import video_render_duration
 from ..services.generation_prompts import compact_image_prompt_payload
 from ..services.generation_request import (
     assert_client_request_replay,
@@ -42,6 +43,11 @@ from ..services.ssrf import (
     local_storage_key_from_user_asset_url,
 )
 from ..services.task_output import build_task_out
+from ..services.video_prompt_compiler import (
+    build_video_prompt_references,
+    compile_video_prompt,
+    store_video_prompt_compile,
+)
 
 router = APIRouter(prefix="/api", tags=["generate"])
 
@@ -377,6 +383,17 @@ def generate(body: GenerateIn, request: Request,
     if not model or not model.enabled:
         raise HTTPException(400, f"未配置可用的{model_use}模型")
 
+    if body.stage == "final" and parent:
+        inherited_snapshot = (dict(parent.params or {}).get("_model_snapshot") or {})
+        if inherited_snapshot:
+            try:
+                assert_model_snapshot_compatible(model, inherited_snapshot)
+            except generation.ModelSnapshotMismatchError as e:
+                raise HTTPException(409, str(e)) from e
+        snapshot = inherited_snapshot or model_snapshot(model)
+    else:
+        snapshot = model_snapshot(model)
+
     # SSRF: validate every URL that may be forwarded to us / the gateway. This
     # runs for ALL stages — including `final`, which inherits its preview's
     # params and could carry an unsafe URL written before this guard existed.
@@ -414,6 +431,59 @@ def generate(body: GenerateIn, request: Request,
     ):
         raise HTTPException(400, "视频参考缺少可用封面或反推提示词,请先反推视频或选择带封面的素材")
 
+    if body.category == "video":
+        references = build_video_prompt_references(
+            source_asset_url=source_asset_url,
+            source_type=source_type,
+            params=task_params,
+        )
+        snapshot_extra = snapshot.get("extra") if isinstance(snapshot.get("extra"), dict) else {}
+        model_profiles = (
+            snapshot_extra.get("video_prompt_profiles")
+            or snapshot_extra.get("prompt_profiles")
+        )
+        if not isinstance(model_profiles, dict):
+            model_profiles = None
+        compiled = compile_video_prompt(
+            prompt,
+            duration=video_render_duration(task_params, body.stage),
+            model_id=str(snapshot.get("model_id") or ""),
+            provider=str(snapshot.get("provider") or ""),
+            extra=snapshot_extra,
+            references=references,
+            product_reference=any(item.get("role") == "product" for item in references),
+            portrait_reference=any(item.get("role") == "character" for item in references),
+            product_lock_mode=str(task_params.get("product_lock_mode") or "locked"),
+            product_video_template=str(
+                task_params.get("product_video_template") or "stable_showcase"
+            ),
+            model_profiles=model_profiles,
+        )
+        if compiled.get("sequence_required"):
+            metadata = compiled.get("metadata") if isinstance(compiled.get("metadata"), dict) else {}
+            profile = compiled.get("profile") if isinstance(compiled.get("profile"), dict) else {}
+            shot_count = max(1, int(metadata.get("shot_count") or 1))
+            max_shots = max(1, int(profile.get("recommended_max_shots") or 1))
+            recommended_clip_count = max(
+                2,
+                int(metadata.get("recommended_clip_count") or ((shot_count + max_shots - 1) // max_shots)),
+            )
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "video_sequence_required",
+                    "error_type": "user_input",
+                    "error_message": (
+                        "当前脚本超过所选模型和时长的单段承载能力，"
+                        f"建议拆成 {recommended_clip_count} 段视频生成。"
+                    ),
+                    "sequence_required": True,
+                    "recommended_clip_count": recommended_clip_count,
+                    "warnings": list((compiled.get("plan") or {}).get("warnings") or []),
+                },
+            )
+        store_video_prompt_compile(task_params, compiled, references)
+
     n_images = int(task_params.get("n") or default_image_n(db)) \
         if body.category == "image" else 1
     # Persist the resolved n so freeze (here), the worker, and settlement all
@@ -433,16 +503,6 @@ def generate(body: GenerateIn, request: Request,
         assert_client_request_replay(existing_client_task, request_fingerprint)
         return build_task_out(db, existing_client_task)
     _rate_limit(user.id)
-    if body.stage == "final" and parent:
-        inherited_snapshot = (dict(parent.params or {}).get("_model_snapshot") or {})
-        if inherited_snapshot:
-            try:
-                assert_model_snapshot_compatible(model, inherited_snapshot)
-            except generation.ModelSnapshotMismatchError as e:
-                raise HTTPException(409, str(e)) from e
-        snapshot = inherited_snapshot or model_snapshot(model)
-    else:
-        snapshot = model_snapshot(model)
     if body.stage != "final" or parent is None:
         task_params["_source_trace"] = _source_trace(
             source_asset_url=source_asset_url,

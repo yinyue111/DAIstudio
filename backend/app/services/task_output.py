@@ -81,12 +81,44 @@ def _decorate_generation_details(
     prompt_obj = task.prompt if isinstance(task.prompt, dict) else {}
     generation_prompt = str(params.get("_generation_prompt") or "").strip()
     request_prompt = str(prompt_obj.get("final_text") or prompt_obj.get("instruction") or "").strip()
+    raw_prompt = str(prompt_obj.get("raw_text") or "").strip()
+    optimized_prompt = str(prompt_obj.get("optimized_text") or "").strip()
+    has_layered_prompt = bool(
+        raw_prompt
+        or optimized_prompt
+        or prompt_obj.get("optimizer_model_id")
+        or prompt_obj.get("prompt_optimizer_model_id")
+    )
+    assembled_prompt = str(
+        prompt_obj.get("assembled_text") or (request_prompt if has_layered_prompt else "")
+    ).strip()
     out.request_prompt_text = request_prompt or None
+    out.raw_prompt_text = raw_prompt or None
+    out.optimized_prompt_text = optimized_prompt or None
+    out.assembled_prompt_text = assembled_prompt or None
     out.generation_prompt_text = generation_prompt or None
     out.prompt_text = generation_prompt or request_prompt or None
     out.prompt_text_source = "generation" if generation_prompt else ("request" if request_prompt else None)
     out.model_id = str(snapshot.get("model_id") or gateway_model_id or "").strip() or None
     out.model_provider = str(snapshot.get("provider") or "").strip() or None
+    out.prompt_optimizer_model_id = str(
+        prompt_obj.get("prompt_optimizer_model_id")
+        or prompt_obj.get("optimizer_model_id")
+        or params.get("_prompt_optimizer_model_id")
+        or ""
+    ).strip() or None
+    out.prompt_compiler_version = str(params.get("_prompt_compiler_version") or "").strip() or None
+    warnings = params.get("_video_prompt_warnings")
+    out.prompt_warnings = [str(item).strip() for item in warnings if str(item).strip()] \
+        if isinstance(warnings, list) else []
+    overlays = params.get("_post_overlays")
+    out.post_overlays = [str(item).strip() for item in overlays if str(item).strip()] \
+        if isinstance(overlays, list) else []
+    out.voiceover = str(params.get("_voiceover") or "").strip() or None
+    sfx = params.get("_sfx")
+    out.sfx = [str(item).strip() for item in sfx if str(item).strip()] \
+        if isinstance(sfx, list) else []
+    out.sequence_required = bool(params.get("_video_prompt_sequence_required"))
 
 
 def _gateway_model_for_task(db: Session, task_id: int) -> str | None:

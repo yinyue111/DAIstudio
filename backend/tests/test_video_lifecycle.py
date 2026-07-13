@@ -114,6 +114,123 @@ def test_video_preview_completes_via_poll(client, make_user, auth):
         db.close()
 
 
+def test_legacy_video_worker_compiles_and_persists_prompt_before_submit(
+    client, make_user, auth
+):
+    uid = make_user("13900003105", balance=1000, admin=True)
+    h = auth("13900003105")
+    _config_video(client, h)
+    db = SessionLocal()
+    try:
+        task = GenTask(
+            user_id=uid,
+            category="video",
+            stage="preview",
+            status="queued",
+            prompt={
+                "shots": ["旧分镜：产品静置"],
+                "user_instruction": "Shot 1：手持产品稳定入镜。字幕：新品上市",
+            },
+            params={"duration": 5, "resolution": "720p"},
+            cost_frozen=5,
+        )
+        db.add(task)
+        db.flush()
+        task_id = task.id
+        credits.freeze(db, uid, 5, biz_ref=task_id, commit=False)
+        db.commit()
+    finally:
+        db.close()
+
+    submitted = {}
+    enqueued = []
+
+    def capture_submit(model, prompt, params):
+        submitted.update(model=model, prompt=prompt, params=params)
+        return "ext-legacy-compiled"
+
+    generation_video_submit.start_video_task(
+        task_id,
+        submit_video_fn=capture_submit,
+        try_enqueue_poll_fn=lambda *args: enqueued.append(args),
+    )
+
+    assert "旧分镜" not in submitted["prompt"]
+    assert "手持产品稳定入镜" in submitted["prompt"]
+    assert "新品上市" not in submitted["prompt"]
+    assert enqueued == [(task_id, "ext-legacy-compiled")]
+    with SessionLocal() as verify_db:
+        task = verify_db.get(GenTask, task_id)
+        params = task.params or {}
+        assert task.status == "running"
+        assert task.phase == "polling"
+        assert task.external_task_id == "ext-legacy-compiled"
+        assert params["_generation_prompt"] == submitted["prompt"]
+        assert params["_prompt_compiler_version"] == "video-prompt-v2"
+        assert params["_post_overlays"] == ["新品上市"]
+        assert params["_video_prompt_plan"]["shots"] == ["手持产品稳定入镜"]
+
+
+def test_legacy_video_worker_rejects_overload_before_provider_submit_and_refunds(
+    client, make_user, auth
+):
+    uid = make_user("13900003106", balance=1000, admin=True)
+    h = auth("13900003106")
+    _config_video(
+        client,
+        h,
+        extra={
+            "prompt_profile": {
+                "max_prompt_chars": 900,
+                "max_shots_by_duration": {"5": 1, "10": 2},
+            }
+        },
+    )
+    db = SessionLocal()
+    try:
+        task = GenTask(
+            user_id=uid,
+            category="video",
+            stage="preview",
+            status="queued",
+            prompt={
+                "final_text": "Shot 1：产品入镜；Shot 2：推近 Logo。"
+            },
+            params={"duration": 10, "resolution": "720p"},
+            cost_frozen=5,
+        )
+        db.add(task)
+        db.flush()
+        task_id = task.id
+        credits.freeze(db, uid, 5, biz_ref=task_id, commit=False)
+        db.commit()
+    finally:
+        db.close()
+
+    called = False
+
+    def unexpected_submit(*_args, **_kwargs):
+        nonlocal called
+        called = True
+        return "must-not-submit"
+
+    generation_video_submit.start_video_task(
+        task_id,
+        submit_video_fn=unexpected_submit,
+        try_enqueue_poll_fn=lambda *_args: None,
+    )
+
+    assert called is False
+    with SessionLocal() as verify_db:
+        task = verify_db.get(GenTask, task_id)
+        user = verify_db.get(User, uid)
+        assert task.status == "failed"
+        assert task.external_task_id is None
+        assert task.cost_settled == 0
+        assert user.balance_credits == 1000
+        assert user.frozen_credits == 0
+
+
 def test_resume_recovers_stranded_video(client, make_user, auth):
     uid = make_user("13900000062", balance=1000, admin=True)
     h = auth("13900000062")
@@ -1528,7 +1645,19 @@ def test_final_generation_drops_preview_video_runtime_params(client, make_user, 
         assert params["target_resolution"] == "1080p"
         assert params["_source_trace"] == {"mode": "reverse"}
         assert "request_id" not in params
-        assert not any(key.startswith("_video_") for key in params)
+        for runtime_key in (
+            "_video_request_id",
+            "_video_result_url",
+            "_video_result_usage",
+            "_video_result_mock",
+            "_video_download_started_at",
+            "_video_download_attempts",
+            "_video_result_keys",
+            "_video_poll_state_unknown",
+            "_video_download_state_unknown",
+        ):
+            assert runtime_key not in params
+        assert params["_video_prompt_plan"]
     finally:
         db.close()
 

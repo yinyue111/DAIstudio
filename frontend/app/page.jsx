@@ -149,6 +149,7 @@ export default function Home() {
   const subjectProfileResultCacheRef = useRef(null);
   const optimizePromptRequestRef = useRef({});
   const optimizePromptContextRef = useRef({});
+  const promptOptimizationRecordsRef = useRef({});
   const {
     workspaces,
     setWorkspaces,
@@ -257,15 +258,41 @@ export default function Home() {
     portraitGenerationMode,
   } = studioCreationFacts({ creationMode, imageEditProductMode, editSubjectMode });
   const optimizingPrompt = optimizingPromptMode === creationMode;
-  const currentPromptOptimizationContextKey = promptOptimizationContextKey({
+  const productAssetSignature = assetSignature(productAsset);
+  const referenceSignature = [productAssetSignature, assetSignature(selected)].join("|");
+  const targetModel = cfg?.models?.[category] || {};
+  const targetGateway = cfg?.gateways?.[category] || {};
+  const targetModelId = targetModel.model_id || targetGateway.model_id || "";
+  const targetModelProvider = targetModel.provider || targetGateway.provider || "";
+  const promptOptimizationContext = {
     creationMode,
     category,
     subjectMode,
     productGenerationMode,
+    duration: category === "video" ? Number(vDuration) : "",
+    referenceSignature,
+    subjectProfileSource: productProfileSource,
+    targetModelId,
+    targetModelProvider,
+  };
+  const currentPromptOptimizationContextKey = promptOptimizationContextKey({
+    ...promptOptimizationContext,
     promptText: prompt,
   });
   optimizePromptContextRef.current[creationMode] = currentPromptOptimizationContextKey;
-  const productAssetSignature = assetSignature(productAsset);
+  const promptOptimizationScopeKey = promptOptimizationContextKey(promptOptimizationContext);
+  const promptOptimizationRecord = promptOptimizationRecordsRef.current[creationMode];
+  const promptForGeneration = (
+    category === "video"
+    && promptOptimizationRecord?.scope_key === promptOptimizationScopeKey
+      ? {
+          text: prompt,
+          raw_text: promptOptimizationRecord.raw_text,
+          optimized_text: promptOptimizationRecord.optimized_text,
+          optimizer_model_id: promptOptimizationRecord.optimizer_model_id,
+        }
+      : prompt
+  );
 
   useEffect(() => {
     workspacesRef.current = workspaces;
@@ -716,7 +743,7 @@ export default function Home() {
     uploading,
     reversing,
     productProfiling,
-    prompt,
+    prompt: promptForGeneration,
     negative,
     promptDirty,
     promptSourceSignature,
@@ -986,7 +1013,29 @@ export default function Home() {
     const request = { id: requestId, contextKey: currentPromptOptimizationContextKey };
     setOptimizingPromptMode(mode);
     try {
-      const result = await api.optimizePrompt(source, category, productGenerationMode);
+      const referenceType = productAsset
+        ? (subjectMode === "portrait" ? "portrait_image" : "product_image")
+        : selected?.type === "video"
+          ? "reference_video"
+          : selected
+            ? "reference_image"
+            : "text";
+      const subjectProfile = productProfile?.structured
+        ? {
+            ...productProfile.structured,
+            ...(productProfile.final_text ? { final_text: productProfile.final_text } : {}),
+          }
+        : null;
+      const result = await api.optimizePrompt(source, {
+        category,
+        product_mode: productGenerationMode,
+        duration: category === "video" ? Number(vDuration) : undefined,
+        subject_mode: subjectMode,
+        reference_type: referenceType,
+        subject_profile: subjectProfile,
+        target_model_id: targetModelId || undefined,
+        target_model_provider: targetModelProvider || undefined,
+      });
       if (!isPromptOptimizationResultCurrent(
         request,
         optimizePromptRequestRef.current[mode],
@@ -994,6 +1043,12 @@ export default function Home() {
       )) return;
       const optimized = String(result?.prompt || "").trim();
       if (!optimized) throw new Error("优化模型未返回有效提示词");
+      promptOptimizationRecordsRef.current[mode] = {
+        raw_text: source,
+        optimized_text: optimized,
+        optimizer_model_id: result.optimizer_model_id || result.model_id || "",
+        scope_key: promptOptimizationScopeKey,
+      };
       setWorkspacePatch({
         prompt: optimized,
         promptDirty: true,
@@ -1029,6 +1084,7 @@ export default function Home() {
 
   function changeEditSubjectMode(value) {
     invalidatePromptOptimization();
+    delete promptOptimizationRecordsRef.current[creationMode];
     setEditSubjectMode(value);
   }
 
@@ -1042,6 +1098,7 @@ export default function Home() {
     subjectProfileResultCacheRef.current = null;
     variationRestoreContextRef.current = null;
     optimizePromptContextRef.current = {};
+    promptOptimizationRecordsRef.current = {};
     setWorkspaces(clearAllWorkspaceContent);
     setPromptLibraryOpen(false);
     setStructOpen(true);

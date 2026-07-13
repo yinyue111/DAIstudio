@@ -153,16 +153,46 @@ class PromptOptimizeIn(BaseModel):
     prompt: str = Field(min_length=1, max_length=4000)
     category: Literal["image", "video"] = "image"
     product_mode: bool = False
+    duration: int | None = Field(default=None, ge=1, le=3600)
+    subject_mode: Literal["general", "product", "portrait"] | None = None
+    reference_type: str | None = Field(default=None, max_length=64)
+    subject_profile: dict[str, Any] | str | None = None
+    target_model_id: str | None = Field(default=None, max_length=256)
+    target_model_provider: str | None = Field(default=None, max_length=128)
 
-    @field_validator("prompt", mode="before")
+    @field_validator(
+        "prompt",
+        "reference_type",
+        "target_model_id",
+        "target_model_provider",
+        mode="before",
+    )
     @classmethod
-    def _strip_prompt(cls, value):
-        return value.strip() if isinstance(value, str) else value
+    def _strip_text(cls, value):
+        if not isinstance(value, str):
+            return value
+        stripped = value.strip()
+        return stripped or None
+
+    @field_validator("subject_profile")
+    @classmethod
+    def _validate_subject_profile(cls, value):
+        if isinstance(value, str):
+            value = value.strip()
+            if len(value) > 4000:
+                raise ValueError("主体档案过长")
+            return value or None
+        if isinstance(value, dict):
+            _validate_json_payload_size(value, 16 * 1024, "主体档案")
+        return value
 
 
 class PromptOptimizeOut(BaseModel):
     prompt: str
     model_id: str
+    optimizer_model_id: str | None = None
+    compiler_metadata: dict[str, Any] | None = None
+    context_metadata: dict[str, Any] | None = None
 
 
 # --- Generate ---
@@ -198,6 +228,16 @@ class TaskOut(BaseModel):
     prompt_text_source: Literal["generation", "request"] | None = None
     request_prompt_text: str | None = None
     generation_prompt_text: str | None = None
+    raw_prompt_text: str | None = None
+    optimized_prompt_text: str | None = None
+    assembled_prompt_text: str | None = None
+    prompt_optimizer_model_id: str | None = None
+    prompt_compiler_version: str | None = None
+    prompt_warnings: list[str] = Field(default_factory=list)
+    post_overlays: list[str] = Field(default_factory=list)
+    voiceover: str | None = None
+    sfx: list[str] = Field(default_factory=list)
+    sequence_required: bool = False
     cost_frozen: int
     cost_settled: int
     error: str | None = None

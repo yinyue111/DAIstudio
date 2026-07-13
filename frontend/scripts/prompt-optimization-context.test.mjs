@@ -27,6 +27,44 @@ const portrait = promptOptimizationContextKey({
 assert.notEqual(general, product);
 assert.notEqual(product, portrait);
 
+const fiveSecondVideo = promptOptimizationContextKey({
+  creationMode: "video_edit",
+  category: "video",
+  subjectMode: "product",
+  productGenerationMode: true,
+  duration: 5,
+  referenceSignature: "product-a|style-a",
+  subjectProfileSource: "product-a",
+  targetModelId: "seedance-mini",
+  targetModelProvider: "volcengine_ark",
+});
+const fifteenSecondVideo = promptOptimizationContextKey({
+  creationMode: "video_edit",
+  category: "video",
+  subjectMode: "product",
+  productGenerationMode: true,
+  duration: 15,
+  referenceSignature: "product-a|style-a",
+  subjectProfileSource: "product-a",
+  targetModelId: "seedance-mini",
+  targetModelProvider: "volcengine_ark",
+});
+assert.notEqual(fiveSecondVideo, fifteenSecondVideo);
+assert.notEqual(
+  fiveSecondVideo,
+  promptOptimizationContextKey({
+    creationMode: "video_edit",
+    category: "video",
+    subjectMode: "product",
+    productGenerationMode: true,
+    duration: 5,
+    referenceSignature: "product-b|style-a",
+    subjectProfileSource: "product-b",
+    targetModelId: "grok-imagine-video",
+    targetModelProvider: "yinyue",
+  }),
+);
+
 const request = { id: 7, contextKey: general };
 assert.equal(isPromptOptimizationResultCurrent(request, 7, general), true);
 assert.equal(isPromptOptimizationResultCurrent(request, 7, product), false);

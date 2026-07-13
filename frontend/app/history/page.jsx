@@ -342,6 +342,7 @@ export default function HistoryPage() {
           <div className="space-y-4">
             {tasks.map((t) => {
               const promptRecords = taskPromptRecords(t);
+              const promptMetadata = taskPromptMetadata(t);
               return (
               <div key={t.id} className="card p-4 animate-fadeup">
                 <div className="mb-3 flex flex-wrap items-center gap-2 text-sm">
@@ -357,6 +358,12 @@ export default function HistoryPage() {
                     <span className="mr-2 text-mist">模型</span>
                     <span className="break-all text-snow">{taskModelLabel(t)}</span>
                   </p>
+                  {promptMetadata.map((item) => (
+                    <p key={item.key} className="min-w-0 text-fog">
+                      <span className="mr-2 text-mist">{item.label}</span>
+                      <span className="break-words text-snow">{item.text}</span>
+                    </p>
+                  ))}
                   {promptRecords.map((record) => (
                     <details key={record.key} className="min-w-0 flex-1 basis-full sm:basis-auto">
                       <summary className="w-fit cursor-pointer select-none text-mist transition hover:text-snow">
@@ -558,14 +565,25 @@ function taskPromptLabel(task) {
 }
 
 function taskPromptRecords(task) {
+  const rawPrompt = String(task?.raw_prompt_text || "").trim();
   const requestPrompt = String(task?.request_prompt_text || "").trim();
+  const optimizedPrompt = String(task?.optimized_prompt_text || "").trim();
+  const assembledPrompt = String(task?.assembled_prompt_text || "").trim();
   const generationPrompt = String(task?.generation_prompt_text || "").trim();
   const records = [];
-  if (requestPrompt) {
+  if (rawPrompt) {
+    records.push({ key: "raw", label: "用户原始输入", text: rawPrompt });
+  } else if (requestPrompt) {
     records.push({ key: "request", label: "原始请求提示词", text: requestPrompt });
   }
+  if (optimizedPrompt) {
+    records.push({ key: "optimized", label: "LLM 优化稿", text: optimizedPrompt });
+  }
+  if (assembledPrompt) {
+    records.push({ key: "assembled", label: "组装请求稿", text: assembledPrompt });
+  }
   if (generationPrompt) {
-    records.push({ key: "generation", label: "最终生成提示词", text: generationPrompt });
+    records.push({ key: "generation", label: "最终模型稿", text: generationPrompt });
   }
   if (records.length) return records;
   return [{
@@ -573,6 +591,31 @@ function taskPromptRecords(task) {
     label: taskPromptLabel(task),
     text: task?.prompt_text || "该历史任务未保存可展示的提示词。",
   }];
+}
+
+function taskPromptMetadata(task) {
+  const optimizerModel = String(task?.prompt_optimizer_model_id || "").trim();
+  const compilerVersion = String(task?.prompt_compiler_version || "").trim();
+  const warnings = Array.isArray(task?.prompt_warnings)
+    ? task.prompt_warnings.map((item) => String(item || "").trim()).filter(Boolean)
+    : [];
+  const overlays = Array.isArray(task?.post_overlays)
+    ? task.post_overlays.map((item) => String(item || "").trim()).filter(Boolean)
+    : [];
+  const sfx = Array.isArray(task?.sfx)
+    ? task.sfx.map((item) => String(item || "").trim()).filter(Boolean)
+    : [];
+  const items = [];
+  if (optimizerModel) items.push({ key: "optimizer", label: "提示词优化模型", text: optimizerModel });
+  if (compilerVersion) items.push({ key: "compiler", label: "编译器版本", text: compilerVersion });
+  if (task?.sequence_required) items.push({ key: "sequence", label: "生成建议", text: "当前脚本建议拆分为多段生成" });
+  if (warnings.length) items.push({ key: "warnings", label: "编译提示", text: warnings.join("；") });
+  if (overlays.length) items.push({ key: "overlays", label: "后期叠字", text: overlays.join("；") });
+  if (String(task?.voiceover || "").trim()) {
+    items.push({ key: "voiceover", label: "后期旁白", text: String(task.voiceover).trim() });
+  }
+  if (sfx.length) items.push({ key: "sfx", label: "后期音效", text: sfx.join("；") });
+  return items;
 }
 
 function mediaAspectStyle(a) {

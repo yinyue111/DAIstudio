@@ -47,6 +47,10 @@ def generic_video_payload_params(params: dict, extra: dict) -> dict:
     character_field = extra.get("character_image_field", "character_reference_image")
     if character and character_field:
         payload_params[str(character_field)] = character
+    style = (params or {}).get("style_reference_image")
+    style_field = extra.get("style_image_field", "style_reference_image")
+    if style and style_field:
+        payload_params[str(style_field)] = style
     return payload_params
 
 
@@ -115,18 +119,44 @@ def ark_text(prompt: str, params: dict) -> str:
 
 def ark_content(prompt: str, params: dict) -> list:
     content = [{"type": "text", "text": ark_text(prompt, params)}]
-    seen_images = set()
+    seen_images: set[tuple[str, str]] = set()
+    role_notes: list[str] = []
+
+    def append_image(value, *, role: str, note: str) -> None:
+        if not value:
+            return
+        key = (str(value), role)
+        if key in seen_images:
+            return
+        seen_images.add(key)
+        image_number = len(content)
+        content.append(
+            {
+                "type": "image_url",
+                "image_url": {"url": value},
+                "role": role,
+            }
+        )
+        role_notes.append(f"第{image_number}张图片为{note}")
+
     img = params.get("first_frame_image")
-    if img:
-        seen_images.add(str(img))
-        content.append({"type": "image_url", "image_url": {"url": img}})
+    append_image(img, role="first_frame", note="首帧")
     last = params.get("last_frame_image")
-    if last and str(last) not in seen_images:
-        seen_images.add(str(last))
-        content.append({"type": "image_url", "image_url": {"url": last}})
+    append_image(last, role="last_frame", note="尾帧")
+    style = params.get("style_reference_image")
+    append_image(
+        style,
+        role="reference_image",
+        note="风格参考，仅迁移色调、光线、材质和商业质感",
+    )
     character = params.get("character_reference_image")
-    if character and str(character) not in seen_images:
-        content.append({"type": "image_url", "image_url": {"url": character}})
+    append_image(
+        character,
+        role="reference_image",
+        note="人物身份参考，仅锁定同一人物身份",
+    )
+    if role_notes:
+        content[0]["text"] = f"{content[0]['text']}  图片角色：{'；'.join(role_notes)}。"
     return content
 
 

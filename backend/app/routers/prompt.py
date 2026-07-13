@@ -70,6 +70,28 @@ def optimize_prompt_text(
     model = get_model_config(db, "prompt")
     if model is None or not model.enabled:
         raise HTTPException(503, "提示词优化模型未启用")
+    target_model_id = body.target_model_id
+    target_model_provider = body.target_model_provider
+    target_model_extra = None
+    if body.category == "video" and (not target_model_id or not target_model_provider):
+        video_model = get_model_config(db, "video")
+        if video_model is not None:
+            target_model_id = target_model_id or video_model.model_id
+            target_model_provider = (
+                target_model_provider
+                or video_model.provider
+                or runtime_config_for_model(video_model, "video").provider
+            )
+    elif body.category == "video":
+        video_model = get_model_config(db, "video")
+    else:
+        video_model = None
+    if (
+        video_model is not None
+        and target_model_id == video_model.model_id
+        and isinstance(video_model.extra, dict)
+    ):
+        target_model_extra = dict(video_model.extra)
     cost = max(0, int(model.cost_credits or 0))
     if cost:
         try:
@@ -88,6 +110,13 @@ def optimize_prompt_text(
             model.model_id,
             category=body.category,
             product_mode=body.product_mode,
+            duration=body.duration,
+            subject_mode=body.subject_mode,
+            reference_type=body.reference_type,
+            subject_profile=body.subject_profile,
+            target_model_id=target_model_id,
+            target_model_provider=target_model_provider,
+            target_model_extra=target_model_extra,
             gateway_config=runtime_config_for_model(model, "prompt"),
         )
         optimized = str(result.get("prompt") or "").strip()
@@ -128,7 +157,13 @@ def optimize_prompt_text(
         usage=result.get("usage"),
         detail={"category": body.category, "product_mode": body.product_mode},
     )
-    return PromptOptimizeOut(prompt=optimized, model_id=model.model_id)
+    return PromptOptimizeOut(
+        prompt=optimized,
+        model_id=model.model_id,
+        optimizer_model_id=model.model_id,
+        compiler_metadata=result.get("compiler_metadata"),
+        context_metadata=result.get("context_metadata"),
+    )
 
 
 def _looks_like_video_url(url: str) -> bool:

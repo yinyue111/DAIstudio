@@ -40,7 +40,7 @@ def test_ark_content_image_to_video():
     assert c[0]["type"] == "text"
     assert c[1]["type"] == "image_url"
     assert c[1]["image_url"]["url"] == "http://x/y.png"
-    assert "role" not in c[1]
+    assert c[1]["role"] == "first_frame"
 
 
 def test_ark_content_image_to_video_with_last_frame():
@@ -54,8 +54,20 @@ def test_ark_content_image_to_video_with_last_frame():
     )
     assert c[1]["image_url"]["url"] == "http://x/first.png"
     assert c[2]["image_url"]["url"] == "http://x/last.png"
-    assert "role" not in c[1]
-    assert "role" not in c[2]
+    assert c[1]["role"] == "first_frame"
+    assert c[2]["role"] == "last_frame"
+
+
+def test_ark_content_keeps_same_image_for_distinct_first_and_last_frame_roles():
+    c = gateway._ark_content(
+        "locked product",
+        {
+            "first_frame_image": "http://x/product.png",
+            "last_frame_image": "http://x/product.png",
+        },
+    )
+
+    assert [item.get("role") for item in c[1:]] == ["first_frame", "last_frame"]
 
 
 def test_ark_content_includes_distinct_character_reference():
@@ -68,9 +80,32 @@ def test_ark_content_includes_distinct_character_reference():
             "resolution": "720p",
         },
     )
-    assert [item["type"] for item in c] == ["text", "image_url", "image_url"]
+    assert [item["type"] for item in c] == ["text", "image_url", "image_url", "image_url"]
     assert c[1]["image_url"]["url"] == "http://x/first.png"
-    assert c[2]["image_url"]["url"] == "http://x/person.png"
+    assert c[1]["role"] == "first_frame"
+    assert c[2]["image_url"]["url"] == "http://x/first.png"
+    assert c[2]["role"] == "last_frame"
+    assert c[3]["image_url"]["url"] == "http://x/person.png"
+    assert c[3]["role"] == "reference_image"
+    assert "人物身份参考" in c[0]["text"]
+
+
+def test_ark_content_includes_distinct_style_reference():
+    c = gateway._ark_content(
+        "product restyle",
+        {
+            "first_frame_image": "http://x/product.png",
+            "style_reference_image": "http://x/style.png",
+            "resolution": "720p",
+        },
+    )
+
+    assert [item["type"] for item in c] == ["text", "image_url", "image_url"]
+    assert c[1]["image_url"]["url"] == "http://x/product.png"
+    assert c[1]["role"] == "first_frame"
+    assert c[2]["image_url"]["url"] == "http://x/style.png"
+    assert c[2]["role"] == "reference_image"
+    assert "风格参考" in c[0]["text"]
 
 
 def test_ark_content_text_to_video():
@@ -277,6 +312,34 @@ def test_generic_video_submit_preserves_character_reference(monkeypatch):
     assert task_id == "task-1"
     assert seen["payload"]["person_image_url"] == "https://example.com/person.jpg"
     assert "character_reference_image" not in seen["payload"]
+
+
+def test_generic_video_submit_preserves_style_reference(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(settings, "mock_mode", False)
+    monkeypatch.setattr(settings, "video_gateway_base_url", "https://video.example.com")
+    monkeypatch.setattr(settings, "video_gateway_api_key", "test-key")
+    monkeypatch.setattr(settings, "video_gateway_format", "openai")
+
+    def fake_post(path, payload, timeout=120):
+        seen["payload"] = payload
+        return {"id": "task-1"}
+
+    monkeypatch.setattr(gateway, "_video_post", fake_post)
+
+    task_id = gateway.submit_video(
+        "product restyle",
+        "video-model",
+        {
+            "duration": 5,
+            "style_reference_image": "https://example.com/style.jpg",
+        },
+        extra={"style_image_field": "style_image_url"},
+    )
+
+    assert task_id == "task-1"
+    assert seen["payload"]["style_image_url"] == "https://example.com/style.jpg"
+    assert "style_reference_image" not in seen["payload"]
 
 
 def test_generic_video_submit_filters_internal_params(monkeypatch):

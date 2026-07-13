@@ -1149,6 +1149,12 @@ def video_target_duration(params: dict, fallback: int = 5) -> int:
     return max(1, min(duration, settings.effective_max_video_generation_seconds))
 
 
+def video_render_duration(params: dict, stage: str | None, fallback: int = 5) -> int:
+    """Return the duration actually sent for the requested render stage."""
+    target_duration = video_target_duration(params, fallback=fallback)
+    return min(target_duration, 5) if str(stage or "").lower() == "preview" else target_duration
+
+
 def video_preview_resolution(target_resolution: str) -> str:
     # Preview remains the cheap probe render; the selected quality is preserved
     # separately and used for the final render.

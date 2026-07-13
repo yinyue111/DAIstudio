@@ -52,6 +52,16 @@ export interface Task {
   prompt_text_source?: "generation" | "request" | null;
   request_prompt_text?: string | null;
   generation_prompt_text?: string | null;
+  raw_prompt_text?: string | null;
+  optimized_prompt_text?: string | null;
+  assembled_prompt_text?: string | null;
+  prompt_optimizer_model_id?: string | null;
+  prompt_compiler_version?: string | null;
+  prompt_warnings?: string[];
+  post_overlays?: string[];
+  voiceover?: string | null;
+  sfx?: string[];
+  sequence_required?: boolean;
   parent_task_id?: number | null;
   percent?: number;
   progress?: number;

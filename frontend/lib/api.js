@@ -480,12 +480,16 @@ export const api = {
       body: { asset_url, target, fallback_image, source_type, video_analysis_preset, client_request_id },
       timeoutMs: REVERSE_TIMEOUT_MS,
     }),
-  optimizePrompt: (prompt, category = "image", product_mode = false) =>
-    request("/api/prompt/optimize", {
+  optimizePrompt: (prompt, options = "image", product_mode = false) => {
+    const context = typeof options === "object" && options !== null
+      ? options
+      : { category: options, product_mode };
+    return request("/api/prompt/optimize", {
       method: "POST",
-      body: { prompt, category, product_mode },
+      body: { prompt, ...context },
       timeoutMs: REVERSE_TIMEOUT_MS,
-    }),
+    });
+  },
   subjectProtectionPreview: (asset_url, edit_mask_mode = "protect_subject") => {
     const controller = new AbortController();
     const promise = request("/api/subject-protection/preview", {

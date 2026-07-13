@@ -41,7 +41,12 @@ interface BuildGenerationPayloadInput {
   isEditMode?: boolean;
   isImageEditMode?: boolean;
   subjectMode?: SubjectMode | "general";
-  prompt?: string;
+  prompt?: string | {
+    text?: string;
+    raw_text?: string;
+    optimized_text?: string;
+    optimizer_model_id?: string;
+  };
   negative?: string;
   promptDirty?: boolean;
   promptSourceSignature?: string;
@@ -66,6 +71,20 @@ interface BuildGenerationPayloadInput {
 
 function cleanText(value: unknown): string {
   return String(value || "").trim();
+}
+
+function promptInputParts(value: BuildGenerationPayloadInput["prompt"]) {
+  if (value && typeof value === "object") {
+    const text = cleanText(value.text || value.optimized_text || value.raw_text);
+    return {
+      text,
+      rawText: cleanText(value.raw_text || text),
+      optimizedText: cleanText(value.optimized_text),
+      optimizerModelId: cleanText(value.optimizer_model_id),
+    };
+  }
+  const text = cleanText(value);
+  return { text, rawText: text, optimizedText: "", optimizerModelId: "" };
 }
 
 function productProfileText(profile: { structured?: Record<string, unknown>; final_text?: string } | null | undefined): string {
@@ -140,11 +159,13 @@ export function buildGenerationPayload({
     productMode,
     subjectModeParam,
   } = effectiveSubjectFlags({ isEditMode, subjectMode });
-  const editNegative = buildEditNegativePrompt(negative, {
-    productMode,
-    portraitMode,
-    editMode: isEditMode,
-  });
+  const editNegative = effCategory === "video"
+    ? cleanText(negative)
+    : buildEditNegativePrompt(negative, {
+        productMode,
+        portraitMode,
+        editMode: isEditMode,
+      });
   const styleSignature = assetSignature(selected);
   const productSignature = assetSignature(productAsset);
   const effectiveProductProfile = (
@@ -165,10 +186,22 @@ export function buildGenerationPayload({
   const promptStructured = isEditMode
     ? styleTransferStructured(effectiveStructured, { video: effCategory === "video", subject: effectiveSubjectMode })
     : effectiveStructured;
+  if (effCategory === "video" && (productMode || portraitMode)) {
+    for (const key of ["可迁移主体动作", "主体动作", "产品展示方式"]) {
+      const original = cleanText(effectiveStructured[key]);
+      if (original) promptStructured[key] = original;
+      else delete promptStructured[key];
+    }
+  }
   const promptSourceStale = Boolean(promptSourceSignature && promptSourceSignature !== styleSignature && !promptDirty);
-  const promptText = promptSourceStale ? "" : String(prompt || "").trim();
+  const promptParts = promptInputParts(prompt);
+  const promptText = promptSourceStale ? "" : promptParts.text;
   const structuredText = isEditMode
-    ? composeStyleTransferPrompt(effectiveStructured, "", { video: effCategory === "video", subject: effectiveSubjectMode })
+    ? (
+        effCategory === "video" && (productMode || portraitMode)
+          ? composePromptFromStructured(promptStructured)
+          : composeStyleTransferPrompt(effectiveStructured, "", { video: effCategory === "video", subject: effectiveSubjectMode })
+      )
     : composePromptFromStructured(effectiveStructured);
   const baseFinalText = (
     promptDirty
@@ -177,6 +210,7 @@ export function buildGenerationPayload({
   ) || "生成同风格的新素材";
   const profiledBaseFinalText = (
     isEditMode
+    && effCategory === "image"
     && (productMode || portraitMode)
     && subjectProfileText
       ? [
@@ -185,9 +219,9 @@ export function buildGenerationPayload({
         ].filter(Boolean).join("；")
       : baseFinalText
   );
-  const finalText = isEditMode
+  const finalText = isEditMode && effCategory === "image"
     ? buildEditPrompt(profiledBaseFinalText, {
-      video: effCategory === "video",
+      video: false,
       hasStyleReference: Boolean(styleReferenceAsset),
       generalEdit: isImageEditMode && effectiveSubjectMode === "general",
       subject: effectiveSubjectMode,
@@ -230,6 +264,12 @@ export function buildGenerationPayload({
       ...(Object.keys(promptStructured).length ? promptStructured : {}),
       ...(subjectProfileText && (productMode || portraitMode) ? { [subjectProfileLabel]: subjectProfileText } : {}),
       ...(promptDirty && promptText ? { user_instruction: promptText } : {}),
+      ...(effCategory === "video" ? {
+        raw_text: promptParts.rawText || promptText,
+        ...(promptParts.optimizedText ? { optimized_text: promptParts.optimizedText } : {}),
+        ...(promptParts.optimizerModelId ? { optimizer_model_id: promptParts.optimizerModelId } : {}),
+        assembled_text: finalText,
+      } : {}),
       final_text: finalText,
       ...(useRefImage ? { instruction: finalText || promptText || "参考所选图生成同款风格的新素材" } : {}),
       ...(useRefVideo ? { instruction: promptText || "参考所选视频的主体、动作和镜头节奏生成同款视频" } : {}),

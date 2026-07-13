@@ -29,6 +29,7 @@ from .generation_media import (
     reference_dimensions,
     video_preview_resolution,
     video_ratio,
+    video_render_duration,
     video_target_duration,
     video_target_resolution,
 )
@@ -40,8 +41,6 @@ from .generation_model_runtime import (
     submit_video_with_model_config,
 )
 from .generation_prompts import (
-    generation_prompt_for_model,
-    product_fidelity_prompt,
     product_video_negative_prompt,
 )
 from .generation_state import TERMINAL_STATUSES as TERMINAL
@@ -61,11 +60,48 @@ from .generation_video_flow import (
 )
 from .model_pricing import usage_from_response
 from .progress import set_progress
+from .video_prompt_compiler import (
+    build_video_prompt_references,
+    compile_video_prompt,
+    store_video_prompt_compile,
+)
 
 log = logging.getLogger("generation")
 VIDEO_FIRST_FRAME_MIN_SIDE = 300
 VIDEO_FIRST_FRAME_MAX_SIDE = 768
 PRODUCT_VIDEO_REFERENCE_MAX_SIDE = 1280
+
+
+def _compile_legacy_video_prompt(task: GenTask, model, params: dict) -> tuple[str, dict]:
+    """Compile retry/legacy tasks that predate request-time video compilation."""
+    references = build_video_prompt_references(
+        source_asset_url=task.source_asset_url,
+        source_type=task.source_type,
+        params=params,
+    )
+    extra = getattr(model, "extra", None) if isinstance(getattr(model, "extra", None), dict) else {}
+    model_profiles = extra.get("video_prompt_profiles") or extra.get("prompt_profiles")
+    if not isinstance(model_profiles, dict):
+        model_profiles = None
+    compiled = compile_video_prompt(
+        task.prompt or final_prompt(task),
+        duration=video_render_duration(params, task.stage),
+        model_id=str(getattr(model, "model_id", "") or ""),
+        provider=str(getattr(model, "provider", "") or ""),
+        extra=extra,
+        references=references,
+        product_reference=any(item.get("role") == "product" for item in references),
+        portrait_reference=any(item.get("role") == "character" for item in references),
+        product_lock_mode=str(params.get("product_lock_mode") or "locked"),
+        product_video_template=str(params.get("product_video_template") or "stable_showcase"),
+        model_profiles=model_profiles,
+    )
+    if compiled.get("sequence_required"):
+        raise RuntimeError("当前脚本超过所选模型和时长的单段承载能力，请拆分为多段视频后重试")
+
+    persisted = dict(params)
+    store_video_prompt_compile(persisted, compiled, references)
+    return persisted["_generation_prompt"], persisted
 
 
 def _enqueue_poll_safely(task_id: int, external_task_id: str | None = None) -> None:
@@ -271,7 +307,7 @@ def video_submit_params(db, task: GenTask) -> dict:
         params["target_resolution"] = target_resolution
         params["target_duration"] = target_duration
         params["resolution"] = video_preview_resolution(target_resolution)
-        params["duration"] = min(target_duration, 5)
+        params["duration"] = video_render_duration(params, task.stage)
     else:
         params["target_resolution"] = target_resolution
         params["target_duration"] = target_duration
@@ -331,6 +367,15 @@ def video_submit_params(db, task: GenTask) -> dict:
                 last_frame,
                 **reference_kwargs,
             )
+    style_ref = params.get("style_reference_image")
+    if style_ref:
+        params["style_reference_image"] = gateway_reference_image(
+            db,
+            task,
+            style_ref,
+            min_side=VIDEO_FIRST_FRAME_MIN_SIDE,
+            max_side=VIDEO_FIRST_FRAME_MAX_SIDE,
+        )
     character_ref = params.get("character_reference_image")
     if character_ref:
         safe_character_ref = gateway_reference_image(
@@ -635,11 +680,12 @@ def start_video_task(
                 raise RuntimeError("未配置可用的视频模型")
             model = model_from_snapshot(task, model)
 
-            prompt = final_prompt(task)
-            prompt = generation_prompt_for_model(prompt, task)
-            prompt = product_fidelity_prompt(prompt, task)
             original_params = dict(task.params or {})
-            original_params["_generation_prompt"] = prompt
+            prompt = str(original_params.get("_generation_prompt") or "").strip()
+            if not prompt:
+                prompt, original_params = _compile_legacy_video_prompt(task, model, original_params)
+            if not prompt:
+                raise RuntimeError("视频提示词为空，无法提交生成")
             if not original_params.get("_video_request_id"):
                 original_params["_video_request_id"] = f"video-{task.id}-{uuid4().hex}"
             task.params = original_params

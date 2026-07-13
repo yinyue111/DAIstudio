@@ -495,6 +495,37 @@ assert.equal(directFinalVideo.payload.params.duration, 10);
 assert.equal(directFinalVideo.payload.params.resolution, "1080p");
 assert.equal(directFinalVideo.payload.params.target_resolution, "1080p");
 assert.equal(directFinalVideo.ratioOption.key, "9:16");
+assert.equal(directFinalVideo.payload.prompt.raw_text, "竖屏短视频成片，产品居中展示，柔和棚拍光线");
+assert.equal(directFinalVideo.payload.prompt.assembled_text, directFinalVideo.payload.prompt.final_text);
+assert.equal(directFinalVideo.payload.prompt.optimized_text, undefined);
+
+const optimizedDirectVideo = buildGenerationPayload({
+  ...directFinalVideo.payload,
+  stage: "final",
+  cfg: { video_duration_max_seconds: 15 },
+  category: "video",
+  creationMode: "video",
+  isEditMode: false,
+  prompt: {
+    text: "10 秒产品广告，抽取后改为微距展开，不再浸水。",
+    raw_text: "女主抽出洗脸巾，展开后浸水。",
+    optimized_text: "10 秒产品广告，仅展示抽取和展开两个连续动作。",
+    optimizer_model_id: "gemini-3.5-flash-low",
+  },
+  promptDirty: true,
+  selected: null,
+  structured: {},
+  ratio: "9:16",
+  imageQuality: "1k",
+  n: 1,
+  seed: "",
+  vDuration: 10,
+  vResolution: "1080p",
+});
+assert.equal(optimizedDirectVideo.payload.prompt.raw_text, "女主抽出洗脸巾，展开后浸水。");
+assert.equal(optimizedDirectVideo.payload.prompt.optimized_text, "10 秒产品广告，仅展示抽取和展开两个连续动作。");
+assert.equal(optimizedDirectVideo.payload.prompt.optimizer_model_id, "gemini-3.5-flash-low");
+assert.equal(optimizedDirectVideo.payload.prompt.assembled_text, "10 秒产品广告，抽取后改为微距展开，不再浸水。");
 
 const productVideoEditArgs = {
   stage: "final",
@@ -541,7 +572,11 @@ assert.equal(productVideoEditFree.payload.params.product_lock_mode, "free");
 assert.equal(productVideoEditFree.payload.params.product_video_template, "soft_splash");
 assert.equal(productVideoEditFree.payload.params.reference_image_url, productAsset.url);
 assert.equal(productVideoEditFree.payload.prompt["场景背景"], "暖棕色广告棚景和金色沙粒台面");
-assert.match(productVideoEditFree.payload.prompt["主体动作"], /上传产品作为唯一视频主体/);
+assert.equal(
+  productVideoEditFree.payload.prompt["主体动作"],
+  "参考商品从画面左侧入场，缓慢旋转，水花飞溅后切到 Logo 特写",
+  "the frontend should preserve reference motion and let the backend assign the product-reference role",
+);
 assert.equal(productVideoEditFree.payload.prompt["镜头运动"], "缓慢推进并轻微环绕");
 assert.match(productVideoEditFree.payload.prompt["产品身份档案"], /DAMAH 黑魔法全棉棉柔巾/);
 assert.equal(productVideoEditFree.payload.prompt["主体"], undefined);
@@ -549,14 +584,23 @@ assert.equal(productVideoEditFree.payload.prompt["商品服装"], undefined);
 assert.equal(productVideoEditFree.payload.prompt["材质纹理"], undefined);
 assert.equal(productVideoEditFree.payload.prompt["标签"], undefined);
 assert.equal(productVideoEditFree.payload.prompt.user_instruction, "产品旋转展示，水花飞溅，镜头推进");
-assert.match(productVideoEditFree.payload.prompt.final_text, /用上传产品替换参考视频/);
-assert.match(productVideoEditFree.payload.prompt.final_text, /DAMAH 黑魔法全棉棉柔巾/);
-assert.match(productVideoEditFree.payload.prompt.final_text, /200抽/);
-assert.match(productVideoEditFree.payload.prompt.final_text, /可适配到产品的展示动作/);
+assert.equal(productVideoEditFree.payload.prompt.raw_text, "产品旋转展示，水花飞溅，镜头推进");
+assert.equal(productVideoEditFree.payload.prompt.assembled_text, "产品旋转展示，水花飞溅，镜头推进");
+assert.equal(productVideoEditFree.payload.prompt.final_text, "产品旋转展示，水花飞溅，镜头推进");
+assert.doesNotMatch(productVideoEditFree.payload.prompt.final_text, /产品与包装文字保真优先/);
 assert.doesNotMatch(productVideoEditFree.payload.prompt.final_text, /Estee Lauder/i);
 assert.doesNotMatch(productVideoEditFree.payload.prompt.final_text, /Advanced Night Repair/i);
 assert.doesNotMatch(productVideoEditFree.payload.prompt.final_text, /dropper bottle/i);
-assert.match(productVideoEditFree.payload.params.negative_prompt, /产品正面文字被重排/);
+assert.equal(productVideoEditFree.payload.params.negative_prompt, undefined);
+
+const reversedProductVideo = buildGenerationPayload({
+  ...productVideoEditArgs,
+  prompt: "",
+  promptDirty: false,
+});
+assert.match(reversedProductVideo.payload.prompt.final_text, /参考商品从画面左侧入场/);
+assert.doesNotMatch(reversedProductVideo.payload.prompt.final_text, /上传产品作为唯一视频主体/);
+assert.doesNotMatch(reversedProductVideo.payload.prompt.final_text, /优先保持完整包装/);
 
 const productVideoEditLocked = buildGenerationPayload({
   ...productVideoEditArgs,

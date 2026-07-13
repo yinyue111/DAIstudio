@@ -54,6 +54,9 @@ def test_task_output_includes_saved_prompt_and_model_snapshot(client, make_user,
             params={
                 "_generation_prompt": "实际发送给模型的最终提示词",
                 "_model_snapshot": {"model_id": "gpt-image-test", "provider": "openai"},
+                "_post_overlays": ["干湿两用"],
+                "_voiceover": "温柔开始每一天。",
+                "_sfx": ["水滴声", "纸张摩擦声"],
             },
             model_use="image",
             cost_frozen=10,
@@ -72,8 +75,13 @@ def test_task_output_includes_saved_prompt_and_model_snapshot(client, make_user,
     assert body["prompt_text_source"] == "generation"
     assert body["request_prompt_text"] == "用户提交的产品提示词"
     assert body["generation_prompt_text"] == "实际发送给模型的最终提示词"
+    assert body["raw_prompt_text"] is None
+    assert body["assembled_prompt_text"] is None
     assert body["model_id"] == "gpt-image-test"
     assert body["model_provider"] == "openai"
+    assert body["post_overlays"] == ["干湿两用"]
+    assert body["voiceover"] == "温柔开始每一天。"
+    assert body["sfx"] == ["水滴声", "纸张摩擦声"]
 
 
 def test_task_output_marks_legacy_request_prompt_and_recovers_gateway_model(client, make_user, auth):
@@ -115,6 +123,8 @@ def test_task_output_marks_legacy_request_prompt_and_recovers_gateway_model(clie
     assert body["prompt_text_source"] == "request"
     assert body["request_prompt_text"] == "旧任务只保存了用户原始请求"
     assert body["generation_prompt_text"] is None
+    assert body["raw_prompt_text"] is None
+    assert body["assembled_prompt_text"] is None
     assert body["model_id"] == "legacy-image-model"
     assert body["model_provider"] is None
 

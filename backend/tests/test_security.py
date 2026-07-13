@@ -1081,6 +1081,7 @@ def test_video_params_localizes_client_reference_url_before_gateway(
             status="queued",
             params={
                 "reference_image_url": "https://cdn.example.com/user-video-cover.png",
+                "style_reference_image": "https://cdn.example.com/video-style.png",
                 "duration": 5,
                 "resolution": "720p",
             },
@@ -1095,6 +1096,8 @@ def test_video_params_localizes_client_reference_url_before_gateway(
     assert params["first_frame_image"].startswith("data:image/jpeg;base64,")
     assert params["reference_image_url"] == params["first_frame_image"]
     assert "cdn.example.com" not in params["first_frame_image"]
+    assert params["style_reference_image"].startswith("data:image/jpeg;base64,")
+    assert "cdn.example.com" not in params["style_reference_image"]
 
 
 def test_parse_video_thumb_is_cleared_when_localize_fails(client, make_user, auth, monkeypatch):
