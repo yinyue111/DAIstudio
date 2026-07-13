@@ -21,6 +21,96 @@ def test_text_to_video_does_not_invent_a_reference_and_returns_a_plan():
     assert result["metadata"]["duration"] == 10
 
 
+def test_structured_portrait_reverse_keeps_clothing_structure_and_coverage():
+    result = compile_video_prompt(
+        {
+            "风格": "品牌 Lookbook",
+            "服装结构": "利落西装剪裁，挺括肩线和自然垂坠面料",
+            "服装覆盖": "长袖及腕，长裤及踝，整体覆盖完整",
+            "时序分镜": "0-5s 成年模特向镜头走近",
+        },
+        duration=5,
+        model_id="seedance-2.0",
+    )
+
+    assert "服装结构：利落西装剪裁" in result["prompt"]
+    assert "服装覆盖：长袖及腕" in result["prompt"]
+
+
+def test_reverse_structured_post_fields_survive_frontend_shaped_prompt_layers():
+    final_text = "高端日系个护广告。Shot 1：抽出洗脸巾。Shot 2：微距展开如意云纹。"
+    result = compile_video_prompt(
+        {
+            "风格": "高端日系个护广告",
+            "时序分镜": "0-5s 抽出洗脸巾；5-10s 微距展开如意云纹",
+            "字幕卖点": "干湿两用",
+            "raw_text": final_text,
+            "assembled_text": final_text,
+            "final_text": final_text,
+        },
+        duration=10,
+        model_id="seedance-2.0",
+    )
+
+    assert result["plan"]["shots"] == [
+        "0-5s 抽出洗脸巾",
+        "5-10s 微距展开如意云纹",
+    ]
+    assert result["plan"]["post_overlays"] == ["干湿两用"]
+    assert "干湿两用" not in result["prompt"]
+
+
+def test_optimized_video_text_does_not_erase_structured_post_production_fields():
+    result = compile_video_prompt(
+        {
+            "字幕卖点": "干湿两用",
+            "旁白": "让洗脸这件事成为温柔的开始",
+            "音效": "水滴声",
+            "raw_text": "Shot 1：抽出洗脸巾。字幕‘旧字幕’。",
+            "optimized_text": "Shot 1：抽出洗脸巾。",
+            "assembled_text": "Shot 1：抽出洗脸巾。",
+            "final_text": "Shot 1：抽出洗脸巾。",
+        },
+        duration=5,
+        model_id="seedance-2.0",
+    )
+
+    assert result["plan"]["post_overlays"] == ["干湿两用"]
+    assert result["plan"]["voiceover"] == "让洗脸这件事成为温柔的开始"
+    assert result["plan"]["sfx"] == ["水滴声"]
+    assert "干湿两用" not in result["prompt"]
+    assert "水滴声" not in result["prompt"]
+
+
+def test_quoted_text_overlay_with_trailing_appearance_verb_moves_to_post():
+    result = compile_video_prompt(
+        "明亮浴室。Shot 1：微距展开云纹；文字“干湿两用”浮现；慢速推近。",
+        duration=5,
+        model_id="seedance-2.0",
+    )
+
+    assert result["plan"]["post_overlays"] == ["干湿两用"]
+    assert "干湿两用" not in result["prompt"]
+    assert "文字" not in result["prompt"]
+    assert "浮现" not in result["prompt"]
+    assert "慢速推近" in result["prompt"]
+
+
+def test_quoted_text_overlay_after_comma_moves_to_post_without_losing_visual_action():
+    result = compile_video_prompt(
+        "明亮浴室，文字“新品上市”浮现，慢速推近。",
+        duration=5,
+        model_id="seedance-2.0",
+    )
+
+    assert result["plan"]["post_overlays"] == ["新品上市"]
+    assert "新品上市" not in result["prompt"]
+    assert "文字" not in result["prompt"]
+    assert "浮现" not in result["prompt"]
+    assert "明亮浴室" in result["prompt"]
+    assert "慢速推近" in result["prompt"]
+
+
 def test_product_reference_locks_only_product_identity_fields():
     result = compile_video_prompt(
         "高端个护广告。女主在浴室从墙面包装下方抽出一张洗脸巾。",

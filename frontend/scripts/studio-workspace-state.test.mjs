@@ -298,8 +298,8 @@ assert.match(
 );
 assert.match(
   referenceParsingSource,
-  /const reversePrompt = isEditMode[\s\S]*composeStyleTransferPrompt[\s\S]*composePromptFromStructured/,
-  "reverse output should choose style-transfer prompts for edit modes and full prompts otherwise",
+  /const transferPrompt = composeSafeVideoTransferPrompt\(structured,\s*subjectMode\)[\s\S]*const reversePrompt = isVideo[\s\S]*isEditMode[\s\S]*transferPrompt[\s\S]*composeStyleTransferPrompt[\s\S]*result\.final_text[\s\S]*composePromptFromStructured/,
+  "video reverse should separate authoritative replication text from identity-safe transfer prompts",
 );
 assert.match(
   referenceParsingSource,

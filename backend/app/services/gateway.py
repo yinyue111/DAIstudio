@@ -17,6 +17,7 @@ import base64
 import json
 import logging
 import random
+import re
 import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -36,6 +37,7 @@ from .gateway_prompting import mock_reverse as _mock_reverse
 from .gateway_prompting import normalize_video_shots as _normalize_video_shots
 from .gateway_prompting import parse_structured as _parse_structured
 from .gateway_prompting import reverse_template as _reverse_template
+from .gateway_prompting import video_analysis_gaps as _video_analysis_gaps
 from .gateway_video_payloads import VIDEO_STATUS as _VIDEO_STATUS
 from .gateway_video_payloads import (
     ark_content as _ark_content,  # noqa: F401 - legacy test/debug hook
@@ -53,7 +55,7 @@ from .ssrf import (
     assert_safe_url,
     pinned_client,
 )
-from .video_prompt_compiler import infer_video_model_profile
+from .video_prompt_compiler import infer_video_model_profile, split_video_post_production
 
 log = logging.getLogger("gateway")
 _IMAGE_GATEWAY_SEMAPHORE_KEY = "gateway:image:semaphore"
@@ -355,9 +357,17 @@ def _video_analysis_context_text(video_analysis: dict) -> str:
     duration = source.get("duration_seconds")
     fps = source.get("fps")
     audio_state = "已检测到音轨,但未分析内容" if source.get("has_audio") else "未检测到音轨"
+    analysis_mode = video_analysis.get("analysis_mode")
+    mode_text = (
+        "封面单帧降级分析,只能确认静态画面,不得推断完整时序动作"
+        if analysis_mode == "cover_fallback"
+        else "全时段关键帧分析"
+    )
     lines = [
         "以下是后端探测的源视频权威事实,必须原样采用,不得根据静帧重新猜测:",
-        f"- 显示尺寸: {source.get('width')}x{source.get('height')}",
+        f"- 分析模式: {mode_text}",
+        f"- 显示尺寸: {source.get('width')}x{source.get('height')}"
+        if source.get("width") and source.get("height") else "- 显示尺寸: 未知",
         f"- 画幅比例: {source.get('ratio') or '未知'}",
         f"- 真实时长: {float(duration):.3f} 秒" if duration is not None else "- 真实时长: 未知",
         f"- 帧率: 约 {float(fps):.3f} fps" if fps is not None else "- 帧率: 未知",
@@ -392,6 +402,48 @@ def _video_shots_timeline(shots: list[dict]) -> str:
         detail = "，".join(dict.fromkeys(value for value in details if value))
         rows.append(f"{start:.3f}-{end:.3f}s {detail or '按参考帧复刻'}")
     return "；".join(rows)
+
+
+def _without_conflicting_video_durations(text: str, duration_seconds: float | None) -> str:
+    if duration_seconds is None:
+        return str(text or "").strip()
+    duration_re = re.compile(
+        r"(?P<label>(?:总时长|视频时长|成片时长|全片时长|片长|建议生成|"
+        r"(?:total\s+)?(?:duration|runtime|length))"
+        r"\s*(?:为|约|建议)?\s*)?"
+        r"(?<![\d.\-])(?P<value>\d+(?:\.\d+)?)\s*"
+        r"(?:秒钟?|seconds?|secs?|s)(?![A-Za-z])",
+        re.IGNORECASE,
+    )
+    source_text = str(text or "")
+
+    def replace(match: re.Match[str]) -> str:
+        before = source_text[max(0, match.start() - 8):match.start()]
+        after = source_text[match.end():match.end() + 24]
+        shot_context = bool(
+            re.search(r"(?:前|后|每|单个|第\d+个?|镜头|持续|停留|动作)\s*$", before)
+            or re.search(
+                r"(?:first|last|next|previous)\s*$|"
+                r"(?:each|every|single|per)\s+(?:shot|scene)\s+(?:lasts?|holds?|for)\s*$|"
+                r"(?:shot|scene)\s+(?:lasts?|holds?|for)\s*$",
+                source_text[max(0, match.start() - 40):match.start()],
+                re.IGNORECASE,
+            )
+        )
+        total_context = bool(match.group("label")) or bool(
+            re.match(
+                r"[^，,。；;\n]{0,20}(?:广告|短片|视频|成片|ad|video|clip|film)",
+                after,
+                re.IGNORECASE,
+            )
+        )
+        value = float(match.group("value"))
+        conflicts = abs(value - float(duration_seconds)) > 0.01
+        return "" if total_context and conflicts and not shot_context else match.group(0)
+
+    cleaned = duration_re.sub(replace, source_text)
+    cleaned = re.sub(r"([，,。；;])\s*([，,。；;])+", r"\1", cleaned)
+    return cleaned.strip(" ，,。；;")
 
 
 def reverse_prompt(image_refs, vision_model_id: str, target: str = "image",
@@ -443,13 +495,29 @@ def reverse_prompt(image_refs, vision_model_id: str, target: str = "image",
     latency_ms = int((time.time() - t0) * 1000)
     content_text = data["choices"][0]["message"]["content"]
     result = _parse_structured(content_text)
+    if target == "video":
+        post = split_video_post_production(result["final_text"])
+        result["final_text"] = post["text"]
+        for key, value in (
+            ("字幕卖点", "；".join(post["post_overlays"])),
+            ("旁白", post["voiceover"]),
+            ("音效", "；".join(post["sfx"])),
+        ):
+            if value and str(result["structured"].get(key) or "").strip() in {"", "无", "未分析"}:
+                result["structured"][key] = value
     if target == "video" and video_analysis:
         source = video_analysis.get("source") or {}
         result["shots"] = _normalize_video_shots(
             result.get("shots"),
             duration_seconds=source.get("duration_seconds"),
             frame_count=len(frame_rows),
+            sampled_frames=frame_rows,
             audio_analyzed=bool(source.get("audio_analyzed")),
+        )
+        result["analysis_gaps"] = _video_analysis_gaps(
+            result["shots"],
+            duration_seconds=source.get("duration_seconds"),
+            analysis_mode=video_analysis.get("analysis_mode"),
         )
         timeline = _video_shots_timeline(result["shots"])
         if timeline:
@@ -465,7 +533,13 @@ def reverse_prompt(image_refs, vision_model_id: str, target: str = "image",
         if source_spec:
             authoritative_prefix.append(f"严格按源视频规格复刻：{source_spec}")
         if authoritative_prefix:
-            result["final_text"] = f"{'。'.join(authoritative_prefix)}。{result['final_text']}"
+            provider_text = _without_conflicting_video_durations(
+                result["final_text"],
+                source.get("duration_seconds"),
+            )
+            result["final_text"] = "。".join(
+                part for part in [*authoritative_prefix, provider_text] if part
+            )
     result["usage"] = data.get("usage")  # {prompt_tokens, completion_tokens, total_tokens}
     result["latency_ms"] = latency_ms
     return result

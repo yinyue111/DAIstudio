@@ -112,7 +112,7 @@ const IMAGE_STYLE_TRANSFER_KEYS = [
 
 const VIDEO_STYLE_TRANSFER_KEYS = [
   "场景背景", "广告目标", "风格", "视角构图", "镜头运动", "剪辑节奏", "时序分镜",
-  "字幕卖点", "光线", "色调配色", "氛围情绪", "转场",
+  "光线", "色调配色", "氛围情绪", "转场",
   "时长建议", "后期质感", "平台质感",
 ];
 
@@ -126,14 +126,26 @@ const REFERENCE_SUBJECT_KEYS = new Set([
   "妆发五官", "商品服装", "细节特征",
   "主体动作", "一致性约束", "负向", "文字水印", "final_text",
 ]);
+const VIDEO_TRANSFER_IDENTITY_KEYS = [
+  "主体", "人像意图", "人物比例", "身材体态", "体态线条", "服装结构", "服装覆盖",
+  "妆发五官", "商品服装", "细节特征", "标签", "品牌Logo", "包装文字", "不可改项",
+];
+const GENERIC_IDENTITY_WORDS = new Set([
+  "product", "products", "video", "image", "model", "logo", "brand", "bottle", "package", "packaging",
+]);
+const UNSAFE_VIDEO_TRANSFER_IDENTITY_RE = /(?:原|参考)(?:片|视频|画面|素材)?(?:主体|商品|产品|品牌|人物|模特|人脸|身份|服装)|(?:original|reference)\s+(?:product|subject|brand|person|character|model|face|identity|clothing)/i;
+const GENERIC_CJK_IDENTITY_PART_RE = /(?:上传|参考|原|视频|画面|素材|唯一|同一|主体|商品|产品|人物|模特|人脸|身份|服装|包装|文字|品牌|标志|正面|背面|侧面|顶部|底部|包含|显示|可见|保持|位于|置于|放置于|摆放于|放在|摆在|悬挂在|靠在|站在|坐在|处于|出现在|写有|印有|为)/g;
+const CJK_SCENE_PLACEMENT_TAIL_RE = /(?:位于|置于|放置于|摆放于|放在|摆在|悬挂在|靠在|站在|坐在|处于|出现在).*$/g;
+const EXPLICIT_CJK_IDENTITY_RE = /(?:品牌|标志|包装文字|正面文字|背面文字|侧面文字|写有|印有)/i;
+const VIDEO_POST_PRODUCTION_CLAUSE_RE = /(^|[\n。；;，,])\s*(?:(?:温柔|轻柔|低沉)?\s*(?:男声|女声|女性|男性)?\s*)?(?:字幕|后期叠字|(?:画面(?:中)?)?文字(?:浮现|出现|显示)?|画面(?:中)?(?:浮现|出现|显示)文字|旁白|voiceover|后期配音|音效|sfx|环境音)\s*[:：]?\s*(?:["'“‘][^"'”’]+["'”’]|[^\n。；;，,]+)\s*(?:浮现|出现|显示)?\s*/gi;
 
 function styleTransferKeys({ video = false, subject = "" } = {}) {
   const base = video ? VIDEO_STYLE_TRANSFER_KEYS : IMAGE_STYLE_TRANSFER_KEYS;
   if (video && (subject === "product" || subject === "portrait")) {
     return [
-      "场景背景", "广告目标", "风格", "视角构图",
+      "场景背景", "风格", "视角构图",
       ...VIDEO_SUBJECT_MOTION_KEYS,
-      "镜头运动", "剪辑节奏", "时序分镜", "字幕卖点", "光线", "色调配色",
+      "镜头运动", "剪辑节奏", "光线", "色调配色",
       "氛围情绪", "转场", "时长建议", "后期质感", "平台质感",
     ];
   }
@@ -141,23 +153,26 @@ function styleTransferKeys({ video = false, subject = "" } = {}) {
   return [...base, ...GENERAL_STYLE_TRANSFER_EXTRA_KEYS];
 }
 
-function rewriteVideoSubjectMotion(value, subject = "") {
+function rewriteVideoSubjectMotion(value, subject = "", structured = {}) {
   const text = String(value || "").trim();
   if (!text || text === "无" || text === "未见" || text === "不确定") return "";
+  const safeMotion = hasReferenceIdentityLeak(text, structured) ? "" : text;
   if (subject === "product") {
     return [
       "上传产品作为唯一视频主体，替换参考片中的原主体/原商品/人物",
       "复用参考片的展示节奏、入镜顺序、角度切换、慢速推拉、稳定特写和卖点展示等可迁移动作",
+      safeMotion ? `具体可迁移动作：${safeMotion}` : "",
       "优先保持完整包装、Logo 和主要文字始终在画面内，避免裁切主体、侧面展示或快速旋转",
       "不要生成参考片里的原商品、原品牌、人物或服装",
-    ].join("；");
+    ].filter(Boolean).join("；");
   }
   if (subject === "portrait") {
     return [
       "上传人物作为唯一视频主体，替换参考片中的原人物身份",
       "复用参考片的动作节奏、走位、姿态变化、镜头调度和分镜顺序",
+      safeMotion ? `具体可迁移动作：${safeMotion}` : "",
       "不要生成参考片里的原人物、人脸身份或品牌主体",
-    ].join("；");
+    ].filter(Boolean).join("；");
   }
   return text;
 }
@@ -166,9 +181,18 @@ export function styleTransferStructured(structured, { video = false, subject = "
   if (!structured || !Object.keys(structured).length) return {};
   const allowed = new Set(styleTransferKeys({ video, subject }));
   const out = {};
+  const motionCandidates = VIDEO_SUBJECT_MOTION_KEYS.map((key) => ({
+    key,
+    value: String(structured[key] || "").trim(),
+  })).filter(({ value }) => value && value !== "无" && value !== "未见" && value !== "不确定");
+  const preferredMotionKey = (
+    motionCandidates.find(({ value }) => !hasReferenceIdentityLeak(value, structured))
+    || motionCandidates[0]
+  )?.key;
   for (const key of Object.keys(structured)) {
     if (video && (subject === "product" || subject === "portrait") && VIDEO_SUBJECT_MOTION_TRANSFER_KEYS.has(key)) {
-      const value = rewriteVideoSubjectMotion(structured[key], subject);
+      if (key !== preferredMotionKey) continue;
+      const value = rewriteVideoSubjectMotion(structured[key], subject, structured);
       if (value) out[key] = value;
       continue;
     }
@@ -184,11 +208,72 @@ export function composeStyleTransferPrompt(structured, fallbackText = "", { vide
   if (!structured || !Object.keys(structured).length) return fallback;
   const transferStructured = styleTransferStructured(structured, { video, subject });
   const parts = [];
+  const seen = new Set();
   for (const key of styleTransferKeys({ video, subject })) {
     const value = String(transferStructured[key] || "").trim();
-    if (value) parts.push(value);
+    const identity = value.replace(/\s+/g, "").toLowerCase();
+    if (identity && !seen.has(identity)) {
+      seen.add(identity);
+      parts.push(value);
+    }
   }
   return parts.join(", ").trim() || fallback;
+}
+
+function referenceIdentityTokens(structured) {
+  const tokens = new Set();
+  for (const key of VIDEO_TRANSFER_IDENTITY_KEYS) {
+    const value = String(structured?.[key] || "");
+    for (const token of value.match(/[A-Za-z][A-Za-z0-9_-]{2,}/g) || []) {
+      const normalized = token.toLowerCase();
+      if (!GENERIC_IDENTITY_WORDS.has(normalized)) tokens.add(normalized);
+    }
+    for (const segment of value.match(/[\u3400-\u9fff]{2,}/g) || []) {
+      const preserveIdentitySuffix = EXPLICIT_CJK_IDENTITY_RE.test(segment);
+      const distinctive = (preserveIdentitySuffix
+        ? segment
+        : segment.replace(CJK_SCENE_PLACEMENT_TAIL_RE, ""))
+        .replace(GENERIC_CJK_IDENTITY_PART_RE, " ")
+        .replace(/\s+/g, "")
+        .trim();
+      if (!distinctive) continue;
+      if (distinctive.length <= 4) {
+        tokens.add(distinctive);
+        continue;
+      }
+      for (let index = 0; index <= distinctive.length - 4; index += 1) {
+        tokens.add(distinctive.slice(index, index + 4));
+      }
+    }
+  }
+  return tokens;
+}
+
+function hasReferenceIdentityLeak(value, structured) {
+  const candidate = String(value || "").trim();
+  if (!candidate) return false;
+  if (UNSAFE_VIDEO_TRANSFER_IDENTITY_RE.test(candidate)) return true;
+  const normalized = candidate.toLowerCase();
+  for (const token of referenceIdentityTokens(structured)) {
+    if (normalized.includes(String(token).toLowerCase())) return true;
+  }
+  return false;
+}
+
+function stripVideoPostProductionClauses(value) {
+  return String(value || "")
+    .replace(VIDEO_POST_PRODUCTION_CLAUSE_RE, "$1")
+    .replace(/([。；;，,])\s*(?=[。；;，,])/g, "")
+    .replace(/^[\s。；;，,]+|[\s。；;，,]+$/g, "")
+    .trim();
+}
+
+export function composeSafeVideoTransferPrompt(structured, subject = "") {
+  const fallback = composeStyleTransferPrompt(structured, "", { video: true, subject });
+  const candidate = stripVideoPostProductionClauses(structured?.["迁移生成指令"]);
+  if (!candidate) return fallback;
+  if (hasReferenceIdentityLeak(candidate, structured)) return fallback;
+  return candidate;
 }
 
 export function ratioKeyForSize(size) {

@@ -12,6 +12,7 @@ import {
   assetDims,
   assetSignature,
   composePromptFromStructured,
+  composeSafeVideoTransferPrompt,
   composeStyleTransferPrompt,
   isRequestTimeoutError,
   nearestRatio,
@@ -22,6 +23,7 @@ import {
 import {
   clearPendingReverseRequest,
   generateReverseClientRequestId,
+  shouldKeepPendingReverseRequest,
 } from "../app/studio/generationRequestId";
 
 function bumpRequest(ref, mode) {
@@ -296,16 +298,26 @@ export default function useReferenceParsing({
       const videoAnalysis = isVideo && result.video_analysis && typeof result.video_analysis === "object"
         ? result.video_analysis
         : null;
-      const reversePrompt = isEditMode
-        ? composeStyleTransferPrompt(structured, result.final_text || "", {
-            video: targetCategory === "video",
-            subject: subjectMode,
-          })
-        : composePromptFromStructured(
-            structured,
-            result.final_text || "",
-            { preferFallback: !isVideo },
-          );
+      const transferPrompt = composeSafeVideoTransferPrompt(structured, subjectMode);
+      const reversePrompt = isVideo
+        ? (
+            isEditMode
+              ? transferPrompt || composeStyleTransferPrompt(structured, "", {
+                  video: true,
+                  subject: subjectMode,
+                })
+              : String(result.final_text || "").trim()
+          )
+        : isEditMode
+          ? composeStyleTransferPrompt(structured, result.final_text || "", {
+              video: targetCategory === "video",
+              subject: subjectMode,
+            })
+          : composePromptFromStructured(
+              structured,
+              result.final_text || "",
+              { preferFallback: true },
+            );
       lastReversePromptRef.current[mode] = {
         prompt: reversePrompt,
         structured,
@@ -344,7 +356,11 @@ export default function useReferenceParsing({
       }
       refreshMe();
     } catch (e) {
-      if (isCurrent() && !isRequestTimeoutError(e)) {
+      if (
+        isCurrent()
+        && !isRequestTimeoutError(e)
+        && !shouldKeepPendingReverseRequest(e)
+      ) {
         clearPendingReverseRequest(pendingReverseRequestRef, clientRequestId);
       }
       if (isCurrent() && isModeVisible(mode)) setMsg(e.message);

@@ -3,11 +3,12 @@ from datetime import datetime, timedelta, timezone
 import pytest
 from fastapi import HTTPException
 
+from app.config import settings
 from app.db import SessionLocal
 from app.models import CreditTransaction, ModelConfig, ReverseOperation, User, UserPrompt
 from app.routers import prompt
 from app.schemas import ReverseIn
-from app.services import config_store, gateway, gateway_prompting, retention
+from app.services import config_store, gateway, gateway_prompting, retention, video_frames
 
 
 class _Model:
@@ -70,6 +71,186 @@ def test_reverse_product_profile_template_extracts_subject_identity():
     assert '"不可改项"' in template
     assert "上传产品是唯一商品主角" in template
     assert "替换参考素材原主体" in template
+
+
+def test_video_reverse_cover_fallback_preserves_probed_source_analysis(monkeypatch):
+    monkeypatch.setattr(settings, "mock_mode", False)
+    monkeypatch.setattr(video_frames, "available", lambda: True)
+    monkeypatch.setattr(
+        video_frames,
+        "sample_video",
+        lambda *_args, **_kwargs: video_frames.VideoSample(
+            frames=(),
+            source=video_frames.VideoMetadata(
+                width=720,
+                height=1280,
+                duration_seconds=12.5,
+                fps=24.0,
+                has_audio=True,
+            ),
+        ),
+    )
+    monkeypatch.setattr(prompt, "_gateway_ref", lambda *_args, **_kwargs: "resolved:cover")
+
+    refs, analysis = prompt._collect_refs(
+        ReverseIn(
+            asset_url="https://cdn.example.com/reference.mp4",
+            fallback_image="https://cdn.example.com/cover.jpg",
+            source_type="video",
+            target="video",
+        ),
+        db=object(),
+        user=User(id=1, phone="13800000000", status="active"),
+        frame_budget=8,
+        video_preset="standard",
+        gateway_mock=False,
+    )
+
+    assert refs == ["resolved:cover"]
+    assert analysis["source"] == {
+        "width": 720,
+        "height": 1280,
+        "ratio": "9:16",
+        "duration_seconds": 12.5,
+        "fps": 24.0,
+        "has_audio": True,
+        "audio_analyzed": False,
+    }
+    assert analysis["sampled_frames"] == []
+    assert analysis["analysis_mode"] == "cover_fallback"
+
+
+def test_video_reverse_cover_fallback_marks_degraded_when_sampling_returns_none(monkeypatch):
+    monkeypatch.setattr(video_frames, "available", lambda: True)
+    monkeypatch.setattr(video_frames, "sample_video", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(prompt, "_gateway_ref", lambda *_args, **_kwargs: "resolved:cover")
+
+    refs, analysis = prompt._collect_refs(
+        ReverseIn(
+            asset_url="https://cdn.example.com/reference.mp4",
+            fallback_image="https://cdn.example.com/cover.jpg",
+            source_type="video",
+            target="video",
+        ),
+        db=object(),
+        user=User(id=1, phone="13800000000", status="active"),
+        gateway_mock=False,
+    )
+
+    assert refs == ["resolved:cover"]
+    assert analysis["analysis_mode"] == "cover_fallback"
+    assert analysis["sampled_frames"] == []
+    assert analysis["degraded_reason"]
+
+
+def test_video_reverse_cover_fallback_handles_sampler_exception(monkeypatch):
+    monkeypatch.setattr(settings, "mock_mode", False)
+    monkeypatch.setattr(video_frames, "available", lambda: True)
+    monkeypatch.setattr(
+        video_frames,
+        "sample_video",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("decode failed")),
+    )
+    monkeypatch.setattr(prompt, "_gateway_ref", lambda *_args, **_kwargs: "resolved:cover")
+
+    refs, analysis = prompt._collect_refs(
+        ReverseIn(
+            asset_url="https://cdn.example.com/reference.mp4",
+            fallback_image="https://cdn.example.com/cover.jpg",
+            source_type="video",
+            target="video",
+        ),
+        db=object(),
+        user=User(id=1, phone="13800000000", status="active"),
+        gateway_mock=False,
+    )
+
+    assert refs == ["resolved:cover"]
+    assert analysis["analysis_mode"] == "cover_fallback"
+    assert analysis["sampled_frames"] == []
+
+
+def test_video_reverse_local_cover_fallback_probes_source_when_sampler_returns_none(
+    monkeypatch,
+):
+    monkeypatch.setattr(settings, "mock_mode", False)
+    monkeypatch.setattr(video_frames, "available", lambda: True)
+    monkeypatch.setattr(prompt.storage, "key_from_url", lambda _url: "generated/video.mp4")
+    monkeypatch.setattr(
+        prompt.asset_refs,
+        "generated_video_reference_path",
+        lambda *_args, **_kwargs: "/tmp/generated-video.mp4",
+    )
+    monkeypatch.setattr(video_frames, "sample_video_from_path", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        video_frames,
+        "probe_media",
+        lambda _path: {
+            "width": 1080,
+            "height": 1920,
+            "duration_seconds": 15.0,
+            "fps": 30.0,
+            "has_audio": True,
+        },
+    )
+    monkeypatch.setattr(prompt, "_gateway_ref", lambda *_args, **_kwargs: "resolved:cover")
+
+    refs, analysis = prompt._collect_refs(
+        ReverseIn(
+            asset_url="http://testserver/api/uploads/generated/video.mp4",
+            fallback_image="http://testserver/api/uploads/upload/cover.jpg",
+            source_type="video",
+            target="video",
+        ),
+        db=object(),
+        user=User(id=1, phone="13800000000", status="active"),
+        frame_budget=8,
+        video_preset="standard",
+        gateway_mock=False,
+    )
+
+    assert refs == ["resolved:cover"]
+    assert analysis["source"] == {
+        "width": 1080,
+        "height": 1920,
+        "ratio": "9:16",
+        "duration_seconds": 15.0,
+        "fps": 30.0,
+        "has_audio": True,
+        "audio_analyzed": False,
+    }
+    assert analysis["sampled_frames"] == []
+    assert analysis["analysis_mode"] == "cover_fallback"
+
+
+@pytest.mark.parametrize("sampler_available", [False, True])
+def test_video_reverse_cover_fallback_always_reports_degraded_analysis(
+    monkeypatch,
+    sampler_available,
+):
+    monkeypatch.setattr(settings, "mock_mode", False)
+    monkeypatch.setattr(video_frames, "available", lambda: sampler_available)
+    monkeypatch.setattr(video_frames, "sample_video", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(prompt, "_gateway_ref", lambda *_args, **_kwargs: "resolved:cover")
+
+    refs, analysis = prompt._collect_refs(
+        ReverseIn(
+            asset_url="https://cdn.example.com/reference.mp4",
+            fallback_image="https://cdn.example.com/cover.jpg",
+            source_type="video",
+            target="video",
+        ),
+        db=object(),
+        user=User(id=1, phone="13800000000", status="active"),
+        frame_budget=8,
+        video_preset="standard",
+    )
+
+    assert refs == ["resolved:cover"]
+    assert analysis["analysis_mode"] == "cover_fallback"
+    assert analysis["sampled_frames"] == []
+    assert analysis["source"]["duration_seconds"] is None
+    assert "封面" in analysis["degraded_reason"]
 
 
 def test_reverse_rejects_video_url_before_gateway(monkeypatch):
@@ -370,6 +551,46 @@ def test_reverse_client_request_id_replays_without_double_charge(client, make_us
         assert db.query(ReverseOperation).filter_by(client_request_id="reverse-retry-001").count() == 1
     finally:
         db.close()
+
+
+def test_reverse_text_fallback_replays_with_empty_structured_result(
+    client,
+    make_user,
+    auth,
+    monkeypatch,
+):
+    make_user("13800000015", balance=100)
+    headers = auth("13800000015")
+    calls = {"gateway": 0}
+
+    monkeypatch.setattr(prompt, "assert_safe_user_asset_url", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(prompt, "_assert_text_allowed", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(prompt, "_collect_refs", lambda *_args, **_kwargs: ["data:image/jpeg;base64,a"])
+
+    def fake_reverse(*_args, **_kwargs):
+        calls["gateway"] += 1
+        return {
+            "structured": {},
+            "final_text": "上游返回的纯文本降级提示词",
+            "usage": {"total_tokens": 10},
+        }
+
+    monkeypatch.setattr(gateway, "reverse_prompt", fake_reverse)
+    monkeypatch.setattr(prompt.usage, "record_call", lambda *_args, **_kwargs: None)
+    body = {
+        "client_request_id": "reverse-text-fallback-001",
+        "asset_url": "https://cdn.example.com/fallback.jpg",
+        "target": "image",
+    }
+
+    first = client.post("/api/prompt/reverse", json=body, headers=headers)
+    second = client.post("/api/prompt/reverse", json=body, headers=headers)
+
+    assert first.status_code == 200, first.text
+    assert second.status_code == 200, second.text
+    assert second.json() == first.json()
+    assert second.json()["structured"] == {}
+    assert calls["gateway"] == 1
 
 
 def test_reverse_without_client_request_id_persists_operation_and_uses_it_for_billing(

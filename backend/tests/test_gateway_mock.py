@@ -3,6 +3,8 @@ import base64
 import time
 from pathlib import Path
 
+import pytest
+
 from app.config import settings
 from app.services import gateway, video_frames
 from app.services.model_gateway_config import RuntimeGatewayConfig
@@ -116,8 +118,8 @@ def test_video_reverse_labels_frames_with_authoritative_timestamps(monkeypatch):
     assert "第 1 帧，时间戳 0.000 秒" in text_items
     assert "第 2 帧，时间戳 10.004 秒" in text_items
     assert result["shots"][0]["visual"] == "液滴入水"
-    assert result["shots"][-1]["end_seconds"] == 10.054
-    assert result["shots"][-1]["evidence_frame_indices"] == [2]
+    assert result["shots"][-1]["end_seconds"] == 2.2
+    assert result["analysis_gaps"] == [{"start_seconds": 2.2, "end_seconds": 10.054}]
     assert "shots" not in result["structured"]
     assert result["structured"]["时序分镜"].startswith("0.000-2.200s 液滴入水")
     assert "0.000-2.200s 液滴入水" not in result["final_text"]
@@ -126,8 +128,20 @@ def test_video_reverse_labels_frames_with_authoritative_timestamps(monkeypatch):
 def test_video_shots_are_sorted_before_normalization():
     shots = gateway._normalize_video_shots(
         [
-            {"start_seconds": 4, "end_seconds": 6, "visual": "后镜头"},
-            {"start_seconds": 0, "end_seconds": 2, "visual": "前镜头"},
+            {
+                "start_seconds": 4,
+                "end_seconds": 6,
+                "visual": "后镜头",
+                "evidence_frame_indices": [2],
+                "confidence": 0.8,
+            },
+            {
+                "start_seconds": 0,
+                "end_seconds": 2,
+                "visual": "前镜头",
+                "evidence_frame_indices": [1],
+                "confidence": 0.8,
+            },
         ],
         duration_seconds=6,
         frame_count=3,
@@ -139,32 +153,220 @@ def test_video_shots_are_sorted_before_normalization():
     ]
     assert [(shot["start_seconds"], shot["end_seconds"]) for shot in shots] == [
         (0.0, 2.0),
-        (2.0, 4.0),
         (4.0, 6.0),
     ]
 
 
-def test_video_shots_fill_leading_internal_and_empty_gaps():
+def test_video_shots_report_unobserved_ranges_without_inventing_actions():
     shots = gateway._normalize_video_shots(
         [
-            {"start_seconds": 1, "end_seconds": 2, "visual": "第一个已识别镜头"},
-            {"start_seconds": 4, "end_seconds": 6, "visual": "第二个已识别镜头"},
+            {"start_seconds": 1, "end_seconds": 2, "visual": "第一个已识别镜头", "evidence_frame_indices": [1], "confidence": 0.8},
+            {"start_seconds": 4, "end_seconds": 6, "visual": "第二个已识别镜头", "evidence_frame_indices": [2], "confidence": 0.8},
         ],
         duration_seconds=10,
         frame_count=5,
     )
-    assert [
-        (shot["start_seconds"], shot["end_seconds"])
-        for shot in shots
-    ] == [(0.0, 1.0), (1.0, 2.0), (2.0, 4.0), (4.0, 6.0), (6.0, 10.0)]
+    assert [(shot["start_seconds"], shot["end_seconds"]) for shot in shots] == [
+        (1.0, 2.0),
+        (4.0, 6.0),
+    ]
+    assert gateway._video_analysis_gaps(shots, duration_seconds=10) == [
+        {"start_seconds": 0.0, "end_seconds": 1.0},
+        {"start_seconds": 2.0, "end_seconds": 4.0},
+        {"start_seconds": 6.0, "end_seconds": 10.0},
+    ]
 
     fallback = gateway._normalize_video_shots(
         [{"start_seconds": "NaN", "end_seconds": 5}],
         duration_seconds=10,
         frame_count=5,
     )
-    assert [(shot["start_seconds"], shot["end_seconds"]) for shot in fallback] == [(0.0, 10.0)]
-    assert fallback[0]["evidence_frame_indices"] == [5]
+    assert fallback == []
+    assert gateway._video_analysis_gaps(fallback, duration_seconds=10) == [
+        {"start_seconds": 0.0, "end_seconds": 10.0}
+    ]
+
+
+def test_video_analysis_gaps_ignore_shots_without_frame_evidence():
+    unsupported = gateway._normalize_video_shots(
+        [{
+            "start_seconds": 0,
+            "end_seconds": 10,
+            "visual": "模型声称完整覆盖",
+            "evidence_frame_indices": [],
+            "confidence": 0,
+        }],
+        duration_seconds=10,
+        frame_count=4,
+    )
+
+    assert unsupported == []
+    assert gateway._video_analysis_gaps(unsupported, duration_seconds=10) == [
+        {"start_seconds": 0.0, "end_seconds": 10.0}
+    ]
+    assert gateway._video_analysis_gaps(
+        [{
+            "start_seconds": 0,
+            "end_seconds": 10,
+            "evidence_frame_indices": [1],
+            "confidence": 1,
+        }],
+        duration_seconds=10,
+        analysis_mode="cover_fallback",
+    ) == [{"start_seconds": 0.0, "end_seconds": 10.0}]
+
+
+def test_unverified_shot_does_not_shift_verified_shot_coverage():
+    shots = gateway._normalize_video_shots(
+        [
+            {
+                "start_seconds": 0,
+                "end_seconds": 9,
+                "visual": "unsupported model guess",
+                "evidence_frame_indices": [],
+                "confidence": 0,
+            },
+            {
+                "start_seconds": 8,
+                "end_seconds": 10,
+                "visual": "observed closing frame",
+                "evidence_frame_indices": [2],
+                "confidence": 0.9,
+            },
+        ],
+        duration_seconds=10,
+        frame_count=2,
+    )
+
+    assert len(shots) == 1
+    assert shots[0]["start_seconds"] == 8.0
+    assert gateway._video_analysis_gaps(
+        shots,
+        duration_seconds=10,
+    ) == [{"start_seconds": 0.0, "end_seconds": 8.0}]
+
+
+def test_shot_evidence_must_match_its_time_range():
+    sampled_frames = [
+        {"index": 1, "timestamp_seconds": 0.0},
+        {"index": 2, "timestamp_seconds": 8.0},
+    ]
+
+    unsupported = gateway._normalize_video_shots(
+        [{
+            "start_seconds": 0,
+            "end_seconds": 2,
+            "visual": "错误引用末尾帧",
+            "evidence_frame_indices": [2],
+            "confidence": 0.9,
+        }],
+        duration_seconds=10,
+        frame_count=2,
+        sampled_frames=sampled_frames,
+    )
+    bracketed = gateway._normalize_video_shots(
+        [{
+            "start_seconds": 2,
+            "end_seconds": 7,
+            "visual": "两帧夹持的高置信区间",
+            "evidence_frame_indices": [1, 2],
+            "confidence": 0.9,
+        }],
+        duration_seconds=10,
+        frame_count=2,
+        sampled_frames=sampled_frames,
+    )
+
+    assert unsupported == []
+    assert bracketed[0]["evidence_frame_indices"] == [1, 2]
+
+
+def test_single_frame_cannot_claim_a_long_video_interval():
+    shots = gateway._normalize_video_shots(
+        [{
+            "start_seconds": 0,
+            "end_seconds": 10,
+            "visual": "单帧被错误扩写为全片",
+            "evidence_frame_indices": [2],
+            "confidence": 0.9,
+        }],
+        duration_seconds=10,
+        frame_count=3,
+        sampled_frames=[
+            {"index": 1, "timestamp_seconds": 0.0},
+            {"index": 2, "timestamp_seconds": 5.0},
+            {"index": 3, "timestamp_seconds": 9.95},
+        ],
+    )
+
+    assert shots == []
+    assert gateway._video_analysis_gaps(shots, duration_seconds=10) == [
+        {"start_seconds": 0.0, "end_seconds": 10.0}
+    ]
+
+
+def test_single_frame_can_support_a_short_local_interval():
+    shots = gateway._normalize_video_shots(
+        [{
+            "start_seconds": 4.5,
+            "end_seconds": 5.5,
+            "visual": "中段产品特写",
+            "evidence_frame_indices": [2],
+            "confidence": 0.9,
+        }],
+        duration_seconds=10,
+        frame_count=3,
+        sampled_frames=[
+            {"index": 1, "timestamp_seconds": 0.0},
+            {"index": 2, "timestamp_seconds": 5.0},
+            {"index": 3, "timestamp_seconds": 9.95},
+        ],
+    )
+
+    assert [(shot["start_seconds"], shot["end_seconds"]) for shot in shots] == [
+        (4.5, 5.5)
+    ]
+
+
+def test_multi_frame_evidence_clamps_unobserved_shot_edges():
+    shots = gateway._normalize_video_shots(
+        [{
+            "start_seconds": 0,
+            "end_seconds": 10,
+            "visual": "中段有证据的长镜头",
+            "evidence_frame_indices": [2, 3],
+            "confidence": 0.9,
+        }],
+        duration_seconds=10,
+        frame_count=4,
+        sampled_frames=[
+            {"index": 1, "timestamp_seconds": 0.0},
+            {"index": 2, "timestamp_seconds": 3.0},
+            {"index": 3, "timestamp_seconds": 7.0},
+            {"index": 4, "timestamp_seconds": 9.95},
+        ],
+    )
+
+    assert [(shot["start_seconds"], shot["end_seconds"]) for shot in shots] == [
+        (2.25, 7.75)
+    ]
+    assert gateway._video_analysis_gaps(shots, duration_seconds=10) == [
+        {"start_seconds": 0.0, "end_seconds": 2.25},
+        {"start_seconds": 7.75, "end_seconds": 10.0},
+    ]
+
+
+def test_reversed_invalid_shot_does_not_create_synthetic_split():
+    shots = gateway._normalize_video_shots(
+        [{"start_seconds": 4, "end_seconds": 2, "visual": "非法倒置镜头"}],
+        duration_seconds=10,
+        frame_count=3,
+    )
+
+    assert shots == []
+    assert gateway._video_analysis_gaps(shots, duration_seconds=10) == [
+        {"start_seconds": 0.0, "end_seconds": 10.0}
+    ]
 
 
 def test_compose_final_fallback():
@@ -172,6 +374,198 @@ def test_compose_final_fallback():
     r = gateway._parse_structured('{"主体":"a cat","光线":"soft","负向":"text"}')
     assert "a cat" in r["final_text"] and "soft" in r["final_text"]
     assert "text" in r["final_text"]  # negative appended
+
+
+def test_video_reverse_template_keeps_generation_prompt_compact():
+    template = gateway._reverse_template("video", n_frames=4)
+
+    assert "220-360 个中文字符" in template
+    assert "末尾追加英文视频关键词" not in template
+
+
+@pytest.mark.parametrize("content", ["[]", '"hello"', "null"])
+def test_parse_structured_non_object_json_uses_text_fallback(content):
+    result = gateway._parse_structured(content)
+
+    assert result["structured"] == {}
+    assert result["final_text"] == content
+    assert result["shots"] == []
+
+
+def test_video_reverse_missing_final_text_does_not_serialize_raw_shot_objects():
+    result = gateway._parse_structured(
+        '{"主体":"产品","shots":[{"start_seconds":0,"end_seconds":2,"visual":"产品入镜"}]}'
+    )
+
+    assert "shots" not in result["final_text"]
+    assert "start_seconds" not in result["final_text"]
+    assert result["shots"][0]["visual"] == "产品入镜"
+
+
+def test_video_reverse_removes_conflicting_provider_duration_from_final_text(monkeypatch):
+    monkeypatch.setattr(settings, "mock_mode", False)
+    cfg = RuntimeGatewayConfig(
+        use="vision",
+        provider="custom_openai",
+        base_url="https://vision-gateway.example.com/v1",
+        api_key="vision-key",
+        gateway_format="openai",
+    )
+
+    monkeypatch.setattr(
+        gateway,
+        "_post",
+        lambda *_args, **_kwargs: {
+            "choices": [{"message": {"content": (
+                '{"主体":"精华广告","shots":[],"final_text":"3:4竖版，8秒水感精华广告"}'
+            )}}],
+            "usage": {"total_tokens": 9},
+        },
+    )
+
+    result = gateway.reverse_prompt(
+        ["data:image/jpeg;base64,Zmlyc3Q="],
+        "vision-model",
+        target="video",
+        video_analysis={
+            "source": {
+                "width": 720,
+                "height": 960,
+                "ratio": "3:4",
+                "duration_seconds": 10.0,
+                "fps": 24.0,
+                "has_audio": False,
+                "audio_analyzed": False,
+            },
+            "sampled_frames": [{"index": 1, "timestamp_seconds": 0.0}],
+        },
+        gateway_config=cfg,
+    )
+
+    assert "10.000秒" in result["final_text"]
+    assert "8秒" not in result["final_text"]
+
+
+def test_video_duration_cleanup_preserves_shot_timing_language():
+    cleaned = gateway._without_conflicting_video_durations(
+        "前2秒产品静置，3秒后切到特写，每个镜头约4秒，8秒水感精华广告",
+        10,
+    )
+
+    assert "前2秒" in cleaned
+    assert "3秒后" in cleaned
+    assert "每个镜头约4秒" in cleaned
+    assert "8秒" not in cleaned
+
+
+def test_video_duration_cleanup_preserves_shot_pacing_and_relative_timing():
+    cleaned = gateway._without_conflicting_video_durations(
+        "总时长8秒，每个镜头约2秒，0-2秒产品静置，3秒后切到特写，10秒广告",
+        10.0,
+    )
+
+    assert "总时长8秒" not in cleaned
+    assert "每个镜头约2秒" in cleaned
+    assert "0-2秒产品静置" in cleaned
+    assert "3秒后切到特写" in cleaned
+    assert "10秒广告" in cleaned
+
+
+@pytest.mark.parametrize(
+    ("text", "removed"),
+    [
+        ("total duration 8 seconds, first 2 seconds hold on product", "total duration 8 seconds"),
+        ("8 sec video, each shot lasts 2 sec", "8 sec video"),
+    ],
+)
+def test_video_duration_cleanup_supports_english_second_units(text, removed):
+    cleaned = gateway._without_conflicting_video_durations(text, 10.0)
+
+    assert removed not in cleaned
+    assert "2 sec" in cleaned or "2 seconds" in cleaned
+
+    english = gateway._without_conflicting_video_durations(
+        "8s video, first 2s hold, 10s ad",
+        10.0,
+    )
+    assert "8s video" not in english
+    assert "first 2s hold" in english
+    assert "10s ad" in english
+
+
+def test_video_reverse_separates_post_production_from_final_text(monkeypatch):
+    monkeypatch.setattr(settings, "mock_mode", False)
+    cfg = RuntimeGatewayConfig(
+        use="vision",
+        provider="custom_openai",
+        base_url="https://vision-gateway.example.com/v1",
+        api_key="vision-key",
+        gateway_format="openai",
+    )
+    monkeypatch.setattr(
+        gateway,
+        "_post",
+        lambda *_args, **_kwargs: {
+            "choices": [{"message": {"content": (
+                '{"主体":"洗脸巾广告","shots":[],"final_text":'
+                '"微距展开如意云纹。字幕‘干湿两用’。旁白‘温柔开启新一天’。SFX‘水滴声’"}'
+            )}}],
+            "usage": {"total_tokens": 9},
+        },
+    )
+
+    result = gateway.reverse_prompt(
+        ["data:image/jpeg;base64,Zmlyc3Q="],
+        "vision-model",
+        target="video",
+        video_analysis={
+            "source": {"duration_seconds": 10.0, "audio_analyzed": False},
+            "sampled_frames": [{"index": 1, "timestamp_seconds": 0.0}],
+        },
+        gateway_config=cfg,
+    )
+
+    assert "微距展开如意云纹" in result["final_text"]
+    assert "干湿两用" not in result["final_text"]
+    assert "温柔开启新一天" not in result["final_text"]
+    assert "水滴声" not in result["final_text"]
+    assert result["structured"]["字幕卖点"] == "干湿两用"
+    assert result["structured"]["旁白"] == "温柔开启新一天"
+    assert result["structured"]["音效"] == "水滴声"
+
+
+def test_video_reverse_separates_post_production_without_video_metadata(monkeypatch):
+    monkeypatch.setattr(settings, "mock_mode", False)
+    cfg = RuntimeGatewayConfig(
+        use="vision",
+        provider="custom_openai",
+        base_url="https://vision-gateway.example.com/v1",
+        api_key="vision-key",
+        gateway_format="openai",
+    )
+    monkeypatch.setattr(
+        gateway,
+        "_post",
+        lambda *_args, **_kwargs: {
+            "choices": [{"message": {"content": (
+                '{"主体":"洗脸巾广告","final_text":'
+                '"微距展开云纹。字幕‘干湿两用’。旁白‘温柔开始’。SFX‘水滴声’"}'
+            )}}],
+            "usage": {"total_tokens": 9},
+        },
+    )
+
+    result = gateway.reverse_prompt(
+        ["data:image/jpeg;base64,Zmlyc3Q="],
+        "vision-model",
+        target="video",
+        gateway_config=cfg,
+    )
+
+    assert result["final_text"] == "微距展开云纹"
+    assert result["structured"]["字幕卖点"] == "干湿两用"
+    assert result["structured"]["旁白"] == "温柔开始"
+    assert result["structured"]["音效"] == "水滴声"
 
 
 def test_compose_final_uses_reverse_dimension_order():

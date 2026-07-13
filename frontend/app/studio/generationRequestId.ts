@@ -313,3 +313,11 @@ export function clearPendingReverseRequest(
     storageKey: PENDING_REVERSE_STORAGE_KEY,
   });
 }
+
+export function shouldKeepPendingReverseRequest(error: unknown) {
+  const candidate = error as { status?: unknown; message?: unknown } | null;
+  return (
+    Number(candidate?.status) === 409
+    && String(candidate?.message || "").includes("仍在处理中")
+  );
+}

@@ -10,6 +10,7 @@ import {
   clearPendingReverseRequest,
   generateClientRequestId,
   generateReverseClientRequestId,
+  shouldKeepPendingReverseRequest,
 } from "../app/studio/generationRequestId";
 import { shouldBlockNewGeneration } from "../app/studio/taskConcurrency";
 import { assetSignature, isRequestTimeoutError, isTerminalTaskStatus } from "../app/studio/helpers";
@@ -219,7 +220,7 @@ export default function useGenerationSubmit({
             refreshMe();
           } catch (e) {
             if (!isCurrent()) return;
-            if (!isRequestTimeoutError(e)) {
+            if (!isRequestTimeoutError(e) && !shouldKeepPendingReverseRequest(e)) {
               clearPendingReverseRequest(pendingProfileReverseRequestRef, profileRequestId);
             }
             if (!isProductAssetStillCurrent()) {
@@ -235,7 +236,11 @@ export default function useGenerationSubmit({
               productProfileSource: "",
               productProfiling: false,
             }, creationMode);
-            setMsg(`主体档案识别失败，请重新点击生成或更换更清晰的主体图片后再试：${e.message}`);
+            setMsg(
+              shouldKeepPendingReverseRequest(e)
+                ? `${e.message}，请稍后再次点击生成。`
+                : `主体档案识别失败，请重新点击生成或更换更清晰的主体图片后再试：${e.message}`,
+            );
             clearPendingGenerateRequest(pendingGenerateRequestRef, requestId);
             return;
           }

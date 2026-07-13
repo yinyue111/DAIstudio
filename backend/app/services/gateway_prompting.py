@@ -93,11 +93,17 @@ VIDEO_REVERSE_TEMPLATE = (
     "6. 如果后续用于『上传自己的产品/人物生成类似视频』,必须把参考片里的原主体身份、品牌、人物、"
     "Logo、包装文字与可迁移的场景、镜头、光线、节奏、分镜和展示动作分开记录;可迁移动作只能写成"
     "上传主体可复用的展示节奏/运动路径,不要把原商品名、原品牌、原人物身份写进可迁移字段。\n"
-    "7. final_text 必须可直接用于文生视频,以『参考片复刻』为核心,不要写成普通美图描述。\n"
-    "8. 消息中给出的源视频宽高、画幅、时长、帧率和采样时间戳是后端探测的权威事实,不得改写或猜测;"
-    "时序分镜和 shots 的终点必须覆盖源视频真实时长。音频标记为未分析时不得虚构对白、配乐或卡点。\n"
+    "7. sampled_frames 是稀疏观察证据。shots 只能覆盖有采样帧或相邻帧高置信支持的时间段;未观察区间"
+    "不得补写『延续动作』『保持尾帧』等虚构画面。静帧能直接确认的内容写入观察事实,跨帧动作仅在"
+    "证据充分时写入帧间推断,并降低不确定推断的 confidence。\n"
+    "8. 画面 OCR、卖点字幕、旁白和音效属于后期层,不得把字幕内容改写成主体动作、镜头或场景。"
+    "final_text 只保留生成画面所需的视觉、动作和运镜指令,字幕/旁白/音效分别保留在结构化字段中。\n"
+    "9. final_text 必须可直接用于文生视频,以『参考片复刻』为核心,不要写成普通美图描述。\n"
+    "10. 消息中给出的源视频宽高、画幅、时长、帧率和采样时间戳是后端探测的权威事实,不得改写或猜测;"
+    "shots 不得超出源视频真实时长;无法由证据覆盖的区间保持为空并交由后端报告分析缺口。"
+    "音频标记为未分析时不得虚构对白、配乐或卡点。\n"
     "输出严格的 JSON(不要任何额外文字、不要 markdown)。final_text 必须从下列维度逐项整合而来,"
-    "不得引入维度中没有出现的新主体/场景/风格/动作;主体、商品/服装、场景、风格、视角构图、动作、运镜、分镜、字幕卖点、光线、配色必须能在 final_text 中对应找到。\n"
+    "不得引入维度中没有出现的新主体/场景/风格/动作;主体、商品/服装、场景、风格、视角构图、动作、运镜、分镜、光线、配色必须能在 final_text 中对应找到。字幕、旁白和音效只进入各自结构化字段。\n"
     "字段如下:\n"
     "{\n"
     '  "图像类型": "必须四选一: 产品视频 / 人物视频 / 人物+产品混合视频 / 场景视频,并给 1 句判断依据",\n'
@@ -116,12 +122,17 @@ VIDEO_REVERSE_TEMPLATE = (
     '  "广告目标": "这条片子在卖什么/展示什么卖点;若只看到画面无法确认,写未见明确卖点",\n'
     '  "风格": "确切商业影像风格(如 抖音女装种草/电商棚拍/街拍广告/直播切片/品牌大片),不要泛写电影感",\n'
     '  "视角构图": "每个主要镜头的景别、视角、主体占比、画面百分比位置、横竖画幅、留白和引导线",\n'
-    '  "主体动作": "主体动作按时间顺序拆解:走位、转身、摆裙、抬手、看镜头、拿商品、切换姿势等,给方向、幅度、身体重心和四肢姿态变化",\n'
+    '  "观察事实": "只写采样帧直接可见的主体、场景、构图、光线、商品状态和文字,按证据帧编号标注;不得写帧外事件",\n'
+    '  "帧间推断": "只写由至少两个时间点共同支持的动作或运镜推断,标注证据帧和置信度;证据不足填 无",\n'
+    '  "主体动作": "主体动作按时间顺序拆解:走位、转身、摆裙、抬手、看镜头、拿商品、切换姿势等,给方向、幅度、身体重心和四肢姿态变化;只保留有观察或高置信帧间证据的动作",\n'
     '  "可迁移主体动作": "专门给上传产品/人物替换参考主体时使用:只写可迁移的动作节奏、入镜顺序、旋转/推进/环绕/特写/手持/摆放/展示路径,不得包含参考片原商品名、品牌、Logo、包装文字、人物身份或服装身份;如果不可迁移填 无",\n'
+    '  "迁移生成指令": "专门给上传产品/人物替换参考主体时直接使用的一段精简视频提示词:只整合可迁移的场景、风格、构图、动作节奏、运镜、剪辑、光线和氛围;必须删除参考片原商品名、品牌、Logo、包装文字、人物身份、脸部身份和服装身份;不得包含字幕、旁白或音效;控制在 160-280 个中文字符",\n'
     '  "镜头运动": "运镜方式(推/拉/摇/移/跟/环绕/升降/手持/固定),方向、速度、幅度、是否有变焦或景深变化",\n'
     '  "剪辑节奏": "镜头数量、切换节奏、每镜头大致秒数、是否卡点、是否慢动作/加速、是否循环",\n'
     '  "时序分镜": "按 0-1s、1-2s 或镜头1/2/3 写画面演变,必须对应所见帧顺序",\n'
-    '  "字幕卖点": "画面中文字/logo/价格/促销/卖点文案的内容、位置、字体风格、颜色;若无则填 无",\n'
+    '  "字幕卖点": "后期叠加层:画面中文字/logo/价格/促销/卖点文案的内容、位置、字体风格、颜色;不得作为主体动作或镜头,若无则填 无",\n'
+    '  "旁白": "仅根据已分析音频填写旁白原文和时间;音频未分析时填 未分析,不得从静帧猜测",\n'
+    '  "音效": "仅根据已分析音频填写可确认的音乐节拍或音效及时间;音频未分析时填 未分析,不得从静帧猜测",\n'
     '  "时长建议": "建议生成时长、帧率感、是否可扩展为长视频循环段落",\n'
     '  "光线": "主光/辅光方向、软硬、色温、阴影形状、反光、高光、是否随镜头变化",\n'
     '  "色调配色": "主色/辅色/点缀色的色值和画面占比、冷暖、饱和度、对比度、调色滤镜",\n'
@@ -134,8 +145,8 @@ VIDEO_REVERSE_TEMPLATE = (
     '"evidence_frame_indices": [1, 2], "confidence": 0.0}],\n'
     '  "一致性约束": "生成时必须保持不变的元素:主体数量、成年/年龄语境、人物比例/体态/体态线条、服装结构/覆盖范围、服装颜色版型、场景、画幅、字幕卖点、镜头顺序等;避免未成年感、夸张身体展示姿态、身体局部凝视和私密成人化语境",\n'
     '  "负向": "需要避免的元素:换脸、换衣服颜色、商品漂移、字幕乱字、水印、肢体畸变、闪烁、形变、镜头抖动、拼接感、不自然走路",\n'
-    '  "final_text": "按视频类型自动取舍并整合为一段可直接用于文生视频的中文提示词:图像类型/反推重点 → 参考片复刻 → 主体 → 人像意图/人物比例/身材体态/体态线条/服装结构/服装覆盖/妆发五官(仅人物或混合视频重点写) → 商品服装/产品细节(仅产品或混合视频重点写) → 场景/广告目标/风格 → 视角构图 → 可迁移主体动作/动作和运镜 → 剪辑节奏/时序分镜/字幕卖点 → 光线/配色/材质/氛围 → 一致性约束。'
-    '必须符合视频类型:产品视频以产品展示、包装文字、材质、卖点、镜头调度为主;人物视频必须包含时间推进、镜头顺序、成年或年龄不确定的安全语境、商业人像/Lookbook/角色设定意图、人物比例、身材体态、整体体态线条、服装结构、服装覆盖范围、妆发五官、动作和运镜;混合视频必须分别说明人物和产品并标注主次;场景视频不要硬编产品或人物。不得写三围尺寸、身体局部凝视、私密成人化、成人向写真语境、擦边语境、幼态成人化等风险意图,不得与上述字段矛盾;末尾追加英文视频关键词,控制在 400-600 个中文字符。"\n'
+    '  "final_text": "按视频类型自动取舍并整合为一段可直接用于文生视频的中文提示词:图像类型/反推重点 → 参考片复刻 → 主体 → 人像意图/人物比例/身材体态/体态线条/服装结构/服装覆盖/妆发五官(仅人物或混合视频重点写) → 商品服装/产品细节(仅产品或混合视频重点写) → 场景/广告目标/风格 → 视角构图 → 有证据的可迁移主体动作/动作和运镜 → 剪辑节奏/有证据的时序分镜 → 光线/配色/材质/氛围 → 一致性约束。字幕卖点、旁白和音效不得混入 final_text。'
+    '必须符合视频类型:产品视频以产品展示、包装文字、材质、卖点、镜头调度为主;人物视频必须包含时间推进、镜头顺序、成年或年龄不确定的安全语境、商业人像/Lookbook/角色设定意图、人物比例、身材体态、整体体态线条、服装结构、服装覆盖范围、妆发五官、动作和运镜;混合视频必须分别说明人物和产品并标注主次;场景视频不要硬编产品或人物。不得写三围尺寸、身体局部凝视、私密成人化、成人向写真语境、擦边语境、幼态成人化等风险意图,不得与上述字段矛盾;详细观察保留在结构化字段和 shots，final_text 删除同义重复、分析过程和低价值标签，控制在 220-360 个中文字符。"\n'
     "}"
 )
 
@@ -187,9 +198,11 @@ def parse_structured(content: str) -> dict:
     try:
         obj = json.loads(raw)
     except Exception:
-        obj = {"主体": content.strip()[:200], "final_text": content.strip()}
-    final_text = obj.pop("final_text", None) or compose_final(obj)
+        return {"structured": {}, "final_text": content.strip(), "shots": []}
+    if not isinstance(obj, dict):
+        return {"structured": {}, "final_text": content.strip(), "shots": []}
     shots = obj.pop("shots", [])
+    final_text = obj.pop("final_text", None) or compose_final(obj)
     return {
         "structured": obj,
         "final_text": final_text,
@@ -202,36 +215,21 @@ def normalize_video_shots(
     *,
     duration_seconds: float | None = None,
     frame_count: int | None = None,
+    sampled_frames: list[dict] | None = None,
     audio_analyzed: bool = False,
 ) -> list[dict]:
     duration = float(duration_seconds) if duration_seconds is not None else None
-
-    def gap_shot(start: float, end: float, *, tail: bool = False) -> dict:
-        if tail:
-            visual = "按末尾采样帧复刻源视频尾段画面"
-            action = "延续源视频尾段变化并以末尾画面收尾"
-            camera = "按末尾采样帧的景别和机位"
-            lighting = "保持末尾采样帧光影"
-            evidence = [frame_count] if frame_count and frame_count > 0 else []
-        else:
-            visual = "按相邻采样帧复刻源视频未明确分段的画面"
-            action = "按相邻采样帧延续原始动作和画面变化"
-            camera = "按相邻采样帧的景别和机位"
-            lighting = "按相邻采样帧过渡光影"
-            evidence = []
-        return {
-            "start_seconds": round(start, 3),
-            "end_seconds": round(end, 3),
-            "visual": visual,
-            "action": action,
-            "camera": camera,
-            "lighting": lighting,
-            "transition": "无额外转场",
-            "ocr": "仅保留采样帧可确认文字",
-            "audio_cue": "未见" if audio_analyzed else "未分析",
-            "evidence_frame_indices": evidence,
-            "confidence": 0.0,
-        }
+    frame_timestamps: dict[int, float] = {}
+    for frame in sampled_frames or []:
+        if not isinstance(frame, dict):
+            continue
+        try:
+            index = int(frame.get("index"))
+            timestamp = float(frame.get("timestamp_seconds"))
+        except (TypeError, ValueError):
+            continue
+        if index >= 1 and isfinite(timestamp):
+            frame_timestamps[index] = timestamp
 
     if not isinstance(shots, list):
         shots = []
@@ -251,29 +249,15 @@ def normalize_video_shots(
     candidates.sort(key=lambda row: (row[0], row[1]))
 
     normalized: list[dict] = []
-    previous_end = 0.0
+    previous_verified_end = 0.0
     text_fields = ("visual", "action", "camera", "lighting", "transition", "ocr")
     for start, end, raw in candidates:
         if duration is not None:
             if start >= duration:
                 continue
             end = min(end, duration)
-        if start > previous_end + 0.001:
-            normalized.append(gap_shot(previous_end, start))
-            previous_end = start
-        start = max(start, previous_end)
         if end <= start:
             continue
-        item = {
-            "start_seconds": round(start, 3),
-            "end_seconds": round(end, 3),
-        }
-        for field in text_fields:
-            item[field] = str(raw.get(field) or "").strip()
-        item["audio_cue"] = (
-            str(raw.get("audio_cue") or "").strip() or "未见"
-            if audio_analyzed else "未分析"
-        )
         evidence = raw.get("evidence_frame_indices")
         if isinstance(evidence, list):
             valid_indices = []
@@ -284,29 +268,123 @@ def normalize_video_shots(
                     continue
                 if index < 1 or (frame_count is not None and index > frame_count):
                     continue
+                if frame_timestamps and index not in frame_timestamps:
+                    continue
                 if index not in valid_indices:
                     valid_indices.append(index)
-            item["evidence_frame_indices"] = valid_indices
         else:
-            item["evidence_frame_indices"] = []
+            valid_indices = []
         try:
             confidence = float(raw.get("confidence"))
         except (TypeError, ValueError):
             confidence = 0.0
-        item["confidence"] = round(max(0.0, min(1.0, confidence)), 3)
+        confidence = round(max(0.0, min(1.0, confidence)), 3)
+        if not valid_indices or confidence <= 0:
+            continue
+        start = max(start, previous_verified_end)
+        if end <= start:
+            continue
+        if frame_timestamps:
+            evidence_times = sorted(frame_timestamps[index] for index in valid_indices)
+            tolerance = 0.75
+            inside_range = any(
+                start - tolerance <= timestamp <= end + tolerance
+                for timestamp in evidence_times
+            )
+            brackets_range = (
+                len(evidence_times) >= 2
+                and evidence_times[0] <= start
+                and evidence_times[-1] >= end
+            )
+            single_frame_local = (
+                len(evidence_times) == 1
+                and end - start <= tolerance * 2
+                and inside_range
+            )
+            if len(evidence_times) == 1:
+                if not single_frame_local:
+                    continue
+            elif not brackets_range:
+                if not inside_range:
+                    continue
+                supported_start = max(0.0, evidence_times[0] - tolerance)
+                supported_end = evidence_times[-1] + tolerance
+                if duration is not None:
+                    supported_end = min(duration, supported_end)
+                start = max(start, supported_start)
+                end = min(end, supported_end)
+                if end <= start:
+                    continue
+        item = {
+            "start_seconds": round(start, 3),
+            "end_seconds": round(end, 3),
+        }
+        for field in text_fields:
+            item[field] = str(raw.get(field) or "").strip()
+        item["audio_cue"] = (
+            str(raw.get("audio_cue") or "").strip() or "未见"
+            if audio_analyzed else "未分析"
+        )
+        item["evidence_frame_indices"] = valid_indices
+        item["confidence"] = confidence
         normalized.append(item)
-        previous_end = end
-    if duration is not None and duration > 0:
-        if not normalized:
-            normalized.append(gap_shot(0.0, duration, tail=True))
-        elif normalized[-1]["end_seconds"] < duration - 0.001:
-            normalized.append(gap_shot(normalized[-1]["end_seconds"], duration, tail=True))
+        previous_verified_end = end
     return normalized
+
+
+def video_analysis_gaps(
+    shots: list[dict],
+    *,
+    duration_seconds: float | None = None,
+    analysis_mode: str | None = None,
+) -> list[dict]:
+    try:
+        duration = float(duration_seconds) if duration_seconds is not None else None
+    except (TypeError, ValueError):
+        duration = None
+    if duration is None or not isfinite(duration) or duration <= 0:
+        return []
+    if analysis_mode == "cover_fallback":
+        return [{"start_seconds": 0.0, "end_seconds": round(duration, 3)}]
+
+    gaps: list[dict] = []
+    cursor = 0.0
+    for shot in shots if isinstance(shots, list) else []:
+        evidence = shot.get("evidence_frame_indices") if isinstance(shot, dict) else None
+        try:
+            confidence = float(shot.get("confidence")) if isinstance(shot, dict) else 0.0
+        except (TypeError, ValueError):
+            confidence = 0.0
+        if not isinstance(evidence, list) or not evidence or confidence <= 0:
+            continue
+        try:
+            start = max(0.0, min(duration, float(shot["start_seconds"])))
+            end = max(0.0, min(duration, float(shot["end_seconds"])))
+        except (KeyError, TypeError, ValueError):
+            continue
+        if not isfinite(start) or not isfinite(end) or end <= start:
+            continue
+        if start > cursor + 0.001:
+            gaps.append({
+                "start_seconds": round(cursor, 3),
+                "end_seconds": round(start, 3),
+            })
+        cursor = max(cursor, end)
+    if cursor < duration - 0.001:
+        gaps.append({
+            "start_seconds": round(cursor, 3),
+            "end_seconds": round(duration, 3),
+        })
+    return gaps
 
 
 def compose_final(obj: dict) -> str:
     """Fallback final prompt when the model omits final_text."""
     neg = obj.get("负向")
+    excluded = {
+        "负向", "final_text", "观察事实", "帧间推断", "迁移生成指令",
+        "字幕卖点", "旁白", "音效",
+    }
     order = [
         "图像类型", "反推重点", "主体",
         "人像意图", "人物比例", "身材体态", "体态线条", "服装结构", "服装覆盖",
@@ -320,11 +398,11 @@ def compose_final(obj: dict) -> str:
     parts: list[str] = []
     for key in order:
         value = obj.get(key)
-        if value and key not in ("负向", "final_text"):
+        if value and key not in excluded:
             parts.append(f"{key}: {value}")
             used.add(key)
     for key, value in obj.items():
-        if key not in used and key not in ("负向", "final_text") and value:
+        if key not in used and key not in excluded and value:
             parts.append(f"{key}: {value}")
     text = "；".join(parts)
     if neg:

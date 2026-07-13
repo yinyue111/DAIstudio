@@ -13,6 +13,7 @@ import {
 import {
   clearPendingReverseRequest,
   generateReverseClientRequestId,
+  shouldKeepPendingReverseRequest,
 } from "../app/studio/generationRequestId";
 
 const DEFAULT_MAX_UPLOAD_IMAGE_BYTES = 20 * 1024 * 1024;
@@ -195,7 +196,7 @@ export default function useMediaUpload({
         !ownerRequest.isCurrent()
         || !isRequestCurrent(productUploadRequestRef, mode, uploadReqId)
       ) return;
-      if (!isRequestTimeoutError(e)) {
+      if (!isRequestTimeoutError(e) && !shouldKeepPendingReverseRequest(e)) {
         clearPendingReverseRequest(pendingProfileReverseRequestRef, profileRequestId);
       }
       setWorkspacePatch({
@@ -203,7 +204,13 @@ export default function useMediaUpload({
         productProfileSource: "",
         productProfiling: false,
       }, mode);
-      if (isModeVisible(mode)) setMsg(`主体档案识别失败，可重新上传更清晰图片后再试：${e.message}`);
+      if (isModeVisible(mode)) {
+        setMsg(
+          shouldKeepPendingReverseRequest(e)
+            ? `${e.message}，请稍后重试。`
+            : `主体档案识别失败，可重新上传更清晰图片后再试：${e.message}`,
+        );
+      }
     }
   }
 

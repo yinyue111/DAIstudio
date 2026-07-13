@@ -192,6 +192,11 @@ for (const [label, source] of [["upload", uploadSource], ["submit", submitSource
     /(?:cacheSubjectProfileResult|readCachedSubjectProfileResult)\(\s*pendingProfileReverseRequestRef,/,
     `${label} path must not store successful results in the pending request ref`,
   );
+  assert.match(
+    source,
+    /!isRequestTimeoutError\(e\)[\s\S]{0,120}!shouldKeepPendingReverseRequest\(e\)[\s\S]{0,160}clearPendingReverseRequest\(pendingProfileReverseRequestRef,\s*profileRequestId\)/,
+    `${label} path must retain the billed profile request id while the backend reports it is still running`,
+  );
 }
 assert.match(
   uploadSource,

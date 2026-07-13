@@ -17,6 +17,7 @@ import {
   clearPendingReverseRequest,
   generateClientRequestId,
   generateReverseClientRequestId,
+  shouldKeepPendingReverseRequest,
 } from "../app/studio/generationRequestId.ts";
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -123,6 +124,50 @@ assert.equal(
   canonicalReversePrompt,
   "reverse parsing should preserve the API final_text instead of rebuilding every structured field",
 );
+
+const reverseVideoFinalText = "高端日系个护广告。Shot 1：抽出洗脸巾。Shot 2：微距展开如意云纹。";
+const reverseVideoPayload = buildGenerationPayload({
+  stage: "preview",
+  cfg: { video_duration_max_seconds: 15 },
+  category: "video",
+  creationMode: "video",
+  isEditMode: false,
+  subjectMode: "general",
+  prompt: reverseVideoFinalText,
+  promptDirty: false,
+  promptSourceSignature: "video|https://cdn.example.com/reference.mp4|https://cdn.example.com/cover.jpg",
+  selected: {
+    type: "video",
+    url: "https://cdn.example.com/reference.mp4",
+    thumb: "https://cdn.example.com/cover.jpg",
+    width: 720,
+    height: 1280,
+  },
+  productAsset: null,
+  structured: {
+    "风格": "高端日系个护广告",
+    "可迁移主体动作": "抽出洗脸巾后微距展开纹理",
+    "时序分镜": "0-5s 抽出洗脸巾；5-10s 微距展开如意云纹",
+    "字幕卖点": "干湿两用",
+  },
+  structuredSource: "video|https://cdn.example.com/reference.mp4|https://cdn.example.com/cover.jpg",
+  ratio: "9:16",
+  imageQuality: "1k",
+  n: 1,
+  vDuration: 10,
+  vResolution: "720p",
+});
+assert.equal(reverseVideoPayload.finalText, reverseVideoFinalText);
+assert.doesNotMatch(reverseVideoPayload.finalText, /参考品牌|原品牌/);
+assert.equal(reverseVideoPayload.payload.prompt.raw_text, reverseVideoPayload.finalText);
+assert.equal(reverseVideoPayload.payload.prompt.assembled_text, reverseVideoPayload.finalText);
+assert.equal(reverseVideoPayload.payload.prompt["字幕卖点"], "干湿两用");
+
+assert.equal(
+  shouldKeepPendingReverseRequest({ status: 409, message: "反推请求仍在处理中,请稍后重试" }),
+  true,
+);
+assert.equal(shouldKeepPendingReverseRequest({ status: 502, message: "网关错误" }), false);
 
 const productAsset = {
   type: "image",
@@ -550,6 +595,7 @@ const productVideoEditArgs = {
     "主体动作": "参考商品从画面左侧入场，缓慢旋转，水花飞溅后切到 Logo 特写",
     "镜头运动": "缓慢推进并轻微环绕",
     "光线": "柔和电影感主光和边缘高光",
+    "迁移生成指令": "暖棕色广告棚景，上传产品从画面左侧入场，缓慢旋转后切到包装特写，镜头低速推进并轻微环绕，柔和主光勾勒边缘高光。",
     "标签": "Estee Lauder, Advanced Night Repair, skincare bottle",
   },
   structuredSource: "image|http://localhost:8000/api/uploads/upload/style.jpg|",
@@ -574,8 +620,8 @@ assert.equal(productVideoEditFree.payload.params.reference_image_url, productAss
 assert.equal(productVideoEditFree.payload.prompt["场景背景"], "暖棕色广告棚景和金色沙粒台面");
 assert.equal(
   productVideoEditFree.payload.prompt["主体动作"],
-  "参考商品从画面左侧入场，缓慢旋转，水花飞溅后切到 Logo 特写",
-  "the frontend should preserve reference motion and let the backend assign the product-reference role",
+  "上传产品作为唯一视频主体，替换参考片中的原主体/原商品/人物；复用参考片的展示节奏、入镜顺序、角度切换、慢速推拉、稳定特写和卖点展示等可迁移动作；优先保持完整包装、Logo 和主要文字始终在画面内，避免裁切主体、侧面展示或快速旋转；不要生成参考片里的原商品、原品牌、人物或服装",
+  "the frontend should keep structured motion identity-safe and let the transfer prompt carry the specific sequence",
 );
 assert.equal(productVideoEditFree.payload.prompt["镜头运动"], "缓慢推进并轻微环绕");
 assert.match(productVideoEditFree.payload.prompt["产品身份档案"], /DAMAH 黑魔法全棉棉柔巾/);
@@ -598,9 +644,99 @@ const reversedProductVideo = buildGenerationPayload({
   prompt: "",
   promptDirty: false,
 });
-assert.match(reversedProductVideo.payload.prompt.final_text, /参考商品从画面左侧入场/);
+assert.match(reversedProductVideo.payload.prompt.final_text, /上传产品从画面左侧入场/);
+assert.equal(reversedProductVideo.payload.prompt.user_instruction, reversedProductVideo.payload.prompt.final_text);
 assert.doesNotMatch(reversedProductVideo.payload.prompt.final_text, /上传产品作为唯一视频主体/);
 assert.doesNotMatch(reversedProductVideo.payload.prompt.final_text, /优先保持完整包装/);
+
+const leakedReverseVideoPayload = buildGenerationPayload({
+  ...productVideoEditArgs,
+  prompt: "Estee Lauder Advanced Night Repair 棕色滴管瓶旋转展示",
+  promptDirty: false,
+});
+assert.doesNotMatch(leakedReverseVideoPayload.payload.prompt.final_text, /Estee Lauder/i);
+assert.doesNotMatch(leakedReverseVideoPayload.payload.prompt.final_text, /Advanced Night Repair/i);
+assert.match(leakedReverseVideoPayload.payload.prompt.final_text, /上传产品从画面左侧入场/);
+
+const poisonedTransferPromptPayload = buildGenerationPayload({
+  ...productVideoEditArgs,
+  prompt: "",
+  promptDirty: false,
+  structured: {
+    ...productVideoEditArgs.structured,
+    "迁移生成指令": "Estee Lauder Advanced Night Repair 原商品继续旋转，最后展示品牌 Logo。",
+  },
+});
+assert.doesNotMatch(poisonedTransferPromptPayload.payload.prompt.final_text, /Estee Lauder/i);
+assert.doesNotMatch(poisonedTransferPromptPayload.payload.prompt.final_text, /Advanced Night Repair/i);
+assert.match(poisonedTransferPromptPayload.payload.prompt.final_text, /上传产品作为唯一视频主体/);
+
+const sparsePoisonedTransferPromptPayload = buildGenerationPayload({
+  ...productVideoEditArgs,
+  prompt: "",
+  promptDirty: false,
+  structured: {
+    "场景背景": "暖棕色广告棚景",
+    "可迁移主体动作": "慢速旋转后推近特写",
+    "迁移生成指令": "Reference product keeps the original brand and original product identity.",
+  },
+});
+assert.doesNotMatch(sparsePoisonedTransferPromptPayload.payload.prompt.final_text, /original brand/i);
+assert.doesNotMatch(sparsePoisonedTransferPromptPayload.payload.prompt.final_text, /original product/i);
+assert.match(sparsePoisonedTransferPromptPayload.payload.prompt.final_text, /上传产品作为唯一视频主体/);
+assert.match(sparsePoisonedTransferPromptPayload.payload.prompt.final_text, /慢速旋转后推近特写/);
+
+const sparseChinesePoisonedTransferPromptPayload = buildGenerationPayload({
+  ...productVideoEditArgs,
+  prompt: "",
+  promptDirty: false,
+  structured: {
+    "场景背景": "暖棕色广告棚景",
+    "可迁移主体动作": "慢速旋转后推近特写",
+    "迁移生成指令": "参考品牌和原商品继续旋转，最后展示原包装文字。",
+  },
+});
+assert.doesNotMatch(
+  sparseChinesePoisonedTransferPromptPayload.payload.prompt.final_text,
+  /参考品牌和原商品继续旋转/,
+);
+assert.match(sparseChinesePoisonedTransferPromptPayload.payload.prompt.final_text, /上传产品作为唯一视频主体/);
+
+const postProductionTransferPromptPayload = buildGenerationPayload({
+  ...productVideoEditArgs,
+  prompt: "",
+  promptDirty: false,
+  structured: {
+    "场景背景": "暖棕色广告棚景",
+    "可迁移主体动作": "慢速旋转后推近特写",
+    "迁移生成指令": "暖棕色广告棚景；慢速旋转后推近特写；字幕：新品上市；温柔女声旁白：安心每一天；SFX：水滴声。",
+  },
+});
+assert.match(postProductionTransferPromptPayload.payload.prompt.final_text, /暖棕色广告棚景/);
+assert.match(postProductionTransferPromptPayload.payload.prompt.final_text, /慢速旋转后推近特写/);
+assert.doesNotMatch(postProductionTransferPromptPayload.payload.prompt.final_text, /字幕|新品上市/);
+assert.doesNotMatch(postProductionTransferPromptPayload.payload.prompt.final_text, /旁白|安心每一天/);
+assert.doesNotMatch(postProductionTransferPromptPayload.payload.prompt.final_text, /SFX|水滴声/i);
+
+const chineseIdentityPoisonedTransferPromptPayload = buildGenerationPayload({
+  ...productVideoEditArgs,
+  prompt: "",
+  promptDirty: false,
+  structured: {
+    "主体": "正面包装文字包含黑魔法全棉棉柔巾",
+    "场景背景": "暖棕色广告棚景",
+    "可迁移主体动作": "慢速旋转后推近包装特写",
+    "迁移生成指令": "黑魔法全棉棉柔巾慢速旋转展示",
+  },
+});
+assert.doesNotMatch(
+  chineseIdentityPoisonedTransferPromptPayload.payload.prompt.final_text,
+  /黑魔法全棉棉柔巾/,
+);
+assert.match(
+  chineseIdentityPoisonedTransferPromptPayload.payload.prompt.final_text,
+  /慢速旋转后推近包装特写/,
+);
 
 const productVideoEditLocked = buildGenerationPayload({
   ...productVideoEditArgs,

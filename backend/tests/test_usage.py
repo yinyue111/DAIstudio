@@ -448,6 +448,7 @@ def test_video_reverse_returns_authoritative_source_analysis(client, make_user, 
     assert seen["video_analysis"] == {
         "source": analysis["source"],
         "sampled_frames": analysis["sampled_frames"],
+        "analysis_mode": "keyframes",
     }
     assert len(seen["refs"]) == 3
     replay = client.post("/api/prompt/reverse", json=request_body, headers=h)
@@ -549,7 +550,12 @@ def test_keyframe_sampling_uses_full_duration_for_long_video(monkeypatch):
     monkeypatch.setattr(video_frames, "_grab_frame", fake_grab)
 
     assert video_frames.sample_keyframes("http://x/long.mp4", n=3) == [b"jpg", b"jpg", b"jpg"]
-    assert stamps == [0.0, 300.0, 899.95]
+    assert stamps == [0.0, 449.975, 899.95]
+
+
+def test_uniform_keyframe_timestamps_cover_the_full_duration_evenly():
+    assert video_frames._uniform_timestamps(20.0, 4) == [0.0, 6.65, 13.3, 19.95]
+    assert video_frames._uniform_timestamps(900.0, 3) == [0.0, 449.975, 899.95]
 
 
 def test_keyframe_sampling_preset_uses_downloaded_duration(monkeypatch):
@@ -665,6 +671,40 @@ def test_keyframe_sampling_covers_full_duration_when_early_scene_cuts_fill_budge
     assert sample.frames[-1].timestamp_seconds == 299.95
     assert any(frame.timestamp_seconds >= 150 for frame in sample.frames[1:-1])
     assert stamps == [frame.timestamp_seconds for frame in sample.frames]
+
+
+def test_keyframe_sampling_keeps_temporal_coverage_when_all_scene_cuts_are_early(monkeypatch):
+    monkeypatch.setattr(video_frames, "FFMPEG", "/usr/bin/ffmpeg")
+    monkeypatch.setattr(video_frames, "_download_capped", lambda *_a, **_k: b"\x00\x00\x00\x18ftypmp42")
+    monkeypatch.setattr(video_frames, "probe_media", lambda _path: {
+        "width": 1920,
+        "height": 1080,
+        "duration_seconds": 300.0,
+        "fps": 24.0,
+        "has_audio": False,
+    })
+    monkeypatch.setattr(
+        video_frames,
+        "_scene_change_timestamps",
+        lambda *_a, **_k: [2.0, 4.0, 8.0, 12.0, 18.0, 24.0, 30.0],
+    )
+
+    def fake_grab(_src, _ts, dst):
+        with open(dst, "wb") as f:
+            f.write(b"jpg")
+        return True
+
+    monkeypatch.setattr(video_frames, "_grab_frame", fake_grab)
+
+    sample = video_frames.sample_video("http://x/early-cuts.mp4", n=8)
+
+    assert sample is not None
+    stamps = [frame.timestamp_seconds for frame in sample.frames]
+    assert stamps[0] == 0.0
+    assert stamps[-1] == 299.95
+    assert any(120 <= stamp <= 180 for stamp in stamps)
+    assert any(220 <= stamp < 299.95 for stamp in stamps)
+    assert max(right - left for left, right in zip(stamps, stamps[1:], strict=False)) <= 70
 
 
 def test_keyframe_sampling_busy_returns_empty(monkeypatch):

@@ -10,6 +10,7 @@ import {
   boundedVideoDuration,
   buildSourceAssetMeta,
   composePromptFromStructured,
+  composeSafeVideoTransferPrompt,
   composeStyleTransferPrompt,
   imageSizeFor,
   shouldUseImageReference,
@@ -186,27 +187,29 @@ export function buildGenerationPayload({
   const promptStructured = isEditMode
     ? styleTransferStructured(effectiveStructured, { video: effCategory === "video", subject: effectiveSubjectMode })
     : effectiveStructured;
-  if (effCategory === "video" && (productMode || portraitMode)) {
-    for (const key of ["可迁移主体动作", "主体动作", "产品展示方式"]) {
-      const original = cleanText(effectiveStructured[key]);
-      if (original) promptStructured[key] = original;
-      else delete promptStructured[key];
-    }
-  }
   const promptSourceStale = Boolean(promptSourceSignature && promptSourceSignature !== styleSignature && !promptDirty);
   const promptParts = promptInputParts(prompt);
   const promptText = promptSourceStale ? "" : promptParts.text;
+  const transferPromptText = (
+    isEditMode && effCategory === "video" && (productMode || portraitMode)
+      ? composeSafeVideoTransferPrompt(effectiveStructured, effectiveSubjectMode)
+      : ""
+  );
   const structuredText = isEditMode
     ? (
         effCategory === "video" && (productMode || portraitMode)
-          ? composePromptFromStructured(promptStructured)
+          ? (transferPromptText || composePromptFromStructured(promptStructured))
           : composeStyleTransferPrompt(effectiveStructured, "", { video: effCategory === "video", subject: effectiveSubjectMode })
       )
     : composePromptFromStructured(effectiveStructured);
   const baseFinalText = (
     promptDirty
       ? (promptText || structuredText)
-      : (isEditMode ? (structuredText || promptText) : (promptText || structuredText))
+      : (
+          isEditMode && effCategory === "video" && (productMode || portraitMode)
+            ? (transferPromptText || structuredText || promptText)
+            : (promptText || structuredText)
+        )
   ) || "生成同风格的新素材";
   const profiledBaseFinalText = (
     isEditMode
@@ -263,7 +266,13 @@ export function buildGenerationPayload({
     prompt: {
       ...(Object.keys(promptStructured).length ? promptStructured : {}),
       ...(subjectProfileText && (productMode || portraitMode) ? { [subjectProfileLabel]: subjectProfileText } : {}),
-      ...(promptDirty && promptText ? { user_instruction: promptText } : {}),
+      ...(promptDirty && promptText
+        ? { user_instruction: promptText }
+        : (
+            isEditMode && effCategory === "video" && (productMode || portraitMode) && finalText
+              ? { user_instruction: finalText }
+              : {}
+          )),
       ...(effCategory === "video" ? {
         raw_text: promptParts.rawText || promptText,
         ...(promptParts.optimizedText ? { optimized_text: promptParts.optimizedText } : {}),

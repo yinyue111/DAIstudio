@@ -341,7 +341,10 @@ def _uniform_timestamps(dur: float | None, n: int) -> list[float]:
     if n < 1:
         return []
     if dur and dur > 0:
-        return [min(dur - 0.05, dur * i / n) for i in range(n)]
+        max_ts = max(0.0, float(dur) - 0.05)
+        if n == 1:
+            return [0.0]
+        return [round(max_ts * i / (n - 1), 3) for i in range(n)]
     return [0.0, 0.5, 1.0, 1.5][:n]
 
 
@@ -362,12 +365,33 @@ def _merge_timestamps(primary: list[float], fallback: list[float], n: int, dur: 
     if n < 1:
         return []
     max_ts = max(0.0, float(dur or 0) - 0.05) if dur else None
+    if max_ts is not None:
+        anchors = _uniform_timestamps(dur, n)
+        if n <= 2:
+            return anchors
+
+        candidates = sorted({
+            max(0.0, min(float(ts), max_ts))
+            for ts in primary
+            if 0.0 < float(ts) < max_ts
+        })
+        merged = [anchors[0]]
+        for index in range(1, len(anchors) - 1):
+            lower = anchors[index - 1]
+            upper = anchors[index]
+            in_bucket = [
+                ts for ts in candidates
+                if lower + MIN_FRAME_GAP_SECONDS <= ts <= upper
+                and all(abs(ts - seen) >= MIN_FRAME_GAP_SECONDS for seen in merged)
+            ]
+            merged.append(max(in_bucket) if in_bucket else anchors[index])
+        merged.append(anchors[-1])
+        return sorted(merged)
+
     endpoints = [0.0]
-    if max_ts is not None and n > 1:
-        endpoints.append(max_ts)
     interior_slots = max(0, n - len(endpoints))
     candidates = [
-        max(0.0, min(float(ts), max_ts)) if max_ts is not None else max(0.0, float(ts))
+        max(0.0, float(ts))
         for ts in primary
     ]
     candidates = [

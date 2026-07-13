@@ -103,6 +103,8 @@ _STRUCTURED_CONTEXT_KEYS = (
     "人物比例",
     "身材体态",
     "体态线条",
+    "服装结构",
+    "服装覆盖",
     "妆发五官",
     "商品服装",
     "细节特征",
@@ -212,12 +214,20 @@ def _layered_authoritative_text(raw_prompt: dict[str, Any]) -> str:
     return optimized if optimized and not assembled else ""
 
 
-def _parse_text_prompt(text: str) -> dict[str, Any]:
+def split_video_post_production(text: str) -> dict[str, Any]:
+    """Remove explicit post-production clauses from model-facing prompt text."""
     overlays: list[str] = []
     voiceover = ""
     sfx: list[str] = []
     post_flags = re.IGNORECASE | re.MULTILINE
-    boundary = r"(?P<boundary>^|[\n。；;])\s*"
+    boundary = r"(?P<boundary>^|[\n。；;\uff0c,])\s*"
+    open_quote = "[“\\\"'‘]"
+    close_quote = "[”\\\"'’]"
+    voiceover_label = r"(?:(?:温柔|轻柔|低沉)?\s*(?:男声|女声|女性|男性)?\s*)?(?:旁白|voiceover|后期配音)"
+    overlay_label = (
+        r"(?:字幕|后期叠字|(?:画面(?:中)?)?文字(?:浮现|出现|显示)?|"
+        r"画面(?:中)?(?:浮现|出现|显示)文字)"
+    )
 
     def remove_voiceover(match: re.Match[str]) -> str:
         nonlocal voiceover
@@ -226,14 +236,15 @@ def _parse_text_prompt(text: str) -> dict[str, Any]:
 
     text = re.sub(
         boundary
-        + r"(?:旁白|voiceover|后期配音)\s*[:：]?\s*[“\"'](?P<content>[^”\"']+)[”\"']",
+        + voiceover_label + r"\s*[:：]?\s*" + open_quote
+        + r"(?P<content>[^”\"'’]+)" + close_quote,
         remove_voiceover,
         text,
         flags=post_flags,
     )
     text = re.sub(
         boundary
-        + r"(?:旁白|voiceover|后期配音)\s*[:：]?\s*(?P<content>[^\n。；;]+)",
+        + voiceover_label + r"\s*[:：]?\s*(?P<content>[^\n。；;\uff0c,]+)",
         remove_voiceover,
         text,
         flags=post_flags,
@@ -245,20 +256,21 @@ def _parse_text_prompt(text: str) -> dict[str, Any]:
 
     text = re.sub(
         boundary
-        + r"(?:字幕|文字|后期叠字)\s*[:：]?\s*[“\"'](?P<content>[^”\"']+)[”\"']\s*(?:浮现|出现|显示)?",
+        + overlay_label + r"\s*[:：]?\s*" + open_quote
+        + r"(?P<content>[^”\"'’]+)" + close_quote + r"\s*(?:浮现|出现|显示)?",
         remove_overlay,
         text,
         flags=post_flags,
     )
     text = re.sub(
         boundary
-        + r"(?:字幕|文字|后期叠字)\s*[:：]\s*(?P<content>[^\n。；;]+)",
+        + overlay_label + r"\s*[:：]\s*(?P<content>[^\n。；;\uff0c,]+)",
         remove_overlay,
         text,
         flags=post_flags,
     )
     text = re.sub(
-        boundary + r"(?:字幕|后期叠字)\s*(?P<content>[^\n。；;]+)",
+        boundary + overlay_label + r"\s*(?P<content>[^\n。；;\uff0c,]+)",
         remove_overlay,
         text,
         flags=post_flags,
@@ -270,17 +282,30 @@ def _parse_text_prompt(text: str) -> dict[str, Any]:
 
     text = re.sub(
         boundary
-        + r"(?:音效|SFX)\s*[:：]?\s*[“\"'](?P<content>[^”\"']+)[”\"']",
+        + r"(?:音效|SFX|环境音)\s*[:：]?\s*" + open_quote
+        + r"(?P<content>[^”\"'’]+)" + close_quote,
         remove_sfx,
         text,
         flags=post_flags,
     )
     text = re.sub(
-        boundary + r"(?:音效|SFX)\s*[:：]?\s*(?P<content>[^\n。；;]+)",
+        boundary + r"(?:音效|SFX|环境音)\s*[:：]?\s*(?P<content>[^\n。；;\uff0c,]+)",
         remove_sfx,
         text,
         flags=post_flags,
     )
+    text = re.sub(r"([。；;，,])\s*(?=[。；;，,])", "", text)
+    return {
+        "text": text.strip(" \n。；;"),
+        "post_overlays": overlays,
+        "voiceover": voiceover,
+        "sfx": sfx,
+    }
+
+
+def _parse_text_prompt(text: str) -> dict[str, Any]:
+    post = split_video_post_production(text)
+    text = post["text"]
     numbered = re.split(
         r"(?:^|[\n。；;])\s*(?:Shot|镜头)\s*\d+\s*[:：]\s*",
         text,
@@ -301,9 +326,9 @@ def _parse_text_prompt(text: str) -> dict[str, Any]:
         "global_style": style,
         "subject_lock": "",
         "shots": shots,
-        "post_overlays": overlays,
-        "voiceover": voiceover,
-        "sfx": sfx,
+        "post_overlays": post["post_overlays"],
+        "voiceover": post["voiceover"],
+        "sfx": post["sfx"],
         "reference_guidance": [],
         "warnings": [],
     }
@@ -352,18 +377,19 @@ def parse_video_prompt(raw_prompt: str | dict[str, Any]) -> dict[str, Any]:
             if isinstance(sfx_text, list)
             else _clauses(str(sfx_text))
         )
+        structured_voiceover = str(
+            raw_prompt.get("旁白") or raw_prompt.get("voiceover") or ""
+        ).strip()
         manual_text = _layered_authoritative_text(raw_prompt)
         if manual_text:
             manual = _parse_text_prompt(manual_text)
             style = manual["global_style"]
             shots = manual["shots"]
-            overlays = manual["post_overlays"]
-            raw_prompt_voiceover = manual["voiceover"]
-            sfx = manual["sfx"]
+            overlays = manual["post_overlays"] or overlays
+            raw_prompt_voiceover = manual["voiceover"] or structured_voiceover
+            sfx = manual["sfx"] or sfx
         else:
-            raw_prompt_voiceover = str(
-                raw_prompt.get("旁白") or raw_prompt.get("voiceover") or ""
-            ).strip()
+            raw_prompt_voiceover = structured_voiceover
         if style or shots or overlays or raw_prompt_voiceover or sfx:
             if not shots:
                 fallback = _parse_text_prompt(
