@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import re
+from math import isfinite
 
 # Rich multi-dimension template so the regenerated image stays close to the
 # reference. Keep keys stable -- the frontend renders whatever keys come back.
@@ -73,7 +74,8 @@ IMAGE_REVERSE_TEMPLATE = (
 # a coherent (not static) clip. Reverse runs on sampled keyframes when possible.
 VIDEO_REVERSE_TEMPLATE = (
     "你是世界顶级的商业广告导演、剪辑师和视频提示词工程师。下面按时间先后给你若干帧(从一段"
-    "参考视频中等间隔抽样,第 1 张为首帧),请把它们当作同一条广告片的时间序列来分析。目标不是"
+    "参考视频中按场景变化与全时段覆盖策略抽样,每帧前有准确时间戳),请把它们当作同一条广告片的"
+    "时间序列来分析。目标不是"
     "泛化成同类视频,而是最大限度复刻参考片的商业视觉:主体、服装/商品、模特动作、场景、构图、"
     "镜头语言、光线、色彩、字幕/卖点和剪辑节奏都要贴近原片。\n"
     "硬性要求:\n"
@@ -92,6 +94,8 @@ VIDEO_REVERSE_TEMPLATE = (
     "Logo、包装文字与可迁移的场景、镜头、光线、节奏、分镜和展示动作分开记录;可迁移动作只能写成"
     "上传主体可复用的展示节奏/运动路径,不要把原商品名、原品牌、原人物身份写进可迁移字段。\n"
     "7. final_text 必须可直接用于文生视频,以『参考片复刻』为核心,不要写成普通美图描述。\n"
+    "8. 消息中给出的源视频宽高、画幅、时长、帧率和采样时间戳是后端探测的权威事实,不得改写或猜测;"
+    "时序分镜和 shots 的终点必须覆盖源视频真实时长。音频标记为未分析时不得虚构对白、配乐或卡点。\n"
     "输出严格的 JSON(不要任何额外文字、不要 markdown)。final_text 必须从下列维度逐项整合而来,"
     "不得引入维度中没有出现的新主体/场景/风格/动作;主体、商品/服装、场景、风格、视角构图、动作、运镜、分镜、字幕卖点、光线、配色必须能在 final_text 中对应找到。\n"
     "字段如下:\n"
@@ -124,6 +128,10 @@ VIDEO_REVERSE_TEMPLATE = (
     '  "材质纹理": "服装/商品/皮肤/背景主要材质与质感,包括布料垂坠、反光、粗糙度、颗粒",\n'
     '  "氛围情绪": "广告气质和情绪:高级/甜美/通勤/轻奢/活力/松弛等,必须贴合画面",\n'
     '  "转场": "转场方式:硬切/闪白/遮挡/变焦/动作匹配/无,以及出现位置",\n'
+    '  "shots": [{"start_seconds": 0.0, "end_seconds": 2.0, "visual": "该镜头可见画面", '
+    '"action": "主体动作", "camera": "景别与运镜", "lighting": "光线变化", '
+    '"transition": "进入下一镜的转场", "ocr": "可见文字或无", "audio_cue": "仅根据音频分析结果填写,否则未分析", '
+    '"evidence_frame_indices": [1, 2], "confidence": 0.0}],\n'
     '  "一致性约束": "生成时必须保持不变的元素:主体数量、成年/年龄语境、人物比例/体态/体态线条、服装结构/覆盖范围、服装颜色版型、场景、画幅、字幕卖点、镜头顺序等;避免未成年感、夸张身体展示姿态、身体局部凝视和私密成人化语境",\n'
     '  "负向": "需要避免的元素:换脸、换衣服颜色、商品漂移、字幕乱字、水印、肢体畸变、闪烁、形变、镜头抖动、拼接感、不自然走路",\n'
     '  "final_text": "按视频类型自动取舍并整合为一段可直接用于文生视频的中文提示词:图像类型/反推重点 → 参考片复刻 → 主体 → 人像意图/人物比例/身材体态/体态线条/服装结构/服装覆盖/妆发五官(仅人物或混合视频重点写) → 商品服装/产品细节(仅产品或混合视频重点写) → 场景/广告目标/风格 → 视角构图 → 可迁移主体动作/动作和运镜 → 剪辑节奏/时序分镜/字幕卖点 → 光线/配色/材质/氛围 → 一致性约束。'
@@ -181,7 +189,119 @@ def parse_structured(content: str) -> dict:
     except Exception:
         obj = {"主体": content.strip()[:200], "final_text": content.strip()}
     final_text = obj.pop("final_text", None) or compose_final(obj)
-    return {"structured": obj, "final_text": final_text}
+    shots = obj.pop("shots", [])
+    return {
+        "structured": obj,
+        "final_text": final_text,
+        "shots": shots if isinstance(shots, list) else [],
+    }
+
+
+def normalize_video_shots(
+    shots,
+    *,
+    duration_seconds: float | None = None,
+    frame_count: int | None = None,
+    audio_analyzed: bool = False,
+) -> list[dict]:
+    duration = float(duration_seconds) if duration_seconds is not None else None
+
+    def gap_shot(start: float, end: float, *, tail: bool = False) -> dict:
+        if tail:
+            visual = "按末尾采样帧复刻源视频尾段画面"
+            action = "延续源视频尾段变化并以末尾画面收尾"
+            camera = "按末尾采样帧的景别和机位"
+            lighting = "保持末尾采样帧光影"
+            evidence = [frame_count] if frame_count and frame_count > 0 else []
+        else:
+            visual = "按相邻采样帧复刻源视频未明确分段的画面"
+            action = "按相邻采样帧延续原始动作和画面变化"
+            camera = "按相邻采样帧的景别和机位"
+            lighting = "按相邻采样帧过渡光影"
+            evidence = []
+        return {
+            "start_seconds": round(start, 3),
+            "end_seconds": round(end, 3),
+            "visual": visual,
+            "action": action,
+            "camera": camera,
+            "lighting": lighting,
+            "transition": "无额外转场",
+            "ocr": "仅保留采样帧可确认文字",
+            "audio_cue": "未见" if audio_analyzed else "未分析",
+            "evidence_frame_indices": evidence,
+            "confidence": 0.0,
+        }
+
+    if not isinstance(shots, list):
+        shots = []
+    candidates = []
+    for raw in shots:
+        if not isinstance(raw, dict):
+            continue
+        try:
+            raw_start = float(raw.get("start_seconds"))
+            end = float(raw.get("end_seconds"))
+        except (TypeError, ValueError):
+            continue
+        if not isfinite(raw_start) or not isfinite(end):
+            continue
+        start = max(0.0, raw_start)
+        candidates.append((start, end, raw))
+    candidates.sort(key=lambda row: (row[0], row[1]))
+
+    normalized: list[dict] = []
+    previous_end = 0.0
+    text_fields = ("visual", "action", "camera", "lighting", "transition", "ocr")
+    for start, end, raw in candidates:
+        if duration is not None:
+            if start >= duration:
+                continue
+            end = min(end, duration)
+        if start > previous_end + 0.001:
+            normalized.append(gap_shot(previous_end, start))
+            previous_end = start
+        start = max(start, previous_end)
+        if end <= start:
+            continue
+        item = {
+            "start_seconds": round(start, 3),
+            "end_seconds": round(end, 3),
+        }
+        for field in text_fields:
+            item[field] = str(raw.get(field) or "").strip()
+        item["audio_cue"] = (
+            str(raw.get("audio_cue") or "").strip() or "未见"
+            if audio_analyzed else "未分析"
+        )
+        evidence = raw.get("evidence_frame_indices")
+        if isinstance(evidence, list):
+            valid_indices = []
+            for value in evidence:
+                try:
+                    index = int(value)
+                except (TypeError, ValueError):
+                    continue
+                if index < 1 or (frame_count is not None and index > frame_count):
+                    continue
+                if index not in valid_indices:
+                    valid_indices.append(index)
+            item["evidence_frame_indices"] = valid_indices
+        else:
+            item["evidence_frame_indices"] = []
+        try:
+            confidence = float(raw.get("confidence"))
+        except (TypeError, ValueError):
+            confidence = 0.0
+        item["confidence"] = round(max(0.0, min(1.0, confidence)), 3)
+        normalized.append(item)
+        previous_end = end
+    if duration is not None and duration > 0:
+        if not normalized:
+            normalized.append(gap_shot(0.0, duration, tail=True))
+        elif normalized[-1]["end_seconds"] < duration - 0.001:
+            normalized.append(gap_shot(normalized[-1]["end_seconds"], duration, tail=True))
+    return normalized
 
 
 def compose_final(obj: dict) -> str:

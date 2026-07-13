@@ -40,6 +40,7 @@ export default function StudioReferencePanel({
   selectedReverseCostLabel,
   videoAnalysisPreset,
   videoAnalysisPresets = [],
+  reverseVideoAnalysis = null,
   setVideoAnalysisPreset,
   imageUploadInputRef,
   productUploadInputRef,
@@ -368,6 +369,17 @@ export default function StudioReferencePanel({
                   </button>
                 ))}
               </div>
+              {reverseVideoAnalysis?.source && (
+                <div className="mt-2 text-xs text-mist">
+                  已识别 {reverseVideoAnalysis.source.ratio || "未知画幅"}
+                  {Number.isFinite(Number(reverseVideoAnalysis.source.duration_seconds))
+                    ? ` · ${Number(reverseVideoAnalysis.source.duration_seconds).toFixed(2)}s`
+                    : ""}
+                  {Array.isArray(reverseVideoAnalysis.shots) && reverseVideoAnalysis.shots.length > 0
+                    ? ` · ${reverseVideoAnalysis.shots.length} 个镜头`
+                    : ""}
+                </div>
+              )}
             </div>
           )}
           <div className="grid grid-cols-1 gap-2">

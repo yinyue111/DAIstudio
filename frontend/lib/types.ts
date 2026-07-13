@@ -62,6 +62,20 @@ export interface SubjectProfile {
   final_text?: string;
 }
 
+export interface ReverseVideoAnalysis {
+  source?: {
+    width?: number | null;
+    height?: number | null;
+    ratio?: string | null;
+    duration_seconds?: number | null;
+    fps?: number | null;
+    has_audio?: boolean;
+    audio_analyzed?: boolean;
+  };
+  sampled_frames?: Array<{ index: number; timestamp_seconds: number }>;
+  shots?: Array<Record<string, unknown>>;
+}
+
 export interface WorkspaceState {
   prompt: string;
   negative: string;
@@ -94,6 +108,7 @@ export interface WorkspaceState {
   variationSource: Asset | null;
   structured: Record<string, string>;
   structuredSource: string;
+  reverseVideoAnalysis: ReverseVideoAnalysis | null;
   promptSourceSignature: string;
   negativeTouched: boolean;
   promptDirty: boolean;

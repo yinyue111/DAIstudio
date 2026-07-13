@@ -6,7 +6,10 @@ import { fileURLToPath } from "node:url";
 import { buildGenerationPayload } from "../app/studio/generationPayload.ts";
 import { MAX_VIDEO_DURATION_SECONDS, VIDEO_DURATION_PRESETS } from "../app/studio/constants.ts";
 import { buildStudioDerivedViewState } from "../app/studio/viewModel.ts";
-import { composePromptFromStructured } from "../app/studio/helpers.ts";
+import {
+  composePromptFromStructured,
+  reverseVideoWorkspacePatch,
+} from "../app/studio/helpers.ts";
 import {
   PENDING_GENERATE_STORAGE_KEY,
   PENDING_REVERSE_STORAGE_KEY,
@@ -45,6 +48,63 @@ assert.deepEqual(
   VIDEO_DURATION_PRESETS.map((item) => item.seconds),
   [5, 8, 10, 15],
   "video duration presets should stop at the 15s generation limit",
+);
+
+const serumReverseAnalysis = {
+  source: {
+    width: 720,
+    height: 960,
+    ratio: "3:4",
+    duration_seconds: 10.053991,
+    fps: 23,
+    has_audio: true,
+    audio_analyzed: false,
+  },
+  sampled_frames: [
+    { index: 1, timestamp_seconds: 0 },
+    { index: 7, timestamp_seconds: 10.004 },
+  ],
+  shots: [
+    { start_seconds: 0, end_seconds: 2.2, visual: "液滴入水" },
+    { start_seconds: 2.2, end_seconds: 4.2, visual: "倒入手心" },
+  ],
+};
+
+assert.deepEqual(
+  reverseVideoWorkspacePatch({
+    analysis: serumReverseAnalysis,
+    current: {
+      ratio: "9:16",
+      vDuration: 5,
+      videoProductLockMode: "locked",
+      videoProductTemplate: "stable_showcase",
+    },
+    startedRatio: "9:16",
+    startedDuration: 5,
+    maxDuration: 15,
+    productVideo: true,
+  }),
+  {
+    reverseVideoAnalysis: serumReverseAnalysis,
+    ratio: "3:4",
+    vDuration: 10,
+    videoProductLockMode: "free",
+    videoProductTemplate: "reference_sequence",
+  },
+  "video reverse should inherit exact source ratio/duration and preserve multi-shot product motion",
+);
+
+assert.deepEqual(
+  reverseVideoWorkspacePatch({
+    analysis: serumReverseAnalysis,
+    current: { ratio: "1:1", vDuration: 8, videoProductLockMode: "locked" },
+    startedRatio: "9:16",
+    startedDuration: 5,
+    maxDuration: 15,
+    productVideo: false,
+  }),
+  { reverseVideoAnalysis: serumReverseAnalysis },
+  "late reverse responses must not overwrite ratio or duration changed by the user",
 );
 
 const canonicalReversePrompt = "参考图复刻：成年人物后仰斜坐，腰腿高度低机位向上约15度，35-45mm近距离透视；保持服装覆盖下较饱满胸廓、自然腰线、较宽胯部与近镜大腿，左前上方大面积柔光、冷紫轮廓光、抬升黑位和宽范围高光扩散。";

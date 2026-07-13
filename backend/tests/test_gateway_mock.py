@@ -62,6 +62,111 @@ def test_mock_reverse_video():
     assert r["final_text"]
 
 
+def test_video_reverse_labels_frames_with_authoritative_timestamps(monkeypatch):
+    monkeypatch.setattr(settings, "mock_mode", False)
+    seen = {}
+    cfg = RuntimeGatewayConfig(
+        use="vision",
+        provider="custom_openai",
+        base_url="https://vision-gateway.example.com/v1",
+        api_key="vision-key",
+        gateway_format="openai",
+    )
+
+    def fake_post(_path, payload, **_kwargs):
+        seen["content"] = payload["messages"][0]["content"]
+        return {
+            "choices": [{"message": {"content": (
+                '{"主体":"水感精华广告","shots":['
+                '{"start_seconds":0,"end_seconds":2.2,"visual":"液滴入水",'
+                '"action":"液滴落下","camera":"微距固定",'
+                '"lighting":"冷白柔光","transition":"动作匹配",'
+                '"ocr":"无","audio_cue":"未分析",'
+                '"evidence_frame_indices":[1,2],"confidence":0.95}],'
+                '"final_text":"3:4竖版，10秒水感精华广告"}'
+            )}}],
+            "usage": {"total_tokens": 9},
+        }
+
+    monkeypatch.setattr(gateway, "_post", fake_post)
+    result = gateway.reverse_prompt(
+        ["data:image/jpeg;base64,Zmlyc3Q=", "data:image/jpeg;base64,bGFzdA=="],
+        "vision-model",
+        target="video",
+        video_analysis={
+            "source": {
+                "width": 720,
+                "height": 960,
+                "ratio": "3:4",
+                "duration_seconds": 10.054,
+                "fps": 23.0,
+                "has_audio": True,
+                "audio_analyzed": False,
+            },
+            "sampled_frames": [
+                {"index": 1, "timestamp_seconds": 0.0},
+                {"index": 2, "timestamp_seconds": 10.004},
+            ],
+        },
+        gateway_config=cfg,
+    )
+
+    text_items = [item["text"] for item in seen["content"] if item["type"] == "text"]
+    assert any("720x960" in text and "3:4" in text and "10.054" in text for text in text_items)
+    assert "第 1 帧，时间戳 0.000 秒" in text_items
+    assert "第 2 帧，时间戳 10.004 秒" in text_items
+    assert result["shots"][0]["visual"] == "液滴入水"
+    assert result["shots"][-1]["end_seconds"] == 10.054
+    assert result["shots"][-1]["evidence_frame_indices"] == [2]
+    assert "shots" not in result["structured"]
+    assert result["structured"]["时序分镜"].startswith("0.000-2.200s 液滴入水")
+    assert "0.000-2.200s 液滴入水" not in result["final_text"]
+
+
+def test_video_shots_are_sorted_before_normalization():
+    shots = gateway._normalize_video_shots(
+        [
+            {"start_seconds": 4, "end_seconds": 6, "visual": "后镜头"},
+            {"start_seconds": 0, "end_seconds": 2, "visual": "前镜头"},
+        ],
+        duration_seconds=6,
+        frame_count=3,
+    )
+
+    assert [shot["visual"] for shot in shots if shot["visual"] in {"前镜头", "后镜头"}] == [
+        "前镜头",
+        "后镜头",
+    ]
+    assert [(shot["start_seconds"], shot["end_seconds"]) for shot in shots] == [
+        (0.0, 2.0),
+        (2.0, 4.0),
+        (4.0, 6.0),
+    ]
+
+
+def test_video_shots_fill_leading_internal_and_empty_gaps():
+    shots = gateway._normalize_video_shots(
+        [
+            {"start_seconds": 1, "end_seconds": 2, "visual": "第一个已识别镜头"},
+            {"start_seconds": 4, "end_seconds": 6, "visual": "第二个已识别镜头"},
+        ],
+        duration_seconds=10,
+        frame_count=5,
+    )
+    assert [
+        (shot["start_seconds"], shot["end_seconds"])
+        for shot in shots
+    ] == [(0.0, 1.0), (1.0, 2.0), (2.0, 4.0), (4.0, 6.0), (6.0, 10.0)]
+
+    fallback = gateway._normalize_video_shots(
+        [{"start_seconds": "NaN", "end_seconds": 5}],
+        duration_seconds=10,
+        frame_count=5,
+    )
+    assert [(shot["start_seconds"], shot["end_seconds"]) for shot in fallback] == [(0.0, 10.0)]
+    assert fallback[0]["evidence_frame_indices"] == [5]
+
+
 def test_compose_final_fallback():
     # when the model omits final_text, we synthesize from all dimensions
     r = gateway._parse_structured('{"主体":"a cat","光线":"soft","负向":"text"}')

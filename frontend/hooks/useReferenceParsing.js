@@ -15,6 +15,8 @@ import {
   composeStyleTransferPrompt,
   isRequestTimeoutError,
   nearestRatio,
+  reverseVideoWorkspacePatch,
+  videoDurationLimit,
   videoRatioOptions,
 } from "../app/studio/helpers";
 import {
@@ -46,6 +48,9 @@ export default function useReferenceParsing({
   negative,
   negativeTouched,
   videoAnalysisPreset,
+  ratio,
+  vDuration,
+  videoDurationMaxSeconds,
   isEditMode = false,
   subjectMode = "",
   setMsg,
@@ -125,6 +130,7 @@ export default function useReferenceParsing({
         ? {
             structured: {},
             structuredSource: "",
+            reverseVideoAnalysis: null,
             ...(
               current.promptSourceSignature
               && current.promptSourceSignature !== nextSignature
@@ -195,6 +201,7 @@ export default function useReferenceParsing({
       variationSource: null,
       structured: {},
       structuredSource: "",
+      reverseVideoAnalysis: null,
       ...(current.promptSourceSignature && !current.promptDirty
         ? { prompt: "", promptSourceSignature: "", promptDirty: false }
         : { promptSourceSignature: "" }),
@@ -246,6 +253,8 @@ export default function useReferenceParsing({
     const targetNegativeTouched = negativeTouched;
     const startedPrompt = String(prompt || "");
     const startedNegative = String(negative || "");
+    const startedRatio = ratio;
+    const startedDuration = vDuration;
     const target = selected;
     const targetSignature = assetSignature(target);
     const reqId = bumpReverseRequest(mode);
@@ -284,6 +293,9 @@ export default function useReferenceParsing({
       if (!isCurrent()) return;
       clearPendingReverseRequest(pendingReverseRequestRef, clientRequestId);
       const structured = result.structured || {};
+      const videoAnalysis = isVideo && result.video_analysis && typeof result.video_analysis === "object"
+        ? result.video_analysis
+        : null;
       const reversePrompt = isEditMode
         ? composeStyleTransferPrompt(structured, result.final_text || "", {
             video: targetCategory === "video",
@@ -292,7 +304,7 @@ export default function useReferenceParsing({
         : composePromptFromStructured(
             structured,
             result.final_text || "",
-            { preferFallback: true },
+            { preferFallback: !isVideo },
           );
       lastReversePromptRef.current[mode] = {
         prompt: reversePrompt,
@@ -308,6 +320,16 @@ export default function useReferenceParsing({
         return {
           structured,
           structuredSource: targetSignature,
+          ...(isVideo
+            ? reverseVideoWorkspacePatch({
+                analysis: videoAnalysis,
+                current,
+                startedRatio,
+                startedDuration,
+                maxDuration: videoDurationLimit(videoDurationMaxSeconds),
+                productVideo: isEditMode && targetCategory === "video" && subjectMode === "product",
+              })
+            : {}),
           ...(promptUnchanged
             ? { prompt: reversePrompt, promptSourceSignature: targetSignature, promptDirty: false }
             : {}),

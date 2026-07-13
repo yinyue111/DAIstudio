@@ -123,8 +123,17 @@ export default function StudioGenerationControls({
   const applyVideoProductMode = (mode) => {
     onVideoProductLockModeChange?.(mode);
     if (mode === "locked") {
+      if (videoProductTemplate === "reference_sequence") {
+        onVideoProductTemplateChange?.("stable_showcase");
+      }
       const current = boundedVideoDuration(vDuration, maxVideoDuration);
       if (current > 5) onVideoDurationChange?.(5);
+    }
+  };
+  const applyVideoProductTemplate = (template) => {
+    onVideoProductTemplateChange?.(template);
+    if (template === "reference_sequence") {
+      onVideoProductLockModeChange?.("free");
     }
   };
 
@@ -376,7 +385,7 @@ export default function StudioGenerationControls({
                       <button
                         key={option.key}
                         type="button"
-                        onClick={() => onVideoProductTemplateChange?.(option.key)}
+                        onClick={() => applyVideoProductTemplate(option.key)}
                         title={option.hint}
                         className={`chip shrink-0 ${videoProductTemplate === option.key ? "chip-active" : ""}`}
                       >

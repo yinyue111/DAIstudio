@@ -146,6 +146,7 @@ class ReverseOut(BaseModel):
     final_text: str
     charged_credits: int = 0
     reference_count: int = 1
+    video_analysis: dict[str, Any] | None = None
 
 
 class PromptOptimizeIn(BaseModel):

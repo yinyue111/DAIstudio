@@ -243,6 +243,7 @@ export default function Home() {
     variationSource,
     structured,
     structuredSource,
+    reverseVideoAnalysis,
     promptSourceSignature,
     negativeTouched,
     promptDirty,
@@ -648,6 +649,9 @@ export default function Home() {
     negative,
     negativeTouched,
     videoAnalysisPreset,
+    ratio,
+    vDuration,
+    videoDurationMaxSeconds: cfg?.video_duration_max_seconds,
     isEditMode,
     subjectMode,
     setMsg,
@@ -929,6 +933,7 @@ export default function Home() {
       reversing: false,
       structured: {},
       structuredSource: "",
+      reverseVideoAnalysis: null,
       ...(current.promptSourceSignature && !current.promptDirty
         ? { prompt: "", promptSourceSignature: "", promptDirty: false }
         : { promptSourceSignature: "" }),
@@ -952,6 +957,7 @@ export default function Home() {
       reversing: false,
       structured: {},
       structuredSource: "",
+      reverseVideoAnalysis: null,
       ...(current.promptSourceSignature && !current.promptDirty
         ? { prompt: "", promptSourceSignature: "", promptDirty: false }
         : { promptSourceSignature: "" }),
@@ -1478,6 +1484,7 @@ export default function Home() {
                 selectedReverseCostLabel={selectedReverseCostLabel}
                 videoAnalysisPreset={videoAnalysisPreset}
                 videoAnalysisPresets={reverseVideoPresets}
+                reverseVideoAnalysis={reverseVideoAnalysis}
                 setVideoAnalysisPreset={setVideoAnalysisPreset}
                 imageUploadInputRef={imageUploadInputRef}
                 productUploadInputRef={productUploadInputRef}

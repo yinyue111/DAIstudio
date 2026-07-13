@@ -33,6 +33,7 @@ from .gateway_mocks import mock_image as _mock_image
 from .gateway_mocks import mock_video as mock_video
 from .gateway_mocks import mock_video_preview_image as mock_video_preview_image
 from .gateway_prompting import mock_reverse as _mock_reverse
+from .gateway_prompting import normalize_video_shots as _normalize_video_shots
 from .gateway_prompting import parse_structured as _parse_structured
 from .gateway_prompting import reverse_template as _reverse_template
 from .gateway_video_payloads import VIDEO_STATUS as _VIDEO_STATUS
@@ -348,8 +349,53 @@ def list_models(config: RuntimeGatewayConfig) -> list[dict]:
 
 
 # ---------------------------------------------------------------- reverse prompt
+def _video_analysis_context_text(video_analysis: dict) -> str:
+    source = video_analysis.get("source") or {}
+    duration = source.get("duration_seconds")
+    fps = source.get("fps")
+    audio_state = "已检测到音轨,但未分析内容" if source.get("has_audio") else "未检测到音轨"
+    lines = [
+        "以下是后端探测的源视频权威事实,必须原样采用,不得根据静帧重新猜测:",
+        f"- 显示尺寸: {source.get('width')}x{source.get('height')}",
+        f"- 画幅比例: {source.get('ratio') or '未知'}",
+        f"- 真实时长: {float(duration):.3f} 秒" if duration is not None else "- 真实时长: 未知",
+        f"- 帧率: 约 {float(fps):.3f} fps" if fps is not None else "- 帧率: 未知",
+        f"- 音频: {audio_state}",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def _video_source_spec(video_analysis: dict) -> str:
+    source = video_analysis.get("source") or {}
+    parts = []
+    if source.get("width") and source.get("height"):
+        parts.append(f"{source['width']}x{source['height']}")
+    if source.get("ratio"):
+        parts.append(str(source["ratio"]))
+    if source.get("duration_seconds") is not None:
+        parts.append(f"{float(source['duration_seconds']):.3f}秒")
+    if source.get("fps") is not None:
+        parts.append(f"约{float(source['fps']):.3f}fps")
+    return "，".join(parts)
+
+
+def _video_shots_timeline(shots: list[dict]) -> str:
+    rows = []
+    for shot in shots:
+        start = float(shot["start_seconds"])
+        end = float(shot["end_seconds"])
+        details = [
+            str(shot.get(field) or "").strip()
+            for field in ("visual", "action", "camera", "transition")
+        ]
+        detail = "，".join(dict.fromkeys(value for value in details if value))
+        rows.append(f"{start:.3f}-{end:.3f}s {detail or '按参考帧复刻'}")
+    return "；".join(rows)
+
+
 def reverse_prompt(image_refs, vision_model_id: str, target: str = "image",
-                   gateway_config: RuntimeGatewayConfig | None = None) -> dict:
+                   gateway_config: RuntimeGatewayConfig | None = None,
+                   video_analysis: dict | None = None) -> dict:
     """Reverse one or more images into a structured prompt.
 
     ``image_refs`` is a single URL/data-URI or a list of them (e.g. several
@@ -362,7 +408,20 @@ def reverse_prompt(image_refs, vision_model_id: str, target: str = "image",
     refs = [image_refs] if isinstance(image_refs, str) else [r for r in image_refs if r]
     if not refs:
         raise GatewayError("反推缺少可用的参考图")
-    content = [{"type": "image_url", "image_url": {"url": r}} for r in refs]
+    content = []
+    frame_rows = (video_analysis or {}).get("sampled_frames") or []
+    if target == "video" and video_analysis:
+        content.append({"type": "text", "text": _video_analysis_context_text(video_analysis)})
+    for index, ref in enumerate(refs, start=1):
+        if target == "video" and video_analysis:
+            row = frame_rows[index - 1] if index <= len(frame_rows) else {}
+            timestamp = row.get("timestamp_seconds")
+            label = (
+                f"第 {index} 帧，时间戳 {float(timestamp):.3f} 秒"
+                if timestamp is not None else f"第 {index} 帧，时间戳未知"
+            )
+            content.append({"type": "text", "text": label})
+        content.append({"type": "image_url", "image_url": {"url": ref}})
     content.append({"type": "text", "text": _reverse_template(target, n_frames=len(refs))})
     payload = {
         "model": vision_model_id,
@@ -383,6 +442,29 @@ def reverse_prompt(image_refs, vision_model_id: str, target: str = "image",
     latency_ms = int((time.time() - t0) * 1000)
     content_text = data["choices"][0]["message"]["content"]
     result = _parse_structured(content_text)
+    if target == "video" and video_analysis:
+        source = video_analysis.get("source") or {}
+        result["shots"] = _normalize_video_shots(
+            result.get("shots"),
+            duration_seconds=source.get("duration_seconds"),
+            frame_count=len(frame_rows),
+            audio_analyzed=bool(source.get("audio_analyzed")),
+        )
+        timeline = _video_shots_timeline(result["shots"])
+        if timeline:
+            result["structured"]["时序分镜"] = timeline
+        source_spec = _video_source_spec(video_analysis)
+        if source_spec:
+            result["structured"]["源视频规格"] = source_spec
+            result["structured"]["时长建议"] = (
+                f"严格复刻源视频 {float(source['duration_seconds']):.3f} 秒"
+                if source.get("duration_seconds") is not None else source_spec
+            )
+        authoritative_prefix = []
+        if source_spec:
+            authoritative_prefix.append(f"严格按源视频规格复刻：{source_spec}")
+        if authoritative_prefix:
+            result["final_text"] = f"{'。'.join(authoritative_prefix)}。{result['final_text']}"
     result["usage"] = data.get("usage")  # {prompt_tokens, completion_tokens, total_tokens}
     result["latency_ms"] = latency_ms
     return result

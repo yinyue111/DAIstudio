@@ -60,6 +60,7 @@ _SUBJECT_MODES = {"general", "product", "portrait"}
 _PRODUCT_LOCK_MODES = {"locked", "free"}
 _PRODUCT_VIDEO_TEMPLATES = {
     "stable_showcase",
+    "reference_sequence",
     "slow_push",
     "handheld_display",
     "background_motion",
@@ -197,6 +198,8 @@ def validate_generation_params(category: str, params: dict) -> dict:
             if product_video_template not in _PRODUCT_VIDEO_TEMPLATES:
                 raise HTTPException(400, "product_video_template 不支持")
             params["product_video_template"] = product_video_template
+            if product_video_template == "reference_sequence":
+                params["product_lock_mode"] = "free"
     return params
 
 

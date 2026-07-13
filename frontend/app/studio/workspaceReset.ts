@@ -19,6 +19,7 @@ export function clearWorkspaceContent(current: Record<string, unknown>) {
     variationSource: null,
     structured: {},
     structuredSource: "",
+    reverseVideoAnalysis: null,
     promptSourceSignature: "",
     negativeTouched: false,
     promptDirty: false,

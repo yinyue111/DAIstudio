@@ -22,6 +22,16 @@ const viewModelSource = readFileSync(join(root, "app/studio/viewModel.ts"), "utf
 const structuredEditorSource = readFileSync(join(root, "app/studio/StudioStructuredEditor.jsx"), "utf8");
 const generationControlsSource = readFileSync(join(root, "components/StudioGenerationControls.jsx"), "utf8");
 const studioSource = `${pageSource}\n${workspaceStateSource}\n${promptWorkspaceSource}\n${editPromptSource}\n${generationPayloadSource}\n${referenceParsingSource}\n${viewModelSource}\n${constantsSource}\n${generationControlsSource}`;
+assert.match(
+  generationControlsSource,
+  /template === "reference_sequence"[\s\S]*onVideoProductLockModeChange\?\.\("free"\)/,
+  "reference-sequence template should force free product motion",
+);
+assert.match(
+  generationControlsSource,
+  /mode === "locked"[\s\S]*videoProductTemplate === "reference_sequence"[\s\S]*onVideoProductTemplateChange\?\.\("stable_showcase"\)/,
+  "switching back to product lock should reset the conflicting reference-sequence template",
+);
 const subjectProtectionModule = await import("../lib/studioSubjectProtection.js").catch(() => ({}));
 const { startSubjectProtectionPreview } = subjectProtectionModule;
 
@@ -33,6 +43,7 @@ const clearedWorkspace = clearWorkspaceContent({
   productAsset: { id: 2 },
   productProfile: { final_text: "旧主体档案" },
   structured: { 主体: "旧反推主体" },
+  reverseVideoAnalysis: { source: { duration_seconds: 10 } },
   ratio: "3:4",
 });
 assert.equal(clearedWorkspace.prompt, "");
@@ -42,6 +53,7 @@ assert.equal(clearedWorkspace.selected, null);
 assert.equal(clearedWorkspace.productAsset, null);
 assert.equal(clearedWorkspace.productProfile, null);
 assert.deepEqual(clearedWorkspace.structured, {});
+assert.equal(clearedWorkspace.reverseVideoAnalysis, null);
 assert.equal(clearedWorkspace.ratio, "3:4", "clear should preserve generation settings");
 
 const clearedWorkspaces = clearAllWorkspaceContent({

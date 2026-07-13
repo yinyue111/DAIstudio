@@ -347,9 +347,15 @@ def test_video_reverse_charges_per_reference_frame(client, make_user, auth, monk
     def fake_sample(*_a, **kwargs):
         seen["n"] = kwargs.get("n")
         seen["preset"] = kwargs.get("preset")
-        return [b"a", b"b", b"c"]
+        return video_frames.VideoSample(
+            frames=tuple(
+                video_frames.SampledVideoFrame(jpeg=value, timestamp_seconds=float(index))
+                for index, value in enumerate((b"a", b"b", b"c"))
+            ),
+            source=video_frames.VideoMetadata(duration_seconds=10.0),
+        )
 
-    monkeypatch.setattr(video_frames, "sample_keyframes", fake_sample)
+    monkeypatch.setattr(video_frames, "sample_video", fake_sample)
     monkeypatch.setattr(
         gateway,
         "reverse_prompt",
@@ -368,6 +374,85 @@ def test_video_reverse_charges_per_reference_frame(client, make_user, auth, monk
     assert seen["n"] == 24
     assert seen["preset"] == "standard"
     assert client.get("/api/me", headers=h).json()["balance_credits"] == 982
+
+
+def test_video_reverse_returns_authoritative_source_analysis(client, make_user, auth, monkeypatch):
+    make_user("13900009052", balance=1000, admin=True)
+    h = auth("13900009052")
+    assert client.put("/api/admin/models", json={
+        "use": "vision",
+        "model_id": "mock-vision",
+        "cost_credits": 7,
+        "unlock_cost": 0,
+        "enabled": True,
+        "admin_password": "pass123456",
+    }, headers=h).status_code == 200
+
+    monkeypatch.setattr("app.config.settings.mock_mode", False)
+    monkeypatch.setattr("app.config.settings.gateway_base_url", "https://gateway.test")
+    monkeypatch.setattr("app.config.settings.gateway_api_key", "sk-test")
+    monkeypatch.setattr(video_frames, "available", lambda: True)
+    sampled = video_frames.VideoSample(
+        frames=(
+            video_frames.SampledVideoFrame(jpeg=b"first", timestamp_seconds=0.0),
+            video_frames.SampledVideoFrame(jpeg=b"middle", timestamp_seconds=4.2),
+            video_frames.SampledVideoFrame(jpeg=b"last", timestamp_seconds=10.004),
+        ),
+        source=video_frames.VideoMetadata(
+            width=720,
+            height=960,
+            duration_seconds=10.054,
+            fps=23.0,
+            has_audio=True,
+        ),
+    )
+    monkeypatch.setattr(video_frames, "sample_video", lambda *_a, **_k: sampled)
+    seen = {}
+
+    def fake_reverse(refs, *_a, **kwargs):
+        seen["refs"] = refs
+        seen["video_analysis"] = kwargs.get("video_analysis")
+        return {
+            "structured": {"主体": "水感精华广告"},
+            "final_text": "3:4竖版，10秒水感精华广告",
+            "shots": [{"start_seconds": 0, "end_seconds": 2.2, "visual": "液滴入水"}],
+            "usage": None,
+            "latency_ms": 1,
+        }
+
+    monkeypatch.setattr(gateway, "reverse_prompt", fake_reverse)
+    request_body = {
+        "client_request_id": "video-analysis-replay-001",
+        "asset_url": "http://x/serum-ad.mp4",
+        "target": "video",
+    }
+    r = client.post("/api/prompt/reverse", json=request_body, headers=h)
+
+    assert r.status_code == 200, r.text
+    analysis = r.json()["video_analysis"]
+    assert analysis["source"] == {
+        "width": 720,
+        "height": 960,
+        "ratio": "3:4",
+        "duration_seconds": 10.054,
+        "fps": 23.0,
+        "has_audio": True,
+        "audio_analyzed": False,
+    }
+    assert analysis["sampled_frames"] == [
+        {"index": 1, "timestamp_seconds": 0.0},
+        {"index": 2, "timestamp_seconds": 4.2},
+        {"index": 3, "timestamp_seconds": 10.004},
+    ]
+    assert analysis["shots"][0]["end_seconds"] == 2.2
+    assert seen["video_analysis"] == {
+        "source": analysis["source"],
+        "sampled_frames": analysis["sampled_frames"],
+    }
+    assert len(seen["refs"]) == 3
+    replay = client.post("/api/prompt/reverse", json=request_body, headers=h)
+    assert replay.status_code == 200, replay.text
+    assert replay.json()["video_analysis"] == analysis
 
 
 def test_video_analysis_presets_match_product_frame_ranges():
@@ -464,7 +549,7 @@ def test_keyframe_sampling_uses_full_duration_for_long_video(monkeypatch):
     monkeypatch.setattr(video_frames, "_grab_frame", fake_grab)
 
     assert video_frames.sample_keyframes("http://x/long.mp4", n=3) == [b"jpg", b"jpg", b"jpg"]
-    assert stamps == [0.0, 300.0, 600.0]
+    assert stamps == [0.0, 300.0, 899.95]
 
 
 def test_keyframe_sampling_preset_uses_downloaded_duration(monkeypatch):
@@ -486,6 +571,49 @@ def test_keyframe_sampling_preset_uses_downloaded_duration(monkeypatch):
     assert len(stamps) == 11
 
 
+def test_keyframe_sampling_backs_off_when_container_tail_has_no_decodable_frame(monkeypatch):
+    monkeypatch.setattr(video_frames, "FFMPEG", "/usr/bin/ffmpeg")
+    monkeypatch.setattr(video_frames, "probe_media", lambda _path: {})
+    monkeypatch.setattr(video_frames, "_scene_change_timestamps", lambda *_a, **_k: [])
+    attempts = []
+
+    def fake_grab(_src, ts, dst):
+        attempts.append(round(ts, 3))
+        if ts > 9.95:
+            return False
+        with open(dst, "wb") as f:
+            f.write(b"jpg")
+        return True
+
+    monkeypatch.setattr(video_frames, "_grab_frame", fake_grab)
+    sample = video_frames._sample_video_from_file(
+        "/tmp/video.mp4",
+        n=3,
+        duration=10.054,
+    )
+
+    assert len(sample.frames) == 3
+    assert attempts[-2:] == [10.004, 9.904]
+    assert sample.frames[-1].timestamp_seconds == 9.904
+
+
+def test_scene_change_detection_spreads_cuts_across_full_output(monkeypatch):
+    monkeypatch.setattr(video_frames, "FFMPEG", "/usr/bin/ffmpeg")
+
+    class Result:
+        stdout = "\n".join(
+            f"frame:{index} pts_time:{index * 0.8}"
+            for index in range(1, 13)
+        )
+
+    monkeypatch.setattr(video_frames.subprocess, "run", lambda *_a, **_k: Result())
+    stamps = video_frames._scene_change_timestamps("/tmp/video.mp4", limit=4)
+
+    assert len(stamps) == 4
+    assert stamps[0] <= 2.4
+    assert stamps[-1] >= 8.0
+
+
 def test_keyframe_sampling_prefers_scene_changes_then_uniform_fill(monkeypatch):
     monkeypatch.setattr(video_frames, "FFMPEG", "/usr/bin/ffmpeg")
     monkeypatch.setattr(video_frames, "_download_capped", lambda *_a, **_k: b"\x00\x00\x00\x18ftypmp42")
@@ -502,7 +630,41 @@ def test_keyframe_sampling_prefers_scene_changes_then_uniform_fill(monkeypatch):
     monkeypatch.setattr(video_frames, "_grab_frame", fake_grab)
 
     assert video_frames.sample_keyframes("http://x/cuts.mp4", n=4) == [b"jpg"] * 4
-    assert stamps == [0.0, 2.0, 5.0, 9.0]
+    assert stamps == [0.0, 2.0, 9.0, 19.95]
+
+
+def test_keyframe_sampling_covers_full_duration_when_early_scene_cuts_fill_budget(monkeypatch):
+    monkeypatch.setattr(video_frames, "FFMPEG", "/usr/bin/ffmpeg")
+    monkeypatch.setattr(video_frames, "_download_capped", lambda *_a, **_k: b"\x00\x00\x00\x18ftypmp42")
+    monkeypatch.setattr(video_frames, "probe_media", lambda _path: {
+        "width": 1920,
+        "height": 1080,
+        "duration_seconds": 300.0,
+        "fps": 24.0,
+        "has_audio": False,
+    })
+    monkeypatch.setattr(
+        video_frames,
+        "_scene_change_timestamps",
+        lambda *_a, **_k: [2.0, 4.0, 8.0, 12.0, 18.0, 24.0, 30.0, 160.0, 240.0],
+    )
+    stamps = []
+
+    def fake_grab(_src, ts, dst):
+        stamps.append(ts)
+        with open(dst, "wb") as f:
+            f.write(b"jpg")
+        return True
+
+    monkeypatch.setattr(video_frames, "_grab_frame", fake_grab)
+
+    sample = video_frames.sample_video("http://x/long-ad.mp4", n=8)
+
+    assert sample is not None
+    assert sample.frames[0].timestamp_seconds == 0.0
+    assert sample.frames[-1].timestamp_seconds == 299.95
+    assert any(frame.timestamp_seconds >= 150 for frame in sample.frames[1:-1])
+    assert stamps == [frame.timestamp_seconds for frame in sample.frames]
 
 
 def test_keyframe_sampling_busy_returns_empty(monkeypatch):

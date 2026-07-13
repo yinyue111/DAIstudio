@@ -35,6 +35,7 @@ export function createWorkspaceState() {
     variationSource: null,
     structured: {},
     structuredSource: "",
+    reverseVideoAnalysis: null,
     promptSourceSignature: "",
     negativeTouched: false,
     promptDirty: false,

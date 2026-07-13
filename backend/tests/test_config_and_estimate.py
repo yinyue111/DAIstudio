@@ -1012,11 +1012,12 @@ def test_video_generation_params_accept_product_video_template():
             "ratio": "9:16",
             "subject_mode": "product",
             "product_lock_mode": "locked",
-            "product_video_template": "soft_splash",
+            "product_video_template": "reference_sequence",
         },
     )
 
-    assert params["product_video_template"] == "soft_splash"
+    assert params["product_video_template"] == "reference_sequence"
+    assert params["product_lock_mode"] == "free"
 
     try:
         validate_generation_params("video", {"product_video_template": "wild_spin"})
@@ -1081,6 +1082,39 @@ def test_product_video_prompt_applies_template_constraint():
     assert "产品视频模板：轻水花" in out
     assert "不得覆盖Logo、包装文字" in out
     assert "快速环绕" not in out
+
+
+def test_reference_sequence_prompt_keeps_one_intact_canonical_timeline():
+    timeline = (
+        "0.000-2.200s 液滴入水，微距固定；"
+        "2.200-4.200s 精华倒入手心，手部特写；"
+        "4.200-7.600s 上脸按压，中近景；"
+        "7.600-10.054s 产品英雄镜头，缓慢推近"
+    )
+    prompt = {
+        "产品身份档案": "上传精华瓶是唯一产品主角，Logo、包装文字、瓶身结构和材质必须保持。" * 4,
+        "场景背景": "清透水感棚拍背景和柔和反射光。" * 8,
+        "时序分镜": timeline,
+        "final_text": "严格复刻参考视频的产品广告。" * 20,
+    }
+
+    out = compact_generation_prompt_text(
+        prompt,
+        {
+            "subject_mode": "product",
+            "_category": "video",
+            "product_lock_mode": "free",
+            "product_video_template": "reference_sequence",
+        },
+        prompt["final_text"],
+        is_product=True,
+    )
+
+    assert timeline in out
+    assert out.count(timeline) == 1
+    assert "0.000-2.200s" in out
+    assert "2.200-4.200s" in out
+    assert len(out) <= 800
 
 
 def test_portrait_generation_prompt_reframes_body_language_safely():

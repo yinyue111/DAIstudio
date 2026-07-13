@@ -165,13 +165,13 @@ def _collect_refs(
     *,
     frame_budget: int | None = None,
     video_preset: str | None = None,
-) -> list[str]:
+) -> tuple[list[str], dict | None]:
     """Resolve the asset into one or more image refs (URLs or base64 data-URIs)
     to feed the vision model. The image-target/video-url mismatch is rejected by
     the caller before this runs."""
     if not _is_video_source(body):
         ref = _gateway_ref(db, user, body.asset_url)
-        return [ref] if ref else []
+        return ([ref] if ref else []), None
 
     key = storage.key_from_url(body.asset_url)
     local_video_path = None
@@ -186,30 +186,35 @@ def _collect_refs(
         n_frames = max(1, int(frame_budget or settings.reverse_video_frames or 1))
         try:
             if local_video_path is not None:
-                frames = video_frames.sample_keyframes_from_path(
+                sample = video_frames.sample_video_from_path(
                     str(local_video_path),
                     n=n_frames,
                     preset=video_preset,
                 )
             else:
-                frames = video_frames.sample_keyframes(
+                sample = video_frames.sample_video(
                     body.asset_url,
                     n=n_frames,
                     preset=video_preset,
                 )
         except asset_refs.AssetRefError as e:
             raise HTTPException(404, str(e))
-        if frames:
-            return ["data:image/jpeg;base64," + base64.b64encode(f).decode()
-                    for f in frames]
+        if sample and sample.frames:
+            return (
+                [
+                    "data:image/jpeg;base64," + base64.b64encode(frame.jpeg).decode()
+                    for frame in sample.frames
+                ],
+                sample.analysis(),
+            )
 
     # fall back to a provided cover/keyframe image
     cover = body.fallback_image
     if cover and not _looks_like_video_url(cover):
         ref = _gateway_ref(db, user, cover)
-        return [ref] if ref else []
+        return ([ref] if ref else []), None
     if settings.effective_mock_mode:
-        return [cover or body.asset_url]
+        return [cover or body.asset_url], None
     raise HTTPException(400, "无法从该视频抽取关键帧,请改用封面图进行反推")
 
 
@@ -243,6 +248,10 @@ def _reverse_operation_response(op: ReverseOperation) -> ReverseOut:
         final_text=final_text,
         charged_credits=int(op.charged_credits or 0),
         reference_count=max(1, int(op.reference_count or 1)),
+        video_analysis=(
+            result.get("video_analysis")
+            if isinstance(result.get("video_analysis"), dict) else None
+        ),
     )
 
 
@@ -435,6 +444,10 @@ def _finish_reverse_operation(
             result={
                 "structured": result.get("structured") or {},
                 "final_text": result.get("final_text") or "",
+                **(
+                    {"video_analysis": result["video_analysis"]}
+                    if isinstance(result.get("video_analysis"), dict) else {}
+                ),
             },
             reference_count=max(1, int(reference_count or 1)),
             error=None,
@@ -594,13 +607,17 @@ def reverse(body: ReverseIn, db: Session = Depends(get_db),
             except ReverseOperationClosed:
                 raise HTTPException(409, "反推请求已被恢复任务关闭,请重新发起") from None
     try:
-        refs = _collect_refs(
+        collected_refs = _collect_refs(
             body,
             db,
             user,
             frame_budget=requested_frame_budget,
             video_preset=video_preset,
         )
+        if isinstance(collected_refs, tuple) and len(collected_refs) == 2:
+            refs, video_analysis = collected_refs
+        else:
+            refs, video_analysis = collected_refs, None
     except Exception:
         _fail_reverse_operation(
             db,
@@ -648,7 +665,14 @@ def reverse(body: ReverseIn, db: Session = Depends(get_db),
         kwargs = {"target": body.target}
         if _accepts_gateway_config(gateway.reverse_prompt):
             kwargs["gateway_config"] = runtime_config_for_model(model, "vision")
+        if video_analysis is not None:
+            kwargs["video_analysis"] = video_analysis
         result = gateway.reverse_prompt(refs, model.model_id, **kwargs)
+        if video_analysis is not None:
+            result["video_analysis"] = {
+                **video_analysis,
+                "shots": result.pop("shots", []),
+            }
     except HTTPException as e:
         _fail_reverse_operation(
             db,
@@ -763,4 +787,8 @@ def reverse(body: ReverseIn, db: Session = Depends(get_db),
         final_text=result["final_text"],
         charged_credits=cost,
         reference_count=max(1, len(refs)),
+        video_analysis=(
+            result.get("video_analysis")
+            if isinstance(result.get("video_analysis"), dict) else None
+        ),
     )

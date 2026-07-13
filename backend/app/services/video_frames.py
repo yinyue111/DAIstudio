@@ -19,6 +19,9 @@ import subprocess
 import tempfile
 import threading
 import time
+from dataclasses import dataclass
+from fractions import Fraction
+from math import gcd
 
 from ..config import settings
 from .safe_logging import redact_url_for_log
@@ -33,6 +36,7 @@ MAX_VIDEO_BYTES = 80 * 1024 * 1024  # don't pull more than ~80MB to sample frame
 DOWNLOAD_TIMEOUT = 30.0
 SCENE_THRESHOLD = 0.28
 MIN_FRAME_GAP_SECONDS = 0.7
+FRAME_BACKOFF_SECONDS = (0.0, 0.1, 0.25, 0.5)
 _SAMPLE_SEMAPHORE = threading.BoundedSemaphore(
     max(1, int(settings.reverse_video_parallelism or 1))
 )
@@ -41,6 +45,54 @@ UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
 )
+
+
+@dataclass(frozen=True)
+class VideoMetadata:
+    width: int | None = None
+    height: int | None = None
+    duration_seconds: float | None = None
+    fps: float | None = None
+    has_audio: bool = False
+
+    @property
+    def ratio(self) -> str | None:
+        if not self.width or not self.height:
+            return None
+        divisor = gcd(int(self.width), int(self.height))
+        return f"{int(self.width) // divisor}:{int(self.height) // divisor}"
+
+    def to_dict(self) -> dict:
+        return {
+            "width": self.width,
+            "height": self.height,
+            "ratio": self.ratio,
+            "duration_seconds": self.duration_seconds,
+            "fps": self.fps,
+            "has_audio": self.has_audio,
+            "audio_analyzed": False,
+        }
+
+
+@dataclass(frozen=True)
+class SampledVideoFrame:
+    jpeg: bytes
+    timestamp_seconds: float
+
+
+@dataclass(frozen=True)
+class VideoSample:
+    frames: tuple[SampledVideoFrame, ...]
+    source: VideoMetadata
+
+    def analysis(self) -> dict:
+        return {
+            "source": self.source.to_dict(),
+            "sampled_frames": [
+                {"index": index, "timestamp_seconds": frame.timestamp_seconds}
+                for index, frame in enumerate(self.frames, start=1)
+            ],
+        }
 
 
 def available() -> bool:
@@ -154,17 +206,52 @@ def probe_media(path: str) -> dict:
         return {}
 
     width = height = None
+    fps = None
+    rotation = 0
+    has_audio = False
     for stream in data.get("streams") or []:
         if stream.get("codec_type") == "video":
             width = stream.get("width")
             height = stream.get("height")
+            raw_fps = stream.get("avg_frame_rate") or stream.get("r_frame_rate")
+            try:
+                parsed_fps = float(Fraction(str(raw_fps)))
+                fps = parsed_fps if parsed_fps > 0 else None
+            except (ValueError, ZeroDivisionError):
+                fps = None
+            try:
+                rotation = int((stream.get("tags") or {}).get("rotate") or 0)
+            except (TypeError, ValueError):
+                rotation = 0
+            for side_data in stream.get("side_data_list") or []:
+                try:
+                    rotation = int(side_data.get("rotation") or rotation)
+                except (TypeError, ValueError):
+                    pass
             break
+    has_audio = any(
+        stream.get("codec_type") == "audio"
+        for stream in data.get("streams") or []
+    )
+    if width and height and abs(rotation) % 180 == 90:
+        width, height = height, width
     duration = None
     try:
         duration = float((data.get("format") or {}).get("duration") or 0) or None
     except (TypeError, ValueError):
         duration = None
-    return {"width": width, "height": height, "duration": duration}
+    metadata = VideoMetadata(
+        width=int(width) if width else None,
+        height=int(height) if height else None,
+        duration_seconds=round(duration, 3) if duration else None,
+        fps=round(fps, 3) if fps else None,
+        has_audio=has_audio,
+    )
+    return {
+        **metadata.to_dict(),
+        # Compatibility for existing upload/generation callers.
+        "duration": metadata.duration_seconds,
+    }
 
 
 def acquire_video_slot() -> bool:
@@ -189,6 +276,17 @@ def _grab_frame(src: str, ts: float, dst: str) -> bool:
     except subprocess.SubprocessError:
         return False
     return os.path.exists(dst) and os.path.getsize(dst) > 0
+
+
+def _grab_frame_with_backoff(src: str, ts: float, dst: str) -> float | None:
+    """Return the actual timestamp used, backing off from an undecodable EOF."""
+    for offset in FRAME_BACKOFF_SECONDS:
+        candidate = max(0.0, float(ts) - offset)
+        if os.path.exists(dst):
+            os.remove(dst)
+        if _grab_frame(src, candidate, dst):
+            return candidate
+    return None
 
 
 def _scene_change_timestamps(src: str, limit: int) -> list[float]:
@@ -236,9 +334,7 @@ def _scene_change_timestamps(src: str, limit: int) -> list[float]:
         if stamps and abs(ts - stamps[-1]) < MIN_FRAME_GAP_SECONDS:
             continue
         stamps.append(ts)
-        if len(stamps) >= limit:
-            break
-    return stamps
+    return _spread_timestamps(stamps, limit)
 
 
 def _uniform_timestamps(dur: float | None, n: int) -> list[float]:
@@ -249,10 +345,41 @@ def _uniform_timestamps(dur: float | None, n: int) -> list[float]:
     return [0.0, 0.5, 1.0, 1.5][:n]
 
 
+def _spread_timestamps(stamps: list[float], count: int) -> list[float]:
+    if count < 1 or not stamps:
+        return []
+    if len(stamps) <= count:
+        return list(stamps)
+    picked: list[float] = []
+    total = len(stamps)
+    for index in range(count):
+        position = round((index + 1) * total / (count + 1)) - 1
+        picked.append(stamps[max(0, min(total - 1, position))])
+    return picked
+
+
 def _merge_timestamps(primary: list[float], fallback: list[float], n: int, dur: float | None) -> list[float]:
-    merged: list[float] = []
+    if n < 1:
+        return []
     max_ts = max(0.0, float(dur or 0) - 0.05) if dur else None
-    for ts in [0.0, *primary, *fallback]:
+    endpoints = [0.0]
+    if max_ts is not None and n > 1:
+        endpoints.append(max_ts)
+    interior_slots = max(0, n - len(endpoints))
+    candidates = [
+        max(0.0, min(float(ts), max_ts)) if max_ts is not None else max(0.0, float(ts))
+        for ts in primary
+    ]
+    candidates = [
+        ts for ts in candidates
+        if all(abs(ts - endpoint) >= MIN_FRAME_GAP_SECONDS for endpoint in endpoints)
+    ]
+    merged = list(endpoints)
+    for ts in _spread_timestamps(candidates, interior_slots):
+        if any(abs(ts - seen) < MIN_FRAME_GAP_SECONDS for seen in merged):
+            continue
+        merged.append(ts)
+    for ts in fallback:
         if len(merged) >= n:
             break
         clean = max(0.0, float(ts))
@@ -273,6 +400,44 @@ def _target_frame_count(n: int, dur: float | None, preset: str | None = None) ->
     return max(1, frame_count_for_duration(dur, None) if n < 1 else n)
 
 
+def _sample_video_from_file(
+    src: str,
+    n: int,
+    *,
+    duration: float | None = None,
+    preset: str | None = None,
+) -> VideoSample:
+    frames: list[SampledVideoFrame] = []
+    probed = probe_media(src)
+    dur = duration if duration is not None else (
+        probed.get("duration_seconds") or probed.get("duration") or _duration_seconds(src)
+    )
+    source = VideoMetadata(
+        width=probed.get("width"),
+        height=probed.get("height"),
+        duration_seconds=round(float(dur), 3) if dur else None,
+        fps=probed.get("fps"),
+        has_audio=bool(probed.get("has_audio")),
+    )
+    target = _target_frame_count(n, dur, preset)
+    scene_stamps = _scene_change_timestamps(src, max(0, target - 1))
+    stamps = _merge_timestamps(scene_stamps, _uniform_timestamps(dur, target), target, dur)
+    if not stamps:
+        return VideoSample(frames=(), source=source)
+
+    with tempfile.TemporaryDirectory() as td:
+        for i, ts in enumerate(stamps):
+            dst = os.path.join(td, f"f_{i:02d}.jpg")
+            actual_ts = _grab_frame_with_backoff(src, max(0.0, ts), dst)
+            if actual_ts is not None:
+                with open(dst, "rb") as f:
+                    frames.append(SampledVideoFrame(
+                        jpeg=f.read(),
+                        timestamp_seconds=round(float(actual_ts), 3),
+                    ))
+    return VideoSample(frames=tuple(frames), source=source)
+
+
 def _sample_keyframes_from_file(
     src: str,
     n: int,
@@ -280,41 +445,37 @@ def _sample_keyframes_from_file(
     duration: float | None = None,
     preset: str | None = None,
 ) -> list[bytes]:
-    frames: list[bytes] = []
-    dur = duration if duration is not None else _duration_seconds(src)
-    target = _target_frame_count(n, dur, preset)
-    scene_stamps = _scene_change_timestamps(src, max(0, target - 1))
-    stamps = _merge_timestamps(scene_stamps, _uniform_timestamps(dur, target), target, dur)
-    if not stamps:
-        return []
+    sample = _sample_video_from_file(src, n, duration=duration, preset=preset)
+    return [frame.jpeg for frame in sample.frames]
 
-    with tempfile.TemporaryDirectory() as td:
-        for i, ts in enumerate(stamps):
-            dst = os.path.join(td, f"f_{i:02d}.jpg")
-            if _grab_frame(src, max(0.0, ts), dst):
-                with open(dst, "rb") as f:
-                    frames.append(f.read())
-    return frames
+
+def sample_video_from_path(
+    video_path: str,
+    n: int = 4,
+    *,
+    preset: str | None = None,
+) -> VideoSample | None:
+    """Return timestamped frames and source facts from an owner-checked video."""
+    if not FFMPEG or n < 1:
+        return None
+    if not acquire_video_slot():
+        log.warning("video keyframe sampler is busy, skipping reverse-video frames")
+        return None
+    try:
+        sample = _sample_video_from_file(video_path, n, preset=preset)
+        log.info("sampled %s timestamped frame(s) from local video", len(sample.frames))
+        return sample
+    except Exception as e:  # noqa: BLE001
+        log.warning("local keyframe sampling failed: %s", e)
+        return None
+    finally:
+        release_video_slot()
 
 
 def sample_keyframes_from_path(video_path: str, n: int = 4, *, preset: str | None = None) -> list[bytes]:
     """Return up to ``n`` JPEG frames from a local, owner-checked video path."""
-    if not FFMPEG or n < 1:
-        return []
-    if not _SAMPLE_SEMAPHORE.acquire(
-        timeout=max(0.0, float(settings.reverse_video_acquire_timeout_seconds or 0))
-    ):
-        log.warning("video keyframe sampler is busy, skipping reverse-video frames")
-        return []
-    try:
-        frames = _sample_keyframes_from_file(video_path, n, preset=preset)
-        log.info("sampled %s keyframe(s) from local video", len(frames))
-        return frames
-    except Exception as e:  # noqa: BLE001
-        log.warning("local keyframe sampling failed: %s", e)
-        return []
-    finally:
-        _SAMPLE_SEMAPHORE.release()
+    sample = sample_video_from_path(video_path, n, preset=preset)
+    return [frame.jpeg for frame in sample.frames] if sample else []
 
 
 def extract_poster(video_path: str) -> bytes | None:
@@ -339,31 +500,41 @@ def sample_keyframes(
     preset: str | None = None,
 ) -> list[bytes]:
     """Return up to ``n`` JPEG frames (first + evenly spaced). [] on any failure."""
+    sample = sample_video(video_url, n, referer=referer, preset=preset)
+    return [frame.jpeg for frame in sample.frames] if sample else []
+
+
+def sample_video(
+    video_url: str,
+    n: int = 4,
+    referer: str | None = None,
+    *,
+    preset: str | None = None,
+) -> VideoSample | None:
+    """Return timestamped frames and source facts from a remote video."""
     if not FFMPEG or n < 1:
-        return []
-    if not _SAMPLE_SEMAPHORE.acquire(
-        timeout=max(0.0, float(settings.reverse_video_acquire_timeout_seconds or 0))
-    ):
+        return None
+    if not acquire_video_slot():
         log.warning("video keyframe sampler is busy, skipping reverse-video frames")
-        return []
+        return None
     try:
         try:
             data = _download_capped(video_url, referer=referer)
         except Exception as e:  # noqa: BLE001 — SSRF/network/etc. -> graceful fallback
             log.warning("keyframe download failed for %s: %s", redact_url_for_log(video_url), e)
-            return []
+            return None
         if not data:
-            return []
+            return None
         if not _looks_like_video(data):
             log.warning("video sample rejected: unsupported file signature")
-            return []
+            return None
 
         with tempfile.TemporaryDirectory() as td:
             src = os.path.join(td, "input")
             with open(src, "wb") as f:
                 f.write(data)
-            frames = _sample_keyframes_from_file(src, n, preset=preset)
-        log.info("sampled %s keyframe(s) from video", len(frames))
-        return frames
+            sample = _sample_video_from_file(src, n, preset=preset)
+        log.info("sampled %s timestamped frame(s) from video", len(sample.frames))
+        return sample
     finally:
-        _SAMPLE_SEMAPHORE.release()
+        release_video_slot()

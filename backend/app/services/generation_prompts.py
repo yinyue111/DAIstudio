@@ -193,6 +193,11 @@ _LOCKED_PRODUCT_VIDEO_USER_REWRITES = (
     ),
 )
 _PRODUCT_VIDEO_TEMPLATE_PROMPTS = {
+    "reference_sequence": (
+        "产品视频模板：参考分镜。严格按反推提示词的时序分镜执行镜头顺序、每镜时长、"
+        "手部使用动作、景别和转场，最后以清晰完整的产品英雄镜头收尾。"
+        "上传产品始终是唯一商品主体，保留 Logo、包装文字和结构，不强制每个镜头都静态正面陈列。"
+    ),
     "stable_showcase": (
         "产品视频模板：稳定陈列。产品正面文字面保持朝向镜头，主体固定在画面中心，"
         "只让背景光影、台面反射、轻微景深和慢速转场产生变化。"
@@ -335,6 +340,7 @@ _PROMPT_FIELD_LIMITS = {
     "服装结构": 150,
     "服装覆盖": 100,
     "妆发五官": 130,
+    "时序分镜": 520,
 }
 
 
@@ -342,7 +348,7 @@ def _compact_prompt_field(key: str, value) -> str:
     text = _normalise_prompt_fragment(value)
     if not text:
         return ""
-    chunks = [item.strip() for item in re.split(r"(?<=[。；;.!?！？])", text) if item.strip()]
+    chunks = [item.strip() for item in re.split(r"(?<=[。；;!?！？])", text) if item.strip()]
     if chunks:
         unique: list[str] = []
         seen: set[str] = set()
@@ -565,11 +571,24 @@ def _style_transfer_generation_prompt(
     return _normalise_prompt_fragment(fallback)
 
 
-def _trim_generation_prompt(text: str, *, max_chars: int = GENERATION_PROMPT_MAX_CHARS) -> str:
+def _trim_generation_prompt(
+    text: str,
+    *,
+    max_chars: int = GENERATION_PROMPT_MAX_CHARS,
+    required_clause: str = "",
+) -> str:
     value = _normalise_prompt_fragment(text)
+    required = _normalise_prompt_fragment(required_clause)
+    if required:
+        without_required = value.replace(required, "", 1).strip(" ,，;；。")
+        if len(required) >= max_chars:
+            return required[:max_chars].rstrip(" ,，;；。")
+        body_budget = max_chars - len(required) - 1
+        body = _trim_generation_prompt(without_required, max_chars=body_budget)
+        return f"{body}；{required}" if body else required
     if len(value) <= max_chars:
         return value
-    sentences = re.split(r"(?<=[。；;.!?！？])", value)
+    sentences = re.split(r"(?<=[。；;!?！？])", value)
     head_budget = int(max_chars * 0.68)
     head: list[str] = []
     head_len = 0
@@ -714,7 +733,12 @@ def compact_generation_prompt_text(
                 "和外盒轮廓全部可见，主体占画面五成五到七成五并保留安全边距；"
                 "不得裁掉包装、不得只显示局部、不得让草叶/水花/道具遮挡Logo和主要文字。"
             )
-    return _trim_generation_prompt(f"{prefix}{source}")
+    timeline = _compact_prompt_field("时序分镜", prompt_obj.get("时序分镜")) if is_video else ""
+    timeline_clause = f"时序分镜: {timeline}" if timeline else ""
+    return _trim_generation_prompt(
+        f"{prefix}{source}",
+        required_clause=timeline_clause,
+    )
 
 
 def _merge_negative_terms(value: str | None, terms: tuple[str, ...]) -> str:

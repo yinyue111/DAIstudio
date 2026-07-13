@@ -1,6 +1,6 @@
 "use client";
 
-import type { AppConfig } from "../../lib/types";
+import type { AppConfig, ReverseVideoAnalysis, WorkspaceState } from "../../lib/types";
 import {
   IMAGE_QUALITY_PRESETS,
   MAX_VIDEO_DURATION_SECONDS,
@@ -239,6 +239,58 @@ export function boundedVideoDuration(value, max = MAX_VIDEO_DURATION_SECONDS) {
   const parsed = Number.parseInt(value, 10);
   if (!Number.isFinite(parsed)) return 5;
   return Math.max(1, Math.min(limit, parsed));
+}
+
+type ReverseVideoWorkspacePatchArgs = {
+  analysis?: ReverseVideoAnalysis | null;
+  current?: Partial<WorkspaceState>;
+  startedRatio?: string;
+  startedDuration?: number;
+  maxDuration?: number;
+  productVideo?: boolean;
+};
+
+export function reverseVideoWorkspacePatch({
+  analysis,
+  current = {},
+  startedRatio,
+  startedDuration,
+  maxDuration = MAX_VIDEO_DURATION_SECONDS,
+  productVideo = false,
+}: ReverseVideoWorkspacePatchArgs = {}): Partial<WorkspaceState> {
+  if (!analysis || typeof analysis !== "object") return { reverseVideoAnalysis: null };
+  const patch: Partial<WorkspaceState> = { reverseVideoAnalysis: analysis };
+  const source = analysis.source || {};
+  const width = Number(source.width);
+  const height = Number(source.height);
+  const exactRatio = videoRatioOptions().find((item) => item.key === source.ratio)?.key;
+  const inferredRatio = width > 0 && height > 0
+    ? nearestRatio(width, height, videoRatioOptions())
+    : null;
+  if (String(current.ratio || "") === String(startedRatio || "") && (exactRatio || inferredRatio)) {
+    patch.ratio = exactRatio || inferredRatio;
+  }
+
+  const sourceDuration = Number(source.duration_seconds);
+  if (
+    Number.isFinite(sourceDuration)
+    && sourceDuration > 0
+    && Number(current.vDuration) === Number(startedDuration)
+  ) {
+    patch.vDuration = boundedVideoDuration(Math.round(sourceDuration), maxDuration);
+  }
+
+  const multiShot = Array.isArray(analysis.shots) && analysis.shots.length > 1;
+  if (
+    productVideo
+    && (multiShot || sourceDuration > 5)
+    && current.videoProductLockMode === "locked"
+    && (!current.videoProductTemplate || current.videoProductTemplate === "stable_showcase")
+  ) {
+    patch.videoProductLockMode = "free";
+    patch.videoProductTemplate = "reference_sequence";
+  }
+  return patch;
 }
 
 export function formatDuration(seconds) {
