@@ -204,6 +204,22 @@ def test_generic_video_submit_preserves_first_frame(monkeypatch):
     assert "first_frame_image" not in seen["payload"]
 
 
+def test_generic_video_submit_accepts_grok_request_id(monkeypatch):
+    monkeypatch.setattr(settings, "mock_mode", False)
+    monkeypatch.setattr(settings, "video_gateway_base_url", "https://video.example.com")
+    monkeypatch.setattr(settings, "video_gateway_api_key", "test-key")
+    monkeypatch.setattr(settings, "video_gateway_format", "openai")
+    monkeypatch.setattr(
+        gateway,
+        "_video_post",
+        lambda *_args, **_kwargs: {"request_id": "grok-request-1"},
+    )
+
+    task_id = gateway.submit_video("animate", "grok-imagine-video-1.5", {})
+
+    assert task_id == "grok-request-1"
+
+
 def test_generic_video_submit_preserves_last_frame(monkeypatch):
     seen = {}
     monkeypatch.setattr(settings, "mock_mode", False)

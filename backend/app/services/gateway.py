@@ -1438,7 +1438,12 @@ def submit_video(prompt: str, video_model_id: str, params: dict,
         data = _video_post(submit_path, payload)
     else:
         data = _video_post(submit_path, payload, config=gateway_config)
-    task_id = data.get(id_field) or data.get("task_id") or data.get("id")
+    task_id = (
+        data.get(id_field)
+        or data.get("task_id")
+        or data.get("id")
+        or data.get("request_id")
+    )
     if not task_id:
         raise GatewayError(f"视频网关未返回任务号: {str(data)[:200]}")
     return str(task_id)
