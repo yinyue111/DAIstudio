@@ -8,6 +8,7 @@ const adminHelpers = fs.readFileSync(new URL("../app/admin/components/admin-help
 
 assert.match(apiSource, /\/api\/prompt\/optimize/);
 assert.match(pageSource, /api\.optimizePrompt\(source, \{[\s\S]{0,1200}duration:[\s\S]{0,1200}subject_mode:[\s\S]{0,1200}reference_type:[\s\S]{0,1200}subject_profile:/);
+assert.match(pageSource, /api\.optimizePrompt\(source, \{[\s\S]{0,1600}aspect_ratio:[\s\S]{0,1600}resolution:[\s\S]{0,1600}product_lock_mode:[\s\S]{0,1600}product_video_template:/);
 assert.match(apiSource, /optimizePrompt:\s*\(prompt, options[\s\S]{0,500}body:\s*\{ prompt, \.\.\.context \}/);
 assert.match(pageSource, /Boolean\(prompt\.trim\(\) && promptDirty\)/);
 assert.match(

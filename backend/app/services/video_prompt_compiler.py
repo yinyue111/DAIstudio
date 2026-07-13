@@ -1,6 +1,8 @@
 """Compile user video instructions without image-prompt truncation."""
+
 from __future__ import annotations
 
+import json
 import re
 from math import ceil
 from typing import Any
@@ -17,16 +19,19 @@ PORTRAIT_SUBJECT_LOCK = (
 _NON_PRODUCT_IDENTITY_RE = re.compile(r"人物|女主|男主|场景|背景|光线|灯光|构图|镜头")
 _NON_PORTRAIT_IDENTITY_RE = re.compile(r"场景|背景|光线|灯光|构图|镜头|道具")
 _ACTION_SIGNAL_RE = re.compile(
-    r"走(?:近|到|向|入)?|伸懒腰|抽出|取出|拉出|展开|浸入|浸水|拧干|"
-    r"洗脸|擦拭|轻拭|擦脸|擦手|撕开|撕扯|"
+    r"走(?:近|到|向|入|进|出)?|伸懒腰|抽出|取出|拉出|展开|浸入|浸水|拧干|"
+    r"洗脸(?!巾)|擦拭|轻拭|擦脸|擦手|撕开|撕扯|"
+    r"打开|关闭|按压|倒(?:入|出|水)?|涂抹|挤出|揭开|拧开|盖上|倾倒|喷洒|泵出|"
     r"旋转|转动|移动|推进|推近|拉远|切到|切换|入镜|出镜|展示|"
     r"拿起|捏住|对折|落下|飞溅|喷溅|后退|抬起|放下|抓住|"
     r"闭眼|微笑|说话|跳起|跑动|坐下|站起|躺下|转身|摇镜|环绕|跟拍|聚焦|静置",
     re.IGNORECASE,
 )
 _EXPLICIT_STYLE_CONTEXT_RE = re.compile(
-    r"风格|广告|色调|配色|光线|灯光|氛围|质感|日系|电影感|"
-    r"商业|写实|影棚",
+    r"风格|广告|色调|配色|光线|灯光|氛围|质感|日系|电影感|商业|写实|影棚|"
+    r"自然光|柔光|侧光|逆光|轮廓光|顶光|微距|浅景深|景深|"
+    r"特写|近景|中景|远景|广角|长焦|构图|视角|运镜|"
+    r"固定镜头|稳定镜头|手持镜头|镜头语言|镜头视角|镜头焦段|镜头运动",
     re.IGNORECASE,
 )
 _SCENE_CONTEXT_RE = re.compile(r"家庭浴室|浴室|卫生间|卧室|场景|背景", re.IGNORECASE)
@@ -202,6 +207,153 @@ def _unlabelled_parts(text: str) -> list[str]:
     return parts
 
 
+def video_action_requirements(shots: list[str]) -> list[str]:
+    """Strip leading visual context from immutable source action requirements."""
+    requirements: list[str] = []
+    for shot in shots:
+        parts = [part.strip() for part in re.split(r"[,，]+", str(shot or "")) if part.strip()]
+        while len(parts) > 1 and _looks_like_global_context(parts[0]):
+            parts.pop(0)
+        requirement = "，".join(parts).strip(" ,，。；;")
+        if requirement:
+            requirements.append(requirement)
+    return requirements
+
+
+VIDEO_SECTION_ALIASES = {
+    "风格设定": "style",
+    "视觉风格": "style",
+    "全局风格": "style",
+    "场景脚本": "scenes",
+    "分镜脚本": "scenes",
+    "镜头脚本": "scenes",
+    "技术约束": "constraints",
+    "生成约束": "constraints",
+    "制作约束": "constraints",
+}
+
+
+def clean_video_prompt_section(value: object) -> str:
+    text = re.sub(r"\s+", " ", str(value or "")).strip()
+    return text.strip(" `#*[]，,。；;")
+
+
+def video_scene_script_items(value: object) -> list[str]:
+    if isinstance(value, list):
+        candidates = value
+    else:
+        text = str(value or "").strip()
+        numbered = re.split(
+            r"(?:^|[\n。；;])\s*(?:Shot|镜头)\s*\d+\s*[:：]\s*",
+            text,
+            flags=re.IGNORECASE,
+        )
+        candidates = numbered[1:] if len(numbered) > 1 else _clauses(text)
+    shots: list[str] = []
+    for candidate in candidates:
+        shot = clean_video_prompt_section(candidate)
+        shot = re.sub(r"^(?:Shot|镜头)\s*\d+\s*[:：]\s*", "", shot, flags=re.IGNORECASE)
+        if shot:
+            shots.append(shot)
+    return shots
+
+
+def _structured_video_sections_from_text(text: str) -> dict[str, object] | None:
+    sections: dict[str, list[str]] = {"style": [], "scenes": [], "constraints": []}
+    current = ""
+    found: set[str] = set()
+    label_pattern = "|".join(re.escape(label) for label in VIDEO_SECTION_ALIASES)
+    for raw_line in str(text or "").replace("\r", "").split("\n"):
+        line = raw_line.strip()
+        line = re.sub(r"^#{1,6}\s*", "", line)
+        line = line.strip(" *`[]")
+        match = re.match(
+            rf"^(?P<label>{label_pattern})\s*[:：]?\s*(?P<value>.*)$",
+            line,
+            flags=re.IGNORECASE,
+        )
+        if match:
+            current = VIDEO_SECTION_ALIASES[match.group("label")]
+            found.add(current)
+            if match.group("value").strip():
+                sections[current].append(match.group("value").strip())
+            continue
+        if current and line:
+            sections[current].append(line)
+    if not {"style", "scenes", "constraints"}.issubset(found):
+        return None
+    return {
+        "style": " ".join(sections["style"]),
+        "scenes": "\n".join(sections["scenes"]),
+        "constraints": " ".join(sections["constraints"]),
+    }
+
+
+def parse_structured_video_sections(content: str | dict[str, Any]) -> dict[str, Any] | None:
+    """Parse the optimizer's JSON or titled text into three canonical sections."""
+    payload: dict[str, Any] | None = content if isinstance(content, dict) else None
+    raw = "" if payload is not None else str(content or "").strip().strip("`").strip()
+    if payload is None:
+        match = re.search(r"\{.*\}", raw, re.DOTALL)
+        if match:
+            try:
+                decoded = json.loads(match.group(0))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                decoded = None
+            if isinstance(decoded, dict):
+                payload = decoded
+    sections: dict[str, object] | None = None
+    if payload is not None:
+        values: dict[str, object] = {"style": "", "scenes": [], "constraints": ""}
+        for label, section in VIDEO_SECTION_ALIASES.items():
+            if not values[section] and payload.get(label):
+                values[section] = payload[label]
+        if values["style"] and values["scenes"] and values["constraints"]:
+            sections = values
+    if sections is None:
+        sections = _structured_video_sections_from_text(raw)
+    if sections is None:
+        return None
+    style = clean_video_prompt_section(sections["style"])
+    shots = video_scene_script_items(sections["scenes"])
+    constraints = clean_video_prompt_section(sections["constraints"])
+    if not style or not shots or not constraints:
+        return None
+    return {"style": style, "shots": shots, "constraints": constraints}
+
+
+def merge_video_constraint_clauses(*values: object) -> str:
+    clauses: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        for clause in re.split(r"[\n。；;]+", str(value or "")):
+            cleaned = clean_video_prompt_section(clause)
+            key = re.sub(r"\s+", "", cleaned).lower()
+            if key and key not in seen:
+                seen.add(key)
+                clauses.append(cleaned)
+    return "；".join(clauses)
+
+
+def render_structured_video_prompt(
+    *,
+    style: object,
+    shots: list[str],
+    constraints: object,
+) -> str:
+    """Render the canonical style + scene script + technical constraints contract."""
+    style_text = clean_video_prompt_section(style)
+    constraint_text = merge_video_constraint_clauses(constraints)
+    clean_shots = [clean_video_prompt_section(shot) for shot in shots]
+    shot_lines = "\n".join(
+        f"Shot {index}：{shot}"
+        for index, shot in enumerate((shot for shot in clean_shots if shot), start=1)
+    )
+    return (
+        f"风格设定：{style_text}。\n" f"场景脚本：\n{shot_lines}\n" f"技术约束：{constraint_text}。"
+    )
+
+
 def _layered_authoritative_text(raw_prompt: dict[str, Any]) -> str:
     user_instruction = str(raw_prompt.get("user_instruction") or "").strip()
     if user_instruction:
@@ -223,7 +375,9 @@ def split_video_post_production(text: str) -> dict[str, Any]:
     boundary = r"(?P<boundary>^|[\n。；;\uff0c,])\s*"
     open_quote = "[“\\\"'‘]"
     close_quote = "[”\\\"'’]"
-    voiceover_label = r"(?:(?:温柔|轻柔|低沉)?\s*(?:男声|女声|女性|男性)?\s*)?(?:旁白|voiceover|后期配音)"
+    voiceover_label = (
+        r"(?:(?:温柔|轻柔|低沉)?\s*(?:男声|女声|女性|男性)?\s*)?(?:旁白|voiceover|后期配音)"
+    )
     overlay_label = (
         r"(?:字幕|后期叠字|(?:画面(?:中)?)?文字(?:浮现|出现|显示)?|"
         r"画面(?:中)?(?:浮现|出现|显示)文字)"
@@ -236,15 +390,17 @@ def split_video_post_production(text: str) -> dict[str, Any]:
 
     text = re.sub(
         boundary
-        + voiceover_label + r"\s*[:：]?\s*" + open_quote
-        + r"(?P<content>[^”\"'’]+)" + close_quote,
+        + voiceover_label
+        + r"\s*[:：]?\s*"
+        + open_quote
+        + r"(?P<content>[^”\"'’]+)"
+        + close_quote,
         remove_voiceover,
         text,
         flags=post_flags,
     )
     text = re.sub(
-        boundary
-        + voiceover_label + r"\s*[:：]?\s*(?P<content>[^\n。；;\uff0c,]+)",
+        boundary + voiceover_label + r"\s*[:：]?\s*(?P<content>[^\n。；;\uff0c,]+)",
         remove_voiceover,
         text,
         flags=post_flags,
@@ -256,15 +412,18 @@ def split_video_post_production(text: str) -> dict[str, Any]:
 
     text = re.sub(
         boundary
-        + overlay_label + r"\s*[:：]?\s*" + open_quote
-        + r"(?P<content>[^”\"'’]+)" + close_quote + r"\s*(?:浮现|出现|显示)?",
+        + overlay_label
+        + r"\s*[:：]?\s*"
+        + open_quote
+        + r"(?P<content>[^”\"'’]+)"
+        + close_quote
+        + r"\s*(?:浮现|出现|显示)?",
         remove_overlay,
         text,
         flags=post_flags,
     )
     text = re.sub(
-        boundary
-        + overlay_label + r"\s*[:：]\s*(?P<content>[^\n。；;\uff0c,]+)",
+        boundary + overlay_label + r"\s*[:：]\s*(?P<content>[^\n。；;\uff0c,]+)",
         remove_overlay,
         text,
         flags=post_flags,
@@ -282,8 +441,10 @@ def split_video_post_production(text: str) -> dict[str, Any]:
 
     text = re.sub(
         boundary
-        + r"(?:音效|SFX|环境音)\s*[:：]?\s*" + open_quote
-        + r"(?P<content>[^”\"'’]+)" + close_quote,
+        + r"(?:音效|SFX|环境音)\s*[:：]?\s*"
+        + open_quote
+        + r"(?P<content>[^”\"'’]+)"
+        + close_quote,
         remove_sfx,
         text,
         flags=post_flags,
@@ -306,6 +467,19 @@ def split_video_post_production(text: str) -> dict[str, Any]:
 def _parse_text_prompt(text: str) -> dict[str, Any]:
     post = split_video_post_production(text)
     text = post["text"]
+    structured_sections = parse_structured_video_sections(text)
+    if structured_sections is not None:
+        return {
+            "global_style": structured_sections["style"],
+            "subject_lock": "",
+            "shots": structured_sections["shots"],
+            "technical_constraints": structured_sections["constraints"],
+            "post_overlays": post["post_overlays"],
+            "voiceover": post["voiceover"],
+            "sfx": post["sfx"],
+            "reference_guidance": [],
+            "warnings": [],
+        }
     numbered = re.split(
         r"(?:^|[\n。；;])\s*(?:Shot|镜头)\s*\d+\s*[:：]\s*",
         text,
@@ -326,6 +500,7 @@ def _parse_text_prompt(text: str) -> dict[str, Any]:
         "global_style": style,
         "subject_lock": "",
         "shots": shots,
+        "technical_constraints": "",
         "post_overlays": post["post_overlays"],
         "voiceover": post["voiceover"],
         "sfx": post["sfx"],
@@ -339,7 +514,12 @@ def parse_video_prompt(raw_prompt: str | dict[str, Any]) -> dict[str, Any]:
     if isinstance(raw_prompt, dict):
         style = "；".join(
             str(raw_prompt.get(key) or "").strip()
-            for key in ("风格", "global_style", "光线")
+            for key in ("风格", "风格设定", "global_style", "光线")
+            if str(raw_prompt.get(key) or "").strip()
+        )
+        technical_constraints = "；".join(
+            str(raw_prompt.get(key) or "").strip()
+            for key in ("技术约束", "technical_constraints")
             if str(raw_prompt.get(key) or "").strip()
         )
         context = "；".join(
@@ -385,22 +565,28 @@ def parse_video_prompt(raw_prompt: str | dict[str, Any]) -> dict[str, Any]:
             manual = _parse_text_prompt(manual_text)
             style = manual["global_style"]
             shots = manual["shots"]
+            technical_constraints = manual["technical_constraints"] or technical_constraints
             overlays = manual["post_overlays"] or overlays
             raw_prompt_voiceover = manual["voiceover"] or structured_voiceover
             sfx = manual["sfx"] or sfx
         else:
             raw_prompt_voiceover = structured_voiceover
-        if style or shots or overlays or raw_prompt_voiceover or sfx:
+        if style or shots or technical_constraints or overlays or raw_prompt_voiceover or sfx:
             if not shots:
                 fallback = _parse_text_prompt(
                     str(raw_prompt.get("final_text") or raw_prompt.get("instruction") or "")
                 )
                 style = _join_unique(style, fallback["global_style"])
                 shots = fallback["shots"]
+                technical_constraints = _join_unique(
+                    technical_constraints,
+                    fallback["technical_constraints"],
+                )
             return {
                 "global_style": style,
                 "subject_lock": str(raw_prompt.get("subject_lock") or "").strip(),
                 "shots": shots,
+                "technical_constraints": technical_constraints,
                 "post_overlays": overlays,
                 "voiceover": raw_prompt_voiceover,
                 "sfx": sfx,
@@ -488,20 +674,16 @@ def infer_video_model_profile(
     runtime = (extra or {}).get("video_prompt_profile")
     if isinstance(runtime, dict):
         profile.update(runtime)
-    profile["seconds_per_shot"] = (
-        _optional_positive_float(profile.get("seconds_per_shot"))
-        or float(default_profile["seconds_per_shot"])
-    )
-    profile["max_shots_cap"] = (
-        _optional_positive_int(profile.get("max_shots_cap"))
-        or int(default_profile["max_shots_cap"])
+    profile["seconds_per_shot"] = _optional_positive_float(
+        profile.get("seconds_per_shot")
+    ) or float(default_profile["seconds_per_shot"])
+    profile["max_shots_cap"] = _optional_positive_int(profile.get("max_shots_cap")) or int(
+        default_profile["max_shots_cap"]
     )
     prompt_budget = _optional_positive_int(profile.get("max_prompt_chars"))
     if prompt_budget is None:
         prompt_budget = _optional_positive_int(profile.get("prompt_budget_chars"))
-    profile["prompt_budget_chars"] = prompt_budget or int(
-        default_profile["prompt_budget_chars"]
-    )
+    profile["prompt_budget_chars"] = prompt_budget or int(default_profile["prompt_budget_chars"])
     profile["family"] = str(profile.get("family") or family)
     normalized_duration = _optional_positive_float(duration) or 10.0
     profile["recommended_max_shots"] = _duration_shot_limit(
@@ -528,6 +710,7 @@ def compile_video_prompt(
     """Return a structured plan and a model-ready prompt."""
     plan = parse_video_prompt(raw_prompt)
     plan["global_style"] = _join_unique(plan["global_style"])
+    plan["technical_constraints"] = _join_unique(plan.get("technical_constraints", ""))
     plan["shots"] = [str(item).strip() for item in plan["shots"] if str(item).strip()]
     for key in ("post_overlays", "sfx", "warnings"):
         plan[key] = _unique_items(plan[key])
@@ -543,8 +726,7 @@ def compile_video_prompt(
     reference_guidance: list[str] = []
     if "style" in reference_roles:
         reference_guidance.append(
-            "风格参考仅迁移色调、光线、材质和商业质感，"
-            "不迁移主体身份、商品、Logo、文字或动作。"
+            "风格参考仅迁移色调、光线、材质和商业质感，" "不迁移主体身份、商品、Logo、文字或动作。"
         )
     if "motion" in reference_roles:
         reference_guidance.append(
@@ -564,13 +746,9 @@ def compile_video_prompt(
             "只生成两帧之间的连续过渡，保持同一主体和场景逻辑。"
         )
     elif has_first_frame:
-        reference_guidance.append(
-            "首帧定义开始状态；从该状态连续运动，不重设主体和场景。"
-        )
+        reference_guidance.append("首帧定义开始状态；从该状态连续运动，不重设主体和场景。")
     elif has_last_frame:
-        reference_guidance.append(
-            "尾帧定义结束状态；动作和镜头平滑收束到该目标帧。"
-        )
+        reference_guidance.append("尾帧定义结束状态；动作和镜头平滑收束到该目标帧。")
     plan["reference_guidance"] = reference_guidance
     product_lock = ""
     portrait_lock = ""
@@ -621,19 +799,25 @@ def compile_video_prompt(
     max_shots = int(profile["recommended_max_shots"])
     prompt_parts = []
     if plan["global_style"]:
-        prompt_parts.append(f"全局风格：{plan['global_style']}")
+        prompt_parts.append(f"风格设定：{plan['global_style']}")
+    if plan["shots"]:
+        prompt_parts.append("场景脚本：")
+        prompt_parts.extend(
+            f"Shot {number}：{shot}" for number, shot in enumerate(plan["shots"], start=1)
+        )
+    technical_parts = [plan["technical_constraints"]]
     if product_lock:
-        prompt_parts.append(f"产品身份约束：{product_lock}")
+        technical_parts.append(f"产品身份约束：{product_lock}")
     if portrait_lock:
-        prompt_parts.append(f"人物身份约束：{portrait_lock}")
+        technical_parts.append(f"人物身份约束：{portrait_lock}")
     if plan["subject_lock"] and not (product_lock or portrait_lock):
-        prompt_parts.append(f"主体锁定：{plan['subject_lock']}")
+        technical_parts.append(f"主体锁定：{plan['subject_lock']}")
     if product_strategy:
-        prompt_parts.append(product_strategy)
-    prompt_parts.extend(reference_guidance)
-    prompt_parts.extend(
-        f"Shot {number}：{shot}" for number, shot in enumerate(plan["shots"], start=1)
-    )
+        technical_parts.append(product_strategy)
+    technical_parts.extend(reference_guidance)
+    technical_text = _join_unique(*technical_parts)
+    if technical_text:
+        prompt_parts.append(f"技术约束：{technical_text}")
     prompt = "\n".join(prompt_parts)
     prompt_char_count = len(prompt)
     prompt_budget_chars = max(1, int(profile.get("prompt_budget_chars") or 1))
@@ -683,6 +867,7 @@ def compile_video_prompt(
             "post_overlays": list(plan["post_overlays"]),
             "voiceover": plan["voiceover"],
             "sfx": list(plan["sfx"]),
+            "technical_constraints": plan["technical_constraints"],
         },
     }
 

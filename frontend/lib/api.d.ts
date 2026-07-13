@@ -92,6 +92,29 @@ export interface GeneratePayload {
   client_request_id?: string | null;
 }
 
+export interface PromptOptimizeOptions {
+  category?: "image" | "video";
+  product_mode?: boolean;
+  duration?: number;
+  subject_mode?: "general" | "product" | "portrait";
+  reference_type?: string;
+  subject_profile?: Record<string, unknown> | string | null;
+  target_model_id?: string;
+  target_model_provider?: string;
+  aspect_ratio?: string;
+  resolution?: string;
+  product_lock_mode?: "free" | "locked";
+  product_video_template?: string;
+}
+
+export interface PromptOptimizeResult {
+  prompt: string;
+  model_id: string;
+  optimizer_model_id?: string | null;
+  compiler_metadata?: Record<string, unknown> | null;
+  context_metadata?: Record<string, unknown> | null;
+}
+
 export interface PromptHistoryQuery {
   favorite?: boolean | null;
   category?: string;
@@ -183,9 +206,9 @@ export const api: {
   ): Promise<unknown>;
   optimizePrompt(
     prompt: string,
-    category?: "image" | "video",
+    options?: "image" | "video" | PromptOptimizeOptions,
     product_mode?: boolean,
-  ): Promise<{ prompt: string; model_id: string }>;
+  ): Promise<PromptOptimizeResult>;
   subjectProtectionPreview(asset_url: string, edit_mask_mode?: EditMaskMode): Promise<SubjectProtectionPreview>;
   generate(payload: GeneratePayload): Promise<Task>;
   task(id: number | string): Promise<Task>;

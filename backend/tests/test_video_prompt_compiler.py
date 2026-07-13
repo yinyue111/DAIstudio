@@ -5,6 +5,57 @@ from app.services.video_prompt_compiler import (
 )
 
 
+def test_structured_video_sections_keep_technical_constraints_out_of_shots():
+    result = compile_video_prompt(
+        (
+            "风格设定：高端日系个护广告，真实家庭浴室，粉绿与米白色调，柔和自然光。\n"
+            "场景脚本：\n"
+            "Shot 1：0-5秒，手从悬挂包装底部抽出一张洗脸巾，稳定中近景。\n"
+            "Shot 2：5-10秒，微距展开洗脸巾，展示3D如意云纹和厚度。\n"
+            "技术约束：总时长10秒；画幅9:16；分辨率1080p；每镜一个主要动作；"
+            "后期叠字：“干湿两用”；后期配音：“温柔开启一天”；音效：水滴声。"
+        ),
+        duration=10,
+        model_id="doubao-seedance-2-0-mini-260615",
+        provider="volcengine_ark",
+    )
+
+    assert result["plan"]["global_style"] == (
+        "高端日系个护广告，真实家庭浴室，粉绿与米白色调，柔和自然光"
+    )
+    assert result["plan"]["shots"] == [
+        "0-5秒，手从悬挂包装底部抽出一张洗脸巾，稳定中近景",
+        "5-10秒，微距展开洗脸巾，展示3D如意云纹和厚度",
+    ]
+    assert "总时长10秒" in result["plan"]["technical_constraints"]
+    assert "画幅9:16" in result["plan"]["technical_constraints"]
+    assert all("技术约束" not in shot for shot in result["plan"]["shots"])
+    assert result["plan"]["post_overlays"] == ["干湿两用"]
+    assert result["plan"]["voiceover"] == "温柔开启一天"
+    assert result["plan"]["sfx"] == ["水滴声"]
+    assert result["prompt"].startswith("风格设定：")
+    assert "\n场景脚本：\nShot 1：" in result["prompt"]
+    assert "\n技术约束：" in result["prompt"]
+
+
+def test_structured_video_prompt_splits_unnumbered_scene_clauses():
+    result = compile_video_prompt(
+        "风格设定：真实生活方式短片。\n"
+        "场景脚本：人物走进浴室；人物拿起毛巾；人物走出浴室。\n"
+        "技术约束：稳定跟拍。",
+        duration=5,
+        model_id="doubao-seedance-2-0-mini-260615",
+    )
+
+    assert result["plan"]["shots"] == [
+        "人物走进浴室",
+        "人物拿起毛巾",
+        "人物走出浴室",
+    ]
+    assert result["plan"]["technical_constraints"] == "稳定跟拍"
+    assert all("技术约束" not in shot for shot in result["plan"]["shots"])
+
+
 def test_text_to_video_does_not_invent_a_reference_and_returns_a_plan():
     result = compile_video_prompt(
         "高端日系个护广告。女主走近洗手台，轻柔地用洗脸巾擦拭脸颊。",
@@ -225,9 +276,7 @@ def test_structured_product_video_without_timeline_keeps_scene_action_and_camera
         product_reference=True,
     )
 
-    assert result["plan"]["shots"] == [
-        "参考商品从画面左侧入场，缓慢旋转，水花飞溅后切到 Logo 特写"
-    ]
+    assert result["plan"]["shots"] == ["参考商品从画面左侧入场，缓慢旋转，水花飞溅后切到 Logo 特写"]
     assert "暖棕色广告棚景和金色沙粒台面" in result["prompt"]
     assert "缓慢推进并轻微环绕" in result["prompt"]
     assert "视角构图：竖屏 9:16，产品居中，浅景深" in result["prompt"]
@@ -570,10 +619,7 @@ def test_optimizer_post_production_labels_do_not_become_video_shots():
 
 
 def test_post_production_labels_without_colons_do_not_leak_into_generation_prompt():
-    raw_text = (
-        "Shot 1：从包装底部抽出洗脸巾；"
-        "字幕“干湿两用”；旁白“温柔开启新一天”；SFX“水滴声”"
-    )
+    raw_text = "Shot 1：从包装底部抽出洗脸巾；" "字幕“干湿两用”；旁白“温柔开启新一天”；SFX“水滴声”"
 
     result = compile_video_prompt(raw_text, duration=5, model_id="seedance-2.0")
 
@@ -587,10 +633,7 @@ def test_post_production_labels_without_colons_do_not_leak_into_generation_promp
 
 
 def test_unquoted_post_production_labels_without_colons_are_extracted():
-    raw_text = (
-        "Shot 1：从包装底部抽出洗脸巾；"
-        "字幕干湿两用；旁白温柔开启新一天；SFX水滴声"
-    )
+    raw_text = "Shot 1：从包装底部抽出洗脸巾；" "字幕干湿两用；旁白温柔开启新一天；SFX水滴声"
 
     result = compile_video_prompt(raw_text, duration=5, model_id="seedance-2.0")
 

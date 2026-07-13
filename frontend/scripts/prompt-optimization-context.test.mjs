@@ -33,6 +33,10 @@ const fiveSecondVideo = promptOptimizationContextKey({
   subjectMode: "product",
   productGenerationMode: true,
   duration: 5,
+  aspectRatio: "9:16",
+  resolution: "1080p",
+  productLockMode: "locked",
+  productVideoTemplate: "slow_push",
   referenceSignature: "product-a|style-a",
   subjectProfileSource: "product-a",
   targetModelId: "seedance-mini",
@@ -44,12 +48,34 @@ const fifteenSecondVideo = promptOptimizationContextKey({
   subjectMode: "product",
   productGenerationMode: true,
   duration: 15,
+  aspectRatio: "9:16",
+  resolution: "1080p",
+  productLockMode: "locked",
+  productVideoTemplate: "slow_push",
   referenceSignature: "product-a|style-a",
   subjectProfileSource: "product-a",
   targetModelId: "seedance-mini",
   targetModelProvider: "volcengine_ark",
 });
 assert.notEqual(fiveSecondVideo, fifteenSecondVideo);
+assert.notEqual(
+  fiveSecondVideo,
+  promptOptimizationContextKey({
+    creationMode: "video_edit",
+    category: "video",
+    subjectMode: "product",
+    productGenerationMode: true,
+    duration: 5,
+    aspectRatio: "16:9",
+    resolution: "720p",
+    productLockMode: "free",
+    productVideoTemplate: "soft_splash",
+    referenceSignature: "product-a|style-a",
+    subjectProfileSource: "product-a",
+    targetModelId: "seedance-mini",
+    targetModelProvider: "volcengine_ark",
+  }),
+);
 assert.notEqual(
   fiveSecondVideo,
   promptOptimizationContextKey({

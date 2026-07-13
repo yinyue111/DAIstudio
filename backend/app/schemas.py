@@ -159,12 +159,19 @@ class PromptOptimizeIn(BaseModel):
     subject_profile: dict[str, Any] | str | None = None
     target_model_id: str | None = Field(default=None, max_length=256)
     target_model_provider: str | None = Field(default=None, max_length=128)
+    aspect_ratio: str | None = Field(default=None, max_length=32)
+    resolution: str | None = Field(default=None, max_length=32)
+    product_lock_mode: Literal["free", "locked"] | None = None
+    product_video_template: str | None = Field(default=None, max_length=64)
 
     @field_validator(
         "prompt",
         "reference_type",
         "target_model_id",
         "target_model_provider",
+        "aspect_ratio",
+        "resolution",
+        "product_video_template",
         mode="before",
     )
     @classmethod

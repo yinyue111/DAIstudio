@@ -116,6 +116,10 @@ def optimize_prompt_text(
             subject_profile=body.subject_profile,
             target_model_id=target_model_id,
             target_model_provider=target_model_provider,
+            aspect_ratio=body.aspect_ratio,
+            resolution=body.resolution,
+            product_lock_mode=body.product_lock_mode,
+            product_video_template=body.product_video_template,
             target_model_extra=target_model_extra,
             gateway_config=runtime_config_for_model(model, "prompt"),
         )

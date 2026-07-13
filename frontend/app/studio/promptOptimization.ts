@@ -5,6 +5,10 @@ export type PromptOptimizationContext = {
   productGenerationMode: boolean;
   promptText?: string;
   duration?: number | string;
+  aspectRatio?: string;
+  resolution?: string;
+  productLockMode?: string;
+  productVideoTemplate?: string;
   referenceSignature?: string;
   subjectProfileSource?: string;
   targetModelId?: string;
@@ -24,6 +28,10 @@ export function promptOptimizationContextKey(context: PromptOptimizationContext)
     Boolean(context.productGenerationMode),
     String(context.promptText || "").trim(),
     String(context.duration || ""),
+    String(context.aspectRatio || ""),
+    String(context.resolution || ""),
+    String(context.productLockMode || ""),
+    String(context.productVideoTemplate || ""),
     String(context.referenceSignature || ""),
     String(context.subjectProfileSource || ""),
     String(context.targetModelId || ""),

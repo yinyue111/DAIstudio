@@ -552,9 +552,21 @@ const optimizedDirectVideo = buildGenerationPayload({
   creationMode: "video",
   isEditMode: false,
   prompt: {
-    text: "10 秒产品广告，抽取后改为微距展开，不再浸水。",
+    text: (
+      "风格设定：高端日系个护广告，柔和自然光。\n"
+      + "场景脚本：\n"
+      + "Shot 1：抽出洗脸巾。\n"
+      + "Shot 2：微距展开，不再浸水。\n"
+      + "技术约束：总时长10秒；画幅9:16；分辨率1080p。"
+    ),
     raw_text: "女主抽出洗脸巾，展开后浸水。",
-    optimized_text: "10 秒产品广告，仅展示抽取和展开两个连续动作。",
+    optimized_text: (
+      "风格设定：高端日系个护广告，柔和自然光。\n"
+      + "场景脚本：\n"
+      + "Shot 1：抽出洗脸巾。\n"
+      + "Shot 2：微距展开洗脸巾。\n"
+      + "技术约束：总时长10秒；画幅9:16；分辨率1080p。"
+    ),
     optimizer_model_id: "gemini-3.5-flash-low",
   },
   promptDirty: true,
@@ -568,9 +580,12 @@ const optimizedDirectVideo = buildGenerationPayload({
   vResolution: "1080p",
 });
 assert.equal(optimizedDirectVideo.payload.prompt.raw_text, "女主抽出洗脸巾，展开后浸水。");
-assert.equal(optimizedDirectVideo.payload.prompt.optimized_text, "10 秒产品广告，仅展示抽取和展开两个连续动作。");
+assert.match(optimizedDirectVideo.payload.prompt.optimized_text, /^风格设定：/);
+assert.match(optimizedDirectVideo.payload.prompt.optimized_text, /\n场景脚本：\nShot 1：/);
+assert.match(optimizedDirectVideo.payload.prompt.optimized_text, /\n技术约束：/);
 assert.equal(optimizedDirectVideo.payload.prompt.optimizer_model_id, "gemini-3.5-flash-low");
-assert.equal(optimizedDirectVideo.payload.prompt.assembled_text, "10 秒产品广告，抽取后改为微距展开，不再浸水。");
+assert.match(optimizedDirectVideo.payload.prompt.assembled_text, /^风格设定：/);
+assert.match(optimizedDirectVideo.payload.prompt.final_text, /\n技术约束：/);
 
 const productVideoEditArgs = {
   stage: "final",
