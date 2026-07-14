@@ -58,6 +58,7 @@ from .ssrf import (
 )
 from .video_prompt_compiler import (
     clean_video_prompt_section,
+    compact_single_clip_prompt,
     infer_video_model_profile,
     merge_video_constraint_clauses,
     parse_structured_video_sections,
@@ -676,9 +677,10 @@ def _required_video_prompt_constraints(
         constraints.append(f"适配目标模型 {target}")
     constraints.extend(
         [
-            f"单段建议最多 {max(1, int(max_shots))} 个主要镜头",
+            f"单段常规舒适密度约 {max(1, int(max_shots))} 个主要动作；"
+            "超出时在同一视频内按原顺序连续串联，不得删减或替换",
             f"单段提示词预算约 {max(1, int(prompt_budget_chars))} 字符",
-            "每个镜头只安排一个主要动作，保持主体、场景、动作和运镜连续",
+            "保持主体、场景、动作和运镜连续，禁止将原始动作合并成泛化描述",
         ]
     )
     if effective_product_mode:
@@ -726,6 +728,8 @@ def _normalize_video_optimizer_output(
     source_shots = video_action_requirements(source_plan_shots)
     if len(source_shots) > len(shots):
         shots = source_shots
+    source_shot_count = len(shots)
+    condensed_for_single_clip = False
     optimized_scene_key = re.sub(r"[\s,，。；;：:、.!！？?]+", "", "".join(shots)).lower()
     missing_source_shots = [
         source_shot
@@ -734,55 +738,52 @@ def _normalize_video_optimizer_output(
         not in optimized_scene_key
     ]
     original_action_constraint = ""
-    if missing_source_shots:
+    if missing_source_shots and not condensed_for_single_clip:
         inventory = "；".join(
             f"{index}. {shot}" for index, shot in enumerate(missing_source_shots, start=1)
         )
         original_action_constraint = f"必须完整执行且不得替换的原始动作要求（按顺序）：{inventory}"
-    overload_constraint = ""
-    if len(shots) > recommended_max_shots:
-        overload_constraint = (
-            f"当前脚本含 {len(shots)} 个主要镜头，超过单段建议的 "
-            f"{recommended_max_shots} 个镜头，需拆分为多段生成"
-        )
     constraint_text = merge_video_constraint_clauses(
         constraints,
         *required_constraints,
         original_action_constraint,
-        overload_constraint,
     )
     normalized = render_structured_video_prompt(
         style=style_text,
         shots=shots,
         constraints=constraint_text,
     )
+    compacted_for_budget = False
     if len(normalized) > prompt_budget_chars:
-        constraint_text = merge_video_constraint_clauses(
-            constraint_text,
-            f"当前结构化提示词约 {len(normalized)} 字符，超过单段建议预算 "
-            f"{prompt_budget_chars} 字符，需拆分为多段生成",
-        )
-        normalized = render_structured_video_prompt(
+        compacted = compact_single_clip_prompt(
             style=style_text,
             shots=shots,
-            constraints=constraint_text,
+            technical=constraint_text,
+            budget=prompt_budget_chars,
+            mandatory_technical=constraint_text,
         )
+        normalized = str(compacted["prompt"])
+        style_text = str(compacted["style"])
+        shots = list(compacted["shots"])
+        constraint_text = str(compacted["technical"])
+        compacted_for_budget = True
     prompt_char_count = len(normalized)
-    sequence_required = (
-        len(shots) > recommended_max_shots or prompt_char_count > prompt_budget_chars
-    )
-    recommended_clip_count = max(
-        1,
-        (len(shots) + recommended_max_shots - 1) // recommended_max_shots,
-        (prompt_char_count + prompt_budget_chars - 1) // prompt_budget_chars,
-    )
+    prompt_over_budget = prompt_char_count > prompt_budget_chars
+    sequence_required = False
+    recommended_clip_count = 1
     return {
         "prompt": normalized,
         "metadata": {
             "shot_count": len(shots),
+            "source_shot_count": source_shot_count,
+            "selected_shot_count": len(shots),
+            "omitted_shot_count": max(0, source_shot_count - len(shots)),
+            "condensed_for_single_clip": condensed_for_single_clip,
+            "compacted_for_budget": compacted_for_budget,
             "recommended_max_shots": recommended_max_shots,
             "prompt_char_count": prompt_char_count,
             "prompt_budget_chars": prompt_budget_chars,
+            "prompt_over_budget": prompt_over_budget,
             "recommended_clip_count": recommended_clip_count,
             "sequence_required": sequence_required,
         },
@@ -1952,7 +1953,7 @@ def submit_video(
     extra = extra or {}
     submit_path = extra.get("submit_path", "/v1/videos/generations")
     id_field = extra.get("id_field", "id")
-    payload_params = _generic_video_payload_params(params or {}, extra)
+    payload_params = _generic_video_payload_params(params or {}, extra, video_model_id)
     payload = {"model": video_model_id, "prompt": prompt, **payload_params}
     if gateway_config is None:
         data = _video_post(submit_path, payload)

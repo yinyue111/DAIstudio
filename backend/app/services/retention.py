@@ -227,6 +227,7 @@ def purge_parsed_previews(db: Session, cutoff: datetime, limit: int = 1000) -> i
 
 _TASK_UPLOAD_PARAM_FIELDS = (
     "reference_image_url",
+    "product_reference_image",
     "first_frame_image",
     "last_frame_image",
     "style_reference_image",

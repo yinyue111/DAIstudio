@@ -494,8 +494,43 @@ assert.match(
 );
 assert.match(
   referencePanelSource,
-  /imageUploadTargetsProduct \? "上传产品主体" : isImageEditMode \? "上传风格参考图" : "上传图片"/,
+  /const imageUploadLabel = imageUploadTargetsProduct[\s\S]*\? "上传产品主体"[\s\S]*isImageEditMode[\s\S]*\? "上传风格参考图"[\s\S]*directProductVideoMode[\s\S]*\? "上传图片参考"/,
   "product and style-reference upload actions should have explicit labels",
+);
+assert.match(
+  referencePanelSource,
+  /const directProductVideoMode = creationMode === "video"[\s\S]*\{\(isImageEditMode \|\| directProductVideoMode\) &&/,
+  "text-to-video should expose a dedicated product-subject upload panel",
+);
+assert.match(
+  referencePanelSource,
+  /作为视频唯一产品主体，不是风格参考/,
+  "text-to-video should explain that the product image is authoritative, not a style reference",
+);
+assert.match(
+  referencePanelSource,
+  /\{\(isEditMode \|\| directProductVideoMode\) && \([\s\S]*ref=\{productUploadInputRef\}/,
+  "text-to-video should render the product file input used by its upload control",
+);
+assert.match(
+  viewModelSource,
+  /creationMode === "video" && productAsset[\s\S]*\? "product"/,
+  "an uploaded text-to-video product image should activate product subject mode",
+);
+assert.match(
+  generationPayloadSource,
+  /const directProductVideo = Boolean\([\s\S]*creationMode === "video"[\s\S]*subjectMode === "product"[\s\S]*productAsset[\s\S]*sourceAsset = isFinal \? null : \(isEditMode \|\| directProductVideo \? productAsset : selected\)/,
+  "direct product video should use the product asset as its source instead of the style reference",
+);
+assert.match(
+  mediaUploadSource,
+  /const profileSubjectMode = creationMode === "video" \? "product" : subjectMode/,
+  "direct product video uploads should prefetch the authoritative product profile",
+);
+assert.match(
+  generationSubmitSource,
+  /const directProductVideo = creationMode === "video" && subjectMode === "product"[\s\S]*\(isEditMode \|\| directProductVideo\)[\s\S]*productAsset\?\.url/,
+  "direct product video submission should resolve a product identity profile before generation",
 );
 const productUploadPatch = mediaUploadSource.match(
   /setWorkspacePatch\(\{\s*productAsset: asset,([\s\S]*?)\}, mode\);/,

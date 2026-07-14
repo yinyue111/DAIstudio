@@ -346,7 +346,7 @@ export default function StudioGenerationControls({
                 ))}
               </div>
             </div>
-            {isEditMode && productGenerationMode && !portraitGenerationMode && (
+            {productGenerationMode && !portraitGenerationMode && (
               <div className={`${controlCardClass} sm:col-span-2`}>
                 <div className="flex min-w-0 items-center justify-between gap-3">
                   <span className={controlLabelClass}>产品运动</span>
@@ -356,8 +356,8 @@ export default function StudioGenerationControls({
                 </div>
                 <div className={`${scrollPillRowClass} mt-2`}>
                   {[
-                    { key: "locked", label: "文字保真", hint: "首末帧都使用产品图，并自动压到短时长，更稳保留包装、Logo 和文字。" },
-                    { key: "free", label: "自由运动", hint: "只锚定首帧，更适合旋转、泼溅、推拉镜头和动态展示，但包装文字稳定性会下降。" },
+                    { key: "locked", label: "文字保真", hint: "产品图作为身份参考，优先保持同一 SKU 的包装、Logo、文字和材质纹理。" },
+                    { key: "free", label: "自由运动", hint: "产品图仍作为身份参考，不限定首尾帧，适合旋转、泼溅、推拉和动态展示。" },
                   ].map((option) => (
                     <button
                       key={option.key}

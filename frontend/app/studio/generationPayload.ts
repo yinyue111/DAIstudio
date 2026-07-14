@@ -19,8 +19,8 @@ import {
   videoRatioOptions,
 } from "./helpers";
 
-function effectiveSubjectFlags({ isEditMode, subjectMode }) {
-  const effectiveSubjectMode = isEditMode ? subjectMode : "";
+function effectiveSubjectFlags({ isEditMode, directProductVideo, subjectMode }) {
+  const effectiveSubjectMode = isEditMode || directProductVideo ? subjectMode : "";
   const portraitMode = effectiveSubjectMode === "portrait";
   const productMode = effectiveSubjectMode === "product";
   return {
@@ -147,11 +147,18 @@ export function buildGenerationPayload({
   const ratioPool = effCategory === "video" ? videoRatioOptions() : RATIOS;
   const ratioOption = ratioPool.find((r) => r.key === finalRatioKey) || ratioPool[0];
   const imageSize = imageSizeFor(ratioOption, imageQuality, cfg?.image_size_max_dim || 2048);
-  const sourceAsset = isFinal ? null : (isEditMode ? productAsset : selected);
+  const directProductVideo = Boolean(
+    !isFinal
+    && effCategory === "video"
+    && creationMode === "video"
+    && subjectMode === "product"
+    && productAsset,
+  );
+  const sourceAsset = isFinal ? null : (isEditMode || directProductVideo ? productAsset : selected);
   const dims = sourceAsset ? assetDims(sourceAsset) : null;
   const refImage = sourceAsset ? (sourceAsset.type === "video" ? sourceAsset.thumb : sourceAsset.url) : null;
   const styleReferenceAsset = variationSource || selected;
-  const styleReferenceUrl = isEditMode && styleReferenceAsset
+  const styleReferenceUrl = (isEditMode || directProductVideo) && styleReferenceAsset
     ? (styleReferenceAsset.type === "video" ? styleReferenceAsset.thumb : styleReferenceAsset.url)
     : null;
   const {
@@ -159,7 +166,7 @@ export function buildGenerationPayload({
     portraitMode,
     productMode,
     subjectModeParam,
-  } = effectiveSubjectFlags({ isEditMode, subjectMode });
+  } = effectiveSubjectFlags({ isEditMode, directProductVideo, subjectMode });
   const editNegative = effCategory === "video"
     ? cleanText(negative)
     : buildEditNegativePrompt(negative, {
@@ -305,12 +312,14 @@ export function buildGenerationPayload({
             target_resolution: finalResolution,
             ratio: ratioOption.key,
             ...(dims ? { reference_width: dims.width, reference_height: dims.height } : {}),
-            ...(refImage ? { reference_image_url: refImage } : {}),
+            ...(productMode && refImage
+              ? { product_reference_image: refImage }
+              : (refImage ? { reference_image_url: refImage } : {})),
             ...(styleReferenceUrl ? { style_reference_image: styleReferenceUrl } : {}),
             ...(portraitMode && refImage ? { character_reference_image: refImage } : {}),
             ...(subjectModeParam ? { subject_mode: subjectModeParam } : {}),
-            ...(isEditMode && productMode ? { product_lock_mode: videoProductLockMode === "locked" ? "locked" : "free" } : {}),
-            ...(isEditMode && productMode ? { product_video_template: videoProductTemplate || "stable_showcase" } : {}),
+            ...((isEditMode || directProductVideo) && productMode ? { product_lock_mode: videoProductLockMode === "locked" ? "locked" : "free" } : {}),
+            ...((isEditMode || directProductVideo) && productMode ? { product_video_template: videoProductTemplate || "stable_showcase" } : {}),
             ...(editNegative ? { negative_prompt: editNegative } : {}),
           },
   };

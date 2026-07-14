@@ -1363,6 +1363,33 @@ def test_image_reference_url_rejects_non_string_value(
     assert "reference_image_url 非法" in r.text
 
 
+@pytest.mark.parametrize(
+    "reference_value",
+    [123, {"url": "https://example.com/product.png"}],
+)
+def test_video_product_reference_rejects_non_string_value(
+    client, make_user, auth, reference_value
+):
+    make_user("13900001972", balance=1000)
+    h = auth("13900001972")
+
+    r = client.post("/api/generate", json={
+        "category": "video",
+        "stage": "preview",
+        "prompt": {"final_text": "让产品在桌面上稳定展示"},
+        "params": {
+            "duration": 5,
+            "resolution": "720p",
+            "ratio": "9:16",
+            "subject_mode": "product",
+            "product_reference_image": reference_value,
+        },
+    }, headers=h)
+
+    assert r.status_code == 400, r.text
+    assert "product_reference_image 非法" in r.text
+
+
 def test_uploaded_large_image_edit_uses_high_resolution_original(
     client, make_user, auth, monkeypatch
 ):
@@ -2501,6 +2528,75 @@ def test_uploaded_image_requires_owner_for_read_and_generation(client, make_user
     assert "上传素材" in r.text
 
 
+def test_video_product_reference_requires_upload_owner(client, make_user, auth):
+    make_user("13900001973", balance=1000)
+    make_user("13900001974", balance=1000, admin=True)
+    owner_h = auth("13900001973")
+    other_h = auth("13900001974")
+    assert client.put("/api/admin/models", json={
+        "use": "video",
+        "model_id": "mock-video",
+        "cost_credits": 50,
+        "unlock_cost": 0,
+        "enabled": True,
+        "extra": {"preview_cost": 5},
+        "admin_password": "pass123456",
+    }, headers=other_h).status_code == 200
+
+    up = client.post(
+        "/api/uploads/image",
+        files={"file": ("product.png", _png_bytes(size=(640, 960)), "image/png")},
+        headers=owner_h,
+    )
+    assert up.status_code == 200, up.text
+
+    r = client.post("/api/generate", json={
+        "category": "video",
+        "stage": "preview",
+        "prompt": {"final_text": "展示上传产品"},
+        "params": {
+            "duration": 5,
+            "resolution": "720p",
+            "ratio": "9:16",
+            "subject_mode": "product",
+            "product_reference_image": up.json()["url"],
+        },
+    }, headers=other_h)
+
+    assert r.status_code == 404, r.text
+    assert "上传素材" in r.text
+
+
+def test_video_product_reference_rejects_unsafe_url(client, make_user, auth):
+    make_user("13900001975", balance=1000, admin=True)
+    h = auth("13900001975")
+    assert client.put("/api/admin/models", json={
+        "use": "video",
+        "model_id": "mock-video",
+        "cost_credits": 50,
+        "unlock_cost": 0,
+        "enabled": True,
+        "extra": {"preview_cost": 5},
+        "admin_password": "pass123456",
+    }, headers=h).status_code == 200
+
+    r = client.post("/api/generate", json={
+        "category": "video",
+        "stage": "preview",
+        "prompt": {"final_text": "展示产品"},
+        "params": {
+            "duration": 5,
+            "resolution": "720p",
+            "ratio": "9:16",
+            "subject_mode": "product",
+            "product_reference_image": "http://169.254.169.254/latest/meta-data",
+        },
+    }, headers=h)
+
+    assert r.status_code == 400, r.text
+    assert "安全策略" in r.text
+
+
 def test_uploaded_image_can_drive_reverse_prompt(client, make_user, auth, monkeypatch):
     make_user("13900000105", balance=1000)
     h = auth("13900000105")
@@ -2637,14 +2733,14 @@ def test_uploaded_image_can_drive_video_first_frame(client, make_user, auth, mon
     }, headers=h)
     assert r.status_code == 200, r.text
     assert seen["first_frame_image"].startswith("data:image/jpeg;base64,")
-    assert seen["last_frame_image"] == seen["first_frame_image"]
-    assert seen["_product_locked"] is True
+    assert "last_frame_image" not in seen
+    assert "product_reference_image" not in seen
     ref_bytes = base64.b64decode(seen["first_frame_image"].split(",", 1)[1])
     ref_img = Image.open(io.BytesIO(ref_bytes))
     assert min(ref_img.size) >= 300
 
 
-def test_uploaded_image_video_free_motion_does_not_auto_lock_last_frame(client, make_user, auth, monkeypatch):
+def test_uploaded_product_video_free_motion_uses_identity_reference_without_frame_lock(client, make_user, auth, monkeypatch):
     make_user("13900001970", balance=1000, admin=True)
     h = auth("13900001970")
     assert client.put("/api/admin/models", json={
@@ -2686,7 +2782,8 @@ def test_uploaded_image_video_free_motion_does_not_auto_lock_last_frame(client, 
         },
     }, headers=h)
     assert r.status_code == 200, r.text
-    assert seen["first_frame_image"].startswith("data:image/jpeg;base64,")
+    assert seen["product_reference_image"].startswith("data:image/jpeg;base64,")
+    assert "first_frame_image" not in seen
     assert "last_frame_image" not in seen
     assert "_product_locked" not in seen
 
@@ -2734,13 +2831,64 @@ def test_uploaded_product_video_uses_high_fidelity_reference_and_negative_prompt
         },
     }, headers=h)
     assert r.status_code == 200, r.text
-    assert seen["last_frame_image"] == seen["first_frame_image"]
-    assert seen["_product_locked"] is True
+    assert "first_frame_image" not in seen
+    assert "last_frame_image" not in seen
+    assert seen["product_reference_image"].startswith("data:image/jpeg;base64,")
     assert "包装文字乱码" in seen["negative_prompt"]
     assert "Logo扭曲" in seen["negative_prompt"]
-    ref_bytes = base64.b64decode(seen["first_frame_image"].split(",", 1)[1])
+    ref_bytes = base64.b64decode(seen["product_reference_image"].split(",", 1)[1])
     ref_img = Image.open(io.BytesIO(ref_bytes))
     assert max(ref_img.size) == 1280
+
+
+def test_product_video_localizes_explicit_last_frame_without_inventing_first_frame(
+    client, make_user, auth, monkeypatch
+):
+    make_user("13900001972", balance=1000, admin=True)
+    headers = auth("13900001972")
+    assert client.put("/api/admin/models", json={
+        "use": "video",
+        "model_id": "mock-video",
+        "cost_credits": 50,
+        "unlock_cost": 0,
+        "enabled": True,
+        "extra": {"preview_cost": 5},
+        "admin_password": "pass123456",
+    }, headers=headers).status_code == 200
+    upload = client.post(
+        "/api/uploads/image",
+        files={"file": ("product.png", _png_bytes(size=(640, 960)), "image/png")},
+        headers=headers,
+    )
+    assert upload.status_code == 200, upload.text
+    product_url = upload.json()["url"]
+    submitted = {}
+
+    def fake_submit(prompt, video_model_id, params, extra=None):
+        submitted.update(params)
+        return "mock-product-last-frame"
+
+    monkeypatch.setattr("app.services.gateway.submit_video", fake_submit)
+    response = client.post("/api/generate", json={
+        "source_asset_url": product_url,
+        "source_type": "image",
+        "category": "video",
+        "stage": "preview",
+        "prompt": {"final_text": "产品先在远景出现，最后收束到清晰产品镜头"},
+        "params": {
+            "duration": 5,
+            "resolution": "720p",
+            "ratio": "9:16",
+            "subject_mode": "product",
+            "product_reference_image": product_url,
+            "last_frame_image": product_url,
+        },
+    }, headers=headers)
+
+    assert response.status_code == 200, response.text
+    assert submitted["product_reference_image"].startswith("data:image/jpeg;base64,")
+    assert submitted["last_frame_image"].startswith("data:image/jpeg;base64,")
+    assert "first_frame_image" not in submitted
 
 
 def test_uploaded_portrait_image_can_drive_video_character_reference(client, make_user, auth, monkeypatch):
@@ -2852,7 +3000,7 @@ def test_uploaded_image_final_video_uses_data_uri_first_frame(client, make_user,
     assert final.status_code == 200, final.text
     assert len(seen) >= 2
     assert seen[-1]["first_frame_image"].startswith("data:image/jpeg;base64,")
-    assert seen[-1]["last_frame_image"] == seen[-1]["first_frame_image"]
+    assert "last_frame_image" not in seen[-1]
 
 
 def test_upload_video_returns_reference_asset(client, make_user, auth, tmp_path):

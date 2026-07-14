@@ -401,6 +401,7 @@ def generate(body: GenerateIn, request: Request,
         assert_safe_user_asset_url(source_asset_url)
         for _url_key in (
             "reference_image_url",
+            "product_reference_image",
             "first_frame_image",
             "last_frame_image",
             "style_reference_image",
@@ -415,6 +416,7 @@ def generate(body: GenerateIn, request: Request,
         user.id,
         source_asset_url,
         task_params.get("reference_image_url"),
+        task_params.get("product_reference_image"),
         task_params.get("first_frame_image"),
         task_params.get("last_frame_image"),
         task_params.get("style_reference_image"),
@@ -458,27 +460,19 @@ def generate(body: GenerateIn, request: Request,
                 task_params.get("product_video_template") or "stable_showcase"
             ),
             model_profiles=model_profiles,
+            fit_mode="single_clip",
         )
         if compiled.get("sequence_required"):
-            metadata = compiled.get("metadata") if isinstance(compiled.get("metadata"), dict) else {}
-            profile = compiled.get("profile") if isinstance(compiled.get("profile"), dict) else {}
-            shot_count = max(1, int(metadata.get("shot_count") or 1))
-            max_shots = max(1, int(profile.get("recommended_max_shots") or 1))
-            recommended_clip_count = max(
-                2,
-                int(metadata.get("recommended_clip_count") or ((shot_count + max_shots - 1) // max_shots)),
-            )
             raise HTTPException(
                 status_code=422,
                 detail={
-                    "code": "video_sequence_required",
+                    "code": "video_prompt_too_long",
                     "error_type": "user_input",
                     "error_message": (
-                        "当前脚本超过所选模型和时长的单段承载能力，"
-                        f"建议拆成 {recommended_clip_count} 段视频生成。"
+                        "核心单视频提示词在自动精简后仍超过模型承载能力，"
+                        "请减少单个动作描述或技术约束后重试。"
                     ),
-                    "sequence_required": True,
-                    "recommended_clip_count": recommended_clip_count,
+                    "sequence_required": False,
                     "warnings": list((compiled.get("plan") or {}).get("warnings") or []),
                 },
             )

@@ -599,7 +599,7 @@ def test_image_prompt_optimizer_does_not_infer_product_mode_from_subject_mode(mo
     assert result["prompt"] == "极简软件界面宣传图，清晰展示功能层级"
 
 
-def test_video_prompt_optimizer_marks_overloaded_scene_script_for_sequence(monkeypatch):
+def test_video_prompt_optimizer_preserves_overloaded_scene_script_for_single_clip(monkeypatch):
     def fake_post(_path, _payload, **_kwargs):
         return {
             "choices": [
@@ -637,13 +637,20 @@ def test_video_prompt_optimizer_marks_overloaded_scene_script_for_sequence(monke
     )
 
     assert result["compiler_metadata"]["shot_count"] == 3
+    assert result["compiler_metadata"]["source_shot_count"] == 3
     assert result["compiler_metadata"]["recommended_max_shots"] == 1
-    assert result["compiler_metadata"]["sequence_required"] is True
-    assert "当前脚本含 3 个主要镜头" in result["prompt"]
-    assert "需拆分为多段生成" in result["prompt"]
+    assert result["compiler_metadata"]["sequence_required"] is False
+    assert result["compiler_metadata"]["condensed_for_single_clip"] is False
+    assert result["compiler_metadata"]["omitted_shot_count"] == 0
+    assert "Shot 1：人物走进浴室" in result["prompt"]
+    assert "Shot 2：人物拿起毛巾" in result["prompt"]
+    assert "Shot 3：人物走出浴室" in result["prompt"]
+    assert "需拆分为多段生成" not in result["prompt"]
 
 
-def test_video_prompt_optimizer_restores_user_actions_omitted_by_model(monkeypatch):
+def test_video_prompt_optimizer_restores_all_source_actions_omitted_by_model(
+    monkeypatch,
+):
     def fake_post(_path, _payload, **_kwargs):
         return {
             "choices": [{"message": {"content": (
@@ -678,7 +685,9 @@ def test_video_prompt_optimizer_restores_user_actions_omitted_by_model(monkeypat
     assert "Shot 2：拿起毛巾" in result["prompt"]
     assert "Shot 3：再走出浴室" in result["prompt"]
     assert result["compiler_metadata"]["shot_count"] == 3
-    assert result["compiler_metadata"]["sequence_required"] is True
+    assert result["compiler_metadata"]["source_shot_count"] == 3
+    assert result["compiler_metadata"]["sequence_required"] is False
+    assert result["compiler_metadata"]["omitted_shot_count"] == 0
 
 
 def test_video_prompt_optimizer_restores_replaced_action_when_shot_count_matches(monkeypatch):
@@ -830,7 +839,7 @@ def test_video_prompt_optimizer_excludes_style_prefix_from_action_inventory(monk
             assert f"原始动作要求（按顺序）：1. {excluded_prefix}" not in result["prompt"]
 
 
-def test_video_prompt_optimizer_marks_prompt_budget_overload_for_sequence(monkeypatch):
+def test_video_prompt_optimizer_reports_over_budget_without_truncating_source_action(monkeypatch):
     long_action = "人物保持稳定步伐向前行走并持续观察周围环境" * 12
 
     def fake_post(_path, _payload, **_kwargs):
@@ -867,12 +876,13 @@ def test_video_prompt_optimizer_marks_prompt_budget_overload_for_sequence(monkey
     assert result["compiler_metadata"]["shot_count"] == 1
     assert result["compiler_metadata"]["prompt_budget_chars"] == 180
     assert result["compiler_metadata"]["prompt_char_count"] > 180
-    assert result["compiler_metadata"]["sequence_required"] is True
-    assert "超过单段建议预算 180 字符" in result["prompt"]
-    assert "需拆分为多段生成" in result["prompt"]
+    assert result["compiler_metadata"]["sequence_required"] is False
+    assert result["compiler_metadata"]["prompt_over_budget"] is True
+    assert result["compiler_metadata"]["compacted_for_budget"] is True
+    assert long_action in result["prompt"]
 
 
-def test_video_prompt_optimizer_rejects_output_that_cannot_fit_complete_sections(monkeypatch):
+def test_video_prompt_optimizer_rejects_extreme_output_instead_of_truncating_action(monkeypatch):
     def fake_post(_path, _payload, **_kwargs):
         return {
             "choices": [

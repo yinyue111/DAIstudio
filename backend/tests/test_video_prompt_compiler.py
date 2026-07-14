@@ -334,6 +334,294 @@ def test_seedance_mini_overload_requires_a_sequence_without_losing_shots():
         assert f"Shot {number}：{shot}" in result["prompt"]
 
 
+def test_single_clip_fit_preserves_long_washcloth_script_and_warns_about_density():
+    raw = {
+        "风格": "高端日系美妆个护广告，真实家庭浴室，粉绿、米白和奶油色调，柔和自然光",
+        "技术约束": (
+            "产品外包装长20cm、宽10cm、高24cm；洗脸巾为20cm见方；"
+            "包装图案和3D如意云纹与参考图保持相同"
+        ),
+        "shots": [
+            "女主舒缓伸懒腰后走向墙面悬挂包装",
+            "手从包装底部轻轻抽出一张洗脸巾",
+            "微距拍摄双手缓慢展开洗脸巾，展示3D如意云压纹和厚度",
+            "俯拍洗脸巾浸水并形成扩散波纹",
+            "双手拧干湿洗脸巾，水流飞溅",
+            "女主用洗脸巾轻拭脸颊",
+            "洗脸巾从手背擦拭到手臂，展示背面压纹",
+            "双手撕开洗脸巾，展示断面纤维",
+            "包装置于白色圆桌中央形成产品收尾镜头",
+        ],
+        "字幕": ["干湿两用", "厚实吸水", "亲肤"],
+        "旁白": "让洗脸这件事，成为一天温柔的开始",
+    }
+
+    result = compile_video_prompt(
+        raw,
+        duration=10,
+        model_id="doubao-seedance-2-0-mini-260615",
+        provider="volcengine_ark",
+        product_reference=True,
+        fit_mode="single_clip",
+    )
+
+    metadata = result["metadata"]
+    assert result["sequence_required"] is False
+    assert result["profile"]["recommended_max_shots"] == 2
+    assert metadata["source_shot_count"] == 9
+    assert metadata["selected_shot_count"] == 9
+    assert metadata["omitted_shot_count"] == 0
+    assert metadata["condensed_for_single_clip"] is False
+    assert "底部轻轻抽出" in result["prompt"]
+    assert "3D如意云压纹" in result["prompt"]
+    assert "产品身份约束" in result["prompt"]
+    assert "浸水" in result["prompt"]
+    assert "拧干" in result["prompt"]
+    assert "撕开" in result["prompt"]
+    assert "包装置于白色圆桌中央" in result["prompt"]
+    assert "干湿两用" not in result["prompt"]
+    assert "让洗脸这件事" not in result["prompt"]
+    assert any("动作密度较高" in warning for warning in result["plan"]["warnings"])
+    assert metadata["prompt_char_count"] <= result["profile"]["prompt_budget_chars"]
+
+
+def test_single_clip_fit_parses_unstructured_washcloth_brief_without_counting_style_as_shots():
+    raw = (
+        "高端日系美妆个护广告；画面以粉绿/米白/奶油色系主调；"
+        "冷暖平衡，偏冷但不刺眼；慢动作+轻微推拉；无明显晃动，稳定器拍摄感；"
+        "场景设置为真实家庭浴室，非影棚布景。"
+        "产品外包装尺寸：长20cm、宽10cm、高24cm，洗脸巾20cm见方，"
+        "纹路为3D如意云纹，与参考图保持相同，视频画面要求："
+        "女主走到悬挂产品处，手从包装底部抽出洗脸巾，"
+        "微距展开并展示3D如意云压纹和厚度；俯拍浸水；双手拧干；"
+        "擦拭脸颊；撕开展示纤维；"
+        "旁白：“让洗脸这件事，成为一天温柔的开始"
+    )
+
+    result = compile_video_prompt(
+        raw,
+        duration=10,
+        model_id="doubao-seedance-2-0-mini-260615",
+        provider="volcengine_ark",
+        product_reference=True,
+        fit_mode="single_clip",
+    )
+
+    assert result["sequence_required"] is False
+    assert result["metadata"]["selected_shot_count"] == result["metadata"]["source_shot_count"]
+    assert result["metadata"]["omitted_shot_count"] == 0
+    assert "粉绿/米白/奶油色系主调" in result["plan"]["global_style"]
+    assert "稳定器拍摄感" in result["plan"]["global_style"]
+    assert "产品外包装尺寸：长20cm" in result["plan"]["technical_constraints"]
+    assert "洗脸巾20cm见方" in result["plan"]["technical_constraints"]
+    assert "底部抽出洗脸巾" in result["prompt"]
+    assert "3D如意云压纹" in result["prompt"]
+    assert "俯拍浸水" in result["prompt"]
+    assert "双手拧干" in result["prompt"]
+    assert "擦拭脸颊" in result["prompt"]
+    assert "撕开展示纤维" in result["prompt"]
+    assert result["plan"]["voiceover"] == "让洗脸这件事，成为一天温柔的开始"
+
+
+def test_single_clip_budget_compaction_never_truncates_user_actions():
+    result = compile_video_prompt(
+        {
+            "风格": "高端日系自然生活方式广告" * 20,
+            "shots": ["手从包装底部抽出洗脸巾", "微距展开3D如意云纹"],
+            "技术约束": "保持同一SKU包装、Logo、文字、尺寸和纹理" * 30,
+        },
+        duration=10,
+        model_id="custom-video",
+        product_reference=True,
+        fit_mode="single_clip",
+        extra={"video_prompt_profile": {"max_prompt_chars": 240}},
+    )
+
+    assert result["sequence_required"] is False
+    assert result["metadata"]["prompt_char_count"] > 240
+    assert result["metadata"]["prompt_over_budget"] is True
+    assert result["metadata"]["compacted_for_budget"] is True
+    assert result["metadata"]["recommended_clip_count"] == 1
+    assert result["plan"]["shots"] == [
+        "手从包装底部抽出洗脸巾",
+        "微距展开3D如意云纹",
+    ]
+    assert "手从包装底部抽出洗脸巾" in result["prompt"]
+    assert "微距展开3D如意云纹" in result["prompt"]
+    assert "保持同一SKU包装、Logo、文字、尺寸和纹理" in result["prompt"]
+    assert "拆分为多段" not in " ".join(result["plan"]["warnings"])
+
+
+def test_single_clip_reports_over_budget_instead_of_cutting_a_long_action():
+    action = (
+        "女主走到墙面悬挂包装前，从包装底部完整抽出一张洗脸巾，"
+        "双手缓慢展开并对折展示厚度，随后浸水、拧干、擦拭脸颊，"
+        "最后撕开展示断面纤维并让包装与洗脸巾同框收尾"
+    )
+
+    result = compile_video_prompt(
+        {"shots": [action]},
+        duration=10,
+        model_id="custom-video",
+        fit_mode="single_clip",
+        extra={"video_prompt_profile": {"max_prompt_chars": 80}},
+    )
+
+    assert result["sequence_required"] is False
+    assert result["plan"]["shots"] == [action]
+    assert action in result["prompt"]
+    assert result["metadata"]["prompt_char_count"] > 80
+    assert result["metadata"]["prompt_over_budget"] is True
+    assert result["metadata"]["recommended_clip_count"] == 1
+
+
+def test_single_clip_over_budget_keeps_product_identity_and_structured_sections():
+    custom_constraint = "不得新增用户未提供的商品、配件或突兀道具"
+    result = compile_video_prompt(
+        {
+            "风格": "高端日系个护广告，柔和浴室自然光",
+            "shots": ["女主从悬挂包装底部抽出洗脸巾并展开3D如意云纹"],
+            "技术约束": (
+                "保持同一SKU包装、Moon Logo、可见文字、底部出纸口和纹理；"
+                f"{custom_constraint}"
+            ),
+        },
+        duration=10,
+        model_id="custom-video",
+        product_reference=True,
+        product_lock_mode="locked",
+        fit_mode="single_clip",
+        extra={"video_prompt_profile": {"max_prompt_chars": 80}},
+    )
+
+    assert result["sequence_required"] is False
+    assert result["metadata"]["prompt_over_budget"] is True
+    assert "风格设定：" in result["prompt"]
+    assert "场景脚本：" in result["prompt"]
+    assert "技术约束：" in result["prompt"]
+    assert "同一SKU" in result["prompt"]
+    assert "Moon Logo" in result["prompt"]
+    assert "可见文字" in result["prompt"]
+    assert custom_constraint in result["prompt"]
+
+
+def test_single_clip_does_not_reclassify_unknown_product_action_as_constraint():
+    action = "洗脸巾纹路在水面上呈现由中心向外扩散的波纹"
+    result = compile_video_prompt(
+        {"shots": [action]},
+        duration=10,
+        product_reference=True,
+        fit_mode="single_clip",
+    )
+
+    assert result["plan"]["shots"] == [action]
+    assert f"Shot 1：{action}" in result["prompt"]
+
+
+def test_single_clip_keeps_unknown_product_action_order_when_it_mentions_reference_lock():
+    first_action = "包装图与参考图保持相同，双手托举产品"
+    second_action = "双手拧干洗脸巾"
+
+    result = compile_video_prompt(
+        {"shots": [first_action, second_action]},
+        duration=10,
+        product_reference=True,
+        fit_mode="single_clip",
+    )
+
+    assert result["plan"]["shots"] == [first_action, second_action]
+    assert f"Shot 1：{first_action}" in result["prompt"]
+    assert f"Shot 2：{second_action}" in result["prompt"]
+
+
+def test_single_clip_always_renders_the_three_section_contract():
+    result = compile_video_prompt(
+        {"shots": ["产品稳定入镜"]},
+        duration=10,
+        fit_mode="single_clip",
+    )
+
+    assert result["prompt"].startswith("风格设定：")
+    assert "\n场景脚本：\n" in result["prompt"]
+    assert "\n技术约束：" in result["prompt"]
+
+
+def test_structured_shots_move_post_production_out_of_generation_prompt():
+    result = compile_video_prompt(
+        {
+            "风格设定": "高端日系美妆个护广告，真实家庭浴室",
+            "shots": [
+                "手从包装底部抽出洗脸巾；字幕：“干湿两用”",
+                "双手展开洗脸巾展示3D如意云纹；旁白：“温柔开始”；音效：水滴声",
+            ],
+            "技术约束": "保持同一SKU包装与Logo",
+        },
+        duration=10,
+        product_reference=True,
+        fit_mode="single_clip",
+    )
+
+    assert "底部抽出洗脸巾" in result["prompt"]
+    assert "3D如意云纹" in result["prompt"]
+    assert "干湿两用" not in result["prompt"]
+    assert "温柔开始" not in result["prompt"]
+    assert "水滴声" not in result["prompt"]
+    assert result["plan"]["post_overlays"] == ["干湿两用"]
+    assert result["plan"]["voiceover"] == "温柔开始"
+    assert result["plan"]["sfx"] == ["水滴声"]
+
+
+def test_single_clip_product_action_keeps_locked_text_fidelity_guard():
+    result = compile_video_prompt(
+        "手从包装底部抽出洗脸巾；微距展开3D如意云纹",
+        duration=10,
+        product_reference=True,
+        product_lock_mode="locked",
+        fit_mode="single_clip",
+    )
+
+    assert "产品视频策略：单段动作展示" in result["prompt"]
+    assert "避免快速旋转、翻面、强运动模糊、遮挡或裁切产品" in result["prompt"]
+
+
+def test_single_clip_preserves_product_actions_after_interaction_and_closing():
+    result = compile_video_prompt(
+        {
+            "shots": [
+                "从包装底部抽出并展开洗脸巾纹理",
+                "包装与洗脸巾同框收尾",
+                "俯拍洗脸巾浸水",
+            ]
+        },
+        duration=10,
+        model_id="doubao-seedance-2-0-mini-260615",
+        product_reference=True,
+        fit_mode="single_clip",
+    )
+
+    assert result["plan"]["shots"] == [
+        "从包装底部抽出并展开洗脸巾纹理",
+        "包装与洗脸巾同框收尾",
+        "俯拍洗脸巾浸水",
+    ]
+
+
+def test_single_clip_general_story_preserves_all_actions_in_order():
+    result = compile_video_prompt(
+        "运动员冲刺起跑；连续跨栏；冲过终点；庆祝后拿起水杯",
+        duration=5,
+        model_id="doubao-seedance-2-0-mini-260615",
+        fit_mode="single_clip",
+    )
+
+    assert result["plan"]["shots"] == [
+        "运动员冲刺起跑",
+        "连续跨栏",
+        "冲过终点",
+        "庆祝后拿起水杯",
+    ]
+
+
 def test_unlabelled_actions_and_repeated_beats_are_all_counted_as_shots():
     result = compile_video_prompt(
         "女主伸懒腰；走到墙面包装；女主伸懒腰",

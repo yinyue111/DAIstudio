@@ -61,6 +61,8 @@ from .generation_video_flow import (
 from .model_pricing import usage_from_response
 from .progress import set_progress
 from .video_prompt_compiler import (
+    COMPILER_VERSION,
+    VIDEO_SUBMIT_CONTRACT_VERSION,
     build_video_prompt_references,
     compile_video_prompt,
     store_video_prompt_compile,
@@ -70,6 +72,10 @@ log = logging.getLogger("generation")
 VIDEO_FIRST_FRAME_MIN_SIDE = 300
 VIDEO_FIRST_FRAME_MAX_SIDE = 768
 PRODUCT_VIDEO_REFERENCE_MAX_SIDE = 1280
+
+
+class VideoSubmitVersionMismatch(RuntimeError):
+    """The API-created task cannot be safely submitted by this Worker build."""
 
 
 def _compile_legacy_video_prompt(task: GenTask, model, params: dict) -> tuple[str, dict]:
@@ -95,9 +101,10 @@ def _compile_legacy_video_prompt(task: GenTask, model, params: dict) -> tuple[st
         product_lock_mode=str(params.get("product_lock_mode") or "locked"),
         product_video_template=str(params.get("product_video_template") or "stable_showcase"),
         model_profiles=model_profiles,
+        fit_mode="single_clip",
     )
     if compiled.get("sequence_required"):
-        raise RuntimeError("当前脚本超过所选模型和时长的单段承载能力，请拆分为多段视频后重试")
+        raise RuntimeError("核心单视频提示词自动精简后仍超限，请减少动作描述或技术约束后重试")
 
     persisted = dict(params)
     store_video_prompt_compile(persisted, compiled, references)
@@ -316,57 +323,65 @@ def video_submit_params(db, task: GenTask) -> dict:
     ref_w, ref_h = reference_dimensions(task)
     if not params.get("ratio"):
         params["ratio"] = video_ratio(ref_w, ref_h)
-    # image-to-video: every client-supplied first-frame/reference URL must be
-    # resolved by this backend before it reaches the model gateway.
-    first_frame = params.get("first_frame_image") or params.get("reference_image_url")
-    if task.source_type == "image":
-        first_frame = first_frame or task.source_asset_url
-    elif task.source_type == "video" and not first_frame:
-        first_frame = gateway_video_first_frame(db, task)
     subject_mode = str(params.get("subject_mode") or "").lower()
-    product_lock_mode = str(params.get("product_lock_mode") or "locked").lower()
     is_product_image_video = task.source_type == "image" and subject_mode == "product"
     if is_product_image_video:
         params["negative_prompt"] = product_video_negative_prompt(params.get("negative_prompt"))
-    if first_frame:
-        reference_kwargs = {
-            "min_side": VIDEO_FIRST_FRAME_MIN_SIDE,
-            "max_side": PRODUCT_VIDEO_REFERENCE_MAX_SIDE if is_product_image_video else VIDEO_FIRST_FRAME_MAX_SIDE,
-        }
-        if is_product_image_video:
-            reference_kwargs.update(
+        product_reference = (
+            params.get("product_reference_image")
+            or params.get("reference_image_url")
+            or task.source_asset_url
+        )
+        if product_reference:
+            params["product_reference_image"] = gateway_reference_image(
+                db,
+                task,
+                product_reference,
+                min_side=VIDEO_FIRST_FRAME_MIN_SIDE,
+                max_side=PRODUCT_VIDEO_REFERENCE_MAX_SIDE,
                 prefer_original_upload=True,
                 quality=92,
                 subsampling=0,
             )
-        safe_ref = gateway_reference_image(
+        if not params.get("first_frame_image"):
+            params.pop("reference_image_url", None)
+
+    # Every client-supplied frame URL must be resolved by this backend before
+    # it reaches the model gateway. Product identity references stay separate
+    # so the provider does not interpret them as the opening or closing frame.
+    first_frame = params.get("first_frame_image")
+    if not is_product_image_video:
+        first_frame = first_frame or params.get("reference_image_url")
+        if task.source_type == "image":
+            first_frame = first_frame or task.source_asset_url
+        elif task.source_type == "video" and not first_frame:
+            first_frame = gateway_video_first_frame(db, task)
+    frame_reference_kwargs = {
+        "min_side": VIDEO_FIRST_FRAME_MIN_SIDE,
+        "max_side": VIDEO_FIRST_FRAME_MAX_SIDE,
+    }
+    safe_first_frame = ""
+    if first_frame:
+        safe_first_frame = gateway_reference_image(
             db,
             task,
             first_frame,
-            **reference_kwargs,
+            **frame_reference_kwargs,
         )
-        params["first_frame_image"] = safe_ref
+        params["first_frame_image"] = safe_first_frame
         if params.get("reference_image_url"):
-            params["reference_image_url"] = safe_ref
-        last_frame = params.get("last_frame_image")
-        should_auto_lock_last_frame = (
-            task.source_type == "image"
-            and not last_frame
-            and (subject_mode == "portrait" or product_lock_mode != "free")
+            params["reference_image_url"] = safe_first_frame
+    last_frame = params.get("last_frame_image")
+    if last_frame:
+        params["last_frame_image"] = gateway_reference_image(
+            db,
+            task,
+            last_frame,
+            **frame_reference_kwargs,
         )
-        if should_auto_lock_last_frame:
-            params["last_frame_image"] = safe_ref
-            if subject_mode == "portrait":
-                params["_portrait_locked"] = True
-            else:
-                params["_product_locked"] = True
-        elif last_frame:
-            params["last_frame_image"] = gateway_reference_image(
-                db,
-                task,
-                last_frame,
-                **reference_kwargs,
-            )
+    elif safe_first_frame and task.source_type == "image" and subject_mode == "portrait":
+        params["last_frame_image"] = safe_first_frame
+        params["_portrait_locked"] = True
     style_ref = params.get("style_reference_image")
     if style_ref:
         params["style_reference_image"] = gateway_reference_image(
@@ -416,14 +431,17 @@ def video_persisted_params(task: GenTask, original: dict, submitted: dict) -> di
     for key in ("ratio",):
         if submitted.get(key):
             persisted[key] = submitted[key]
+    subject_mode = str(original.get("subject_mode") or "").lower()
+    if original.get("product_reference_image"):
+        persisted["product_reference_image"] = original["product_reference_image"]
+    elif subject_mode == "product" and task.source_type == "image" and task.source_asset_url:
+        persisted["product_reference_image"] = task.source_asset_url
     if original.get("first_frame_image"):
         persisted["first_frame_image"] = original["first_frame_image"]
-    elif task.source_type == "image" and task.source_asset_url:
+    elif subject_mode != "product" and task.source_type == "image" and task.source_asset_url:
         persisted["first_frame_image"] = task.source_asset_url
     if original.get("last_frame_image"):
         persisted["last_frame_image"] = original["last_frame_image"]
-    elif task.source_type == "image" and task.source_asset_url:
-        persisted["last_frame_image"] = task.source_asset_url
     if original.get("character_reference_image"):
         persisted["character_reference_image"] = original["character_reference_image"]
     for key in ("subject_mode",):
@@ -682,8 +700,22 @@ def start_video_task(
 
             original_params = dict(task.params or {})
             prompt = str(original_params.get("_generation_prompt") or "").strip()
-            if not prompt:
+            stored_compiler_version = str(
+                original_params.get("_prompt_compiler_version") or ""
+            ).strip()
+            stored_contract_version = str(
+                original_params.get("_video_submit_contract_version") or ""
+            ).strip()
+            if not prompt or not stored_compiler_version or not stored_contract_version:
                 prompt, original_params = _compile_legacy_video_prompt(task, model, original_params)
+            elif stored_contract_version != VIDEO_SUBMIT_CONTRACT_VERSION:
+                raise VideoSubmitVersionMismatch(
+                    "视频提交契约版本不一致，已停止提交；请重启 API 与 Worker 后重试"
+                )
+            elif stored_compiler_version != COMPILER_VERSION:
+                raise VideoSubmitVersionMismatch(
+                    "视频提示词编译器版本不一致，已停止提交；请重启 API 与 Worker 后重试"
+                )
             if not prompt:
                 raise RuntimeError("视频提示词为空，无法提交生成")
             if not original_params.get("_video_request_id"):
@@ -798,7 +830,11 @@ def start_video_task(
                 mark_poll_alive(task_id, current.external_task_id)
                 enqueue_poll_fn(task_id, current.external_task_id)
             return
-        public_error = "视频提交失败，已退回冻结积分，请稍后重试"
+        public_error = (
+            str(e)
+            if isinstance(e, VideoSubmitVersionMismatch)
+            else "视频提交失败，已退回冻结积分，请稍后重试"
+        )
         fail_and_refund(db, task_id, str(e), public_error=public_error)
     finally:
         db.close()

@@ -151,8 +151,9 @@ export default function useGenerationSubmit({
       }
       let resolvedProductProfile = productProfile;
       let resolvedProductProfileSource = productProfileSource;
+      const directProductVideo = creationMode === "video" && subjectMode === "product";
       const needsSubjectProfile = (
-        isEditMode
+        (isEditMode || directProductVideo)
         && productAsset?.url
         && (subjectMode === "product" || subjectMode === "portrait")
       );
@@ -246,7 +247,7 @@ export default function useGenerationSubmit({
           }
         }
       }
-      if (isEditMode && productAsset?.url && !isProductAssetStillCurrent()) {
+      if ((isEditMode || directProductVideo) && productAsset?.url && !isProductAssetStillCurrent()) {
         setMsg("主体图片已变更，请重新点击生成。");
         clearPendingGenerateRequest(pendingGenerateRequestRef, requestId);
         return;

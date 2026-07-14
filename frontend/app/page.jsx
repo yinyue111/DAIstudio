@@ -256,7 +256,7 @@ export default function Home() {
     subjectMode,
     productGenerationMode,
     portraitGenerationMode,
-  } = studioCreationFacts({ creationMode, imageEditProductMode, editSubjectMode });
+  } = studioCreationFacts({ creationMode, imageEditProductMode, editSubjectMode, productAsset });
   const optimizingPrompt = optimizingPromptMode === creationMode;
   const productAssetSignature = assetSignature(productAsset);
   const referenceSignature = [productAssetSignature, assetSignature(selected)].join("|");

@@ -4,6 +4,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { buildGenerationPayload } from "../app/studio/generationPayload.ts";
+import { studioCreationFacts } from "../app/studio/viewModel.ts";
 import { MAX_VIDEO_DURATION_SECONDS, VIDEO_DURATION_PRESETS } from "../app/studio/constants.ts";
 import { buildStudioDerivedViewState } from "../app/studio/viewModel.ts";
 import {
@@ -191,6 +192,61 @@ const styleAsset = {
   width: 900,
   height: 1200,
 };
+
+const directProductVideoFacts = studioCreationFacts({
+  creationMode: "video",
+  imageEditProductMode: false,
+  editSubjectMode: "general",
+  productAsset,
+});
+assert.equal(directProductVideoFacts.isEditMode, false);
+assert.equal(directProductVideoFacts.subjectMode, "product");
+assert.equal(directProductVideoFacts.productGenerationMode, true);
+
+const directProductVideo = buildGenerationPayload({
+  stage: "final",
+  cfg: { video_duration_max_seconds: 15 },
+  category: "video",
+  creationMode: "video",
+  isEditMode: false,
+  isImageEditMode: false,
+  subjectMode: "product",
+  prompt: "产品放在浴室台面，镜头缓慢推进，水珠沿包装边缘滑落。",
+  promptDirty: true,
+  selected: styleAsset,
+  productAsset,
+  productProfile,
+  productProfileSource: productAssetSignature,
+  structured: {},
+  ratio: "9:16",
+  imageQuality: "1k",
+  n: 1,
+  seed: "",
+  vDuration: 10,
+  vResolution: "1080p",
+  videoProductLockMode: "locked",
+  videoProductTemplate: "stable_showcase",
+});
+assert.equal(directProductVideo.payload.source_asset_url, productAsset.url);
+assert.equal(directProductVideo.payload.source_type, "image");
+assert.equal(directProductVideo.payload.params.subject_mode, "product");
+assert.equal(directProductVideo.payload.params.product_reference_image, productAsset.url);
+assert.equal(directProductVideo.payload.params.reference_image_url, undefined);
+assert.equal(directProductVideo.payload.params.first_frame_image, undefined);
+assert.equal(directProductVideo.payload.params.last_frame_image, undefined);
+assert.equal(directProductVideo.payload.params.style_reference_image, styleAsset.url);
+assert.equal(directProductVideo.payload.params.product_lock_mode, "locked");
+assert.equal(directProductVideo.payload.params.product_video_template, "stable_showcase");
+assert.equal(directProductVideo.payload.source_asset_meta.product_generation_mode, true);
+assert.equal(directProductVideo.payload.source_asset_meta.product_subject.selected_url, productAsset.url);
+assert.equal(directProductVideo.payload.source_asset_meta.style_reference.selected_url, styleAsset.url);
+assert.match(directProductVideo.payload.prompt["产品身份档案"], /DAMAH 黑魔法全棉棉柔巾/);
+assert.equal(
+  directProductVideo.payload.prompt.final_text,
+  "产品放在浴室台面，镜头缓慢推进，水珠沿包装边缘滑落。",
+  "direct product video should retain text-to-video prompt semantics",
+);
+assert.equal(directProductVideo.payload.params.character_reference_image, undefined);
 
 const productEditArgs = {
   stage: "preview",
@@ -631,7 +687,10 @@ assert.equal(productVideoEditFree.payload.parent_task_id, null);
 assert.equal(productVideoEditFree.payload.params.subject_mode, "product");
 assert.equal(productVideoEditFree.payload.params.product_lock_mode, "free");
 assert.equal(productVideoEditFree.payload.params.product_video_template, "soft_splash");
-assert.equal(productVideoEditFree.payload.params.reference_image_url, productAsset.url);
+assert.equal(productVideoEditFree.payload.params.product_reference_image, productAsset.url);
+assert.equal(productVideoEditFree.payload.params.reference_image_url, undefined);
+assert.equal(productVideoEditFree.payload.params.first_frame_image, undefined);
+assert.equal(productVideoEditFree.payload.params.last_frame_image, undefined);
 assert.equal(productVideoEditFree.payload.prompt["场景背景"], "暖棕色广告棚景和金色沙粒台面");
 assert.equal(
   productVideoEditFree.payload.prompt["主体动作"],

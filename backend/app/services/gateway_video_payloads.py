@@ -24,25 +24,58 @@ GENERIC_VIDEO_ALLOWED_PARAMS = {
 }
 
 
-def generic_video_payload_params(params: dict, extra: dict) -> dict:
+def generic_video_payload_params(params: dict, extra: dict, model_id: str = "") -> dict:
     allowed = set(GENERIC_VIDEO_ALLOWED_PARAMS)
     allowed.update(str(k) for k in (extra.get("allowed_param_fields") or []))
     payload_params = {
         k: v
         for k, v in dict(params or {}).items()
         if k in allowed
-        and k != "last_frame_image"
+        and k
+        not in {
+            "first_frame_image",
+            "last_frame_image",
+            "product_reference_image",
+            "character_reference_image",
+            "style_reference_image",
+        }
         and not str(k).startswith("_")
         and v not in (None, "")
     }
     first_frame = (params or {}).get("first_frame_image")
-    first_frame_field = extra.get("first_frame_field", "first_frame_image")
+    is_grok_video = "grok" in str(model_id or "").strip().lower()
+    first_frame_field = (
+        extra.get("first_frame_field")
+        if "first_frame_field" in extra
+        else "image_url" if is_grok_video else "first_frame_image"
+    )
     if first_frame and first_frame_field:
         payload_params[str(first_frame_field)] = first_frame
     last_frame = (params or {}).get("last_frame_image")
-    last_frame_field = extra.get("last_frame_field", "last_frame_image")
+    last_frame_field = (
+        extra.get("last_frame_field")
+        if "last_frame_field" in extra
+        else None if is_grok_video else "last_frame_image"
+    )
     if last_frame and last_frame_field:
         payload_params[str(last_frame_field)] = last_frame
+    product = (params or {}).get("product_reference_image")
+    product_field = (
+        extra.get("product_image_field")
+        if "product_image_field" in extra
+        else "image_url" if is_grok_video else "product_reference_image"
+    )
+    if (
+        product
+        and first_frame
+        and product_field
+        and first_frame_field
+        and str(product_field) == str(first_frame_field)
+        and str(product) != str(first_frame)
+    ):
+        raise ValueError("产品身份参考与首帧不能映射到同一供应商字段")
+    if product and product_field:
+        payload_params[str(product_field)] = product
     character = (params or {}).get("character_reference_image")
     character_field = extra.get("character_image_field", "character_reference_image")
     if character and character_field:
@@ -143,6 +176,12 @@ def ark_content(prompt: str, params: dict) -> list:
     append_image(img, role="first_frame", note="首帧")
     last = params.get("last_frame_image")
     append_image(last, role="last_frame", note="尾帧")
+    product = params.get("product_reference_image")
+    append_image(
+        product,
+        role="reference_image",
+        note="产品身份参考，仅锁定同一SKU的包装、Logo、文字和材质纹理，不要求作为首帧",
+    )
     style = params.get("style_reference_image")
     append_image(
         style,

@@ -47,6 +47,7 @@ _VIDEO_PARAM_KEYS = _COMMON_PARAM_KEYS | {
     "target_resolution",
     "ratio",
     "reference_image_url",
+    "product_reference_image",
     "first_frame_image",
     "last_frame_image",
     "style_reference_image",
@@ -101,6 +102,17 @@ def validate_generation_params(category: str, params: dict) -> dict:
     unknown = sorted(str(k) for k in params if k not in allowed)
     if unknown:
         raise HTTPException(400, f"不支持的生成参数:{','.join(unknown[:5])}")
+    for key in (
+        "reference_image_url",
+        "product_reference_image",
+        "first_frame_image",
+        "last_frame_image",
+        "style_reference_image",
+        "character_reference_image",
+        "mask_image_url",
+    ):
+        if params.get(key) is not None and not isinstance(params[key], str):
+            raise HTTPException(400, f"{key} 非法")
     _normalise_reference_dimensions(params)
     if params.get("subject_mode") not in (None, ""):
         subject_mode = str(params["subject_mode"]).strip().lower()
@@ -116,9 +128,6 @@ def validate_generation_params(category: str, params: dict) -> dict:
             raise HTTPException(400, "seed 超出范围")
         params["seed"] = seed
     if category == "image":
-        reference_image_url = params.get("reference_image_url")
-        if reference_image_url is not None and not isinstance(reference_image_url, str):
-            raise HTTPException(400, "reference_image_url 非法")
         if params.get("variation_of_asset_id") not in (None, ""):
             try:
                 variation_of_asset_id = int(params["variation_of_asset_id"])

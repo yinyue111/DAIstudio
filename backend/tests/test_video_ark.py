@@ -1,4 +1,6 @@
 """Volcengine Ark (Seedance) video adapter — payload shaping (no network)."""
+import pytest
+
 from app.config import settings
 from app.services import gateway
 from app.services.model_gateway_config import RuntimeGatewayConfig
@@ -88,6 +90,20 @@ def test_ark_content_includes_distinct_character_reference():
     assert c[3]["image_url"]["url"] == "http://x/person.png"
     assert c[3]["role"] == "reference_image"
     assert "人物身份参考" in c[0]["text"]
+
+
+def test_ark_content_sends_product_identity_reference_without_frame_role():
+    content = gateway._ark_content(
+        "产品从稍远景进入画面，随后手从包装底部抽出洗脸巾",
+        {"product_reference_image": "http://x/product.png", "duration": 10},
+    )
+
+    assert [item["type"] for item in content] == ["text", "image_url"]
+    assert content[1]["image_url"]["url"] == "http://x/product.png"
+    assert content[1]["role"] == "reference_image"
+    assert "产品身份参考" in content[0]["text"]
+    assert "第1张图片为首帧" not in content[0]["text"]
+    assert "第1张图片为尾帧" not in content[0]["text"]
 
 
 def test_ark_content_includes_distinct_style_reference():
@@ -237,6 +253,75 @@ def test_generic_video_submit_preserves_first_frame(monkeypatch):
     assert task_id == "task-1"
     assert seen["payload"]["image_url"] == "https://example.com/cover.jpg"
     assert "first_frame_image" not in seen["payload"]
+
+
+def test_grok_video_submit_maps_product_source_to_native_image_url(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(settings, "mock_mode", False)
+    monkeypatch.setattr(settings, "video_gateway_base_url", "https://video.example.com")
+    monkeypatch.setattr(settings, "video_gateway_api_key", "test-key")
+    monkeypatch.setattr(settings, "video_gateway_format", "openai")
+
+    def fake_post(path, payload, timeout=120):
+        seen["payload"] = payload
+        return {"request_id": "grok-product-video"}
+
+    monkeypatch.setattr(gateway, "_video_post", fake_post)
+
+    task_id = gateway.submit_video(
+        "animate the uploaded product",
+        "grok-imagine-video-1.5",
+        {
+            "duration": 10,
+            "product_reference_image": "https://example.com/product.png",
+        },
+    )
+
+    assert task_id == "grok-product-video"
+    assert seen["payload"]["image_url"] == "https://example.com/product.png"
+    assert "product_reference_image" not in seen["payload"]
+    assert "first_frame_image" not in seen["payload"]
+    assert "last_frame_image" not in seen["payload"]
+
+
+def test_generic_video_submit_maps_product_reference_to_configured_field(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(settings, "mock_mode", False)
+    monkeypatch.setattr(settings, "video_gateway_base_url", "https://video.example.com")
+    monkeypatch.setattr(settings, "video_gateway_api_key", "test-key")
+    monkeypatch.setattr(settings, "video_gateway_format", "openai")
+    monkeypatch.setattr(
+        gateway,
+        "_video_post",
+        lambda _path, payload, timeout=120: seen.update(payload=payload) or {"id": "task-product"},
+    )
+
+    gateway.submit_video(
+        "animate product",
+        "custom-video",
+        {"product_reference_image": "https://example.com/product.png"},
+        extra={"product_image_field": "reference_image_url"},
+    )
+
+    assert seen["payload"]["reference_image_url"] == "https://example.com/product.png"
+    assert "product_reference_image" not in seen["payload"]
+
+
+def test_grok_video_submit_rejects_distinct_product_and_first_frame_on_same_field(monkeypatch):
+    monkeypatch.setattr(settings, "mock_mode", False)
+    monkeypatch.setattr(settings, "video_gateway_base_url", "https://video.example.com")
+    monkeypatch.setattr(settings, "video_gateway_api_key", "test-key")
+    monkeypatch.setattr(settings, "video_gateway_format", "openai")
+
+    with pytest.raises(ValueError, match="产品身份参考.*首帧"):
+        gateway.submit_video(
+            "animate product",
+            "grok-imagine-video-1.5",
+            {
+                "product_reference_image": "https://example.com/product.png",
+                "first_frame_image": "https://example.com/opening.png",
+            },
+        )
 
 
 def test_generic_video_submit_accepts_grok_request_id(monkeypatch):

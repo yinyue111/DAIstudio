@@ -149,12 +149,17 @@ export default function useMediaUpload({
   }
 
   async function prefetchProductProfile(mode, asset, uploadReqId, ownerRequest) {
-    if (!isEditMode || !asset?.url || !["product", "portrait"].includes(subjectMode)) return;
+    const profileSubjectMode = creationMode === "video" ? "product" : subjectMode;
+    if (
+      (!isEditMode && creationMode !== "video")
+      || !asset?.url
+      || !["product", "portrait"].includes(profileSubjectMode)
+    ) return;
     const signature = assetSignature(asset);
     setWorkspacePatch({ productProfiling: true, productProfile: null, productProfileSource: "" }, mode);
     const requestIdentity = buildSubjectProfileRequestIdentity({
       mode,
-      subjectMode,
+      subjectMode: profileSubjectMode,
       assetUrl: asset.url,
       assetSignature: signature,
     });

@@ -166,12 +166,13 @@ def test_legacy_video_worker_compiles_and_persists_prompt_before_submit(
         assert task.phase == "polling"
         assert task.external_task_id == "ext-legacy-compiled"
         assert params["_generation_prompt"] == submitted["prompt"]
-        assert params["_prompt_compiler_version"] == "video-prompt-v2"
+        assert params["_prompt_compiler_version"] == "video-prompt-v4"
+        assert params["_video_submit_contract_version"] == "video-submit-v3"
         assert params["_post_overlays"] == ["新品上市"]
         assert params["_video_prompt_plan"]["shots"] == ["手持产品稳定入镜"]
 
 
-def test_legacy_video_worker_rejects_overload_before_provider_submit_and_refunds(
+def test_legacy_video_worker_preserves_dense_prompt_before_provider_submit(
     client, make_user, auth
 ):
     uid = make_user("13900003106", balance=1000, admin=True)
@@ -207,26 +208,80 @@ def test_legacy_video_worker_rejects_overload_before_provider_submit_and_refunds
     finally:
         db.close()
 
-    called = False
+    submitted = {}
+    enqueued = []
 
-    def unexpected_submit(*_args, **_kwargs):
-        nonlocal called
-        called = True
-        return "must-not-submit"
+    def capture_submit(model, prompt, params):
+        submitted.update(model=model, prompt=prompt, params=params)
+        return "ext-legacy-condensed"
 
     generation_video_submit.start_video_task(
         task_id,
-        submit_video_fn=unexpected_submit,
-        try_enqueue_poll_fn=lambda *_args: None,
+        submit_video_fn=capture_submit,
+        try_enqueue_poll_fn=lambda *args: enqueued.append(args),
     )
 
-    assert called is False
+    assert submitted["prompt"].count("Shot ") == 2
+    assert "产品入镜" in submitted["prompt"]
+    assert "推近 Logo" in submitted["prompt"]
+    assert enqueued == [(task_id, "ext-legacy-condensed")]
+    with SessionLocal() as verify_db:
+        task = verify_db.get(GenTask, task_id)
+        user = verify_db.get(User, uid)
+        metadata = task.params["_video_prompt_metadata"]
+        assert task.status == "running"
+        assert task.phase == "polling"
+        assert task.external_task_id == "ext-legacy-condensed"
+        assert task.cost_settled == 0
+        assert metadata["condensed_for_single_clip"] is False
+        assert metadata["selected_shot_count"] == 2
+        assert metadata["omitted_shot_count"] == 0
+        assert user.balance_credits == 995
+        assert user.frozen_credits == 5
+
+
+def test_video_worker_rejects_mismatched_submit_contract_before_provider_call(
+    client, make_user, auth
+):
+    uid = make_user("13900003109", balance=1000, admin=True)
+    headers = auth("13900003109")
+    _config_video(client, headers)
+    db = SessionLocal()
+    try:
+        task = GenTask(
+            user_id=uid,
+            category="video",
+            stage="preview",
+            status="queued",
+            prompt={"final_text": "产品稳定入镜"},
+            params={
+                "duration": 5,
+                "_generation_prompt": "场景脚本：\nShot 1：产品稳定入镜",
+                "_prompt_compiler_version": "video-prompt-v4",
+                "_video_submit_contract_version": "video-submit-v2",
+            },
+            cost_frozen=5,
+        )
+        db.add(task)
+        db.flush()
+        task_id = task.id
+        credits.freeze(db, uid, 5, biz_ref=task_id, commit=False)
+        db.commit()
+    finally:
+        db.close()
+
+    submitted = []
+    generation_video_submit.start_video_task(
+        task_id,
+        submit_video_fn=lambda *_args: submitted.append(True) or "must-not-submit",
+    )
+
+    assert submitted == []
     with SessionLocal() as verify_db:
         task = verify_db.get(GenTask, task_id)
         user = verify_db.get(User, uid)
         assert task.status == "failed"
-        assert task.external_task_id is None
-        assert task.cost_settled == 0
+        assert "提交契约版本不一致" in (task.error or "")
         assert user.balance_credits == 1000
         assert user.frozen_credits == 0
 
@@ -3094,6 +3149,86 @@ def test_video_retry_drops_internal_download_state(client, make_user, auth):
         assert "_video_result_url" not in (task.params or {})
         assert (task.params or {}).get("_video_download_attempts") == 1
         assert task.external_task_id != "old-ext"
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize(
+    ("reference_url", "expected_status", "expected_error"),
+    [
+        ("other_user_upload", 404, "上传素材"),
+        ("http://127.0.0.1/private-product.png", 400, "安全策略"),
+    ],
+)
+def test_video_retry_revalidates_product_reference_before_freezing(
+    client,
+    make_user,
+    auth,
+    reference_url,
+    expected_status,
+    expected_error,
+):
+    owner_uid = make_user("13900001976", balance=1000)
+    retry_uid = make_user("13900001977", balance=1000, admin=True)
+    retry_h = auth("13900001977")
+    _config_video(client, retry_h)
+
+    if reference_url == "other_user_upload":
+        upload_key = storage.save_bytes_named(
+            b"product",
+            "upload",
+            "retry-other-user-product.png",
+        )
+        db = SessionLocal()
+        try:
+            db.add(UploadedAsset(
+                key=upload_key,
+                user_id=owner_uid,
+                mime="image/png",
+                bytes=7,
+                original_filename="product.png",
+            ))
+            db.commit()
+        finally:
+            db.close()
+        reference_url = storage.upload_api_url(upload_key)
+
+    db = SessionLocal()
+    try:
+        task = GenTask(
+            user_id=retry_uid,
+            category="video",
+            stage="preview",
+            status="failed",
+            prompt={"final_text": "retry product video"},
+            params={
+                "duration": 5,
+                "resolution": "720p",
+                "ratio": "9:16",
+                "subject_mode": "product",
+                "product_reference_image": reference_url,
+            },
+            cost_frozen=0,
+            cost_settled=0,
+        )
+        db.add(task)
+        db.commit()
+        task_id = task.id
+    finally:
+        db.close()
+
+    response = client.post(f"/api/tasks/{task_id}/retry", headers=retry_h)
+
+    assert response.status_code == expected_status, response.text
+    assert expected_error in response.text
+    db = SessionLocal()
+    try:
+        task = db.get(GenTask, task_id)
+        user = db.get(User, retry_uid)
+        assert task.status == "failed"
+        assert task.cost_frozen == 0
+        assert user.balance_credits == 1000
+        assert user.frozen_credits == 0
     finally:
         db.close()
 

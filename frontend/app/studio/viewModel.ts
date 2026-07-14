@@ -13,11 +13,13 @@ import {
 } from "./helpers";
 import { shouldBlockNewGeneration } from "./taskConcurrency";
 
-export function studioCreationFacts({ creationMode, imageEditProductMode, editSubjectMode }) {
+export function studioCreationFacts({ creationMode, imageEditProductMode, editSubjectMode, productAsset = null }) {
   const category = creationMode === "video" || creationMode === "video_edit" ? "video" : "image";
   const isEditMode = creationMode === "image_edit" || creationMode === "video_edit";
   const isImageEditMode = creationMode === "image_edit";
-  const subjectMode = creationMode === "video_edit"
+  const subjectMode = creationMode === "video" && productAsset
+    ? "product"
+    : creationMode === "video_edit"
     ? (editSubjectMode === "portrait" ? "portrait" : "product")
     : imageEditProductMode
       ? (editSubjectMode === "portrait" ? "portrait" : "product")
@@ -81,7 +83,11 @@ export function buildStudioDerivedViewState({
   const videoDuration = boundedVideoDuration(vDuration, maxVideoDuration);
   const currentImageSize = imageSizeFor(ratioOption, imageQuality, cfg?.image_size_max_dim || 2048);
   const taskParams = task?.params || {};
-  const imageReferenceSource = isEditMode ? productAsset : selected;
+  const imageReferenceSource = productGenerationMode && productAsset
+    ? productAsset
+    : isEditMode
+      ? productAsset
+      : selected;
   const usesImageReference = shouldUseImageReference({
     sourceAsset: imageReferenceSource,
     isEditMode,
@@ -120,7 +126,9 @@ export function buildStudioDerivedViewState({
           ? `${creationModeLabel(creationMode)}：先在右侧选择目标视频/风格参考并反推，再上传人物照片；这里可补充服装、动作、镜头和身份保留要求…`
           : `${creationModeLabel(creationMode)}：先在右侧选择风格参考并反推，再上传产品主体图；这里可补充必须保留或强化的卖点…`)
     : category === "video"
-      ? "描述你想要的视频：主体 / 动作 / 镜头运动 / 光线 / 节奏… ⌘/Ctrl + Enter 生成"
+      ? (productGenerationMode
+          ? "描述基于已上传产品图生成的视频：产品动作 / 场景 / 镜头运动 / 光线 / 节奏… 产品会作为唯一商品主体。⌘/Ctrl + Enter 生成"
+          : "描述你想要的视频：主体 / 动作 / 镜头运动 / 光线 / 节奏… ⌘/Ctrl + Enter 生成")
       : "描述你想要的画面：主体 / 风格 / 光线 / 色调 / 构图… ⌘/Ctrl + Enter 生成";
   const editStyleKeys = (EDIT_STYLE_KEYS[category] || EDIT_STYLE_KEYS.image)
     .filter((key) => String(structured?.[key] || "").trim());

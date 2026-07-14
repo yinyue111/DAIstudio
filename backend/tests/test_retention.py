@@ -621,6 +621,46 @@ def test_purge_uploaded_assets_keeps_recent_params_reference(client, make_user):
         db.close()
 
 
+def test_purge_uploaded_assets_keeps_product_reference_group(client, make_user):
+    uid = make_user("13900001978", balance=1000)
+    upload_key = storage.save_bytes_named(b"upload", "upload", "retention-product-ref.png")
+    preview_key = storage.save_bytes_named(
+        b"preview",
+        "upload_preview",
+        "retention-product-ref.png",
+    )
+    db = SessionLocal()
+    try:
+        old = datetime.now(timezone.utc) - timedelta(days=40)
+        cutoff = datetime.now(timezone.utc) - timedelta(days=30)
+        for key, byte_count in ((upload_key, 6), (preview_key, 7)):
+            db.add(UploadedAsset(
+                key=key,
+                user_id=uid,
+                mime="image/png",
+                bytes=byte_count,
+                original_filename="product.png",
+                created_at=old,
+            ))
+        db.add(GenTask(
+            user_id=uid,
+            category="video",
+            stage="preview",
+            status="succeeded",
+            params={"product_reference_image": storage.upload_api_url(upload_key)},
+            created_at=datetime.now(timezone.utc) - timedelta(days=1),
+        ))
+        db.commit()
+
+        assert retention.purge_uploaded_assets(db, cutoff) == 0
+        assert db.get(UploadedAsset, upload_key) is not None
+        assert db.get(UploadedAsset, preview_key) is not None
+        assert storage.local_path(upload_key).exists()
+        assert storage.local_path(preview_key).exists()
+    finally:
+        db.close()
+
+
 def test_purge_uploaded_assets_keeps_recent_mask_reference(client, make_user):
     uid = make_user("13900000463", balance=1000)
     upload_key = storage.save_bytes_named(b"upload", "upload", "retention-mask-ref.png")

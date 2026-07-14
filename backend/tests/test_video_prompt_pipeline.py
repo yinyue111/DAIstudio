@@ -72,6 +72,9 @@ def test_direct_video_prompt_compiles_without_inventing_a_reference(
     assert task["generation_prompt_text"] == submitted["prompt"]
     assert task["prompt_compiler_version"]
     assert task["sequence_required"] is False
+    with SessionLocal() as db:
+        persisted = db.get(GenTask, response.json()["id"])
+        assert persisted.params["_video_submit_contract_version"] == "video-submit-v3"
 
 
 def test_layered_video_prompt_submits_assembled_user_draft_and_keeps_history(
@@ -124,18 +127,17 @@ def test_layered_video_prompt_submits_assembled_user_draft_and_keeps_history(
     assert task["prompt_optimizer_model_id"] == "gemini-3.5-flash-low"
 
 
-def test_overloaded_video_prompt_returns_sequence_required_before_charging_or_submit(
+def test_dense_video_prompt_is_preserved_instead_of_requesting_a_sequence(
     client, make_user, auth, monkeypatch
 ):
     user_id = make_user("13900003102", balance=1000)
     headers = auth("13900003102")
     _configure_video_model("doubao-seedance-2-0-mini-260615")
-    called = False
+    submitted = {}
 
-    def fake_submit(*_args, **_kwargs):
-        nonlocal called
-        called = True
-        return "should-not-submit"
+    def fake_submit(prompt, video_model_id, params, extra=None):
+        submitted.update(prompt=prompt, model_id=video_model_id, params=params)
+        return "video-condensed-overload"
 
     monkeypatch.setattr("app.services.gateway.submit_video", fake_submit)
     response = client.post(
@@ -160,24 +162,71 @@ def test_overloaded_video_prompt_returns_sequence_required_before_charging_or_su
         headers=headers,
     )
 
-    assert response.status_code == 422, response.text
-    detail = response.json()["detail"]
-    assert detail["code"] == "video_sequence_required"
-    assert detail["sequence_required"] is True
-    assert detail["recommended_clip_count"] >= 2
-    assert called is False
+    assert response.status_code == 200, response.text
+    assert submitted["prompt"].count("Shot ") == 11
+    for action in ("伸懒腰", "底部抽出", "浸水吸水", "双手拧干", "撕开展示纤维", "产品英雄镜头"):
+        assert action in submitted["prompt"]
+    task = client.get(f"/api/tasks/{response.json()['id']}", headers=headers).json()
+    assert task["generation_prompt_text"] == submitted["prompt"]
+    assert any("动作密度较高" in warning for warning in task["prompt_warnings"])
     with SessionLocal() as db:
         assert db.query(GenTask).filter(
             GenTask.user_id == user_id,
             GenTask.category == "video",
-        ).count() == 0
+        ).count() == 1
         assert db.get(ModelConfig, 1) is not None
-        from app.models import User
-
-        assert db.get(User, user_id).balance_credits == 1000
 
 
-def test_preview_capacity_uses_actual_preview_duration_before_task_creation(
+def test_default_video_generation_preserves_dense_prompt_and_submits(
+    client, make_user, auth, monkeypatch
+):
+    user_id = make_user("13900003108", balance=1000)
+    headers = auth("13900003108")
+    _configure_video_model("doubao-seedance-2-0-mini-260615")
+    submitted = {}
+
+    def fake_submit(prompt, video_model_id, params, extra=None):
+        submitted.update(prompt=prompt, model_id=video_model_id, params=params)
+        return "video-condensed-1"
+
+    monkeypatch.setattr("app.services.gateway.submit_video", fake_submit)
+    raw_prompt = (
+        "高端日系美妆个护广告；女主走向墙面悬挂包装；"
+        "手从包装底部抽出洗脸巾；微距展开并展示3D如意云纹和厚度；"
+        "俯拍浸水；双手拧干；擦拭脸颊；擦拭手臂；"
+        "撕开展示纤维；最后展示产品英雄镜头。"
+    )
+    response = client.post(
+        "/api/generate",
+        json={
+            "category": "video",
+            "stage": "final",
+            "prompt": {"raw_text": raw_prompt, "final_text": raw_prompt},
+            "params": {"duration": 10, "resolution": "720p", "ratio": "9:16"},
+        },
+        headers=headers,
+    )
+
+    assert response.status_code == 200, response.text
+    assert submitted["prompt"].count("Shot ") == 9
+    assert "底部抽出" in submitted["prompt"]
+    assert "3D如意云纹" in submitted["prompt"]
+    assert "浸水" in submitted["prompt"]
+    assert "双手拧干" in submitted["prompt"]
+    assert "撕开展示纤维" in submitted["prompt"]
+    task = client.get(f"/api/tasks/{response.json()['id']}", headers=headers).json()
+    assert task["raw_prompt_text"] == raw_prompt
+    assert task["generation_prompt_text"] == submitted["prompt"]
+    assert task["sequence_required"] is False
+    with SessionLocal() as db:
+        persisted = db.query(GenTask).filter(GenTask.user_id == user_id).one()
+        metadata = persisted.params["_video_prompt_metadata"]
+        assert metadata["condensed_for_single_clip"] is False
+        assert metadata["source_shot_count"] == metadata["selected_shot_count"]
+        assert metadata["omitted_shot_count"] == 0
+
+
+def test_preview_capacity_keeps_all_actions_for_actual_preview_duration(
     client, make_user, auth, monkeypatch
 ):
     user_id = make_user("13900003107", balance=1000)
@@ -189,12 +238,11 @@ def test_preview_capacity_uses_actual_preview_duration_before_task_creation(
             "max_shots_by_duration": {"5": 1, "10": 2},
         },
     )
-    called = False
+    submitted = {}
 
-    def fake_submit(*_args, **_kwargs):
-        nonlocal called
-        called = True
-        return "should-not-submit-preview"
+    def fake_submit(prompt, video_model_id, params, extra=None):
+        submitted.update(prompt=prompt, model_id=video_model_id, params=params)
+        return "video-condensed-preview"
 
     monkeypatch.setattr("app.services.gateway.submit_video", fake_submit)
     response = client.post(
@@ -208,11 +256,12 @@ def test_preview_capacity_uses_actual_preview_duration_before_task_creation(
         headers=headers,
     )
 
-    assert response.status_code == 422, response.text
-    assert response.json()["detail"]["code"] == "video_sequence_required"
-    assert called is False
+    assert response.status_code == 200, response.text
+    assert submitted["prompt"].count("Shot ") == 2
+    assert "产品入镜" in submitted["prompt"]
+    assert "推近 Logo" in submitted["prompt"]
     with SessionLocal() as db:
-        assert db.query(GenTask).filter(GenTask.user_id == user_id).count() == 0
+        assert db.query(GenTask).filter(GenTask.user_id == user_id).count() == 1
 
 
 def test_product_video_compiles_one_fidelity_guard_and_separates_post_production(
@@ -258,6 +307,7 @@ def test_product_video_compiles_one_fidelity_guard_and_separates_post_production
                 "resolution": "720p",
                 "ratio": "9:16",
                 "subject_mode": "product",
+                "product_reference_image": upload.json()["url"],
                 "product_lock_mode": "free",
                 "product_video_template": "reference_sequence",
             },
@@ -273,6 +323,10 @@ def test_product_video_compiles_one_fidelity_guard_and_separates_post_production
     assert "3D如意云纹" in submitted["prompt"]
     assert "产品视频策略：参考分镜" in submitted["prompt"]
     assert "不强制每个镜头静态正面" in submitted["prompt"]
+    assert submitted["params"]["product_reference_image"].startswith("data:image/jpeg;base64,")
+    assert "first_frame_image" not in submitted["params"]
+    assert "last_frame_image" not in submitted["params"]
+    assert "style_reference_image" not in submitted["params"]
 
     task = client.get(f"/api/tasks/{response.json()['id']}", headers=headers).json()
     assert task["post_overlays"] == ["干湿两用"]

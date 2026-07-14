@@ -55,43 +55,57 @@ export default function StudioReferencePanel({
   onReverse,
 }) {
   const isImageEditMode = creationMode === "image_edit";
-  const subjectMode = creationMode === "video_edit"
+  const directProductVideoMode = creationMode === "video";
+  const subjectMode = directProductVideoMode && productAsset
+    ? "product"
+    : creationMode === "video_edit"
     ? (editSubjectMode === "portrait" ? "portrait" : "product")
     : imageEditProductMode
       ? (editSubjectMode === "portrait" ? "portrait" : "product")
       : "general";
   const productGenerationMode = subjectMode === "product";
   const portraitGenerationMode = subjectMode === "portrait";
+  const productSubjectMode = productGenerationMode || directProductVideoMode;
   const productActionBusy = Boolean(uploading || productBusy);
   const imageUploadTargetsProduct = isImageEditMode && productGenerationMode && !productAsset;
-  const imageUploadLabel = imageUploadTargetsProduct ? "上传产品主体" : isImageEditMode ? "上传风格参考图" : "上传图片";
+  const imageUploadLabel = imageUploadTargetsProduct
+    ? "上传产品主体"
+    : isImageEditMode
+      ? "上传风格参考图"
+      : directProductVideoMode
+      ? "上传图片参考"
+      : "上传图片";
   const modeTitle = isEditMode
     ? (creationMode === "video_edit" ? (portraitGenerationMode ? "视频人物重构" : "图生视频重构") : "图片编辑")
-    : (category === "video" ? "视频参考" : "链接反推");
-  const styleTitle = isImageEditMode ? "可选风格参考" : (isEditMode ? "风格参考" : "参考素材");
+    : (category === "video" ? "文生视频" : "链接反推");
+  const styleTitle = isImageEditMode || directProductVideoMode ? "可选风格参考" : (isEditMode ? "风格参考" : "参考素材");
   const styleDescription = isImageEditMode
     ? (portraitGenerationMode ? "可选：反推另一张图/视频的场景、光线、妆造和画面风格" : "可选：反推另一张图的场景、构图、光线和广告质感")
+    : directProductVideoMode
+    ? "可选：仅用于反推场景、动作、镜头和光影，不会替换上方产品主体"
     : isEditMode
     ? (portraitGenerationMode ? "目标视频/风格参考：只迁移动作、镜头、场景和画面质感，不保证逐帧换脸" : "用于反推场景、构图、光线和广告质感")
     : (category === "video" ? "上传视频或粘贴链接做反推" : "上传图片或粘贴链接做反推");
   const emptyStyleTitle = isImageEditMode
     ? "添加可选风格参考"
-    : (portraitGenerationMode ? "上传目标视频 / 风格参考" : category === "video" ? "上传视频 / 图片参考" : "上传图片参考");
+    : (portraitGenerationMode ? "上传目标视频 / 风格参考" : category === "video" ? "上传可选视频 / 图片参考" : "上传图片参考");
   const emptyStyleHint = isImageEditMode
     ? "不加也能编辑；需要同款风格时再上传或粘贴链接"
+    : directProductVideoMode
+    ? "不上传也能生成；这里的素材只提供风格和运动信息"
     : isEditMode
     ? (portraitGenerationMode ? "上传目标视频或粘贴链接，先反推镜头和风格，再上传人物照片做重构" : "也可粘贴小红书、抖音或网页链接抓取素材")
     : (category === "video" ? "点击上传视频，下方也可改传图片或粘贴链接" : "点击上传图片，下方也可粘贴链接抓取素材");
-  const productTitle = portraitGenerationMode ? "人物照片" : productGenerationMode ? "产品图片" : (isImageEditMode ? "编辑源图片" : "产品主体");
+  const productTitle = portraitGenerationMode ? "人物照片" : productSubjectMode ? "产品主体图片" : (isImageEditMode ? "编辑源图片" : "产品主体");
   const productHint = isImageEditMode
     ? (portraitGenerationMode
         ? "上传需要保留身份的人像照片，生成时强保护五官、脸型、发型和人物身份"
-        : productGenerationMode
+        : productSubjectMode
         ? "上传产品图作为唯一产品身份，生成时强保护Logo、包装和细节"
         : "上传需要被编辑的图片，未要求修改的内容默认保留")
     : (portraitGenerationMode
         ? "上传要生成进目标视频风格的人物照片，参考视频只提供动作、镜头和风格"
-        : "保留产品、Logo、包装、颜色、形状和文字标识");
+        : "上传产品图作为视频中的唯一商品主体，不作为风格参考；保留Logo、包装、颜色、形状和文字标识");
 
   return (
     <aside className="relative min-w-0 overflow-hidden rounded-xl3 border border-iris/35 bg-gradient-to-b from-iris/20 via-base2/80 to-rose/10 p-3 shadow-glow-sm">
@@ -99,7 +113,7 @@ export default function StudioReferencePanel({
       <div className="relative">
         <div className="mb-3 flex min-w-0 items-start justify-between gap-3">
           <div className="min-w-0">
-            <p className="text-xs font-display font-semibold text-iris-400">参考素材</p>
+            <p className="text-xs font-display font-semibold text-iris-400">{directProductVideoMode ? "产品与参考" : "参考素材"}</p>
             <h3 className="mt-1 text-lg font-display font-semibold text-snow">
               {modeTitle}
             </h3>
@@ -111,7 +125,7 @@ export default function StudioReferencePanel({
           )}
         </div>
 
-        {isImageEditMode && (
+        {(isImageEditMode || directProductVideoMode) && (
           <div className="mb-3 rounded-xl2 border border-aqua/30 bg-aqua/10 p-2">
             <div className="mb-2 flex items-start justify-between gap-2">
               <div>
@@ -132,7 +146,7 @@ export default function StudioReferencePanel({
                   <>
                     <ReferenceAssetPreview asset={productAsset} />
                     <span className="badge absolute left-2 top-2 bg-aqua/90 text-black">
-                      {portraitGenerationMode ? "人像" : productGenerationMode ? "产品图" : "编辑源"}
+                      {portraitGenerationMode ? "人像" : productSubjectMode ? "产品主体" : "编辑源"}
                     </span>
                   </>
                 ) : (
@@ -145,10 +159,16 @@ export default function StudioReferencePanel({
                     <span className="flex h-11 w-11 items-center justify-center rounded-full bg-aqua text-lg text-black shadow-glow-sm">+</span>
                     <div>
                       <span className="text-sm font-display font-medium text-snow">
-                        {portraitGenerationMode ? "上传人物照片" : productGenerationMode ? "上传产品图片" : "上传要编辑的图片"}
+                        {portraitGenerationMode ? "上传人物照片" : productSubjectMode ? "上传产品图片" : "上传要编辑的图片"}
                       </span>
                       <span className="mt-1 block text-xs text-fog">
-                        {portraitGenerationMode ? "作为人像身份参考" : productGenerationMode ? "作为高保真产品生成源" : "作为图片编辑源"}
+                        {portraitGenerationMode
+                          ? "作为人像身份参考"
+                          : directProductVideoMode
+                            ? "作为视频唯一产品主体，不是风格参考"
+                            : productSubjectMode
+                              ? "作为高保真产品生成源"
+                              : "作为图片编辑源"}
                       </span>
                     </div>
                   </button>
@@ -161,7 +181,7 @@ export default function StudioReferencePanel({
                 <div className="mt-1 text-fog">
                   {portraitGenerationMode
                     ? "生成时会锁定人物身份，只迁移参考素材的场景、光线、构图和风格。"
-                    : productGenerationMode
+                    : productSubjectMode
                     ? "生成时会锁定产品身份，只迁移或生成广告场景、光线、构图和质感。"
                     : "生成时会按提示词编辑这张图，未指定修改的部分默认保留。"}
                 </div>
@@ -174,8 +194,8 @@ export default function StudioReferencePanel({
               className="btn-secondary btn-sm mt-2 w-full justify-center border-aqua/30 bg-aqua/10 text-snow"
             >
               {uploading ? "上传中…" : productBusy ? "识别中…" : productAsset
-                ? (portraitGenerationMode ? "替换人物照片" : productGenerationMode ? "替换产品图片" : "替换编辑源图片")
-                : (portraitGenerationMode ? "上传人物照片" : productGenerationMode ? "上传产品图片" : "上传编辑源图片")}
+                ? (portraitGenerationMode ? "替换人物照片" : productSubjectMode ? "替换产品图片" : "替换编辑源图片")
+                : (portraitGenerationMode ? "上传人物照片" : productSubjectMode ? "上传产品图片" : "上传编辑源图片")}
             </button>
           </div>
         )}
@@ -227,7 +247,11 @@ export default function StudioReferencePanel({
             <div className="mt-2 min-w-0 rounded-xl border border-line bg-white/5 px-3 py-2 text-xs text-fog">
               <div className="truncate text-mist">{selectedLabel(selected)}</div>
               {selected?.type === "image" && selected?.url?.includes("/api/uploads/upload/") && (
-                <div className="mt-1 text-fog">{isEditMode ? "作为风格参考，不会覆盖产品主体。" : "可直接作为编辑源生成。"}</div>
+                <div className="mt-1 text-fog">
+                  {isEditMode || directProductVideoMode
+                    ? "仅作为风格参考，不会覆盖产品主体。"
+                    : "可直接作为编辑源生成。"}
+                </div>
               )}
               {selected?.type === "video" && selected?.url?.includes("/api/uploads/upload_video/") && (
                 <div className="mt-1 text-fog">会抽取关键帧理解内容，并提取镜头节奏和画面风格。</div>
@@ -277,7 +301,7 @@ export default function StudioReferencePanel({
                           ? "作为视频人物身份参考"
                           : isImageEditMode
                           ? "作为图片编辑源"
-                          : creationMode === "video_edit" ? "作为图生视频首帧和主体身份参考" : "作为图片编辑源"}
+                          : "作为产品身份参考，不限定视频首帧"}
                       </span>
                     </div>
                   </button>
@@ -292,7 +316,7 @@ export default function StudioReferencePanel({
                     ? "生成时会按提示词编辑这张图，未指定修改的部分默认保留。"
                     : portraitGenerationMode
                     ? "生成时保留这张人物照片的身份，目标视频只迁移动作、镜头和风格；当前不是逐帧换脸。"
-                    : "生成时只迁移风格参考的场景、光线、构图和广告质感。"}
+                    : "生成时以这张图片锁定同一产品身份，场景、动作和首尾画面由提示词决定。"}
                 </div>
               </div>
             )}
@@ -410,7 +434,7 @@ export default function StudioReferencePanel({
             className="hidden"
             onChange={(e) => onUploadVideo(e.target.files?.[0])}
           />
-          {isEditMode && (
+          {(isEditMode || directProductVideoMode) && (
             <input
               ref={productUploadInputRef}
               type="file"

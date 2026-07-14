@@ -7,7 +7,8 @@ import re
 from math import ceil
 from typing import Any
 
-COMPILER_VERSION = "video-prompt-v2"
+COMPILER_VERSION = "video-prompt-v4"
+VIDEO_SUBMIT_CONTRACT_VERSION = "video-submit-v3"
 PRODUCT_SUBJECT_LOCK = (
     "上传产品是唯一商品主体；仅锁定同一SKU的包装外形与比例、Logo、"
     "包装结构、品牌色、标签排版、可见文字和材质纹理。"
@@ -31,7 +32,8 @@ _EXPLICIT_STYLE_CONTEXT_RE = re.compile(
     r"风格|广告|色调|配色|光线|灯光|氛围|质感|日系|电影感|商业|写实|影棚|"
     r"自然光|柔光|侧光|逆光|轮廓光|顶光|微距|浅景深|景深|"
     r"特写|近景|中景|远景|广角|长焦|构图|视角|运镜|"
-    r"固定镜头|稳定镜头|手持镜头|镜头语言|镜头视角|镜头焦段|镜头运动",
+    r"固定镜头|稳定镜头|手持镜头|镜头语言|镜头视角|镜头焦段|镜头运动|"
+    r"色系|主调|冷暖|偏冷|偏暖|慢动作|稳定器|晃动|推拉",
     re.IGNORECASE,
 )
 _SCENE_CONTEXT_RE = re.compile(r"家庭浴室|浴室|卫生间|卧室|场景|背景", re.IGNORECASE)
@@ -71,6 +73,10 @@ _PRODUCT_VIDEO_STRATEGIES = {
     "soft_splash": (
         "产品视频策略：轻水花。水花、泡沫或颗粒只在产品底部和背景边缘运动，"
         "不覆盖 Logo、包装文字、正面标签和产品轮廓。"
+    ),
+    "single_clip_action": (
+        "产品视频策略：单段动作展示。按场景脚本连续完成一次核心产品交互，"
+        "动作后以产品结构或材质细节清晰可见的近景收束。"
     ),
 }
 DEFAULT_VIDEO_MODEL_PROFILES: dict[str, dict[str, Any]] = {
@@ -161,6 +167,20 @@ def _join_unique(*values: str) -> str:
     return "；".join(parts)
 
 
+def _join_voiceovers(*values: str) -> str:
+    """Deduplicate voiceover blocks without stripping sentence punctuation."""
+    parts: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        for part in re.split(r"[\n；;]+", str(value or "")):
+            item = part.strip()
+            key = re.sub(r"\s+", "", item).lower()
+            if key and key not in seen:
+                seen.add(key)
+                parts.append(item)
+    return "；".join(parts)
+
+
 def _unique_items(values: list[str]) -> list[str]:
     unique: list[str] = []
     seen: set[str] = set()
@@ -218,6 +238,116 @@ def video_action_requirements(shots: list[str]) -> list[str]:
         if requirement:
             requirements.append(requirement)
     return requirements
+
+
+_PRODUCT_INTERACTION_RE = re.compile(
+    r"抽出|拉出|取出|泵出|挤出|打开|揭开|拿起|按压",
+    re.IGNORECASE,
+)
+_PRODUCT_CONSTRAINT_RE = re.compile(
+    r"尺寸\s*[:：]|长\s*\d|宽\s*\d|高\s*\d|\d+(?:\.\d+)?\s*cm\s*见方|"
+    r"与?参考图保持相同|同一\s*SKU|包装图.*保持相同|纹路\s*(?:为|是|[:：])",
+    re.IGNORECASE,
+)
+
+
+def _extract_single_clip_constraints(shots: list[str]) -> tuple[list[str], str]:
+    cleaned_shots: list[str] = []
+    constraints: list[str] = []
+    for shot in shots:
+        parts = re.split(r"视频画面要求\s*[:：]", shot, maxsplit=1)
+        if len(parts) == 2 and _PRODUCT_CONSTRAINT_RE.search(parts[0]):
+            constraints.append(parts[0].strip())
+            if parts[1].strip():
+                cleaned_shots.append(parts[1].strip())
+            continue
+        cleaned_shots.append(shot)
+    return cleaned_shots, _join_unique(*constraints)
+
+
+_TECHNICAL_PRIORITY_RE = re.compile(
+    r"参考|同一|SKU|Logo|文字|包装|尺寸|比例|纹理|纹路|材质|身份|时长|画面无字",
+    re.IGNORECASE,
+)
+
+
+def compact_single_clip_prompt(
+    *,
+    style: str,
+    shots: list[str],
+    technical: str,
+    budget: int,
+    mandatory_technical: str = "",
+) -> dict[str, Any]:
+    """Compact optional context without shortening any user action."""
+    budget = max(80, int(budget or 80))
+    compact_style = clean_video_prompt_section(style)
+    compact_shots = [clean_video_prompt_section(shot) for shot in shots if clean_video_prompt_section(shot)]
+    compact_technical = clean_video_prompt_section(technical)
+
+    def render() -> str:
+        parts = [f"风格设定：{compact_style}", "场景脚本："]
+        parts.extend(
+            f"Shot {index}：{shot}" for index, shot in enumerate(compact_shots, start=1)
+        )
+        parts.append(f"技术约束：{compact_technical}")
+        return "\n".join(parts)
+
+    prompt = render()
+    if len(prompt) > budget:
+        style_clauses = _clauses(compact_style)
+        technical_clauses = _clauses(compact_technical)
+        mandatory_clauses = _clauses(mandatory_technical)
+        mandatory_keys = {
+            re.sub(r"\s+", "", clause).lower() for clause in mandatory_clauses
+        }
+        required_technical = [
+            clause
+            for clause in technical_clauses
+            if re.sub(r"\s+", "", clause).lower() in mandatory_keys
+            or _TECHNICAL_PRIORITY_RE.search(clause)
+        ]
+        optional_technical = [
+            clause for clause in technical_clauses if clause not in required_technical
+        ]
+
+        # Keep the three-section contract and never remove product identity rules.
+        compact_style = style_clauses[0] if style_clauses else ""
+        compact_technical = "；".join(
+            required_technical or technical_clauses[:1]
+        )
+
+        def append_if_fits(current: str, clause: str, *, target: str) -> str:
+            nonlocal compact_style, compact_technical
+            candidate = "；".join(part for part in (current, clause) if part)
+            previous = compact_style if target == "style" else compact_technical
+            if target == "style":
+                compact_style = candidate
+            else:
+                compact_technical = candidate
+            if len(render()) <= budget:
+                return candidate
+            if target == "style":
+                compact_style = previous
+            else:
+                compact_technical = previous
+            return current
+
+        for clause in optional_technical:
+            compact_technical = append_if_fits(
+                compact_technical,
+                clause,
+                target="technical",
+            )
+        for clause in style_clauses[1:]:
+            compact_style = append_if_fits(compact_style, clause, target="style")
+        prompt = render()
+    return {
+        "prompt": prompt,
+        "style": compact_style,
+        "shots": compact_shots,
+        "technical": compact_technical,
+    }
 
 
 VIDEO_SECTION_ALIASES = {
@@ -400,6 +530,16 @@ def split_video_post_production(text: str) -> dict[str, Any]:
         flags=post_flags,
     )
     text = re.sub(
+        boundary
+        + voiceover_label
+        + r"\s*[:：]?\s*"
+        + open_quote
+        + r"(?P<content>[^\n。；;]+)$",
+        remove_voiceover,
+        text,
+        flags=post_flags,
+    )
+    text = re.sub(
         boundary + voiceover_label + r"\s*[:：]?\s*(?P<content>[^\n。；;\uff0c,]+)",
         remove_voiceover,
         text,
@@ -488,19 +628,35 @@ def _parse_text_prompt(text: str) -> dict[str, Any]:
     if len(numbered) > 1:
         style = numbered[0].strip(" ,，。；;")
         shots = [part.strip(" ,，。；;") for part in numbered[1:] if part.strip(" ,，。；;")]
+        technical_constraints = ""
     else:
-        parts = _unlabelled_parts(text)
-        if parts and _looks_like_global_context(parts[0]):
-            style = parts[0]
-            shots = parts[1:]
+        action_marker = re.search(r"视频画面要求\s*[:：]", text)
+        technical_constraints = ""
+        if action_marker:
+            prefix_parts = _clauses(text[: action_marker.start()])
+            constraint_index = next(
+                (
+                    index
+                    for index, part in enumerate(prefix_parts)
+                    if _PRODUCT_CONSTRAINT_RE.search(part)
+                ),
+                len(prefix_parts),
+            )
+            style = _join_unique(*prefix_parts[:constraint_index])
+            technical_constraints = _join_unique(*prefix_parts[constraint_index:])
+            shots = _unlabelled_parts(text[action_marker.end() :])
         else:
-            style = ""
+            parts = _unlabelled_parts(text)
+            style_parts: list[str] = []
+            while parts and _looks_like_global_context(parts[0]):
+                style_parts.append(parts.pop(0))
+            style = _join_unique(*style_parts)
             shots = parts
     return {
         "global_style": style,
         "subject_lock": "",
         "shots": shots,
-        "technical_constraints": "",
+        "technical_constraints": technical_constraints,
         "post_overlays": post["post_overlays"],
         "voiceover": post["voiceover"],
         "sfx": post["sfx"],
@@ -571,6 +727,22 @@ def parse_video_prompt(raw_prompt: str | dict[str, Any]) -> dict[str, Any]:
             sfx = manual["sfx"] or sfx
         else:
             raw_prompt_voiceover = structured_voiceover
+        cleaned_shots: list[str] = []
+        shot_overlays: list[str] = []
+        shot_voiceovers: list[str] = []
+        shot_sfx: list[str] = []
+        for shot in shots:
+            shot_post = split_video_post_production(shot)
+            if shot_post["text"]:
+                cleaned_shots.append(shot_post["text"])
+            shot_overlays.extend(shot_post["post_overlays"])
+            if shot_post["voiceover"]:
+                shot_voiceovers.append(shot_post["voiceover"])
+            shot_sfx.extend(shot_post["sfx"])
+        shots = cleaned_shots
+        overlays = _unique_items([*overlays, *shot_overlays])
+        raw_prompt_voiceover = _join_voiceovers(raw_prompt_voiceover, *shot_voiceovers)
+        sfx = _unique_items([*sfx, *shot_sfx])
         if style or shots or technical_constraints or overlays or raw_prompt_voiceover or sfx:
             if not shots:
                 fallback = _parse_text_prompt(
@@ -706,6 +878,7 @@ def compile_video_prompt(
     product_lock_mode: str = "locked",
     product_video_template: str = "stable_showcase",
     model_profiles: dict[str, dict[str, Any]] | None = None,
+    fit_mode: str = "strict_sequence",
 ) -> dict[str, Any]:
     """Return a structured plan and a model-ready prompt."""
     plan = parse_video_prompt(raw_prompt)
@@ -776,17 +949,18 @@ def compile_video_prompt(
     normalized_lock_mode = "free" if str(product_lock_mode).lower() == "free" else "locked"
     normalized_template = str(product_video_template or "stable_showcase").lower().strip()
     product_strategy = ""
+    locked_product_guard = ""
     if has_product_reference:
         product_strategy = _PRODUCT_VIDEO_STRATEGIES.get(
             normalized_template,
             _PRODUCT_VIDEO_STRATEGIES["stable_showcase"],
         )
         if normalized_lock_mode == "locked":
-            product_strategy = (
+            locked_product_guard = (
                 "文字保真模式：包装正面、Logo 和主要文字持续清晰可见，"
                 "避免快速旋转、翻面、强运动模糊、遮挡或裁切产品。"
-                f"{product_strategy}"
             )
+            product_strategy = f"{locked_product_guard}{product_strategy}"
         plan["product_strategy"] = product_strategy
     profile = infer_video_model_profile(
         model_id=model_id,
@@ -795,49 +969,115 @@ def compile_video_prompt(
         extra=extra,
         model_profiles=model_profiles,
     )
-    shot_count = len(plan["shots"])
-    max_shots = int(profile["recommended_max_shots"])
-    prompt_parts = []
-    if plan["global_style"]:
-        prompt_parts.append(f"风格设定：{plan['global_style']}")
-    if plan["shots"]:
-        prompt_parts.append("场景脚本：")
-        prompt_parts.extend(
-            f"Shot {number}：{shot}" for number, shot in enumerate(plan["shots"], start=1)
+    normalized_fit_mode = (
+        "single_clip" if str(fit_mode).strip().lower() == "single_clip" else "strict_sequence"
+    )
+    if normalized_fit_mode == "single_clip":
+        plan["shots"], promoted_constraints = _extract_single_clip_constraints(plan["shots"])
+        plan["technical_constraints"] = _join_unique(
+            plan["technical_constraints"],
+            promoted_constraints,
         )
+    source_shots = list(plan["shots"])
+    source_shot_count = len(source_shots)
+    max_shots = int(profile["recommended_max_shots"])
+    if normalized_fit_mode == "single_clip" and source_shot_count > max_shots:
+        plan["warnings"].append(
+            f"当前 {duration:g} 秒单视频包含 {source_shot_count} 个动作段落，动作密度较高；"
+            "已保留全部用户动作，模型可能弱化部分细节。"
+        )
+    if (
+        normalized_fit_mode == "single_clip"
+        and has_product_reference
+        and normalized_template == "stable_showcase"
+        and any(_PRODUCT_INTERACTION_RE.search(shot) for shot in plan["shots"])
+    ):
+        product_strategy = (
+            f"{locked_product_guard}{_PRODUCT_VIDEO_STRATEGIES['single_clip_action']}"
+        )
+        plan["product_strategy"] = product_strategy
+    shot_count = len(plan["shots"])
+    prompt_parts = [f"风格设定：{plan['global_style']}", "场景脚本："]
+    prompt_parts.extend(
+        f"Shot {number}：{shot}" for number, shot in enumerate(plan["shots"], start=1)
+    )
     technical_parts = [plan["technical_constraints"]]
+    mandatory_technical_parts = [plan["technical_constraints"]]
     if product_lock:
-        technical_parts.append(f"产品身份约束：{product_lock}")
+        product_identity_constraint = f"产品身份约束：{product_lock}"
+        technical_parts.append(product_identity_constraint)
+        mandatory_technical_parts.append(product_identity_constraint)
     if portrait_lock:
-        technical_parts.append(f"人物身份约束：{portrait_lock}")
+        portrait_identity_constraint = f"人物身份约束：{portrait_lock}"
+        technical_parts.append(portrait_identity_constraint)
+        mandatory_technical_parts.append(portrait_identity_constraint)
     if plan["subject_lock"] and not (product_lock or portrait_lock):
-        technical_parts.append(f"主体锁定：{plan['subject_lock']}")
+        subject_constraint = f"主体锁定：{plan['subject_lock']}"
+        technical_parts.append(subject_constraint)
+        mandatory_technical_parts.append(subject_constraint)
     if product_strategy:
         technical_parts.append(product_strategy)
     technical_parts.extend(reference_guidance)
+    mandatory_technical_parts.extend(reference_guidance)
     technical_text = _join_unique(*technical_parts)
-    if technical_text:
-        prompt_parts.append(f"技术约束：{technical_text}")
+    mandatory_technical_text = _join_unique(*mandatory_technical_parts)
+    prompt_parts.append(f"技术约束：{technical_text}")
     prompt = "\n".join(prompt_parts)
     prompt_char_count = len(prompt)
     prompt_budget_chars = max(1, int(profile.get("prompt_budget_chars") or 1))
+    compacted_for_budget = False
+    if normalized_fit_mode == "single_clip" and prompt_char_count > prompt_budget_chars:
+        compacted = compact_single_clip_prompt(
+            style=plan["global_style"],
+            shots=plan["shots"],
+            technical=technical_text,
+            budget=prompt_budget_chars,
+            mandatory_technical=mandatory_technical_text,
+        )
+        prompt = str(compacted["prompt"])
+        plan["global_style"] = str(compacted["style"])
+        plan["shots"] = list(compacted["shots"])
+        technical_text = str(compacted["technical"])
+        prompt_char_count = len(prompt)
+        compacted_for_budget = True
+        plan["warnings"].append(
+            f"已按单视频提示词预算将模型输入精简至 {prompt_char_count} 字符。"
+        )
     shot_overload = shot_count > max_shots
     prompt_overload = prompt_char_count > prompt_budget_chars
-    sequence_required = shot_overload or prompt_overload
+    sequence_required = normalized_fit_mode != "single_clip" and (
+        prompt_overload or shot_overload
+    )
     if shot_overload:
-        plan["warnings"].append(
-            f"当前 {duration:g} 秒/{profile['family']} 建议最多 {max_shots} 个镜头；"
-            f"已保留全部 {shot_count} 个镜头，请拆分为多段生成。"
-        )
+        if normalized_fit_mode == "single_clip":
+            plan["warnings"].append(
+                f"当前 {duration:g} 秒/{profile['family']} 常规建议最多 {max_shots} 个镜头；"
+                f"单视频模式已保留全部 {shot_count} 个动作段落。"
+            )
+        else:
+            plan["warnings"].append(
+                f"当前 {duration:g} 秒/{profile['family']} 建议最多 {max_shots} 个镜头；"
+                f"已保留全部 {shot_count} 个镜头，请拆分为多段生成。"
+            )
     if prompt_overload:
-        plan["warnings"].append(
-            f"当前模型提示词预算约 {prompt_budget_chars} 字符；"
-            f"已保留全部 {prompt_char_count} 字符，请拆分为多段生成。"
+        if normalized_fit_mode == "single_clip":
+            plan["warnings"].append(
+                f"当前模型提示词预算约 {prompt_budget_chars} 字符；"
+                "单视频模式已保留全部动作和产品硬约束，模型可能弱化部分细节。"
+            )
+        else:
+            plan["warnings"].append(
+                f"当前模型提示词预算约 {prompt_budget_chars} 字符；"
+                f"已保留全部 {prompt_char_count} 字符，请拆分为多段生成。"
+            )
+    recommended_clip_count = (
+        1
+        if normalized_fit_mode == "single_clip"
+        else max(
+            1,
+            ceil(shot_count / max_shots),
+            ceil(prompt_char_count / prompt_budget_chars),
         )
-    recommended_clip_count = max(
-        1,
-        ceil(shot_count / max_shots),
-        ceil(prompt_char_count / prompt_budget_chars),
     )
     return {
         "prompt": prompt,
@@ -850,9 +1090,17 @@ def compile_video_prompt(
             "model_id": model_id,
             "provider": provider,
             "shot_count": shot_count,
+            "source_shot_count": source_shot_count,
+            "selected_shot_count": shot_count,
             "prompt_char_count": prompt_char_count,
             "prompt_budget_chars": prompt_budget_chars,
-            "omitted_shot_count": 0,
+            "prompt_over_budget": prompt_overload,
+            "omitted_shot_count": max(0, source_shot_count - shot_count),
+            "condensed_for_single_clip": (
+                normalized_fit_mode == "single_clip" and source_shot_count > shot_count
+            ),
+            "compacted_for_budget": compacted_for_budget,
+            "fit_mode": normalized_fit_mode,
             "recommended_clip_count": recommended_clip_count,
             "reference_roles": sorted(reference_roles),
             "motion_reference_mode": (
@@ -921,6 +1169,7 @@ def build_video_prompt_references(
         else "first_frame"
     )
     for key, role in (
+        ("product_reference_image", "product"),
         ("reference_image_url", reference_role),
         ("first_frame_image", "first_frame"),
         ("last_frame_image", "last_frame"),
@@ -946,6 +1195,7 @@ def store_video_prompt_compile(
     params["_video_prompt_metadata"] = dict(compiled.get("metadata") or {})
     params["_video_reference_roles"] = references
     params["_prompt_compiler_version"] = str(compiled.get("compiler_version") or "").strip()
+    params["_video_submit_contract_version"] = VIDEO_SUBMIT_CONTRACT_VERSION
     params["_post_overlays"] = list(plan.get("post_overlays") or [])
     params["_voiceover"] = str(plan.get("voiceover") or "").strip()
     params["_sfx"] = list(plan.get("sfx") or [])
