@@ -2796,6 +2796,10 @@ def test_uploaded_product_video_uses_high_fidelity_reference_and_negative_prompt
     assert client.put("/api/admin/models", json={
         "use": "video",
         "model_id": "mock-video",
+        "provider": "custom_openai",
+        "base_url": "https://example.com",
+        "api_key": "sk-test-video-model-key",
+        "gateway_format": "openai",
         "cost_credits": 50,
         "unlock_cost": 0,
         "enabled": True,
@@ -2805,7 +2809,7 @@ def test_uploaded_product_video_uses_high_fidelity_reference_and_negative_prompt
 
     up = client.post(
         "/api/uploads/image",
-        files={"file": ("product.png", _png_bytes(size=(2000, 1200)), "image/png")},
+        files={"file": ("product.png", _png_bytes(size=(3000, 1800)), "image/png")},
         headers=h,
     )
     assert up.status_code == 200, up.text
@@ -2838,7 +2842,7 @@ def test_uploaded_product_video_uses_high_fidelity_reference_and_negative_prompt
     assert "Logo扭曲" in seen["negative_prompt"]
     ref_bytes = base64.b64decode(seen["product_reference_image"].split(",", 1)[1])
     ref_img = Image.open(io.BytesIO(ref_bytes))
-    assert max(ref_img.size) == 1280
+    assert max(ref_img.size) == 2048
 
 
 def test_product_video_localizes_explicit_last_frame_without_inventing_first_frame(

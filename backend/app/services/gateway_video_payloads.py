@@ -150,19 +150,33 @@ def ark_text(prompt: str, params: dict) -> str:
     return "  ".join(parts)
 
 
+def _bind_ark_product_reference(text: str, image_number: int) -> str:
+    """Bind generic upload wording to Ark's required image-number syntax."""
+    product_ref = f"图片{image_number}中的产品"
+    for marker in (
+        "上传的产品图片",
+        "上传的产品图",
+        "上传产品图片",
+        "上传产品图",
+        "上传产品",
+    ):
+        text = text.replace(marker, product_ref)
+    return text
+
+
 def ark_content(prompt: str, params: dict) -> list:
     content = [{"type": "text", "text": ark_text(prompt, params)}]
     seen_images: set[tuple[str, str]] = set()
     role_notes: list[str] = []
 
-    def append_image(value, *, role: str, note: str) -> None:
+    def append_image(value, *, role: str) -> int | None:
         if not value:
-            return
+            return None
         key = (str(value), role)
         if key in seen_images:
-            return
+            return None
         seen_images.add(key)
-        image_number = len(content)
+        image_number = 1 + sum(item.get("type") == "image_url" for item in content)
         content.append(
             {
                 "type": "image_url",
@@ -170,30 +184,37 @@ def ark_content(prompt: str, params: dict) -> list:
                 "role": role,
             }
         )
-        role_notes.append(f"第{image_number}张图片为{note}")
+        return image_number
 
     img = params.get("first_frame_image")
-    append_image(img, role="first_frame", note="首帧")
+    first_number = append_image(img, role="first_frame")
+    if first_number:
+        role_notes.append(f"图片{first_number}为首帧")
     last = params.get("last_frame_image")
-    append_image(last, role="last_frame", note="尾帧")
+    last_number = append_image(last, role="last_frame")
+    if last_number:
+        role_notes.append(f"图片{last_number}为尾帧")
     product = params.get("product_reference_image")
-    append_image(
-        product,
-        role="reference_image",
-        note="产品身份参考，仅锁定同一SKU的包装、Logo、文字和材质纹理，不要求作为首帧",
-    )
+    product_number = append_image(product, role="reference_image")
+    if product_number:
+        content[0]["text"] = _bind_ark_product_reference(
+            content[0]["text"],
+            product_number,
+        )
+        role_notes.append(
+            f"图片{product_number}中的产品是唯一商品主体；图片{product_number}为产品身份参考，"
+            "仅锁定同一SKU的包装、Logo、文字和材质纹理，不要求作为首帧"
+        )
     style = params.get("style_reference_image")
-    append_image(
-        style,
-        role="reference_image",
-        note="风格参考，仅迁移色调、光线、材质和商业质感",
-    )
+    style_number = append_image(style, role="reference_image")
+    if style_number:
+        role_notes.append(
+            f"图片{style_number}为风格参考，仅迁移色调、光线、材质和商业质感"
+        )
     character = params.get("character_reference_image")
-    append_image(
-        character,
-        role="reference_image",
-        note="人物身份参考，仅锁定同一人物身份",
-    )
+    character_number = append_image(character, role="reference_image")
+    if character_number:
+        role_notes.append(f"图片{character_number}为人物身份参考，仅锁定同一人物身份")
     if role_notes:
         content[0]["text"] = f"{content[0]['text']}  图片角色：{'；'.join(role_notes)}。"
     return content

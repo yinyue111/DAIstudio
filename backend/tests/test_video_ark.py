@@ -94,7 +94,7 @@ def test_ark_content_includes_distinct_character_reference():
 
 def test_ark_content_sends_product_identity_reference_without_frame_role():
     content = gateway._ark_content(
-        "产品从稍远景进入画面，随后手从包装底部抽出洗脸巾",
+        "以上传产品图为唯一商品主体，产品从稍远景进入画面，随后手从包装底部抽出洗脸巾",
         {"product_reference_image": "http://x/product.png", "duration": 10},
     )
 
@@ -102,8 +102,26 @@ def test_ark_content_sends_product_identity_reference_without_frame_role():
     assert content[1]["image_url"]["url"] == "http://x/product.png"
     assert content[1]["role"] == "reference_image"
     assert "产品身份参考" in content[0]["text"]
-    assert "第1张图片为首帧" not in content[0]["text"]
-    assert "第1张图片为尾帧" not in content[0]["text"]
+    assert "图片1中的产品" in content[0]["text"]
+    assert "上传产品图" not in content[0]["text"]
+    assert "第1张图片" not in content[0]["text"]
+
+
+def test_ark_content_binds_product_to_its_actual_image_number():
+    content = gateway._ark_content(
+        "上传产品是唯一产品身份，保持包装文字清晰",
+        {
+            "first_frame_image": "http://x/first.png",
+            "product_reference_image": "http://x/product.png",
+        },
+    )
+
+    assert content[1]["role"] == "first_frame"
+    assert content[2]["role"] == "reference_image"
+    assert "图片1为首帧" in content[0]["text"]
+    assert "图片2中的产品是唯一商品主体" in content[0]["text"]
+    assert "图片2中的产品是唯一产品身份" in content[0]["text"]
+    assert "上传产品" not in content[0]["text"]
 
 
 def test_ark_content_includes_distinct_style_reference():

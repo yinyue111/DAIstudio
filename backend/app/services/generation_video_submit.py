@@ -71,7 +71,7 @@ from .video_prompt_compiler import (
 log = logging.getLogger("generation")
 VIDEO_FIRST_FRAME_MIN_SIDE = 300
 VIDEO_FIRST_FRAME_MAX_SIDE = 768
-PRODUCT_VIDEO_REFERENCE_MAX_SIDE = 1280
+PRODUCT_VIDEO_REFERENCE_MAX_SIDE = 2048
 
 
 class VideoSubmitVersionMismatch(RuntimeError):
