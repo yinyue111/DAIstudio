@@ -613,6 +613,7 @@ _NON_PHYSICAL_PRODUCT_CONTEXT_RE = re.compile(
     re.IGNORECASE,
 )
 _PRODUCT_VIDEO_TEMPLATE_LABELS = {
+    "prompt_driven": "提示词驱动",
     "reference_sequence": "参考分镜",
     "stable_showcase": "稳定陈列",
     "slow_push": "慢速推近",
@@ -687,12 +688,20 @@ def _required_video_prompt_constraints(
         constraints.append("同一 SKU 的包装外形与比例、Logo、品牌色、可见文字、材质和纹理保持一致")
         constraints.append("不得新增用户未提供的商品、配件或突兀道具")
         if product_lock_mode == "locked":
-            constraints.append("文字保真，避免遮挡、裁切、快速旋转和运动模糊")
+            if str(product_video_template or "").strip().lower() == "prompt_driven":
+                constraints.append("文字保真，避免遮挡、裁切和运动模糊")
+            else:
+                constraints.append("文字保真，避免遮挡、裁切、快速旋转和运动模糊")
         template = str(product_video_template or "").strip().lower()
         if template:
             label = _PRODUCT_VIDEO_TEMPLATE_LABELS.get(template, template)
             constraints.append(f"产品视频策略 {template}（{label}）")
-    constraints.append("画面无字，精确字幕、旁白和音效仅后期添加")
+        constraints.append(
+            "不得生成无关文字、错误品牌或水印；准确保留产品包装原有文字，"
+            "并按用户要求显示指定卖点文字"
+        )
+    else:
+        constraints.append("画面无字，精确字幕、旁白和音效仅后期添加")
     return constraints
 
 
@@ -703,6 +712,7 @@ def _normalize_video_optimizer_output(
     required_constraints: list[str],
     recommended_max_shots: int,
     prompt_budget_chars: int,
+    preserve_requested_post_production: bool = False,
 ) -> dict:
     sections = parse_structured_video_sections(content)
     if sections is None:
@@ -743,9 +753,27 @@ def _normalize_video_optimizer_output(
             f"{index}. {shot}" for index, shot in enumerate(missing_source_shots, start=1)
         )
         original_action_constraint = f"必须完整执行且不得替换的原始动作要求（按顺序）：{inventory}"
+    requested_post_constraints: list[str] = []
+    if preserve_requested_post_production:
+        requested_post = split_video_post_production(source)
+        if requested_post["post_overlays"]:
+            requested_post_constraints.append(
+                "用户指定卖点文字："
+                + "；".join(requested_post["post_overlays"])
+                + "，按原文准确显示"
+            )
+        if requested_post["voiceover"]:
+            requested_post_constraints.append(
+                f"用户指定旁白：{requested_post['voiceover']}"
+            )
+        if requested_post["sfx"]:
+            requested_post_constraints.append(
+                "用户指定音效：" + "；".join(requested_post["sfx"])
+            )
     constraint_text = merge_video_constraint_clauses(
         constraints,
         *required_constraints,
+        *requested_post_constraints,
         original_action_constraint,
     )
     normalized = render_structured_video_prompt(
@@ -900,6 +928,7 @@ def optimize_prompt(
                 required_constraints=required_video_constraints,
                 recommended_max_shots=max_shots,
                 prompt_budget_chars=prompt_budget_chars,
+                preserve_requested_post_production=effective_product_mode,
             )
             optimized_prompt = normalized["prompt"]
             _assert_complete_video_optimizer_output(optimized_prompt)
@@ -915,13 +944,25 @@ def optimize_prompt(
             "context_metadata": context_metadata,
         }
     if effective_product_mode:
-        focus = (
-            "这是产品图片生成提示词。补强产品主体、SKU一致性、包装结构、材质、Logo与可见文字保真、"
-            "完整入镜、商业构图、产品与场景的空间关系和光线。"
-            if category == "image"
-            else "这是产品视频生成提示词。补强产品主体、SKU一致性、包装结构、材质、Logo与可见文字保真、"
-            "镜头运动、展示节奏、产品完整入镜，并避免快速旋转、遮挡和文字模糊。"
+        prompt_driven_product_video = (
+            category == "video"
+            and str(product_video_template or "").strip().lower() == "prompt_driven"
         )
+        if category == "image":
+            focus = (
+                "这是产品图片生成提示词。补强产品主体、SKU一致性、包装结构、材质、Logo与可见文字保真、"
+                "完整入镜、商业构图、产品与场景的空间关系和光线。"
+            )
+        elif prompt_driven_product_video:
+            focus = (
+                "这是产品视频生成提示词。补强产品主体、SKU一致性、包装结构、材质、Logo与可见文字保真、"
+                "镜头运动、展示节奏、产品完整入镜，并避免遮挡和文字模糊。"
+            )
+        else:
+            focus = (
+                "这是产品视频生成提示词。补强产品主体、SKU一致性、包装结构、材质、Logo与可见文字保真、"
+                "镜头运动、展示节奏、产品完整入镜，并避免快速旋转、遮挡和文字模糊。"
+            )
         focus += (
             "不得凭空新增参考图或用户输入中不存在的纸巾、花瓶、植物及其他道具；"
             "参考图已有道具仅可保留并与产品、台面和场景自然融合，不得增殖、放大、悬浮或突兀贴附。"
@@ -947,9 +988,17 @@ def optimize_prompt(
         video_constraints = (
             f"目标生成模型为 {target_name}（{provider_name}）。{density_rule}"
             "原稿超载时优先保留核心连续动作，不承诺在单次生成中完成过多场景和动作。"
-            "将精确字幕、卖点文字和旁白改写为后期叠字与后期配音要求，"
-            "画面保持无字，不要求视频模型渲染精确字幕或旁白。"
         )
+        if effective_product_mode:
+            video_constraints += (
+                "保留用户明确要求的卖点文字、旁白和音效，并写入对应场景脚本或技术约束；"
+                "不得删除、改写或一律转为后期。不得生成无关文字、错误品牌或水印。"
+            )
+        else:
+            video_constraints += (
+                "将精确字幕、卖点文字和旁白改写为后期叠字与后期配音要求，"
+                "画面保持无字，不要求视频模型渲染精确字幕或旁白。"
+            )
         if effective_product_mode and reference_type:
             video_constraints += (
                 "产品参考图只锁定产品身份，包括 SKU、包装结构、Logo、颜色、材质和纹理；"
@@ -1032,6 +1081,7 @@ def optimize_prompt(
             required_constraints=required_video_constraints,
             recommended_max_shots=max_shots,
             prompt_budget_chars=prompt_budget_chars,
+            preserve_requested_post_production=effective_product_mode,
         )
         optimized = normalized["prompt"]
         _assert_complete_video_optimizer_output(optimized)

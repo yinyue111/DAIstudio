@@ -60,6 +60,7 @@ _VIDEO_PARAM_KEYS = _COMMON_PARAM_KEYS | {
 _SUBJECT_MODES = {"general", "product", "portrait"}
 _PRODUCT_LOCK_MODES = {"locked", "free"}
 _PRODUCT_VIDEO_TEMPLATES = {
+    "prompt_driven",
     "stable_showcase",
     "reference_sequence",
     "slow_push",

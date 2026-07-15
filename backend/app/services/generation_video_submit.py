@@ -99,7 +99,7 @@ def _compile_legacy_video_prompt(task: GenTask, model, params: dict) -> tuple[st
         product_reference=any(item.get("role") == "product" for item in references),
         portrait_reference=any(item.get("role") == "character" for item in references),
         product_lock_mode=str(params.get("product_lock_mode") or "locked"),
-        product_video_template=str(params.get("product_video_template") or "stable_showcase"),
+        product_video_template=str(params.get("product_video_template") or "prompt_driven"),
         model_profiles=model_profiles,
         fit_mode="single_clip",
     )

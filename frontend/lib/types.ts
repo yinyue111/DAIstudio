@@ -89,8 +89,6 @@ export interface WorkspaceState {
   vResolution: string;
   editMaskMode: "protect_subject" | "center_box" | "off";
   productPixelLockMode: ProductPixelLockMode;
-  videoProductLockMode: "locked" | "free";
-  videoProductTemplate: string;
   videoAnalysisPreset: string;
   url: string;
   parsing: boolean;

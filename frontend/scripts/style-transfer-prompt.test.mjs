@@ -58,10 +58,12 @@ const productVideoStylePrompt = composeStyleTransferPrompt({
 
 assert.match(productVideoStylePrompt, /上传产品作为唯一视频主体/);
 assert.match(productVideoStylePrompt, /替换参考片中的原主体/);
-assert.match(productVideoStylePrompt, /展示节奏/);
+assert.match(productVideoStylePrompt, /具体动作、运镜、节奏和先后顺序/);
 assert.match(productVideoStylePrompt, /镜头从左侧入场/);
 assert.match(productVideoStylePrompt, /产品缓慢旋转/);
 assert.match(productVideoStylePrompt, /缓慢推进并轻微环绕/);
+assert.match(productVideoStylePrompt, /包装结构、Logo、可见文字、颜色和材质纹理连续一致/);
+assert.doesNotMatch(productVideoStylePrompt, /避免快速旋转|稳定陈列/);
 assert.doesNotMatch(productVideoStylePrompt, /Estee Lauder/i);
 assert.doesNotMatch(productVideoStylePrompt, /Advanced Night Repair/i);
 assert.doesNotMatch(productVideoStylePrompt, /skincare bottle/i);

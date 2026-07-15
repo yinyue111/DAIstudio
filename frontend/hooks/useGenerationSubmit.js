@@ -52,8 +52,6 @@ export default function useGenerationSubmit({
   productPixelLockMode,
   vDuration,
   vResolution,
-  videoProductLockMode,
-  videoProductTemplate,
   resultsRef,
   modelEnabled,
   setMsg,
@@ -280,8 +278,6 @@ export default function useGenerationSubmit({
         productPixelLockMode,
         vDuration,
         vResolution,
-        videoProductLockMode,
-        videoProductTemplate,
       });
       payload.client_request_id = generateClientRequestId(
         pendingGenerateRequestRef,

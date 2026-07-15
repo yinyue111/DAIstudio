@@ -4,6 +4,92 @@ from app.services.video_prompt_compiler import (
     infer_video_model_profile,
 )
 
+DIRECT_PRODUCT_VIDEO_PROMPT = (
+    "视频风格要求是高端日系的美妆个护拍摄风格，强调自然、亲肤、安心；"
+    "画面以粉绿、米白、奶油色系为主调，冷暖平衡，偏冷但不刺眼；"
+    "镜头多用特写、微距、中景，慢动作加轻微推拉，稳定器拍摄感；"
+    "场景为真实家庭浴室。产品外包装长20cm宽10cm高24cm，洗脸巾20cm见方，"
+    "纹路为3D如意云纹，包装图和洗脸巾纹路与上传产品图保持相同。"
+    "女主走到悬挂包装处，从下方抽出一张洗脸巾；推近放大纹理，手指捏住边缘缓慢展开，"
+    "双手对折再展开展示厚度；俯拍洗脸巾浸水并形成扩散波纹，文字“干湿两用”浮现，水滴落水声；"
+    "双手拧干，水流飞溅，文字“厚实吸水”出现；侧脸特写，洗脸巾轻拭脸颊，文字“亲肤”浮现；"
+    "展开洗脸巾擦拭手臂，展示背面压纹，文字“加大加厚 克重95g/㎡”浮现；"
+    "双手撕开展示无弹力纤维，文字“耐拉扯 不易掉絮”浮现；"
+    "最后包装置于白色圆桌中央，周围为香薰棒、毛巾和白玫瑰；"
+    "温柔女声旁白：“让洗脸这件事，成为一天温柔的开始。”"
+)
+
+
+def test_direct_product_video_passthrough_preserves_model_facing_copy_and_history_metadata():
+    result = compile_video_prompt(
+        {
+            "user_instruction": DIRECT_PRODUCT_VIDEO_PROMPT,
+            "raw_text": DIRECT_PRODUCT_VIDEO_PROMPT,
+            "assembled_text": DIRECT_PRODUCT_VIDEO_PROMPT,
+            "final_text": DIRECT_PRODUCT_VIDEO_PROMPT,
+            "产品身份档案": "冗长OCR档案不应注入直通提示词；Moon Logo；额外包装描述。",
+        },
+        duration=10,
+        model_id="doubao-seedance-2-0-mini-260615",
+        provider="volcengine_ark",
+        references=[{"role": "product", "url": "https://example.com/product.png"}],
+        product_reference=True,
+        product_lock_mode="locked",
+        product_video_template="prompt_driven",
+        fit_mode="single_clip",
+    )
+
+    assert result["prompt"].startswith(
+        "产品身份约束：以上传产品图为唯一商品主体，保持同一SKU的包装结构、Logo、"
+        "包装文字、颜色、材质和纹理一致。\n原始生成要求：\n"
+    )
+    assert DIRECT_PRODUCT_VIDEO_PROMPT in result["prompt"]
+    for selling_point in (
+        "干湿两用",
+        "厚实吸水",
+        "亲肤",
+        "加大加厚 克重95g/㎡",
+        "耐拉扯 不易掉絮",
+    ):
+        assert selling_point in result["prompt"]
+    assert "水滴落水声" in result["prompt"]
+    assert "让洗脸这件事，成为一天温柔的开始" in result["prompt"]
+    assert "画面无字" not in result["prompt"]
+    assert "Shot " not in result["prompt"]
+    assert "Moon Logo" not in result["prompt"]
+    assert result["plan"]["shots"] == [DIRECT_PRODUCT_VIDEO_PROMPT]
+    assert result["plan"]["post_overlays"] == [
+        "干湿两用",
+        "厚实吸水",
+        "亲肤",
+        "加大加厚 克重95g/㎡",
+        "耐拉扯 不易掉絮",
+    ]
+    assert result["plan"]["voiceover"] == "让洗脸这件事，成为一天温柔的开始。"
+    assert result["metadata"]["prompt_mode"] == "direct_passthrough"
+    assert result["metadata"]["shot_count"] == 1
+
+
+def test_structured_reverse_input_mode_does_not_use_direct_passthrough():
+    text = "高端浴室广告。Shot 1：抽出洗脸巾。文字“干湿两用”浮现。"
+    result = compile_video_prompt(
+        {
+            "input_mode": "structured_reverse",
+            "user_instruction": text,
+            "raw_text": text,
+            "assembled_text": text,
+            "final_text": text,
+        },
+        product_reference=True,
+        fit_mode="single_clip",
+    )
+
+    assert result["prompt"].startswith("风格设定：")
+    assert "Shot 1：抽出洗脸巾" in result["prompt"]
+    assert "干湿两用" not in result["prompt"]
+    assert result["plan"]["post_overlays"] == ["干湿两用"]
+    assert result["metadata"].get("prompt_mode") != "direct_passthrough"
+
 
 def test_structured_video_sections_keep_technical_constraints_out_of_shots():
     result = compile_video_prompt(
@@ -571,7 +657,7 @@ def test_structured_shots_move_post_production_out_of_generation_prompt():
     assert result["plan"]["sfx"] == ["水滴声"]
 
 
-def test_single_clip_product_action_keeps_locked_text_fidelity_guard():
+def test_single_clip_product_action_uses_prompt_driven_identity_guard():
     result = compile_video_prompt(
         "手从包装底部抽出洗脸巾；微距展开3D如意云纹",
         duration=10,
@@ -580,8 +666,11 @@ def test_single_clip_product_action_keeps_locked_text_fidelity_guard():
         fit_mode="single_clip",
     )
 
-    assert "产品视频策略：单段动作展示" in result["prompt"]
-    assert "避免快速旋转、翻面、强运动模糊、遮挡或裁切产品" in result["prompt"]
+    assert "底部抽出洗脸巾" in result["prompt"]
+    assert "微距展开3D如意云纹" in result["prompt"]
+    assert "产品视频策略：提示词驱动" in result["prompt"]
+    assert "不得据此删除、替换或降速用户动作" in result["prompt"]
+    assert "避免快速旋转" not in result["prompt"]
 
 
 def test_single_clip_preserves_product_actions_after_interaction_and_closing():
@@ -738,6 +827,25 @@ def test_product_lock_mode_and_template_change_the_compiled_strategy():
     assert "不强制每个镜头静态正面" in free["prompt"]
     assert locked["metadata"]["product_lock_mode"] == "locked"
     assert free["metadata"]["product_video_template"] == "reference_sequence"
+
+
+def test_prompt_driven_product_strategy_preserves_explicit_motion():
+    result = compile_video_prompt(
+        "产品缓慢旋转一周，水花飞溅，随后快速推近包装 Logo 特写。",
+        duration=10,
+        product_reference=True,
+        product_lock_mode="locked",
+        product_video_template="prompt_driven",
+    )
+
+    assert "产品缓慢旋转一周" in result["prompt"]
+    assert "水花飞溅" in result["prompt"]
+    assert "快速推近包装 Logo 特写" in result["prompt"]
+    assert "产品身份保真" in result["prompt"]
+    assert "提示词驱动" in result["prompt"]
+    assert "稳定陈列" not in result["prompt"]
+    assert "避免快速旋转" not in result["prompt"]
+    assert result["metadata"]["product_video_template"] == "prompt_driven"
 
 
 def test_style_motion_and_frame_references_compile_role_boundaries():

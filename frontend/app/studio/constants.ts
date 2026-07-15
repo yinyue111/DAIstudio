@@ -41,15 +41,6 @@ export const VIDEO_QUALITIES = [
   { key: "1080p", label: "1080p", hint: "高清" },
 ];
 
-export const VIDEO_PRODUCT_TEMPLATES = [
-  { key: "stable_showcase", label: "稳定陈列", hint: "产品正面稳定入镜，背景和光影变化，最适合包装文字保真。" },
-  { key: "reference_sequence", label: "参考分镜", hint: "保留反推视频的镜头顺序、时长和使用动作，适合多镜头广告复刻。" },
-  { key: "slow_push", label: "慢速推近", hint: "低速推近/拉远，不旋转不翻面，适合正面产品广告。" },
-  { key: "handheld_display", label: "手持展示", hint: "手部只扶边缘或底部，不遮挡 Logo、包装文字和抽口结构。" },
-  { key: "background_motion", label: "背景动效", hint: "产品稳定，动态主要来自背景光线、道具、烟雾或台面反射。" },
-  { key: "soft_splash", label: "轻水花", hint: "水花和泡沫围绕底部/背景运动，不遮挡包装正面。" },
-];
-
 export const MAX_VIDEO_DURATION_SECONDS = 15;
 
 export const VIDEO_DURATION_PRESETS = [

@@ -78,22 +78,17 @@ assert.deepEqual(
     current: {
       ratio: "9:16",
       vDuration: 5,
-      videoProductLockMode: "locked",
-      videoProductTemplate: "stable_showcase",
     },
     startedRatio: "9:16",
     startedDuration: 5,
     maxDuration: 15,
-    productVideo: true,
   }),
   {
     reverseVideoAnalysis: serumReverseAnalysis,
     ratio: "3:4",
     vDuration: 10,
-    videoProductLockMode: "free",
-    videoProductTemplate: "reference_sequence",
   },
-  "video reverse should inherit exact source ratio/duration and preserve multi-shot product motion",
+  "video reverse should inherit exact source ratio/duration without mutating hidden product-motion state",
 );
 
 assert.deepEqual(
@@ -236,7 +231,7 @@ assert.equal(directProductVideo.payload.params.first_frame_image, undefined);
 assert.equal(directProductVideo.payload.params.last_frame_image, undefined);
 assert.equal(directProductVideo.payload.params.style_reference_image, styleAsset.url);
 assert.equal(directProductVideo.payload.params.product_lock_mode, "locked");
-assert.equal(directProductVideo.payload.params.product_video_template, "stable_showcase");
+assert.equal(directProductVideo.payload.params.product_video_template, "prompt_driven");
 assert.equal(directProductVideo.payload.source_asset_meta.product_generation_mode, true);
 assert.equal(directProductVideo.payload.source_asset_meta.product_subject.selected_url, productAsset.url);
 assert.equal(directProductVideo.payload.source_asset_meta.style_reference.selected_url, styleAsset.url);
@@ -599,6 +594,7 @@ assert.equal(directFinalVideo.ratioOption.key, "9:16");
 assert.equal(directFinalVideo.payload.prompt.raw_text, "竖屏短视频成片，产品居中展示，柔和棚拍光线");
 assert.equal(directFinalVideo.payload.prompt.assembled_text, directFinalVideo.payload.prompt.final_text);
 assert.equal(directFinalVideo.payload.prompt.optimized_text, undefined);
+assert.equal(directFinalVideo.payload.prompt.input_mode, "direct_input");
 
 const optimizedDirectVideo = buildGenerationPayload({
   ...directFinalVideo.payload,
@@ -642,6 +638,7 @@ assert.match(optimizedDirectVideo.payload.prompt.optimized_text, /\n技术约束
 assert.equal(optimizedDirectVideo.payload.prompt.optimizer_model_id, "gemini-3.5-flash-low");
 assert.match(optimizedDirectVideo.payload.prompt.assembled_text, /^风格设定：/);
 assert.match(optimizedDirectVideo.payload.prompt.final_text, /\n技术约束：/);
+assert.equal(optimizedDirectVideo.payload.prompt.input_mode, "optimized");
 
 const productVideoEditArgs = {
   stage: "final",
@@ -685,8 +682,8 @@ assert.equal(productVideoEditFree.payload.category, "video");
 assert.equal(productVideoEditFree.payload.stage, "final");
 assert.equal(productVideoEditFree.payload.parent_task_id, null);
 assert.equal(productVideoEditFree.payload.params.subject_mode, "product");
-assert.equal(productVideoEditFree.payload.params.product_lock_mode, "free");
-assert.equal(productVideoEditFree.payload.params.product_video_template, "soft_splash");
+assert.equal(productVideoEditFree.payload.params.product_lock_mode, "locked");
+assert.equal(productVideoEditFree.payload.params.product_video_template, "prompt_driven");
 assert.equal(productVideoEditFree.payload.params.product_reference_image, productAsset.url);
 assert.equal(productVideoEditFree.payload.params.reference_image_url, undefined);
 assert.equal(productVideoEditFree.payload.params.first_frame_image, undefined);
@@ -694,7 +691,7 @@ assert.equal(productVideoEditFree.payload.params.last_frame_image, undefined);
 assert.equal(productVideoEditFree.payload.prompt["场景背景"], "暖棕色广告棚景和金色沙粒台面");
 assert.equal(
   productVideoEditFree.payload.prompt["主体动作"],
-  "上传产品作为唯一视频主体，替换参考片中的原主体/原商品/人物；复用参考片的展示节奏、入镜顺序、角度切换、慢速推拉、稳定特写和卖点展示等可迁移动作；优先保持完整包装、Logo 和主要文字始终在画面内，避免裁切主体、侧面展示或快速旋转；不要生成参考片里的原商品、原品牌、人物或服装",
+  "上传产品作为唯一视频主体，替换参考片中的原主体/原商品/人物；严格保留参考片中可迁移的具体动作、运镜、节奏和先后顺序，不得删除、替换或降速；动作过程中保持同一 SKU 的包装结构、Logo、可见文字、颜色和材质纹理连续一致；不要生成参考片里的原商品、原品牌、人物或服装",
   "the frontend should keep structured motion identity-safe and let the transfer prompt carry the specific sequence",
 );
 assert.equal(productVideoEditFree.payload.prompt["镜头运动"], "缓慢推进并轻微环绕");
@@ -720,6 +717,7 @@ const reversedProductVideo = buildGenerationPayload({
 });
 assert.match(reversedProductVideo.payload.prompt.final_text, /上传产品从画面左侧入场/);
 assert.equal(reversedProductVideo.payload.prompt.user_instruction, reversedProductVideo.payload.prompt.final_text);
+assert.equal(reversedProductVideo.payload.prompt.input_mode, "structured_reverse");
 assert.doesNotMatch(reversedProductVideo.payload.prompt.final_text, /上传产品作为唯一视频主体/);
 assert.doesNotMatch(reversedProductVideo.payload.prompt.final_text, /优先保持完整包装/);
 
@@ -819,7 +817,7 @@ const productVideoEditLocked = buildGenerationPayload({
 });
 
 assert.equal(productVideoEditLocked.payload.params.product_lock_mode, "locked");
-assert.equal(productVideoEditLocked.payload.params.product_video_template, "slow_push");
+assert.equal(productVideoEditLocked.payload.params.product_video_template, "prompt_driven");
 
 const productVideoEditDefault = buildGenerationPayload({
   ...productVideoEditArgs,
@@ -828,7 +826,7 @@ const productVideoEditDefault = buildGenerationPayload({
 });
 
 assert.equal(productVideoEditDefault.payload.params.product_lock_mode, "locked");
-assert.equal(productVideoEditDefault.payload.params.product_video_template, "stable_showcase");
+assert.equal(productVideoEditDefault.payload.params.product_video_template, "prompt_driven");
 
 const fakeStorage = new Map();
 const storage = {

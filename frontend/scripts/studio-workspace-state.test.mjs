@@ -22,15 +22,15 @@ const viewModelSource = readFileSync(join(root, "app/studio/viewModel.ts"), "utf
 const structuredEditorSource = readFileSync(join(root, "app/studio/StudioStructuredEditor.jsx"), "utf8");
 const generationControlsSource = readFileSync(join(root, "components/StudioGenerationControls.jsx"), "utf8");
 const studioSource = `${pageSource}\n${workspaceStateSource}\n${promptWorkspaceSource}\n${editPromptSource}\n${generationPayloadSource}\n${referenceParsingSource}\n${viewModelSource}\n${constantsSource}\n${generationControlsSource}`;
-assert.match(
+assert.doesNotMatch(
   generationControlsSource,
-  /template === "reference_sequence"[\s\S]*onVideoProductLockModeChange\?\.\("free"\)/,
-  "reference-sequence template should force free product motion",
+  /applyVideoProductTemplate/,
+  "removed product-template controls should not keep template handlers",
 );
-assert.match(
+assert.doesNotMatch(
   generationControlsSource,
-  /mode === "locked"[\s\S]*videoProductTemplate === "reference_sequence"[\s\S]*onVideoProductTemplateChange\?\.\("stable_showcase"\)/,
-  "switching back to product lock should reset the conflicting reference-sequence template",
+  /applyVideoProductMode/,
+  "removed product-motion controls should not keep mode handlers",
 );
 const subjectProtectionModule = await import("../lib/studioSubjectProtection.js").catch(() => ({}));
 const { startSubjectProtectionPreview } = subjectProtectionModule;
@@ -236,8 +236,6 @@ for (const field of [
   "vResolution",
   "editMaskMode",
   "productPixelLockMode",
-  "videoProductLockMode",
-  "videoProductTemplate",
   "videoAnalysisPreset",
   "subjectProtection",
   "subjectProtectionLoading",
@@ -356,30 +354,30 @@ assert.match(
   /productBusy=\{submitting \|\| productProfiling\}/,
   "subject replacement controls should be disabled while submit-time profiling is running",
 );
-assert.match(
+assert.doesNotMatch(
   generationSubmitSource,
   /videoProductLockMode,/,
-  "video product lock mode should be submitted with the generation payload",
+  "removed video product lock state should not be submitted",
 );
 assert.match(
   generationSubmitSource,
   /productPixelLockMode,/,
   "product pixel lock mode should be submitted with the generation payload",
 );
-assert.match(
+assert.doesNotMatch(
   generationSubmitSource,
   /videoProductTemplate,/,
-  "video product template should be submitted with the generation payload",
+  "removed video product template state should not be submitted",
 );
 assert.match(
   generationPayloadSource,
-  /product_lock_mode:\s*videoProductLockMode === "locked" \? "locked" : "free"/,
-  "video product lock mode should be explicit in image-to-video edit params",
+  /product_lock_mode:\s*"locked"/,
+  "product video requests should always preserve product identity",
 );
 assert.match(
   generationPayloadSource,
-  /product_video_template:\s*videoProductTemplate \|\| "stable_showcase"/,
-  "video product template should be explicit in product image-to-video params",
+  /product_video_template:\s*"prompt_driven"/,
+  "product video requests should always preserve user-authored motion",
 );
 assert.match(
   generationPayloadSource,
@@ -416,25 +414,25 @@ assert.match(
   /强制像素锁/,
   "product image editing controls should expose strict pixel-lock mode",
 );
-assert.match(
+assert.doesNotMatch(
   generationControlsSource,
   /自由运动/,
-  "video product generation controls should expose a dynamic free-motion option",
+  "video product generation controls should not expose a free-motion module",
 );
-assert.match(
+assert.doesNotMatch(
   generationControlsSource,
-  /文字保真/,
-  "video product generation controls should expose a text-fidelity lock option",
+  /产品运动/,
+  "video product generation controls should not expose a product-motion module",
 );
-assert.match(
+assert.doesNotMatch(
   generationControlsSource,
   /产品模板/,
-  "video product generation controls should expose product-safe video templates",
+  "video product generation controls should not expose product templates",
 );
-assert.match(
+assert.doesNotMatch(
   constantsSource,
   /VIDEO_PRODUCT_TEMPLATES/,
-  "product-safe video templates should live in studio constants",
+  "removed product video templates should not remain in studio constants",
 );
 assert.match(
   workspaceStateSource,
@@ -446,15 +444,15 @@ assert.match(
   /productPixelLockMode:\s*current\.productPixelLockMode \|\| "auto"/,
   "restored workspaces without a product pixel lock mode should use automatic pixel lock",
 );
-assert.match(
+assert.doesNotMatch(
   workspaceStateSource,
-  /videoProductLockMode:\s*"locked"/,
-  "video product generation should default to text-fidelity lock mode",
+  /videoProductLockMode/,
+  "removed product motion mode should not remain in workspace state",
 );
-assert.match(
+assert.doesNotMatch(
   workspaceStateSource,
-  /videoProductTemplate:\s*"stable_showcase"/,
-  "video product generation should default to the stable showcase template",
+  /videoProductTemplate/,
+  "removed product video template should not remain in workspace state",
 );
 assert.match(
   pageSource,
@@ -552,10 +550,10 @@ assert.match(
   /subjectProtectionPreview:[\s\S]*?new AbortController\(\)[\s\S]*?promise\.cancel = \(\) => controller\.abort\(\)/,
   "subject-protection API requests should expose real AbortController cancellation",
 );
-assert.match(
+assert.doesNotMatch(
   pageSource,
-  /videoProductLockMode:\s*current\.videoProductLockMode \|\| "locked"/,
-  "restored workspaces without a lock mode should use text-fidelity lock mode",
+  /videoProductLockMode:\s*current\.videoProductLockMode/,
+  "draft restore should not revive removed product motion state",
 );
 assert.match(
   pageSource,

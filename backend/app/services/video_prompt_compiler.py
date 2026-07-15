@@ -7,11 +7,15 @@ import re
 from math import ceil
 from typing import Any
 
-COMPILER_VERSION = "video-prompt-v4"
+COMPILER_VERSION = "video-prompt-v5"
 VIDEO_SUBMIT_CONTRACT_VERSION = "video-submit-v3"
 PRODUCT_SUBJECT_LOCK = (
     "上传产品是唯一商品主体；仅锁定同一SKU的包装外形与比例、Logo、"
     "包装结构、品牌色、标签排版、可见文字和材质纹理。"
+)
+DIRECT_PRODUCT_SUBJECT_LOCK = (
+    "以上传产品图为唯一商品主体，保持同一SKU的包装结构、Logo、包装文字、"
+    "颜色、材质和纹理一致。"
 )
 PORTRAIT_SUBJECT_LOCK = (
     "上传人像是唯一人物身份；保持同一成年人的脸型、五官比例、发际线、"
@@ -50,6 +54,10 @@ _CONTEXT_SUBJECT_RE = re.compile(
     re.IGNORECASE,
 )
 _PRODUCT_VIDEO_STRATEGIES = {
+    "prompt_driven": (
+        "产品视频策略：提示词驱动。严格执行场景脚本中的产品动作、运镜和节奏，"
+        "不额外添加、替换或限制动作；外观身份锁定只用于保持同一 SKU 的包装和纹理。"
+    ),
     "reference_sequence": (
         "产品视频策略：参考分镜。依次执行当前分镜的动作、景别和转场，"
         "最后以清晰完整的产品镜头收尾；不强制每个镜头静态正面。"
@@ -496,6 +504,48 @@ def _layered_authoritative_text(raw_prompt: dict[str, Any]) -> str:
     return optimized if optimized and not assembled else ""
 
 
+def _normalized_prompt_layer(value: Any) -> str:
+    return re.sub(r"\s+", " ", str(value or "")).strip()
+
+
+def _direct_passthrough_text(raw_prompt: str | dict[str, Any]) -> str:
+    """Return an explicit user draft only when every persisted text layer agrees."""
+    if not isinstance(raw_prompt, dict):
+        return ""
+    input_mode = str(raw_prompt.get("input_mode") or "").strip().lower()
+    if input_mode and input_mode not in {"direct", "direct_input", "manual"}:
+        return ""
+    layers = [
+        str(raw_prompt.get(key) or "").strip()
+        for key in ("user_instruction", "raw_text", "assembled_text", "final_text")
+    ]
+    if any(not layer for layer in layers):
+        return ""
+    normalized = [_normalized_prompt_layer(layer) for layer in layers]
+    if len(set(normalized)) != 1:
+        return ""
+    optimized = _normalized_prompt_layer(raw_prompt.get("optimized_text"))
+    if optimized and optimized != normalized[0]:
+        return ""
+    return layers[0]
+
+
+def _direct_passthrough_plan(text: str) -> dict[str, Any]:
+    """Extract history metadata without rewriting the model-facing user draft."""
+    post = split_video_post_production(text)
+    return {
+        "global_style": "",
+        "subject_lock": "",
+        "shots": [text],
+        "technical_constraints": "",
+        "post_overlays": post["post_overlays"],
+        "voiceover": post["voiceover"],
+        "sfx": post["sfx"],
+        "reference_guidance": [],
+        "warnings": [],
+    }
+
+
 def split_video_post_production(text: str) -> dict[str, Any]:
     """Remove explicit post-production clauses from model-facing prompt text."""
     overlays: list[str] = []
@@ -876,12 +926,17 @@ def compile_video_prompt(
     product_reference: bool = False,
     portrait_reference: bool = False,
     product_lock_mode: str = "locked",
-    product_video_template: str = "stable_showcase",
+    product_video_template: str = "prompt_driven",
     model_profiles: dict[str, dict[str, Any]] | None = None,
     fit_mode: str = "strict_sequence",
 ) -> dict[str, Any]:
     """Return a structured plan and a model-ready prompt."""
-    plan = parse_video_prompt(raw_prompt)
+    direct_passthrough_text = _direct_passthrough_text(raw_prompt)
+    plan = (
+        _direct_passthrough_plan(direct_passthrough_text)
+        if direct_passthrough_text
+        else parse_video_prompt(raw_prompt)
+    )
     plan["global_style"] = _join_unique(plan["global_style"])
     plan["technical_constraints"] = _join_unique(plan.get("technical_constraints", ""))
     plan["shots"] = [str(item).strip() for item in plan["shots"] if str(item).strip()]
@@ -926,15 +981,18 @@ def compile_video_prompt(
     product_lock = ""
     portrait_lock = ""
     if has_product_reference:
-        product_profile = (
-            raw_prompt.get("产品身份档案") or raw_prompt.get("product_profile_text") or ""
-            if isinstance(raw_prompt, dict)
-            else ""
-        )
-        product_lock = _join_unique(
-            _clean_identity_profile(product_profile, product=True),
-            PRODUCT_SUBJECT_LOCK,
-        )
+        if direct_passthrough_text:
+            product_lock = DIRECT_PRODUCT_SUBJECT_LOCK
+        else:
+            product_profile = (
+                raw_prompt.get("产品身份档案") or raw_prompt.get("product_profile_text") or ""
+                if isinstance(raw_prompt, dict)
+                else ""
+            )
+            product_lock = _join_unique(
+                _clean_identity_profile(product_profile, product=True),
+                PRODUCT_SUBJECT_LOCK,
+            )
     if has_portrait_reference:
         portrait_profile = (
             raw_prompt.get("人物身份档案") or raw_prompt.get("subject_profile_summary") or ""
@@ -947,21 +1005,10 @@ def compile_video_prompt(
         )
     plan["subject_lock"] = _join_unique(plan["subject_lock"], product_lock, portrait_lock)
     normalized_lock_mode = "free" if str(product_lock_mode).lower() == "free" else "locked"
-    normalized_template = str(product_video_template or "stable_showcase").lower().strip()
-    product_strategy = ""
-    locked_product_guard = ""
-    if has_product_reference:
-        product_strategy = _PRODUCT_VIDEO_STRATEGIES.get(
-            normalized_template,
-            _PRODUCT_VIDEO_STRATEGIES["stable_showcase"],
-        )
-        if normalized_lock_mode == "locked":
-            locked_product_guard = (
-                "文字保真模式：包装正面、Logo 和主要文字持续清晰可见，"
-                "避免快速旋转、翻面、强运动模糊、遮挡或裁切产品。"
-            )
-            product_strategy = f"{locked_product_guard}{product_strategy}"
-        plan["product_strategy"] = product_strategy
+    normalized_template = str(product_video_template or "prompt_driven").lower().strip()
+    normalized_fit_mode = (
+        "single_clip" if str(fit_mode).strip().lower() == "single_clip" else "strict_sequence"
+    )
     profile = infer_video_model_profile(
         model_id=model_id,
         provider=provider,
@@ -969,9 +1016,71 @@ def compile_video_prompt(
         extra=extra,
         model_profiles=model_profiles,
     )
-    normalized_fit_mode = (
-        "single_clip" if str(fit_mode).strip().lower() == "single_clip" else "strict_sequence"
-    )
+    if direct_passthrough_text and has_product_reference:
+        prompt = (
+            f"产品身份约束：{DIRECT_PRODUCT_SUBJECT_LOCK}\n"
+            f"原始生成要求：\n{direct_passthrough_text}"
+        )
+        prompt_char_count = len(prompt)
+        prompt_budget_chars = max(1, int(profile.get("prompt_budget_chars") or 1))
+        prompt_overload = prompt_char_count > prompt_budget_chars
+        if prompt_overload:
+            plan["warnings"].append(
+                f"直输提示词已按原文完整保留；当前长度超过模型建议的 "
+                f"{prompt_budget_chars} 字符预算，模型可能弱化部分细节。"
+            )
+        return {
+            "prompt": prompt,
+            "plan": plan,
+            "sequence_required": False,
+            "profile": profile,
+            "compiler_version": COMPILER_VERSION,
+            "metadata": {
+                "duration": duration,
+                "model_id": model_id,
+                "provider": provider,
+                "prompt_mode": "direct_passthrough",
+                "shot_count": 1,
+                "source_shot_count": 1,
+                "selected_shot_count": 1,
+                "prompt_char_count": prompt_char_count,
+                "prompt_budget_chars": prompt_budget_chars,
+                "prompt_over_budget": prompt_overload,
+                "omitted_shot_count": 0,
+                "condensed_for_single_clip": False,
+                "compacted_for_budget": False,
+                "fit_mode": normalized_fit_mode,
+                "recommended_clip_count": 1,
+                "reference_roles": sorted(reference_roles),
+                "motion_reference_mode": "",
+                "product_lock_mode": normalized_lock_mode,
+                "product_video_template": normalized_template,
+                "post_overlays": list(plan["post_overlays"]),
+                "voiceover": plan["voiceover"],
+                "sfx": list(plan["sfx"]),
+                "technical_constraints": "",
+            },
+        }
+    product_strategy = ""
+    locked_product_guard = ""
+    if has_product_reference:
+        product_strategy = _PRODUCT_VIDEO_STRATEGIES.get(
+            normalized_template,
+            _PRODUCT_VIDEO_STRATEGIES["prompt_driven"],
+        )
+        if normalized_lock_mode == "locked" and normalized_template == "prompt_driven":
+            locked_product_guard = (
+                "产品身份保真：在用户指定动作和运镜过程中，保持同一 SKU 的包装结构、"
+                "Logo、可见文字、颜色和材质纹理连续一致；不得据此删除、替换或降速用户动作。"
+            )
+            product_strategy = f"{locked_product_guard}{product_strategy}"
+        elif normalized_lock_mode == "locked":
+            locked_product_guard = (
+                "文字保真模式：包装正面、Logo 和主要文字持续清晰可见，"
+                "避免快速旋转、翻面、强运动模糊、遮挡或裁切产品。"
+            )
+            product_strategy = f"{locked_product_guard}{product_strategy}"
+        plan["product_strategy"] = product_strategy
     if normalized_fit_mode == "single_clip":
         plan["shots"], promoted_constraints = _extract_single_clip_constraints(plan["shots"])
         plan["technical_constraints"] = _join_unique(

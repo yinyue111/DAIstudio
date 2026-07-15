@@ -264,7 +264,7 @@ def test_preview_capacity_keeps_all_actions_for_actual_preview_duration(
         assert db.query(GenTask).filter(GenTask.user_id == user_id).count() == 1
 
 
-def test_product_video_compiles_one_fidelity_guard_and_separates_post_production(
+def test_direct_product_video_submits_original_copy_and_keeps_post_metadata(
     client, make_user, auth, monkeypatch
 ):
     make_user("13900003103", balance=1000)
@@ -296,6 +296,8 @@ def test_product_video_compiles_one_fidelity_guard_and_separates_post_production
             "category": "video",
             "stage": "final",
             "prompt": {
+                "input_mode": "direct_input",
+                "user_instruction": raw_prompt,
                 "raw_text": raw_prompt,
                 "assembled_text": raw_prompt,
                 "产品身份档案": "同一SKU悬挂式洗脸巾包装，保持Logo、底部出纸口和3D如意云纹。",
@@ -308,8 +310,8 @@ def test_product_video_compiles_one_fidelity_guard_and_separates_post_production
                 "ratio": "9:16",
                 "subject_mode": "product",
                 "product_reference_image": upload.json()["url"],
-                "product_lock_mode": "free",
-                "product_video_template": "reference_sequence",
+                "product_lock_mode": "locked",
+                "product_video_template": "prompt_driven",
             },
         },
         headers=headers,
@@ -317,12 +319,14 @@ def test_product_video_compiles_one_fidelity_guard_and_separates_post_production
 
     assert response.status_code == 200, response.text
     assert submitted["prompt"].count("产品身份约束") == 1
-    assert "干湿两用" not in submitted["prompt"]
-    assert "让洗脸这件事，成为一天温柔的开始" not in submitted["prompt"]
+    assert "干湿两用" in submitted["prompt"]
+    assert "让洗脸这件事，成为一天温柔的开始" in submitted["prompt"]
     assert "底部抽出一张洗脸巾" in submitted["prompt"]
     assert "3D如意云纹" in submitted["prompt"]
-    assert "产品视频策略：参考分镜" in submitted["prompt"]
-    assert "不强制每个镜头静态正面" in submitted["prompt"]
+    assert "Shot 1" in submitted["prompt"]
+    assert submitted["prompt"].count("Shot ") == 2
+    assert "产品视频策略" not in submitted["prompt"]
+    assert "画面无字" not in submitted["prompt"]
     assert submitted["params"]["product_reference_image"].startswith("data:image/jpeg;base64,")
     assert "first_frame_image" not in submitted["params"]
     assert "last_frame_image" not in submitted["params"]
@@ -333,3 +337,6 @@ def test_product_video_compiles_one_fidelity_guard_and_separates_post_production
     assert task["voiceover"] == "让洗脸这件事，成为一天温柔的开始。"
     assert task["prompt_compiler_version"]
     assert task["model_id"] == "grok-imagine-video-1.5"
+    with SessionLocal() as db:
+        persisted = db.get(GenTask, response.json()["id"])
+        assert persisted.params["_video_prompt_metadata"]["prompt_mode"] == "direct_passthrough"

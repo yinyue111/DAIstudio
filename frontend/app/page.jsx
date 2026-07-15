@@ -166,8 +166,6 @@ export default function Home() {
     setProductPixelLockMode,
     setVDuration,
     setVResolution,
-    setVideoProductLockMode,
-    setVideoProductTemplate,
     setVideoAnalysisPreset,
     setStructured,
     setNegativeTouched,
@@ -225,8 +223,6 @@ export default function Home() {
     productPixelLockMode = "auto",
     vDuration,
     vResolution,
-    videoProductLockMode,
-    videoProductTemplate = "stable_showcase",
     videoAnalysisPreset,
     url,
     parsing,
@@ -272,8 +268,6 @@ export default function Home() {
     duration: category === "video" ? Number(vDuration) : "",
     aspectRatio: category === "video" ? ratio : "",
     resolution: category === "video" ? vResolution : "",
-    productLockMode: category === "video" ? videoProductLockMode : "",
-    productVideoTemplate: category === "video" ? videoProductTemplate : "",
     referenceSignature,
     subjectProfileSource: productProfileSource,
     targetModelId,
@@ -766,8 +760,6 @@ export default function Home() {
     productPixelLockMode,
     vDuration,
     vResolution,
-    videoProductLockMode,
-    videoProductTemplate,
     resultsRef,
     modelEnabled,
     setMsg,
@@ -819,8 +811,6 @@ export default function Home() {
       vResolution: current.vResolution || "720p",
       editMaskMode: current.editMaskMode || "protect_subject",
       productPixelLockMode: current.productPixelLockMode || "auto",
-      videoProductLockMode: current.videoProductLockMode || "locked",
-      videoProductTemplate: current.videoProductTemplate || "stable_showcase",
       videoAnalysisPreset: current.videoAnalysisPreset || "standard",
       url: current.url || "",
       assets: (current.assets || []).map(sanitizeAssetForDraft).filter(Boolean).slice(0, 12),
@@ -1036,8 +1026,8 @@ export default function Home() {
         duration: category === "video" ? Number(vDuration) : undefined,
         aspect_ratio: category === "video" ? ratio : undefined,
         resolution: category === "video" ? vResolution : undefined,
-        product_lock_mode: category === "video" ? videoProductLockMode : undefined,
-        product_video_template: category === "video" ? videoProductTemplate : undefined,
+        product_lock_mode: category === "video" && productGenerationMode ? "locked" : undefined,
+        product_video_template: category === "video" && productGenerationMode ? "prompt_driven" : undefined,
         subject_mode: subjectMode,
         reference_type: referenceType,
         subject_profile: subjectProfile,
@@ -1505,10 +1495,6 @@ export default function Home() {
                     isEditMode={isEditMode}
                     productGenerationMode={productGenerationMode}
                     portraitGenerationMode={portraitGenerationMode}
-                    videoProductLockMode={videoProductLockMode}
-                    onVideoProductLockModeChange={setVideoProductLockMode}
-                    videoProductTemplate={videoProductTemplate}
-                    onVideoProductTemplateChange={setVideoProductTemplate}
                     showNegative={showNegative}
                     onToggleNegative={() => setShowNegative((s) => !s)}
                     seed={seed}

@@ -339,7 +339,6 @@ export default function useReferenceParsing({
                 startedRatio,
                 startedDuration,
                 maxDuration: videoDurationLimit(videoDurationMaxSeconds),
-                productVideo: isEditMode && targetCategory === "video" && subjectMode === "product",
               })
             : {}),
           ...(promptUnchanged

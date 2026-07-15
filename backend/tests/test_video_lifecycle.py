@@ -2,6 +2,7 @@
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 
 import pytest
 from billiard.exceptions import SoftTimeLimitExceeded
@@ -166,10 +167,57 @@ def test_legacy_video_worker_compiles_and_persists_prompt_before_submit(
         assert task.phase == "polling"
         assert task.external_task_id == "ext-legacy-compiled"
         assert params["_generation_prompt"] == submitted["prompt"]
-        assert params["_prompt_compiler_version"] == "video-prompt-v4"
+        assert params["_prompt_compiler_version"] == "video-prompt-v5"
         assert params["_video_submit_contract_version"] == "video-submit-v3"
         assert params["_post_overlays"] == ["新品上市"]
         assert params["_video_prompt_plan"]["shots"] == ["手持产品稳定入镜"]
+
+
+def test_legacy_video_worker_preserves_direct_product_prompt_and_post_metadata(client):
+    text = (
+        "高端日系浴室广告，产品缓慢推近；文字“厚实吸水”出现；"
+        "旁白：“温柔开始。”；音效：水滴声。"
+    )
+    task = SimpleNamespace(
+        prompt={
+            "input_mode": "direct_input",
+            "user_instruction": text,
+            "raw_text": text,
+            "assembled_text": text,
+            "final_text": text,
+        },
+        source_asset_url=None,
+        source_type="image",
+        stage="final",
+    )
+    model = SimpleNamespace(
+        model_id="doubao-seedance-2-0-mini-260615",
+        provider="volcengine_ark",
+        extra={},
+    )
+
+    prompt, persisted = generation_video_submit._compile_legacy_video_prompt(
+        task,
+        model,
+        {
+            "duration": 10,
+            "product_reference_image": "https://example.com/product.png",
+            "product_lock_mode": "locked",
+            "product_video_template": "prompt_driven",
+        },
+    )
+
+    assert prompt.startswith("产品身份约束：以上传产品图为唯一商品主体")
+    assert text in prompt
+    assert "厚实吸水" in prompt
+    assert "温柔开始" in prompt
+    assert "水滴声" in prompt
+    assert "画面无字" not in prompt
+    assert persisted["_generation_prompt"] == prompt
+    assert persisted["_post_overlays"] == ["厚实吸水"]
+    assert persisted["_voiceover"] == "温柔开始。"
+    assert persisted["_sfx"] == ["水滴声"]
+    assert persisted["_video_prompt_metadata"]["prompt_mode"] == "direct_passthrough"
 
 
 def test_legacy_video_worker_preserves_dense_prompt_before_provider_submit(
@@ -257,7 +305,7 @@ def test_video_worker_rejects_mismatched_submit_contract_before_provider_call(
             params={
                 "duration": 5,
                 "_generation_prompt": "场景脚本：\nShot 1：产品稳定入镜",
-                "_prompt_compiler_version": "video-prompt-v4",
+                "_prompt_compiler_version": "video-prompt-v5",
                 "_video_submit_contract_version": "video-submit-v2",
             },
             cost_frozen=5,

@@ -193,6 +193,10 @@ _LOCKED_PRODUCT_VIDEO_USER_REWRITES = (
     ),
 )
 _PRODUCT_VIDEO_TEMPLATE_PROMPTS = {
+    "prompt_driven": (
+        "产品视频模板：提示词驱动。严格执行用户场景脚本中的产品动作、运镜和节奏，"
+        "不额外添加、替换或限制动作；同时保持同一 SKU 的包装结构、Logo、可见文字和材质纹理。"
+    ),
     "reference_sequence": (
         "产品视频模板：参考分镜。严格按反推提示词的时序分镜执行镜头顺序、每镜时长、"
         "手部使用动作、景别和转场，最后以清晰完整的产品英雄镜头收尾。"
@@ -222,8 +226,8 @@ _PRODUCT_VIDEO_TEMPLATE_PROMPTS = {
 
 
 def _product_video_template_prompt(template: str | None, *, locked: bool) -> str:
-    key = str(template or "stable_showcase").lower().strip()
-    text = _PRODUCT_VIDEO_TEMPLATE_PROMPTS.get(key) or _PRODUCT_VIDEO_TEMPLATE_PROMPTS["stable_showcase"]
+    key = str(template or "prompt_driven").lower().strip()
+    text = _PRODUCT_VIDEO_TEMPLATE_PROMPTS.get(key) or _PRODUCT_VIDEO_TEMPLATE_PROMPTS["prompt_driven"]
     if locked:
         return text
     return (
@@ -402,12 +406,22 @@ def _rewrite_transfer_motion(
     product: bool = False,
     portrait: bool = False,
     product_lock_mode: str = "locked",
-    product_video_template: str = "stable_showcase",
+    product_video_template: str = "prompt_driven",
 ) -> str:
     text = _normalise_prompt_fragment(value)
     if not text:
         return ""
     if product:
+        if product_video_template == "prompt_driven":
+            cleaned_motion = _REFERENCE_PRODUCT_NOUN_RE.sub("上传产品", text)
+            cleaned_motion = _REFERENCE_PRODUCT_DETAIL_RE.sub("上传产品对应结构与材质", cleaned_motion)
+            return (
+                "上传产品作为唯一视频主体，替换参考片中的原主体/原商品/人物；"
+                "严格执行以下可迁移动作、运镜、节奏和顺序，不得删除、替换或降速："
+                f"{cleaned_motion}；"
+                "保持同一 SKU 的包装结构、Logo、可见文字和材质纹理；"
+                "不要生成参考片里的原商品、原品牌、人物或服装。"
+            )
         if product_lock_mode != "free":
             return (
                 "上传产品作为唯一视频主体，替换参考片中的原主体/原商品/人物；"
@@ -522,7 +536,7 @@ def _style_transfer_generation_prompt(
     portrait: bool = False,
     is_video: bool = False,
     product_lock_mode: str = "locked",
-    product_video_template: str = "stable_showcase",
+    product_video_template: str = "prompt_driven",
 ) -> str:
     """Keep only transferable visual style fields for product/person edits.
 
@@ -546,7 +560,13 @@ def _style_transfer_generation_prompt(
                 product_lock_mode=product_lock_mode,
                 product_video_template=product_video_template,
             )
-        elif product and is_video and product_lock_mode != "free" and key == "镜头运动":
+        elif (
+            product
+            and is_video
+            and product_lock_mode != "free"
+            and product_video_template != "prompt_driven"
+            and key == "镜头运动"
+        ):
             fragment = (
                 "固定正面或轻微推拉镜头，稳定展示上传产品，保持完整包装、Logo和主要文字始终在画面内，"
                 "避免环绕、旋转、侧面展示、强运动模糊或裁切主体。"
@@ -559,7 +579,12 @@ def _style_transfer_generation_prompt(
         if fragment:
             parts.append(f"{key}: {fragment}")
     for key in _USER_INSTRUCTION_KEYS:
-        if product and is_video and product_lock_mode != "free":
+        if (
+            product
+            and is_video
+            and product_lock_mode != "free"
+            and product_video_template != "prompt_driven"
+        ):
             fragment = _rewrite_locked_product_user_instruction(prompt_obj.get(key))
         else:
             fragment = _normalise_prompt_fragment(prompt_obj.get(key))
@@ -662,7 +687,7 @@ def compact_generation_prompt_text(
         source = canonical
     elif product or portrait_mode:
         product_lock_mode = str((params or {}).get("product_lock_mode") or "locked").lower()
-        product_video_template = str((params or {}).get("product_video_template") or "stable_showcase").lower()
+        product_video_template = str((params or {}).get("product_video_template") or "prompt_driven").lower()
         source = _style_transfer_generation_prompt(
             prompt_obj,
             fallback,
@@ -711,7 +736,14 @@ def compact_generation_prompt_text(
         )
     elif product:
         product_lock_mode = str((params or {}).get("product_lock_mode") or "locked").lower()
-        if is_video and product_lock_mode != "free":
+        if is_video and product_video_template == "prompt_driven":
+            prefix += (
+                "产品生成需保持同一 SKU、Logo、包装结构、品牌色、可见文字和材质纹理连续一致；"
+                "产品身份保护只约束外观一致性，不得删除、替换、降速或改写用户指定的产品动作、"
+                "运镜、节奏和先后顺序。"
+                f"{_product_video_template_prompt(product_video_template, locked=True)}"
+            )
+        elif is_video and product_lock_mode != "free":
             prefix += (
                 "产品生成需保持同一商品、Logo、包装结构、品牌色、文字和材质细节稳定；"
                 "文字保真模式下采用固定正面、慢速轻推/轻拉、稳定特写或克制转场，"

@@ -66,8 +66,6 @@ interface BuildGenerationPayloadInput {
   productPixelLockMode?: ProductPixelLockMode;
   vDuration: number | string;
   vResolution: string;
-  videoProductLockMode?: "free" | "locked";
-  videoProductTemplate?: string;
 }
 
 function cleanText(value: unknown): string {
@@ -134,8 +132,6 @@ export function buildGenerationPayload({
   productPixelLockMode = "auto",
   vDuration,
   vResolution,
-  videoProductLockMode = "locked",
-  videoProductTemplate = "stable_showcase",
 }: BuildGenerationPayloadInput) {
   const isFinal = stage === "final" && Boolean(task);
   const effCategory = isFinal ? task.category : category;
@@ -281,6 +277,9 @@ export function buildGenerationPayload({
               : {}
           )),
       ...(effCategory === "video" ? {
+        input_mode: promptParts.optimizedText
+          ? "optimized"
+          : (promptDirty ? "direct_input" : "structured_reverse"),
         raw_text: promptParts.rawText || promptText,
         ...(promptParts.optimizedText ? { optimized_text: promptParts.optimizedText } : {}),
         ...(promptParts.optimizerModelId ? { optimizer_model_id: promptParts.optimizerModelId } : {}),
@@ -318,8 +317,10 @@ export function buildGenerationPayload({
             ...(styleReferenceUrl ? { style_reference_image: styleReferenceUrl } : {}),
             ...(portraitMode && refImage ? { character_reference_image: refImage } : {}),
             ...(subjectModeParam ? { subject_mode: subjectModeParam } : {}),
-            ...((isEditMode || directProductVideo) && productMode ? { product_lock_mode: videoProductLockMode === "locked" ? "locked" : "free" } : {}),
-            ...((isEditMode || directProductVideo) && productMode ? { product_video_template: videoProductTemplate || "stable_showcase" } : {}),
+            ...((isEditMode || directProductVideo) && productMode ? {
+              product_lock_mode: "locked",
+              product_video_template: "prompt_driven",
+            } : {}),
             ...(editNegative ? { negative_prompt: editNegative } : {}),
           },
   };

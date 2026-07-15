@@ -160,9 +160,9 @@ function rewriteVideoSubjectMotion(value, subject = "", structured = {}) {
   if (subject === "product") {
     return [
       "上传产品作为唯一视频主体，替换参考片中的原主体/原商品/人物",
-      "复用参考片的展示节奏、入镜顺序、角度切换、慢速推拉、稳定特写和卖点展示等可迁移动作",
+      "严格保留参考片中可迁移的具体动作、运镜、节奏和先后顺序，不得删除、替换或降速",
       safeMotion ? `具体可迁移动作：${safeMotion}` : "",
-      "优先保持完整包装、Logo 和主要文字始终在画面内，避免裁切主体、侧面展示或快速旋转",
+      "动作过程中保持同一 SKU 的包装结构、Logo、可见文字、颜色和材质纹理连续一致",
       "不要生成参考片里的原商品、原品牌、人物或服装",
     ].filter(Boolean).join("；");
   }
@@ -332,7 +332,6 @@ type ReverseVideoWorkspacePatchArgs = {
   startedRatio?: string;
   startedDuration?: number;
   maxDuration?: number;
-  productVideo?: boolean;
 };
 
 export function reverseVideoWorkspacePatch({
@@ -341,7 +340,6 @@ export function reverseVideoWorkspacePatch({
   startedRatio,
   startedDuration,
   maxDuration = MAX_VIDEO_DURATION_SECONDS,
-  productVideo = false,
 }: ReverseVideoWorkspacePatchArgs = {}): Partial<WorkspaceState> {
   if (!analysis || typeof analysis !== "object") return { reverseVideoAnalysis: null };
   const patch: Partial<WorkspaceState> = { reverseVideoAnalysis: analysis };
@@ -365,16 +363,6 @@ export function reverseVideoWorkspacePatch({
     patch.vDuration = boundedVideoDuration(Math.round(sourceDuration), maxDuration);
   }
 
-  const multiShot = Array.isArray(analysis.shots) && analysis.shots.length > 1;
-  if (
-    productVideo
-    && (multiShot || sourceDuration > 5)
-    && current.videoProductLockMode === "locked"
-    && (!current.videoProductTemplate || current.videoProductTemplate === "stable_showcase")
-  ) {
-    patch.videoProductLockMode = "free";
-    patch.videoProductTemplate = "reference_sequence";
-  }
   return patch;
 }
 

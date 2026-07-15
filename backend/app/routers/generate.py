@@ -457,7 +457,7 @@ def generate(body: GenerateIn, request: Request,
             portrait_reference=any(item.get("role") == "character" for item in references),
             product_lock_mode=str(task_params.get("product_lock_mode") or "locked"),
             product_video_template=str(
-                task_params.get("product_video_template") or "stable_showcase"
+                task_params.get("product_video_template") or "prompt_driven"
             ),
             model_profiles=model_profiles,
             fit_mode="single_clip",

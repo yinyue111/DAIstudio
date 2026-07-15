@@ -977,7 +977,7 @@ def test_structured_portrait_without_reference_is_not_reference_fidelity_task():
     assert is_portrait_generation_task(task) is False
 
 
-def test_product_video_locked_prompt_rewrites_orbit_and_keeps_product_in_frame():
+def test_product_video_prompt_driven_keeps_user_motion_and_product_identity():
     prompt = {
         "产品身份档案": "上传产品是 DAMAH 黑魔法棉柔巾, Logo 和包装文字必须完整保留。",
         "场景背景": "冷调棚拍背景",
@@ -995,15 +995,29 @@ def test_product_video_locked_prompt_rewrites_orbit_and_keeps_product_in_frame()
     )
 
     assert "DAMAH 黑魔法棉柔巾" in out
-    assert "固定正面" in out
-    assert "完整包装、Logo" in out
-    assert "避免裁切主体" in out
-    assert "缓慢推进并轻微环绕" not in out
-    assert "产品旋转展示" not in out
-    assert "背景水花或光影点缀且不遮挡包装" in out
+    assert "缓慢推进并轻微环绕" in out
+    assert "产品旋转展示" in out
+    assert "水花飞溅" in out
+    assert "固定正面" not in out
+    assert "稳定陈列" not in out
+    assert "避免快速旋转" not in out
 
 
 def test_video_generation_params_accept_product_video_template():
+    prompt_driven = validate_generation_params(
+        "video",
+        {
+            "duration": 5,
+            "resolution": "1080p",
+            "ratio": "9:16",
+            "subject_mode": "product",
+            "product_lock_mode": "locked",
+            "product_video_template": "prompt_driven",
+        },
+    )
+    assert prompt_driven["product_video_template"] == "prompt_driven"
+    assert prompt_driven["product_lock_mode"] == "locked"
+
     params = validate_generation_params(
         "video",
         {

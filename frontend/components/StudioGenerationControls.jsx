@@ -3,7 +3,6 @@
 import {
   IMAGE_QUALITY_PRESETS,
   VIDEO_DURATION_PRESETS,
-  VIDEO_PRODUCT_TEMPLATES,
   VIDEO_QUALITIES,
 } from "../app/studio/constants";
 import { boundedImageCount, boundedVideoDuration, formatDuration } from "../app/studio/helpers";
@@ -29,10 +28,6 @@ export default function StudioGenerationControls({
   isEditMode = false,
   productGenerationMode = false,
   portraitGenerationMode = false,
-  videoProductLockMode = "locked",
-  onVideoProductLockModeChange,
-  videoProductTemplate = "stable_showcase",
-  onVideoProductTemplateChange,
   showNegative,
   onToggleNegative,
   seed,
@@ -120,23 +115,6 @@ export default function StudioGenerationControls({
   const subjectProtectionStatusClass = subjectProtectionLoading || !subjectProtection
     ? "border-line bg-white/5 text-fog"
     : riskClass;
-  const applyVideoProductMode = (mode) => {
-    onVideoProductLockModeChange?.(mode);
-    if (mode === "locked") {
-      if (videoProductTemplate === "reference_sequence") {
-        onVideoProductTemplateChange?.("stable_showcase");
-      }
-      const current = boundedVideoDuration(vDuration, maxVideoDuration);
-      if (current > 5) onVideoDurationChange?.(5);
-    }
-  };
-  const applyVideoProductTemplate = (template) => {
-    onVideoProductTemplateChange?.(template);
-    if (template === "reference_sequence") {
-      onVideoProductLockModeChange?.("free");
-    }
-  };
-
   return (
     <>
       <div className="grid min-w-0 gap-3 px-1 py-1">
@@ -346,56 +324,6 @@ export default function StudioGenerationControls({
                 ))}
               </div>
             </div>
-            {productGenerationMode && !portraitGenerationMode && (
-              <div className={`${controlCardClass} sm:col-span-2`}>
-                <div className="flex min-w-0 items-center justify-between gap-3">
-                  <span className={controlLabelClass}>产品运动</span>
-                  <span className="min-w-0 truncate text-right text-xs text-fog">
-                    {videoProductLockMode === "locked" ? "文字保真" : "自由运动"}
-                  </span>
-                </div>
-                <div className={`${scrollPillRowClass} mt-2`}>
-                  {[
-                    { key: "locked", label: "文字保真", hint: "产品图作为身份参考，优先保持同一 SKU 的包装、Logo、文字和材质纹理。" },
-                    { key: "free", label: "自由运动", hint: "产品图仍作为身份参考，不限定首尾帧，适合旋转、泼溅、推拉和动态展示。" },
-                  ].map((option) => (
-                    <button
-                      key={option.key}
-                      type="button"
-                      onClick={() => applyVideoProductMode(option.key)}
-                      title={option.hint}
-                      className={`chip shrink-0 ${videoProductLockMode === option.key ? "chip-active" : ""}`}
-                    >
-                      {option.label}
-                    </button>
-                  ))}
-                </div>
-                <p className="mt-2 text-xs leading-relaxed text-fog">
-                  包装小字多的产品建议使用高清正面图或透明 PNG；文字保真模式会使用更克制的镜头。自由运动模式下，快速旋转、泼溅和运动模糊会增加文字乱码概率。
-                </p>
-                <div className="mt-3">
-                  <div className="flex min-w-0 items-center justify-between gap-3">
-                    <span className={controlLabelClass}>产品模板</span>
-                    <span className="min-w-0 truncate text-right text-xs text-fog">
-                      {VIDEO_PRODUCT_TEMPLATES.find((item) => item.key === videoProductTemplate)?.label || "稳定陈列"}
-                    </span>
-                  </div>
-                  <div className={`${scrollPillRowClass} mt-2`}>
-                    {VIDEO_PRODUCT_TEMPLATES.map((option) => (
-                      <button
-                        key={option.key}
-                        type="button"
-                        onClick={() => applyVideoProductTemplate(option.key)}
-                        title={option.hint}
-                        className={`chip shrink-0 ${videoProductTemplate === option.key ? "chip-active" : ""}`}
-                      >
-                        {option.label}
-                      </button>
-                    ))}
-                  </div>
-                </div>
-              </div>
-            )}
           </div>
         )}
 

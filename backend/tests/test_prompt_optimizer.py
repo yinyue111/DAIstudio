@@ -370,9 +370,9 @@ def test_anthropic_prompt_optimizer_uses_messages_protocol(monkeypatch):
     assert "最多 4 个主要镜头" in seen["payload"]["system"]
     assert "产品参考图只锁定产品身份" in seen["payload"]["system"]
     assert "不得用产品参考图锁定人物身份、场景、构图或光线" in seen["payload"]["system"]
-    assert "后期叠字" in seen["payload"]["system"]
-    assert "后期配音" in seen["payload"]["system"]
-    assert "不要求视频模型渲染精确字幕或旁白" in seen["payload"]["system"]
+    assert "保留用户明确要求的卖点文字、旁白和音效" in seen["payload"]["system"]
+    assert "不得删除、改写或一律转为后期" in seen["payload"]["system"]
+    assert "画面保持无字" not in seen["payload"]["system"]
     assert "风格设定" in seen["payload"]["system"]
     assert "场景脚本" in seen["payload"]["system"]
     assert "技术约束" in seen["payload"]["system"]
@@ -418,6 +418,65 @@ def test_anthropic_prompt_optimizer_uses_messages_protocol(monkeypatch):
         "effective_product_mode": True,
         "product_mode_source": "explicit",
     }
+
+
+def test_prompt_driven_product_video_optimizer_keeps_requested_text_voiceover_and_sfx(
+    monkeypatch,
+):
+    seen = {}
+
+    def fake_post(path, payload, **kwargs):
+        seen.update(path=path, payload=payload, **kwargs)
+        return {
+            "choices": [
+                {
+                    "message": {
+                        "content": (
+                            '{"风格设定":"高端日系个护广告，柔和浴室光",'
+                            '"场景脚本":["产品旋转展示"],'
+                            '"技术约束":"保持同一SKU一致"}'
+                        )
+                    }
+                }
+            ],
+            "usage": None,
+        }
+
+    monkeypatch.setattr(gateway, "_post", fake_post)
+    monkeypatch.setattr(gateway, "_gateway_mock", lambda _config=None: False)
+    cfg = RuntimeGatewayConfig(
+        use="prompt",
+        provider="custom_openai",
+        base_url="https://example.com/v1",
+        api_key="secret",
+        gateway_format="openai",
+    )
+
+    result = gateway.optimize_prompt(
+        "产品旋转展示，文字“厚实吸水”出现；旁白：“温柔开始。”；音效：水滴声。",
+        "gemini-3.5-flash-low",
+        category="video",
+        product_mode=True,
+        duration=10,
+        subject_mode="product",
+        reference_type="product_image",
+        target_model_id="doubao-seedance-2-0-mini-260615",
+        target_model_provider="volcengine_ark",
+        product_lock_mode="locked",
+        product_video_template="prompt_driven",
+        gateway_config=cfg,
+    )
+
+    system = seen["payload"]["messages"][0]["content"]
+    assert "保留用户明确要求的卖点文字、旁白和音效" in system
+    assert "避免快速旋转" not in system
+    assert "画面无字" not in system
+    assert "厚实吸水" in result["prompt"]
+    assert "温柔开始" in result["prompt"]
+    assert "水滴声" in result["prompt"]
+    assert "按用户要求显示指定卖点文字" in result["prompt"]
+    assert "避免快速旋转" not in result["prompt"]
+    assert "画面无字" not in result["prompt"]
 
 
 def test_openai_prompt_optimizer_uses_runtime_video_prompt_profile(monkeypatch):
@@ -470,7 +529,8 @@ def test_openai_prompt_optimizer_uses_runtime_video_prompt_profile(monkeypatch):
     assert "最多 5 个主要镜头" in seen["payload"]["messages"][0]["content"]
     assert result["prompt"].startswith("风格设定：极简商业广告，柔和侧光")
     assert "场景脚本：\nShot 1：产品稳定入镜\nShot 2：镜头慢速推近Logo" in result["prompt"]
-    assert "画面无字，精确字幕、旁白和音效仅后期添加" in result["prompt"]
+    assert "按用户要求显示指定卖点文字" in result["prompt"]
+    assert "画面无字" not in result["prompt"]
     assert "必须完整执行且不得替换的原始动作要求" in result["prompt"]
 
 
