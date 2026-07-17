@@ -23,7 +23,8 @@ def _fake_tools(tmp_path: Path) -> tuple[Path, Path]:
         bin_dir / "pg_dump",
         'printf "pg_dump" >> "$COMMAND_LOG"\n'
         'for arg in "$@"; do printf " <%s>" "$arg" >> "$COMMAND_LOG"; done\n'
-        'printf " PGPASSFILE_MODE=%s\\n" "$(stat -f %Lp "$PGPASSFILE")" >> "$COMMAND_LOG"\n'
+        'mode="$(stat -c %a "$PGPASSFILE" 2>/dev/null || stat -f %Lp "$PGPASSFILE")"\n'
+        'printf " PGPASSFILE_MODE=%s\\n" "$mode" >> "$COMMAND_LOG"\n'
         '[[ -z "${EXPECTED_PGPASS:-}" ]] || grep -Fq "$EXPECTED_PGPASS" "$PGPASSFILE"\n'
         '[[ "${ASSERT_PGPASSWORD_UNSET:-}" != 1 || -z "${PGPASSWORD+x}" ]]\n'
         'if [[ -n "${DUMP_ENTERED_FILE:-}" ]]; then touch "$DUMP_ENTERED_FILE"; while [[ ! -f "$DUMP_RELEASE_FILE" ]]; do sleep 0.01; done; fi\n'
