@@ -346,6 +346,9 @@ class Settings(BaseSettings):
     max_generate_params_bytes: int = 16_384
     # How many keyframes to sample from a reference video for understanding.
     reverse_video_frames: int = 4
+    # Bound the raw JPEG bytes sent to the vision gateway. Base64 encoding adds
+    # overhead later, so enforce this before constructing the model request.
+    reverse_video_frame_payload_max_bytes: int = 12 * 1024 * 1024
     # Cap concurrent video downloads/ffmpeg jobs used by reverse-video analysis.
     reverse_video_parallelism: int = 2
     reverse_video_acquire_timeout_seconds: int = 2
@@ -433,6 +436,13 @@ class Settings(BaseSettings):
     def _validate_upload_processing_parallelism(cls, value: int) -> int:
         if value < 1:
             raise ValueError("upload_processing_parallelism must be at least 1")
+        return value
+
+    @field_validator("reverse_video_frame_payload_max_bytes")
+    @classmethod
+    def _validate_reverse_frame_payload_budget(cls, value: int) -> int:
+        if value < 1024 * 1024 or value > 64 * 1024 * 1024:
+            raise ValueError("reverse_video_frame_payload_max_bytes must be between 1MiB and 64MiB")
         return value
 
     @field_validator("upload_processing_acquire_timeout_seconds")

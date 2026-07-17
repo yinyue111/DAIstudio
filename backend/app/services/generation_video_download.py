@@ -21,7 +21,7 @@ from .generation_common import (
     settlement_cost,
 )
 from .generation_media import localize_video_poster, video_media_meta, video_poster_url
-from .generation_model_runtime import model_from_snapshot
+from .generation_model_runtime import model_config_for_task, model_from_snapshot
 from .generation_state import (
     NEEDS_REVIEW,
     LocalVideoSettlementError,
@@ -41,6 +41,7 @@ from .generation_video_flow import (
     mark_video_download_alive,
     unlink_keys,
 )
+from .media_sidecars import storage_bytes_for_asset_urls, storage_bytes_for_keys
 from .progress import set_progress
 
 log = logging.getLogger("generation")
@@ -112,6 +113,10 @@ def persist_local_video_result_asset(db, task: GenTask, keys: list[str]) -> list
                 width=media_meta.get("width"),
                 height=media_meta.get("height"),
                 duration=media_meta.get("duration"),
+                bytes=storage_bytes_for_asset_urls(
+                    storage.public_url(preview_key),
+                    storage.public_url(media_key),
+                ),
             )
         )
         return written_keys
@@ -136,6 +141,7 @@ def persist_local_video_result_asset(db, task: GenTask, keys: list[str]) -> list
             width=media_meta.get("width"),
             height=media_meta.get("height"),
             duration=media_meta.get("duration"),
+            bytes=storage_bytes_for_asset_urls(storage.public_url(media_key)),
         )
     )
     return written_keys
@@ -412,7 +418,7 @@ def run_video_download_task(
         expected_phase = observed_phase
         identity_captured = True
         model_loader = get_model_config_fn or get_model_config
-        model = model_loader(db, "video")
+        model = model_config_for_task(db, task, "video", model_loader)
         if not model:
             hold_video_download_for_reconciliation(
                 db,
@@ -629,6 +635,7 @@ def finalize_video_success(
             width=media_meta.get("width"),
             height=media_meta.get("height"),
             duration=media_meta.get("duration"),
+            bytes=storage_bytes_for_keys(written_keys),
         )
     )
     claimed_terminal = False
@@ -711,7 +718,7 @@ def admin_settle_needs_review_video(
     if task.category != "video":
         raise ValueError("仅视频任务支持补结果结算")
     model_loader = get_model_config_fn or get_model_config
-    model = model_loader(db, "video")
+    model = model_config_for_task(db, task, "video", model_loader)
     if not model:
         raise ValueError("未配置视频模型")
     model = model_from_snapshot(task, model)

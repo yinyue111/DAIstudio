@@ -79,7 +79,15 @@ export function safeAssetMediaSrc(src) {
 }
 
 export function assetPreviewSrc(asset) {
-  return safeAssetMediaSrc(asset?.preview_url || asset?.hd_url || "");
+  return safeAssetMediaSrc(
+    asset?.display_url
+    || asset?.display_thumb
+    || asset?.preview_url
+    || asset?.thumb
+    || asset?.hd_url
+    || asset?.url
+    || "",
+  );
 }
 
 export function isAssetTakenDown(asset) {
@@ -91,15 +99,34 @@ export function assetUnavailableText(asset) {
   return "预览暂不可用";
 }
 
-export function assetDisplaySrc(asset, { playbackUrl = "" } = {}) {
+export function assetDisplaySrc(asset, { playbackUrl = "", interactive = false } = {}) {
+  if (asset?.origin === "uploaded") {
+    if (asset?.type === "video") {
+      return safeAssetMediaSrc(
+        interactive
+          ? (playbackUrl || asset.url || asset.hd_url || asset.preview_url || asset.thumb || "")
+          : (asset.preview_url || asset.thumb || asset.url || asset.hd_url || ""),
+      );
+    }
+    return safeAssetMediaSrc(
+      playbackUrl || asset.url || asset.hd_url || asset.preview_url || asset.thumb || "",
+    );
+  }
   if (asset?.type === "video" && asset.unlocked) {
     return safeAssetMediaSrc(playbackUrl || asset.preview_url || asset.hd_url || "");
   }
   return assetPreviewSrc(asset);
 }
 
-export function shouldRenderVideo(asset, { playbackUrl = "" } = {}) {
+export function shouldRenderVideo(asset, { playbackUrl = "", interactive = false } = {}) {
   if (asset?.type !== "video") return false;
+  if (asset?.origin === "uploaded") {
+    const playableUrl = playbackUrl || asset.url || asset.hd_url || "";
+    if (interactive) return Boolean(playableUrl);
+    const posterOrPreview = asset.preview_url || asset.thumb || "";
+    if (posterOrPreview) return /\.(mp4|webm|mov)(\?|$)/i.test(posterOrPreview);
+    return /\.(mp4|webm|mov)(\?|$)/i.test(playableUrl);
+  }
   if (playbackUrl) return true;
   return Boolean(
     asset.preview_url
@@ -119,11 +146,16 @@ export function isDownscaledImageAsset(asset) {
 }
 
 export function canDownloadAsset(asset) {
-  return Boolean(asset?.unlocked && !isAssetTakenDown(asset));
+  return Boolean(
+    asset?.available !== false
+    && !isAssetTakenDown(asset)
+    && (asset?.origin === "uploaded" || asset?.unlocked),
+  );
 }
 
 export function assetPreviewLabel(asset) {
   if (isAssetTakenDown(asset)) return "素材已下架";
+  if (asset?.origin === "uploaded") return "我的上传 · 可用于创作";
   if (!asset?.unlocked) return "预览 · 带水印";
   return isPreviewVideoAsset(asset) ? "视频 · 可下载" : "预览 · 已解锁，可下载";
 }
@@ -168,6 +200,7 @@ export default function AssetMedia({
     setImagePreviewUrl("");
     setError("");
     if (!interactive || !asset?.unlocked || isAssetTakenDown(asset)) return;
+    if (asset?.origin === "uploaded") return;
     if (asset.type === "image" && asset.hd_url) {
       let objectUrl = "";
       assetDownloadObjectUrl(asset.id)
@@ -195,10 +228,12 @@ export default function AssetMedia({
     return () => {
       cancelled = true;
     };
-  }, [asset?.id, asset?.type, asset?.unlocked, asset?.hd_url, asset?.moderation_status, interactive]);
+  }, [asset?.id, asset?.origin, asset?.type, asset?.unlocked, asset?.hd_url, asset?.moderation_status, interactive]);
 
-  const src = safeAssetMediaSrc(imagePreviewUrl || assetDisplaySrc(asset, { playbackUrl }));
-  const renderVideo = shouldRenderVideo(asset, { playbackUrl });
+  const src = safeAssetMediaSrc(
+    imagePreviewUrl || assetDisplaySrc(asset, { playbackUrl, interactive }),
+  );
+  const renderVideo = shouldRenderVideo(asset, { playbackUrl, interactive });
   if (error) {
     return (
       <div className={fallbackClassName || className}>

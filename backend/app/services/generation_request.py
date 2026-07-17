@@ -6,11 +6,12 @@ import json
 import re
 
 from fastapi import HTTPException
+from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from ..config import settings
-from ..models import GenTask, UploadedAsset
-from . import asset_refs
+from ..models import GenAsset, GenTask, UploadedAsset
+from . import asset_refs, retention, storage
 from .config_store import get_setting
 from .generation_pricing import generation_cost, generation_cost_from_snapshot
 from .ssrf import local_storage_key_from_user_asset_url
@@ -48,6 +49,7 @@ _VIDEO_PARAM_KEYS = _COMMON_PARAM_KEYS | {
     "ratio",
     "reference_image_url",
     "product_reference_image",
+    "product_detail_images",
     "first_frame_image",
     "last_frame_image",
     "style_reference_image",
@@ -70,6 +72,7 @@ _PRODUCT_VIDEO_TEMPLATES = {
 }
 _EDIT_MASK_MODES = {"off", "protect_subject", "center_box"}
 _PRODUCT_PIXEL_LOCK_MODES = {"auto", "strict", "on", "true", "1", "off", "false", "0"}
+_MAX_PRODUCT_DETAIL_IMAGES = 5
 
 
 def image_max_pixels() -> int:
@@ -88,6 +91,36 @@ def _normalise_reference_dimensions(params: dict) -> None:
         if not (1 <= value <= 20000):
             raise HTTPException(400, f"{key} 超出范围")
         params[key] = value
+
+
+def validate_product_detail_images(params: dict) -> dict:
+    """Validate and canonicalize the ordered product-detail reference contract."""
+    if "product_detail_images" not in params:
+        return params
+    details = params.get("product_detail_images")
+    if not isinstance(details, list):
+        raise HTTPException(400, "product_detail_images 必须是图片链接数组")
+    if len(details) > _MAX_PRODUCT_DETAIL_IMAGES:
+        raise HTTPException(400, f"产品细节图最多 {_MAX_PRODUCT_DETAIL_IMAGES} 张")
+
+    normalized: list[str] = []
+    for index, value in enumerate(details, start=1):
+        if not isinstance(value, str) or not value.strip():
+            raise HTTPException(400, f"product_detail_images[{index - 1}] 非法")
+        normalized.append(value.strip())
+    if len(set(normalized)) != len(normalized):
+        raise HTTPException(400, "产品细节图不能重复")
+
+    if normalized:
+        product = params.get("product_reference_image")
+        if not isinstance(product, str) or not product.strip():
+            raise HTTPException(400, "上传产品细节图前必须先提供产品主题图")
+        product = product.strip()
+        if product in normalized:
+            raise HTTPException(400, "产品主题图和细节图不能重复")
+        params["product_reference_image"] = product
+    params["product_detail_images"] = normalized
+    return params
 
 
 def validate_generation_params(category: str, params: dict) -> dict:
@@ -114,6 +147,8 @@ def validate_generation_params(category: str, params: dict) -> dict:
     ):
         if params.get(key) is not None and not isinstance(params[key], str):
             raise HTTPException(400, f"{key} 非法")
+    if category == "video":
+        validate_product_detail_images(params)
     _normalise_reference_dimensions(params)
     if params.get("subject_mode") not in (None, ""):
         subject_mode = str(params["subject_mode"]).strip().lower()
@@ -271,6 +306,79 @@ def assert_reference_access(db: Session, user_id: int, *urls: str | None) -> Non
             raise HTTPException(404, str(e)) from e
 
 
+def _assert_owned_live_image_asset(
+    db: Session,
+    user_id: int,
+    url: str,
+    *,
+    label: str,
+) -> None:
+    """Require one product reference to be an owned, live local image asset."""
+    retention_days = retention.get_retention_days(db)
+    key = local_storage_key_from_user_asset_url(url)
+    if not key:
+        raise HTTPException(400, f"{label}必须来自本人素材库")
+
+    uploaded = db.get(UploadedAsset, key)
+    if uploaded is not None:
+        if uploaded.user_id != user_id:
+            raise HTTPException(404, "上传素材不存在")
+        if not str(uploaded.mime or "").lower().startswith("image/"):
+            raise HTTPException(400, f"{label}仅支持图片素材")
+        if uploaded.retained_at is None and retention.is_expired(
+            uploaded.created_at,
+            retention_days,
+        ):
+            raise HTTPException(410, f"{label}已失效，请重新上传")
+        path = storage.local_path(key)
+        if not path.exists() or not path.is_file():
+            raise HTTPException(410, f"{label}文件已失效，请重新上传")
+        return
+
+    if key.startswith(("upload/", "upload_preview/", "upload_video/", "upload_video_preview/")):
+        raise HTTPException(404, "上传素材不存在")
+
+    public_url = storage.public_url(key)
+    generated = db.query(GenAsset).filter(
+        or_(GenAsset.preview_url == public_url, GenAsset.hd_url == public_url)
+    ).first()
+    if generated is None or generated.user_id != user_id:
+        raise HTTPException(404, "生成素材不存在")
+    if generated.type != "image":
+        raise HTTPException(400, f"{label}仅支持图片素材")
+    if generated.moderation_status != "active":
+        raise HTTPException(410, f"{label}已失效，请重新选择")
+    if generated.retained_at is None and retention.is_expired(
+        generated.created_at,
+        retention_days,
+    ):
+        raise HTTPException(410, f"{label}已失效，请重新选择")
+    try:
+        path = asset_refs.generated_asset_reference_path(db, user_id, key)
+    except asset_refs.AssetRefError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    if not path.exists() or not path.is_file():
+        raise HTTPException(410, f"{label}文件已失效，请重新选择")
+
+
+def assert_product_reference_image_access(
+    db: Session,
+    user_id: int,
+    url: str | None,
+) -> None:
+    if url:
+        _assert_owned_live_image_asset(db, user_id, url, label="产品主题图")
+
+
+def assert_product_detail_image_access(
+    db: Session,
+    user_id: int,
+    urls: list[str] | tuple[str, ...],
+) -> None:
+    for url in urls:
+        _assert_owned_live_image_asset(db, user_id, url, label="产品细节图")
+
+
 def default_image_n(db: Session) -> int:
     try:
         n = int(get_setting(db, "image_n", 1))
@@ -302,6 +410,7 @@ def request_fingerprint(
     prompt: dict,
     params: dict,
     parent_task_id: int | None,
+    model_config_id: int | None = None,
 ) -> str:
     payload = {
         "category": category,
@@ -311,6 +420,7 @@ def request_fingerprint(
         "prompt": _fingerprint_clean(prompt or {}),
         "params": _fingerprint_clean(params or {}),
         "parent_task_id": parent_task_id,
+        "model_config_id": model_config_id,
     }
     raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(raw.encode()).hexdigest()

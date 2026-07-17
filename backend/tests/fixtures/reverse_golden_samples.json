@@ -1,0 +1,89 @@
+{
+  "samples": [
+    {
+      "id": "sanitized-image-001",
+      "result": {
+        "structured": {
+          "主体": "白色瓷杯",
+          "场景背景": "浅灰色影棚背景"
+        },
+        "final_text": "白色瓷杯置于浅灰色影棚背景，柔和侧光"
+      },
+      "expected": {
+        "required_fields": ["structured.主体", "final_text"],
+        "forbidden_claims": ["包装上写有品牌名"]
+      },
+      "latency_ms": 410,
+      "cost_credits": 2
+    },
+    {
+      "id": "sanitized-video-001",
+      "result": {
+        "structured": {
+          "主体": "ACME 示例瓶",
+          "场景背景": "白色展台"
+        },
+        "final_text": "ACME 示例瓶在白色展台上，镜头保持稳定",
+        "shots": [
+          {
+            "start_seconds": 0,
+            "end_seconds": 2,
+            "visual": "瓶身正面特写",
+            "evidence_frame_indices": [1, 2],
+            "confidence": 0.96
+          },
+          {
+            "start_seconds": 2,
+            "end_seconds": 4,
+            "visual": "瓶身与展台保持不变",
+            "evidence_frame_indices": [2, 3],
+            "confidence": 0.94
+          }
+        ]
+      },
+      "expected": {
+        "required_fields": ["structured.主体", "final_text", "shots"],
+        "ocr_tokens": ["ACME"],
+        "forbidden_claims": ["镜头快速环绕", "人物进入画面"],
+        "evidence_units": [1, 2, 3]
+      },
+      "latency_ms": 1280,
+      "cost_credits": 18
+    },
+    {
+      "id": "sanitized-product-profile-001",
+      "result": {
+        "structured": {
+          "产品品类": "矩形盒装护肤品",
+          "包装结构": "顶部插口纸盒",
+          "不可改项": "盒型比例与主色"
+        },
+        "final_text": "保持矩形纸盒比例、顶部插口结构与主色稳定"
+      },
+      "expected": {
+        "required_fields": ["structured.产品品类", "structured.包装结构", "final_text"],
+        "forbidden_claims": ["成年女性模特"]
+      },
+      "latency_ms": 520,
+      "cost_credits": 2
+    },
+    {
+      "id": "sanitized-portrait-profile-001",
+      "result": {
+        "structured": {
+          "年龄语境": "成年商业人像",
+          "脸型五官": "椭圆脸，平直眉，眼距中等",
+          "身份稳定特征": "脸型、眉形与眼距",
+          "不可改项": "脸型、五官比例与肤色"
+        },
+        "final_text": "保持椭圆脸、平直眉、中等眼距和肤色一致"
+      },
+      "expected": {
+        "required_fields": ["structured.脸型五官", "structured.身份稳定特征", "final_text"],
+        "forbidden_claims": ["矩形盒装产品"]
+      },
+      "latency_ms": 610,
+      "cost_credits": 2
+    }
+  ]
+}

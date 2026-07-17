@@ -76,14 +76,7 @@ assert.deepEqual(datetime.localDateRangeToIsoBounds("2026-02-30", "2026-02-30"),
 
 const historySource = readFileSync(join(root, "app/history/page.jsx"), "utf8");
 const auditSource = readFileSync(join(root, "app/admin/components/reports-audit.jsx"), "utf8");
-const profileSource = readFileSync(join(root, "app/profile/page.jsx"), "utf8");
 
 assert.match(historySource, /formatLocalDateTime\(t\.created_at\)/);
 assert.match(auditSource, /formatLocalDateTime\(r\.created_at, \{ includeSeconds: true \}\)/);
-assert.match(
-  profileSource,
-  /localDateRangeToProfileAssetParams\(assetFilters\.created_from,\s*assetFilters\.created_to\)/,
-  "profile asset filters should send explicit local-day ISO boundaries",
-);
-
 console.log("datetime formatting tests passed");

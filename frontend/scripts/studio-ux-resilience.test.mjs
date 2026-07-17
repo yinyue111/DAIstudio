@@ -93,8 +93,8 @@ assert.match(
 );
 assert.match(
   pageSource,
-  /for \(const \{ key: mode \} of CREATION_MODES\)[\s\S]*invalidatePromptOptimization\(mode\);[\s\S]*resetOwnerReferenceParsing\(\);[\s\S]*resetOwnerMediaUpload\(\);/,
-  "workspace clear should invalidate stale optimizer, reverse and upload responses",
+  /async function clearAllWorkspaces\(\)[\s\S]*window\.confirm\([\s\S]*for \(const \{ key: mode \} of CREATION_MODES\)[\s\S]*invalidatePromptOptimization\(mode\);[\s\S]*resetOwnerReferenceParsing\(\);[\s\S]*resetOwnerMediaUpload\(\);/,
+  "confirmed clear-all should invalidate stale optimizer, reverse and upload responses",
 );
 assert.match(
   pageSource,

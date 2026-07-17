@@ -444,6 +444,31 @@ export const api = {
     }
     return request(`/api/profile/assets?${qs.toString()}`);
   },
+  meAssets: ({
+    origin = "all",
+    type = "all",
+    favorite = "",
+    retention = "all",
+    limit = 60,
+    offset = 0,
+    cursor = "",
+  } = {}) => {
+    const qs = new URLSearchParams({
+      origin,
+      type,
+      favorite: favorite === "" || favorite == null ? "" : String(Boolean(favorite)),
+      retention,
+      limit: String(limit),
+      offset: String(offset),
+    });
+    if (cursor) qs.set("cursor", String(cursor));
+    return request(`/api/me/assets?${qs.toString()}`);
+  },
+  updateMeAssetMetadata: (body) => request("/api/me/assets/metadata", { method: "POST", body }),
+  batchDeleteMeAssets: (asset_refs) => request("/api/me/assets/batch-delete", {
+    method: "POST",
+    body: { asset_refs },
+  }),
   paymentPackages: () => request("/api/payments/packages"),
   paymentConfig: () => request("/api/payments/config"),
   paymentOrders: (limit = 20) => request(`/api/payments/orders?limit=${limit}`),
@@ -479,6 +504,32 @@ export const api = {
       method: "POST",
       body: { asset_url, target, fallback_image, source_type, video_analysis_preset, client_request_id },
       timeoutMs: REVERSE_TIMEOUT_MS,
+    }),
+  createReverseOperation: (body) =>
+    request("/api/prompt/reverse-operations", {
+      method: "POST",
+      body,
+      timeoutMs: DEFAULT_TIMEOUT_MS,
+    }),
+  reverseOperation: (id) =>
+    request(`/api/prompt/reverse-operations/${encodeURIComponent(id)}`),
+  reverseOperations: ({ status = "", limit = 30, offset = 0 } = {}) => {
+    const qs = new URLSearchParams({ limit: String(limit), offset: String(offset) });
+    if (status) qs.set("status", status);
+    return request(`/api/prompt/reverse-operations?${qs.toString()}`);
+  },
+  confirmReverseOperationCover: (id, fallback_image = null) =>
+    request(`/api/prompt/reverse-operations/${encodeURIComponent(id)}/confirm-cover`, {
+      method: "POST",
+      body: fallback_image ? { fallback_image } : {},
+    }),
+  cancelReverseOperation: (id) =>
+    request(`/api/prompt/reverse-operations/${encodeURIComponent(id)}/cancel`, {
+      method: "POST",
+    }),
+  reverseOperationWsTicket: (id) =>
+    request(`/api/prompt/reverse-operations/${encodeURIComponent(id)}/ws-ticket`, {
+      method: "POST",
     }),
   optimizePrompt: (prompt, options = "image", product_mode = false) => {
     const context = typeof options === "object" && options !== null
@@ -564,8 +615,12 @@ export const api = {
   adminResetPassword: (userId, body) =>
     request(`/api/admin/users/${userId}/reset_password`, { method: "POST", body }),
   adminModels: () => request("/api/admin/models"),
+  adminCreateModel: (body) => request("/api/admin/models", { method: "POST", body }),
+  adminUpdateModel: (id, body) =>
+    request(`/api/admin/models/${encodeURIComponent(id)}`, { method: "PATCH", body }),
   adminSaveModel: (body) => request("/api/admin/models", { method: "PUT", body }),
   adminProbeModels: (body) => request("/api/admin/models/probe", { method: "POST", body }),
+  adminImportModels: (body) => request("/api/admin/models/import", { method: "POST", body }),
   adminReport: (qs = "") => request(`/api/admin/usage/report${qs}`),
   adminUsageDashboard: (qs = "") => request(`/api/admin/usage/dashboard${qs}`),
   adminModelCosts: (qs = "") => request(`/api/admin/usage/model-costs${qs}`),

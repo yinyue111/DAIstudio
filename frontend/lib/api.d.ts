@@ -7,11 +7,62 @@ export class ApiError extends Error {
 }
 
 export type AssetType = "image" | "video";
-export type ReverseTarget = AssetType | "product_profile";
+export type ReverseTarget = AssetType | "product_profile" | "portrait_profile";
 export type TaskStatus = "queued" | "running" | "succeeded" | "failed" | "needs_review" | "canceled";
+export type ReverseOperationStatus = "queued" | "running" | "needs_confirmation" | "succeeded" | "failed" | "canceled";
+
+export interface ReverseOperationTimestamps {
+  created_at: string | null;
+  updated_at: string | null;
+  started_at: string | null;
+  finished_at: string | null;
+}
+
+export interface ReverseOperation {
+  id: number | string;
+  status: ReverseOperationStatus;
+  target: ReverseTarget;
+  source_type: AssetType | null;
+  phase: string | null;
+  progress: number;
+  result: Record<string, unknown> | null;
+  video_analysis: Record<string, unknown> | null;
+  request_context: Record<string, unknown> | null;
+  workspace_snapshot_v2: Record<string, unknown> | null;
+  reference_count: number;
+  charged_credits: number;
+  cost_frozen: number;
+  cost_settled: number;
+  confirmation_expires_at: string | null;
+  cancel_requested: boolean;
+  error_code: string | null;
+  error: string | null;
+  created_at: string | null;
+  updated_at: string | null;
+  queued_at?: string | null;
+  started_at: string | null;
+  finished_at: string | null;
+  timestamps: ReverseOperationTimestamps;
+  model_config_id?: number | null;
+  model_name?: string | null;
+  model_id?: string | null;
+}
+
+export interface ReverseOperationCreate {
+  asset_url: string;
+  target: ReverseTarget;
+  client_request_id: string;
+  fallback_image?: string | null;
+  source_type?: AssetType | null;
+  video_analysis_preset?: string | null;
+  workspace_snapshot_v2?: Record<string, unknown> | null;
+  model_config_id?: number | null;
+}
 
 export interface Asset {
   id?: number;
+  asset_ref?: string;
+  origin?: "generated" | "uploaded";
   type: AssetType;
   url?: string;
   thumb?: string | null;
@@ -21,6 +72,9 @@ export interface Asset {
   original_thumb?: string | null;
   source_page_url?: string | null;
   source_captured_at?: string | null;
+  retention_expires_at?: string | null;
+  expired?: boolean;
+  available?: boolean;
   preview_url?: string | null;
   hd_url?: string | null;
   width?: number | null;
@@ -29,6 +83,12 @@ export interface Asset {
   thumb_height?: number | null;
   unlocked?: boolean;
   favorite?: boolean;
+  retained?: boolean;
+  created_at?: string | null;
+  expires_at?: string | null;
+  filename?: string | null;
+  bytes?: number | null;
+  duration?: number | null;
   unlock_cost?: number | null;
   quality_status?: string | null;
   quality_message?: string | null;
@@ -48,6 +108,8 @@ export interface Task {
   model_use?: string | null;
   model_id?: string | null;
   model_provider?: string | null;
+  model_config_id?: number | null;
+  model_name?: string | null;
   prompt_text?: string | null;
   prompt_text_source?: "generation" | "request" | null;
   request_prompt_text?: string | null;
@@ -90,6 +152,7 @@ export interface GeneratePayload {
   params?: Record<string, unknown>;
   parent_task_id?: number | null;
   client_request_id?: string | null;
+  model_config_id?: number | null;
 }
 
 export interface PromptOptimizeOptions {
@@ -105,6 +168,8 @@ export interface PromptOptimizeOptions {
   resolution?: string;
   product_lock_mode?: "free" | "locked";
   product_video_template?: string;
+  optimizer_model_config_id?: number | null;
+  target_model_config_id?: number | null;
 }
 
 export interface PromptOptimizeResult {
@@ -113,6 +178,23 @@ export interface PromptOptimizeResult {
   optimizer_model_id?: string | null;
   compiler_metadata?: Record<string, unknown> | null;
   context_metadata?: Record<string, unknown> | null;
+  optimizer_model_config_id?: number | null;
+  optimizer_model_name?: string | null;
+}
+
+export type ModelUse = "vision" | "image" | "video" | "prompt";
+
+export interface ModelOption {
+  id: number;
+  use: ModelUse;
+  name: string;
+  model_id: string;
+  provider: string;
+  provider_label: string;
+  cost_credits: number;
+  unlock_cost: number;
+  is_default: boolean;
+  capabilities: Record<string, boolean | number | string | string[]>;
 }
 
 export interface PromptHistoryQuery {
@@ -184,6 +266,21 @@ export const api: {
   config(): Promise<unknown>;
   profile(): Promise<unknown>;
   profileAssets(query?: ProfileAssetQuery): Promise<Asset[]>;
+  meAssets(query?: {
+    origin?: "all" | "generated" | "uploaded";
+    type?: "all" | AssetType;
+    favorite?: boolean | "";
+    retention?: "all" | "retained" | "expiring";
+    limit?: number;
+    offset?: number;
+    cursor?: string;
+  }): Promise<{ items: Asset[]; total: number; stats?: Record<string, number>; next_cursor?: string | null }>;
+  updateMeAssetMetadata(body: {
+    asset_refs: string[];
+    favorite?: boolean;
+    retained?: boolean;
+  }): Promise<unknown>;
+  batchDeleteMeAssets(asset_refs: string[]): Promise<unknown>;
   paymentPackages(): Promise<unknown>;
   paymentConfig(): Promise<unknown>;
   paymentOrders(limit?: number): Promise<unknown>;
@@ -204,6 +301,12 @@ export const api: {
     video_analysis_preset?: string | null,
     client_request_id?: string | null,
   ): Promise<unknown>;
+  createReverseOperation(body: ReverseOperationCreate): Promise<ReverseOperation>;
+  reverseOperation(id: number | string): Promise<ReverseOperation>;
+  reverseOperations(query?: { status?: string; limit?: number; offset?: number }): Promise<ReverseOperation[]>;
+  confirmReverseOperationCover(id: number | string, fallback_image?: string | null): Promise<ReverseOperation>;
+  cancelReverseOperation(id: number | string): Promise<ReverseOperation>;
+  reverseOperationWsTicket(id: number | string): Promise<{ ticket: string; expires_in: number }>;
   optimizePrompt(
     prompt: string,
     options?: "image" | "video" | PromptOptimizeOptions,
@@ -240,8 +343,11 @@ export const api: {
   adminSetUserStatus(userId: number | string, body: Record<string, unknown>): Promise<unknown>;
   adminResetPassword(userId: number | string, body: Record<string, unknown>): Promise<unknown>;
   adminModels(): Promise<unknown>;
+  adminCreateModel(body: Record<string, unknown>): Promise<unknown>;
+  adminUpdateModel(id: number | string, body: Record<string, unknown>): Promise<unknown>;
   adminSaveModel(body: Record<string, unknown>): Promise<unknown>;
   adminProbeModels(body: Record<string, unknown>): Promise<unknown>;
+  adminImportModels(body: Record<string, unknown>): Promise<unknown>;
   adminReport(qs?: string): Promise<unknown>;
   adminReportCsvUrl(qs?: string): string;
   adminAudit(qs?: string): Promise<unknown>;

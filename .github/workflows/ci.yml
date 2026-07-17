@@ -12,6 +12,9 @@ jobs:
   secrets:
     name: Secret scan
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
     steps:
       - uses: actions/checkout@v4
         with:
@@ -45,6 +48,8 @@ jobs:
       - name: Test (pytest)
         # tests run on sqlite + fakeredis + eager Celery + mock gateway — no services needed
         run: pytest
+      - name: Reverse prompt offline golden evaluation
+        run: python scripts/evaluate_reverse_golden.py tests/fixtures/reverse_golden_samples.json
 
   migrations:
     name: Backend — alembic migration chain
@@ -123,6 +128,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Validate worker topology
+        run: ./scripts/test_worker_parallelism.sh
       - name: Validate compose config
         run: docker compose config --quiet
         env:
@@ -171,6 +178,8 @@ jobs:
         run: npm ci
       - name: Unit tests
         run: npm run test:unit
+      - name: Typecheck
+        run: npm run typecheck
       - name: Build
         run: npm run build
         env:

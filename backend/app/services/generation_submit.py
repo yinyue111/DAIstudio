@@ -24,6 +24,7 @@ def submit_generation_task(
     stage: str,
     prompt: dict,
     model_use: str,
+    model_config_id: int | None,
     params: dict,
     client_request_id: str | None,
     cost: int,
@@ -39,6 +40,7 @@ def submit_generation_task(
         stage=stage,
         prompt=prompt,
         model_use=model_use,
+        model_config_id=model_config_id,
         params=params,
         client_request_id=client_request_id,
         status="queued",
@@ -80,7 +82,12 @@ def submit_generation_task(
         biz_type="gen_task",
         biz_id=task.id,
         ip=ip,
-        detail={"category": category, "stage": stage, "cost": cost},
+        detail={
+            "category": category,
+            "stage": stage,
+            "cost": cost,
+            "model_config_id": model_config_id,
+        },
     )
     return build_task_out(db, task)
 

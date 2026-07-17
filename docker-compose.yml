@@ -233,6 +233,32 @@ services:
         condition: service_healthy
     networks: [backend_internal, external_access]
 
+  worker_reverse:
+    build: ./backend
+    restart: unless-stopped
+    stop_grace_period: ${WORKER_STOP_GRACE_PERIOD:-15m}
+    # Keep this on threads: reverse tasks use cooperative cancellation and must
+    # never enter Celery's process-killing hard-timeout path.
+    command: celery -A app.celery_app.celery_app worker -l info --pool=threads --concurrency=${WORKER_REVERSE_CONCURRENCY:-2} -Q ${WORKER_REVERSE_QUEUES:-reverse}
+    env_file: *backend_env_file
+    environment:
+      <<: *app_datastores
+      DEPLOY_ENV: ${DEPLOY_ENV:-production}
+    mem_limit: ${WORKER_REVERSE_MEM_LIMIT:-2g}
+    volumes:
+      - media:/app/storage
+    healthcheck:
+      test: ["CMD-SHELL", "celery -A app.celery_app.celery_app inspect ping -d celery@$$HOSTNAME || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    networks: [backend_internal, external_access]
+
   beat:
     build: ./backend
     restart: unless-stopped

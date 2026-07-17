@@ -1,12 +1,14 @@
 """Video reverse-prompt analysis presets.
 
 The UI exposes three presets. The backend translates each preset and source
-duration into a concrete keyframe budget, then settles credits on the number of
-frames actually sent to the vision model.
+duration into a concrete keyframe budget; billing uses one fixed reverse price
+rather than multiplying by the extracted frame count.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
+
+from .generation_pricing import REVERSE_VIDEO_PRESET_COSTS
 
 DEFAULT_VIDEO_ANALYSIS_PRESET = "standard"
 
@@ -82,7 +84,7 @@ def frame_count_for_duration(duration_seconds: float | None, preset_key: str | N
     - 2-5min: fast 8-12, standard 16-24, fine 24-36
 
     Durations between 15s and 2min are smoothly interpolated to avoid jumps.
-    Unknown duration uses the preset maximum so credit pre-checks remain safe.
+    Unknown duration uses the preset maximum so extraction remains bounded.
     """
     preset = VIDEO_ANALYSIS_PRESETS[normalize_video_analysis_preset(preset_key)]
     if not duration_seconds or duration_seconds <= 0:
@@ -100,8 +102,8 @@ def frame_count_for_duration(duration_seconds: float | None, preset_key: str | N
 
 
 def preset_options(vision_cost: int = 0, preset_costs: dict[str, int] | None = None) -> list[dict]:
-    cost = max(0, int(vision_cost or 0))
-    preset_costs = preset_costs or {}
+    del vision_cost  # Compatibility argument; reverse video billing is preset-based.
+    preset_costs = {**REVERSE_VIDEO_PRESET_COSTS, **(preset_costs or {})}
     return [
         {
             "key": preset.key,
@@ -118,7 +120,7 @@ def preset_options(vision_cost: int = 0, preset_costs: dict[str, int] | None = N
                 else f"{preset.long_min_frames}-{preset.long_max_frames}帧"
             ),
             "max_frames": preset.max_frames,
-            "max_cost": int(preset_costs.get(preset.key, cost * preset.max_frames)),
+            "max_cost": int(preset_costs[preset.key]),
         }
         for preset in VIDEO_ANALYSIS_PRESETS.values()
     ]

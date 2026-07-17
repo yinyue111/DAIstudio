@@ -36,6 +36,7 @@ from .generation_media import (
 from .generation_model_runtime import (
     ModelSnapshotMismatchError,
     find_video_by_request_id_with_model_config,
+    model_config_for_task,
     model_from_snapshot,
     poll_video_with_model_config,
     submit_video_with_model_config,
@@ -345,6 +346,21 @@ def video_submit_params(db, task: GenTask) -> dict:
             )
         if not params.get("first_frame_image"):
             params.pop("reference_image_url", None)
+    product_details = params.get("product_detail_images")
+    if isinstance(product_details, list) and product_details:
+        params["product_detail_images"] = [
+            gateway_reference_image(
+                db,
+                task,
+                detail_url,
+                min_side=VIDEO_FIRST_FRAME_MIN_SIDE,
+                max_side=PRODUCT_VIDEO_REFERENCE_MAX_SIDE,
+                prefer_original_upload=True,
+                quality=92,
+                subsampling=0,
+            )
+            for detail_url in product_details
+        ]
 
     # Every client-supplied frame URL must be resolved by this backend before
     # it reaches the model gateway. Product identity references stay separate
@@ -436,6 +452,8 @@ def video_persisted_params(task: GenTask, original: dict, submitted: dict) -> di
         persisted["product_reference_image"] = original["product_reference_image"]
     elif subject_mode == "product" and task.source_type == "image" and task.source_asset_url:
         persisted["product_reference_image"] = task.source_asset_url
+    if "product_detail_images" in original:
+        persisted["product_detail_images"] = list(original.get("product_detail_images") or [])
     if original.get("first_frame_image"):
         persisted["first_frame_image"] = original["first_frame_image"]
     elif subject_mode != "product" and task.source_type == "image" and task.source_asset_url:
@@ -693,7 +711,7 @@ def start_video_task(
             task = db.get(GenTask, task_id)
             raise_if_cancel_requested(db, task)
 
-            model = model_loader(db, "video")
+            model = model_config_for_task(db, task, "video", model_loader)
             if not model or not model.enabled:
                 raise RuntimeError("未配置可用的视频模型")
             model = model_from_snapshot(task, model)
@@ -876,7 +894,7 @@ def poll_video_once(
         if action != "poll":
             return
         polled_external_task_id = task.external_task_id
-        model = model_loader(db, "video")
+        model = model_config_for_task(db, task, "video", model_loader)
         if not model:
             hold_video_poll_for_reconciliation(
                 db,

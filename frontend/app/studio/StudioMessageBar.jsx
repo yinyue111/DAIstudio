@@ -1,5 +1,7 @@
 "use client";
 
+import { useEffect } from "react";
+
 const KIND_STYLES = {
   bad: "border-bad/30 bg-bad/10 text-bad",
   warn: "border-warn/35 bg-warn/10 text-warn",
@@ -15,13 +17,34 @@ function inferKind(message) {
   return "info";
 }
 
-export default function StudioMessageBar({ message, kind }) {
-  if (!message) return null;
+export default function StudioMessageBar({ message, kind, onDismiss }) {
   const resolvedKind = KIND_STYLES[kind] ? kind : inferKind(message);
 
+  useEffect(() => {
+    if (!message || resolvedKind !== "ok" || typeof onDismiss !== "function") return undefined;
+    const timer = window.setTimeout(() => onDismiss(""), 4200);
+    return () => window.clearTimeout(timer);
+  }, [message, onDismiss, resolvedKind]);
+
+  if (!message) return null;
+
   return (
-    <div className={`mt-3 rounded-xl border px-4 py-2.5 text-sm shadow-pop max-lg:fixed max-lg:inset-x-3 max-lg:bottom-[76px] max-lg:z-30 max-lg:mt-0 ${KIND_STYLES[resolvedKind]}`}>
-      {message}
+    <div
+      role="status"
+      className={`mt-3 flex items-start gap-3 rounded-xl border px-4 py-2.5 text-sm shadow-pop max-lg:fixed max-lg:inset-x-3 max-lg:bottom-[76px] max-lg:z-30 max-lg:mt-0 ${KIND_STYLES[resolvedKind]}`}
+    >
+      <span className="min-w-0 flex-1 break-words">{message}</span>
+      {typeof onDismiss === "function" && (
+        <button
+          type="button"
+          onClick={() => onDismiss("")}
+          className="shrink-0 rounded-full px-1.5 text-lg leading-none text-current opacity-70 hover:bg-white/10 hover:opacity-100"
+          aria-label="关闭消息"
+          title="关闭消息"
+        >
+          ×
+        </button>
+      )}
     </div>
   );
 }

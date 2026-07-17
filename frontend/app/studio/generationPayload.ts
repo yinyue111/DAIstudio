@@ -1,7 +1,7 @@
 "use client";
 
-import type { AppConfig, Asset, Category, CreationModeKey, ProductPixelLockMode, SubjectMode, Task } from "../../lib/types";
-import { RATIOS } from "./constants";
+import type { AppConfig, Asset, Category, CreationModeKey, ProductPixelLockMode, ReverseVideoAnalysis, SubjectMode, Task } from "../../lib/types";
+import { MAX_PRODUCT_DETAIL_IMAGES, RATIOS } from "./constants";
 import { buildEditNegativePrompt, buildEditPrompt } from "./editPrompt";
 import {
   assetDims,
@@ -9,12 +9,12 @@ import {
   boundedImageCount,
   boundedVideoDuration,
   buildSourceAssetMeta,
+  composeEvidenceBackedVideoTransferPrompt,
   composePromptFromStructured,
-  composeSafeVideoTransferPrompt,
-  composeStyleTransferPrompt,
   imageSizeFor,
   shouldUseImageReference,
   styleTransferStructured,
+  visualStructuredFields,
   videoDurationLimit,
   videoRatioOptions,
 } from "./helpers";
@@ -47,17 +47,20 @@ interface BuildGenerationPayloadInput {
     raw_text?: string;
     optimized_text?: string;
     optimizer_model_id?: string;
+    optimizer_model_config_id?: number | null;
   };
   negative?: string;
   promptDirty?: boolean;
   promptSourceSignature?: string;
   selected?: Asset | null;
   productAsset?: Asset | null;
+  productDetailAssets?: Asset[];
   productProfile?: { structured?: Record<string, unknown>; final_text?: string } | null;
   productProfileSource?: string;
   variationSource?: Asset | null;
   structured?: Record<string, unknown>;
   structuredSource?: string;
+  reverseVideoAnalysis?: ReverseVideoAnalysis | null;
   ratio: string;
   imageQuality: string;
   n: number | string;
@@ -66,10 +69,33 @@ interface BuildGenerationPayloadInput {
   productPixelLockMode?: ProductPixelLockMode;
   vDuration: number | string;
   vResolution: string;
+  modelConfigId?: number | null;
 }
 
 function cleanText(value: unknown): string {
   return String(value || "").trim();
+}
+
+export function orderedProductDetailUrls(
+  productAsset: Asset | null | undefined,
+  details: Asset[] | string[] | null | undefined,
+): string[] {
+  const mainUrl = cleanText(productAsset?.url);
+  const rows = Array.isArray(details) ? details : [];
+  if (rows.length > 0 && !mainUrl) throw new Error("请先选择产品主题图，再添加产品细节图。");
+  if (rows.length > MAX_PRODUCT_DETAIL_IMAGES) {
+    throw new Error(`产品细节图最多 ${MAX_PRODUCT_DETAIL_IMAGES} 张，请移除后再生成。`);
+  }
+  const urls = rows.map((item) => cleanText(typeof item === "string" ? item : item?.url));
+  if (urls.some((url) => !url)) throw new Error("产品细节图存在不可用素材，请移除后重新选择。");
+  if (rows.some((item) => typeof item !== "string" && item?.type && item.type !== "image")) {
+    throw new Error("产品细节图只支持图片素材。");
+  }
+  const unique = new Set(urls);
+  if (unique.size !== urls.length || (mainUrl && unique.has(mainUrl))) {
+    throw new Error("产品主题图和细节图不能重复，请调整后再生成。");
+  }
+  return urls;
 }
 
 function promptInputParts(value: BuildGenerationPayloadInput["prompt"]) {
@@ -80,28 +106,28 @@ function promptInputParts(value: BuildGenerationPayloadInput["prompt"]) {
       rawText: cleanText(value.raw_text || text),
       optimizedText: cleanText(value.optimized_text),
       optimizerModelId: cleanText(value.optimizer_model_id),
+      optimizerModelConfigId: Number(value.optimizer_model_config_id) || null,
     };
   }
   const text = cleanText(value);
-  return { text, rawText: text, optimizedText: "", optimizerModelId: "" };
+  return { text, rawText: text, optimizedText: "", optimizerModelId: "", optimizerModelConfigId: null };
 }
 
-function productProfileText(profile: { structured?: Record<string, unknown>; final_text?: string } | null | undefined): string {
+function buildSubjectProfileText(
+  profile: { structured?: Record<string, unknown>; final_text?: string } | null | undefined,
+  target: "product_profile" | "portrait_profile",
+): string {
   if (!profile) return "";
-  const direct = cleanText(profile.final_text || profile.structured?.final_text);
-  if (direct) return direct;
   const structured = profile.structured || {};
-  const keys = [
-    "档案类型", "产品品类", "品牌Logo", "包装文字", "包装结构", "主色材质",
-    "形状比例", "关键图案", "卖点摘要", "展示角度", "主角约束", "不可改项",
-  ];
-  return keys
+  const visual = visualStructuredFields(structured, target);
+  const composed = Object.keys(visual)
     .map((key) => {
-      const text = cleanText(structured[key]);
+      const text = cleanText(visual[key]);
       return text ? `${key}: ${text}` : "";
     })
     .filter(Boolean)
     .join("；");
+  return composed;
 }
 
 export function buildGenerationPayload({
@@ -119,11 +145,13 @@ export function buildGenerationPayload({
   promptSourceSignature = "",
   selected = null,
   productAsset = null,
+  productDetailAssets = [],
   productProfile = null,
   productProfileSource = "",
   variationSource = null,
   structured = {},
   structuredSource = "",
+  reverseVideoAnalysis = null,
   ratio,
   imageQuality,
   n,
@@ -132,6 +160,7 @@ export function buildGenerationPayload({
   productPixelLockMode = "auto",
   vDuration,
   vResolution,
+  modelConfigId = null,
 }: BuildGenerationPayloadInput) {
   const isFinal = stage === "final" && Boolean(task);
   const effCategory = isFinal ? task.category : category;
@@ -157,6 +186,10 @@ export function buildGenerationPayload({
   const styleReferenceUrl = (isEditMode || directProductVideo) && styleReferenceAsset
     ? (styleReferenceAsset.type === "video" ? styleReferenceAsset.thumb : styleReferenceAsset.url)
     : null;
+  const productDetailUrls = orderedProductDetailUrls(
+    isFinal ? ({ url: cleanText(parentParams.product_reference_image), type: "image" } as Asset) : productAsset,
+    isFinal ? (parentParams.product_detail_images as string[] | undefined) : productDetailAssets,
+  );
   const {
     effectiveSubjectMode,
     portraitMode,
@@ -180,37 +213,52 @@ export function buildGenerationPayload({
       ? productProfile
       : null
   );
-  const subjectProfileText = productProfileText(effectiveProductProfile);
+  const subjectProfileTarget = portraitMode ? "portrait_profile" : "product_profile";
+  const subjectProfileText = buildSubjectProfileText(effectiveProductProfile, subjectProfileTarget);
+  const subjectProfileNegative = cleanText(effectiveProductProfile?.structured?.["负向"]);
+  const effectiveEditNegative = [...new Set(
+    [editNegative, subjectProfileNegative].map(cleanText).filter(Boolean),
+  )].join("，");
   const subjectProfileLabel = portraitMode ? "人物身份档案" : "产品身份档案";
   const effectiveStructured = (
     structuredSource && structuredSource !== styleSignature
       ? {}
       : structured
   );
-  const promptStructured = isEditMode
-    ? styleTransferStructured(effectiveStructured, { video: effCategory === "video", subject: effectiveSubjectMode })
-    : effectiveStructured;
+  const structuredVisualTarget = (
+    effCategory === "video" && reverseVideoAnalysis?.analysis_mode === "image_motion"
+      ? "image_to_video"
+      : effCategory
+  );
+  const promptStructured = visualStructuredFields(
+    isEditMode
+      ? styleTransferStructured(effectiveStructured, { video: effCategory === "video", subject: effectiveSubjectMode })
+      : effectiveStructured,
+    structuredVisualTarget,
+  );
   const promptSourceStale = Boolean(promptSourceSignature && promptSourceSignature !== styleSignature && !promptDirty);
   const promptParts = promptInputParts(prompt);
   const promptText = promptSourceStale ? "" : promptParts.text;
   const transferPromptText = (
     isEditMode && effCategory === "video" && (productMode || portraitMode)
-      ? composeSafeVideoTransferPrompt(effectiveStructured, effectiveSubjectMode)
+      ? composeEvidenceBackedVideoTransferPrompt(
+          effectiveStructured,
+          reverseVideoAnalysis,
+          effectiveSubjectMode,
+        )
       : ""
   );
-  const structuredText = isEditMode
-    ? (
-        effCategory === "video" && (productMode || portraitMode)
-          ? (transferPromptText || composePromptFromStructured(promptStructured))
-          : composeStyleTransferPrompt(effectiveStructured, "", { video: effCategory === "video", subject: effectiveSubjectMode })
-      )
-    : composePromptFromStructured(effectiveStructured);
+  const structuredText = transferPromptText || composePromptFromStructured(
+    promptStructured,
+    "",
+    { target: structuredVisualTarget },
+  );
   const baseFinalText = (
     promptDirty
       ? (promptText || structuredText)
       : (
           isEditMode && effCategory === "video" && (productMode || portraitMode)
-            ? (transferPromptText || structuredText || promptText)
+            ? (transferPromptText || promptText || structuredText)
             : (promptText || structuredText)
         )
   ) || "生成同风格的新素材";
@@ -253,6 +301,7 @@ export function buildGenerationPayload({
     } : {}),
     style_reference: styleReferenceAsset ? buildSourceAssetMeta(styleReferenceAsset) : null,
     product_subject: productAsset ? buildSourceAssetMeta(productAsset) : null,
+    product_details: productDetailAssets.map(buildSourceAssetMeta),
     ...(variationSource ? {
       variation_source: buildSourceAssetMeta(variationSource),
       variation_of_asset_id: variationSource.id || null,
@@ -260,6 +309,7 @@ export function buildGenerationPayload({
   } : null;
 
   const payload = {
+    ...(modelConfigId ? { model_config_id: Number(modelConfigId) } : {}),
     source_asset_url: sourceAsset ? sourceAsset.url : null,
     source_type: sourceAsset ? sourceAsset.type : "image",
     source_asset_meta: sourceAssetMeta,
@@ -283,6 +333,7 @@ export function buildGenerationPayload({
         raw_text: promptParts.rawText || promptText,
         ...(promptParts.optimizedText ? { optimized_text: promptParts.optimizedText } : {}),
         ...(promptParts.optimizerModelId ? { optimizer_model_id: promptParts.optimizerModelId } : {}),
+        ...(promptParts.optimizerModelConfigId ? { optimizer_model_config_id: promptParts.optimizerModelConfigId } : {}),
         assembled_text: finalText,
       } : {}),
       final_text: finalText,
@@ -303,7 +354,7 @@ export function buildGenerationPayload({
             ...(variationSource?.id ? { variation_of_asset_id: Number(variationSource.id) } : {}),
             ...(isImageEditMode && productMode ? { edit_mask_mode: editMaskMode || "protect_subject" } : {}),
             ...(isImageEditMode && productMode ? { product_pixel_lock: editMaskMode === "off" ? "off" : (productPixelLockMode || "auto") } : {}),
-            ...(editNegative ? { negative_prompt: editNegative } : {}),
+            ...(effectiveEditNegative ? { negative_prompt: effectiveEditNegative } : {}),
           }
         : {
             duration: boundedVideoDuration(finalDuration, maxVideoDuration),
@@ -313,7 +364,10 @@ export function buildGenerationPayload({
             ...(dims ? { reference_width: dims.width, reference_height: dims.height } : {}),
             ...(productMode && refImage
               ? { product_reference_image: refImage }
-              : (refImage ? { reference_image_url: refImage } : {})),
+              : (isFinal && parentParams.product_reference_image
+                  ? { product_reference_image: parentParams.product_reference_image }
+                  : (refImage ? { reference_image_url: refImage } : {}))),
+            ...(productDetailUrls.length ? { product_detail_images: productDetailUrls } : {}),
             ...(styleReferenceUrl ? { style_reference_image: styleReferenceUrl } : {}),
             ...(portraitMode && refImage ? { character_reference_image: refImage } : {}),
             ...(subjectModeParam ? { subject_mode: subjectModeParam } : {}),
@@ -321,7 +375,7 @@ export function buildGenerationPayload({
               product_lock_mode: "locked",
               product_video_template: "prompt_driven",
             } : {}),
-            ...(editNegative ? { negative_prompt: editNegative } : {}),
+            ...(effectiveEditNegative ? { negative_prompt: effectiveEditNegative } : {}),
           },
   };
 

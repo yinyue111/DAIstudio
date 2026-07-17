@@ -63,25 +63,129 @@ export function buildSourceAssetMeta(asset) {
 export function composePromptFromStructured(
   structured,
   fallbackText = "",
-  { preferFallback = false } = {},
+  { preferFallback = false, target = "image" } = {},
 ) {
   const fallback = String(fallbackText || "").trim();
   if (preferFallback && fallback) return fallback;
   if (!structured || !Object.keys(structured).length) return fallback;
   const finalText = String(structured.final_text || structured["final_text"] || fallbackText || "").trim();
-  const order = [
-    "主体", "商品服装", "细节特征", "场景背景", "广告目标", "风格", "景别", "构图",
-    "视角镜头", "视角构图", "主体动作", "镜头运动", "运动节奏", "剪辑节奏", "时序分镜",
-    "字幕卖点", "光线", "色调配色", "材质纹理", "氛围情绪", "后期质感", "转场", "一致性约束",
-  ];
-  const skip = new Set(["负向", "标签", "文字水印", "时长建议", "final_text"]);
+  const order = visualStructuredFieldOrder(target);
   const parts = [];
-  for (const k of order) if (structured[k] && !skip.has(k)) parts.push(structured[k]);
-  for (const k of Object.keys(structured))
-    if (!order.includes(k) && !skip.has(k) && structured[k]) parts.push(structured[k]);
-  let text = parts.join(", ");
-  if (structured["标签"]) text += (text ? ", " : "") + structured["标签"];
+  for (const key of order) {
+    const value = structured[key];
+    if (typeof value === "string" && value.trim()) parts.push(value.trim());
+  }
+  const text = parts.join(", ");
   return text.trim() || finalText;
+}
+
+const VISUAL_STRUCTURED_FIELDS = {
+  image: [
+    "主体", "人像意图", "人物比例", "身材体态", "体态线条", "服装结构", "服装覆盖", "妆发五官",
+    "商品服装", "细节特征", "场景背景", "广告目标", "风格", "景别", "构图",
+    "视角镜头", "光线", "色调配色", "材质纹理", "氛围情绪",
+    "后期质感", "一致性约束", "平台质感",
+  ],
+  video: [
+    "主体", "人像意图", "人物比例", "身材体态", "体态线条", "服装结构", "服装覆盖", "妆发五官",
+    "商品服装", "细节特征", "场景背景", "广告目标", "风格", "视角构图",
+    "光线", "色调配色", "材质纹理", "氛围情绪",
+    "一致性约束", "源视频规格",
+  ],
+  product_profile: [
+    "产品品类", "品牌Logo", "包装文字", "包装结构", "主色材质", "形状比例",
+    "关键图案", "卖点摘要", "展示角度", "主角约束", "不可改项", "可迁移项",
+  ],
+  portrait_profile: [
+    "年龄语境", "脸型五官", "妆发", "肤质", "体型比例", "姿态表情", "服装", "配饰",
+    "身份稳定特征", "不可改项", "可调整项",
+  ],
+  image_to_video: [
+    "静态观察", "主体", "场景背景", "视角构图", "光线", "色调配色", "材质纹理",
+    "可动元素", "主体运动设计", "镜头运动设计", "时序设计", "一致性约束",
+  ],
+};
+
+export function visualStructuredFieldOrder(target = "image") {
+  return VISUAL_STRUCTURED_FIELDS[target] || VISUAL_STRUCTURED_FIELDS.image;
+}
+
+export function visualStructuredFields(structured, target = "image") {
+  if (!structured || typeof structured !== "object") return {};
+  const allowed = new Set(visualStructuredFieldOrder(target));
+  return Object.fromEntries(
+    Object.entries(structured).filter(([key, value]) => (
+      allowed.has(key) && typeof value === "string" && value.trim()
+    )),
+  );
+}
+
+const VIDEO_EVIDENCE_SHOT_FIELDS = ["visual", "action", "camera", "lighting", "transition"];
+
+function videoSubjectTransferRules(subject = "") {
+  if (subject === "product") {
+    return [
+      "上传产品作为唯一视频主体，替换参考片中的原主体/原商品/人物",
+      "动作过程中保持同一 SKU 的包装结构、Logo、可见文字、颜色和材质纹理连续一致",
+      "不要生成参考片里的原商品、原品牌、人物或服装",
+    ];
+  }
+  if (subject === "portrait") {
+    return [
+      "上传人物作为唯一视频主体，替换参考片中的原人物身份",
+      "动作过程中保持人脸、发型、体型比例和身份稳定特征连续一致",
+      "不要生成参考片里的原人物、人脸身份或品牌主体",
+    ];
+  }
+  return [];
+}
+
+export function composeEvidenceBackedVideoTransferPrompt(
+  structured,
+  videoAnalysis = null,
+  subject = "",
+) {
+  const staticStructured = visualStructuredFields(
+    styleTransferStructured(structured, { video: true, subject }),
+    "video",
+  );
+  const parts = [
+    ...videoSubjectTransferRules(subject),
+    composePromptFromStructured(staticStructured, "", { target: "video" }),
+  ].filter(Boolean);
+  const shots = Array.isArray(videoAnalysis?.shots) ? videoAnalysis.shots : [];
+  const frameTimes = new Map(
+    (Array.isArray(videoAnalysis?.sampled_frames) ? videoAnalysis.sampled_frames : [])
+      .map((frame) => [Number(frame?.index), Number(frame?.timestamp_seconds)])
+      .filter(([index, timestamp]) => Number.isInteger(index) && Number.isFinite(timestamp)),
+  );
+  for (let index = 0; index < shots.length; index += 1) {
+    const shot = shots[index];
+    if (!shot || typeof shot !== "object") continue;
+    const confidence = Number(shot.confidence);
+    const evidenceIndices = Array.isArray(shot.evidence_frame_indices)
+      ? [...new Set(shot.evidence_frame_indices.map(Number))].filter((value) => frameTimes.has(value))
+      : [];
+    if (!evidenceIndices.length || !Number.isFinite(confidence) || confidence <= 0) continue;
+    const hasCrossFrameEvidence = new Set(
+      evidenceIndices.map((value) => frameTimes.get(value)),
+    ).size >= 2;
+    const allowedShotFields = hasCrossFrameEvidence
+      ? VIDEO_EVIDENCE_SHOT_FIELDS
+      : ["visual", "lighting"];
+    const details = allowedShotFields
+      .map((key) => String(shot[key] || "").trim())
+      .filter((value) => value && !hasReferenceIdentityLeak(value, structured));
+    const uniqueDetails = [...new Set(details)];
+    if (!uniqueDetails.length) continue;
+    const start = Number(shot.start_seconds);
+    const end = Number(shot.end_seconds);
+    const range = Number.isFinite(start) && Number.isFinite(end) && end >= start
+      ? ` ${start}-${end}s`
+      : "";
+    parts.push(`镜头${index + 1}${range}: ${uniqueDetails.join("，")}`);
+  }
+  return [...new Set(parts)].join("；").trim();
 }
 
 export function isStructuredPortrait(structured) {

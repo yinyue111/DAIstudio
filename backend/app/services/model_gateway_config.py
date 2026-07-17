@@ -31,11 +31,14 @@ VALID_PROVIDERS = {
     "tencent_hunyuan",
     "yinyue",
     "anthropic",
+    "antigravity",
+    "grok",
+    "gemini",
     "custom_openai",
 }
 VALID_GATEWAY_FORMATS = {"openai", "ark", "anthropic"}
 
-PROVIDER_PRESETS: dict[str, dict[str, str]] = {
+PROVIDER_PRESETS: dict[str, dict[str, Any]] = {
     "openai": {
         "label": "OpenAI",
         "base_url": "https://api.openai.com/v1",
@@ -95,6 +98,24 @@ PROVIDER_PRESETS: dict[str, dict[str, str]] = {
         "label": "Anthropic-Compatible",
         "base_url": "https://api.anthropic.com",
         "gateway_format": "anthropic",
+    },
+    "antigravity": {
+        "label": "Antigravity (Claude / Gemini)",
+        "base_url": "https://sub.aiwuq.cn/antigravity",
+        "gateway_format": "anthropic",
+        "description": "Anthropic Messages 协议；支持 Claude/Gemini 对话和 Gemini 图片模型",
+    },
+    "grok": {
+        "label": "Grok / xAI Compatible",
+        "base_url": "https://sub.aiwuq.cn/v1",
+        "gateway_format": "openai",
+        "description": "OpenAI-Compatible 协议；支持 Grok 对话、图片和异步视频",
+    },
+    "gemini": {
+        "label": "Google Gemini",
+        "base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
+        "gateway_format": "openai",
+        "description": "Gemini OpenAI-Compatible 对话端点；图片/视频需按实际网关接口适配",
     },
     "custom_openai": {
         "label": "自定义 OpenAI-Compatible",
@@ -178,7 +199,7 @@ def mask_secret(value: str | None) -> str:
     return (text[:6] + "..." + text[-4:]) if len(text) > 12 else "已配置"
 
 
-def provider_preset(provider: str | None) -> dict[str, str]:
+def provider_preset(provider: str | None) -> dict[str, Any]:
     return PROVIDER_PRESETS.get(provider or "", {})
 
 
@@ -361,6 +382,23 @@ def runtime_config_for_model(row: ModelConfig | None, use: str | None = None) ->
                 source="model",
             )
     return _env_runtime_config(resolved_use)
+
+
+def apply_saved_model_gateway(row: ModelConfig, source: ModelConfig | None) -> None:
+    """Copy a saved provider connection without exposing its secret to clients."""
+    if source is None or not encrypted_key_present(source) or not normalise_base_url(source.base_url):
+        raise ModelGatewayConfigError("所选已有供应商未完整配置 Base URL 和 API Key")
+    config = runtime_config_for_model(source, use=row.use)
+    if config.source != "model" or not config.configured:
+        raise ModelGatewayConfigError("所选已有供应商连接不可用")
+    apply_model_gateway_update(
+        row,
+        provider=config.provider,
+        base_url=config.base_url,
+        api_key=config.api_key,
+        api_key_clear=False,
+        gateway_format=config.gateway_format,
+    )
 
 
 def runtime_config_from_probe(

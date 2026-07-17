@@ -126,11 +126,20 @@ def test_public_config_exposes_video_reverse_presets(client, make_user, auth):
     assert data["reverse"]["video_default_preset"] == "standard"
     assert [p["key"] for p in presets] == ["fast", "standard", "fine"]
     assert presets[0]["short_range"] == "4帧"
-    assert presets[0]["max_cost"] == 8
+    assert presets[0]["max_cost"] == 5
     assert presets[1]["long_range"] == "16-24帧"
-    assert presets[1]["max_cost"] == 18
+    assert presets[1]["max_cost"] == 5
     assert presets[2]["max_frames"] == 36
-    assert presets[2]["max_cost"] == 32
+    assert presets[2]["max_cost"] == 5
+    assert data["pricing"]["reverse"]["image_cost"] == 5
+    assert data["pricing"]["image"]["unit_costs"] == {"1k": 8, "2k": 8, "4k": 8}
+    assert data["pricing"]["image"]["edit_unit_costs"] == {"1k": 8, "2k": 8, "4k": 8}
+    assert data["pricing"]["video"]["preview_cost"] == 50
+    assert data["pricing"]["video"]["per_second"] == {
+        "480p": 10,
+        "720p": 10,
+        "1080p": 10,
+    }
 
 
 def test_redis_blocking_client_uses_bounded_pool_settings():
@@ -574,10 +583,10 @@ class _Model:
 
 def test_video_cost_estimate():
     m = _Model(50, {"preview_cost": 5})
-    assert estimate_generation_cost(m, "video", "preview", params={"duration": 5}) == 15
-    assert estimate_generation_cost(m, "video", "final", params={"target_resolution": "720p", "target_duration": 10}) == 160
-    assert estimate_generation_cost(m, "video", "final", params={"target_resolution": "1080p", "target_duration": 10}) == 280
-    assert estimate_generation_cost(m, "image", "preview", 2, params={"size": "1024x1024"}) == 30
+    assert estimate_generation_cost(m, "video", "preview", params={"duration": 5}) == 50
+    assert estimate_generation_cost(m, "video", "final", params={"target_resolution": "720p", "target_duration": 10}) == 100
+    assert estimate_generation_cost(m, "video", "final", params={"target_resolution": "1080p", "target_duration": 10}) == 100
+    assert estimate_generation_cost(m, "image", "preview", 2, params={"size": "1024x1024"}) == 16
     assert estimate_generation_cost(
         m,
         "image",
@@ -585,7 +594,7 @@ def test_video_cost_estimate():
         2,
         params={"size": "2048x2048", "subject_mode": "product"},
         source_type="image",
-    ) == 110
+    ) == 16
 
 
 def test_generation_model_snapshot_freezes_dynamic_credit_pricing():

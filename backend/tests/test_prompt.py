@@ -8,7 +8,14 @@ from app.db import SessionLocal
 from app.models import CreditTransaction, ModelConfig, ReverseOperation, User, UserPrompt
 from app.routers import prompt
 from app.schemas import ReverseIn
-from app.services import config_store, gateway, gateway_prompting, retention, video_frames
+from app.services import (
+    config_store,
+    gateway,
+    gateway_prompting,
+    retention,
+    reverse_operations,
+    video_frames,
+)
 
 
 class _Model:
@@ -223,6 +230,58 @@ def test_video_reverse_local_cover_fallback_probes_source_when_sampler_returns_n
     assert analysis["analysis_mode"] == "cover_fallback"
 
 
+def test_video_reverse_local_upload_samples_frames_in_mock_mode(monkeypatch):
+    monkeypatch.setattr(video_frames, "available", lambda: True)
+    monkeypatch.setattr(prompt.storage, "key_from_url", lambda _url: "upload_video/local.mp4")
+    monkeypatch.setattr(
+        prompt.asset_refs,
+        "generated_video_reference_path",
+        lambda *_args, **_kwargs: "/tmp/local-video.mp4",
+    )
+    sampled = []
+
+    def _sample(path, *, n, preset):
+        sampled.append((path, n, preset))
+        return video_frames.VideoSample(
+            frames=(
+                video_frames.SampledVideoFrame(
+                    jpeg=b"local-frame",
+                    timestamp_seconds=0.0,
+                    priority=3,
+                ),
+            ),
+            source=video_frames.VideoMetadata(
+                width=640,
+                height=640,
+                duration_seconds=3.0,
+                fps=24.0,
+                has_audio=False,
+            ),
+        )
+
+    monkeypatch.setattr(video_frames, "sample_video_from_path", _sample)
+
+    refs, analysis = prompt._collect_refs(
+        ReverseIn(
+            asset_url="http://testserver/api/uploads/upload_video/local.mp4",
+            fallback_image="http://testserver/api/uploads/upload_video_preview/local.jpg",
+            source_type="video",
+            target="video",
+        ),
+        db=object(),
+        user=User(id=1, phone="13800000000", status="active"),
+        frame_budget=8,
+        video_preset="standard",
+        gateway_mock=True,
+    )
+
+    assert sampled == [("/tmp/local-video.mp4", 8, "standard")]
+    assert refs == ["data:image/jpeg;base64,bG9jYWwtZnJhbWU="]
+    assert analysis["analysis_mode"] == "keyframes"
+    assert analysis["source"]["audio_analyzed"] is False
+    assert analysis["sampled_frames"] == [{"index": 1, "timestamp_seconds": 0.0}]
+
+
 @pytest.mark.parametrize("sampler_available", [False, True])
 def test_video_reverse_cover_fallback_always_reports_degraded_analysis(
     monkeypatch,
@@ -270,7 +329,7 @@ def test_reverse_rejects_video_url_before_gateway(monkeypatch):
         )
 
     assert exc.value.status_code == 400
-    assert "反推只支持图片素材" in exc.value.detail
+    assert "视频素材仅支持视频反推" in exc.value.detail
 
 
 def test_reverse_source_type_video_uses_video_template_without_suffix(client, make_user, monkeypatch):
@@ -280,8 +339,21 @@ def test_reverse_source_type_video_uses_video_template_without_suffix(client, ma
     monkeypatch.setattr(prompt, "get_model_config", lambda db, use: _Model())
     monkeypatch.setattr(prompt, "get_setting", lambda db, key, default=None: True)
     monkeypatch.setattr(prompt, "_assert_text_allowed", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(prompt, "_gateway_ref", lambda db, user, url: "data:image/png;base64,abc")
-    monkeypatch.setattr(prompt.credits, "consume", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        prompt,
+        "_collect_refs",
+        lambda *_args, **_kwargs: (
+            ["data:image/png;base64,frame-1", "data:image/png;base64,frame-2"],
+            {
+                "analysis_mode": "multi_frame",
+                "source": {"audio_analyzed": False},
+                "sampled_frames": [
+                    {"index": 0, "timestamp_seconds": 0.0},
+                    {"index": 1, "timestamp_seconds": 1.0},
+                ],
+            },
+        ),
+    )
     monkeypatch.setattr(prompt.usage, "record_call", lambda *_args, **_kwargs: None)
 
     def fake_reverse(refs, model_id, target="image"):
@@ -307,7 +379,10 @@ def test_reverse_source_type_video_uses_video_template_without_suffix(client, ma
 
     assert out.final_text == "x"
     assert seen["target"] == "video"
-    assert seen["refs"] == ["data:image/png;base64,abc"]
+    assert seen["refs"] == [
+        "data:image/png;base64,frame-1",
+        "data:image/png;base64,frame-2",
+    ]
 
 
 def test_reverse_product_profile_uses_single_image_ref(client, make_user, monkeypatch):
@@ -320,7 +395,7 @@ def test_reverse_product_profile_uses_single_image_ref(client, make_user, monkey
     monkeypatch.setattr(prompt, "_gateway_ref", lambda db, user, url: "data:image/png;base64,product")
     monkeypatch.setattr(prompt.credits, "consume", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(prompt.usage, "record_call", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(prompt, "remember_prompt", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(reverse_operations, "_remember_history", lambda *_args, **_kwargs: None)
 
     def fake_reverse(refs, model_id, target="image"):
         seen.update({"refs": refs, "model_id": model_id, "target": target})
@@ -345,7 +420,7 @@ def test_reverse_product_profile_uses_single_image_ref(client, make_user, monkey
     finally:
         db.close()
 
-    assert out.charged_credits == 2
+    assert out.charged_credits == 5
     assert out.reference_count == 1
     assert out.final_text.startswith("上传产品是唯一商品主角")
     assert seen["target"] == "product_profile"
@@ -405,8 +480,8 @@ def test_reverse_video_usage_cost_is_not_multiplied_by_frame_count(client, make_
         )
         user = db.get(User, uid)
         assert out.reference_count == 4
-        assert out.charged_credits == 18
-        assert user.balance_credits == 82
+        assert out.charged_credits == 5
+        assert user.balance_credits == 95
     finally:
         db.close()
 
@@ -461,7 +536,7 @@ def test_reverse_blocks_unsafe_gateway_output_before_history(client, make_user, 
 
 
 def test_reverse_usage_metadata_does_not_override_fixed_image_price(client, make_user, monkeypatch):
-    uid = make_user("13800000003", balance=2)
+    uid = make_user("13800000003", balance=5)
     db = SessionLocal()
     try:
         model = db.query(ModelConfig).filter(ModelConfig.use == "vision").one()
@@ -502,7 +577,7 @@ def test_reverse_usage_metadata_does_not_override_fixed_image_price(client, make
             user=db.get(User, uid),
         )
         user = db.get(User, uid)
-        assert out.charged_credits == 2
+        assert out.charged_credits == 5
         assert user.balance_credits == 0
     finally:
         db.close()
@@ -547,19 +622,65 @@ def test_reverse_client_request_id_replays_without_double_charge(client, make_us
 
     db = SessionLocal()
     try:
-        assert db.get(User, uid).balance_credits == 98
+        assert db.get(User, uid).balance_credits == 95
         assert db.query(ReverseOperation).filter_by(client_request_id="reverse-retry-001").count() == 1
     finally:
         db.close()
 
 
-def test_reverse_text_fallback_replays_with_empty_structured_result(
+def test_legacy_reverse_http_error_includes_deprecation_headers_and_logs_call(
+    client,
+    make_user,
+    auth,
+    monkeypatch,
+    caplog,
+):
+    uid = make_user("13800000016", balance=100)
+    headers = auth("13800000016")
+    caplog.set_level("WARNING", logger="prompt")
+
+    def reject_by_current_asset_policy(*_args, **_kwargs):
+        raise HTTPException(400, "素材不符合当前安全策略")
+
+    monkeypatch.setattr(
+        prompt,
+        "_validate_reverse_asset_request",
+        reject_by_current_asset_policy,
+    )
+    response = client.post(
+        "/api/prompt/reverse",
+        json={
+            "client_request_id": "legacy-reverse-deprecation-error-001",
+            "asset_url": "https://cdn.example.com/rejected.jpg",
+            "target": "image",
+        },
+        headers=headers,
+    )
+
+    assert response.status_code == 400, response.text
+    assert response.json()["detail"] == "素材不符合当前安全策略"
+    assert response.headers["deprecation"] == "true"
+    assert response.headers["sunset"] == "Wed, 16 Sep 2026 00:00:00 GMT"
+    assert response.headers["link"] == (
+        '</api/prompt/reverse-operations>; rel="successor-version"'
+    )
+    assert any(
+        record.name == "prompt"
+        and "deprecated reverse endpoint called" in record.getMessage()
+        and f"user_id={uid}" in record.getMessage()
+        and "client_request_id=legacy-reverse-deprecation-error-001" in record.getMessage()
+        and "target=image" in record.getMessage()
+        for record in caplog.records
+    )
+
+
+def test_reverse_empty_structured_result_fails_and_refunds_without_settlement(
     client,
     make_user,
     auth,
     monkeypatch,
 ):
-    make_user("13800000015", balance=100)
+    uid = make_user("13800000015", balance=100)
     headers = auth("13800000015")
     calls = {"gateway": 0}
 
@@ -586,11 +707,33 @@ def test_reverse_text_fallback_replays_with_empty_structured_result(
     first = client.post("/api/prompt/reverse", json=body, headers=headers)
     second = client.post("/api/prompt/reverse", json=body, headers=headers)
 
-    assert first.status_code == 200, first.text
-    assert second.status_code == 200, second.text
-    assert second.json() == first.json()
-    assert second.json()["structured"] == {}
+    assert first.status_code == 502, first.text
+    assert second.status_code == 409, second.text
     assert calls["gateway"] == 1
+    db = SessionLocal()
+    try:
+        operation = db.query(ReverseOperation).filter_by(
+            client_request_id="reverse-text-fallback-001"
+        ).one()
+        assert operation.status == "failed"
+        assert operation.error_code == "INVALID_REVERSE_RESULT"
+        assert operation.cost_frozen == 0
+        assert operation.cost_settled == 0
+        assert db.get(User, uid).balance_credits == 100
+        assert db.query(CreditTransaction).filter_by(
+            user_id=uid,
+            biz_type="reverse_operation",
+            biz_ref=operation.id,
+            type="refund",
+        ).count() == 1
+        assert db.query(CreditTransaction).filter_by(
+            user_id=uid,
+            biz_type="reverse_operation",
+            biz_ref=operation.id,
+            type="settle",
+        ).count() == 0
+    finally:
+        db.close()
 
 
 def test_reverse_without_client_request_id_persists_operation_and_uses_it_for_billing(
@@ -631,50 +774,21 @@ def test_reverse_without_client_request_id_persists_operation_and_uses_it_for_bi
         operation = db.query(ReverseOperation).filter_by(user_id=uid).one()
         assert operation.client_request_id is None
         assert operation.status == "succeeded"
-        assert operation.charged_credits == 2
-        charge = db.query(CreditTransaction).filter_by(
+        assert operation.charged_credits == 5
+        frozen = db.query(CreditTransaction).filter_by(
             user_id=uid,
-            biz_type="reverse",
-            type="consume",
+            biz_type="reverse_operation",
+            type="freeze",
         ).one()
-        assert charge.biz_ref == operation.id
-        assert db.get(User, uid).balance_credits == 98
-    finally:
-        db.close()
-
-
-def test_reverse_charge_rejects_terminal_operation(client, make_user):
-    uid = make_user("13800000013", balance=100)
-    db = SessionLocal()
-    try:
-        operation = ReverseOperation(
+        settled = db.query(CreditTransaction).filter_by(
             user_id=uid,
-            client_request_id=None,
-            request_fingerprint="e" * 64,
-            target="image",
-            asset_url="https://cdn.example.com/terminal.jpg",
-            status="failed",
-        )
-        db.add(operation)
-        db.commit()
-        operation_id = operation.id
-
-        with pytest.raises(prompt.ReverseOperationClosed):
-            prompt._charge_reverse_operation(
-                db,
-                operation_id,
-                2,
-                note="must not charge terminal operation",
-            )
-
-        db.expire_all()
-        assert db.get(ReverseOperation, operation_id).charged_credits == 0
-        assert db.get(User, uid).balance_credits == 100
-        assert db.query(CreditTransaction).filter_by(
-            user_id=uid,
-            biz_type="reverse",
-            biz_ref=operation_id,
-        ).count() == 0
+            biz_type="reverse_operation",
+            type="settle",
+        ).one()
+        assert frozen.biz_ref == operation.id
+        assert settled.biz_ref == operation.id
+        assert settled.real_cost == 5
+        assert db.get(User, uid).balance_credits == 95
     finally:
         db.close()
 
@@ -741,61 +855,10 @@ def test_reverse_http_exception_refunds_and_marks_operation_failed(client, make_
         assert "provider rejected" in (op.error or "")
         assert db.query(CreditTransaction).filter_by(
             user_id=uid,
-            biz_type="reverse",
+            biz_type="reverse_operation",
             biz_ref=op.id,
             type="refund",
         ).count() == 1
-    finally:
-        db.close()
-
-
-def test_reverse_failure_refund_error_rolls_back_operation_state(client, make_user, monkeypatch):
-    uid = make_user("13800000014", balance=100)
-    db = SessionLocal()
-    try:
-        operation = ReverseOperation(
-            user_id=uid,
-            client_request_id=None,
-            request_fingerprint="f" * 64,
-            target="image",
-            asset_url="https://cdn.example.com/refund-error.jpg",
-            status="running",
-            charged_credits=2,
-        )
-        db.add(operation)
-        db.commit()
-        operation_id = operation.id
-        prompt.credits.consume(
-            db,
-            uid,
-            2,
-            biz_type="reverse",
-            biz_ref=operation_id,
-        )
-
-        def fail_refund(*_args, **_kwargs):
-            raise RuntimeError("refund unavailable")
-
-        monkeypatch.setattr(prompt.credits, "refund_consumed", fail_refund)
-
-        assert prompt._fail_reverse_operation(
-            db,
-            operation_id,
-            "gateway failed",
-            refund_note="failed reverse refund",
-        ) is False
-
-        db.expire_all()
-        unchanged = db.get(ReverseOperation, operation_id)
-        assert unchanged.status == "running"
-        assert unchanged.charged_credits == 2
-        assert db.get(User, uid).balance_credits == 98
-        assert db.query(CreditTransaction).filter_by(
-            user_id=uid,
-            biz_type="reverse",
-            biz_ref=operation_id,
-            type="refund",
-        ).count() == 0
     finally:
         db.close()
 
@@ -814,9 +877,9 @@ def test_reverse_completion_cannot_overwrite_stale_refund(client, make_user, aut
             operation = reaper_db.query(ReverseOperation).filter_by(
                 client_request_id="reverse-race-refund"
             ).one()
-            operation.updated_at = datetime.now(timezone.utc) - timedelta(minutes=30)
+            operation.updated_at = datetime.now(timezone.utc) - timedelta(minutes=31)
             reaper_db.commit()
-            assert retention.reap_stuck_reverse_operations(reaper_db, max_minutes=15) == 1
+            assert reverse_operations.reap_operations()["failed"] == 1
         finally:
             reaper_db.close()
         return {
@@ -837,14 +900,17 @@ def test_reverse_completion_cannot_overwrite_stale_refund(client, make_user, aut
         headers=headers,
     )
 
-    assert response.status_code == 409, response.text
+    assert response.status_code == 502, response.text
     db = SessionLocal()
     try:
         operation = db.query(ReverseOperation).filter_by(
             client_request_id="reverse-race-refund"
         ).one()
         assert operation.status == "failed"
+        assert operation.error_code == "OPERATION_TIMEOUT"
         assert operation.charged_credits == 0
+        assert operation.cost_frozen == 0
+        assert operation.cost_settled == 0
         assert db.get(User, uid).balance_credits == 100
         assert db.query(UserPrompt).filter_by(user_id=uid, source="reverse").count() == 0
     finally:

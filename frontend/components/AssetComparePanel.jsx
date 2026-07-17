@@ -1,6 +1,7 @@
 "use client";
 
 import AssetMedia, { assetPreviewSrc, assetUnavailableText } from "./AssetMedia";
+import { unifiedAssetKey } from "../lib/unifiedAssets";
 
 export default function AssetComparePanel({ assets = [], onClose }) {
   const visible = (assets || []).filter(Boolean).slice(0, 4);
@@ -18,7 +19,7 @@ export default function AssetComparePanel({ assets = [], onClose }) {
         {visible.map((asset) => {
           const src = assetPreviewSrc(asset);
           return (
-            <article key={asset.id} className="overflow-hidden rounded-xl border border-line bg-base2/80">
+            <article key={unifiedAssetKey(asset)} className="overflow-hidden rounded-xl border border-line bg-base2/80">
               <div className="relative aspect-square bg-black/20">
                 {!src ? (
                   <div className="absolute inset-0 flex items-center justify-center px-3 text-center text-xs text-fog">

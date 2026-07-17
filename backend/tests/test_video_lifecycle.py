@@ -173,7 +173,7 @@ def test_legacy_video_worker_compiles_and_persists_prompt_before_submit(
         assert params["_video_prompt_plan"]["shots"] == ["手持产品稳定入镜"]
 
 
-def test_legacy_video_worker_preserves_direct_product_prompt_and_post_metadata(client):
+def test_legacy_video_worker_separates_direct_product_prompt_and_post_metadata(client):
     text = (
         "高端日系浴室广告，产品缓慢推近；文字“厚实吸水”出现；"
         "旁白：“温柔开始。”；音效：水滴声。"
@@ -208,10 +208,10 @@ def test_legacy_video_worker_preserves_direct_product_prompt_and_post_metadata(c
     )
 
     assert prompt.startswith("产品身份约束：以上传产品图为唯一商品主体")
-    assert text in prompt
-    assert "厚实吸水" in prompt
-    assert "温柔开始" in prompt
-    assert "水滴声" in prompt
+    assert "高端日系浴室广告，产品缓慢推近" in prompt
+    assert "厚实吸水" not in prompt
+    assert "温柔开始" not in prompt
+    assert "水滴声" not in prompt
     assert "画面无字" not in prompt
     assert persisted["_generation_prompt"] == prompt
     assert persisted["_post_overlays"] == ["厚实吸水"]
@@ -429,8 +429,8 @@ def test_video_submit_unknown_state_holds_for_review_without_refund(
         assert (task.params or {}).get("_video_submit_state_unknown") is True
         assert "视频提交状态未知" in (task.error or "")
         user = db.get(User, task.user_id)
-        assert user.balance_credits == 985
-        assert user.frozen_credits == 15
+        assert user.balance_credits == 950
+        assert user.frozen_credits == 50
     finally:
         db.close()
 

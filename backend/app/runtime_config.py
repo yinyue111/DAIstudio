@@ -173,7 +173,20 @@ def validate_runtime_config() -> None:
 
 
 def validate_model_gateway_rows(db) -> None:
-    """Fail fast on unsafe DB-configured model base URLs in production."""
+    """Fail fast on unsupported protocols and unsafe production model config."""
+    from sqlalchemy import select
+
+    from .models import ModelConfig
+
+    rows = list(db.execute(select(ModelConfig)).scalars())
+    for row in rows:
+        if row.use == "vision" and (
+            row.provider == "anthropic" or row.gateway_format == "anthropic"
+        ):
+            raise RuntimeError(
+                "视觉反推不支持 Anthropic 原生协议,"
+                "请将 vision 模型改为 OpenAI-compatible 网关"
+            )
     if settings.debug:
         return
     anthropic_base_configured = bool(str(settings.anthropic_base_url or "").strip())
@@ -183,11 +196,6 @@ def validate_model_gateway_rows(db) -> None:
             "生产环境提示词优化网关配置不完整。"
             "ANTHROPIC_BASE_URL 和 ANTHROPIC_AUTH_TOKEN 必须同时配置,或同时清空后使用后台模型配置。"
         )
-    from sqlalchemy import select
-
-    from .models import ModelConfig
-
-    rows = list(db.execute(select(ModelConfig)).scalars())
     required_uses = {"vision", "image", "video", "prompt"}
     configured_uses = {str(row.use or "") for row in rows}
     missing_uses = sorted(required_uses - configured_uses)

@@ -5,7 +5,11 @@ import { fileURLToPath } from "node:url";
 
 import { buildGenerationPayload } from "../app/studio/generationPayload.ts";
 import { studioCreationFacts } from "../app/studio/viewModel.ts";
-import { MAX_VIDEO_DURATION_SECONDS, VIDEO_DURATION_PRESETS } from "../app/studio/constants.ts";
+import {
+  MAX_PRODUCT_DETAIL_IMAGES,
+  MAX_VIDEO_DURATION_SECONDS,
+  VIDEO_DURATION_PRESETS,
+} from "../app/studio/constants.ts";
 import { buildStudioDerivedViewState } from "../app/studio/viewModel.ts";
 import {
   composePromptFromStructured,
@@ -46,6 +50,7 @@ assert.match(
   "generation submit hook should own idempotent request ids",
 );
 assert.equal(MAX_VIDEO_DURATION_SECONDS, 15);
+assert.equal(MAX_PRODUCT_DETAIL_IMAGES, 5);
 assert.deepEqual(
   VIDEO_DURATION_PRESETS.map((item) => item.seconds),
   [5, 8, 10, 15],
@@ -143,8 +148,16 @@ const reverseVideoPayload = buildGenerationPayload({
   structured: {
     "风格": "高端日系个护广告",
     "可迁移主体动作": "抽出洗脸巾后微距展开纹理",
+    "主体动作": "未证实的顶层动作",
+    "镜头运动": "未证实的顶层运镜",
+    "剪辑节奏": "未证实的顶层剪辑",
     "时序分镜": "0-5s 抽出洗脸巾；5-10s 微距展开如意云纹",
     "字幕卖点": "干湿两用",
+    "旁白": "模型幻觉旁白",
+    "音效": "模型幻觉音效",
+    "OCR证据": "不得下发的 OCR",
+    "分析证据": "不得下发的证据",
+    "未知字段": "不得下发的未知内容",
   },
   structuredSource: "video|https://cdn.example.com/reference.mp4|https://cdn.example.com/cover.jpg",
   ratio: "9:16",
@@ -157,7 +170,15 @@ assert.equal(reverseVideoPayload.finalText, reverseVideoFinalText);
 assert.doesNotMatch(reverseVideoPayload.finalText, /参考品牌|原品牌/);
 assert.equal(reverseVideoPayload.payload.prompt.raw_text, reverseVideoPayload.finalText);
 assert.equal(reverseVideoPayload.payload.prompt.assembled_text, reverseVideoPayload.finalText);
-assert.equal(reverseVideoPayload.payload.prompt["字幕卖点"], "干湿两用");
+for (const field of [
+  "可迁移主体动作", "主体动作", "镜头运动", "剪辑节奏", "时序分镜",
+  "字幕卖点", "旁白", "音效", "OCR证据", "分析证据", "未知字段",
+]) assert.equal(reverseVideoPayload.payload.prompt[field], undefined);
+assert.doesNotMatch(
+  JSON.stringify(reverseVideoPayload.payload.prompt),
+  /未证实的顶层|模型幻觉|不得下发/,
+  "audit-only video fields must not cross the final generation boundary",
+);
 
 assert.equal(
   shouldKeepPendingReverseRequest({ status: 409, message: "反推请求仍在处理中,请稍后重试" }),
@@ -178,6 +199,7 @@ const productProfile = {
     "品牌Logo": "DAMAH 黑魔法 Logo 位于包装正面",
     "包装文字": "黑魔法、全棉棉柔巾、200抽",
     "不可改项": "Logo、包装文字、黑白包装结构、抽取式开口、品牌色必须完整保留",
+    "负向": "Logo 变形、包装文字乱码、多余商品",
   },
   final_text: "上传产品是唯一商品主角：DAMAH 黑魔法全棉棉柔巾洗脸巾，正面包装文字包含黑魔法、全棉棉柔巾、200抽；黑白包装结构、抽取式开口、Logo和所有文字必须完整保留，用它替换参考素材原主体。",
 };
@@ -187,6 +209,10 @@ const styleAsset = {
   width: 900,
   height: 1200,
 };
+const productDetails = [
+  { type: "image", url: "http://localhost:8000/api/uploads/upload/detail-front.png" },
+  { type: "image", url: "http://localhost:8000/api/uploads/upload/detail-back.png" },
+];
 
 const directProductVideoFacts = studioCreationFacts({
   creationMode: "video",
@@ -210,6 +236,7 @@ const directProductVideo = buildGenerationPayload({
   promptDirty: true,
   selected: styleAsset,
   productAsset,
+  productDetailAssets: productDetails,
   productProfile,
   productProfileSource: productAssetSignature,
   structured: {},
@@ -226,6 +253,35 @@ assert.equal(directProductVideo.payload.source_asset_url, productAsset.url);
 assert.equal(directProductVideo.payload.source_type, "image");
 assert.equal(directProductVideo.payload.params.subject_mode, "product");
 assert.equal(directProductVideo.payload.params.product_reference_image, productAsset.url);
+assert.deepEqual(
+  directProductVideo.payload.params.product_detail_images,
+  productDetails.map((asset) => asset.url),
+  "product detail images must preserve the user-defined order",
+);
+const fiveProductDetails = [
+  ...productDetails,
+  { type: "image", url: "/d3.png" },
+  { type: "image", url: "/d4.png" },
+  { type: "image", url: "/d5.png" },
+];
+const fiveDetailVideo = buildGenerationPayload({
+  ...directProductVideo,
+  category: "video",
+  creationMode: "video",
+  subjectMode: "product",
+  productAsset,
+  productDetailAssets: fiveProductDetails,
+  ratio: "9:16",
+  imageQuality: "1k",
+  n: 1,
+  vDuration: 5,
+  vResolution: "720p",
+});
+assert.deepEqual(
+  fiveDetailVideo.payload.params.product_detail_images,
+  fiveProductDetails.map((asset) => asset.url),
+  "five product details must be accepted and preserve order",
+);
 assert.equal(directProductVideo.payload.params.reference_image_url, undefined);
 assert.equal(directProductVideo.payload.params.first_frame_image, undefined);
 assert.equal(directProductVideo.payload.params.last_frame_image, undefined);
@@ -235,13 +291,65 @@ assert.equal(directProductVideo.payload.params.product_video_template, "prompt_d
 assert.equal(directProductVideo.payload.source_asset_meta.product_generation_mode, true);
 assert.equal(directProductVideo.payload.source_asset_meta.product_subject.selected_url, productAsset.url);
 assert.equal(directProductVideo.payload.source_asset_meta.style_reference.selected_url, styleAsset.url);
-assert.match(directProductVideo.payload.prompt["产品身份档案"], /DAMAH 黑魔法全棉棉柔巾/);
+assert.match(directProductVideo.payload.prompt["产品身份档案"], /DAMAH 黑魔法/);
+assert.match(directProductVideo.payload.prompt["产品身份档案"], /全棉棉柔巾/);
 assert.equal(
   directProductVideo.payload.prompt.final_text,
   "产品放在浴室台面，镜头缓慢推进，水珠沿包装边缘滑落。",
   "direct product video should retain text-to-video prompt semantics",
 );
 assert.equal(directProductVideo.payload.params.character_reference_image, undefined);
+assert.throws(
+  () => buildGenerationPayload({
+    category: "video",
+    creationMode: "video",
+    subjectMode: "product",
+    productAsset: null,
+    productDetailAssets: [productDetails[0]],
+    prompt: "x",
+    ratio: "9:16",
+    imageQuality: "1k",
+    n: 1,
+    vDuration: 5,
+    vResolution: "720p",
+  }),
+  /请先选择产品主题图/,
+  "product details must never be submitted without a theme image",
+);
+assert.throws(
+  () => buildGenerationPayload({
+    ...directProductVideo,
+    category: "video",
+    creationMode: "video",
+    subjectMode: "product",
+    productAsset,
+    productDetailAssets: [productDetails[0], productDetails[0]],
+    ratio: "9:16",
+    imageQuality: "1k",
+    n: 1,
+    vDuration: 5,
+    vResolution: "720p",
+  }),
+  /不能重复/,
+  "duplicate product details must fail instead of being silently removed",
+);
+assert.throws(
+  () => buildGenerationPayload({
+    category: "video",
+    creationMode: "video",
+    subjectMode: "product",
+    productAsset,
+    productDetailAssets: [...fiveProductDetails, { type: "image", url: "/d6.png" }],
+    prompt: "x",
+    ratio: "9:16",
+    imageQuality: "1k",
+    n: 1,
+    vDuration: 5,
+    vResolution: "720p",
+  }),
+  /最多 5 张/,
+  "more than five details must fail instead of being truncated",
+);
 
 const productEditArgs = {
   stage: "preview",
@@ -284,8 +392,9 @@ assert.equal(productEdit.payload.params.style_reference_image, styleAsset.url);
 assert.equal(productEdit.payload.params.edit_mask_mode, "protect_subject");
 assert.equal(productEdit.payload.params.product_pixel_lock, "auto");
 assert.equal(productEdit.payload.params.n, 4);
-assert.match(productEdit.payload.prompt["产品身份档案"], /DAMAH 黑魔法全棉棉柔巾/);
-assert.match(productEdit.payload.prompt.final_text, /DAMAH 黑魔法全棉棉柔巾/);
+assert.match(productEdit.payload.prompt["产品身份档案"], /DAMAH 黑魔法/);
+assert.match(productEdit.payload.prompt.final_text, /DAMAH 黑魔法/);
+assert.match(productEdit.payload.prompt.final_text, /全棉棉柔巾/);
 assert.match(productEdit.payload.prompt.final_text, /200抽/);
 assert.match(productEdit.payload.prompt.final_text, /唯一产品身份/);
 assert.match(productEdit.payload.prompt.final_text, /Logo和可见文字/);
@@ -303,6 +412,8 @@ assert.match(productEdit.payload.params.negative_prompt, /包装文字被改写/
 assert.match(productEdit.payload.params.negative_prompt, /低清/);
 assert.match(productEdit.payload.params.negative_prompt, /产品残缺/);
 assert.match(productEdit.payload.params.negative_prompt, /产品被裁切/);
+assert.match(productEdit.payload.params.negative_prompt, /Logo 变形/);
+assert.doesNotMatch(productEdit.payload.prompt.final_text, /Logo 变形/);
 
 const staleReversePromptArgs = {
   stage: "preview",
@@ -489,6 +600,16 @@ const portraitEdit = buildGenerationPayload({
   promptDirty: true,
   selected: styleAsset,
   productAsset,
+  productProfile: {
+    structured: {
+      "年龄语境": "成年",
+      "脸型五官": "椭圆脸，深棕色眼睛",
+      "身份稳定特征": "保持眼型、鼻梁和下颌轮廓稳定",
+      "负向": "换脸、五官漂移、年龄突变",
+    },
+    final_text: "这段未经白名单的模型文本不应直接使用",
+  },
+  productProfileSource: productAssetSignature,
   structured: {},
   ratio: "2:3",
   imageQuality: "1k",
@@ -507,6 +628,8 @@ assert.doesNotMatch(portraitEdit.payload.prompt.final_text, /严格按照用户�
 assert.match(portraitEdit.payload.params.negative_prompt, /身份不一致/);
 assert.match(portraitEdit.payload.params.negative_prompt, /幼态成人化/);
 assert.match(portraitEdit.payload.params.negative_prompt, /低机位身体凝视/);
+assert.match(portraitEdit.payload.params.negative_prompt, /五官漂移/);
+assert.doesNotMatch(portraitEdit.payload.prompt.final_text, /未经白名单/);
 
 const dirtyPortraitCanonical = "保持低机位后仰坐姿，使用硬质影棚主光、高锐度 HDR，明确无柔雾、无光晕。";
 const dirtyPortraitEdit = buildGenerationPayload({
@@ -545,7 +668,13 @@ const finalVideo = buildGenerationPayload({
   task: {
     id: 42,
     category: "video",
-    params: { target_ratio: "9:16", target_resolution: "1080p", target_duration: 30 },
+    params: {
+      target_ratio: "9:16",
+      target_resolution: "1080p",
+      target_duration: 30,
+      product_reference_image: productAsset.url,
+      product_detail_images: productDetails.map((asset) => asset.url),
+    },
   },
   cfg: { video_duration_max_seconds: 900 },
   category: "image",
@@ -563,6 +692,7 @@ assert.equal(finalVideo.payload.category, "video");
 assert.equal(finalVideo.payload.parent_task_id, 42);
 assert.equal(finalVideo.payload.params.resolution, "1080p");
 assert.equal(finalVideo.payload.params.duration, 15);
+assert.deepEqual(finalVideo.payload.params.product_detail_images, productDetails.map((asset) => asset.url));
 assert.equal(finalVideo.ratioOption.key, "9:16");
 
 const directFinalVideo = buildGenerationPayload({
@@ -667,6 +797,24 @@ const productVideoEditArgs = {
     "标签": "Estee Lauder, Advanced Night Repair, skincare bottle",
   },
   structuredSource: "image|http://localhost:8000/api/uploads/upload/style.jpg|",
+  reverseVideoAnalysis: {
+    analysis_mode: "multi_frame",
+    sampled_frames: [
+      { index: 1, timestamp_seconds: 0 },
+      { index: 2, timestamp_seconds: 5 },
+    ],
+    shots: [{
+      start_seconds: 0,
+      end_seconds: 5,
+      visual: "产品居中展示",
+      action: "产品从画面左侧入场，慢速旋转后推近包装特写",
+      camera: "镜头低速推进",
+      ocr: "不得进入的字幕",
+      audio_cue: "不得进入的音效",
+      evidence_frame_indices: [1, 2],
+      confidence: 0.9,
+    }],
+  },
   ratio: "9:16",
   imageQuality: "1k",
   n: 1,
@@ -689,13 +837,10 @@ assert.equal(productVideoEditFree.payload.params.reference_image_url, undefined)
 assert.equal(productVideoEditFree.payload.params.first_frame_image, undefined);
 assert.equal(productVideoEditFree.payload.params.last_frame_image, undefined);
 assert.equal(productVideoEditFree.payload.prompt["场景背景"], "暖棕色广告棚景和金色沙粒台面");
-assert.equal(
-  productVideoEditFree.payload.prompt["主体动作"],
-  "上传产品作为唯一视频主体，替换参考片中的原主体/原商品/人物；严格保留参考片中可迁移的具体动作、运镜、节奏和先后顺序，不得删除、替换或降速；动作过程中保持同一 SKU 的包装结构、Logo、可见文字、颜色和材质纹理连续一致；不要生成参考片里的原商品、原品牌、人物或服装",
-  "the frontend should keep structured motion identity-safe and let the transfer prompt carry the specific sequence",
-);
-assert.equal(productVideoEditFree.payload.prompt["镜头运动"], "缓慢推进并轻微环绕");
-assert.match(productVideoEditFree.payload.prompt["产品身份档案"], /DAMAH 黑魔法全棉棉柔巾/);
+assert.equal(productVideoEditFree.payload.prompt["主体动作"], undefined);
+assert.equal(productVideoEditFree.payload.prompt["镜头运动"], undefined);
+assert.match(productVideoEditFree.payload.prompt["产品身份档案"], /DAMAH 黑魔法/);
+assert.match(productVideoEditFree.payload.prompt["产品身份档案"], /全棉棉柔巾/);
 assert.equal(productVideoEditFree.payload.prompt["主体"], undefined);
 assert.equal(productVideoEditFree.payload.prompt["商品服装"], undefined);
 assert.equal(productVideoEditFree.payload.prompt["材质纹理"], undefined);
@@ -708,18 +853,19 @@ assert.doesNotMatch(productVideoEditFree.payload.prompt.final_text, /产品与�
 assert.doesNotMatch(productVideoEditFree.payload.prompt.final_text, /Estee Lauder/i);
 assert.doesNotMatch(productVideoEditFree.payload.prompt.final_text, /Advanced Night Repair/i);
 assert.doesNotMatch(productVideoEditFree.payload.prompt.final_text, /dropper bottle/i);
-assert.equal(productVideoEditFree.payload.params.negative_prompt, undefined);
+assert.match(productVideoEditFree.payload.params.negative_prompt, /Logo 变形/);
 
 const reversedProductVideo = buildGenerationPayload({
   ...productVideoEditArgs,
   prompt: "",
   promptDirty: false,
 });
-assert.match(reversedProductVideo.payload.prompt.final_text, /上传产品从画面左侧入场/);
+assert.match(reversedProductVideo.payload.prompt.final_text, /产品从画面左侧入场/);
 assert.equal(reversedProductVideo.payload.prompt.user_instruction, reversedProductVideo.payload.prompt.final_text);
 assert.equal(reversedProductVideo.payload.prompt.input_mode, "structured_reverse");
-assert.doesNotMatch(reversedProductVideo.payload.prompt.final_text, /上传产品作为唯一视频主体/);
+assert.match(reversedProductVideo.payload.prompt.final_text, /上传产品作为唯一视频主体/);
 assert.doesNotMatch(reversedProductVideo.payload.prompt.final_text, /优先保持完整包装/);
+assert.doesNotMatch(reversedProductVideo.payload.prompt.final_text, /不得进入的字幕|不得进入的音效/);
 
 const leakedReverseVideoPayload = buildGenerationPayload({
   ...productVideoEditArgs,
@@ -728,7 +874,7 @@ const leakedReverseVideoPayload = buildGenerationPayload({
 });
 assert.doesNotMatch(leakedReverseVideoPayload.payload.prompt.final_text, /Estee Lauder/i);
 assert.doesNotMatch(leakedReverseVideoPayload.payload.prompt.final_text, /Advanced Night Repair/i);
-assert.match(leakedReverseVideoPayload.payload.prompt.final_text, /上传产品从画面左侧入场/);
+assert.match(leakedReverseVideoPayload.payload.prompt.final_text, /产品从画面左侧入场/);
 
 const poisonedTransferPromptPayload = buildGenerationPayload({
   ...productVideoEditArgs,
@@ -756,7 +902,7 @@ const sparsePoisonedTransferPromptPayload = buildGenerationPayload({
 assert.doesNotMatch(sparsePoisonedTransferPromptPayload.payload.prompt.final_text, /original brand/i);
 assert.doesNotMatch(sparsePoisonedTransferPromptPayload.payload.prompt.final_text, /original product/i);
 assert.match(sparsePoisonedTransferPromptPayload.payload.prompt.final_text, /上传产品作为唯一视频主体/);
-assert.match(sparsePoisonedTransferPromptPayload.payload.prompt.final_text, /慢速旋转后推近特写/);
+assert.match(sparsePoisonedTransferPromptPayload.payload.prompt.final_text, /慢速旋转后推近(?:包装)?特写/);
 
 const sparseChinesePoisonedTransferPromptPayload = buildGenerationPayload({
   ...productVideoEditArgs,
@@ -785,7 +931,7 @@ const postProductionTransferPromptPayload = buildGenerationPayload({
   },
 });
 assert.match(postProductionTransferPromptPayload.payload.prompt.final_text, /暖棕色广告棚景/);
-assert.match(postProductionTransferPromptPayload.payload.prompt.final_text, /慢速旋转后推近特写/);
+assert.match(postProductionTransferPromptPayload.payload.prompt.final_text, /慢速旋转后推近(?:包装)?特写/);
 assert.doesNotMatch(postProductionTransferPromptPayload.payload.prompt.final_text, /字幕|新品上市/);
 assert.doesNotMatch(postProductionTransferPromptPayload.payload.prompt.final_text, /旁白|安心每一天/);
 assert.doesNotMatch(postProductionTransferPromptPayload.payload.prompt.final_text, /SFX|水滴声/i);

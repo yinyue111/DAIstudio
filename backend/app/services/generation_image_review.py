@@ -8,10 +8,10 @@ from ..models import GenAsset, GenTask
 from . import credits, gateway, storage
 from .config_store import get_model_config
 from .generation_common import publish_task_update, settlement_cost
-from .generation_model_runtime import model_from_snapshot
+from .generation_model_runtime import model_config_for_task, model_from_snapshot
 from .generation_state import NEEDS_REVIEW, claim_terminal
 from .generation_state import TERMINAL_STATUSES as TERMINAL
-from .media_sidecars import unlink_keys
+from .media_sidecars import storage_bytes_for_asset_urls, unlink_keys
 from .progress import set_progress
 from .watermark import image_ext, make_image_preview
 
@@ -28,7 +28,7 @@ def admin_settle_needs_review_image(
         raise ValueError("仅待对账任务可执行成功结算")
     if task.category != "image":
         raise ValueError("仅图片任务支持图片补结果结算")
-    model = get_model_config_fn(db, "image")
+    model = model_config_for_task(db, task, "image", get_model_config_fn)
     if not model:
         raise ValueError("未配置图片模型")
     model = model_from_snapshot(task, model)
@@ -75,6 +75,7 @@ def admin_settle_needs_review_image(
                         unlocked=True,
                         width=hd_w,
                         height=hd_h,
+                        bytes=len(raw) + len(preview_png),
                     )
                 )
                 image_count = 1
@@ -98,6 +99,10 @@ def admin_settle_needs_review_image(
                             hd_url=storage.public_url(hd_key),
                             watermarked=False,
                             unlocked=True,
+                            bytes=storage_bytes_for_asset_urls(
+                                storage.public_url(preview_key),
+                                storage.public_url(hd_key),
+                            ),
                         )
                     )
                 image_count = len(hd_keys)

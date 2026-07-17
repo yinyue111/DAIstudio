@@ -42,6 +42,7 @@ export const VIDEO_QUALITIES = [
 ];
 
 export const MAX_VIDEO_DURATION_SECONDS = 15;
+export const MAX_PRODUCT_DETAIL_IMAGES = 5;
 
 export const VIDEO_DURATION_PRESETS = [
   { seconds: 5, label: "5s", hint: "短镜头预览" },
@@ -55,10 +56,3 @@ export const PARSE_POLL_INTERVAL_MS = 1000;
 export const PARSE_POLL_TIMEOUT_MS = 240_000;
 export const STUDIO_SESSION_DRAFT_KEY = "studio_session_draft_v1";
 export const STUDIO_VARIATION_DRAFT_KEY = "studio_variation_draft_v1";
-
-export const EXAMPLES = [
-  "赛博朋克城市夜景，霓虹灯反射在湿漉漉的街道上，电影感，超广角",
-  "一只穿宇航服的柴犬漂浮在太空，背景是绚丽星云，3D 渲染，皮克斯风格",
-  "极简北欧风咖啡馆，晨光透过落地窗，暖色调，柔和景深",
-  "国潮水墨山水，仙鹤掠过云海，金箔点缀，高级感海报",
-];

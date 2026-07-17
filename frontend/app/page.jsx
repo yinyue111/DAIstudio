@@ -23,7 +23,8 @@ import { startSubjectProtectionPreview } from "../lib/studioSubjectProtection";
 import Nav from "../components/Nav";
 import { canDownloadAsset, isAssetTakenDown } from "../components/AssetMedia";
 import AssetWindowControls from "../components/AssetWindowControls";
-import PromptLibraryBrowser, { STUDIO_DRAFT_PROMPT_KEY } from "../components/PromptLibraryBrowser";
+import AssetPickerDialog from "../components/AssetPickerDialog";
+import { STUDIO_DRAFT_PROMPT_KEY } from "../components/PromptLibraryBrowser";
 import StudioGenerationControls from "../components/StudioGenerationControls";
 import { useToast } from "../components/ToastProvider";
 import useGenerationSubmit from "../hooks/useGenerationSubmit";
@@ -32,8 +33,11 @@ import useReferenceParsing from "../hooks/useReferenceParsing";
 import useStudioWorkspaceState from "../hooks/useStudioWorkspaceState";
 import useTaskTracking from "../hooks/useTaskTracking";
 import useVisibleItemWindow from "../hooks/useVisibleItemWindow";
+import { reverseOperationResumeCandidates } from "../lib/reverseOperations";
+import { assetReferenceUrl, dedupeAssets, unifiedAssetKey } from "../lib/unifiedAssets";
 import {
   CREATION_MODES,
+  MAX_PRODUCT_DETAIL_IMAGES,
   RATIOS,
   STUDIO_SESSION_DRAFT_KEY,
   STUDIO_VARIATION_DRAFT_KEY,
@@ -41,6 +45,16 @@ import {
   creationModeLabel,
 } from "./studio/constants";
 import StudioMessageBar from "./studio/StudioMessageBar";
+import {
+  filterModelOptions,
+  MODEL_SELECTION_USES,
+  normalizeModelOptions,
+  readModelSelections,
+  resolveModelConfigId,
+  strictMultiReferenceLimit,
+  validateMultiReferenceSelection,
+  writeModelSelections,
+} from "./studio/StudioModelSelector";
 import StudioModeTabs from "./studio/StudioModeTabs";
 import StudioPromptWorkspace from "./studio/StudioPromptWorkspace";
 import StudioReferencePanel from "./studio/StudioReferencePanel";
@@ -63,7 +77,11 @@ import {
   isPromptOptimizationResultCurrent,
   promptOptimizationContextKey,
 } from "./studio/promptOptimization";
-import { clearAllWorkspaceContent } from "./studio/workspaceReset";
+import {
+  buildReverseSnapshotV2,
+  workspacePatchFromReverseSnapshot,
+} from "./studio/reverseSnapshot";
+import { clearAllWorkspaceContent, clearWorkspaceContent } from "./studio/workspaceReset";
 
 function parsePromptDraft(raw) {
   if (raw && typeof raw === "object") {
@@ -72,6 +90,8 @@ function parsePromptDraft(raw) {
       category: String(raw.category || ""),
       creationMode: String(raw.creationMode || ""),
       savedAt: Number(raw.savedAt || 0),
+      reverseSnapshotV2: raw.reverse_snapshot_v2 || null,
+      legacyReverse: Boolean(raw.legacy_reverse),
     };
   }
   try {
@@ -82,12 +102,21 @@ function parsePromptDraft(raw) {
         category: String(parsed.category || ""),
         creationMode: String(parsed.creationMode || ""),
         savedAt: Number(parsed.savedAt || 0),
+        reverseSnapshotV2: parsed.reverse_snapshot_v2 || null,
+        legacyReverse: Boolean(parsed.legacy_reverse),
       };
     }
   } catch (_e) {
     // Legacy prompt drafts were stored as plain strings.
   }
-  return { prompt: String(raw || ""), category: "", creationMode: "", savedAt: 0 };
+  return {
+    prompt: String(raw || ""),
+    category: "",
+    creationMode: "",
+    savedAt: 0,
+    reverseSnapshotV2: null,
+    legacyReverse: false,
+  };
 }
 
 function promptDraftMode(draft) {
@@ -97,20 +126,44 @@ function promptDraftMode(draft) {
   return draft.category === "video" ? "video" : "image";
 }
 
+const ACTIVE_REVERSE_STATUSES = new Set(["queued", "running", "needs_confirmation"]);
+
+function hasActiveReverseOperations(workspaces) {
+  return Object.values(workspaces || {}).some((current) => (
+    ACTIVE_REVERSE_STATUSES.has(current?.reverseOperation?.status)
+    || ACTIVE_REVERSE_STATUSES.has(current?.profileOperation?.status)
+  ));
+}
+
+function reverseSnapshotModelSelections(snapshot) {
+  if (!snapshot || typeof snapshot !== "object") return null;
+  const nested = snapshot.workspace_snapshot_v2 && typeof snapshot.workspace_snapshot_v2 === "object"
+    ? snapshot.workspace_snapshot_v2
+    : {};
+  const selections = snapshot.model_selections || nested.model_selections;
+  return selections && typeof selections === "object" ? selections : null;
+}
+
 export default function Home() {
   const router = useRouter();
   const notify = useToast();
   const [me, setMe] = useState(null);
   const [cfg, setCfg] = useState(null);
+  const [modelSelections, setModelSelections] = useState({
+    vision: null,
+    image: null,
+    video: null,
+    prompt: null,
+  });
 
   // creation state
   const [creationMode, setCreationMode] = useState("image"); // image | video | image_edit | video_edit
   const [showNegative, setShowNegative] = useState(false);
-  const [promptLibraryOpen, setPromptLibraryOpen] = useState(false);
   const [promptSaveTitle, setPromptSaveTitle] = useState("");
   const [promptSaveCategory, setPromptSaveCategory] = useState("image");
   const [promptSaveFavorite, setPromptSaveFavorite] = useState(false);
   const [optimizingPromptMode, setOptimizingPromptMode] = useState("");
+  const [assetPicker, setAssetPicker] = useState(null);
 
   // reference (paste link -> reverse) state
   const [refOpen, setRefOpen] = useState(false);
@@ -147,9 +200,15 @@ export default function Home() {
   const variationRestoreContextRef = useRef(null);
   const subjectProfilePendingRequestRef = useRef(null);
   const subjectProfileResultCacheRef = useRef(null);
+  const subjectProfileOperationsRef = useRef({});
+  const reverseResumeOperationsRef = useRef([]);
+  const localReverseDraftRef = useRef({ owner: "", active: false });
   const optimizePromptRequestRef = useRef({});
   const optimizePromptContextRef = useRef({});
   const promptOptimizationRecordsRef = useRef({});
+  const modelSelectionsRef = useRef(modelSelections);
+  const modelSelectionOwnerRef = useRef("");
+  const configRefreshSeqRef = useRef(0);
   const {
     workspaces,
     setWorkspaces,
@@ -225,20 +284,28 @@ export default function Home() {
     vResolution,
     videoAnalysisPreset,
     url,
+    appliedUrl,
     parsing,
     uploading,
     reversing,
+    reverseOperation: workspaceReverseOperation,
+    profileOperation,
     assets,
     selected,
     productAsset,
+    productDetailAssets = [],
     productProfile,
     productProfileSource,
+    portraitProfile,
+    portraitProfileSource,
     productProfiling,
     subjectProtection = null,
     subjectProtectionLoading = false,
     subjectProtectionSource = "",
     variationSource,
     structured,
+    structuredBaseline,
+    structuredDirty,
     structuredSource,
     reverseVideoAnalysis,
     promptSourceSignature,
@@ -253,13 +320,98 @@ export default function Home() {
     productGenerationMode,
     portraitGenerationMode,
   } = studioCreationFacts({ creationMode, imageEditProductMode, editSubjectMode, productAsset });
+  const activeSubjectProfile = portraitGenerationMode ? portraitProfile : productProfile;
+  const activeSubjectProfileSource = portraitGenerationMode ? portraitProfileSource : productProfileSource;
   const optimizingPrompt = optimizingPromptMode === creationMode;
+  const promptReadyForOptimization = Boolean(prompt.trim() && promptDirty);
   const productAssetSignature = assetSignature(productAsset);
   const referenceSignature = [productAssetSignature, assetSignature(selected)].join("|");
+  const reverseResumeOperations = reverseResumeOperationsRef.current;
+  const allModelOptions = normalizeModelOptions(cfg);
+  const generationModelOptions = filterModelOptions(allModelOptions[category], {
+    use: category,
+    creationMode,
+    selected,
+    productAsset,
+    subjectMode,
+  });
+  const visionModelOptions = filterModelOptions(allModelOptions.vision, {
+    use: "vision",
+    creationMode,
+    selected,
+    productAsset,
+    subjectMode,
+  });
+  const promptModelOptions = filterModelOptions(allModelOptions.prompt, {
+    use: "prompt",
+    creationMode,
+    selected,
+    productAsset,
+  });
+  const modelOptionsForSelection = {
+    ...allModelOptions,
+    [category]: generationModelOptions,
+    vision: visionModelOptions,
+    prompt: promptModelOptions,
+  };
+  const selectedGenerationModelConfigId = resolveModelConfigId(
+    generationModelOptions,
+    modelSelections[category],
+  );
+  const selectedVisionModelConfigId = resolveModelConfigId(
+    visionModelOptions,
+    modelSelections.vision,
+  );
+  const selectedPromptModelConfigId = resolveModelConfigId(
+    promptModelOptions,
+    modelSelections.prompt,
+  );
+  const effectiveModelSelections = {
+    ...modelSelections,
+    [category]: selectedGenerationModelConfigId,
+    vision: selectedVisionModelConfigId,
+    prompt: selectedPromptModelConfigId,
+  };
+  const selectedGenerationModel = generationModelOptions.find(
+    (option) => option.id === selectedGenerationModelConfigId,
+  ) || null;
+  const baseProductReferenceUrls = [productAsset, selected]
+    .map(assetReferenceUrl)
+    .filter(Boolean);
+  const productDetailUrls = productDetailAssets.map(assetReferenceUrl).filter(Boolean);
+  const totalProductReferenceCount = new Set([...baseProductReferenceUrls, ...productDetailUrls]).size;
+  const productDetailValidation = productAsset
+    ? validateMultiReferenceSelection(
+        selectedGenerationModel,
+        totalProductReferenceCount,
+        productDetailUrls.length,
+      )
+    : { ok: false, limit: 0, message: "请先选择产品主题图" };
+  const productDetailModelLimit = strictMultiReferenceLimit(selectedGenerationModel);
+  const productDetailLimit = productAsset
+    ? Math.min(
+        MAX_PRODUCT_DETAIL_IMAGES,
+        Math.max(0, productDetailModelLimit - new Set(baseProductReferenceUrls).size),
+      )
+    : 0;
+  const selectedPromptModel = promptModelOptions.find(
+    (option) => option.id === selectedPromptModelConfigId,
+  ) || null;
+  const studioCfg = cfg?.model_options ? {
+    ...cfg,
+    models: {
+      ...(cfg.models || {}),
+      [category]: {
+        ...(cfg.models?.[category] || {}),
+        ...(selectedGenerationModel || {}),
+        enabled: generationModelOptions.length > 0,
+      },
+    },
+  } : cfg;
   const targetModel = cfg?.models?.[category] || {};
   const targetGateway = cfg?.gateways?.[category] || {};
-  const targetModelId = targetModel.model_id || targetGateway.model_id || "";
-  const targetModelProvider = targetModel.provider || targetGateway.provider || "";
+  const targetModelId = selectedGenerationModel?.model_id || targetModel.model_id || targetGateway.model_id || "";
+  const targetModelProvider = selectedGenerationModel?.provider || targetModel.provider || targetGateway.provider || "";
   const promptOptimizationContext = {
     creationMode,
     category,
@@ -269,9 +421,11 @@ export default function Home() {
     aspectRatio: category === "video" ? ratio : "",
     resolution: category === "video" ? vResolution : "",
     referenceSignature,
-    subjectProfileSource: productProfileSource,
+    subjectProfileSource: activeSubjectProfileSource,
     targetModelId,
     targetModelProvider,
+    targetModelConfigId: selectedGenerationModelConfigId,
+    optimizerModelConfigId: selectedPromptModelConfigId,
   };
   const currentPromptOptimizationContextKey = promptOptimizationContextKey({
     ...promptOptimizationContext,
@@ -288,6 +442,7 @@ export default function Home() {
           raw_text: promptOptimizationRecord.raw_text,
           optimized_text: promptOptimizationRecord.optimized_text,
           optimizer_model_id: promptOptimizationRecord.optimizer_model_id,
+          optimizer_model_config_id: promptOptimizationRecord.optimizer_model_config_id,
         }
       : prompt
   );
@@ -295,6 +450,66 @@ export default function Home() {
   useEffect(() => {
     workspacesRef.current = workspaces;
   }, [workspaces]);
+
+  modelSelectionsRef.current = modelSelections;
+
+  useEffect(() => {
+    const owner = String(me?.id || "");
+    if (!owner || !cfg) return;
+    let preferred = modelSelectionsRef.current;
+    if (modelSelectionOwnerRef.current !== owner) {
+      preferred = readModelSelections(window.localStorage, owner);
+      modelSelectionOwnerRef.current = owner;
+    }
+    const next = Object.fromEntries(MODEL_SELECTION_USES.map((use) => [
+      use,
+      resolveModelConfigId(modelOptionsForSelection[use], preferred?.[use]),
+    ]));
+    const fallbackUses = MODEL_SELECTION_USES.filter((use) => (
+      preferred?.[use]
+      && next[use] !== Number(preferred[use])
+      && allModelOptions[use].length > 0
+    ));
+    modelSelectionsRef.current = next;
+    setModelSelections((current) => (
+      JSON.stringify(current) === JSON.stringify(next) ? current : next
+    ));
+    writeModelSelections(window.localStorage, owner, next);
+    if (fallbackUses.length > 0) {
+      const labels = fallbackUses.map((use) => ({
+        vision: "反推",
+        image: "图片",
+        video: "视频",
+        prompt: "提示词优化",
+      }[use])).join("、");
+      notify.warn(`${labels}已选模型不再可用，已切换为默认模型。`);
+    }
+  }, [
+    me?.id,
+    cfg,
+    creationMode,
+    category,
+    selected?.type,
+    selected?.id,
+    selected?.url,
+    productAsset?.id,
+    productAsset?.url,
+  ]);
+
+  useEffect(() => {
+    const owner = String(me?.id || "");
+    const previous = localReverseDraftRef.current;
+    if (!owner || !cloudDraftLoadedRef.current) {
+      localReverseDraftRef.current = { owner, active: false };
+      return;
+    }
+    const active = hasActiveReverseOperations(workspaces);
+    if (previous.owner === owner && !active && !previous.active) return;
+    localReverseDraftRef.current = { owner, active };
+    saveStudioSessionDraft(active ? "reverse_operation_active" : "reverse_operation_settled", {
+      persistCloud: false,
+    });
+  }, [me?.id, workspaces, creationMode, showNegative, refOpen, structOpen]);
 
   function studioAdminImagePatch(config = cfg) {
     const patch = {};
@@ -324,8 +539,9 @@ export default function Home() {
     loadWorksSeqRef.current += 1;
     resetOwnerTracking();
     resetOwnerReferenceParsing();
-    resetOwnerMediaUpload();
+    cancelOwnerProfileOperationsAndReset();
     resetOwnerGenerationSubmit();
+    reverseResumeOperationsRef.current = [];
     workspacesRef.current = baseline.workspaces;
     studioUiStateRef.current = baseline;
     setWorkspaces(baseline.workspaces);
@@ -364,10 +580,17 @@ export default function Home() {
 
     return ownerSession.commit(() => {
       cloudDraftLoadedRef.current = true;
+      const persistedSelections = readModelSelections(window.localStorage, u?.id);
+      const hasPersistedSelection = MODEL_SELECTION_USES.some((use) => persistedSelections?.[use]);
+      const draftSelections = localDraft?.modelSelections || cloudDraft?.modelSelections;
+      if (!hasPersistedSelection && draftSelections) {
+        applyModelSelectionPreferences(draftSelections, u?.id);
+      }
       const restoredWorkspaces = mergeStudioWorkspaceLayers(baseline.workspaces, {
         localDraft,
         cloudDraft,
       });
+      reverseResumeOperationsRef.current = reverseOperationResumeCandidates(restoredWorkspaces);
       const currentState = studioUiStateRef.current || baseline;
       const restoredMetadata = mergeStudioDraftMetadataLayers(localDraft, cloudDraft);
       const validModes = new Set(CREATION_MODES.map((item) => item.key));
@@ -408,15 +631,33 @@ export default function Home() {
       let variationTransferApplied = false;
       if (promptDraft) {
         const parsedDraft = parsePromptDraft(promptDraft);
-        const draftMode = promptDraftMode(parsedDraft);
+        const snapshotRestore = workspacePatchFromReverseSnapshot(parsedDraft.reverseSnapshotV2);
+        const snapshotSelections = reverseSnapshotModelSelections(parsedDraft.reverseSnapshotV2);
+        const draftMode = snapshotRestore?.creationMode || promptDraftMode(parsedDraft);
         promptTransferApplied = canApplyStudioPromptTransfer(baseline, currentState, draftMode);
         if (promptTransferApplied) {
+          if (snapshotSelections) applyModelSelectionPreferences(snapshotSelections, u?.id);
           setCreationMode(draftMode);
+          const restoredWorkspace = snapshotRestore?.workspace || {};
+          const restoredSelectedSignature = assetSignature(restoredWorkspace.selected);
           setWorkspacePatch({
-            prompt: parsedDraft.prompt,
-            promptDirty: true,
-            promptSourceSignature: "",
+            ...restoredWorkspace,
+            editSubjectMode: snapshotRestore?.subjectMode || restoredWorkspace.editSubjectMode || "general",
+            imageEditProductMode: ["product", "portrait"].includes(snapshotRestore?.subjectMode),
+            prompt: parsedDraft.prompt || restoredWorkspace.prompt || "",
+            promptDirty: snapshotRestore ? false : true,
+            promptSourceSignature: snapshotRestore ? restoredSelectedSignature : "",
+            structuredSource: snapshotRestore ? restoredSelectedSignature : "",
           }, draftMode);
+          if (snapshotRestore) {
+            setStructOpen(true);
+            setRefOpen(Boolean(restoredWorkspace.selected || restoredWorkspace.productAsset));
+            setMsg(snapshotRestore.expiredAssetsSkipped
+              ? "已恢复反推文字、结构和分析证据；过期素材已跳过，请重新上传。"
+              : "已恢复反推文字、结构、素材和分析证据。");
+          } else if (parsedDraft.legacyReverse) {
+            setMsg("旧版反推记录仅支持恢复提示词文字，素材和分析证据未保存。");
+          }
         }
         removeStudioUserDraft(window.localStorage, STUDIO_DRAFT_PROMPT_KEY, u?.id);
       }
@@ -512,6 +753,21 @@ export default function Home() {
       stopAllTracking();
       revokeUploadedObjectUrls();
       revokeProductObjectUrls();
+    };
+  }, []);
+
+  useEffect(() => {
+    const onFocus = () => {
+      refreshStudioConfig().catch((e) => reportBackgroundError(e, "refresh studio config on focus"));
+    };
+    const onVisibilityChange = () => {
+      if (document.visibilityState === "visible") onFocus();
+    };
+    window.addEventListener("focus", onFocus);
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    return () => {
+      window.removeEventListener("focus", onFocus);
+      document.removeEventListener("visibilitychange", onVisibilityChange);
     };
   }, []);
 
@@ -620,6 +876,39 @@ export default function Home() {
       .catch((e) => reportBackgroundError(e, "refresh current user"));
   }
 
+  async function refreshStudioConfig() {
+    const seq = ++configRefreshSeqRef.current;
+    const next = await api.config();
+    if (seq === configRefreshSeqRef.current) setCfg(next);
+    return next;
+  }
+
+  function applyModelSelectionPreferences(preferred, ownerId = me?.id) {
+    const next = Object.fromEntries(MODEL_SELECTION_USES.map((use) => [
+      use,
+      resolveModelConfigId(modelOptionsForSelection[use], preferred?.[use]),
+    ]));
+    modelSelectionsRef.current = next;
+    setModelSelections(next);
+    if (typeof window !== "undefined" && ownerId) {
+      writeModelSelections(window.localStorage, String(ownerId), next);
+    }
+    return next;
+  }
+
+  function changeModelSelection(use, modelConfigId) {
+    const next = {
+      ...effectiveModelSelections,
+      [use]: resolveModelConfigId(modelOptionsForSelection[use], modelConfigId),
+    };
+    modelSelectionsRef.current = next;
+    setModelSelections(next);
+    if (typeof window !== "undefined" && me?.id) {
+      writeModelSelections(window.localStorage, String(me.id), next);
+    }
+    if (use === "prompt" || use === category) invalidatePromptOptimization();
+  }
+
   const {
     task,
     setTask,
@@ -662,6 +951,12 @@ export default function Home() {
     pickAsset,
     doParse,
     doReverse,
+    confirmReverseCover,
+    cancelReverseOperationForMode,
+    cancelRecoveredProfileOperationForMode,
+    trackProfileReverseOperation,
+    cancelAllReverseOperations,
+    reverseOperation,
     lastReversePromptRef,
     resetOwnerReferenceParsing,
   } = useReferenceParsing({
@@ -670,10 +965,18 @@ export default function Home() {
     url,
     parsing,
     selected,
+    assets,
+    productAsset,
+    productProfile: activeSubjectProfile,
+    structured,
+    reverseVideoAnalysis,
+    workspaceReverseOperation,
     prompt,
     negative,
     negativeTouched,
     videoAnalysisPreset,
+    modelConfigId: selectedVisionModelConfigId,
+    modelSelections: effectiveModelSelections,
     ratio,
     vDuration,
     videoDurationMaxSeconds: cfg?.video_duration_max_seconds,
@@ -689,20 +992,28 @@ export default function Home() {
     refreshMe,
     revokeUploadedObjectUrlsRef,
     getOwnerSession: () => studioOwnerSessionRef.current,
+    ownerKey: me?.id ? String(me.id) : "",
+    resumeOperations: reverseResumeOperations,
   });
 
   const {
     imageUploadInputRef,
     productUploadInputRef,
+    productDetailUploadInputRef,
     videoUploadInputRef,
     bumpUploadRequest,
     bumpProductUploadRequest,
     revokeUploadedObjectUrls,
     revokeProductObjectUrl,
     revokeProductObjectUrls,
+    cancelProfileOperation,
+    cancelAllProfileOperations,
+    cancelOwnerProfileOperationsAndReset,
     resetOwnerMediaUpload,
     doUploadImage,
     doUploadProductImage,
+    doUploadProductDetailImages,
+    selectProductAsset,
     doUploadVideo,
   } = useMediaUpload({
     cfg,
@@ -710,6 +1021,9 @@ export default function Home() {
     category,
     isEditMode,
     subjectMode,
+    productAsset,
+    productDetailAssets,
+    visionModelConfigId: selectedVisionModelConfigId,
     uploading,
     setMsg,
     setWorkspacePatch,
@@ -722,6 +1036,10 @@ export default function Home() {
     selectAssetForMode,
     subjectProfilePendingRequestRef,
     subjectProfileResultCacheRef,
+    subjectProfileOperationsRef,
+    profileOperation,
+    cancelRecoveredProfileOperation: cancelRecoveredProfileOperationForMode,
+    trackProfileReverseOperation,
     getOwnerSession: () => studioOwnerSessionRef.current,
   });
 
@@ -747,11 +1065,16 @@ export default function Home() {
     promptSourceSignature,
     selected,
     productAsset,
+    productDetailAssets,
     productProfile,
     productProfileSource,
+    portraitProfile,
+    portraitProfileSource,
     variationSource,
     structured,
+    structuredDirty,
     structuredSource,
+    reverseVideoAnalysis,
     ratio,
     imageQuality,
     n,
@@ -760,6 +1083,9 @@ export default function Home() {
     productPixelLockMode,
     vDuration,
     vResolution,
+    modelConfigId: selectedGenerationModelConfigId,
+    modelOption: selectedGenerationModel,
+    visionModelConfigId: selectedVisionModelConfigId,
     resultsRef,
     modelEnabled,
     setMsg,
@@ -772,6 +1098,8 @@ export default function Home() {
     startTracking,
     subjectProfilePendingRequestRef,
     subjectProfileResultCacheRef,
+    subjectProfileOperationsRef,
+    trackProfileReverseOperation,
     getOwnerSession: () => studioOwnerSessionRef.current,
   });
 
@@ -780,6 +1108,16 @@ export default function Home() {
   }, [revokeUploadedObjectUrls]);
 
   function modelEnabled(kind) {
+    const use = String(kind || "").startsWith("video") ? "video" : "image";
+    if (cfg?.model_options) {
+      return filterModelOptions(allModelOptions[use], {
+        use,
+        creationMode: kind,
+        selected: kind === creationMode ? selected : null,
+        productAsset: kind === creationMode ? productAsset : null,
+        subjectMode: kind === creationMode ? subjectMode : "general",
+      }).length > 0;
+    }
     return modelEnabledForConfig(cfg, kind);
   }
 
@@ -787,9 +1125,10 @@ export default function Home() {
     if (!asset) return null;
     const clean = {};
     for (const key of [
-      "id", "type", "url", "thumb", "preview_url", "original_url", "original_thumb",
+      "id", "asset_ref", "origin", "type", "url", "thumb", "preview_url", "original_url", "original_thumb",
       "source_page_url", "source_captured_at", "width", "height", "thumb_width", "thumb_height",
-      "unlock_cost", "unlocked", "favorite",
+      "retention_expires_at", "expired", "available", "filename",
+      "unlock_cost", "unlocked", "favorite", "retained",
     ]) {
       if (asset[key] !== undefined && asset[key] !== null) clean[key] = asset[key];
     }
@@ -813,14 +1152,30 @@ export default function Home() {
       productPixelLockMode: current.productPixelLockMode || "auto",
       videoAnalysisPreset: current.videoAnalysisPreset || "standard",
       url: current.url || "",
+      appliedUrl: current.appliedUrl || "",
       assets: (current.assets || []).map(sanitizeAssetForDraft).filter(Boolean).slice(0, 12),
       selected: sanitizeAssetForDraft(current.selected),
       productAsset: sanitizeAssetForDraft(current.productAsset),
+      productDetailAssets: (current.productDetailAssets || [])
+        .map(sanitizeAssetForDraft)
+        .filter(Boolean)
+        .slice(0, MAX_PRODUCT_DETAIL_IMAGES),
       productProfile: current.productProfile || null,
       productProfileSource: current.productProfileSource || "",
+      portraitProfile: current.portraitProfile || null,
+      portraitProfileSource: current.portraitProfileSource || "",
       variationSource: sanitizeAssetForDraft(current.variationSource),
       structured: current.structured || {},
+      structuredBaseline: current.structuredBaseline || {},
+      structuredDirty: !!current.structuredDirty,
       structuredSource: current.structuredSource || "",
+      reverseVideoAnalysis: current.reverseVideoAnalysis || null,
+      reverseOperation: current.reverseOperation && ["queued", "running", "needs_confirmation"].includes(current.reverseOperation.status)
+        ? current.reverseOperation
+        : null,
+      profileOperation: current.profileOperation && ["queued", "running", "needs_confirmation"].includes(current.profileOperation.status)
+        ? current.profileOperation
+        : null,
       promptSourceSignature: current.promptSourceSignature || "",
       negativeTouched: !!current.negativeTouched,
       promptDirty: !!current.promptDirty,
@@ -848,6 +1203,7 @@ export default function Home() {
       showNegative,
       refOpen,
       structOpen,
+      modelSelections: effectiveModelSelections,
       workspaces: savedWorkspaces,
       activeTaskId: taskRef.current?.id || null,
     };
@@ -918,13 +1274,24 @@ export default function Home() {
     }
   }
 
-  function clearProductAsset() {
+  async function clearProductAsset() {
+    try {
+      await cancelRecoveredProfileOperationForMode(creationMode);
+      await cancelProfileOperation(creationMode);
+    } catch (e) {
+      reportBackgroundError(e, "cancel profile while clearing subject");
+      setMsg(errorMessage(e, "主体档案任务取消失败，已保留当前素材。"));
+      return;
+    }
     bumpProductUploadRequest(creationMode);
     revokeProductObjectUrl(creationMode);
     setWorkspacePatch({
       productAsset: null,
+      productDetailAssets: [],
       productProfile: null,
       productProfileSource: "",
+      portraitProfile: null,
+      portraitProfileSource: "",
       productProfiling: false,
       subjectProtection: null,
       subjectProtectionLoading: false,
@@ -934,8 +1301,15 @@ export default function Home() {
     if (productUploadInputRef.current) productUploadInputRef.current.value = "";
   }
 
-  function clearRef() {
+  async function clearRef() {
     const mode = creationMode;
+    try {
+      await cancelReverseOperationForMode(mode);
+    } catch (e) {
+      reportBackgroundError(e, "cancel reverse while clearing reference");
+      setMsg(errorMessage(e, "反推任务取消失败，已保留当前参考素材。"));
+      return;
+    }
     bumpRefVersion(mode);
     bumpParseRequest(mode);
     bumpUploadRequest(mode);
@@ -949,12 +1323,16 @@ export default function Home() {
       assets: [],
       variationSource: null,
       url: "",
+      appliedUrl: "",
       parsing: false,
       uploading: false,
       reversing: false,
       structured: {},
+      structuredBaseline: {},
+      structuredDirty: false,
       structuredSource: "",
       reverseVideoAnalysis: null,
+      reverseOperation: null,
       ...(current.promptSourceSignature && !current.promptDirty
         ? { prompt: "", promptSourceSignature: "", promptDirty: false }
         : { promptSourceSignature: "" }),
@@ -966,35 +1344,27 @@ export default function Home() {
     const mode = creationMode;
     bumpRefVersion(mode);
     bumpParseRequest(mode);
-    bumpReverseRequest(mode);
-    revokeUploadedObjectUrls(mode);
-    clearSelectedForMode(mode);
-    setWorkspacePatch((current) => ({
-      url: value,
-      selected: null,
-      assets: [],
-      variationSource: null,
-      parsing: false,
-      reversing: false,
-      structured: {},
-      structuredSource: "",
-      reverseVideoAnalysis: null,
-      ...(current.promptSourceSignature && !current.promptDirty
-        ? { prompt: "", promptSourceSignature: "", promptDirty: false }
-        : { promptSourceSignature: "" }),
-      ...(current.negativeTouched ? {} : { negative: "" }),
-    }), mode);
+    setWorkspacePatch({ url: value, parsing: false }, mode);
   }
 
   // rebuild the prompt text from the (possibly edited) reverse dimensions
   function recompose() {
     const nextPrompt = isEditMode
       ? composeStyleTransferPrompt(structured, prompt, { video: category === "video", subject: subjectMode })
-      : composePromptFromStructured(structured, prompt);
+      : composePromptFromStructured(structured, prompt, { target: category });
     setWorkspacePatch({
       prompt: nextPrompt,
       promptDirty: false,
+      structuredBaseline: structured,
+      structuredDirty: false,
       promptSourceSignature: structuredSource || assetSignature(selected) || "",
+    });
+  }
+
+  function undoStructuredChanges() {
+    setWorkspacePatch({
+      structured: structuredBaseline || {},
+      structuredDirty: false,
     });
   }
 
@@ -1014,10 +1384,10 @@ export default function Home() {
           : selected
             ? "reference_image"
             : "text";
-      const subjectProfile = productProfile?.structured
+      const subjectProfile = activeSubjectProfile?.structured
         ? {
-            ...productProfile.structured,
-            ...(productProfile.final_text ? { final_text: productProfile.final_text } : {}),
+            ...activeSubjectProfile.structured,
+            ...(activeSubjectProfile.final_text ? { final_text: activeSubjectProfile.final_text } : {}),
           }
         : null;
       const result = await api.optimizePrompt(source, {
@@ -1031,8 +1401,10 @@ export default function Home() {
         subject_mode: subjectMode,
         reference_type: referenceType,
         subject_profile: subjectProfile,
-        target_model_id: targetModelId || undefined,
-        target_model_provider: targetModelProvider || undefined,
+        optimizer_model_config_id: selectedPromptModelConfigId || undefined,
+        target_model_config_id: selectedGenerationModelConfigId || undefined,
+        target_model_id: selectedGenerationModelConfigId ? undefined : (targetModelId || undefined),
+        target_model_provider: selectedGenerationModelConfigId ? undefined : (targetModelProvider || undefined),
       });
       if (!isPromptOptimizationResultCurrent(
         request,
@@ -1045,6 +1417,7 @@ export default function Home() {
         raw_text: source,
         optimized_text: optimized,
         optimizer_model_id: result.optimizer_model_id || result.model_id || "",
+        optimizer_model_config_id: result.optimizer_model_config_id || selectedPromptModelConfigId || null,
         scope_key: promptOptimizationScopeKey,
       };
       setWorkspacePatch({
@@ -1052,7 +1425,7 @@ export default function Home() {
         promptDirty: true,
         promptSourceSignature: "",
       }, mode);
-      setMsg(`提示词已优化 · ${result.model_id || "gemini-3.5-flash-low"}`);
+      setMsg(`提示词已优化 · ${result.optimizer_model_name || result.model_id || selectedPromptModel?.display_name || "默认模型"}`);
       notify.success("提示词已优化，可继续修改或直接生成。 ");
     } catch (e) {
       if (!isPromptOptimizationResultCurrent(
@@ -1086,10 +1459,47 @@ export default function Home() {
     setEditSubjectMode(value);
   }
 
-  function clearCurrentWorkspace() {
-    for (const { key: mode } of CREATION_MODES) {
-      invalidatePromptOptimization(mode);
+  async function clearCurrentWorkspace() {
+    const mode = creationMode;
+    try {
+      await cancelReverseOperationForMode(mode);
+      await cancelRecoveredProfileOperationForMode(mode);
+      await cancelProfileOperation(mode);
+    } catch (e) {
+      reportBackgroundError(e, "cancel reverse operation while clearing workspace");
+      setMsg(errorMessage(e, "后台任务取消失败，已保留当前模式内容。"));
+      return;
     }
+    invalidatePromptOptimization(mode);
+    bumpRefVersion(mode);
+    bumpParseRequest(mode);
+    bumpUploadRequest(mode);
+    bumpProductUploadRequest(mode);
+    bumpReverseRequest(mode);
+    revokeUploadedObjectUrls(mode);
+    revokeProductObjectUrl(mode);
+    clearSelectedForMode(mode);
+    subjectProfilePendingRequestRef.current = null;
+    subjectProfileResultCacheRef.current = null;
+    variationRestoreContextRef.current = null;
+    delete optimizePromptContextRef.current[mode];
+    delete promptOptimizationRecordsRef.current[mode];
+    setWorkspacePatch((current) => clearWorkspaceContent(current), mode);
+    setStructOpen(true);
+    setMsg("");
+  }
+
+  async function clearAllWorkspaces() {
+    if (!window.confirm("确认清空全部创作模式？所有模式中的提示词、素材和反推结果都会被移除。")) return;
+    try {
+      await cancelAllReverseOperations();
+      await cancelAllProfileOperations();
+    } catch (e) {
+      reportBackgroundError(e, "cancel reverse operations while clearing all workspaces");
+      setMsg(errorMessage(e, "部分后台任务取消失败，已保留全部模式内容。"));
+      return;
+    }
+    for (const { key: mode } of CREATION_MODES) invalidatePromptOptimization(mode);
     resetOwnerReferenceParsing();
     resetOwnerMediaUpload();
     subjectProfilePendingRequestRef.current = null;
@@ -1098,7 +1508,6 @@ export default function Home() {
     optimizePromptContextRef.current = {};
     promptOptimizationRecordsRef.current = {};
     setWorkspaces(clearAllWorkspaceContent);
-    setPromptLibraryOpen(false);
     setStructOpen(true);
     setMsg("");
   }
@@ -1123,6 +1532,23 @@ export default function Home() {
           subject_mode: subjectMode,
           source_signature: reverseSource.sourceSignature || structuredSource || promptSourceSignature || assetSignature(selected),
           structured,
+          reverse_snapshot_v2: {
+            ...buildReverseSnapshotV2({
+              creationMode,
+              subjectMode,
+              target: category,
+              selected,
+              productAsset,
+              assets,
+              structured,
+              finalText: text,
+              videoAnalysisPreset,
+              videoAnalysis: reverseVideoAnalysis,
+              subjectProfile: activeSubjectProfile,
+            }),
+            model_selections: effectiveModelSelections,
+            model_config_id: selectedVisionModelConfigId,
+          },
         },
       });
       setMsg("已保存到“我的提示词”。");
@@ -1132,16 +1558,6 @@ export default function Home() {
       setMsg(text);
       notify.error(text);
     }
-  }
-
-  function applyLibraryPrompt(text, mode = "replace") {
-    const next = String(text || "").trim();
-    if (!next) return;
-    updatePromptFromUser((current) => {
-      if (mode !== "append" || !current.trim()) return next;
-      return `${current.trim()}\n\n${next}`;
-    });
-    setPromptDirty(true);
   }
 
   function createImageVariation(asset) {
@@ -1168,6 +1584,8 @@ export default function Home() {
       selected: null,
       assets: [],
       structured: {},
+      structuredBaseline: {},
+      structuredDirty: false,
       structuredSource: "",
       promptSourceSignature: "",
       promptDirty: true,
@@ -1202,11 +1620,15 @@ export default function Home() {
       productAsset: nextAsset,
       productProfile: null,
       productProfileSource: "",
+      portraitProfile: null,
+      portraitProfileSource: "",
       productProfiling: false,
       variationSource: nextAsset,
       selected: null,
       assets: [],
       structured: {},
+      structuredBaseline: {},
+      structuredDirty: false,
       structuredSource: "",
       promptSourceSignature: "",
       promptDirty: true,
@@ -1313,6 +1735,7 @@ export default function Home() {
   const {
     running,
     reverseVideoPresets,
+    reverseImageCost,
     selectedReverseCost,
     selectedReverseCostLabel,
     reverseEnabled,
@@ -1331,7 +1754,7 @@ export default function Home() {
     editReadySteps,
     submitLabel,
   } = buildStudioDerivedViewState({
-    cfg,
+    cfg: studioCfg,
     creationMode,
     category,
     isEditMode,
@@ -1361,6 +1784,10 @@ export default function Home() {
 
   function renderSubmitBar(variant = "desktop") {
     const isMobile = variant === "mobile";
+    const estimatedCredits = category === "video" ? videoFinalCost : estCost;
+    const imageUnitCredits = category === "image" && imageCount > 0
+      ? estCost / imageCount
+      : 0;
     return (
       <div
         className={isMobile
@@ -1368,21 +1795,38 @@ export default function Home() {
           : "mt-3 hidden min-w-0 items-center justify-between gap-3 px-1 lg:flex"
         }
       >
-        <p className="min-w-0 text-xs leading-snug text-fog">
+        <div className="min-w-0" aria-live="polite">
           {estCost ? (
-            <>预计消耗 <b className="text-mist">{category === "video" ? `${videoFinalCost} · ${formatDuration(videoDuration)} · ${vResolution}` : estCost}</b> 积分{category === "image" ? " · 可连续提交" : ""}</>
-          ) : "提交后冻结预估积分"}
-        </p>
+            <>
+              <div className="flex min-w-0 items-baseline gap-1 whitespace-nowrap">
+                <span className="text-[11px] text-fog">预计消耗</span>
+                <strong className="font-display text-base font-semibold text-snow">{estimatedCredits}</strong>
+                <span className="text-xs font-medium text-mist">积分</span>
+              </div>
+              <p className="mt-0.5 truncate text-[10px] leading-snug text-fog">
+                {category === "video"
+                  ? `${formatDuration(videoDuration)} · ${vResolution}`
+                  : `${imageCount} 张 × ${imageUnitCredits} 积分/张 · 可连续提交`}
+              </p>
+            </>
+          ) : (
+            <p className="text-xs leading-snug text-fog">费用将在提交时按当前参数预估并冻结</p>
+          )}
+        </div>
         <button
           onClick={() => submit(category === "video" ? "final" : "preview")}
-          disabled={missingRequiredSource || generationSubmitDisabled({
+          disabled={missingRequiredSource || structuredDirty || generationSubmitDisabled({
             submitting,
             busy: parsing || uploading || reversing || productProfiling,
             currentTask: task,
             nextCategory: category,
             currentModelEnabled,
           })}
-          title={missingRequiredSource ? `${missingRequiredSourceLabel}后再生成` : undefined}
+          title={missingRequiredSource
+            ? `${missingRequiredSourceLabel}后再生成`
+            : structuredDirty
+              ? "请先应用结构修改或撤销结构修改"
+              : undefined}
           className="btn-primary btn-lg min-w-28 shrink-0 px-4 sm:min-w-32 sm:px-6"
         >
           {(submitting || running) && (
@@ -1441,17 +1885,24 @@ export default function Home() {
                   productGenerationMode={productGenerationMode}
                   prompt={prompt}
                   placeholder={promptPlaceholder}
-                  promptLibraryOpen={promptLibraryOpen}
                   readySteps={editReadySteps}
                   editStyleKeys={editStyleKeys}
                   onPromptChange={updatePromptFromUser}
                   onPromptDirty={setPromptDirty}
-                  onAppendPrompt={(text) => applyLibraryPrompt(text, "append")}
-                  onTogglePromptLibrary={() => setPromptLibraryOpen((open) => !open)}
                   onOptimizePrompt={optimizeDirectPrompt}
-                  canOptimizePrompt={Boolean(prompt.trim() && promptDirty)}
+                  canOptimizePrompt={Boolean(
+                    promptReadyForOptimization
+                    && (!cfg?.model_options || selectedPromptModelConfigId)
+                  )}
                   optimizingPrompt={optimizingPrompt}
+                  generationModelOptions={generationModelOptions}
+                  selectedGenerationModelConfigId={selectedGenerationModelConfigId}
+                  onGenerationModelChange={(id) => changeModelSelection(category, id)}
+                  promptModelOptions={promptModelOptions}
+                  selectedPromptModelConfigId={selectedPromptModelConfigId}
+                  onPromptModelChange={(id) => changeModelSelection("prompt", id)}
                   onClearWorkspace={clearCurrentWorkspace}
+                  onClearAllWorkspaces={clearAllWorkspaces}
                   canClearWorkspace={Boolean(
                     prompt.trim()
                     || negative.trim()
@@ -1461,6 +1912,7 @@ export default function Home() {
                     || assets.length
                     || Object.keys(structured || {}).length
                     || productProfile
+                    || portraitProfile
                     || variationSource
                     || parsing
                     || uploading
@@ -1521,52 +1973,102 @@ export default function Home() {
                 isEditMode={isEditMode}
                 selected={selected}
                 productAsset={productAsset}
+                productDetailAssets={productDetailAssets}
+                productDetailValidation={productDetailValidation}
+                productDetailLimit={productDetailLimit}
                 url={url}
+                appliedUrl={appliedUrl}
                 setUrl={updateReferenceUrl}
                 parsing={parsing}
                 uploading={uploading || submitting}
-                productBusy={submitting || productProfiling}
+                productBusy={submitting}
+                productProfiling={productProfiling}
+                profileOperation={profileOperation}
                 assets={assets}
                 refOpen={refOpen}
                 setRefOpen={setRefOpen}
                 reversing={reversing}
-                reverseEnabled={reverseEnabled}
+                reverseEnabled={Boolean(
+                  reverseEnabled
+                  && (!cfg?.model_options || selectedVisionModelConfigId)
+                )}
+                reverseImageCost={reverseImageCost}
                 selectedReverseCost={selectedReverseCost}
                 selectedReverseCostLabel={selectedReverseCostLabel}
                 videoAnalysisPreset={videoAnalysisPreset}
                 videoAnalysisPresets={reverseVideoPresets}
                 reverseVideoAnalysis={reverseVideoAnalysis}
+                reverseOperation={reverseOperation || workspaceReverseOperation}
+                visionModelOptions={visionModelOptions}
+                selectedVisionModelConfigId={selectedVisionModelConfigId}
+                onVisionModelChange={(id) => changeModelSelection("vision", id)}
                 setVideoAnalysisPreset={setVideoAnalysisPreset}
                 imageUploadInputRef={imageUploadInputRef}
                 productUploadInputRef={productUploadInputRef}
+                productDetailUploadInputRef={productDetailUploadInputRef}
                 videoUploadInputRef={videoUploadInputRef}
                 onClear={clearRef}
                 onClearProductAsset={clearProductAsset}
                 onParse={doParse}
                 onUploadImage={doUploadImage}
                 onUploadProductImage={doUploadProductImage}
+                onUploadProductDetailImages={doUploadProductDetailImages}
+                onOpenAssetPicker={(role) => {
+                  if (role === "product_detail" && !productAsset) {
+                    setMsg("请先选择产品主题图");
+                    return;
+                  }
+                  setAssetPicker({ role });
+                }}
+                onRemoveProductDetail={(index) => setWorkspacePatch((current) => ({
+                  productDetailAssets: (current.productDetailAssets || []).filter((_, itemIndex) => itemIndex !== index),
+                }))}
+                onMoveProductDetail={(index, direction) => setWorkspacePatch((current) => {
+                  const next = [...(current.productDetailAssets || [])];
+                  const target = index + direction;
+                  if (target < 0 || target >= next.length) return {};
+                  [next[index], next[target]] = [next[target], next[index]];
+                  return { productDetailAssets: next };
+                })}
                 onUploadVideo={doUploadVideo}
                 onPickAsset={pickAsset}
                 onReverse={doReverse}
+                onConfirmCover={(fallbackFile) => confirmReverseCover(fallbackFile).catch((e) => {
+                  setMsg(e.message || "封面分析确认失败，请重试。");
+                  reportBackgroundError(e, "confirm reverse cover");
+                })}
+                onCancelReverse={() => cancelReverseOperationForMode(creationMode).catch((e) => {
+                  reportBackgroundError(e, "cancel reverse from reference panel");
+                })}
               />
             </div>
-
-            {promptLibraryOpen && (
-              <PromptLibraryBrowser
-                onClose={() => setPromptLibraryOpen(false)}
-                onPrimary={(item) => applyLibraryPrompt(item.prompt, "replace")}
-                onSecondary={(item) => applyLibraryPrompt(item.prompt, "append")}
-              />
-            )}
 
             <StudioStructuredEditor
               structured={structured}
               open={structOpen}
               onToggleOpen={() => setStructOpen((open) => !open)}
               onRecompose={recompose}
+              onUndo={undoStructuredChanges}
               onClear={clearRef}
+              structuredDirty={structuredDirty}
+              promptDirty={promptDirty}
               onChange={(key, value) => {
-                setStructured({ ...structured, [key]: value });
+                const nextStructured = { ...structured, [key]: value };
+                if (promptDirty) {
+                  setWorkspacePatch({ structured: nextStructured, structuredDirty: true });
+                  return;
+                }
+                const nextPrompt = isEditMode
+                  ? composeStyleTransferPrompt(nextStructured, prompt, { video: category === "video", subject: subjectMode })
+                  : composePromptFromStructured(nextStructured, prompt, { target: category });
+                setWorkspacePatch({
+                  structured: nextStructured,
+                  structuredBaseline: nextStructured,
+                  structuredDirty: false,
+                  prompt: nextPrompt,
+                  promptDirty: false,
+                  promptSourceSignature: structuredSource || assetSignature(selected) || "",
+                });
               }}
             />
             {prompt?.trim() && (structuredSource || promptSourceSignature || lastReversePromptRef.current?.[creationMode]?.prompt) && (
@@ -1604,7 +2106,7 @@ export default function Home() {
 
           </div>
 
-          <StudioMessageBar message={msg} />
+          <StudioMessageBar message={msg} onDismiss={setMsg} />
         </section>
 
         <StudioResults
@@ -1639,6 +2141,51 @@ export default function Home() {
           onReset={worksWindow.reset}
         />
       </main>
+      <AssetPickerDialog
+        open={Boolean(assetPicker)}
+        role={assetPicker?.role || "product_theme"}
+        multiple={assetPicker?.role === "product_detail"}
+        maxSelection={assetPicker?.role === "product_detail" ? Math.max(0, productDetailLimit - productDetailAssets.length) : 1}
+        selected={assetPicker?.role === "product_theme" ? (productAsset ? [productAsset] : []) : []}
+        mediaType="image"
+        excludedRefs={assetPicker?.role === "product_detail" && productAsset ? [unifiedAssetKey(productAsset)] : []}
+        excludedUrls={assetPicker?.role === "product_detail" && productAsset ? [assetReferenceUrl(productAsset)] : []}
+        onClose={() => setAssetPicker(null)}
+        onUploadRequest={() => {
+          const role = assetPicker?.role;
+          setAssetPicker(null);
+          if (role === "product_detail") productDetailUploadInputRef.current?.click();
+          else productUploadInputRef.current?.click();
+        }}
+        onConfirm={(picked) => {
+          if (assetPicker?.role === "product_theme") {
+            const next = picked[0];
+            if (next) {
+              const url = assetReferenceUrl(next);
+              const clean = { ...next, url };
+              setWorkspacePatch((current) => ({
+                productDetailAssets: (current.productDetailAssets || []).filter((item) => assetReferenceUrl(item) !== url),
+              }));
+              selectProductAsset(clean);
+            }
+          } else {
+            if (!productAsset) {
+              setMsg("请先选择产品主题图");
+              setAssetPicker(null);
+              return;
+            }
+            setWorkspacePatch((current) => {
+              const mainUrl = assetReferenceUrl(current.productAsset);
+              const existing = current.productDetailAssets || [];
+              const combined = dedupeAssets([...existing, ...picked]);
+              const next = combined.filter((item) => assetReferenceUrl(item) !== mainUrl);
+              if (next.length > 3) return {};
+              return { productDetailAssets: next };
+            });
+          }
+          setAssetPicker(null);
+        }}
+      />
       {renderSubmitBar("mobile")}
     </div>
   );

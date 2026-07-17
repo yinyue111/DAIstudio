@@ -36,6 +36,7 @@ def generic_video_payload_params(params: dict, extra: dict, model_id: str = "") 
             "first_frame_image",
             "last_frame_image",
             "product_reference_image",
+            "product_detail_images",
             "character_reference_image",
             "style_reference_image",
         }
@@ -76,6 +77,15 @@ def generic_video_payload_params(params: dict, extra: dict, model_id: str = "") 
         raise ValueError("产品身份参考与首帧不能映射到同一供应商字段")
     if product and product_field:
         payload_params[str(product_field)] = product
+    product_details = (params or {}).get("product_detail_images")
+    if product_details:
+        detail_field = extra.get("product_detail_images_field")
+        if not detail_field:
+            raise ValueError("当前视频模型未配置产品细节图上游字段")
+        detail_field = str(detail_field)
+        if detail_field in payload_params:
+            raise ValueError("产品细节图与其他参考图映射到了同一上游字段")
+        payload_params[detail_field] = list(product_details)
     character = (params or {}).get("character_reference_image")
     character_field = extra.get("character_image_field", "character_reference_image")
     if character and character_field:
@@ -186,14 +196,6 @@ def ark_content(prompt: str, params: dict) -> list:
         )
         return image_number
 
-    img = params.get("first_frame_image")
-    first_number = append_image(img, role="first_frame")
-    if first_number:
-        role_notes.append(f"图片{first_number}为首帧")
-    last = params.get("last_frame_image")
-    last_number = append_image(last, role="last_frame")
-    if last_number:
-        role_notes.append(f"图片{last_number}为尾帧")
     product = params.get("product_reference_image")
     product_number = append_image(product, role="reference_image")
     if product_number:
@@ -205,6 +207,23 @@ def ark_content(prompt: str, params: dict) -> list:
             f"图片{product_number}中的产品是唯一商品主体；图片{product_number}为产品身份参考，"
             "仅锁定同一SKU的包装、Logo、文字和材质纹理，不要求作为首帧"
         )
+    product_details = params.get("product_detail_images")
+    if isinstance(product_details, list):
+        for detail_index, detail in enumerate(product_details, start=1):
+            detail_number = append_image(detail, role="reference_image")
+            if detail_number:
+                role_notes.append(
+                    f"图片{detail_number}为产品细节参考{detail_index}，"
+                    "仅补充同一SKU的局部结构、材质和文字细节"
+                )
+    img = params.get("first_frame_image")
+    first_number = append_image(img, role="first_frame")
+    if first_number:
+        role_notes.append(f"图片{first_number}为首帧")
+    last = params.get("last_frame_image")
+    last_number = append_image(last, role="last_frame")
+    if last_number:
+        role_notes.append(f"图片{last_number}为尾帧")
     style = params.get("style_reference_image")
     style_number = append_image(style, role="reference_image")
     if style_number:

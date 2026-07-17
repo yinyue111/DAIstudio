@@ -1,5 +1,5 @@
 export function modelUseLabel(use) {
-  return use === "prompt" ? "提示词优化" : use === "vision" ? "反推 / 视觉理解" : use === "image" ? "图片生成" : "视频生成";
+  return use === "prompt" ? "对话 / 提示词" : use === "vision" ? "反推 / 视觉理解" : use === "image" ? "图片生成" : "视频生成";
 }
 
 export function reportReasonLabel(reason) {

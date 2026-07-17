@@ -527,6 +527,7 @@ async def upload_video(
                     mime="video/mp4",
                     width=width,
                     height=height,
+                    duration=max(1, int(round(duration))) if duration is not None else None,
                     bytes=stored_bytes,
                     original_filename=original_filename,
                 )

@@ -5,8 +5,11 @@ export default function StudioStructuredEditor({
   open,
   onToggleOpen,
   onRecompose,
+  onUndo,
   onClear,
   onChange,
+  structuredDirty = false,
+  promptDirty = false,
 }) {
   const keys = Object.keys(structured || {});
   if (keys.length === 0) return null;
@@ -24,17 +27,32 @@ export default function StudioStructuredEditor({
         </div>
       </div>
       {open && (
-        <div className="grid grid-cols-1 gap-2 px-3 pb-3 sm:grid-cols-2">
-          {keys.map((key) => (
-            <div key={key}>
-              <label className="label mb-1 normal-case">{key}</label>
-              <input
-                className="input px-2.5 py-1.5 text-xs"
-                value={structured[key] || ""}
-                onChange={(event) => onChange(key, event.target.value)}
-              />
+        <div className="px-3 pb-3">
+          {structuredDirty && promptDirty && (
+            <div className="mb-3 flex flex-wrap items-center justify-between gap-2 rounded-xl border border-warn/35 bg-warn/10 px-3 py-2" role="alert">
+              <p className="text-xs text-warn">提示词已手工修改。生成前请选择应用结构修改或撤销结构修改。</p>
+              <div className="flex gap-1.5">
+                <button type="button" onClick={onUndo} className="btn-secondary btn-sm px-2.5 py-1 text-xs">
+                  撤销结构修改
+                </button>
+                <button type="button" onClick={onRecompose} className="btn-primary btn-sm px-2.5 py-1 text-xs">
+                  应用结构修改
+                </button>
+              </div>
             </div>
-          ))}
+          )}
+          <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+            {keys.map((key) => (
+              <div key={key}>
+                <label className="label mb-1 normal-case">{key}</label>
+                <input
+                  className="input px-2.5 py-1.5 text-xs"
+                  value={typeof structured[key] === "string" ? structured[key] : JSON.stringify(structured[key] ?? "")}
+                  onChange={(event) => onChange(key, event.target.value)}
+                />
+              </div>
+            ))}
+          </div>
         </div>
       )}
     </div>

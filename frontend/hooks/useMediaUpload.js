@@ -2,9 +2,16 @@
 
 import { useEffect, useRef } from "react";
 import { api } from "../lib/api";
+import {
+  normalizeReverseOperation,
+  reverseOperationFailure,
+  reverseOperationResult,
+} from "../lib/reverseOperations";
+import { reportBackgroundError } from "../lib/errorHandling";
 import { createAbortableRequestRegistry } from "../lib/abortableRequestRegistry";
 import { createStudioOwnerRequestContext } from "../lib/studioSession";
 import { assetSignature, isRequestTimeoutError } from "../app/studio/helpers";
+import { buildReverseOperationRequestSnapshotV2 } from "../app/studio/reverseSnapshot";
 import {
   buildSubjectProfileRequestIdentity,
   cacheSubjectProfileResult,
@@ -15,6 +22,7 @@ import {
   generateReverseClientRequestId,
   shouldKeepPendingReverseRequest,
 } from "../app/studio/generationRequestId";
+import { MAX_PRODUCT_DETAIL_IMAGES } from "../app/studio/constants";
 
 const DEFAULT_MAX_UPLOAD_IMAGE_BYTES = 20 * 1024 * 1024;
 const DEFAULT_MAX_UPLOAD_VIDEO_BYTES = 512 * 1024 * 1024;
@@ -38,12 +46,68 @@ function isRequestCurrent(ref, mode, id) {
   return Number(ref.current[mode] || 0) === id;
 }
 
+function trackingLostError(operation) {
+  return Object.assign(
+    new Error(operation?.error || "主体档案仍在后台处理中，稍后会自动恢复进度"),
+    { operation_id: operation?.id },
+  );
+}
+
+function waitForTrackedProfileOperation(operation, {
+  mode,
+  signal,
+  trackProfileReverseOperation,
+  context,
+}) {
+  if (typeof trackProfileReverseOperation !== "function") {
+    return Promise.reject(new Error("主体档案任务跟踪器不可用"));
+  }
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const finish = (callback, value) => {
+      if (settled) return;
+      settled = true;
+      signal?.removeEventListener("abort", onAbort);
+      callback(value);
+    };
+    const onAbort = () => finish(
+      reject,
+      Object.assign(new Error("主体档案任务跟踪已取消"), { name: "AbortError" }),
+    );
+    if (signal?.aborted) {
+      onAbort();
+      return;
+    }
+    signal?.addEventListener("abort", onAbort, { once: true });
+    try {
+      Promise.resolve(trackProfileReverseOperation(operation, mode, {
+        ...context,
+        onUpdate: (nextOperation) => {
+          context.onUpdate?.(nextOperation);
+          if (nextOperation?.error_code === "tracking_lost") {
+            finish(reject, trackingLostError(nextOperation));
+          }
+        },
+        onSettled: (settledOperation) => {
+          context.onSettled?.(settledOperation);
+          finish(resolve, settledOperation);
+        },
+      })).catch((error) => finish(reject, error));
+    } catch (error) {
+      finish(reject, error);
+    }
+  });
+}
+
 export default function useMediaUpload({
   cfg,
   creationMode,
   category,
   isEditMode,
   subjectMode = "",
+  productAsset = null,
+  productDetailAssets = [],
+  visionModelConfigId = null,
   uploading,
   setMsg,
   setWorkspacePatch,
@@ -57,21 +121,29 @@ export default function useMediaUpload({
   getOwnerSession,
   subjectProfilePendingRequestRef = null,
   subjectProfileResultCacheRef = null,
+  subjectProfileOperationsRef = null,
+  profileOperation = null,
+  cancelRecoveredProfileOperation = null,
+  trackProfileReverseOperation = null,
 }) {
   const uploadRequestRef = useRef({});
   const productUploadRequestRef = useRef({});
   const imageUploadInputRef = useRef(null);
   const productUploadInputRef = useRef(null);
+  const productDetailUploadInputRef = useRef(null);
   const videoUploadInputRef = useRef(null);
   const objectUrlsByModeRef = useRef({});
   const productObjectUrlsRef = useRef({});
   const fallbackSubjectProfilePendingRequestRef = useRef(null);
   const fallbackSubjectProfileResultCacheRef = useRef(null);
+  const fallbackSubjectProfileOperationsRef = useRef({});
+  const profileAbortControllersRef = useRef({});
   const getOwnerSessionRef = useRef(getOwnerSession);
   const ownerRequestContextRef = useRef(null);
   const activeUploadRequestsRef = useRef(null);
   const pendingProfileReverseRequestRef = subjectProfilePendingRequestRef || fallbackSubjectProfilePendingRequestRef;
   const profileResultCacheRef = subjectProfileResultCacheRef || fallbackSubjectProfileResultCacheRef;
+  const profileOperationsRef = subjectProfileOperationsRef || fallbackSubjectProfileOperationsRef;
 
   getOwnerSessionRef.current = getOwnerSession;
   if (!ownerRequestContextRef.current) {
@@ -139,12 +211,12 @@ export default function useMediaUpload({
     };
   }
 
-  function assignUploadedReferenceAsset(mode, displayAsset) {
+  async function assignUploadedReferenceAsset(mode, displayAsset) {
+    await selectAssetForMode(displayAsset, mode);
     setWorkspacePatch((current) => ({
       assets: [displayAsset, ...current.assets],
       variationSource: null,
     }), mode);
-    selectAssetForMode(displayAsset, mode);
     setRefOpen(true);
   }
 
@@ -156,12 +228,19 @@ export default function useMediaUpload({
       || !["product", "portrait"].includes(profileSubjectMode)
     ) return;
     const signature = assetSignature(asset);
-    setWorkspacePatch({ productProfiling: true, productProfile: null, productProfileSource: "" }, mode);
+    setWorkspacePatch({
+      productProfiling: true,
+      productProfile: null,
+      productProfileSource: "",
+      portraitProfile: null,
+      portraitProfileSource: "",
+    }, mode);
     const requestIdentity = buildSubjectProfileRequestIdentity({
       mode,
       subjectMode: profileSubjectMode,
       assetUrl: asset.url,
       assetSignature: signature,
+      modelConfigId: visionModelConfigId,
     });
     const profileRequestId = generateReverseClientRequestId(
       pendingProfileReverseRequestRef,
@@ -169,14 +248,56 @@ export default function useMediaUpload({
       requestIdentity.signature,
     );
     try {
-      const profile = await api.reverse(
-        asset.url,
-        "product_profile",
-        null,
-        "image",
-        null,
-        profileRequestId,
-      );
+      const profileAbortController = new AbortController();
+      profileAbortControllersRef.current[mode]?.abort();
+      profileAbortControllersRef.current[mode] = profileAbortController;
+      const profileTarget = profileSubjectMode === "portrait" ? "portrait_profile" : "product_profile";
+      const createdOperation = normalizeReverseOperation(await api.createReverseOperation({
+        asset_url: asset.url,
+        target: profileTarget,
+        source_type: "image",
+        ...(visionModelConfigId ? { model_config_id: Number(visionModelConfigId) } : {}),
+        client_request_id: profileRequestId,
+        workspace_snapshot_v2: {
+          ...buildReverseOperationRequestSnapshotV2({
+            creationMode: mode,
+            subjectMode: profileSubjectMode,
+            target: profileTarget,
+            productAsset: asset,
+          }),
+          source_signature: signature,
+          ...(visionModelConfigId ? { model_config_id: Number(visionModelConfigId) } : {}),
+        },
+      }));
+      profileOperationsRef.current[mode] = createdOperation;
+      const settledOperation = await waitForTrackedProfileOperation(createdOperation, {
+        mode,
+        signal: profileAbortController.signal,
+        trackProfileReverseOperation,
+        context: {
+          clientRequestId: profileRequestId,
+          targetSignature: signature,
+          sourceAsset: asset,
+          onUpdate: (operation) => {
+            profileOperationsRef.current[mode] = operation;
+            if (
+              ownerRequest.isCurrent()
+              && isRequestCurrent(productUploadRequestRef, mode, uploadReqId)
+            ) setWorkspacePatch({ profileOperation: operation }, mode);
+          },
+          onSettled: (operation) => {
+            delete profileOperationsRef.current[mode];
+            if (["succeeded", "failed", "canceled"].includes(operation.status)) {
+              clearPendingReverseRequest(pendingProfileReverseRequestRef, profileRequestId);
+            }
+          },
+        },
+      });
+      if (settledOperation.status !== "succeeded") {
+        throw reverseOperationFailure(settledOperation);
+      }
+      const profile = reverseOperationResult(settledOperation);
+      if (!profile) throw new Error("主体档案任务完成但未返回结果");
       const resolvedProfile = normalizeSubjectProfileResult(profile);
       if (
         !ownerRequest.isCurrent()
@@ -191,24 +312,56 @@ export default function useMediaUpload({
         profileRequestId,
         resolvedProfile,
       );
-      setWorkspacePatch({
+      setWorkspacePatch(profileSubjectMode === "portrait" ? {
+        portraitProfile: resolvedProfile,
+        portraitProfileSource: signature,
+        productProfile: null,
+        productProfileSource: "",
+        productProfiling: false,
+        profileOperation: null,
+      } : {
         productProfile: resolvedProfile,
         productProfileSource: signature,
+        portraitProfile: null,
+        portraitProfileSource: "",
         productProfiling: false,
+        profileOperation: null,
       }, mode);
+      delete profileOperationsRef.current[mode];
+      delete profileAbortControllersRef.current[mode];
     } catch (e) {
       if (
         !ownerRequest.isCurrent()
         || !isRequestCurrent(productUploadRequestRef, mode, uploadReqId)
       ) return;
-      if (!isRequestTimeoutError(e) && !shouldKeepPendingReverseRequest(e)) {
+      const keepTracking = shouldKeepPendingReverseRequest(e);
+      if (!isRequestTimeoutError(e) && !keepTracking) {
         clearPendingReverseRequest(pendingProfileReverseRequestRef, profileRequestId);
+      }
+      if (keepTracking) {
+        delete profileAbortControllersRef.current[mode];
+        const activeOperation = profileOperationsRef.current[mode];
+        if (activeOperation) {
+          setWorkspacePatch({
+            productProfiling: true,
+            profileOperation: activeOperation,
+          }, mode);
+          if (isModeVisible(mode)) {
+            setMsg(`${e.message}，可刷新页面继续查看进度。`);
+          }
+        }
+        return;
       }
       setWorkspacePatch({
         productProfile: null,
         productProfileSource: "",
+        portraitProfile: null,
+        portraitProfileSource: "",
         productProfiling: false,
+        profileOperation: null,
       }, mode);
+      delete profileOperationsRef.current[mode];
+      delete profileAbortControllersRef.current[mode];
       if (isModeVisible(mode)) {
         setMsg(
           shouldKeepPendingReverseRequest(e)
@@ -217,6 +370,33 @@ export default function useMediaUpload({
         );
       }
     }
+  }
+
+  async function cancelProfileOperation(mode = creationMode) {
+    const operation = profileOperationsRef.current[mode]
+      || (mode === creationMode ? profileOperation : null);
+    let canceledOperation = null;
+    if (operation?.id && ["queued", "running", "needs_confirmation"].includes(operation.status)) {
+      canceledOperation = await api.cancelReverseOperation(operation.id);
+    }
+    profileAbortControllersRef.current[mode]?.abort();
+    delete profileAbortControllersRef.current[mode];
+    delete profileOperationsRef.current[mode];
+    setWorkspacePatch({ profileOperation: null, productProfiling: false }, mode);
+    return canceledOperation;
+  }
+
+  async function cancelAllProfileOperations() {
+    const entries = Object.entries(profileOperationsRef.current || {});
+    const results = await Promise.allSettled(entries
+      .filter(([, operation]) => operation?.id && ["queued", "running", "needs_confirmation"].includes(operation.status))
+      .map(([, operation]) => api.cancelReverseOperation(operation.id)));
+    const failure = results.find((result) => result.status === "rejected");
+    if (failure) throw failure.reason;
+    Object.values(profileAbortControllersRef.current).forEach((controller) => controller?.abort());
+    profileAbortControllersRef.current = {};
+    profileOperationsRef.current = {};
+    return results;
   }
 
   async function doUploadImage(file) {
@@ -243,7 +423,7 @@ export default function useMediaUpload({
       if (!ownerRequest.isCurrent() || !isRefVersionCurrent(mode, refVersion)) return;
       const { previewUrl, asset } = buildDisplayAsset(uploaded, file);
       rememberUploadedObjectUrl(mode, previewUrl);
-      assignUploadedReferenceAsset(mode, asset);
+      await assignUploadedReferenceAsset(mode, asset);
     } catch (e) {
       if (
         ownerRequest.isCurrent()
@@ -275,8 +455,16 @@ export default function useMediaUpload({
       resetInput(productUploadInputRef);
       return;
     }
-    const reqId = bumpRequest(uploadRequestRef, mode);
+    try {
+      await cancelRecoveredProfileOperation?.(mode);
+      await cancelProfileOperation(mode);
+    } catch (error) {
+      setMsg(error.message || "旧主体档案任务取消失败，已保留当前素材");
+      resetInput(productUploadInputRef);
+      return;
+    }
     const productReqId = bumpRequest(productUploadRequestRef, mode);
+    const reqId = bumpRequest(uploadRequestRef, mode);
     setMsg("");
     setWorkspacePatch({ uploading: true }, mode);
     const uploadRequest = activeUploadRequestsRef.current.capture();
@@ -297,7 +485,10 @@ export default function useMediaUpload({
         productAsset: asset,
         productProfile: null,
         productProfileSource: "",
+        portraitProfile: null,
+        portraitProfileSource: "",
         productProfiling: false,
+        profileOperation: null,
         subjectProtection: null,
         subjectProtectionLoading: true,
         subjectProtectionSource: "",
@@ -315,6 +506,92 @@ export default function useMediaUpload({
       ) {
         setWorkspacePatch({ uploading: false }, mode);
         resetInput(productUploadInputRef);
+      }
+    }
+  }
+
+  async function selectProductAsset(asset) {
+    if (!asset?.url || uploading) return;
+    const ownerRequest = ownerRequestContextRef.current.capture();
+    const mode = creationMode;
+    try {
+      await cancelRecoveredProfileOperation?.(mode);
+      await cancelProfileOperation(mode);
+    } catch (error) {
+      setMsg(error.message || "旧主体档案任务取消失败，已保留当前素材");
+      return;
+    }
+    const productReqId = bumpRequest(productUploadRequestRef, mode);
+    revokeProductObjectUrl(mode);
+    setWorkspacePatch({
+      productAsset: asset,
+      productProfile: null,
+      productProfileSource: "",
+      portraitProfile: null,
+      portraitProfileSource: "",
+      productProfiling: false,
+      profileOperation: null,
+      subjectProtection: null,
+      subjectProtectionLoading: true,
+      subjectProtectionSource: "",
+      variationSource: null,
+    }, mode);
+    setRefOpen(true);
+    prefetchProductProfile(mode, asset, productReqId, ownerRequest);
+  }
+
+  async function doUploadProductDetailImages(fileList) {
+    const files = Array.from(fileList || []);
+    if (!files.length || uploading) return;
+    if (!productAsset?.url) {
+      setMsg("请先选择产品主题图");
+      resetInput(productDetailUploadInputRef);
+      return;
+    }
+    const mode = creationMode;
+    if (files.some((file) => !file.type?.startsWith("image/"))) {
+      setMsg("产品细节图只支持图片文件");
+      resetInput(productDetailUploadInputRef);
+      return;
+    }
+    if (files.some((file) => uploadLimitExceeded(file, "image"))) {
+      resetInput(productDetailUploadInputRef);
+      return;
+    }
+    if (productDetailAssets.length + files.length > MAX_PRODUCT_DETAIL_IMAGES) {
+      setMsg(`产品细节图最多 ${MAX_PRODUCT_DETAIL_IMAGES} 张，当前已有 ${productDetailAssets.length} 张。`);
+      resetInput(productDetailUploadInputRef);
+      return;
+    }
+    const ownerRequest = ownerRequestContextRef.current.capture();
+    const reqId = bumpRequest(uploadRequestRef, mode);
+    setMsg("");
+    setWorkspacePatch({ uploading: true }, mode);
+    const uploadRequest = activeUploadRequestsRef.current.capture();
+    try {
+      const uploadedRows = [];
+      for (const file of files) {
+        const uploaded = await api.uploadImage(file, { signal: uploadRequest.signal });
+        if (!ownerRequest.isCurrent() || !isRequestCurrent(uploadRequestRef, mode, reqId)) return;
+        const { previewUrl, asset } = buildDisplayAsset(uploaded, file);
+        rememberUploadedObjectUrl(mode, previewUrl);
+        uploadedRows.push(asset);
+      }
+      setWorkspacePatch((current) => {
+        const existing = current.productDetailAssets || [];
+        const urls = new Set([current.productAsset?.url, ...existing.map((item) => item?.url)].filter(Boolean));
+        const additions = uploadedRows.filter((item) => item?.url && !urls.has(item.url));
+        if (existing.length + additions.length > MAX_PRODUCT_DETAIL_IMAGES) return current;
+        return { productDetailAssets: [...existing, ...additions] };
+      }, mode);
+      setRefOpen(true);
+    } catch (error) {
+      if (ownerRequest.isCurrent() && isModeVisible(mode)) setMsg(error.message || "产品细节图上传失败");
+    } finally {
+      uploadRequest.release();
+      if (ownerRequest.isCurrent() && isRequestCurrent(uploadRequestRef, mode, reqId)) {
+        setWorkspacePatch({ uploading: false }, mode);
+        resetInput(productDetailUploadInputRef);
       }
     }
   }
@@ -348,7 +625,7 @@ export default function useMediaUpload({
       ) return;
       const { previewUrl, asset } = buildDisplayAsset(uploaded, file, { thumb: uploaded.thumb });
       rememberUploadedObjectUrl(targetMode, previewUrl);
-      assignUploadedReferenceAsset(targetMode, asset);
+      await assignUploadedReferenceAsset(targetMode, asset);
     } catch (e) {
       if (
         ownerRequest.isCurrent()
@@ -368,6 +645,9 @@ export default function useMediaUpload({
   }
 
   function resetOwnerMediaUpload() {
+    Object.values(profileAbortControllersRef.current).forEach((controller) => controller?.abort());
+    profileAbortControllersRef.current = {};
+    profileOperationsRef.current = {};
     activeUploadRequestsRef.current.abortAll();
     ownerRequestContextRef.current.invalidate();
     uploadRequestRef.current = {};
@@ -378,7 +658,15 @@ export default function useMediaUpload({
     revokeProductObjectUrls();
     resetInput(imageUploadInputRef);
     resetInput(productUploadInputRef);
+    resetInput(productDetailUploadInputRef);
     resetInput(videoUploadInputRef);
+  }
+
+  function cancelOwnerProfileOperationsAndReset() {
+    cancelAllProfileOperations().catch((error) => {
+      reportBackgroundError(error, "cancel owner subject profile operations");
+    });
+    resetOwnerMediaUpload();
   }
 
   useEffect(() => () => {
@@ -388,15 +676,21 @@ export default function useMediaUpload({
   return {
     imageUploadInputRef,
     productUploadInputRef,
+    productDetailUploadInputRef,
     videoUploadInputRef,
     bumpUploadRequest: (mode = creationMode) => bumpRequest(uploadRequestRef, mode),
     bumpProductUploadRequest: (mode = creationMode) => bumpRequest(productUploadRequestRef, mode),
     revokeUploadedObjectUrls,
     revokeProductObjectUrl,
     revokeProductObjectUrls,
+    cancelProfileOperation,
+    cancelAllProfileOperations,
+    cancelOwnerProfileOperationsAndReset,
     resetOwnerMediaUpload,
     doUploadImage,
     doUploadProductImage,
+    doUploadProductDetailImages,
+    selectProductAsset,
     doUploadVideo,
   };
 }

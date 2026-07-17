@@ -99,6 +99,7 @@ def _decorate_generation_details(
     out.generation_prompt_text = generation_prompt or None
     out.prompt_text = generation_prompt or request_prompt or None
     out.prompt_text_source = "generation" if generation_prompt else ("request" if request_prompt else None)
+    out.model_name = str(snapshot.get("model_name") or "").strip() or None
     out.model_id = str(snapshot.get("model_id") or gateway_model_id or "").strip() or None
     out.model_provider = str(snapshot.get("provider") or "").strip() or None
     out.prompt_optimizer_model_id = str(

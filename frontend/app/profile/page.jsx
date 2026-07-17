@@ -3,252 +3,263 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { api, clearToken, downloadBlob, loginPath } from "../../lib/api";
-import { redirectOnAuthError, reportBackgroundError, showError } from "../../lib/errorHandling";
-import { localDateRangeToProfileAssetParams } from "../../lib/datetime";
+import { formatLocalDateTime } from "../../lib/datetime";
+import { redirectOnAuthError, reportBackgroundError } from "../../lib/errorHandling";
 import { saveStudioUserDraft } from "../../lib/studioSession";
+import {
+  normalizeUnifiedAsset,
+  normalizeUnifiedAssetPage,
+  unifiedAssetKey,
+} from "../../lib/unifiedAssets";
 import Nav from "../../components/Nav";
 import { useToast } from "../../components/ToastProvider";
 import AssetMedia, {
   assetPreviewSrc,
   assetUnavailableText,
   canDownloadAsset,
-  isAssetTakenDown,
 } from "../../components/AssetMedia";
 import AssetPreviewDialog from "../../components/AssetPreviewDialog";
 import AssetComparePanel from "../../components/AssetComparePanel";
-import GroupedAssetGallery from "../studio/GroupedAssetGallery";
-import { assetVariationSourceUrl, confirmAssetUnlock } from "../studio/assetActions";
+import { assetVariationSourceUrl } from "../studio/assetActions";
 import { STUDIO_VARIATION_DRAFT_KEY } from "../studio/constants";
 
-const PAGE = 30;
-function srcOf(a) {
-  return assetPreviewSrc(a);
+const PAGE_SIZE = 36;
+
+function generatedAssetId(asset) {
+  if (asset?.origin !== "generated") return null;
+  const match = /^g\.(\d+)$/.exec(unifiedAssetKey(asset));
+  return match ? Number(match[1]) : (Number(asset?.id) || null);
+}
+
+function formatBytes(value) {
+  const bytes = Number(value || 0);
+  if (!bytes) return "";
+  if (bytes >= 1024 ** 3) return `${(bytes / 1024 ** 3).toFixed(1)} GB`;
+  if (bytes >= 1024 ** 2) return `${(bytes / 1024 ** 2).toFixed(1)} MB`;
+  return `${Math.max(1, Math.round(bytes / 1024))} KB`;
+}
+
+function formatDuration(value) {
+  const seconds = Number(value);
+  if (!Number.isFinite(seconds) || seconds <= 0) return "";
+  if (seconds < 60) return `${Number.isInteger(seconds) ? seconds : seconds.toFixed(1)} 秒`;
+  const roundedSeconds = Math.round(seconds);
+  const minutes = Math.floor(roundedSeconds / 60);
+  const remainder = roundedSeconds % 60;
+  return `${minutes}:${String(remainder).padStart(2, "0")}`;
+}
+
+function assetMeta(asset) {
+  const width = Number(asset?.width || 0);
+  const height = Number(asset?.height || 0);
+  const dimensions = width > 0 && height > 0 ? `${width}×${height}` : "";
+  const duration = asset?.type === "video" ? formatDuration(asset.duration) : "";
+  const createdAt = asset?.created_at ? formatLocalDateTime(asset.created_at) : "";
+  return [dimensions, duration, createdAt].filter((value) => value && value !== "-").join(" · ");
+}
+
+function downloadFilename(asset) {
+  if (asset?.filename) return asset.filename;
+  const id = generatedAssetId(asset) || "media";
+  return asset?.type === "video" ? `asset-${id}.mp4` : `asset-${id}.png`;
 }
 
 export default function ProfilePage() {
   const router = useRouter();
   const notify = useToast();
   const [me, setMe] = useState(null);
-  const [cfg, setCfg] = useState(null);
-  const [data, setData] = useState(null);
-  const [filter, setFilter] = useState("all");
-  const [assetFilters, setAssetFilters] = useState({
-    created_from: "",
-    created_to: "",
-    model_use: "",
-    size: "",
-  });
+  const [profile, setProfile] = useState(null);
+  const [filters, setFilters] = useState({ origin: "all", type: "all", favorite: false, retention: "all" });
   const [assets, setAssets] = useState(null);
+  const [stats, setStats] = useState(null);
+  const [total, setTotal] = useState(0);
+  const [nextCursor, setNextCursor] = useState(null);
   const [loading, setLoading] = useState(false);
-  const reqRef = useRef(0);
-  const loadingRef = useRef(false);
-  const assetsRef = useRef([]);
-  const [hasMore, setHasMore] = useState(false);
   const [lightbox, setLightbox] = useState(null);
   const [msg, setMsg] = useState("");
-  const [busyAssetIds, setBusyAssetIds] = useState(() => new Set());
-  const busyAssetIdsRef = useRef(new Set());
-  const [selectedIds, setSelectedIds] = useState(() => new Set());
-  const [batchDownloading, setBatchDownloading] = useState(false);
-
-  // change password
+  const [busyRefs, setBusyRefs] = useState(() => new Set());
+  const [selectedRefs, setSelectedRefs] = useState(() => new Set());
+  const [uploading, setUploading] = useState("");
   const [pwOpen, setPwOpen] = useState(false);
   const [oldPw, setOldPw] = useState("");
   const [newPw, setNewPw] = useState("");
   const [pwMsg, setPwMsg] = useState("");
+  const requestRef = useRef(0);
+  const assetsRef = useRef([]);
+  const loadingRef = useRef(false);
+  const imageInputRef = useRef(null);
+  const videoInputRef = useRef(null);
 
   useEffect(() => {
-    api.me().then(setMe).catch((e) => redirectOnAuthError(e, router, setMsg, "profile session probe"));
-    api.config().then(setCfg).catch((e) => showError(setMsg, e, "加载素材配置失败"));
-    api.profile().then(setData).catch((e) => setMsg(e.message));
+    api.me().then(setMe).catch((error) => redirectOnAuthError(error, router, setMsg, "profile session probe"));
+    api.profile().then(setProfile).catch((error) => reportBackgroundError(error, "load profile summary"));
   }, []);
 
   useEffect(() => {
     loadAssets(true);
-  }, [filter, assetFilters.created_from, assetFilters.created_to, assetFilters.model_use, assetFilters.size]);
+  }, [filters.origin, filters.type, filters.favorite, filters.retention]);
 
   useEffect(() => {
     if (!assets) return;
-    const visibleIds = new Set(assets.map((asset) => asset.id));
-    setSelectedIds((prev) => {
-      const next = new Set([...prev].filter((id) => visibleIds.has(id)));
-      return next.size === prev.size ? prev : next;
-    });
+    const visible = new Set(assets.map(unifiedAssetKey));
+    setSelectedRefs((current) => new Set([...current].filter((ref) => visible.has(ref))));
   }, [assets]);
 
-  function paramsFor(f) {
-    const base = {
-      ...assetFilters,
-      ...localDateRangeToProfileAssetParams(assetFilters.created_from, assetFilters.created_to),
-    };
-    if (f === "fav") return { ...base, favorite: true };
-    if (f === "image" || f === "video") return { ...base, type: f };
-    return base;
-  }
-
-  async function loadAssets(reset) {
-    if (loadingRef.current && !reset) return;  // block double load-more; a filter reset may interrupt
+  async function loadAssets(reset = false) {
+    if (loadingRef.current && !reset) return;
     loadingRef.current = true;
     setLoading(true);
     setMsg("");
-    if (reset) {
-      if (!assetsRef.current.length) setAssets(null);
-      setHasMore(false);
-      setSelectedIds(new Set());
-    }
-    const myReq = ++reqRef.current;  // newest request wins; stale pages are dropped
-    const currentAssets = reset ? [] : (assetsRef.current || []);
-    const off = reset ? 0 : currentAssets.length;
+    const requestId = ++requestRef.current;
+    const current = reset ? [] : (assetsRef.current || []);
+    if (reset && !current.length) setAssets(null);
     try {
-      const list = await api.profileAssets({ ...paramsFor(filter), limit: PAGE, offset: off });
-      if (myReq !== reqRef.current) return;  // superseded (filter switch / refresh)
-      const seen = new Set(currentAssets.map((asset) => asset.id));
-      const merged = reset ? [] : [...currentAssets];
-      for (const item of list) {
-        if (!seen.has(item.id)) {
-          seen.add(item.id);
-          merged.push(item);
+      const payload = await api.meAssets({
+        origin: filters.origin,
+        type: filters.type,
+        favorite: filters.favorite ? true : "",
+        retention: filters.retention,
+        limit: PAGE_SIZE,
+        cursor: reset ? "" : nextCursor,
+        offset: 0,
+      });
+      if (requestId !== requestRef.current) return;
+      const page = normalizeUnifiedAssetPage(payload);
+      const seen = new Set(current.map(unifiedAssetKey));
+      const merged = reset ? [] : [...current];
+      for (const asset of page.items) {
+        const ref = unifiedAssetKey(asset);
+        if (!seen.has(ref)) {
+          seen.add(ref);
+          merged.push(asset);
         }
       }
       assetsRef.current = merged;
       setAssets(merged);
-      setHasMore(list.length === PAGE);
-    } catch (e) {
-      if (myReq === reqRef.current) {
-        setMsg(e.message);
-        notify.error(e.message || "作品加载失败，已保留当前列表");
+      setStats(page.stats);
+      setTotal(page.total);
+      setNextCursor(page.nextCursor || null);
+    } catch (error) {
+      if (requestId === requestRef.current) {
+        setMsg(error.message || "资产加载失败");
+        notify.error(error.message || "资产加载失败，已保留当前列表");
       }
     } finally {
-      if (myReq === reqRef.current) {
+      if (requestId === requestRef.current) {
         loadingRef.current = false;
         setLoading(false);
       }
     }
   }
 
-  function patchAsset(updated) {
-    const removedFromCurrentView = filter === "fav" && updated.favorite === false;
-    setAssets((prev) => {
-      const list = prev || [];
-      if (removedFromCurrentView) {
-        const next = list.filter((x) => x.id !== updated.id);
-        assetsRef.current = next;
-        return next;
-      }
-      const next = list.map((x) => (x.id === updated.id ? updated : x));
+  function patchAssets(refs, patch) {
+    const targets = new Set(refs);
+    const apply = (list) => (list || []).map((asset) => (
+      targets.has(unifiedAssetKey(asset)) ? normalizeUnifiedAsset({ ...asset, ...patch }) : asset
+    ));
+    setAssets((current) => {
+      const next = apply(current);
       assetsRef.current = next;
       return next;
     });
-    if (removedFromCurrentView) {
-      setSelectedIds((prev) => {
-        if (!prev.has(updated.id)) return prev;
-        const next = new Set(prev);
-        next.delete(updated.id);
+    setLightbox((current) => (
+      current && targets.has(unifiedAssetKey(current))
+        ? normalizeUnifiedAsset({ ...current, ...patch })
+        : current
+    ));
+  }
+
+  async function withBusy(refs, action) {
+    const keys = [...new Set(refs)].filter(Boolean);
+    if (!keys.length || keys.some((ref) => busyRefs.has(ref))) return;
+    setBusyRefs((current) => new Set([...current, ...keys]));
+    try {
+      await action();
+    } finally {
+      setBusyRefs((current) => {
+        const next = new Set(current);
+        keys.forEach((ref) => next.delete(ref));
         return next;
       });
     }
-    if (lightbox && lightbox.id === updated.id) setLightbox(updated);
   }
 
-  async function withAssetBusy(assetId, fn) {
-    if (busyAssetIdsRef.current.has(assetId)) return;
-    busyAssetIdsRef.current.add(assetId);
-    setBusyAssetIds(new Set(busyAssetIdsRef.current));
-    try {
-      await fn();
-    } finally {
-      busyAssetIdsRef.current.delete(assetId);
-      setBusyAssetIds(new Set(busyAssetIdsRef.current));
-    }
-  }
-
-  async function unlock(asset) {
-    if (isAssetTakenDown(asset)) {
-      setMsg("素材已下架，不能继续解锁。");
-      notify.warn("素材已下架，不能继续解锁。");
-      return;
-    }
-    if (!confirmAssetUnlock(asset, me, cfg)) return;
-    await withAssetBusy(asset.id, async () => {
+  async function updateMetadata(refs, patch) {
+    await withBusy(refs, async () => {
       try {
-        patchAsset(await api.unlock(asset.id));
-        notify.success("素材已解锁。");
-        api.me().then(setMe).catch((e) => reportBackgroundError(e, "refresh current user after unlock"));
-        api.profile().then(setData).catch((e) => reportBackgroundError(e, "refresh profile after unlock"));
-      } catch (e) {
-        setMsg(e.message);
-        notify.error(e.message || "解锁失败");
+        const targetRefs = new Set(refs);
+        const visibleTargets = (assetsRef.current || []).filter((asset) => (
+          targetRefs.has(unifiedAssetKey(asset))
+        ));
+        const retainedDelta = Object.hasOwn(patch, "retained")
+          ? visibleTargets.reduce((delta, asset) => (
+            Boolean(asset.retained) === Boolean(patch.retained)
+              ? delta
+              : delta + (patch.retained ? 1 : -1)
+          ), 0)
+          : 0;
+        const favoriteDelta = Object.hasOwn(patch, "favorite")
+          ? visibleTargets.reduce((delta, asset) => (
+            Boolean(asset.favorite) === Boolean(patch.favorite)
+              ? delta
+              : delta + (patch.favorite ? 1 : -1)
+          ), 0)
+          : 0;
+        await api.updateMeAssetMetadata({ asset_refs: refs, ...patch });
+        patchAssets(refs, patch);
+        if (retainedDelta || favoriteDelta) {
+          setStats((current) => current ? {
+            ...current,
+            retained: Math.max(0, Number(current.retained || 0) + retainedDelta),
+            favorites: Math.max(0, Number(current.favorites || 0) + favoriteDelta),
+          } : current);
+        }
+        if (filters.favorite && patch.favorite === false) await loadAssets(true);
+        if (filters.retention !== "all" && Object.hasOwn(patch, "retained")) await loadAssets(true);
+        notify.success(Object.hasOwn(patch, "favorite")
+          ? (patch.favorite ? "已收藏。" : "已取消收藏。")
+          : (patch.retained ? "已设为长期保留。" : "已恢复默认保留策略。"));
+      } catch (error) {
+        setMsg(error.message || "资产更新失败");
+        notify.error(error.message || "资产更新失败");
       }
     });
   }
 
-  async function toggleFav(asset) {
-    if (isAssetTakenDown(asset)) {
-      setMsg("素材已下架，不能继续收藏。");
-      notify.warn("素材已下架，不能继续收藏。");
-      return;
-    }
-    await withAssetBusy(asset.id, async () => {
+  async function deleteRefs(refs) {
+    if (!refs.length || !window.confirm(`确认删除选中的 ${refs.length} 个资产？删除后不可恢复。`)) return;
+    await withBusy(refs, async () => {
       try {
-        const updated = await api.favoriteAsset(asset.id);
-        patchAsset(updated);
-        notify.success(updated.favorite ? "已收藏。" : "已取消收藏。");
-      } catch (e) {
-        setMsg(e.message);
-        notify.error(e.message || "收藏操作失败");
-      }
-    });
-  }
-
-  async function del(asset) {
-    const label = asset.type === "video" ? "视频" : "图片";
-    if (!window.confirm(`确认删除这条${label}素材？删除后不可恢复。`)) return;
-    await withAssetBusy(asset.id, async () => {
-      try {
-        await api.deleteAsset(asset.id);
-        setAssets((prev) => {
-          const next = (prev || []).filter((x) => x.id !== asset.id);
-          assetsRef.current = next;
-          return next;
-        });
-        setSelectedIds((prev) => {
-          if (!prev.has(asset.id)) return prev;
-          const next = new Set(prev);
-          next.delete(asset.id);
-          return next;
-        });
-        if (lightbox && lightbox.id === asset.id) setLightbox(null);
-        notify.success("素材已删除。");
-        api.profile().then(setData).catch((e) => reportBackgroundError(e, "refresh profile after delete"));
-      } catch (e) {
-        setMsg(e.message);
-        notify.error(e.message || "删除失败");
+        const response = await api.batchDeleteMeAssets(refs);
+        const deletedRefs = new Set(response?.asset_refs || response?.deleted || refs);
+        const next = (assetsRef.current || []).filter((asset) => !deletedRefs.has(unifiedAssetKey(asset)));
+        assetsRef.current = next;
+        setAssets(next);
+        setSelectedRefs((current) => new Set([...current].filter((ref) => !deletedRefs.has(ref))));
+        setLightbox((current) => current && deletedRefs.has(unifiedAssetKey(current)) ? null : current);
+        notify.success(`已删除 ${deletedRefs.size} 个资产。`);
+        await loadAssets(true);
+      } catch (error) {
+        setMsg(error.message || "删除失败");
+        notify.error(error.message || "删除失败；正在被草稿或任务使用的资产不能删除");
       }
     });
   }
 
   async function download(asset) {
-    if (isAssetTakenDown(asset)) {
-      setMsg("素材已下架，不能继续下载。");
-      notify.warn("素材已下架，不能继续下载。");
-      return;
-    }
+    const ref = unifiedAssetKey(asset);
     if (!canDownloadAsset(asset)) {
-      setMsg("请先解锁后再下载。");
-      notify.warn("请先解锁后再下载。");
+      notify.warn(asset.origin === "generated" ? "请先解锁后再下载。" : "当前资产不可下载。");
       return;
     }
-    await withAssetBusy(asset.id, async () => {
+    await withBusy([ref], async () => {
       try {
-        const filename = await downloadBlob(
-          `/api/assets/${asset.id}/download`,
-          asset.type === "video" ? `asset-${asset.id}.mp4` : undefined,
-        );
-        setMsg(`已开始下载 ${filename}`);
+        const path = asset.download_url || `/api/me/assets/download?asset_ref=${encodeURIComponent(ref)}`;
+        const filename = await downloadBlob(path, downloadFilename(asset));
         notify.success(`已开始下载 ${filename}`);
-      } catch (e) {
-        setMsg(e.message);
-        notify.error(e.message || "下载失败");
+      } catch (error) {
+        setMsg(error.message || "下载失败");
+        notify.error(error.message || "下载失败");
       }
     });
   }
@@ -256,347 +267,201 @@ export default function ProfilePage() {
   function createVariation(asset) {
     const sourceUrl = assetVariationSourceUrl(asset);
     if (!sourceUrl) {
-      setMsg("当前图片暂不可作为变体来源，请确认预览可用后再试。");
-      notify.warn("当前图片暂不可作为变体来源，请确认预览可用后再试。");
+      notify.warn("当前图片暂不可作为变体来源。");
       return;
     }
-    try {
-      const saved = saveStudioUserDraft(window.localStorage, STUDIO_VARIATION_DRAFT_KEY, me?.id, {
-        asset: {
-          ...asset,
-          type: "image",
-          url: sourceUrl,
-          thumb: asset.preview_url || asset.thumb || sourceUrl,
-        },
-        prompt: "基于这张图生成同主体、同构图、同光线和同广告质感的近似变体；保留主体结构、产品文字、Logo、比例和核心视觉，只做轻微差异化。",
-      });
-      if (!saved) throw new Error("无法保存当前用户的变体草稿");
-      router.push("/");
-    } catch (e) {
-      setMsg(e.message || "创建变体草稿失败");
-      notify.error(e.message || "创建变体草稿失败");
-    }
-  }
-
-  function toggleSelected(assetId) {
-    setSelectedIds((prev) => {
-      const next = new Set(prev);
-      if (next.has(assetId)) next.delete(assetId);
-      else next.add(assetId);
-      return next;
+    const saved = saveStudioUserDraft(window.localStorage, STUDIO_VARIATION_DRAFT_KEY, me?.id, {
+      asset: { ...asset, type: "image", url: sourceUrl, thumb: asset.preview_url || asset.thumb || sourceUrl },
+      prompt: "基于这张图生成同主体、同构图、同光线和同广告质感的近似变体；保留主体结构、产品文字、Logo、比例和核心视觉，只做轻微差异化。",
     });
-  }
-
-  async function batchDelete() {
-    const visibleIds = new Set((assetsRef.current || []).map((asset) => asset.id));
-    const ids = [...selectedIds].filter((id) => visibleIds.has(id));
-    if (!ids.length) return;
-    if (!window.confirm(`确认删除选中的 ${ids.length} 个素材？删除后不可恢复。`)) return;
-    setMsg("");
-    try {
-      const res = await api.batchDeleteAssets(ids);
-      const deleted = new Set(res.deleted || []);
-      setAssets((prev) => {
-        const next = (prev || []).filter((x) => !deleted.has(x.id));
-        assetsRef.current = next;
-        return next;
-      });
-      setSelectedIds(new Set());
-      api.profile().then(setData).catch((e) => reportBackgroundError(e, "refresh profile after batch action"));
-      const failed = res.failed?.length || 0;
-      const text = failed ? `已删除 ${deleted.size} 个，${failed} 个删除失败。` : `已删除 ${deleted.size} 个素材。`;
-      setMsg(text);
-      notify.success(text);
-    } catch (e) {
-      setMsg(e.message);
-      notify.error(e.message || "批量删除失败");
-    }
-  }
-
-  async function batchDownload() {
-    const selectedAssets = (assetsRef.current || []).filter((asset) => selectedIds.has(asset.id));
-    const downloadable = selectedAssets.filter(canDownloadAsset);
-    const skipped = selectedAssets.length - downloadable.length;
-    const ids = downloadable.map((asset) => asset.id);
-    if (!selectedAssets.length || batchDownloading) return;
-    if (!ids.length) {
-      setMsg("选中的素材都未解锁或已下架，无法批量下载。");
-      notify.warn("选中的素材都未解锁或已下架，无法批量下载。");
+    if (!saved) {
+      notify.error("创建变体草稿失败");
       return;
     }
+    router.push("/");
+  }
+
+  async function uploadFile(file, type) {
+    if (!file || uploading) return;
+    setUploading(type);
     setMsg("");
-    setBatchDownloading(true);
     try {
-      const filename = await api.batchDownloadAssets(ids);
-      const text = skipped ? `已开始下载 ${filename}，已跳过 ${skipped} 个未解锁或已下架素材。` : `已开始下载 ${filename}`;
-      setMsg(text);
-      notify.success(text);
-    } catch (e) {
-      setMsg(e.message);
-      notify.error(e.message || "批量下载失败");
+      if (type === "image") await api.uploadImage(file);
+      else await api.uploadVideo(file);
+      notify.success(`${type === "image" ? "图片" : "视频"}已加入我的资产。`);
+      setFilters((current) => ({ ...current, origin: "all", type }));
+      await loadAssets(true);
+    } catch (error) {
+      setMsg(error.message || "上传失败");
+      notify.error(error.message || "上传失败");
     } finally {
-      setBatchDownloading(false);
+      setUploading("");
+      if (imageInputRef.current) imageInputRef.current.value = "";
+      if (videoInputRef.current) videoInputRef.current.value = "";
     }
   }
 
   async function changePassword() {
     setPwMsg("");
-    if (newPw.length < 6) {
-      notify.warn("新密码至少 6 位");
-      return setPwMsg("新密码至少 6 位");
-    }
+    if (newPw.length < 6) return setPwMsg("新密码至少 6 位");
     try {
       await api.changePassword(oldPw, newPw);
       clearToken();
       router.push(loginPath());
-    } catch (e) { setPwMsg(e.message); }
+    } catch (error) {
+      setPwMsg(error.message);
+    }
   }
 
-  const u = data?.user || me;
-  const initial = (u?.nickname || u?.phone || "?").slice(-2);
-  const visibleSelectedCount = (assets || []).filter((asset) => selectedIds.has(asset.id)).length;
-  const compareSelection = selectedIds;
-  const compareAssets = useMemo(
-    () => (assets || []).filter((asset) => compareSelection.has(asset.id)).slice(0, 4),
+  function toggleSelected(ref) {
+    setSelectedRefs((current) => {
+      const next = new Set(current);
+      if (next.has(ref)) next.delete(ref);
+      else next.add(ref);
+      return next;
+    });
+  }
+
+  const user = profile?.user || me;
+  const compareSelection = selectedRefs;
+  const selectedAssets = useMemo(
+    () => (assets || []).filter((asset) => compareSelection.has(unifiedAssetKey(asset))),
     [assets, compareSelection],
   );
+  const compareAssets = selectedAssets.slice(0, 4);
+  const hasMore = Boolean(nextCursor);
 
-  function renderAssetCard(a) {
-    const src = srcOf(a);
-    const busy = busyAssetIds.has(a.id);
-    const takenDown = isAssetTakenDown(a);
+  function renderAsset(asset) {
+    const ref = unifiedAssetKey(asset);
+    const selected = selectedRefs.has(ref);
+    const busy = busyRefs.has(ref);
+    const preview = assetPreviewSrc(asset);
+    const metadata = assetMeta(asset);
     return (
-      <div className={`group relative flex h-full flex-col overflow-hidden rounded-xl2 border bg-base2 ${selectedIds.has(a.id) ? "border-brand" : "border-line"}`}>
-        <label className="absolute right-2 top-2 z-10 flex h-7 w-7 cursor-pointer items-center justify-center rounded-full border border-white/20 bg-black/55">
-          <input
-            type="checkbox"
-            checked={selectedIds.has(a.id)}
-            onChange={() => toggleSelected(a.id)}
-            className="h-3.5 w-3.5 accent-brand"
-            aria-label={`选择素材 #${a.id}`}
-          />
-        </label>
-        <button
-          onClick={() => setLightbox(a)}
-          aria-label={`预览${a.type === "video" ? "视频" : "图片"}素材 #${a.id}`}
-          className="relative block aspect-[4/5] w-full cursor-zoom-in overflow-hidden bg-black/20"
-        >
-          {!src ? (
-            <div className="absolute inset-0 flex h-full w-full items-center justify-center px-3 text-center text-xs text-fog">
-              {assetUnavailableText(a)}
-            </div>
-          ) : (
-            <AssetMedia
-              asset={a}
-              className="absolute inset-0 h-full w-full object-contain transition duration-300 group-hover:scale-[1.04]"
-              fallbackClassName="absolute inset-0 flex h-full w-full items-center justify-center px-3 text-center text-xs text-fog"
-            />
-          )}
-          <span className="badge absolute left-2 top-2 bg-black/60 text-white">
-            {a.type === "video" ? "视频" : "图片"}
-          </span>
-          {takenDown && <span className="badge absolute right-2 bottom-2 bg-bad/80 text-white">已下架</span>}
-          {a.days_left != null && (
-            <span className="badge absolute bottom-2 left-2 bg-black/60 text-fog">{a.days_left} 天后过期</span>
-          )}
-        </button>
-        <div className="mt-auto flex items-center justify-between gap-1 p-2">
-          <div className="flex items-center gap-2">
-            <button
-              onClick={() => toggleFav(a)}
-              disabled={busy || takenDown}
-              title={takenDown ? "素材已下架" : "收藏"}
-              aria-label={`${a.favorite ? "取消收藏" : "收藏"}素材 #${a.id}`}
-              className={`text-base leading-none transition disabled:opacity-50 ${a.favorite ? "text-rose" : "text-fog hover:text-snow"}`}>
-              {a.favorite ? "★" : "☆"}
-            </button>
-            <button
-              onClick={() => del(a)}
-              disabled={busy}
-              title="删除"
-              aria-label={`删除${a.type === "video" ? "视频" : "图片"}素材 #${a.id}`}
-              className="text-fog transition hover:text-bad disabled:opacity-50">🗑</button>
+      <article key={ref} className={`group overflow-hidden rounded-xl2 border bg-base2 ${selected ? "border-brand ring-1 ring-brand/30" : "border-line"}`}>
+        <div className="relative aspect-[4/5] overflow-hidden bg-black/20">
+          <button type="button" onClick={() => setLightbox(asset)} className="absolute inset-0 w-full cursor-zoom-in" aria-label={`预览${asset.type === "video" ? "视频" : "图片"}`}>
+            {preview ? (
+              <AssetMedia asset={asset} className="h-full w-full object-contain transition duration-200 group-hover:scale-[1.03]" fallbackClassName="flex h-full items-center justify-center text-xs text-fog" />
+            ) : (
+              <span className="flex h-full items-center justify-center px-4 text-xs text-fog">{assetUnavailableText(asset)}</span>
+            )}
+          </button>
+          <label className="absolute right-2 top-2 z-10 flex h-7 w-7 cursor-pointer items-center justify-center rounded-full border border-white/25 bg-black/65">
+            <input type="checkbox" checked={selected} onChange={() => toggleSelected(ref)} className="h-3.5 w-3.5 accent-brand" aria-label="选择资产" />
+          </label>
+          <div className="pointer-events-none absolute left-2 top-2 flex flex-wrap gap-1">
+            <span className="badge bg-black/70 text-white">{asset.origin === "uploaded" ? "上传" : "生成"}</span>
+            <span className="badge bg-black/70 text-white">{asset.type === "video" ? "视频" : "图片"}</span>
           </div>
-          {takenDown ? (
-            <span className="btn-secondary btn-sm cursor-not-allowed opacity-60">已下架</span>
-          ) : (
-            <div className="flex gap-1.5">
-              {a.type === "image" && (
-                <button onClick={() => createVariation(a)} disabled={busy} className="btn-secondary btn-sm">
-                  变体
-                </button>
-              )}
-              {a.unlocked ? (
-                <button
-                  onClick={() => download(a)}
-                  disabled={busy || !canDownloadAsset(a)}
-                  className={canDownloadAsset(a) ? "btn-primary btn-sm" : "btn-secondary btn-sm cursor-not-allowed opacity-70"}
-                >
-                  {busy ? "处理中…" : "下载"}
-                </button>
-              ) : (
-                <button onClick={() => unlock(a)} disabled={busy} className="btn-secondary btn-sm">解锁</button>
-              )}
-            </div>
-          )}
+          <div className="pointer-events-none absolute bottom-2 left-2 flex flex-wrap gap-1">
+            {asset.retained && <span className="badge bg-aqua/90 text-black">长期保留</span>}
+            {!asset.retained && asset.days_left != null && <span className="badge bg-black/70 text-white">{asset.days_left} 天后过期</span>}
+          </div>
         </div>
-      </div>
+        <div className="space-y-2 p-3">
+          <div className="flex min-w-0 items-center justify-between gap-2 text-xs text-fog">
+            <span className="truncate">{asset.filename || (asset.origin === "uploaded" ? "上传素材" : `生成资产 ${generatedAssetId(asset) || ""}`)}</span>
+            {asset.bytes ? <span className="shrink-0">{formatBytes(asset.bytes)}</span> : null}
+          </div>
+          {metadata && <p className="truncate text-[11px] text-fog">{metadata}</p>}
+          <div className="flex items-center justify-between gap-2">
+            <div className="flex gap-1">
+              <button type="button" onClick={() => updateMetadata([ref], { favorite: !asset.favorite })} disabled={busy} className="btn-ghost btn-sm" aria-label={asset.favorite ? "取消收藏" : "收藏"} title={asset.favorite ? "取消收藏" : "收藏"}>{asset.favorite ? "★" : "☆"}</button>
+              <button type="button" onClick={() => updateMetadata([ref], { retained: !asset.retained })} disabled={busy} className="btn-ghost btn-sm" title={asset.retained ? "取消长期保留" : "长期保留"}>{asset.retained ? "取消保留" : "保留"}</button>
+              <button type="button" onClick={() => deleteRefs([ref])} disabled={busy} className="btn-ghost btn-sm text-bad" title="删除">删除</button>
+            </div>
+            <div className="flex gap-1">
+              {asset.type === "image" && <button type="button" onClick={() => createVariation(asset)} disabled={busy} className="btn-secondary btn-sm">变体</button>}
+              <button type="button" onClick={() => download(asset)} disabled={busy || !canDownloadAsset(asset)} className="btn-primary btn-sm">{busy ? "处理中" : "下载"}</button>
+            </div>
+          </div>
+        </div>
+      </article>
     );
   }
 
   return (
     <div className="min-h-screen">
       <Nav me={me} active="profile" />
-      <main className="mx-auto max-w-5xl px-4 pb-24 pt-10 sm:px-6">
-        {/* header */}
-        <div className="card mb-6 p-6 animate-fadeup sm:p-7">
-          <div className="flex flex-wrap items-center gap-4">
-            <span className="flex h-16 w-16 shrink-0 items-center justify-center rounded-full bg-brand text-xl font-display font-semibold text-white shadow-glow-sm">
-              {initial}
-            </span>
-            <div className="min-w-0">
-              <div className="flex items-center gap-2">
-                <h1 className="truncate text-2xl font-bold">{u?.nickname || u?.phone || "我的主页"}</h1>
-                {u?.is_admin && <span className="badge border border-iris/30 bg-iris/15 text-iris-400">admin</span>}
-              </div>
-              <p className="mt-1 text-sm text-mist">{u?.phone}{u?.department ? ` · ${u.department}` : ""}</p>
+      <main className="mx-auto max-w-7xl px-4 pb-24 pt-8 sm:px-6">
+        <section className="mb-7 border-b border-line pb-6">
+          <div className="flex flex-wrap items-start justify-between gap-4">
+            <div>
+              <h1 className="text-2xl font-display font-bold text-snow">我的资产</h1>
+              <p className="mt-1 text-sm text-fog">统一管理生成作品和上传素材，也可在创作时直接复用。</p>
             </div>
-            <div className="ml-auto flex flex-col items-end gap-2">
-              <div className="rounded-xl2 border border-iris/30 bg-iris/10 px-4 py-2 text-right">
-                <div className="font-display text-2xl font-bold text-grad">{u?.balance_credits ?? "—"}</div>
-                <div className="text-xs text-fog">可用额度{u?.frozen_credits ? ` · 冻结 ${u.frozen_credits}` : ""}</div>
-              </div>
-              <div className="flex gap-2">
-                <a href="/recharge" className="btn-primary btn-sm">充值积分</a>
-                <button onClick={() => setPwOpen(!pwOpen)} className="btn-ghost btn-sm">修改密码</button>
-              </div>
+            <div className="flex flex-wrap gap-2">
+              <input ref={imageInputRef} type="file" accept="image/*" className="hidden" onChange={(event) => uploadFile(event.target.files?.[0], "image")} />
+              <input ref={videoInputRef} type="file" accept="video/*" className="hidden" onChange={(event) => uploadFile(event.target.files?.[0], "video")} />
+              <button type="button" onClick={() => imageInputRef.current?.click()} disabled={Boolean(uploading)} className="btn-secondary btn-sm">{uploading === "image" ? "上传中…" : "上传图片"}</button>
+              <button type="button" onClick={() => videoInputRef.current?.click()} disabled={Boolean(uploading)} className="btn-primary btn-sm">{uploading === "video" ? "上传中…" : "上传视频"}</button>
+              <button type="button" onClick={() => setPwOpen((open) => !open)} className="btn-ghost btn-sm">账户设置</button>
             </div>
           </div>
 
           {pwOpen && (
-            <div className="mt-5 flex flex-wrap items-center gap-2 border-t border-line pt-5 animate-fadeup">
-              <input type="password" className="input w-44" placeholder="原密码"
-                value={oldPw} onChange={(e) => setOldPw(e.target.value)} />
-              <input type="password" className="input w-44" placeholder="新密码(≥6 位)"
-                value={newPw} onChange={(e) => setNewPw(e.target.value)} />
-              <button onClick={changePassword} className="btn-primary btn-sm">确认修改</button>
-              <span className="text-xs text-fog">修改后需重新登录</span>
+            <div className="mt-4 flex flex-wrap items-center gap-2 border-t border-line pt-4">
+              <span className="mr-2 text-sm text-mist">{user?.nickname || user?.phone || "当前账户"}</span>
+              <input type="password" className="input w-40" placeholder="原密码" value={oldPw} onChange={(event) => setOldPw(event.target.value)} />
+              <input type="password" className="input w-40" placeholder="新密码(≥6 位)" value={newPw} onChange={(event) => setNewPw(event.target.value)} />
+              <button type="button" onClick={changePassword} className="btn-primary btn-sm">确认修改</button>
               {pwMsg && <span className="text-sm text-bad">{pwMsg}</span>}
             </div>
           )}
 
-          {data && (
-            <div className="mt-6 grid grid-cols-2 gap-3 sm:grid-cols-4">
-              <Stat label="图片" value={data.stats.images} />
-              <Stat label="视频" value={data.stats.videos} />
-              <Stat label="已解锁" value={data.stats.unlocked} />
-              <Stat label="任务" value={data.stats.tasks} />
-            </div>
-          )}
-          <p className="mt-5 text-xs text-fog">
-            生成的素材默认保留 <b className="text-mist">{data?.retention_days ?? 30}</b> 天，过期后自动清理，请及时下载需要的素材。
-          </p>
-        </div>
+          <div className="mt-5 grid grid-cols-2 gap-2 sm:grid-cols-3 lg:grid-cols-6">
+            <Stat label="全部" value={total} />
+            <Stat label="生成" value={stats?.generated ?? "—"} />
+            <Stat label="上传" value={stats?.uploaded ?? "—"} />
+            <Stat label="图片" value={stats?.images ?? "—"} />
+            <Stat label="视频" value={stats?.videos ?? "—"} />
+            <Stat label="长期保留" value={stats?.retained ?? "—"} />
+          </div>
+        </section>
 
-        {/* filter */}
-        <div className="mb-5 inline-flex gap-1 rounded-full border border-line bg-white/5 p-1">
-          {[["all", "全部"], ["image", "图片"], ["video", "视频"], ["fav", "收藏"]].map(([k, label]) => (
-            <button key={k} onClick={() => setFilter(k)}
-              className={filter === k ? "chip chip-active" : "chip"}>
-              {label}
-            </button>
-          ))}
-        </div>
+        <section className="mb-5 flex flex-wrap items-center gap-2 border-b border-line pb-4" aria-label="资产筛选">
+          <FilterSelect label="来源" value={filters.origin} onChange={(origin) => setFilters((current) => ({ ...current, origin }))} options={[["all", "全部来源"], ["uploaded", "我的上传"], ["generated", "生成作品"]]} />
+          <FilterSelect label="类型" value={filters.type} onChange={(type) => setFilters((current) => ({ ...current, type }))} options={[["all", "全部类型"], ["image", "图片"], ["video", "视频"]]} />
+          <FilterSelect label="保留" value={filters.retention} onChange={(retention) => setFilters((current) => ({ ...current, retention }))} options={[["all", "全部策略"], ["retained", "长期保留"], ["expiring", "默认保留"]]} />
+          <label className="chip cursor-pointer gap-2 px-3 py-2">
+            <input type="checkbox" checked={filters.favorite} onChange={(event) => setFilters((current) => ({ ...current, favorite: event.target.checked }))} className="h-3.5 w-3.5 accent-brand" />
+            仅收藏
+          </label>
+          <span className="ml-auto text-xs text-fog">默认资产按平台保留策略过期；收藏不等于长期保留。</span>
+        </section>
 
-        <div className="mb-5 grid gap-2 rounded-xl2 border border-line bg-white/[0.03] p-3 sm:grid-cols-[1fr_1fr_auto_auto_auto]">
-          <input
-            type="date"
-            className="input px-3 py-2 text-xs"
-            value={assetFilters.created_from}
-            onChange={(e) => setAssetFilters((v) => ({ ...v, created_from: e.target.value }))}
-            aria-label="开始日期"
-          />
-          <input
-            type="date"
-            className="input px-3 py-2 text-xs"
-            value={assetFilters.created_to}
-            onChange={(e) => setAssetFilters((v) => ({ ...v, created_to: e.target.value }))}
-            aria-label="结束日期"
-          />
-          <select
-            className="input px-3 py-2 text-xs"
-            value={assetFilters.model_use}
-            onChange={(e) => setAssetFilters((v) => ({ ...v, model_use: e.target.value }))}
-            aria-label="模型类型"
-          >
-            <option value="">全部模型</option>
-            <option value="image">图片模型</option>
-            <option value="video">视频模型</option>
-          </select>
-          <select
-            className="input px-3 py-2 text-xs"
-            value={assetFilters.size}
-            onChange={(e) => setAssetFilters((v) => ({ ...v, size: e.target.value }))}
-            aria-label="画面比例"
-          >
-            <option value="">全部比例</option>
-            <option value="portrait">竖图</option>
-            <option value="landscape">横图</option>
-            <option value="square">方图</option>
-          </select>
-          <button
-            onClick={() => setAssetFilters({ created_from: "", created_to: "", model_use: "", size: "" })}
-            className="btn-secondary btn-sm"
-          >
-            重置筛选
-          </button>
-        </div>
-
-        {visibleSelectedCount > 0 && (
-          <div className="mb-5 flex flex-wrap items-center justify-between gap-2 rounded-xl2 border border-brand/30 bg-brand/10 px-3 py-2">
-            <span className="text-sm text-mist">已选择 {visibleSelectedCount} 个素材</span>
+        {selectedAssets.length > 0 && (
+          <div className="sticky top-[73px] z-20 mb-5 flex flex-wrap items-center justify-between gap-2 border border-brand/30 bg-base2/95 px-3 py-2 shadow-pop backdrop-blur-xl">
+            <span className="text-sm text-mist">已选择 {selectedAssets.length} 个资产</span>
             <div className="flex flex-wrap gap-2">
-              <button onClick={batchDownload} disabled={batchDownloading} className="btn-secondary btn-sm">
-                {batchDownloading ? "打包中..." : "批量下载"}
-              </button>
-              <button onClick={batchDelete} className="btn-ghost btn-sm text-bad">批量删除</button>
-              <button onClick={() => setSelectedIds(new Set())} className="btn-ghost btn-sm">取消选择</button>
+              <button type="button" onClick={() => updateMetadata([...selectedRefs], { retained: true })} className="btn-secondary btn-sm">长期保留</button>
+              <button type="button" onClick={() => updateMetadata([...selectedRefs], { favorite: true })} className="btn-secondary btn-sm">收藏</button>
+              <button type="button" onClick={() => deleteRefs([...selectedRefs])} className="btn-ghost btn-sm text-bad">删除</button>
+              <button type="button" onClick={() => setSelectedRefs(new Set())} className="btn-ghost btn-sm">取消选择</button>
             </div>
           </div>
         )}
 
-        {msg && (
-          <div className="mb-5 rounded-xl border border-bad/30 bg-bad/10 px-4 py-2.5 text-sm text-bad">{msg}</div>
-        )}
+        {msg && <div className="mb-5 border border-bad/30 bg-bad/10 px-4 py-3 text-sm text-bad">{msg}</div>}
 
-        <AssetComparePanel assets={compareAssets} onClose={() => setSelectedIds(new Set())} />
+        <AssetComparePanel assets={compareAssets} onClose={() => setSelectedRefs(new Set())} />
 
         {assets === null ? (
-          <div className="masonry">
-            {Array.from({ length: 8 }).map((_, i) => (
-              <div key={i} className="skeleton" style={{ height: 160 + (i % 4) * 60 }} />
-            ))}
+          <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-4">
+            {Array.from({ length: 8 }).map((_, index) => <div key={index} className="skeleton aspect-[4/5]" />)}
           </div>
         ) : assets.length === 0 ? (
-          <div className="card flex flex-col items-center justify-center gap-3 p-16 text-center">
-            <span className="text-3xl">🪄</span>
-            <p className="text-sm text-mist">{filter === "fav" ? "还没有收藏的素材。" : "还没有生成的素材。"}</p>
-            <a href="/" className="btn-primary btn-sm mt-1">去工作台生成</a>
+          <div className="flex min-h-72 flex-col items-center justify-center gap-3 border-y border-line text-center">
+            <p className="text-sm text-mist">当前筛选下还没有资产。</p>
+            <button type="button" onClick={() => imageInputRef.current?.click()} className="btn-primary btn-sm">上传第一张素材</button>
           </div>
         ) : (
           <>
-            <GroupedAssetGallery
-              assets={assets}
-              renderAsset={renderAssetCard}
-              className="grid grid-cols-1 items-start gap-4 sm:grid-cols-2"
-              groupClassName="rounded-xl2 border border-line bg-white/[0.025] p-2.5"
-              assetGridClassName="grid grid-cols-1 gap-3"
-            />
+            <div className="grid grid-cols-1 items-start gap-4 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">{assets.map(renderAsset)}</div>
             {hasMore && (
-              <div className="mt-6 text-center">
-                <button onClick={() => loadAssets(false)} disabled={loading} className="btn-secondary">
-                  {loading ? "加载中…" : "加载更多"}
-                </button>
+              <div className="mt-7 text-center">
+                <button type="button" onClick={() => loadAssets(false)} disabled={loading} className="btn-secondary">{loading ? "加载中…" : "加载更多"}</button>
               </div>
             )}
           </>
@@ -604,56 +469,39 @@ export default function ProfilePage() {
       </main>
 
       {lightbox && (
-        <AssetPreviewDialog
-          asset={lightbox}
-          onClose={() => setLightbox(null)}
-          onError={(e) => setMsg(e?.message || "预览加载失败")}
-          meta={lightbox.days_left != null ? ` · ${lightbox.days_left} 天后过期` : ""}
-        >
-          {({ asset, takenDown, canDownload }) => (
-            <>
-              {!takenDown && (
-                <button
-                  type="button"
-                  onClick={() => toggleFav(asset)}
-                  disabled={busyAssetIds.has(asset.id)}
-                  aria-pressed={Boolean(asset.favorite)}
-                  className="btn-ghost btn-sm"
-                >
-                  {asset.favorite ? "★ 已收藏" : "☆ 收藏"}
-                </button>
-              )}
-              {!takenDown && !asset.unlocked && (
-                <button type="button" onClick={() => unlock(asset)} disabled={busyAssetIds.has(asset.id)} className="btn-primary btn-sm">
-                  解锁
-                </button>
-              )}
-              {!takenDown && asset.unlocked && (
-                <button
-                  type="button"
-                  onClick={() => download(asset)}
-                  disabled={busyAssetIds.has(asset.id) || !canDownload}
-                  className={canDownload ? "btn-primary btn-sm" : "btn-secondary btn-sm cursor-not-allowed opacity-70"}
-                >
-                  下载
-                </button>
-              )}
-              {!takenDown && asset.type === "image" && (
-                <button type="button" onClick={() => createVariation(asset)} className="btn-secondary btn-sm">
-                  生成变体
-                </button>
-              )}
-            </>
-          )}
+        <AssetPreviewDialog asset={lightbox} onClose={() => setLightbox(null)} onError={(error) => setMsg(error?.message || "预览加载失败")} meta={lightbox.retained ? " · 长期保留" : (lightbox.days_left != null ? ` · ${lightbox.days_left} 天后过期` : "")}>
+          {({ asset }) => {
+            const ref = unifiedAssetKey(asset);
+            return (
+              <>
+                <button type="button" onClick={() => updateMetadata([ref], { favorite: !asset.favorite })} disabled={busyRefs.has(ref)} className="btn-ghost btn-sm">{asset.favorite ? "★ 已收藏" : "☆ 收藏"}</button>
+                <button type="button" onClick={() => updateMetadata([ref], { retained: !asset.retained })} disabled={busyRefs.has(ref)} className="btn-secondary btn-sm">{asset.retained ? "取消长期保留" : "长期保留"}</button>
+                {asset.type === "image" && <button type="button" onClick={() => createVariation(asset)} className="btn-secondary btn-sm">生成变体</button>}
+                <button type="button" onClick={() => download(asset)} disabled={busyRefs.has(ref) || !canDownloadAsset(asset)} className="btn-primary btn-sm">下载</button>
+                <button type="button" onClick={() => deleteRefs([ref])} disabled={busyRefs.has(ref)} className="btn-ghost btn-sm text-bad">删除</button>
+              </>
+            );
+          }}
         </AssetPreviewDialog>
       )}
     </div>
   );
 }
 
+function FilterSelect({ label, value, onChange, options }) {
+  return (
+    <label className="flex items-center gap-2 text-xs text-fog">
+      <span>{label}</span>
+      <select className="input min-w-28 px-3 py-2 text-xs" value={value} onChange={(event) => onChange(event.target.value)}>
+        {options.map(([optionValue, optionLabel]) => <option key={optionValue} value={optionValue}>{optionLabel}</option>)}
+      </select>
+    </label>
+  );
+}
+
 function Stat({ label, value }) {
   return (
-    <div className="rounded-xl2 border border-line bg-white/5 px-3 py-3 text-center transition hover:border-line2">
+    <div className="border-l border-line px-3 py-1 first:border-l-0">
       <div className="font-display text-xl font-bold text-snow">{value}</div>
       <div className="mt-0.5 text-xs text-fog">{label}</div>
     </div>

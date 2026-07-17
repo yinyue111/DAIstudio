@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import json
-import re
 from math import isfinite
+from typing import ClassVar
+
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
 # Rich multi-dimension template so the regenerated image stays close to the
 # reference. Keep keys stable -- the frontend renders whatever keys come back.
@@ -158,11 +160,11 @@ PRODUCT_PROFILE_TEMPLATE = (
     "1. 只描述上传产品图中能确认或高置信推断的产品信息,不要分析背景风格,不要引入参考视频/参考图主体。\n"
     "2. 产品表面所有可见文字、Logo、品牌名、数字、卖点、标签位置都要尽量逐字记录;看不清写『不清晰/未见』。\n"
     "3. 必须区分『可改』和『不可改』:不可改包括产品品类、SKU、Logo、包装结构、品牌色、文字、标签版式、形状、材质和关键图案;可改只包括背景、台面、道具、光线、镜头和展示动作。\n"
-    "4. 如果图中是人物而非产品,仍按主体身份档案输出,但明确这是人物照片;不得编造商品。\n"
-    "5. final_text 必须可直接拼入文生图/文生视频提示词,强调上传产品/主体是唯一主角,用于替换参考素材原主体。\n"
+    "4. 如果图中不是产品,明确写『非产品图』,不得改用人物档案或编造商品信息。\n"
+    "5. final_text 必须可直接拼入文生图/文生视频提示词,强调上传产品是唯一主角,用于替换参考素材原主体。\n"
     "输出严格 JSON,不要 markdown,字段如下:\n"
     "{\n"
-    '  "档案类型": "产品档案 / 人物档案 / 其他主体档案,并给 1 句判断依据",\n'
+    '  "档案类型": "产品档案 / 非产品图,并给 1 句判断依据",\n'
     '  "产品品类": "具体品类、用途、规格或形态;无法判断写 不确定",\n'
     '  "品牌Logo": "可见品牌名、Logo文字、商标形状、位置、颜色;不可见写 未见",\n'
     '  "包装文字": "逐条记录正面/顶部/侧面可见文字、数字、英文、中文、卖点和警示;看不清写 不清晰",\n'
@@ -180,32 +182,364 @@ PRODUCT_PROFILE_TEMPLATE = (
     "}"
 )
 
+PORTRAIT_PROFILE_TEMPLATE = (
+    "你是商业人像摄影、角色一致性和视觉身份档案专家。请只分析这张用户上传的人物图,生成"
+    "『人物身份档案』,供后续在不同场景和镜头中保持同一人物。\n"
+    "硬性要求:\n"
+    "1. 只记录画面可确认的身份稳定特征;不确定年龄时写『年龄不确定』,不推断真实姓名、种族、职业或健康状况。\n"
+    "2. 区分身份稳定特征与可变造型:脸型、五官比例、发际线和标志性特征列入不可改;妆容、发型、服装和配饰单独记录。\n"
+    "3. 人物比例、体态和姿态用中性商业人像语言;不写三围尺寸、身体局部凝视、私密或成人化评价。\n"
+    "4. 如果图中不是人物,明确写『非人物图』,不得改用产品 SKU、包装或 Logo 字段。\n"
+    "输出严格 JSON,不要 markdown,字段如下:\n"
+    "{\n"
+    '  "档案类型": "人物档案 / 非人物图,并给 1 句判断依据",\n'
+    '  "年龄语境": "成年 / 年龄不确定;只写视觉语境,不做真实身份推断",\n'
+    '  "脸型五官": "脸部轮廓、眉眼、鼻、唇、下颌及各自比例和间距",\n'
+    '  "妆发": "发型、发色、发际线、发缝、妆容强度与关键色彩",\n'
+    '  "肤质": "可见皮肤色调、质感、雀斑/痣/纹理等稳定细节;不做健康诊断",\n'
+    '  "体型比例": "头身比、肩宽、躯干与四肢比例,并区分镜头透视影响",\n'
+    '  "姿态表情": "身体朝向、重心、手势、脸部朝向和可见表情",\n'
+    '  "服装": "品类、版型、剪裁、色彩、材质、层次与覆盖范围",\n'
+    '  "配饰": "眼镜、首饰、帽子、鞋包及位置;无则填 无",\n'
+    '  "身份稳定特征": "跨画面必须保持的高辨识度特征组合",\n'
+    '  "不可改项": "脸型、五官比例、发际线、肤色和标志性特征等身份锁定项",\n'
+    '  "可调整项": "根据任务可替换的妆容、发型、服装、配饰、场景、光线和姿态",\n'
+    '  "负向": "换脸、五官漂移、年龄突变、肤色偏移、比例畸变、多余肢体或标志特征丢失等",\n'
+    '  "final_text": "220-420 个中文字符的人物身份锁定提示词,只整合已观察特征、不可改项和负向约束。"\n'
+    "}"
+)
+
+IMAGE_TO_VIDEO_TEMPLATE = (
+    "你是单图生成视频的运动设计师。输入只有一张静态封面,不是视频时序证据。"
+    "请先记录静帧可见事实,再明确地设计一段保守、可生成的运动方案。\n"
+    "不得声称观察到原视频的动作、运镜、剪辑、音频或时间线;不得虚构封面外的人物、产品、场景和文字。"
+    "旁白和音效必须填『未分析』,final_text 只包含视觉、主体运动和镜头运动指令。\n"
+    "输出严格 JSON,不要 markdown,字段如下:\n"
+    "{\n"
+    '  "分析模式": "封面单帧运动设计",\n'
+    '  "静态观察": "只写封面直接可见的主体、场景、构图、光线和文字",\n'
+    '  "主体": "类别、数量、位置、朝向和静态状态",\n'
+    '  "场景背景": "前中后景、道具、地面、墙面和景深关系",\n'
+    '  "视角构图": "景别、机位、主体占比、留白和画幅比例",\n'
+    '  "光线": "主光方向、软硬、色温、阴影和高光",\n'
+    '  "色调配色": "主色、辅色、点缀色及占比",\n'
+    '  "材质纹理": "主体和环境可见材质、反光、粗糙度和细节",\n'
+    '  "可动元素": "从封面结构中可安全设计微动的元素;无则填 无",\n'
+    '  "主体运动设计": "明确标记为新设计,写方向、幅度、速度和物理约束",\n'
+    '  "镜头运动设计": "明确标记为新设计,优先固定、缓推、轻微平移或微弱景深变化",\n'
+    '  "时序设计": "按秒写新设计的起始、过渡和结尾,不得写成原片观察",\n'
+    '  "字幕卖点": "封面可见文字的后期保留说明;无则填 无",\n'
+    '  "旁白": "未分析",\n'
+    '  "音效": "未分析",\n'
+    '  "一致性约束": "主体身份、数量、形状、比例、Logo/文字、场景结构和光线方向不变",\n'
+    '  "负向": "新增主体、身份漂移、形变、文字变形、违反物理的大幅动作、闪烁和抖动等",\n'
+    '  "final_text": "160-280 个中文字符的单图转视频生成提示词,明确运动是新设计,不包含字幕、旁白、音效和 OCR 证据。"\n'
+    "}"
+)
+
+
+_IMAGE_FIELDS = frozenset({
+    "图像类型", "反推重点", "主体", "人像意图", "人物比例", "身材体态", "体态线条",
+    "服装结构", "服装覆盖", "妆发五官", "商品服装", "细节特征", "场景背景", "广告目标",
+    "风格", "构图", "景别", "视角镜头", "光线", "色调配色", "材质纹理", "文字版式",
+    "氛围情绪", "后期质感", "平台质感", "一致性约束", "标签", "负向",
+})
+_VIDEO_FIELDS = frozenset({
+    "图像类型", "反推重点", "主体", "人像意图", "人物比例", "身材体态", "体态线条",
+    "服装结构", "服装覆盖", "妆发五官", "商品服装", "细节特征", "场景背景", "广告目标",
+    "风格", "视角构图", "观察事实", "帧间推断", "主体动作", "可迁移主体动作", "迁移生成指令",
+    "镜头运动", "剪辑节奏", "时序分镜", "字幕卖点", "旁白", "音效", "时长建议", "光线",
+    "色调配色", "材质纹理", "氛围情绪", "转场", "一致性约束", "源视频规格", "负向",
+})
+_PRODUCT_FIELDS = frozenset({
+    "档案类型", "产品品类", "品牌Logo", "包装文字", "包装结构", "主色材质", "形状比例",
+    "关键图案", "卖点摘要", "展示角度", "主角约束", "不可改项", "可迁移项", "负向",
+})
+_PORTRAIT_FIELDS = frozenset({
+    "档案类型", "年龄语境", "脸型五官", "妆发", "肤质", "体型比例", "姿态表情", "服装", "配饰",
+    "身份稳定特征", "不可改项", "可调整项", "负向",
+})
+_IMAGE_TO_VIDEO_FIELDS = frozenset({
+    "分析模式", "静态观察", "主体", "场景背景", "视角构图", "光线", "色调配色", "材质纹理",
+    "可动元素", "主体运动设计", "镜头运动设计", "时序设计", "字幕卖点", "旁白", "音效",
+    "一致性约束", "负向",
+})
+
+# Only these contract fields may become model-facing generation text. Provider
+# ``final_text`` is retained for audit, but never trusted as a visual prompt:
+# audio, subtitles, OCR, evidence notes and unknown fields stay structured-only.
+_VISUAL_FIELD_ORDERS: dict[str, tuple[str, ...]] = {
+    "image": (
+        "主体", "人像意图", "人物比例", "身材体态", "体态线条", "服装结构", "服装覆盖",
+        "妆发五官", "商品服装", "细节特征", "场景背景", "广告目标", "风格", "景别", "构图",
+        "视角镜头", "光线", "色调配色", "材质纹理", "氛围情绪", "后期质感",
+        "一致性约束", "平台质感", "负向",
+    ),
+    "video": (
+        "主体", "人像意图", "人物比例", "身材体态", "体态线条", "服装结构", "服装覆盖",
+        "妆发五官", "商品服装", "细节特征", "场景背景", "广告目标", "风格", "视角构图",
+        "光线", "色调配色", "材质纹理", "氛围情绪", "一致性约束", "源视频规格", "负向",
+    ),
+    "product_profile": (
+        "产品品类", "品牌Logo", "包装文字", "包装结构", "主色材质", "形状比例", "关键图案",
+        "卖点摘要", "展示角度", "主角约束", "不可改项", "可迁移项", "负向",
+    ),
+    "portrait_profile": (
+        "年龄语境", "脸型五官", "妆发", "肤质", "体型比例", "姿态表情", "服装", "配饰",
+        "身份稳定特征", "不可改项", "可调整项", "负向",
+    ),
+    "image_to_video": (
+        "静态观察", "主体", "场景背景", "视角构图", "光线", "色调配色", "材质纹理",
+        "可动元素", "主体运动设计", "镜头运动设计", "时序设计", "一致性约束", "负向",
+    ),
+}
+_VISUAL_SHOT_FIELDS = ("visual", "action", "camera", "lighting", "transition")
+_VISUAL_PROMPT_PREFIXES = {
+    "product_profile": "上传产品是唯一商品主角",
+    "portrait_profile": "保持上传人物身份稳定",
+    "image_to_video": "基于单图新设计运动",
+}
+
+
+class ReverseResultValidationError(ValueError):
+    """The provider returned JSON that does not satisfy the reverse contract."""
+
+
+def compose_visual_final_text(
+    structured: dict,
+    target: str,
+    shots: list[dict] | None = None,
+) -> str:
+    """Build generation text exclusively from target-specific visual fields."""
+    order = _VISUAL_FIELD_ORDERS.get(target)
+    if order is None:
+        raise ReverseResultValidationError(f"不支持的反推目标: {target}")
+    parts: list[str] = []
+    prefix = _VISUAL_PROMPT_PREFIXES.get(target)
+    if prefix:
+        parts.append(prefix)
+    if isinstance(structured, dict):
+        for key in order:
+            value = structured.get(key)
+            if not isinstance(value, str) or not value.strip():
+                continue
+            text = value.strip()
+            if key == "负向":
+                text = f"避免：{text}"
+            if text not in parts:
+                parts.append(text)
+    if target == "video" and isinstance(shots, list):
+        for index, shot in enumerate(shots, start=1):
+            if not isinstance(shot, dict):
+                continue
+            details = [
+                value.strip()
+                for key in _VISUAL_SHOT_FIELDS
+                if isinstance((value := shot.get(key)), str) and value.strip()
+            ]
+            details = list(dict.fromkeys(details))
+            if details:
+                parts.append(f"镜头{index}: {'，'.join(details)}")
+    text = "；".join(dict.fromkeys(parts)).strip()
+    if not text:
+        raise ReverseResultValidationError("反推结果缺少可用于生成的视觉白名单字段")
+    return text
+
+
+class ReverseVideoShot(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    start_seconds: float
+    end_seconds: float
+    visual: str = ""
+    action: str = ""
+    camera: str = ""
+    lighting: str = ""
+    transition: str = ""
+    ocr: str = ""
+    audio_cue: str = ""
+    evidence_frame_indices: list[int] = Field(default_factory=list)
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _strict_field_types(cls, value):
+        if not isinstance(value, dict):
+            raise ValueError("shot 必须是 JSON 对象")
+        for key in ("start_seconds", "end_seconds", "confidence"):
+            if key in value and (
+                isinstance(value[key], bool) or not isinstance(value[key], (int, float))
+            ):
+                raise ValueError(f"shot.{key} 必须是数值")
+        for key in ("visual", "action", "camera", "lighting", "transition", "ocr", "audio_cue"):
+            if key in value and not isinstance(value[key], str):
+                raise ValueError(f"shot.{key} 必须是字符串")
+        evidence = value.get("evidence_frame_indices", [])
+        if not isinstance(evidence, list) or any(
+            isinstance(item, bool) or not isinstance(item, int) for item in evidence
+        ):
+            raise ValueError("shot.evidence_frame_indices 必须是整数数组")
+        return value
+
+
+class _ReverseResultBase(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+    final_text: str = Field(min_length=1)
+    shots: list[ReverseVideoShot] = Field(default_factory=list)
+    structured_fields: ClassVar[frozenset[str]] = frozenset()
+    required_structured_fields: ClassVar[frozenset[str]] = frozenset()
+    allow_shots: ClassVar[bool] = False
+
+    @model_validator(mode="before")
+    @classmethod
+    def _validate_result_shape(cls, value):
+        if not isinstance(value, dict):
+            raise ValueError("反推结果必须是 JSON 对象")
+        final_text = value.get("final_text")
+        if not isinstance(final_text, str):
+            raise ValueError("final_text 必须是非空字符串")
+        missing = sorted(
+            key for key in cls.required_structured_fields
+            if key not in value or not isinstance(value.get(key), str) or not value[key].strip()
+        )
+        if missing:
+            raise ValueError(f"缺少非空核心字段: {', '.join(missing)}")
+        for key in cls.structured_fields:
+            if key in value and not isinstance(value[key], str):
+                raise ValueError(f"{key} 必须是字符串")
+        if not cls.allow_shots and value.get("shots") not in (None, []):
+            raise ValueError("该反推目标不允许 shots 字段")
+        return value
+
+    @field_validator("final_text")
+    @classmethod
+    def _non_empty_final_text(cls, value: str) -> str:
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("final_text 不能为空")
+        return stripped
+
+
+class ImageReverseResult(_ReverseResultBase):
+    structured_fields = _IMAGE_FIELDS
+    required_structured_fields = frozenset({"主体"})
+
+
+class VideoReverseResult(_ReverseResultBase):
+    structured_fields = _VIDEO_FIELDS
+    required_structured_fields = frozenset({"主体"})
+    allow_shots = True
+
+
+class ProductProfileReverseResult(_ReverseResultBase):
+    structured_fields = _PRODUCT_FIELDS
+    required_structured_fields = frozenset({"产品品类"})
+
+
+class PortraitProfileReverseResult(_ReverseResultBase):
+    structured_fields = _PORTRAIT_FIELDS
+    required_structured_fields = frozenset({"脸型五官"})
+
+
+class ImageToVideoReverseResult(_ReverseResultBase):
+    structured_fields = _IMAGE_TO_VIDEO_FIELDS
+    required_structured_fields = frozenset({"静态观察", "主体运动设计", "镜头运动设计"})
+
+
+_REVERSE_RESULT_MODELS = {
+    "image": ImageReverseResult,
+    "video": VideoReverseResult,
+    "product_profile": ProductProfileReverseResult,
+    "portrait_profile": PortraitProfileReverseResult,
+    "image_to_video": ImageToVideoReverseResult,
+}
+
 
 def reverse_template(target: str, n_frames: int = 1) -> str:
     if target == "product_profile":
         return PRODUCT_PROFILE_TEMPLATE
+    if target == "portrait_profile":
+        return PORTRAIT_PROFILE_TEMPLATE
+    if target == "image_to_video":
+        return IMAGE_TO_VIDEO_TEMPLATE
     if target == "video":
         if n_frames > 1:
             return f"(以下共 {n_frames} 帧,按时间先后排列)\n" + VIDEO_REVERSE_TEMPLATE
         return VIDEO_REVERSE_TEMPLATE
-    return IMAGE_REVERSE_TEMPLATE
+    if target == "image":
+        return IMAGE_REVERSE_TEMPLATE
+    raise ReverseResultValidationError(f"不支持的反推目标: {target}")
 
 
-def parse_structured(content: str) -> dict:
-    # tolerate ```json fences / surrounding prose
-    m = re.search(r"\{.*\}", content, re.S)
-    raw = m.group(0) if m else content
+def _decode_json_object(content: str) -> dict:
+    if not isinstance(content, str):
+        raise ReverseResultValidationError("模型输出必须是字符串")
+    text = content.lstrip("\ufeff").strip()
+    decoder = json.JSONDecoder()
     try:
-        obj = json.loads(raw)
-    except Exception:
-        return {"structured": {}, "final_text": content.strip(), "shots": []}
-    if not isinstance(obj, dict):
-        return {"structured": {}, "final_text": content.strip(), "shots": []}
+        value, end = decoder.raw_decode(text)
+    except (json.JSONDecodeError, TypeError) as exc:
+        raise ReverseResultValidationError(f"无法解析反推 JSON: {exc}") from exc
+    if text[end:].strip():
+        raise ReverseResultValidationError("反推 JSON 后存在额外非空内容")
+    if not isinstance(value, dict):
+        raise ReverseResultValidationError("反推结果必须是 JSON 对象")
+    return value
+
+
+def validate_reverse_result(payload_or_text: str | dict, target: str) -> dict:
+    """Strictly decode and validate one provider result for ``target``."""
+    model = _REVERSE_RESULT_MODELS.get(target)
+    if model is None:
+        raise ReverseResultValidationError(f"不支持的反推目标: {target}")
+    payload = _decode_json_object(payload_or_text) if isinstance(payload_or_text, str) else payload_or_text
+    try:
+        validated = model.model_validate(payload)
+    except ValidationError as exc:
+        raise ReverseResultValidationError(str(exc)) from exc
+    result = validated.model_dump(exclude_none=True)
+    provider_final_text = result.pop("final_text")
+    shots = result.pop("shots", [])
+    final_text = compose_visual_final_text(result, target, shots)
+    return {
+        "structured": result,
+        "final_text": final_text,
+        "provider_final_text": provider_final_text,
+        "shots": shots,
+    }
+
+
+def reverse_repair_template(content: str, error: str, target: str) -> str:
+    """Build the single text-only repair request used after strict validation fails."""
+    return (
+        "你只负责修复 JSON 结构,不得增加、删除或改写事实。"
+        f"目标契约: {target}。输出必须是唯一 JSON 对象,不要 markdown 或解释;"
+        "final_text 必须是非空字符串,已有结构化字段保持原意和正确类型。\n"
+        f"校验错误:\n{str(error)[:2000]}\n"
+        f"待修复输出:\n{str(content)[:65536]}"
+    )
+
+
+def parse_structured(content: str, target: str | None = None) -> dict:
+    """Parse a result; callers selecting a target get the strict contract path.
+
+    The target-less branch remains for legacy internal composition helpers. It
+    is not used to accept provider output in ``reverse_prompt``.
+    """
+    if target is not None:
+        return validate_reverse_result(content, target)
+    try:
+        obj = _decode_json_object(content)
+    except ReverseResultValidationError:
+        return {"structured": {}, "final_text": str(content).strip(), "shots": []}
     shots = obj.pop("shots", [])
-    final_text = obj.pop("final_text", None) or compose_final(obj)
+    final_text = obj.pop("final_text", None)
+    if not isinstance(final_text, str) or not final_text.strip():
+        final_text = compose_final(obj)
     return {
         "structured": obj,
-        "final_text": final_text,
+        "final_text": final_text.strip(),
         "shots": shots if isinstance(shots, list) else [],
     }
 
@@ -281,11 +615,13 @@ def normalize_video_shots(
         confidence = round(max(0.0, min(1.0, confidence)), 3)
         if not valid_indices or confidence <= 0:
             continue
+        has_cross_frame_evidence = len(valid_indices) >= 2
         start = max(start, previous_verified_end)
         if end <= start:
             continue
         if frame_timestamps:
             evidence_times = sorted(frame_timestamps[index] for index in valid_indices)
+            has_cross_frame_evidence = len(set(evidence_times)) >= 2
             tolerance = 0.75
             inside_range = any(
                 start - tolerance <= timestamp <= end + tolerance
@@ -321,6 +657,12 @@ def normalize_video_shots(
         }
         for field in text_fields:
             item[field] = str(raw.get(field) or "").strip()
+        if not has_cross_frame_evidence:
+            # One still frame can establish appearance and lighting, but it
+            # cannot prove motion, camera movement, or a transition. Keep
+            # those provider claims out of normalized generation data.
+            for field in ("action", "camera", "transition"):
+                item[field] = ""
         item["audio_cue"] = (
             str(raw.get("audio_cue") or "").strip() or "未见"
             if audio_analyzed else "未分析"
@@ -411,6 +753,43 @@ def compose_final(obj: dict) -> str:
 
 
 def mock_reverse(target: str = "image") -> dict:
+    if target == "product_profile":
+        return {
+            "structured": {
+                "档案类型": "产品档案(mock)",
+                "产品品类": "示例包装产品",
+                "品牌Logo": "未见",
+                "包装结构": "矩形盒装",
+                "不可改项": "产品品类、包装结构和主色",
+                "负向": "Logo变形,包装漂移,多余产品",
+            },
+            "final_text": "上传产品是唯一商品主角,保持包装结构、主色和可见标签一致(mock)",
+        }
+    if target == "portrait_profile":
+        return {
+            "structured": {
+                "档案类型": "人物档案(mock)",
+                "年龄语境": "成年商业人像",
+                "脸型五官": "示例人物面部特征",
+                "身份稳定特征": "脸型、五官比例和发际线",
+                "不可改项": "脸型、五官比例和肤色",
+                "负向": "换脸,五官漂移,年龄突变",
+            },
+            "final_text": "保持上传人物的脸型、五官比例、发际线和肤色稳定,禁止换脸与身份漂移(mock)",
+        }
+    if target == "image_to_video":
+        return {
+            "structured": {
+                "分析模式": "封面单帧运动设计",
+                "静态观察": "示例主体居中,纯色背景",
+                "主体运动设计": "新设计:主体保持结构稳定,仅轻微呼吸式微动",
+                "镜头运动设计": "新设计:镜头缓慢推近",
+                "旁白": "未分析",
+                "音效": "未分析",
+                "负向": "新增主体,形变,闪烁,抖动",
+            },
+            "final_text": "基于封面单帧的新运动设计:保持主体身份、构图与光线不变,镜头缓慢推近,主体仅作轻微微动(mock)",
+        }
     if target == "video":
         structured = {
             "主体": "示例主体(mock)", "场景背景": "简洁纯色背景", "风格": "极简插画",
@@ -420,6 +799,7 @@ def mock_reverse(target: str = "image") -> dict:
             "运动节奏": "舒缓", "时序分镜": "0-2s 静止特写;2-4s 推近;4-6s 主体动作",
             "时长建议": "6 秒 / 24fps", "光线": "柔和顶光,逐渐变亮",
             "色调配色": "暖色低饱和", "氛围情绪": "宁静治愈", "转场": "无",
+            "旁白": "未分析", "音效": "未分析",
             "负向": "闪烁, 形变, 拼接感, 水印",
         }
         return {

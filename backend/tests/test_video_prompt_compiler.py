@@ -20,7 +20,7 @@ DIRECT_PRODUCT_VIDEO_PROMPT = (
 )
 
 
-def test_direct_product_video_passthrough_preserves_model_facing_copy_and_history_metadata():
+def test_direct_product_video_passthrough_separates_post_production_from_visual_prompt():
     result = compile_video_prompt(
         {
             "user_instruction": DIRECT_PRODUCT_VIDEO_PROMPT,
@@ -43,7 +43,8 @@ def test_direct_product_video_passthrough_preserves_model_facing_copy_and_histor
         "产品身份约束：以上传产品图为唯一商品主体，保持同一SKU的包装结构、Logo、"
         "包装文字、颜色、材质和纹理一致。\n原始生成要求：\n"
     )
-    assert DIRECT_PRODUCT_VIDEO_PROMPT in result["prompt"]
+    assert "女主走到悬挂包装处，从下方抽出一张洗脸巾" in result["prompt"]
+    assert "最后包装置于白色圆桌中央" in result["prompt"]
     for selling_point in (
         "干湿两用",
         "厚实吸水",
@@ -51,13 +52,15 @@ def test_direct_product_video_passthrough_preserves_model_facing_copy_and_histor
         "加大加厚 克重95g/㎡",
         "耐拉扯 不易掉絮",
     ):
-        assert selling_point in result["prompt"]
-    assert "水滴落水声" in result["prompt"]
-    assert "让洗脸这件事，成为一天温柔的开始" in result["prompt"]
+        assert f"文字“{selling_point}”" not in result["prompt"]
+    for overlay_only in ("干湿两用", "厚实吸水", "加大加厚 克重95g/㎡", "耐拉扯 不易掉絮"):
+        assert overlay_only not in result["prompt"]
+    assert "水滴落水声" not in result["prompt"]
+    assert "让洗脸这件事，成为一天温柔的开始" not in result["prompt"]
     assert "画面无字" not in result["prompt"]
     assert "Shot " not in result["prompt"]
     assert "Moon Logo" not in result["prompt"]
-    assert result["plan"]["shots"] == [DIRECT_PRODUCT_VIDEO_PROMPT]
+    assert result["plan"]["shots"] == [result["prompt"].split("原始生成要求：\n", 1)[1]]
     assert result["plan"]["post_overlays"] == [
         "干湿两用",
         "厚实吸水",
@@ -66,6 +69,7 @@ def test_direct_product_video_passthrough_preserves_model_facing_copy_and_histor
         "耐拉扯 不易掉絮",
     ]
     assert result["plan"]["voiceover"] == "让洗脸这件事，成为一天温柔的开始。"
+    assert result["plan"]["sfx"] == ["水滴落水声"]
     assert result["metadata"]["prompt_mode"] == "direct_passthrough"
     assert result["metadata"]["shot_count"] == 1
 
@@ -889,6 +893,33 @@ def test_uploaded_video_is_analysis_only_without_native_video_transport():
     assert "不进行原视频逐帧动作复刻" in result["prompt"]
     assert result["metadata"]["reference_roles"] == ["motion_analysis"]
     assert result["metadata"]["motion_reference_mode"] == "analysis_only"
+
+
+def test_product_detail_references_keep_ordered_numbered_roles():
+    references = build_video_prompt_references(
+        source_asset_url="/api/uploads/product.png",
+        source_type="image",
+        params={
+            "subject_mode": "product",
+            "product_reference_image": "/api/uploads/product.png",
+            "product_detail_images": [
+                "/api/uploads/detail-a.png",
+                "/api/uploads/detail-b.png",
+                "/api/uploads/detail-c.png",
+                "/api/uploads/detail-d.png",
+                "/api/uploads/detail-e.png",
+            ],
+        },
+    )
+
+    assert references == [
+        {"role": "product", "source": "source_asset_url"},
+        {"role": "product_detail_1", "source": "product_detail_images[0]"},
+        {"role": "product_detail_2", "source": "product_detail_images[1]"},
+        {"role": "product_detail_3", "source": "product_detail_images[2]"},
+        {"role": "product_detail_4", "source": "product_detail_images[3]"},
+        {"role": "product_detail_5", "source": "product_detail_images[4]"},
+    ]
 
 
 def test_model_profiles_distinguish_grok_and_allow_runtime_override():

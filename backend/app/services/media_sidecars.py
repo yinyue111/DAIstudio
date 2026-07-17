@@ -42,6 +42,29 @@ def keys_for_asset_urls(*urls: str | None) -> list[str]:
     return keys
 
 
+def storage_bytes_for_keys(keys) -> int | None:
+    """Return bytes occupied by the existing local files in ``keys``."""
+    total = 0
+    found = False
+    seen: set[str] = set()
+    for key in keys or []:
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        try:
+            path = storage.local_path(key)
+            if path.exists() and path.is_file():
+                total += int(path.stat().st_size)
+                found = True
+        except Exception:  # noqa: BLE001
+            log.debug("asset size inspection skipped for %s", key, exc_info=True)
+    return total if found else None
+
+
+def storage_bytes_for_asset_urls(*urls: str | None) -> int | None:
+    return storage_bytes_for_keys(keys_for_asset_urls(*urls))
+
+
 def direct_keys_for_asset_urls(*urls: str | None) -> list[str]:
     keys: list[str] = []
     seen: set[str] = set()
