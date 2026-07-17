@@ -6,8 +6,9 @@ gap with evenly-spaced frames via the ffmpeg CLI. Frames come back as JPEG bytes
 so the caller can inline them as base64 data-URIs (no public URL needed, so an
 external gateway can still "see" them).
 
-Everything is best-effort: if ffmpeg is missing or the video can't be decoded,
-we return an empty list and the caller falls back to the cover image.
+Sampling is best-effort: if ffmpeg is missing or the video cannot be decoded,
+we return no frames. The orchestration layer then requests explicit cover-mode
+confirmation; this module never silently changes the analysis contract.
 """
 from __future__ import annotations
 
@@ -21,7 +22,10 @@ import threading
 import time
 from dataclasses import dataclass
 from fractions import Fraction
+from io import BytesIO
 from math import gcd
+
+from PIL import Image
 
 from ..config import settings
 from .safe_logging import redact_url_for_log
@@ -78,6 +82,9 @@ class VideoMetadata:
 class SampledVideoFrame:
     jpeg: bytes
     timestamp_seconds: float
+    # Endpoint frames outrank scene-change frames, which outrank uniform fill
+    # frames when the aggregate model payload must be reduced.
+    priority: int = 1
 
 
 @dataclass(frozen=True)
@@ -269,8 +276,10 @@ def _grab_frame(src: str, ts: float, dst: str) -> bool:
     try:
         subprocess.run(
             [FFMPEG, "-y", "-protocol_whitelist", "file,pipe", "-ss", f"{ts:.3f}",
-             "-i", src, "-frames:v", "1",
-             "-q:v", "3", "-vf", "scale='min(1024,iw)':-1", dst],
+             "-i", src, "-frames:v", "1", "-q:v", "3", "-vf",
+             "scale=w='min(1024,iw)':h='min(1024,ih)':"
+             "force_original_aspect_ratio=decrease:force_divisible_by=2",
+             dst],
             capture_output=True, timeout=30,
         )
     except subprocess.SubprocessError:
@@ -424,6 +433,95 @@ def _target_frame_count(n: int, dur: float | None, preset: str | None = None) ->
     return max(1, frame_count_for_duration(dur, None) if n < 1 else n)
 
 
+def _reencode_jpeg(jpeg: bytes, *, quality: int, max_edge: int) -> bytes:
+    try:
+        with Image.open(BytesIO(jpeg)) as image:
+            image.load()
+            if image.mode != "RGB":
+                image = image.convert("RGB")
+            width, height = image.size
+            scale = min(1.0, float(max_edge) / max(width, height))
+            if scale < 1.0:
+                resized = (
+                    max(1, int(round(width * scale))),
+                    max(1, int(round(height * scale))),
+                )
+                image = image.resize(resized, Image.Resampling.LANCZOS)
+            output = BytesIO()
+            image.save(
+                output,
+                format="JPEG",
+                quality=quality,
+                optimize=True,
+                progressive=True,
+            )
+            return output.getvalue()
+    except (OSError, ValueError):
+        return jpeg
+
+
+def fit_frame_payload_budget(
+    frames: list[SampledVideoFrame] | tuple[SampledVideoFrame, ...],
+    max_bytes: int | None = None,
+) -> tuple[SampledVideoFrame, ...]:
+    """Compress then evidence-prune frames to a bounded raw-JPEG payload."""
+    budget = int(
+        settings.reverse_video_frame_payload_max_bytes
+        if max_bytes is None else max_bytes
+    )
+    if budget <= 0 or not frames:
+        return ()
+    candidates = list(frames)
+    initial_bytes = sum(len(frame.jpeg) for frame in candidates)
+    if initial_bytes <= budget:
+        return tuple(candidates)
+
+    # Re-encode every frame from its original bytes at each level so quality
+    # loss does not compound. Most real samples fit before evidence pruning.
+    compressed = candidates
+    for quality, max_edge in ((82, 1024), (70, 896), (58, 768), (46, 640)):
+        compressed = [
+            SampledVideoFrame(
+                jpeg=_reencode_jpeg(frame.jpeg, quality=quality, max_edge=max_edge),
+                timestamp_seconds=frame.timestamp_seconds,
+                priority=frame.priority,
+            )
+            for frame in candidates
+        ]
+        if sum(len(frame.jpeg) for frame in compressed) <= budget:
+            log.info(
+                "compressed reverse-video frame payload from %s to %s bytes",
+                initial_bytes,
+                sum(len(frame.jpeg) for frame in compressed),
+            )
+            return tuple(compressed)
+
+    ranked = sorted(
+        enumerate(compressed),
+        key=lambda row: (-row[1].priority, row[0]),
+    )
+    selected_indices: set[int] = set()
+    used = 0
+    for index, frame in ranked:
+        size = len(frame.jpeg)
+        if used + size > budget:
+            continue
+        selected_indices.add(index)
+        used += size
+    selected = tuple(
+        frame for index, frame in enumerate(compressed)
+        if index in selected_indices
+    )
+    log.warning(
+        "pruned reverse-video frames for payload budget: %s -> %s frame(s), %s -> %s bytes",
+        len(candidates),
+        len(selected),
+        initial_bytes,
+        used,
+    )
+    return selected
+
+
 def _sample_video_from_file(
     src: str,
     n: int,
@@ -458,8 +556,13 @@ def _sample_video_from_file(
                     frames.append(SampledVideoFrame(
                         jpeg=f.read(),
                         timestamp_seconds=round(float(actual_ts), 3),
+                        priority=(
+                            3 if i in {0, len(stamps) - 1}
+                            else 2 if any(abs(float(ts) - float(scene_ts)) < 0.001 for scene_ts in scene_stamps)
+                            else 1
+                        ),
                     ))
-    return VideoSample(frames=tuple(frames), source=source)
+    return VideoSample(frames=fit_frame_payload_budget(frames), source=source)
 
 
 def _sample_keyframes_from_file(

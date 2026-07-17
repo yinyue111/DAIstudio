@@ -70,8 +70,15 @@ def test_prompt_optimizer_passes_video_generation_context_and_returns_metadata(
     try:
         row = db.query(ModelConfig).filter(ModelConfig.use == "prompt").one()
         row.model_id = "gemini-3.5-flash-low"
+        row.display_name = "Gemini 3.5 Flash Low"
         row.cost_credits = 1
         row.enabled = True
+        prompt_model_config_id = row.id
+        video_model = db.query(ModelConfig).filter(ModelConfig.use == "video").one()
+        video_model.model_id = "doubao-seedance-2-0-mini-260615"
+        video_model.provider = "volcengine_ark"
+        video_model.enabled = True
+        video_model_config_id = video_model.id
         db.commit()
     finally:
         db.close()
@@ -124,6 +131,7 @@ def test_prompt_optimizer_passes_video_generation_context_and_returns_metadata(
             },
             "target_model_id": "doubao-seedance-2-0-mini-260615",
             "target_model_provider": "volcengine_ark",
+            "target_model_config_id": video_model_config_id,
             "aspect_ratio": "9:16",
             "resolution": "1080p",
             "product_lock_mode": "locked",
@@ -156,6 +164,8 @@ def test_prompt_optimizer_passes_video_generation_context_and_returns_metadata(
         ),
         "model_id": "gemini-3.5-flash-low",
         "optimizer_model_id": "gemini-3.5-flash-low",
+        "optimizer_model_config_id": prompt_model_config_id,
+        "optimizer_model_name": "Gemini 3.5 Flash Low",
         "compiler_metadata": {
             "version": "prompt-optimizer-v3",
             "output_format": "structured_video_text",

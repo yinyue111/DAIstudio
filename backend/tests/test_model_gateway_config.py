@@ -75,7 +75,7 @@ def test_models_yaml_seeds_prompt_optimizer_model(client):
         row = db.query(ModelConfig).filter(ModelConfig.use == "prompt").one()
 
         assert row.model_id == "gemini-3.5-flash-low"
-        assert row.cost_credits == 1
+        assert row.cost_credits == 3
         assert row.enabled is True
 
 
@@ -124,6 +124,20 @@ def test_production_rejects_partial_anthropic_env_gateway(
                 RuntimeError,
                 match="ANTHROPIC_BASE_URL 和 ANTHROPIC_AUTH_TOKEN 必须同时配置",
             ):
+                validate_model_gateway_rows(db)
+        finally:
+            db.rollback()
+
+
+def test_debug_runtime_rejects_anthropic_vision_row(client, monkeypatch):
+    monkeypatch.setattr(settings, "debug", True)
+
+    with SessionLocal() as db:
+        vision = db.query(ModelConfig).filter(ModelConfig.use == "vision").one()
+        vision.provider = "anthropic"
+        vision.gateway_format = "anthropic"
+        try:
+            with pytest.raises(RuntimeError, match="视觉反推不支持 Anthropic 原生协议"):
                 validate_model_gateway_rows(db)
         finally:
             db.rollback()
@@ -180,10 +194,10 @@ def test_admin_model_config_audit_records_before_after_without_secret(client, ma
         json={
             **body,
             "base_url": "https://audit-new.example.com/v1",
-            "api_key": "audit-new-secret",
-            "model_id": "model-new",
-            "cost_credits": 8,
-            "enabled": False,
+                "api_key": "audit-new-secret",
+                "model_id": "model-new",
+                "cost_credits": 8,
+                "enabled": True,
             "extra": {"internal_note": "sensitive-extra-value"},
         },
         headers=h,
@@ -203,7 +217,7 @@ def test_admin_model_config_audit_records_before_after_without_secret(client, ma
     assert detail["after"]["model_id"] == "model-new"
     assert detail["after"]["base_url"] == "https://audit-new.example.com/v1"
     assert detail["after"]["cost_credits"] == 8
-    assert detail["after"]["enabled"] is False
+    assert detail["after"]["enabled"] is True
     assert detail["after"]["extra_keys"] == ["internal_note"]
 
 

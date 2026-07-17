@@ -208,6 +208,7 @@ worker_image  image
 worker_video  video_submit
 worker_video_download  video_download
 worker_parse  parse
+worker_reverse  reverse
 ```
 
 `make run-worker` 本地默认仍可消费全部队列，方便开发；生产裸机部署可以用 `WORKER_ROLE` 直接拆：
@@ -218,6 +219,7 @@ WORKER_ROLE=image WORKER_CONCURRENCY=6 ./scripts/run_worker.sh
 WORKER_ROLE=video-submit ./scripts/run_worker.sh
 WORKER_ROLE=video-download ./scripts/run_worker.sh
 WORKER_ROLE=parse ./scripts/run_worker.sh
+WORKER_ROLE=reverse ./scripts/run_worker.sh
 ```
 
 `WORKER_ROLE=video` 仍作为本地兼容别名存在，但会同时消费 `video_submit,video_download`，生产不建议使用。特殊场景仍可直接覆盖 `WORKER_QUEUES`。需要兼容 macOS fork 调试时，可显式设置 `WORKER_POOL=solo WORKER_CONCURRENCY=1`，但这会让对应 worker 串行执行。`beat` 服务只能保留一个实例，负责支付对账、卡死任务回收、视频轮询恢复和清理任务。
@@ -368,8 +370,17 @@ Docker Compose 部署时，在线升级配置同样写在 `backend/.env.producti
 
 1. `ONLINE_UPDATE_REPO_DIR` 指向宿主机真实 checkout 的挂载目录。
 2. `ONLINE_UPDATE_APPLY_COMMAND` 指向一个不会直接重启 API 的固定命令，例如写入一个队列文件、调用宿主机 systemd oneshot、或通知外部 supervisor。
-3. 宿主机 oneshot/supervisor 再执行 `docker compose up -d --build migrate api worker worker_image worker_video worker_video_download worker_parse beat frontend`。
+3. 宿主机 oneshot/supervisor 再执行 `docker compose up -d --build migrate api worker worker_image worker_video worker_video_download worker_parse worker_reverse beat frontend`。
 4. 重启完成后先用 `https://dream.aiwuq.cn/api/live` 确认进程存活，再用 `https://dream.aiwuq.cn/api/ready` 确认 DB/Redis 就绪，最后检查容器状态和后台版本页。
+
+提示词反推异步化版本必须按以下顺序发布，不能把 API 或前端先于数据库迁移上线：
+
+1. 先运行 `migrate`，确认 Alembic 已到 `0035_async_reverse_operations`，旧同步接口仍可读写已有记录。
+2. 再发布 `api`，检查 `/api/live`、`/api/ready` 和 `/api/health` 均正常；此时旧前端仍可使用兼容接口。
+3. 然后发布独立的 `worker_reverse` 和 `beat`，确认 `reverse` 队列可消费、每分钟清理任务已注册，且 worker 使用线程池并发 2。
+4. 最后发布 `frontend`，完成图片反推、视频反推、封面确认、取消和刷新恢复的 mock 冒烟检查。
+
+若任一阶段失败，停止后续阶段；不要用强杀 worker 的方式回滚。已冻结但未完成的反推任务由补投和超时清理流程继续处理或退款。
 
 如果暂时没有宿主机执行器，建议把 `ONLINE_UPDATE_APPLY_COMMAND` 留空：后台只允许查看远端版本和升级预检；检测到新版本时会拒绝直接合并代码，之后由运维在宿主机手动执行拉取、迁移和 Compose 生效。
 

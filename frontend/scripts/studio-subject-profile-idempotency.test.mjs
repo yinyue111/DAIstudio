@@ -34,6 +34,7 @@ const request = {
   subjectMode: "product",
   assetUrl: "/api/uploads/upload/product.png",
   assetSignature: "image|/api/uploads/upload/product.png|",
+  modelConfigId: 1,
 };
 const prefetchIdentity = profileIdentity.buildSubjectProfileRequestIdentity(request);
 const submitIdentity = profileIdentity.buildSubjectProfileRequestIdentity(request);
@@ -154,7 +155,19 @@ const otherAssetId = generateReverseClientRequestId(
 );
 assert.notEqual(otherAssetId, prefetchId, "different subject assets must not reuse a profile request id");
 
+const otherModelIdentity = profileIdentity.buildSubjectProfileRequestIdentity({
+  ...request,
+  modelConfigId: 2,
+});
+assert.notEqual(
+  otherModelIdentity.signature,
+  prefetchIdentity.signature,
+  "different vision models must not share a billed profile request id or cached result",
+);
+
 const portraitIdentity = profileIdentity.buildSubjectProfileRequestIdentity({ ...request, subjectMode: "portrait" });
+assert.match(portraitIdentity.signature, /portrait_profile/);
+assert.match(prefetchIdentity.signature, /product_profile/);
 assert.notEqual(
   portraitIdentity.signature,
   prefetchIdentity.signature,
@@ -194,14 +207,29 @@ for (const [label, source] of [["upload", uploadSource], ["submit", submitSource
   );
   assert.match(
     source,
-    /!isRequestTimeoutError\(e\)[\s\S]{0,120}!shouldKeepPendingReverseRequest\(e\)[\s\S]{0,160}clearPendingReverseRequest\(pendingProfileReverseRequestRef,\s*profileRequestId\)/,
+    /const keepTracking = shouldKeepPendingReverseRequest\(e\)[\s\S]{0,160}!isRequestTimeoutError\(e\) && !keepTracking[\s\S]{0,160}clearPendingReverseRequest\(pendingProfileReverseRequestRef,\s*profileRequestId\)/,
     `${label} path must retain the billed profile request id while the backend reports it is still running`,
+  );
+  assert.match(
+    source,
+    /waitForTrackedProfileOperation\(createdOperation,[\s\S]*trackProfileReverseOperation/,
+    `${label} path must register new profile operations with the shared websocket/poll tracker`,
+  );
+  assert.doesNotMatch(
+    source,
+    /createAndWaitForReverseOperation/,
+    `${label} path must not start an independent polling loop beside the shared tracker`,
   );
 }
 assert.match(
   uploadSource,
   /cacheSubjectProfileResult\(\s*profileResultCacheRef,/,
   "upload prefetch should retain its successful result in the dedicated result cache ref",
+);
+assert.match(
+  uploadSource,
+  /model_config_id: Number\(visionModelConfigId\)/,
+  "upload prefetch must carry the selected vision model id",
 );
 assert.match(
   submitSource,
@@ -214,10 +242,10 @@ assert.match(
   "generation fallback should retain its successful result in the dedicated result cache ref",
 );
 const cachedReadIndex = submitSource.indexOf("readCachedSubjectProfileResult(");
-const reverseCallIndex = submitSource.indexOf("await api.reverse(");
+const reverseCallIndex = submitSource.indexOf("await api.createReverseOperation(");
 assert.ok(
   cachedReadIndex >= 0 && reverseCallIndex > cachedReadIndex,
-  "generation should consult the successful prefetch cache before issuing a reverse request",
+  "generation should consult the successful prefetch cache before creating an async reverse operation",
 );
 assert.doesNotMatch(uploadSource, /profile-prefetch/, "prefetch must not use a phase-specific idempotency scope");
 

@@ -17,7 +17,7 @@ from ..deps import get_client_ip, get_current_user
 from ..models import GenAsset, GenTask, UploadedAsset, User
 from ..schemas import GenerateIn, TaskOut
 from ..services import asset_refs, generation, locks
-from ..services.config_store import get_model_config
+from ..services.config_store import ModelConfigResolutionError, resolve_model_config
 from ..services.content_safety import assert_text_allowed
 from ..services.generation import (
     assert_model_snapshot_compatible,
@@ -27,15 +27,19 @@ from ..services.generation_media import video_render_duration
 from ..services.generation_prompts import compact_image_prompt_payload
 from ..services.generation_request import (
     assert_client_request_replay,
+    assert_product_detail_image_access,
+    assert_product_reference_image_access,
     assert_reference_access,
     default_image_n,
     estimate_generation_cost_from_snapshot,
     validate_generation_params,
+    validate_product_detail_images,
 )
 from ..services.generation_request import (
     request_fingerprint as build_request_fingerprint,
 )
 from ..services.generation_submit import submit_generation_task
+from ..services.model_capabilities import ModelCapabilityError, assert_generation_capability
 from ..services.rate_limit import incr_window
 from ..services.ssrf import (
     SsrfError,
@@ -366,6 +370,10 @@ def generate(body: GenerateIn, request: Request,
         source_asset_url = body.source_asset_url
         source_type = body.source_type
         task_params = params
+    if body.category == "video":
+        # Final renders inherit the preview task's params. Re-validate the
+        # ordered detail-image contract instead of trusting historical rows.
+        validate_product_detail_images(task_params)
     assert_text_allowed(
         db,
         prompt,
@@ -379,9 +387,47 @@ def generate(body: GenerateIn, request: Request,
             return build_task_out(db, existing_final)
 
     model_use = body.category  # image/video
-    model = get_model_config(db, model_use)
-    if not model or not model.enabled:
-        raise HTTPException(400, f"未配置可用的{model_use}模型")
+    selected_model_config_id = body.model_config_id
+    require_enabled = True
+    if parent is not None and body.stage == "final":
+        parent_model_config_id = getattr(parent, "model_config_id", None)
+        if (
+            selected_model_config_id is not None
+            and parent_model_config_id is not None
+            and int(selected_model_config_id) != int(parent_model_config_id)
+        ):
+            raise HTTPException(409, "视频最终生成必须使用预览任务绑定的同一模型")
+        selected_model_config_id = parent_model_config_id or selected_model_config_id
+        require_enabled = False
+    elif existing_client_task is not None:
+        existing_model_config_id = getattr(existing_client_task, "model_config_id", None)
+        if (
+            selected_model_config_id is not None
+            and existing_model_config_id is not None
+            and int(selected_model_config_id) != int(existing_model_config_id)
+        ):
+            raise HTTPException(409, "client_request_id 已用于不同模型配置")
+        selected_model_config_id = existing_model_config_id or selected_model_config_id
+        require_enabled = False
+    try:
+        model = resolve_model_config(
+            db,
+            model_use,
+            selected_model_config_id,
+            require_enabled=require_enabled,
+        )
+    except ModelConfigResolutionError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    try:
+        assert_generation_capability(
+            model,
+            category=body.category,
+            source_asset_url=source_asset_url,
+            source_type=source_type,
+            params=task_params,
+        )
+    except ModelCapabilityError as exc:
+        raise HTTPException(400, str(exc)) from exc
 
     if body.stage == "final" and parent:
         inherited_snapshot = (dict(parent.params or {}).get("_model_snapshot") or {})
@@ -409,6 +455,8 @@ def generate(body: GenerateIn, request: Request,
             "mask_image_url",
         ):
             assert_safe_user_asset_url(task_params.get(_url_key))
+        for _detail_url in task_params.get("product_detail_images") or []:
+            assert_safe_user_asset_url(_detail_url)
     except SsrfError as e:
         raise HTTPException(400, f"素材链接被安全策略拦截:{e}")
     assert_reference_access(
@@ -422,6 +470,16 @@ def generate(body: GenerateIn, request: Request,
         task_params.get("style_reference_image"),
         task_params.get("character_reference_image"),
         task_params.get("mask_image_url"),
+    )
+    assert_product_detail_image_access(
+        db,
+        user.id,
+        task_params.get("product_detail_images") or [],
+    )
+    assert_product_reference_image_access(
+        db,
+        user.id,
+        task_params.get("product_reference_image"),
     )
     if body.category == "video" and parent is None and not _video_reference_is_actionable(
         db,
@@ -492,6 +550,13 @@ def generate(body: GenerateIn, request: Request,
         prompt=prompt,
         params=task_params,
         parent_task_id=body.parent_task_id,
+        model_config_id=(
+            None
+            if existing_client_task is not None
+            and getattr(existing_client_task, "model_config_id", None) is None
+            and body.model_config_id is None
+            else int(model.id)
+        ),
     )
     if existing_client_task is not None:
         assert_client_request_replay(existing_client_task, request_fingerprint)
@@ -539,6 +604,7 @@ def generate(body: GenerateIn, request: Request,
             stage=body.stage,
             prompt=prompt,
             model_use=model_use,
+            model_config_id=int(model.id),
             params=task_params,
             client_request_id=client_request_id,
             cost=cost,

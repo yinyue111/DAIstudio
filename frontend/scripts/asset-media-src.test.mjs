@@ -8,7 +8,12 @@ globalThis.window = {
   location: new URL("http://127.0.0.1:3002/"),
 };
 
-const { assetPreviewSrc, safeAssetMediaSrc } = await import("../components/AssetMedia.jsx");
+const {
+  assetDisplaySrc,
+  assetPreviewSrc,
+  safeAssetMediaSrc,
+  shouldRenderVideo,
+} = await import("../components/AssetMedia.jsx");
 
 assert.equal(
   safeAssetMediaSrc("/media/preview/example.png"),
@@ -64,5 +69,42 @@ assert.equal(
   "slash-backslash authority URLs must not bypass the media allowlist",
 );
 assert.equal(safeAssetMediaSrc("javascript:alert(1)"), "");
+
+const uploadedVideo = {
+  origin: "uploaded",
+  type: "video",
+  url: "/api/uploads/upload_video/product.mp4",
+  preview_url: "/api/uploads/upload_video_preview/product.jpg",
+  unlocked: true,
+};
+assert.equal(
+  assetDisplaySrc(uploadedVideo),
+  uploadedVideo.preview_url,
+  "uploaded video cards should render the poster instead of loading MP4 bytes as an image",
+);
+assert.equal(
+  shouldRenderVideo(uploadedVideo),
+  false,
+  "uploaded video cards with a poster should render the poster frame",
+);
+assert.equal(
+  assetDisplaySrc(uploadedVideo, { interactive: true }),
+  uploadedVideo.url,
+  "interactive uploaded-video previews should use the playable MP4 URL",
+);
+assert.equal(
+  shouldRenderVideo(uploadedVideo, { interactive: true }),
+  true,
+  "interactive uploaded-video previews should render a video player",
+);
+
+const generatedVideo = {
+  origin: "generated",
+  type: "video",
+  preview_url: "/media/video_preview/generated.mp4",
+  unlocked: true,
+};
+assert.equal(assetDisplaySrc(generatedVideo), generatedVideo.preview_url);
+assert.equal(shouldRenderVideo(generatedVideo), true, "generated video card behavior must stay unchanged");
 
 console.log("asset media source normalization test passed");

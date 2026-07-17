@@ -6,7 +6,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session
 
 from ..db import get_db
@@ -55,7 +55,10 @@ def profile(db: Session = Depends(get_db), user: User = Depends(get_current_user
     base = (
         select(func.count())
         .select_from(GenAsset)
-        .where(GenAsset.user_id == user.id, GenAsset.created_at >= cutoff)
+        .where(
+            GenAsset.user_id == user.id,
+            or_(GenAsset.created_at >= cutoff, GenAsset.retained_at.is_not(None)),
+        )
     )
     images = db.execute(base.where(GenAsset.type == "image")).scalar() or 0
     videos = db.execute(base.where(GenAsset.type == "video")).scalar() or 0
@@ -93,7 +96,10 @@ def my_assets(type: str = "all", favorite: bool = False,
     q = (
         select(GenAsset, GenTask)
         .join(GenTask, GenTask.id == GenAsset.task_id)
-        .where(GenAsset.user_id == user.id, GenAsset.created_at >= cutoff)
+        .where(
+            GenAsset.user_id == user.id,
+            or_(GenAsset.created_at >= cutoff, GenAsset.retained_at.is_not(None)),
+        )
         .order_by(GenAsset.id.desc())
     )
     if type in ("image", "video"):
@@ -129,8 +135,9 @@ def my_assets(type: str = "all", favorite: bool = False,
     out: list[AssetOut] = []
     for asset, task in db.execute(q).all():
         ao = to_asset_out(db, asset, task=task)
-        ao.expires_at = retention.expiry_of(asset.created_at, days)
-        ao.days_left = retention.days_left(asset.created_at, days)
+        if asset.retained_at is None:
+            ao.expires_at = retention.expiry_of(asset.created_at, days)
+            ao.days_left = retention.days_left(asset.created_at, days)
         ao.category = task.category
         out.append(ao)
     return out

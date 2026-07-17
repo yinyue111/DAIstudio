@@ -13,29 +13,29 @@ from typing import Any
 
 _SIZE_RE = re.compile(r"^(\d{2,5})x(\d{2,5})$")
 
-REVERSE_IMAGE_COST = 2
+REVERSE_IMAGE_COST = 5
 REVERSE_VIDEO_PRESET_COSTS = {
-    "fast": 8,
-    "standard": 18,
-    "fine": 32,
+    "fast": 5,
+    "standard": 5,
+    "fine": 5,
 }
 
 IMAGE_PRICE_TABLE = {
-    "1k": 15,
-    "2k": 40,
-    "4k": 100,
+    "1k": 8,
+    "2k": 8,
+    "4k": 8,
 }
 IMAGE_EDIT_PRICE_TABLE = {
-    "1k": 20,
-    "2k": 55,
-    "4k": 130,
+    "1k": 8,
+    "2k": 8,
+    "4k": 8,
 }
 
-VIDEO_PREVIEW_COST = 15
+VIDEO_PREVIEW_COST = 50
 VIDEO_PER_SECOND = {
-    "480p": 8,
-    "720p": 16,
-    "1080p": 28,
+    "480p": 10,
+    "720p": 10,
+    "1080p": 10,
 }
 
 

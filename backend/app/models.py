@@ -224,6 +224,15 @@ class UploadedAsset(Base):
     __tablename__ = "uploaded_assets"
     __table_args__ = (
         CheckConstraint("bytes IS NULL OR bytes >= 0", name="ck_uploaded_assets_bytes_nonnegative"),
+        CheckConstraint("duration IS NULL OR duration >= 0", name="ck_uploaded_assets_duration_nonnegative"),
+        Index("ix_uploaded_assets_user_created", "user_id", "created_at"),
+        Index(
+            "ix_uploaded_assets_user_favorite_created",
+            "user_id",
+            "favorite",
+            "created_at",
+        ),
+        Index("ix_uploaded_assets_user_retained", "user_id", "retained_at"),
     )
 
     key: Mapped[str] = mapped_column(String(255), primary_key=True)
@@ -231,8 +240,11 @@ class UploadedAsset(Base):
     mime: Mapped[str | None] = mapped_column(String(64))
     width: Mapped[int | None] = mapped_column(Integer)
     height: Mapped[int | None] = mapped_column(Integer)
+    duration: Mapped[int | None] = mapped_column(Integer)
     bytes: Mapped[int | None] = mapped_column(BigInteger)
     original_filename: Mapped[str | None] = mapped_column(String(255))
+    favorite: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    retained_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
@@ -256,9 +268,15 @@ class ReverseOperation(Base):
     __tablename__ = "reverse_operations"
     __table_args__ = (
         CheckConstraint(
-            "status in ('running', 'succeeded', 'failed')",
+            "status in ('queued', 'running', 'needs_confirmation', 'succeeded', 'failed', 'canceled')",
             name="ck_reverse_operations_status_valid",
         ),
+        CheckConstraint(
+            "progress >= 0 AND progress <= 100",
+            name="ck_reverse_operations_progress_range",
+        ),
+        CheckConstraint("cost_frozen >= 0", name="ck_reverse_operations_cost_frozen_nonnegative"),
+        CheckConstraint("cost_settled >= 0", name="ck_reverse_operations_cost_settled_nonnegative"),
         Index("uq_reverse_operations_user_client_request_id", "user_id", "client_request_id", unique=True),
         Index("ix_reverse_operations_user_created", "user_id", "created_at"),
         Index("ix_reverse_operations_status_updated", "status", "updated_at"),
@@ -266,15 +284,35 @@ class ReverseOperation(Base):
 
     id: Mapped[int] = mapped_column(BigIntPK, primary_key=True, autoincrement=True)
     user_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("users.id"), index=True)
+    model_config_id: Mapped[int | None] = mapped_column(
+        BigInteger,
+        ForeignKey("model_configs.id"),
+        index=True,
+    )
     client_request_id: Mapped[str | None] = mapped_column(String(128))
     request_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
     target: Mapped[str] = mapped_column(String(32), nullable=False)
     asset_url: Mapped[str] = mapped_column(Text, nullable=False)
-    status: Mapped[str] = mapped_column(String(16), default="running", nullable=False)
+    status: Mapped[str] = mapped_column(String(32), default="queued", nullable=False)
+    phase: Mapped[str | None] = mapped_column(String(32))
+    progress: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    request_context: Mapped[dict | None] = mapped_column(JSONType)
+    model_snapshot: Mapped[dict | None] = mapped_column(JSONType)
+    template_snapshot: Mapped[dict | None] = mapped_column(JSONType)
+    pricing_snapshot: Mapped[dict | None] = mapped_column(JSONType)
+    celery_task_id: Mapped[str | None] = mapped_column(String(64))
     result: Mapped[dict | None] = mapped_column(JSONType)
     charged_credits: Mapped[int] = mapped_column(BigInteger, default=0, nullable=False)
+    cost_frozen: Mapped[int] = mapped_column(BigInteger, default=0, nullable=False)
+    cost_settled: Mapped[int] = mapped_column(BigInteger, default=0, nullable=False)
     reference_count: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    confirmation_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    cancel_requested: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    attempt_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    error_code: Mapped[str | None] = mapped_column(String(64))
     error: Mapped[str | None] = mapped_column(Text)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
@@ -304,6 +342,11 @@ class GenTask(Base):
 
     id: Mapped[int] = mapped_column(BigIntPK, primary_key=True, autoincrement=True)
     user_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("users.id"), index=True)
+    model_config_id: Mapped[int | None] = mapped_column(
+        BigInteger,
+        ForeignKey("model_configs.id"),
+        index=True,
+    )
     source_asset_url: Mapped[str | None] = mapped_column(Text)
     source_type: Mapped[str | None] = mapped_column(String(8))  # image/video
     category: Mapped[str] = mapped_column(String(8), nullable=False)  # image/video
@@ -363,6 +406,10 @@ class GenAsset(Base):
         CheckConstraint("width IS NULL OR width > 0", name="ck_gen_assets_width_positive"),
         CheckConstraint("height IS NULL OR height > 0", name="ck_gen_assets_height_positive"),
         CheckConstraint("duration IS NULL OR duration >= 0", name="ck_gen_assets_duration_nonnegative"),
+        CheckConstraint("bytes IS NULL OR bytes >= 0", name="ck_gen_assets_bytes_nonnegative"),
+        Index("ix_gen_assets_user_created", "user_id", "created_at"),
+        Index("ix_gen_assets_user_favorite_created", "user_id", "favorite", "created_at"),
+        Index("ix_gen_assets_user_retained", "user_id", "retained_at"),
     )
 
     id: Mapped[int] = mapped_column(BigIntPK, primary_key=True, autoincrement=True)
@@ -378,6 +425,8 @@ class GenAsset(Base):
     width: Mapped[int | None] = mapped_column(Integer)
     height: Mapped[int | None] = mapped_column(Integer)
     duration: Mapped[int | None] = mapped_column(Integer)
+    bytes: Mapped[int | None] = mapped_column(BigInteger)
+    retained_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
@@ -478,6 +527,11 @@ class GatewayCall(Base):
     id: Mapped[int] = mapped_column(BigIntPK, primary_key=True, autoincrement=True)
     user_id: Mapped[int | None] = mapped_column(BigInteger, index=True)
     task_id: Mapped[int | None] = mapped_column(BigInteger, index=True)
+    model_config_id: Mapped[int | None] = mapped_column(
+        BigInteger,
+        ForeignKey("model_configs.id"),
+        index=True,
+    )
     kind: Mapped[str] = mapped_column(String(16))  # reverse/prompt_optimize/image/video_*
     model_id: Mapped[str | None] = mapped_column(String(128))
     status: Mapped[str | None] = mapped_column(String(16))  # ok/failed
@@ -513,7 +567,15 @@ class AuditLog(Base):
 class ModelConfig(Base):
     __tablename__ = "model_configs"
     __table_args__ = (
-        Index("ix_model_configs_use", "use", unique=True),
+        Index("ix_model_configs_use", "use"),
+        Index("uq_model_configs_use_model_id", "use", "model_id", unique=True),
+        Index(
+            "uq_model_configs_default_per_use",
+            "use",
+            unique=True,
+            postgresql_where=text("is_default"),
+            sqlite_where=text("is_default = 1"),
+        ),
         CheckConstraint("use in ('vision', 'image', 'video', 'prompt')", name="ck_model_configs_use_valid"),
         CheckConstraint(
             "gateway_format IS NULL OR gateway_format in ('openai', 'ark', 'anthropic')",
@@ -526,6 +588,9 @@ class ModelConfig(Base):
     id: Mapped[int] = mapped_column(BigIntPK, primary_key=True, autoincrement=True)
     use: Mapped[str] = mapped_column(String(16), nullable=False)  # vision/image/video/prompt
     model_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    display_name: Mapped[str] = mapped_column(String(128), nullable=False)
+    is_default: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    sort_order: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     provider: Mapped[str | None] = mapped_column(String(32))
     base_url: Mapped[str | None] = mapped_column(String(512))
     api_key_encrypted: Mapped[str | None] = mapped_column(Text)

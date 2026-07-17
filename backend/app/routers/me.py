@@ -4,7 +4,8 @@ import math
 import re
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, HTTPException, Request, Response
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
+from fastapi.responses import FileResponse
 from sqlalchemy import update
 from sqlalchemy.orm import Session
 
@@ -14,9 +15,18 @@ from ..deps import get_client_ip, get_current_user
 from ..models import User, UserDraft
 from ..password_policy import MIN_PASSWORD_LEN
 from ..redis_client import redis_client
-from ..schemas import ChangePasswordIn, UserDraftIn, UserDraftOut, UserOut
+from ..schemas import (
+    ChangePasswordIn,
+    UserAssetBatchDeleteIn,
+    UserAssetListOut,
+    UserAssetMetadataIn,
+    UserAssetMutationOut,
+    UserDraftIn,
+    UserDraftOut,
+    UserOut,
+)
 from ..security import hash_password, verify_password
-from ..services import audit
+from ..services import audit, storage, user_assets
 from ..services.rate_limit import incr_window
 
 router = APIRouter(prefix="/api", tags=["me"])
@@ -31,6 +41,153 @@ _DRAFT_KEY_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 @router.get("/me", response_model=UserOut)
 def me(user: User = Depends(get_current_user)):
     return user
+
+
+def _optional_bool(value: str | None) -> bool | None:
+    normalized = str(value or "").strip().lower()
+    if not normalized:
+        return None
+    if normalized == "true":
+        return True
+    if normalized == "false":
+        return False
+    raise HTTPException(400, "favorite 应为 true 或 false")
+
+
+def _asset_error(error: Exception) -> HTTPException:
+    if isinstance(error, (user_assets.InvalidAssetRef, user_assets.InvalidCursor)):
+        return HTTPException(400, str(error))
+    if isinstance(error, user_assets.AssetNotFound):
+        return HTTPException(404, str(error))
+    if isinstance(error, user_assets.AssetInUse):
+        return HTTPException(409, str(error))
+    raise error
+
+
+@router.get("/me/assets", response_model=UserAssetListOut)
+def list_me_assets(
+    origin: str = Query(default="all", pattern="^(all|generated|uploaded)$"),
+    type: str = Query(default="all", pattern="^(all|image|video)$"),
+    favorite: str | None = None,
+    retention: str = Query(default="all", pattern="^(all|retained|expiring)$"),
+    limit: int = Query(default=60, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+    cursor: str | None = None,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    try:
+        return user_assets.list_user_assets(
+            db,
+            user.id,
+            origin=origin,
+            asset_type=type,
+            favorite=_optional_bool(favorite),
+            retention_filter=retention,
+            limit=limit,
+            offset=offset,
+            cursor=cursor,
+        )
+    except (user_assets.InvalidCursor, user_assets.InvalidAssetRef) as error:
+        raise _asset_error(error) from None
+
+
+@router.post("/me/assets/metadata", response_model=UserAssetMutationOut)
+def update_me_asset_metadata(
+    body: UserAssetMetadataIn,
+    request: Request,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    try:
+        asset_refs = user_assets.update_asset_metadata(
+            db,
+            user.id,
+            body.asset_refs,
+            favorite=body.favorite,
+            retained=body.retained,
+        )
+    except (user_assets.InvalidAssetRef, user_assets.AssetNotFound) as error:
+        db.rollback()
+        raise _asset_error(error) from None
+    audit.log(
+        db,
+        user_id=user.id,
+        action="update_user_asset_metadata",
+        biz_type="user_asset",
+        ip=get_client_ip(request),
+        detail={
+            "asset_refs": asset_refs,
+            "favorite": body.favorite,
+            "retained": body.retained,
+        },
+    )
+    return UserAssetMutationOut(asset_refs=asset_refs)
+
+
+@router.post("/me/assets/batch-delete", response_model=UserAssetMutationOut)
+def batch_delete_me_assets(
+    body: UserAssetBatchDeleteIn,
+    request: Request,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    try:
+        asset_refs = user_assets.delete_assets(db, user.id, body.asset_refs)
+    except (
+        user_assets.InvalidAssetRef,
+        user_assets.AssetNotFound,
+        user_assets.AssetInUse,
+    ) as error:
+        db.rollback()
+        raise _asset_error(error) from None
+    audit.log(
+        db,
+        user_id=user.id,
+        action="batch_delete_user_assets",
+        biz_type="user_asset",
+        ip=get_client_ip(request),
+        detail={"asset_refs": asset_refs},
+    )
+    return UserAssetMutationOut(asset_refs=asset_refs)
+
+
+@router.get("/me/assets/download")
+def download_me_asset(
+    request: Request,
+    asset_ref: str = Query(min_length=3, max_length=512),
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    try:
+        resolved = user_assets.resolve_asset_ref(db, user.id, asset_ref)
+    except (user_assets.InvalidAssetRef, user_assets.AssetNotFound) as error:
+        raise _asset_error(error) from None
+    if resolved.origin == "generated":
+        from .assets import download as download_generated_asset
+
+        return download_generated_asset(resolved.row.id, request, db, user)
+
+    row = resolved.row
+    try:
+        path = storage.local_path(row.key)
+    except Exception:
+        raise HTTPException(404, "原文件不存在") from None
+    if not path.exists() or not path.is_file():
+        raise HTTPException(404, "原文件不存在")
+    audit.log(
+        db,
+        user_id=user.id,
+        action="download_user_asset",
+        biz_type="upload",
+        ip=get_client_ip(request),
+        detail={"asset_ref": resolved.asset_ref, "type": row.mime},
+    )
+    return FileResponse(
+        str(path),
+        filename=row.original_filename or path.name,
+        media_type=row.mime or None,
+    )
 
 
 def _validate_draft_key(key: str) -> str:

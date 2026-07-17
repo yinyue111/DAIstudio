@@ -718,6 +718,18 @@ def test_admin_usage_dashboard_and_model_cost_dashboard(client, make_user, auth)
                 created_at=now,
             )
         )
+        db.add(
+            GatewayCall(
+                user_id=uid,
+                kind="reverse",
+                model_id="legacy-reverse",
+                status="ok",
+                latency_ms=900,
+                total_tokens=25,
+                detail={"cost": 2},
+                created_at=now,
+            )
+        )
         db.commit()
     finally:
         db.close()
@@ -736,3 +748,26 @@ def test_admin_usage_dashboard_and_model_cost_dashboard(client, make_user, auth)
     cost_rows = costs.json()["models"]
     assert any(row["model_id"] == "mock-image" and row["call_count"] >= 1 for row in cost_rows)
     assert any(row["model_id"] == "mock-video" and row["failed_count"] >= 1 for row in cost_rows)
+    assert any(
+        row["model_id"] == "legacy-reverse" and row["estimated_cost_credits"] == 2
+        for row in cost_rows
+    )
+
+
+def test_reverse_task_uses_isolated_queue_without_hard_kill():
+    from app.celery_app import celery_app
+    from app.tasks import reverse_operation_task
+
+    route = celery_app.amqp.router.route({}, "reverse.run", args=(1,), kwargs={})
+    assert route["queue"].name == "reverse"
+    assert reverse_operation_task.acks_late is True
+    assert reverse_operation_task.reject_on_worker_lost is True
+    assert reverse_operation_task.soft_time_limit is None
+    assert reverse_operation_task.time_limit is None
+    task_options = reverse_operation_task._get_exec_options()
+    assert task_options["soft_time_limit"] is None
+    assert task_options["time_limit"] is None
+
+    reaper = celery_app.conf.beat_schedule["reap-stuck-reverse-operations"]
+    assert reaper["task"] == "cleanup.reap_reverse"
+    assert reaper["schedule"]._orig_minute == "*"

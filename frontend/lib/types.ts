@@ -13,6 +13,8 @@ export type {
   GeneratePayload,
   ProductPixelLockMode,
   ReverseTarget,
+  ReverseOperation,
+  ReverseOperationStatus,
   SubjectProtectionPreview,
   Task,
   TaskStatus,
@@ -74,6 +76,10 @@ export interface ReverseVideoAnalysis {
   };
   sampled_frames?: Array<{ index: number; timestamp_seconds: number }>;
   shots?: Array<Record<string, unknown>>;
+  analysis_mode?: "multi_frame" | "cover" | "image_motion" | string;
+  fallback_reason?: string | null;
+  evidence_coverage?: { start_seconds?: number; end_seconds?: number; ratio?: number } | null;
+  analysis_gaps?: Array<string | Record<string, unknown>>;
 }
 
 export interface WorkspaceState {
@@ -91,20 +97,28 @@ export interface WorkspaceState {
   productPixelLockMode: ProductPixelLockMode;
   videoAnalysisPreset: string;
   url: string;
+  appliedUrl: string;
   parsing: boolean;
   uploading: boolean;
   reversing: boolean;
+  reverseOperation: import("./api").ReverseOperation | null;
+  profileOperation: import("./api").ReverseOperation | null;
   assets: Asset[];
   selected: Asset | null;
   productAsset: Asset | null;
+  productDetailAssets: Asset[];
   productProfile: SubjectProfile | null;
   productProfileSource: string;
+  portraitProfile: SubjectProfile | null;
+  portraitProfileSource: string;
   productProfiling: boolean;
   subjectProtection: SubjectProtectionPreview | null;
   subjectProtectionLoading: boolean;
   subjectProtectionSource: string;
   variationSource: Asset | null;
   structured: Record<string, string>;
+  structuredBaseline: Record<string, string>;
+  structuredDirty: boolean;
   structuredSource: string;
   reverseVideoAnalysis: ReverseVideoAnalysis | null;
   promptSourceSignature: string;
@@ -122,6 +136,23 @@ export interface ModelInfo {
   enabled: boolean;
   preview_cost?: number | null;
   final_cost?: number;
+  model_config_id?: number | null;
+  model_id?: string | null;
+  name?: string | null;
+  provider?: string | null;
+}
+
+export interface ModelOption {
+  id: number;
+  use: "vision" | "image" | "video" | "prompt";
+  name: string;
+  model_id: string;
+  provider: string;
+  provider_label: string;
+  cost_credits: number;
+  unlock_cost: number;
+  is_default: boolean;
+  capabilities: Record<string, boolean | number | string | string[]>;
 }
 
 export interface PricingConfig {
@@ -149,6 +180,7 @@ export interface AppConfig {
     payment_enabled: boolean;
   };
   models: Record<string, ModelInfo>;
+  model_options: Record<"vision" | "image" | "video" | "prompt", ModelOption[]>;
   pricing: PricingConfig;
   image_sizes: string[];
   image_size_max_dim: number;

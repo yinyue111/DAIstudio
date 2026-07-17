@@ -116,12 +116,32 @@ def test_ark_content_binds_product_to_its_actual_image_number():
         },
     )
 
-    assert content[1]["role"] == "first_frame"
-    assert content[2]["role"] == "reference_image"
-    assert "图片1为首帧" in content[0]["text"]
-    assert "图片2中的产品是唯一商品主体" in content[0]["text"]
-    assert "图片2中的产品是唯一产品身份" in content[0]["text"]
+    assert content[1]["role"] == "reference_image"
+    assert content[2]["role"] == "first_frame"
+    assert "图片2为首帧" in content[0]["text"]
+    assert "图片1中的产品是唯一商品主体" in content[0]["text"]
+    assert "图片1中的产品是唯一产品身份" in content[0]["text"]
     assert "上传产品" not in content[0]["text"]
+
+
+def test_ark_content_orders_product_theme_then_details_before_other_references():
+    content = gateway._ark_content(
+        "保持上传产品的包装和细节",
+        {
+            "product_reference_image": "http://x/product.png",
+            "product_detail_images": ["http://x/detail-a.png", "http://x/detail-b.png"],
+            "first_frame_image": "http://x/first.png",
+        },
+    )
+
+    assert [item["image_url"]["url"] for item in content[1:]] == [
+        "http://x/product.png",
+        "http://x/detail-a.png",
+        "http://x/detail-b.png",
+        "http://x/first.png",
+    ]
+    assert "图片2为产品细节参考1" in content[0]["text"]
+    assert "图片3为产品细节参考2" in content[0]["text"]
 
 
 def test_ark_content_includes_distinct_style_reference():
@@ -323,6 +343,60 @@ def test_generic_video_submit_maps_product_reference_to_configured_field(monkeyp
 
     assert seen["payload"]["reference_image_url"] == "https://example.com/product.png"
     assert "product_reference_image" not in seen["payload"]
+
+
+def test_generic_video_submit_requires_explicit_product_detail_field(monkeypatch):
+    monkeypatch.setattr(settings, "mock_mode", False)
+    monkeypatch.setattr(settings, "video_gateway_base_url", "https://video.example.com")
+    monkeypatch.setattr(settings, "video_gateway_api_key", "test-key")
+    monkeypatch.setattr(settings, "video_gateway_format", "openai")
+
+    with pytest.raises(ValueError, match="未配置产品细节图上游字段"):
+        gateway.submit_video(
+            "animate product",
+            "custom-video",
+            {
+                "product_reference_image": "https://example.com/product.png",
+                "product_detail_images": ["https://example.com/detail.png"],
+            },
+            extra={"product_image_field": "product_image"},
+        )
+
+
+def test_generic_video_submit_maps_ordered_product_details_to_configured_field(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(settings, "mock_mode", False)
+    monkeypatch.setattr(settings, "video_gateway_base_url", "https://video.example.com")
+    monkeypatch.setattr(settings, "video_gateway_api_key", "test-key")
+    monkeypatch.setattr(settings, "video_gateway_format", "openai")
+    monkeypatch.setattr(
+        gateway,
+        "_video_post",
+        lambda _path, payload, timeout=120: seen.update(payload=payload) or {"id": "task-details"},
+    )
+
+    gateway.submit_video(
+        "animate product",
+        "custom-video",
+        {
+            "product_reference_image": "https://example.com/product.png",
+            "product_detail_images": [
+                "https://example.com/detail-a.png",
+                "https://example.com/detail-b.png",
+            ],
+        },
+        extra={
+            "product_image_field": "product_image",
+            "product_detail_images_field": "detail_images",
+        },
+    )
+
+    assert seen["payload"]["product_image"] == "https://example.com/product.png"
+    assert seen["payload"]["detail_images"] == [
+        "https://example.com/detail-a.png",
+        "https://example.com/detail-b.png",
+    ]
+    assert "product_detail_images" not in seen["payload"]
 
 
 def test_grok_video_submit_rejects_distinct_product_and_first_frame_on_same_field(monkeypatch):

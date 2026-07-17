@@ -8,6 +8,7 @@ import { useToast } from "../../components/ToastProvider";
 import { api } from "../../lib/api";
 import { redirectOnAuthError, reportBackgroundError } from "../../lib/errorHandling";
 import { saveStudioUserDraft } from "../../lib/studioSession";
+import { reverseSnapshotFromHistory } from "../studio/reverseSnapshot";
 
 export default function PromptsPage() {
   const router = useRouter();
@@ -52,11 +53,14 @@ export default function PromptsPage() {
   }
 
   function usePrompt(item, { trackUsage = true } = {}) {
+    const reverseSnapshotV2 = reverseSnapshotFromHistory(item);
     try {
       const saved = saveStudioUserDraft(window.localStorage, STUDIO_DRAFT_PROMPT_KEY, me?.id, {
         prompt: item.prompt || "",
         category: item.category || "general",
-        creationMode: item.category === "video" ? "video" : "image",
+        creationMode: reverseSnapshotV2?.creation_mode || (item.category === "video" ? "video" : "image"),
+        reverse_snapshot_v2: reverseSnapshotV2,
+        legacy_reverse: item.source === "reverse" && !reverseSnapshotV2,
         savedAt: Date.now(),
       });
       if (!saved) throw new Error("无法保存当前用户的提示词草稿");

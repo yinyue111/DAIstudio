@@ -12,6 +12,27 @@ MAX_PAYMENT_AMOUNT_CENTS = 1_000_000_00  # 1,000,000 CNY
 MAX_PAYMENT_PACKAGE_CREDITS = 100_000_000
 MAX_PAYMENT_CREDITS_PER_CENT = 10_000
 
+ModelUse = Literal["vision", "image", "video", "prompt"]
+ModelProvider = Literal[
+    "openai",
+    "volcengine_ark",
+    "openrouter",
+    "siliconflow",
+    "deepseek",
+    "moonshot",
+    "zhipu",
+    "dashscope",
+    "baidu_qianfan",
+    "tencent_hunyuan",
+    "yinyue",
+    "anthropic",
+    "antigravity",
+    "grok",
+    "gemini",
+    "custom_openai",
+]
+ModelGatewayFormat = Literal["openai", "ark", "anthropic"]
+
 
 def _serialize_utc_datetime(value: datetime) -> str:
     if value.tzinfo is None:
@@ -130,15 +151,118 @@ class ParseOut(BaseModel):
 
 
 # --- Reverse prompt ---
+ReverseTarget = Literal["image", "video", "product_profile", "portrait_profile"]
+ReverseOperationStatus = Literal[
+    "queued",
+    "running",
+    "needs_confirmation",
+    "succeeded",
+    "failed",
+    "canceled",
+]
+
+
 class ReverseIn(BaseModel):
     client_request_id: str | None = Field(default=None, min_length=8, max_length=128)
     asset_url: str
-    target: Literal["image", "video", "product_profile"] = "image"  # selects prompt dimensions
+    target: ReverseTarget = "image"  # selects prompt dimensions
     source_type: Literal["image", "video"] | None = None
     video_analysis_preset: Literal["fast", "standard", "fine"] | None = None
-    # For a video asset_url with target=video: a cover/keyframe image to fall
-    # back to when server-side keyframe sampling is unavailable.
+    # Candidate cover used only after explicit fallback confirmation when
+    # server-side keyframe sampling is unavailable.
     fallback_image: str | None = None
+    model_config_id: int | None = Field(default=None, gt=0)
+
+    @field_validator("client_request_id")
+    @classmethod
+    def _normalize_optional_request_id(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip()
+        if not 8 <= len(normalized) <= 128:
+            raise ValueError("client_request_id 去除首尾空白后长度必须为 8-128")
+        return normalized
+
+
+class ReverseOperationCreate(BaseModel):
+    client_request_id: str = Field(min_length=8, max_length=128)
+    asset_url: str = Field(min_length=1, max_length=4096)
+    target: ReverseTarget = "image"
+    source_type: Literal["image", "video"] | None = None
+    video_analysis_preset: Literal["fast", "standard", "fine"] | None = None
+    fallback_image: str | None = Field(default=None, max_length=4096)
+    workspace_snapshot_v2: dict[str, Any] | None = None
+    model_config_id: int | None = Field(default=None, gt=0)
+
+    @field_validator("client_request_id")
+    @classmethod
+    def _normalize_request_id(cls, value: str) -> str:
+        normalized = value.strip()
+        if not 8 <= len(normalized) <= 128:
+            raise ValueError("client_request_id 去除首尾空白后长度必须为 8-128")
+        return normalized
+
+    @field_validator("workspace_snapshot_v2")
+    @classmethod
+    def _workspace_snapshot_size(cls, value: dict[str, Any] | None):
+        if value is not None:
+            _validate_workspace_snapshot(value)
+            _validate_json_payload_size(value, 64 * 1024, "工作区快照")
+        return value
+
+
+class ReverseOperationConfirm(BaseModel):
+    fallback_image: str | None = Field(default=None, max_length=4096)
+
+
+class ReverseOperationTimestamps(BaseModel):
+    created_at: UtcDateTime | None = None
+    updated_at: UtcDateTime | None = None
+    started_at: UtcDateTime | None = None
+    finished_at: UtcDateTime | None = None
+
+
+class ReverseOperationOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    model_config_id: int | None = None
+    model_name: str | None = None
+    model_id: str | None = None
+    target: ReverseTarget
+    source_type: Literal["image", "video"] | None = None
+    status: ReverseOperationStatus
+    phase: str | None = None
+    progress: int = Field(default=0, ge=0, le=100)
+    result: dict[str, Any] | None = None
+    video_analysis: dict[str, Any] | None = None
+    request_context: dict[str, Any] | None = None
+    workspace_snapshot_v2: dict[str, Any] | None = None
+    reference_count: int = Field(default=1, ge=0)
+    charged_credits: int = Field(default=0, ge=0)
+    cost_frozen: int = 0
+    cost_settled: int = 0
+    confirmation_expires_at: UtcDateTime | None = None
+    cancel_requested: bool = False
+    error_code: str | None = None
+    error: str | None = None
+    created_at: UtcDateTime | None = None
+    updated_at: UtcDateTime | None = None
+    started_at: UtcDateTime | None = None
+    finished_at: UtcDateTime | None = None
+    timestamps: ReverseOperationTimestamps = Field(default_factory=ReverseOperationTimestamps)
+
+    @model_validator(mode="after")
+    def _sync_timestamps(self):
+        # Keep the flat fields for one compatibility window while making the
+        # grouped lifecycle contract present on every response.
+        self.timestamps = ReverseOperationTimestamps(
+            created_at=self.created_at,
+            updated_at=self.updated_at,
+            started_at=self.started_at,
+            finished_at=self.finished_at,
+        )
+        return self
 
 
 class ReverseOut(BaseModel):
@@ -147,6 +271,8 @@ class ReverseOut(BaseModel):
     charged_credits: int = 0
     reference_count: int = 1
     video_analysis: dict[str, Any] | None = None
+    model_config_id: int | None = None
+    model_name: str | None = None
 
 
 class PromptOptimizeIn(BaseModel):
@@ -163,6 +289,8 @@ class PromptOptimizeIn(BaseModel):
     resolution: str | None = Field(default=None, max_length=32)
     product_lock_mode: Literal["free", "locked"] | None = None
     product_video_template: str | None = Field(default=None, max_length=64)
+    optimizer_model_config_id: int | None = Field(default=None, gt=0)
+    target_model_config_id: int | None = Field(default=None, gt=0)
 
     @field_validator(
         "prompt",
@@ -200,6 +328,8 @@ class PromptOptimizeOut(BaseModel):
     optimizer_model_id: str | None = None
     compiler_metadata: dict[str, Any] | None = None
     context_metadata: dict[str, Any] | None = None
+    optimizer_model_config_id: int | None = None
+    optimizer_model_name: str | None = None
 
 
 # --- Generate ---
@@ -218,6 +348,7 @@ class GenerateIn(BaseModel):
     instruction: str | None = None
     source_asset_meta: dict[str, Any] | None = None
     params: dict[str, Any] = Field(default_factory=dict)
+    model_config_id: int | None = Field(default=None, gt=0)
 
 
 class TaskOut(BaseModel):
@@ -229,6 +360,8 @@ class TaskOut(BaseModel):
     parent_task_id: int | None = None
     status: str
     model_use: str | None = None
+    model_config_id: int | None = None
+    model_name: str | None = None
     model_id: str | None = None
     model_provider: str | None = None
     prompt_text: str | None = None
@@ -293,6 +426,83 @@ class AssetOut(BaseModel):
     quality_message: str | None = None
 
     model_config = ConfigDict(from_attributes=True)
+
+
+class UserAssetItem(BaseModel):
+    asset_ref: str
+    origin: Literal["generated", "uploaded"]
+    type: Literal["image", "video"]
+    url: str | None = None
+    preview_url: str | None = None
+    thumb: str | None = None
+    favorite: bool = False
+    retained: bool = False
+    unlocked: bool = False
+    unlock_cost: int = 0
+    moderation_status: str = "active"
+    available: bool = True
+    created_at: UtcDateTime | None = None
+    expires_at: UtcDateTime | None = None
+    days_left: int | None = None
+    bytes: int | None = None
+    width: int | None = None
+    height: int | None = None
+    duration: int | None = None
+    filename: str | None = None
+    task_id: int | None = None
+    download_url: str | None = None
+
+
+class UserAssetStats(BaseModel):
+    generated: int = 0
+    uploaded: int = 0
+    images: int = 0
+    videos: int = 0
+    favorites: int = 0
+    retained: int = 0
+
+
+class UserAssetListOut(BaseModel):
+    items: list[UserAssetItem] = Field(default_factory=list)
+    total: int = 0
+    stats: UserAssetStats = Field(default_factory=UserAssetStats)
+    next_cursor: str | None = None
+
+
+class UserAssetMetadataIn(BaseModel):
+    asset_refs: list[str] = Field(min_length=1, max_length=100)
+    favorite: bool | None = None
+    retained: bool | None = None
+
+    @field_validator("asset_refs")
+    @classmethod
+    def _normalize_asset_refs(cls, values: list[str]) -> list[str]:
+        normalized = list(dict.fromkeys(str(value or "").strip() for value in values))
+        if not normalized or any(not value or len(value) > 512 for value in normalized):
+            raise ValueError("asset_refs 非法")
+        return normalized
+
+    @model_validator(mode="after")
+    def _require_metadata_change(self):
+        if self.favorite is None and self.retained is None:
+            raise ValueError("favorite 和 retained 至少提供一个")
+        return self
+
+
+class UserAssetBatchDeleteIn(BaseModel):
+    asset_refs: list[str] = Field(min_length=1, max_length=100)
+
+    @field_validator("asset_refs")
+    @classmethod
+    def _normalize_asset_refs(cls, values: list[str]) -> list[str]:
+        normalized = list(dict.fromkeys(str(value or "").strip() for value in values))
+        if not normalized or any(not value or len(value) > 512 for value in normalized):
+            raise ValueError("asset_refs 非法")
+        return normalized
+
+
+class UserAssetMutationOut(BaseModel):
+    asset_refs: list[str] = Field(default_factory=list)
 
 
 class AssetReportIn(BaseModel):
@@ -504,27 +714,17 @@ class UserStatusIn(BaseModel):
 class ModelConfigIn(BaseModel):
     model_config = ConfigDict(protected_namespaces=())
 
-    use: Literal["vision", "image", "video", "prompt"]
+    use: ModelUse
     model_id: str = Field(min_length=1, max_length=128)
-    provider: Literal[
-        "openai",
-        "volcengine_ark",
-        "openrouter",
-        "siliconflow",
-        "deepseek",
-        "moonshot",
-        "zhipu",
-        "dashscope",
-        "baidu_qianfan",
-        "tencent_hunyuan",
-        "yinyue",
-        "anthropic",
-        "custom_openai",
-    ] | None = None
+    display_name: str | None = Field(default=None, min_length=1, max_length=128)
+    is_default: bool | None = None
+    sort_order: int = Field(default=0, ge=-100000, le=100000)
+    provider_config_id: int | None = Field(default=None, ge=1)
+    provider: ModelProvider | None = None
     base_url: str | None = Field(default=None, max_length=512)
     api_key: str | None = Field(default=None, max_length=4096)
     api_key_clear: bool = False
-    gateway_format: Literal["openai", "ark", "anthropic"] | None = None
+    gateway_format: ModelGatewayFormat | None = None
     cost_credits: int = Field(ge=1, le=MAX_MODEL_COST_CREDITS)
     unlock_cost: int = Field(default=0, ge=0, le=MAX_MODEL_COST_CREDITS)
     enabled: bool = True
@@ -563,27 +763,87 @@ class ModelConfigIn(BaseModel):
             return None
         return v.strip()
 
+    @field_validator("model_id", "display_name")
+    @classmethod
+    def _normalise_model_labels(cls, v: str | None):
+        if v is None:
+            return None
+        text = v.strip()
+        if not text:
+            raise ValueError("模型标识和展示名称不能为空")
+        return text
 
-class ModelProbeIn(BaseModel):
-    use: Literal["vision", "image", "video", "prompt"] | None = None
-    provider: Literal[
-        "openai",
-        "volcengine_ark",
-        "openrouter",
-        "siliconflow",
-        "deepseek",
-        "moonshot",
-        "zhipu",
-        "dashscope",
-        "baidu_qianfan",
-        "tencent_hunyuan",
-        "yinyue",
-        "anthropic",
-        "custom_openai",
-    ] | None = None
+    @model_validator(mode="after")
+    def _validate_gateway_source(self):
+        if self.provider_config_id is not None and any((
+            self.provider,
+            self.base_url,
+            self.api_key,
+            self.api_key_clear,
+            self.gateway_format,
+        )):
+            raise ValueError("已有供应商不能与 Base URL、API Key 或网关格式同时提交")
+        if self.use == "vision" and (
+            self.provider == "anthropic" or self.gateway_format == "anthropic"
+        ):
+            raise ValueError("视觉反推不支持 Anthropic 原生协议,请使用 OpenAI-compatible 视觉网关")
+        return self
+
+
+class ModelConfigPatchIn(BaseModel):
+    model_config = ConfigDict(protected_namespaces=())
+
+    model_id: str | None = Field(default=None, min_length=1, max_length=128)
+    display_name: str | None = Field(default=None, min_length=1, max_length=128)
+    provider: ModelProvider | None = None
     base_url: str | None = Field(default=None, max_length=512)
     api_key: str | None = Field(default=None, max_length=4096)
-    gateway_format: Literal["openai", "ark", "anthropic"] | None = None
+    api_key_clear: bool = False
+    gateway_format: ModelGatewayFormat | None = None
+    cost_credits: int | None = Field(default=None, ge=1, le=MAX_MODEL_COST_CREDITS)
+    unlock_cost: int | None = Field(default=None, ge=0, le=MAX_MODEL_COST_CREDITS)
+    enabled: bool | None = None
+    is_default: bool | None = None
+    sort_order: int | None = Field(default=None, ge=-100000, le=100000)
+    extra: dict[str, Any] | None = None
+
+    @field_validator("extra")
+    @classmethod
+    def _validate_extra_costs(cls, v: dict[str, Any] | None):
+        return ModelConfigIn._validate_extra_costs(v)
+
+    @field_validator("base_url")
+    @classmethod
+    def _normalise_base_url(cls, v: str | None):
+        return ModelConfigIn._normalise_base_url(v)
+
+    @field_validator("api_key")
+    @classmethod
+    def _normalise_api_key(cls, v: str | None):
+        return ModelConfigIn._normalise_api_key(v)
+
+    @field_validator("model_id", "display_name")
+    @classmethod
+    def _normalise_model_labels(cls, v: str | None):
+        return ModelConfigIn._normalise_model_labels(v)
+
+    @model_validator(mode="after")
+    def _reject_conflicting_key_actions(self):
+        if self.api_key_clear and self.api_key not in (None, ""):
+            raise ValueError("不能同时提交 api_key 和 api_key_clear")
+        if not self.model_fields_set:
+            raise ValueError("至少提交一个待修改字段")
+        return self
+
+
+class ModelProbeIn(BaseModel):
+    model_config_id: int | None = Field(default=None, ge=1)
+    provider_config_id: int | None = Field(default=None, ge=1)
+    use: ModelUse | None = None
+    provider: ModelProvider | None = None
+    base_url: str | None = Field(default=None, max_length=512)
+    api_key: str | None = Field(default=None, max_length=4096)
+    gateway_format: ModelGatewayFormat | None = None
 
     @field_validator("base_url")
     @classmethod
@@ -599,6 +859,70 @@ class ModelProbeIn(BaseModel):
         if v is None:
             return None
         return v.strip()
+
+    @model_validator(mode="after")
+    def _validate_probe_source(self):
+        if self.model_config_id is not None and self.provider_config_id is not None:
+            raise ValueError("模型配置与已有供应商连接只能选择一个")
+        if self.provider_config_id is not None and any((
+            self.provider,
+            self.base_url,
+            self.api_key,
+            self.gateway_format,
+        )):
+            raise ValueError("使用已有供应商探测时不能临时覆盖网关参数")
+        if self.use == "vision" and (
+            self.provider == "anthropic" or self.gateway_format == "anthropic"
+        ):
+            raise ValueError("视觉反推不支持 Anthropic 原生协议,请使用 OpenAI-compatible 视觉网关")
+        return self
+
+
+class ModelCatalogImportItemIn(BaseModel):
+    model_config = ConfigDict(protected_namespaces=())
+
+    use: ModelUse
+    model_id: str = Field(min_length=1, max_length=128)
+    display_name: str | None = Field(default=None, min_length=1, max_length=128)
+    cost_credits: int = Field(ge=1, le=MAX_MODEL_COST_CREDITS)
+    unlock_cost: int = Field(default=0, ge=0, le=MAX_MODEL_COST_CREDITS)
+    enabled: bool = True
+    sort_order: int = Field(default=0, ge=-100000, le=100000)
+    extra: dict[str, Any] | None = None
+
+    @field_validator("model_id", "display_name")
+    @classmethod
+    def _normalise_model_labels(cls, v: str | None):
+        return ModelConfigIn._normalise_model_labels(v)
+
+    @field_validator("extra")
+    @classmethod
+    def _validate_extra_costs(cls, v: dict[str, Any] | None):
+        return ModelConfigIn._validate_extra_costs(v)
+
+
+class ModelCatalogImportIn(BaseModel):
+    provider: ModelProvider
+    base_url: str = Field(min_length=1, max_length=512)
+    api_key: str = Field(min_length=1, max_length=4096)
+    gateway_format: ModelGatewayFormat
+    models: list[ModelCatalogImportItemIn] = Field(min_length=1, max_length=50)
+
+    @field_validator("base_url")
+    @classmethod
+    def _normalise_base_url(cls, v: str):
+        value = ModelConfigIn._normalise_base_url(v)
+        if not value:
+            raise ValueError("批量导入必须填写 Base URL")
+        return value
+
+    @field_validator("api_key")
+    @classmethod
+    def _normalise_api_key(cls, v: str):
+        value = ModelConfigIn._normalise_api_key(v)
+        if not value:
+            raise ValueError("批量导入必须填写 API Key")
+        return value
 
 
 class SettingsIn(BaseModel):
@@ -741,6 +1065,49 @@ def _validate_json_payload_size(value: dict[str, Any], max_bytes: int, label: st
         raise ValueError(f"{label} 必须是可序列化 JSON") from e
     if len(raw) > max_bytes:
         raise ValueError(f"{label} 不能超过 {max_bytes // 1024}KB")
+
+
+_SNAPSHOT_SECRET_KEY_PARTS = (
+    "api_key",
+    "apikey",
+    "token",
+    "secret",
+    "password",
+    "authorization",
+    "cookie",
+    "credential",
+    "private_key",
+    "auth_key",
+)
+_SNAPSHOT_BINARY_KEY_PARTS = ("base64", "binary", "blob", "file_content", "raw_bytes")
+
+
+def _validate_workspace_snapshot(value: dict[str, Any]) -> None:
+    """Reject secrets and embedded media while keeping Studio metadata extensible."""
+
+    def walk(node: Any, *, path: str, depth: int) -> None:
+        if depth > 12:
+            raise ValueError("工作区快照嵌套过深")
+        if isinstance(node, dict):
+            for raw_key, child in node.items():
+                if not isinstance(raw_key, str):
+                    raise ValueError("工作区快照的字段名必须是字符串")
+                key = raw_key.strip().lower().replace("-", "_")
+                child_path = f"{path}.{raw_key}" if path else raw_key
+                if any(part in key for part in _SNAPSHOT_SECRET_KEY_PARTS):
+                    raise ValueError(f"工作区快照不得包含密钥或凭据字段: {child_path}")
+                if any(part in key for part in _SNAPSHOT_BINARY_KEY_PARTS):
+                    raise ValueError(f"工作区快照不得包含二进制内容字段: {child_path}")
+                walk(child, path=child_path, depth=depth + 1)
+            return
+        if isinstance(node, list):
+            for index, child in enumerate(node):
+                walk(child, path=f"{path}[{index}]", depth=depth + 1)
+            return
+        if isinstance(node, str) and node.lstrip().lower().startswith("data:"):
+            raise ValueError(f"工作区快照不得内嵌 data URI: {path}")
+
+    walk(value, path="", depth=0)
 
 
 TaskOut.model_rebuild()

@@ -124,21 +124,39 @@ def purge_expired(db: Session, user_id: int | None = None, limit: int = 1000) ->
     """Delete expired assets (files + rows). Returns how many were removed."""
     days = get_retention_days(db)
     cutoff = datetime.now(timezone.utc) - timedelta(days=days)
-    q = select(GenAsset).where(GenAsset.created_at < cutoff)
+    q = select(GenAsset).where(
+        GenAsset.created_at < cutoff,
+        GenAsset.retained_at.is_(None),
+    )
     if user_id is not None:
         q = q.where(GenAsset.user_id == user_id)
     q = q.limit(limit)
     rows = list(db.execute(q).scalars())
+    candidate_urls = {
+        url
+        for asset in rows
+        for url in (asset.preview_url, asset.hd_url)
+        if url
+    }
+    referenced_urls = _referenced_upload_urls(db, cutoff, candidate_urls)
+    studio_draft_urls = _studio_draft_upload_urls(db, {int(asset.user_id) for asset in rows})
     unlink_after_commit: list[str] = []
+    removed = 0
     for a in rows:
+        urls = {url for url in (a.preview_url, a.hd_url) if url}
+        if urls.intersection(referenced_urls) or any(
+            (int(a.user_id), url) in studio_draft_urls for url in urls
+        ):
+            continue
         unlink_after_commit.extend(collect_unreferenced_asset_keys(db, a))
         detach_asset_reports(db, a.id)
         db.delete(a)
-    if rows:
+        removed += 1
+    if removed:
         db.commit()
         unlink_keys(unlink_after_commit)
-        log.info("purged %s expired assets (user=%s)", len(rows), user_id)
-    return len(rows)
+        log.info("purged %s expired assets (user=%s)", removed, user_id)
+    return removed
 
 
 def _purge_table_older_than(db: Session, model, cutoff: datetime, extra=None) -> int:
@@ -234,6 +252,7 @@ _TASK_UPLOAD_PARAM_FIELDS = (
     "character_reference_image",
     "mask_image_url",
 )
+_TASK_UPLOAD_ARRAY_PARAM_FIELDS = ("product_detail_images",)
 _REFERENCE_QUERY_CHUNK_SIZE = 500
 
 
@@ -247,6 +266,8 @@ def _referenced_upload_urls(
     db: Session,
     cutoff: datetime,
     candidate_urls: set[str],
+    *,
+    user_ids: set[int] | None = None,
 ) -> set[str]:
     """Find task references only among this purge batch's candidate URLs."""
     if not candidate_urls:
@@ -256,30 +277,34 @@ def _referenced_upload_urls(
         GenTask.created_at >= cutoff,
         GenTask.status.in_(("queued", "running", generation.NEEDS_REVIEW)),
     )
-    for chunk in _chunks(candidate_urls):
+    query = select(GenTask.source_asset_url, GenTask.params).where(active)
+    if user_ids is not None:
+        if not user_ids:
+            return set()
+        query = query.where(GenTask.user_id.in_(user_ids))
+    for source_asset_url, params in db.execute(query).all():
+        values = [source_asset_url]
+        params = params if isinstance(params, dict) else {}
+        values.extend(params.get(field) for field in _TASK_UPLOAD_PARAM_FIELDS)
+        for field in _TASK_UPLOAD_ARRAY_PARAM_FIELDS:
+            array_value = params.get(field)
+            if isinstance(array_value, list):
+                values.extend(array_value)
         refs.update(
             value
-            for value in db.execute(
-                select(GenTask.source_asset_url).where(
-                    active,
-                    GenTask.source_asset_url.in_(chunk),
-                )
-            ).scalars()
-            if value
+            for value in values
+            if isinstance(value, str) and value in candidate_urls
         )
-        for field in _TASK_UPLOAD_PARAM_FIELDS:
-            value_expr = GenTask.params[field].as_string()
-            refs.update(
-                value
-                for value in db.execute(
-                    select(value_expr).where(active, value_expr.in_(chunk))
-                ).scalars()
-                if value
-            )
     return refs
 
 
-_STUDIO_ASSET_FIELDS = ("assets", "selected", "productAsset", "variationSource")
+_STUDIO_ASSET_FIELDS = (
+    "assets",
+    "selected",
+    "productAsset",
+    "productDetailAssets",
+    "variationSource",
+)
 _STUDIO_ASSET_URL_FIELDS = (
     "url",
     "thumb",
@@ -309,7 +334,7 @@ def _studio_draft_upload_urls(db: Session, user_ids: set[int]) -> set[tuple[int,
                 continue
             for field in _STUDIO_ASSET_FIELDS:
                 value = workspace.get(field)
-                assets = value if field == "assets" and isinstance(value, list) else [value]
+                assets = value if isinstance(value, list) else [value]
                 for asset in assets:
                     if not isinstance(asset, dict):
                         continue
@@ -356,6 +381,28 @@ def _upload_related_keys(upload_key: str) -> list[str]:
     return keys
 
 
+def upload_related_keys(upload_key: str) -> list[str]:
+    return _upload_related_keys(upload_key)
+
+
+def active_asset_reference_urls(
+    db: Session,
+    candidate_urls: set[str],
+    *,
+    user_ids: set[int],
+) -> tuple[set[str], set[tuple[int, str]]]:
+    """References that make a user-requested asset deletion unsafe."""
+    return (
+        _referenced_upload_urls(
+            db,
+            datetime.now(timezone.utc),
+            candidate_urls,
+            user_ids=user_ids,
+        ),
+        _studio_draft_upload_urls(db, user_ids),
+    )
+
+
 def _upload_group_is_referenced(
     row: UploadedAsset,
     referenced_urls: set[str],
@@ -384,6 +431,7 @@ def purge_uploaded_assets(db: Session, cutoff: datetime, limit: int = 1000) -> i
             select(UploadedAsset)
             .where(
                 UploadedAsset.created_at < cutoff,
+                UploadedAsset.retained_at.is_(None),
                 or_(
                     UploadedAsset.key.like("upload/%"),
                     UploadedAsset.key.like("upload_video/%"),
@@ -489,7 +537,12 @@ def reap_stuck_parse_records(db: Session, max_minutes: int | None = None) -> int
 
 
 def reap_stuck_reverse_operations(db: Session, max_minutes: int | None = None) -> int:
-    """Fail and refund reverse calls abandoned by an API process crash."""
+    """Fail pre-0035 synchronous reverse calls abandoned by an API crash.
+
+    Async reverse rows always carry ``cost_frozen`` and are exclusively owned
+    by ``reverse_operations.reap_operations``. Keeping that predicate here
+    prevents this compatibility reaper from stranding a frozen reservation.
+    """
     window = (
         timedelta(minutes=max(1, int(max_minutes)))
         if max_minutes is not None
@@ -502,6 +555,7 @@ def reap_stuck_reverse_operations(db: Session, max_minutes: int | None = None) -
             select(ReverseOperation.id).where(
                 ReverseOperation.status == "running",
                 ReverseOperation.updated_at < cutoff,
+                ReverseOperation.cost_frozen == 0,
             )
         ).scalars()
     )
@@ -514,6 +568,7 @@ def reap_stuck_reverse_operations(db: Session, max_minutes: int | None = None) -
                     ReverseOperation.id == int(operation_id),
                     ReverseOperation.status == "running",
                     ReverseOperation.updated_at < cutoff,
+                    ReverseOperation.cost_frozen == 0,
                 )
                 .values(
                     status="failed",

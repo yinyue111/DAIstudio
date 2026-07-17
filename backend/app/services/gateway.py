@@ -21,6 +21,7 @@ import random
 import re
 import tempfile
 import time
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -34,10 +35,16 @@ from . import locks, storage
 from .gateway_mocks import mock_image as _mock_image
 from .gateway_mocks import mock_video as mock_video
 from .gateway_mocks import mock_video_preview_image as mock_video_preview_image
+from .gateway_prompting import ReverseResultValidationError
+from .gateway_prompting import compose_visual_final_text as _compose_visual_final_text
 from .gateway_prompting import mock_reverse as _mock_reverse
 from .gateway_prompting import normalize_video_shots as _normalize_video_shots
-from .gateway_prompting import parse_structured as _parse_structured
+from .gateway_prompting import (
+    parse_structured as _parse_structured,  # noqa: F401 - legacy test hook
+)
+from .gateway_prompting import reverse_repair_template as _reverse_repair_template
 from .gateway_prompting import reverse_template as _reverse_template
+from .gateway_prompting import validate_reverse_result as _validate_reverse_result
 from .gateway_prompting import video_analysis_gaps as _video_analysis_gaps
 from .gateway_video_payloads import VIDEO_STATUS as _VIDEO_STATUS
 from .gateway_video_payloads import (
@@ -81,11 +88,15 @@ class GatewayError(Exception):
         status_code: int | None = None,
         transient: bool = False,
         submit_state_unknown: bool | None = None,
+        error_code: str | None = None,
+        phase: str | None = None,
     ) -> None:
         super().__init__(message)
         self.status_code = status_code
         self.transient = transient
         self.submit_state_unknown = submit_state_unknown
+        self.error_code = error_code
+        self.phase = phase
 
 
 @dataclass(frozen=True)
@@ -395,6 +406,51 @@ def list_models(config: RuntimeGatewayConfig) -> list[dict]:
 
 
 # ---------------------------------------------------------------- reverse prompt
+_REVERSE_AUDIT_CONTEXT_FIELDS = ("operation_id", "preset", "cost_credits")
+
+
+def _reverse_audit_context(value: dict | None) -> dict:
+    if not isinstance(value, dict):
+        return {key: None for key in _REVERSE_AUDIT_CONTEXT_FIELDS}
+    return {
+        key: (
+            raw
+            if raw is None or isinstance(raw, (str, int, float, bool))
+            else str(raw)[:128]
+        )
+        for key in _REVERSE_AUDIT_CONTEXT_FIELDS
+        for raw in (value.get(key),)
+    }
+
+
+def _log_reverse_audit_event(
+    *,
+    status: str,
+    phase: str,
+    target: str,
+    audit_context: dict | None,
+    latency_ms: int | None = None,
+    error_code: str | None = None,
+) -> None:
+    event = {
+        "event": "reverse_gateway_call",
+        "status": status,
+        "operation_id": None,
+        "phase": phase,
+        "error_code": error_code,
+        "target": target,
+        "preset": None,
+        "cost_credits": None,
+        "latency_ms": latency_ms,
+        **_reverse_audit_context(audit_context),
+    }
+    message = json.dumps(event, ensure_ascii=False, separators=(",", ":"))
+    if status == "failed":
+        log.warning("reverse_gateway_event=%s", message)
+    else:
+        log.info("reverse_gateway_event=%s", message)
+
+
 def _video_analysis_context_text(video_analysis: dict) -> str:
     source = video_analysis.get("source") or {}
     duration = source.get("duration_seconds")
@@ -490,12 +546,114 @@ def _without_conflicting_video_durations(text: str, duration_seconds: float | No
     return cleaned.strip(" ，,。；;")
 
 
-def reverse_prompt(
+def _reverse_response_content(data: dict) -> str:
+    try:
+        content = data["choices"][0]["message"]["content"]
+    except (KeyError, IndexError, TypeError) as exc:
+        raise GatewayError("反推网关返回结构不符合预期:缺少 choices.message.content") from exc
+    if not isinstance(content, str):
+        raise GatewayError("反推网关返回的 message.content 必须是字符串")
+    return content
+
+
+def _merge_gateway_usage(*rows: dict | None) -> dict | None:
+    merged: dict = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        for key, value in row.items():
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                merged[key] = merged.get(key, 0) + value
+            elif key not in merged:
+                merged[key] = value
+    return merged or None
+
+
+_VIDEO_TEMPORAL_EVIDENCE_FIELDS = frozenset({
+    "帧间推断",
+    "主体动作",
+    "可迁移主体动作",
+    "迁移生成指令",
+    "镜头运动",
+    "运动节奏",
+    "剪辑节奏",
+    "时序分镜",
+    "转场",
+})
+
+
+def _drop_unverified_video_timeline(result: dict) -> None:
+    """Remove structured timeline claims when no normalized shot has evidence."""
+    shots = result.get("shots")
+    has_cross_frame_evidence = any(
+        len(set(shot.get("evidence_frame_indices") or [])) >= 2
+        and any(
+            str(shot.get(field) or "").strip()
+            for field in ("action", "camera", "transition")
+        )
+        for shot in shots or []
+        if isinstance(shot, dict)
+    )
+    if has_cross_frame_evidence:
+        return
+    structured = result.get("structured")
+    if not isinstance(structured, dict):
+        return
+    removed = {
+        key: structured.pop(key)
+        for key in _VIDEO_TEMPORAL_EVIDENCE_FIELDS
+        if str(structured.get(key) or "").strip()
+    }
+    if removed:
+        result["unverified_temporal_fields"] = removed
+
+
+def _repair_reverse_result_once(
+    content: str,
+    error: ReverseResultValidationError,
+    *,
+    target: str,
+    vision_model_id: str,
+    gateway_config: RuntimeGatewayConfig | None,
+) -> tuple[dict, dict | None]:
+    """Make exactly one text-only request to repair an invalid model result."""
+    payload = {
+        "model": vision_model_id,
+        "messages": [{
+            "role": "user",
+            "content": _reverse_repair_template(content, str(error), target),
+        }],
+        "temperature": 0,
+    }
+    repair_data = _post(
+        "/chat/completions",
+        payload,
+        timeout=int(settings.reverse_gateway_timeout_seconds or 150),
+        config=gateway_config,
+        retries=0,
+    )
+    repaired_content = _reverse_response_content(repair_data)
+    try:
+        result = _validate_reverse_result(repaired_content, target)
+    except ReverseResultValidationError as repair_error:
+        raise GatewayError(
+            "反推结果不符合结构契约,且一次自动修复后仍无效: "
+            f"{str(repair_error)[:300]}",
+            error_code="INVALID_REVERSE_RESULT",
+            phase="repairing",
+        ) from repair_error
+    return result, repair_data.get("usage")
+
+
+def _reverse_prompt_impl(
     image_refs,
     vision_model_id: str,
     target: str = "image",
     gateway_config: RuntimeGatewayConfig | None = None,
     video_analysis: dict | None = None,
+    before_repair: Callable[[], bool | None] | None = None,
+    audit_context: dict | None = None,
+    template_override: str | None = None,
 ) -> dict:
     """Reverse one or more images into a structured prompt.
 
@@ -503,75 +661,155 @@ def reverse_prompt(
     keyframes sampled from a reference video, in temporal order). ``target``
     selects the image vs video template. Returns the parsed prompt plus the
     provider ``usage`` (real token consumption) and call latency."""
+    if target not in {"image", "video", "product_profile", "portrait_profile", "image_to_video"}:
+        raise GatewayError(f"不支持的反推目标: {target}")
+    if gateway_config is not None and (
+        gateway_config.provider == "anthropic" or gateway_config.gateway_format == "anthropic"
+    ):
+        raise GatewayError("视觉反推不支持 Anthropic 原生协议,请使用 OpenAI-compatible 视觉网关")
     _ensure_gateway_configured(gateway_config, "反推")
-    if _gateway_mock(gateway_config):
-        return _mock_reverse(target)
-    refs = [image_refs] if isinstance(image_refs, str) else [r for r in image_refs if r]
-    if not refs:
-        raise GatewayError("反推缺少可用的参考图")
-    content = []
-    frame_rows = (video_analysis or {}).get("sampled_frames") or []
-    if target == "video" and video_analysis:
-        content.append({"type": "text", "text": _video_analysis_context_text(video_analysis)})
-    for index, ref in enumerate(refs, start=1):
-        if target == "video" and video_analysis:
-            row = frame_rows[index - 1] if index <= len(frame_rows) else {}
-            timestamp = row.get("timestamp_seconds")
-            label = (
-                f"第 {index} 帧，时间戳 {float(timestamp):.3f} 秒"
-                if timestamp is not None
-                else f"第 {index} 帧，时间戳未知"
-            )
-            content.append({"type": "text", "text": label})
-        content.append({"type": "image_url", "image_url": {"url": ref}})
-    content.append({"type": "text", "text": _reverse_template(target, n_frames=len(refs))})
-    payload = {
-        "model": vision_model_id,
-        "messages": [{"role": "user", "content": content}],
-        "temperature": 0.2,  # low temp -> more faithful, repeatable description
-    }
     t0 = time.time()
-    data = _post(
-        "/chat/completions",
-        payload,
-        timeout=int(settings.reverse_gateway_timeout_seconds or 150),
-        config=gateway_config,
-        # Reverse/profile analysis is safe to replay. Absorb brief upstream
-        # 429/5xx/connectivity blips instead of blocking image generation on
-        # the first transient failure.
-        retries=settings.gateway_max_retries,
+    repair_attempted = False
+    repair_usage = None
+    data: dict = {}
+    if _gateway_mock(gateway_config):
+        # Mock mode replaces only the provider response. It must still pass
+        # through the same audio, temporal-evidence, and analysis-gap gates as
+        # a real model response so offline E2E cannot mask contract failures.
+        mock_result = _mock_reverse(target)
+        mock_payload = dict(mock_result.get("structured") or {})
+        mock_payload["final_text"] = mock_result.get("final_text")
+        if "shots" in mock_result:
+            mock_payload["shots"] = mock_result.get("shots")
+        result = _validate_reverse_result(mock_payload, target)
+    else:
+        refs = [image_refs] if isinstance(image_refs, str) else [r for r in image_refs if r]
+        if not refs:
+            raise GatewayError("反推缺少可用的参考图")
+        content = []
+        frame_rows = (video_analysis or {}).get("sampled_frames") or []
+        if target == "video" and video_analysis:
+            content.append({"type": "text", "text": _video_analysis_context_text(video_analysis)})
+        for index, ref in enumerate(refs, start=1):
+            if target == "video" and video_analysis:
+                row = frame_rows[index - 1] if index <= len(frame_rows) else {}
+                timestamp = row.get("timestamp_seconds")
+                label = (
+                    f"第 {index} 帧，时间戳 {float(timestamp):.3f} 秒"
+                    if timestamp is not None
+                    else f"第 {index} 帧，时间戳未知"
+                )
+                content.append({"type": "text", "text": label})
+            content.append({"type": "image_url", "image_url": {"url": ref}})
+        template = (
+            template_override
+            if isinstance(template_override, str) and template_override.strip()
+            else _reverse_template(target, n_frames=len(refs))
+        )
+        content.append({"type": "text", "text": template})
+        payload = {
+            "model": vision_model_id,
+            "messages": [{"role": "user", "content": content}],
+            "temperature": 0.2,  # low temp -> more faithful, repeatable description
+        }
+        data = _post(
+            "/chat/completions",
+            payload,
+            timeout=int(settings.reverse_gateway_timeout_seconds or 150),
+            config=gateway_config,
+            # Reverse/profile analysis is safe to replay. Absorb brief upstream
+            # 429/5xx/connectivity blips instead of blocking image generation on
+            # the first transient failure.
+            retries=settings.gateway_max_retries,
+        )
+        content_text = _reverse_response_content(data)
+        try:
+            result = _validate_reverse_result(content_text, target)
+        except ReverseResultValidationError as validation_error:
+            repair_attempted = True
+            _log_reverse_audit_event(
+                status="repairing",
+                phase="repairing",
+                target=target,
+                audit_context=audit_context,
+            )
+            if before_repair is not None:
+                try:
+                    should_continue = before_repair()
+                except Exception as callback_error:
+                    if isinstance(callback_error, GatewayError) and callback_error.phase is None:
+                        callback_error.phase = "repairing"
+                    else:
+                        callback_error.reverse_phase = "repairing"
+                    raise
+                if should_continue is False:
+                    raise GatewayError(
+                        "反推任务已在文本修复前取消",
+                        error_code="CANCELED",
+                        phase="repairing",
+                    )
+            try:
+                result, repair_usage = _repair_reverse_result_once(
+                    content_text,
+                    validation_error,
+                    target=target,
+                    vision_model_id=vision_model_id,
+                    gateway_config=gateway_config,
+                )
+            except GatewayError as repair_error:
+                repair_error.phase = repair_error.phase or "repairing"
+                repair_error.error_code = repair_error.error_code or "REPAIR_FAILED"
+                raise
+    frame_rows = (video_analysis or {}).get("sampled_frames") or []
+    video_target = target in {"video", "image_to_video"}
+    audio_analyzed = bool(
+        target == "video" and ((video_analysis or {}).get("source") or {}).get("audio_analyzed")
     )
-    latency_ms = int((time.time() - t0) * 1000)
-    content_text = data["choices"][0]["message"]["content"]
-    result = _parse_structured(content_text)
-    if target == "video":
-        post = split_video_post_production(result["final_text"])
-        result["final_text"] = post["text"]
-        for key, value in (
-            ("字幕卖点", "；".join(post["post_overlays"])),
-            ("旁白", post["voiceover"]),
-            ("音效", "；".join(post["sfx"])),
-        ):
+    if video_target:
+        # Provider prose is audit input only. It may help recover explicit
+        # post-production metadata, but never contributes visual prompt text.
+        provider_text = result.get("provider_final_text")
+        post = split_video_post_production(
+            provider_text if isinstance(provider_text, str) else ""
+        )
+        for key, value in (("字幕卖点", "；".join(post["post_overlays"])),):
             if value and str(result["structured"].get(key) or "").strip() in {"", "无", "未分析"}:
                 result["structured"][key] = value
-    if target == "video" and video_analysis:
-        source = video_analysis.get("source") or {}
-        result["shots"] = _normalize_video_shots(
-            result.get("shots"),
-            duration_seconds=source.get("duration_seconds"),
-            frame_count=len(frame_rows),
-            sampled_frames=frame_rows,
-            audio_analyzed=bool(source.get("audio_analyzed")),
-        )
-        result["analysis_gaps"] = _video_analysis_gaps(
-            result["shots"],
-            duration_seconds=source.get("duration_seconds"),
-            analysis_mode=video_analysis.get("analysis_mode"),
-        )
+        if audio_analyzed:
+            for key, value in (("旁白", post["voiceover"]), ("音效", "；".join(post["sfx"]))):
+                if value and str(result["structured"].get(key) or "").strip() in {"", "无", "未分析"}:
+                    result["structured"][key] = value
+        else:
+            result["structured"]["旁白"] = "未分析"
+            result["structured"]["音效"] = "未分析"
+            for shot in result.get("shots") or []:
+                shot["audio_cue"] = "未分析"
+    if target == "video":
+        # This value is derived below from trusted media metadata. Ignore a
+        # same-named provider extra so it cannot claim an unobserved format.
+        result["structured"].pop("源视频规格", None)
+        source = (video_analysis or {}).get("source") or {}
+        if video_analysis:
+            result["shots"] = _normalize_video_shots(
+                result.get("shots"),
+                duration_seconds=source.get("duration_seconds"),
+                frame_count=len(frame_rows),
+                sampled_frames=frame_rows,
+                audio_analyzed=bool(source.get("audio_analyzed")),
+            )
+            result["analysis_gaps"] = _video_analysis_gaps(
+                result["shots"],
+                duration_seconds=source.get("duration_seconds"),
+                analysis_mode=video_analysis.get("analysis_mode"),
+            )
+        else:
+            result["shots"] = []
+            result["analysis_gaps"] = [{"message": "缺少视频帧分析证据"}]
+        _drop_unverified_video_timeline(result)
         timeline = _video_shots_timeline(result["shots"])
         if timeline:
             result["structured"]["时序分镜"] = timeline
-        source_spec = _video_source_spec(video_analysis)
+        source_spec = _video_source_spec(video_analysis or {})
         if source_spec:
             result["structured"]["源视频规格"] = source_spec
             result["structured"]["时长建议"] = (
@@ -579,19 +817,113 @@ def reverse_prompt(
                 if source.get("duration_seconds") is not None
                 else source_spec
             )
-        authoritative_prefix = []
-        if source_spec:
-            authoritative_prefix.append(f"严格按源视频规格复刻：{source_spec}")
-        if authoritative_prefix:
-            provider_text = _without_conflicting_video_durations(
-                result["final_text"],
-                source.get("duration_seconds"),
-            )
-            result["final_text"] = "。".join(
-                part for part in [*authoritative_prefix, provider_text] if part
-            )
-    result["usage"] = data.get("usage")  # {prompt_tokens, completion_tokens, total_tokens}
-    result["latency_ms"] = latency_ms
+    try:
+        result["final_text"] = _compose_visual_final_text(
+            result["structured"],
+            target,
+            result.get("shots"),
+        )
+    except ReverseResultValidationError as error:
+        raise GatewayError(
+            str(error),
+            error_code="INVALID_REVERSE_RESULT",
+            phase="validating",
+        ) from error
+    result["usage"] = _merge_gateway_usage(data.get("usage"), repair_usage)
+    result["latency_ms"] = int((time.time() - t0) * 1000)
+    result["repair_attempted"] = repair_attempted
+    result["repair_succeeded"] = repair_attempted
+    return result
+
+
+def _attach_image_to_video_analysis(result: dict, video_analysis: dict | None) -> dict:
+    """Attach explicit single-image evidence without inventing a video timeline."""
+    provided = dict(video_analysis) if isinstance(video_analysis, dict) else {}
+    analysis_mode = str(provided.get("analysis_mode") or "image_motion")
+    source = dict(provided.get("source")) if isinstance(provided.get("source"), dict) else {}
+    source["audio_analyzed"] = False
+    source.setdefault("source_type", "image" if analysis_mode == "image_motion" else "video_cover")
+    sampled_frames = provided.get("sampled_frames")
+    if not isinstance(sampled_frames, list) or not sampled_frames:
+        sampled_frames = [{"index": 1, "timestamp_seconds": 0}]
+    gaps = provided.get("analysis_gaps")
+    if not isinstance(gaps, list) or not gaps:
+        message = (
+            "单图输入没有可观察的视频时间线"
+            if analysis_mode == "image_motion"
+            else "封面单帧无法覆盖源视频时间线"
+        )
+        gaps = [{"message": message}]
+    analysis = {
+        **provided,
+        "analysis_mode": analysis_mode,
+        "source": source,
+        "sampled_frames": sampled_frames,
+        "analysis_gaps": gaps,
+    }
+    normalized = dict(result)
+    normalized["analysis_gaps"] = gaps
+    normalized["video_analysis"] = analysis
+    return normalized
+
+
+def reverse_prompt(
+    image_refs,
+    vision_model_id: str,
+    target: str = "image",
+    gateway_config: RuntimeGatewayConfig | None = None,
+    video_analysis: dict | None = None,
+    before_repair: Callable[[], bool | None] | None = None,
+    audit_context: dict | None = None,
+    template_override: str | None = None,
+) -> dict:
+    """Run reverse analysis and emit one bounded audit event for its outcome."""
+    started = time.time()
+    _log_reverse_audit_event(
+        status="started",
+        phase="calling_model",
+        target=target,
+        audit_context=audit_context,
+    )
+    try:
+        result = _reverse_prompt_impl(
+            image_refs,
+            vision_model_id,
+            target=target,
+            gateway_config=gateway_config,
+            video_analysis=video_analysis,
+            before_repair=before_repair,
+            audit_context=audit_context,
+            template_override=template_override,
+        )
+        if target == "image_to_video":
+            result = _attach_image_to_video_analysis(result, video_analysis)
+    except Exception as error:
+        phase = str(
+            getattr(error, "phase", None)
+            or getattr(error, "reverse_phase", None)
+            or "calling_model"
+        )
+        error_code = str(
+            getattr(error, "error_code", None)
+            or ("GATEWAY_ERROR" if isinstance(error, GatewayError) else "INTERNAL_ERROR")
+        )
+        _log_reverse_audit_event(
+            status="failed",
+            phase=phase,
+            target=target,
+            audit_context=audit_context,
+            latency_ms=int((time.time() - started) * 1000),
+            error_code=error_code,
+        )
+        raise
+    _log_reverse_audit_event(
+        status="ok",
+        phase="completed",
+        target=target,
+        audit_context=audit_context,
+        latency_ms=int(result.get("latency_ms") or (time.time() - started) * 1000),
+    )
     return result
 
 
@@ -1180,6 +1512,116 @@ def _decode_image_response_with_diagnostics(
     return out, diagnostics
 
 
+_DATA_URI_IMAGE_RE = re.compile(
+    r"data:(image/(?:png|jpe?g|webp));base64,([A-Za-z0-9+/=\r\n]+)",
+    re.IGNORECASE,
+)
+
+
+def _anthropic_message_text(data: dict) -> str:
+    content = data.get("content")
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return ""
+    return "\n".join(
+        str(item.get("text") or "")
+        for item in content
+        if isinstance(item, dict) and item.get("type") == "text"
+    )
+
+
+def _decode_message_data_uri_images(data: dict) -> list[bytes]:
+    text = _anthropic_message_text(data)
+    max_bytes = int(settings.generated_image_max_bytes)
+    images: list[bytes] = []
+    for match in _DATA_URI_IMAGE_RE.finditer(text):
+        encoded = re.sub(r"\s+", "", match.group(2))
+        if len(encoded) > _max_b64_len(max_bytes):
+            raise GatewayError("图像结果超出大小上限")
+        try:
+            raw = base64.b64decode(encoded, validate=True)
+        except Exception as exc:  # noqa: BLE001
+            raise GatewayError("Anthropic Messages 返回的图像数据无法解码") from exc
+        if not raw:
+            continue
+        if len(raw) > max_bytes:
+            raise GatewayError("图像结果超出大小上限")
+        images.append(raw)
+    return images
+
+
+def _gen_image_via_anthropic_messages(
+    prompt: str,
+    image_model_id: str,
+    *,
+    n: int,
+    size: str,
+    extra: dict,
+    gateway_config: RuntimeGatewayConfig,
+) -> ImageBatchResult:
+    max_tokens = int(extra.pop("message_max_tokens", 4096) or 4096)
+    request_prompt = (
+        f"{prompt.strip()}\n\n"
+        f"Generate exactly one image. Target canvas: {size}. "
+        "Return the generated image directly."
+    )
+    payload = {
+        "model": image_model_id,
+        "max_tokens": max_tokens,
+        "messages": [{"role": "user", "content": request_prompt}],
+    }
+
+    def one() -> bytes:
+        data = _post(
+            "/messages",
+            payload,
+            timeout=settings.image_gateway_timeout_seconds,
+            config=gateway_config,
+            retries=0,
+        )
+        images = _decode_message_data_uri_images(data)
+        if not images:
+            raise GatewayError(
+                "Anthropic Messages 未返回 Data URI 图像",
+                transient=False,
+                submit_state_unknown=False,
+            )
+        return images[0]
+
+    workers = max(1, min(n, int(settings.image_gateway_parallelism or 1)))
+    if workers == 1:
+        return ImageBatchResult([one() for _ in range(n)])
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        return ImageBatchResult(list(pool.map(lambda _: one(), range(n))))
+
+
+def _grok_image_payload(
+    image_model_id: str,
+    prompt: str,
+    size: str,
+    extra: dict,
+) -> dict:
+    try:
+        width, height = (int(value) for value in str(size).lower().split("x", 1))
+    except (TypeError, ValueError):
+        width, height = 1024, 1024
+    aspect_ratio = "1:1"
+    if width > height:
+        aspect_ratio = "16:9" if width / max(height, 1) >= 1.5 else "4:3"
+    elif height > width:
+        aspect_ratio = "9:16" if height / max(width, 1) >= 1.5 else "3:4"
+    resolution = "2k" if max(width, height) > 1536 else "1k"
+    return {
+        "model": image_model_id,
+        "prompt": prompt,
+        "aspect_ratio": extra.pop("aspect_ratio", aspect_ratio),
+        "resolution": extra.pop("resolution", resolution),
+        "response_format": extra.pop("response_format", "b64_json"),
+        **extra,
+    }
+
+
 def _image_quality_for_size(size: str | None) -> str:
     try:
         w, h = (int(x) for x in str(size or "").lower().split("x", 1))
@@ -1589,12 +2031,33 @@ def gen_image(
 
     n = max(1, int(n))
     extra = {k: v for k, v in (extra_payload or {}).items() if v not in (None, "")}
-    extra.setdefault("quality", _image_quality_for_size(size))
-    extra.setdefault("output_format", "jpeg")
-    extra.setdefault("output_compression", 100)
     refs = [str(x) for x in (reference_image_urls or []) if x]
     if reference_image_url and not refs:
         refs = [reference_image_url]
+    image_transport = str(extra.pop("image_transport", "openai_images") or "openai_images")
+    if image_transport == "anthropic_messages":
+        if refs or reference_image_url:
+            raise GatewayError("当前 Antigravity Gemini 图片适配仅支持文生图")
+        if gateway_config is None or gateway_config.gateway_format != "anthropic":
+            raise GatewayError("Anthropic Messages 图片模型需要 Anthropic 网关格式")
+        return _gen_image_via_anthropic_messages(
+            prompt,
+            image_model_id,
+            n=n,
+            size=size,
+            extra=extra,
+            gateway_config=gateway_config,
+        )
+    if image_transport == "grok_images":
+        if refs or reference_image_url:
+            raise GatewayError("当前 Grok 图片适配仅支持文生图")
+        payload = _grok_image_payload(image_model_id, prompt, size, extra)
+        return _post_single_image_repeated(
+            "/images/generations", payload, n, config=gateway_config
+        )
+    extra.setdefault("quality", _image_quality_for_size(size))
+    extra.setdefault("output_format", "jpeg")
+    extra.setdefault("output_compression", 100)
     if refs and edit_path:
         # Current OpenAI-compatible image-edit gateways often implement edits
         # through the Responses image tool, where `tools[0].n` is invalid.

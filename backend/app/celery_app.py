@@ -68,6 +68,7 @@ celery_app.conf.update(
         Queue("video_poll"),
         Queue("video_download"),
         Queue("parse"),
+        Queue("reverse"),
         Queue("cleanup"),
         Queue("payment"),
     ),
@@ -77,6 +78,7 @@ celery_app.conf.update(
         "poll.video": {"queue": "video_poll"},
         "download.video": {"queue": "video_download"},
         "parse.*": {"queue": "parse"},
+        "reverse.*": {"queue": "reverse"},
         "cleanup.*": {"queue": "cleanup"},
         "payments.*": {"queue": "payment"},
     },
@@ -96,10 +98,10 @@ celery_app.conf.update(
             "task": "cleanup.reap_parse",
             "schedule": crontab(minute="*/10"),
         },
-        # refund synchronous reverse calls abandoned by an API process crash
+        # expire confirmations, refund stale runs, and republish lost messages
         "reap-stuck-reverse-operations": {
             "task": "cleanup.reap_reverse",
-            "schedule": crontab(minute="*/10"),
+            "schedule": crontab(minute="*"),
         },
         # resume in-flight video renders whose poll chain died (worker crash)
         "resume-stuck-videos": {

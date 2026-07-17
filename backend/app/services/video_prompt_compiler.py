@@ -536,7 +536,7 @@ def _direct_passthrough_plan(text: str) -> dict[str, Any]:
     return {
         "global_style": "",
         "subject_lock": "",
-        "shots": [text],
+        "shots": [post["text"]] if post["text"] else [],
         "technical_constraints": "",
         "post_overlays": post["post_overlays"],
         "voiceover": post["voiceover"],
@@ -556,12 +556,22 @@ def split_video_post_production(text: str) -> dict[str, Any]:
     open_quote = "[“\\\"'‘]"
     close_quote = "[”\\\"'’]"
     voiceover_label = (
-        r"(?:(?:温柔|轻柔|低沉)?\s*(?:男声|女声|女性|男性)?\s*)?(?:旁白|voiceover|后期配音)"
+        r"(?:(?:温柔|轻柔|低沉)?\s*(?:男声|女声|女性|男性)?\s*)?"
+        r"(?:旁白|voiceover|后期配音|人物对白|角色对白|对白|台词)"
     )
+    label_separator = r"\s*(?:(?:[:：]|为|是|说)|内容\s*(?:为|是))?\s*"
     overlay_label = (
-        r"(?:字幕|后期叠字|(?:画面(?:中)?)?文字(?:浮现|出现|显示)?|"
+        r"(?:字幕(?:卖点)?|后期叠字|OCR(?:识别)?(?:文字|内容)?|"
+        r"(?:画面(?:中)?)?文字(?:浮现|出现|显示)?|"
         r"画面(?:中)?(?:浮现|出现|显示)文字)"
     )
+    overlay_separator = (
+        r"\s*(?:(?:[:：]|为|是|写着)|内容\s*(?:为|是)|显示\s*(?:为|是)?)?\s*"
+    )
+    sfx_label = (
+        r"(?:音效|SFX|环境音|背景配乐|背景音乐|配乐|音乐|BGM|声音设计|音频)"
+    )
+    sfx_separator = r"\s*(?:(?:[:：]|为|是|随|随着)|内容\s*(?:为|是))?\s*"
 
     def remove_voiceover(match: re.Match[str]) -> str:
         nonlocal voiceover
@@ -571,7 +581,7 @@ def split_video_post_production(text: str) -> dict[str, Any]:
     text = re.sub(
         boundary
         + voiceover_label
-        + r"\s*[:：]?\s*"
+        + label_separator
         + open_quote
         + r"(?P<content>[^”\"'’]+)"
         + close_quote,
@@ -582,7 +592,7 @@ def split_video_post_production(text: str) -> dict[str, Any]:
     text = re.sub(
         boundary
         + voiceover_label
-        + r"\s*[:：]?\s*"
+        + label_separator
         + open_quote
         + r"(?P<content>[^\n。；;]+)$",
         remove_voiceover,
@@ -590,7 +600,7 @@ def split_video_post_production(text: str) -> dict[str, Any]:
         flags=post_flags,
     )
     text = re.sub(
-        boundary + voiceover_label + r"\s*[:：]?\s*(?P<content>[^\n。；;\uff0c,]+)",
+        boundary + voiceover_label + label_separator + r"(?P<content>[^\n。；;\uff0c,]+)",
         remove_voiceover,
         text,
         flags=post_flags,
@@ -603,7 +613,7 @@ def split_video_post_production(text: str) -> dict[str, Any]:
     text = re.sub(
         boundary
         + overlay_label
-        + r"\s*[:：]?\s*"
+        + overlay_separator
         + open_quote
         + r"(?P<content>[^”\"'’]+)"
         + close_quote
@@ -613,13 +623,13 @@ def split_video_post_production(text: str) -> dict[str, Any]:
         flags=post_flags,
     )
     text = re.sub(
-        boundary + overlay_label + r"\s*[:：]\s*(?P<content>[^\n。；;\uff0c,]+)",
+        boundary + overlay_label + overlay_separator + r"(?P<content>[^\n。；;\uff0c,]+)",
         remove_overlay,
         text,
         flags=post_flags,
     )
     text = re.sub(
-        boundary + overlay_label + r"\s*(?P<content>[^\n。；;\uff0c,]+)",
+        boundary + overlay_label + overlay_separator + r"(?P<content>[^\n。；;\uff0c,]+)",
         remove_overlay,
         text,
         flags=post_flags,
@@ -631,7 +641,8 @@ def split_video_post_production(text: str) -> dict[str, Any]:
 
     text = re.sub(
         boundary
-        + r"(?:音效|SFX|环境音)\s*[:：]?\s*"
+        + sfx_label
+        + sfx_separator
         + open_quote
         + r"(?P<content>[^”\"'’]+)"
         + close_quote,
@@ -640,8 +651,36 @@ def split_video_post_production(text: str) -> dict[str, Any]:
         flags=post_flags,
     )
     text = re.sub(
-        boundary + r"(?:音效|SFX|环境音)\s*[:：]?\s*(?P<content>[^\n。；;\uff0c,]+)",
+        boundary + sfx_label + sfx_separator + r"(?P<content>[^\n。；;\uff0c,]+)",
         remove_sfx,
+        text,
+        flags=post_flags,
+    )
+    text = re.sub(
+        boundary
+        + r"(?P<content>(?:伴随|配合|同步(?:出现|响起)?)"
+        + r"[^\n。；;\uff0c,]*(?:声音|声|音效|配乐|音乐|鼓点|节拍)"
+        + r"[^\n。；;\uff0c,]*)",
+        remove_sfx,
+        text,
+        flags=post_flags,
+    )
+    text = re.sub(
+        boundary
+        + r"(?P<content>[^\n。；;\uff0c,]{0,64}"
+        + r"(?:水滴声|落水声|脚步声|环境声|人声|鼓点|配乐|背景音乐|音效)"
+        + r"[^\n。；;\uff0c,]*)",
+        remove_sfx,
+        text,
+        flags=post_flags,
+    )
+    text = re.sub(
+        boundary
+        + r"(?:OCR(?:识别)?(?:文字|内容)?|观察事实|帧间推断|"
+        + r"证据(?:帧|描述|索引)?|analysis\s+evidence)"
+        + r"\s*(?:(?:[:：]|为|是|写着)|内容\s*(?:为|是)|显示\s*(?:为|是)?)"
+        + r"\s*[^\n。；;]*",
+        lambda match: match.group("boundary"),
         text,
         flags=post_flags,
     )
@@ -937,6 +976,8 @@ def compile_video_prompt(
         if direct_passthrough_text
         else parse_video_prompt(raw_prompt)
     )
+    if direct_passthrough_text:
+        direct_passthrough_text = plan["shots"][0] if plan["shots"] else ""
     plan["global_style"] = _join_unique(plan["global_style"])
     plan["technical_constraints"] = _join_unique(plan.get("technical_constraints", ""))
     plan["shots"] = [str(item).strip() for item in plan["shots"] if str(item).strip()]
@@ -1277,8 +1318,16 @@ def build_video_prompt_references(
         if subject_mode == "portrait"
         else "first_frame"
     )
+    add("product", "product_reference_image", params.get("product_reference_image"))
+    product_details = params.get("product_detail_images")
+    if isinstance(product_details, list):
+        for index, value in enumerate(product_details, start=1):
+            add(
+                f"product_detail_{index}",
+                f"product_detail_images[{index - 1}]",
+                value,
+            )
     for key, role in (
-        ("product_reference_image", "product"),
         ("reference_image_url", reference_role),
         ("first_frame_image", "first_frame"),
         ("last_frame_image", "last_frame"),

@@ -46,13 +46,18 @@ def _settled_reserved_amount(tx: CreditTransaction) -> int:
     return 0
 
 
-def _outstanding_reserved_for_biz(db: Session, user_id: int, biz_ref: int | None) -> int | None:
+def _outstanding_reserved_for_biz(
+    db: Session,
+    user_id: int,
+    biz_type: str,
+    biz_ref: int | None,
+) -> int | None:
     if biz_ref is None:
         return None
     rows = db.execute(
         select(CreditTransaction).where(
             CreditTransaction.user_id == user_id,
-            CreditTransaction.biz_type == "gen_task",
+            CreditTransaction.biz_type == biz_type,
             CreditTransaction.biz_ref == biz_ref,
             CreditTransaction.type.in_(("freeze", "refund", "settle")),
         )
@@ -97,8 +102,14 @@ def _outstanding_consumed_for_biz(
     return max(0, outstanding)
 
 
-def _assert_biz_reserved(db: Session, user_id: int, biz_ref: int | None, amount: int) -> None:
-    outstanding = _outstanding_reserved_for_biz(db, user_id, biz_ref)
+def _assert_biz_reserved(
+    db: Session,
+    user_id: int,
+    biz_type: str,
+    biz_ref: int | None,
+    amount: int,
+) -> None:
+    outstanding = _outstanding_reserved_for_biz(db, user_id, biz_type, biz_ref)
     if outstanding is None:
         return
     if amount > outstanding:
@@ -180,7 +191,7 @@ def grant(db: Session, user_id: int, amount: int, note: str | None = None,
 
 
 def freeze(db: Session, user_id: int, amount: int, biz_ref: int | None,
-           *, commit: bool = True) -> User:
+           *, biz_type: str = "gen_task", commit: bool = True) -> User:
     _reject_negative(amount, "freeze")
     user = _lock_user(db, user_id)
     if amount == 0:
@@ -192,12 +203,12 @@ def freeze(db: Session, user_id: int, amount: int, biz_ref: int | None,
         )
     user.balance_credits -= amount
     user.frozen_credits += amount
-    _record(db, user, "freeze", -amount, "gen_task", biz_ref, frozen_delta=amount)
+    _record(db, user, "freeze", -amount, biz_type, biz_ref, frozen_delta=amount)
     return _finish(db, user, commit)
 
 
 def settle(db: Session, user_id: int, reserved: int, real_cost: int,
-           biz_ref: int | None, *, commit: bool = True) -> User:
+           biz_ref: int | None, *, biz_type: str = "gen_task", commit: bool = True) -> User:
     """Charge real_cost out of the reserved (frozen) amount; return the rest."""
     _reject_negative(reserved, "settle reserved")
     _reject_negative(real_cost, "settle real_cost")
@@ -212,7 +223,7 @@ def settle(db: Session, user_id: int, reserved: int, real_cost: int,
             f"冻结额度不足:需要释放 {reserved},当前冻结 {user.frozen_credits}"
         )
     try:
-        _assert_biz_reserved(db, user_id, biz_ref, reserved)
+        _assert_biz_reserved(db, user_id, biz_type, biz_ref, reserved)
     except InsufficientCredits:
         db.rollback()
         raise
@@ -227,7 +238,7 @@ def settle(db: Session, user_id: int, reserved: int, real_cost: int,
         user,
         "settle",
         refund_part,
-        "gen_task",
+        biz_type,
         biz_ref,
         note=f"reserved={reserved} real={real_cost}",
         frozen_delta=-reserved,
@@ -238,7 +249,7 @@ def settle(db: Session, user_id: int, reserved: int, real_cost: int,
 
 
 def refund(db: Session, user_id: int, amount: int, biz_ref: int | None,
-           *, commit: bool = True) -> User:
+           *, biz_type: str = "gen_task", commit: bool = True) -> User:
     _reject_negative(amount, "refund")
     user = _lock_user(db, user_id)
     if amount == 0:
@@ -249,13 +260,13 @@ def refund(db: Session, user_id: int, amount: int, biz_ref: int | None,
             f"冻结额度不足:需要退回 {amount},当前冻结 {user.frozen_credits}"
         )
     try:
-        _assert_biz_reserved(db, user_id, biz_ref, amount)
+        _assert_biz_reserved(db, user_id, biz_type, biz_ref, amount)
     except InsufficientCredits:
         db.rollback()
         raise
     user.frozen_credits -= amount
     user.balance_credits += amount
-    _record(db, user, "refund", amount, "gen_task", biz_ref, frozen_delta=-amount)
+    _record(db, user, "refund", amount, biz_type, biz_ref, frozen_delta=-amount)
     return _finish(db, user, commit)
 
 

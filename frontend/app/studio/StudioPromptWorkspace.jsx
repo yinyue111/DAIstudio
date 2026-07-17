@@ -1,35 +1,6 @@
 "use client";
 
-import { EXAMPLES } from "./constants";
-
-const EDIT_PROMPT_CHIPS = [
-  "保留品牌标识",
-  "包装文字逐字保留",
-  "保留人像身份",
-  "强化产品卖点",
-  "产品边缘自然融入场景",
-  "干净商业广告质感",
-  "小红书种草氛围",
-];
-
-function promptChipsForEditMode({
-  isImageEditMode,
-  portraitGenerationMode,
-  productGenerationMode,
-}) {
-  if (!isImageEditMode) {
-    return portraitGenerationMode
-      ? ["保留人物身份", "参考视频动作节奏", "同款镜头语言", "保留五官和发型", "自然面部表情", "不迁移参考人物长相"]
-      : EDIT_PROMPT_CHIPS;
-  }
-  if (portraitGenerationMode) {
-    return ["保留人像身份", "同款光线和构图", "小红书封面写真", "职业形象照", "自然皮肤质感", "不改变五官"];
-  }
-  if (productGenerationMode) {
-    return ["包装文字逐字保留", "保留包装和Logo", "生成电商主图", "小红书产品种草图", "替换广告场景", "产品边缘自然融入"];
-  }
-  return ["替换为干净棚拍背景", "保留主体和Logo", "增加商业广告光感", "调整为小红书封面", "去除杂乱背景"];
-}
+import StudioModelSelector from "./StudioModelSelector";
 
 function transferRulesForEditMode({
   isImageEditMode,
@@ -187,23 +158,19 @@ function EditBrief({
 function EditPromptPanel({
   prompt,
   placeholder,
-  promptLibraryOpen,
-  isImageEditMode,
-  portraitGenerationMode,
-  productGenerationMode,
   onPromptChange,
   onPromptDirty,
-  onAppendPrompt,
-  onTogglePromptLibrary,
   onOptimizePrompt,
   canOptimizePrompt,
   optimizingPrompt,
+  promptModelOptions,
+  selectedPromptModelConfigId,
+  onPromptModelChange,
   onClearWorkspace,
+  onClearAllWorkspaces,
   canClearWorkspace,
   onSubmitPreview,
 }) {
-  const chips = promptChipsForEditMode({ isImageEditMode, portraitGenerationMode, productGenerationMode });
-
   return (
     <div className="rounded-2xl border border-line bg-base/35 p-3">
       <div className="mb-2 flex items-center justify-between gap-3">
@@ -226,23 +193,13 @@ function EditPromptPanel({
         }}
       />
       <div className="mt-2 flex flex-wrap gap-1.5">
-        {chips.map((ex) => (
-          <button
-            key={ex}
-            type="button"
-            onClick={() => onAppendPrompt(ex)}
-            className="chip"
-          >
-            {ex}
-          </button>
-        ))}
-        <button
-          type="button"
-          onClick={onTogglePromptLibrary}
-          className={`chip ${promptLibraryOpen ? "chip-active" : ""}`}
-        >
-          提示词库
-        </button>
+        <StudioModelSelector
+          use="prompt"
+          options={promptModelOptions}
+          value={selectedPromptModelConfigId}
+          onChange={onPromptModelChange}
+          compact
+        />
         <button
           type="button"
           onClick={onOptimizePrompt}
@@ -260,6 +217,14 @@ function EditPromptPanel({
           title="清空提示词、上传素材和反推结果"
         >
           ✕ 清空
+        </button>
+        <button
+          type="button"
+          onClick={onClearAllWorkspaces}
+          className="chip text-fog hover:text-bad"
+          title="二次确认后清空全部创作模式"
+        >
+          清空全部模式
         </button>
       </div>
     </div>
@@ -325,14 +290,16 @@ function EditAssistPanels({
 function DefaultPromptPanel({
   prompt,
   placeholder,
-  promptLibraryOpen,
   onPromptChange,
   onPromptDirty,
-  onTogglePromptLibrary,
   onOptimizePrompt,
   canOptimizePrompt,
   optimizingPrompt,
+  promptModelOptions,
+  selectedPromptModelConfigId,
+  onPromptModelChange,
   onClearWorkspace,
+  onClearAllWorkspaces,
   canClearWorkspace,
   onSubmitPreview,
 }) {
@@ -354,27 +321,13 @@ function DefaultPromptPanel({
         }}
       />
       <div className="mt-1.5 flex flex-wrap gap-1.5 border-t border-line pt-2.5">
-        {EXAMPLES.map((ex, i) => (
-          <button
-            key={i}
-            type="button"
-            onClick={() => {
-              onPromptChange(ex);
-              onPromptDirty(true);
-            }}
-            className="chip"
-            title={ex}
-          >
-            ✦ {ex.slice(0, 12)}…
-          </button>
-        ))}
-        <button
-          type="button"
-          onClick={onTogglePromptLibrary}
-          className={`chip ${promptLibraryOpen ? "chip-active" : ""}`}
-        >
-          提示词库
-        </button>
+        <StudioModelSelector
+          use="prompt"
+          options={promptModelOptions}
+          value={selectedPromptModelConfigId}
+          onChange={onPromptModelChange}
+          compact
+        />
         <button
           type="button"
           onClick={onOptimizePrompt}
@@ -393,6 +346,14 @@ function DefaultPromptPanel({
         >
           ✕ 清空
         </button>
+        <button
+          type="button"
+          onClick={onClearAllWorkspaces}
+          className="chip text-fog hover:text-bad"
+          title="二次确认后清空全部创作模式"
+        >
+          清空全部模式
+        </button>
       </div>
     </>
   );
@@ -408,43 +369,63 @@ export default function StudioPromptWorkspace({
   productGenerationMode,
   prompt,
   placeholder,
-  promptLibraryOpen,
   readySteps,
   editStyleKeys,
   onPromptChange,
   onPromptDirty,
-  onAppendPrompt,
-  onTogglePromptLibrary,
   onOptimizePrompt,
   canOptimizePrompt,
   optimizingPrompt,
+  generationModelOptions = [],
+  selectedGenerationModelConfigId = null,
+  onGenerationModelChange,
+  promptModelOptions = [],
+  selectedPromptModelConfigId = null,
+  onPromptModelChange,
   onClearWorkspace,
+  onClearAllWorkspaces,
   canClearWorkspace,
   onSubjectModeChange,
   onRecompose,
   onSubmitPreview,
 }) {
+  const generationModelSelector = (
+    <div className="flex min-w-0 justify-end border-b border-line pb-2">
+      <StudioModelSelector
+        use={category}
+        options={generationModelOptions}
+        value={selectedGenerationModelConfigId}
+        onChange={onGenerationModelChange}
+      />
+    </div>
+  );
   if (!isEditMode) {
     return (
-      <DefaultPromptPanel
-        prompt={prompt}
-        placeholder={placeholder}
-        promptLibraryOpen={promptLibraryOpen}
-        onPromptChange={onPromptChange}
-        onPromptDirty={onPromptDirty}
-        onTogglePromptLibrary={onTogglePromptLibrary}
-        onOptimizePrompt={onOptimizePrompt}
-        canOptimizePrompt={canOptimizePrompt}
-        optimizingPrompt={optimizingPrompt}
-        onClearWorkspace={onClearWorkspace}
-        canClearWorkspace={canClearWorkspace}
-        onSubmitPreview={onSubmitPreview}
-      />
+      <div className="grid gap-2">
+        {generationModelSelector}
+        <DefaultPromptPanel
+          prompt={prompt}
+          placeholder={placeholder}
+          onPromptChange={onPromptChange}
+          onPromptDirty={onPromptDirty}
+          onOptimizePrompt={onOptimizePrompt}
+          canOptimizePrompt={canOptimizePrompt}
+          optimizingPrompt={optimizingPrompt}
+          promptModelOptions={promptModelOptions}
+          selectedPromptModelConfigId={selectedPromptModelConfigId}
+          onPromptModelChange={onPromptModelChange}
+          onClearWorkspace={onClearWorkspace}
+          onClearAllWorkspaces={onClearAllWorkspaces}
+          canClearWorkspace={canClearWorkspace}
+          onSubmitPreview={onSubmitPreview}
+        />
+      </div>
     );
   }
 
   return (
     <div className="grid gap-3">
+      {generationModelSelector}
       <EditBrief
         category={category}
         isImageEditMode={isImageEditMode}
@@ -459,18 +440,16 @@ export default function StudioPromptWorkspace({
       <EditPromptPanel
         prompt={prompt}
         placeholder={placeholder}
-        promptLibraryOpen={promptLibraryOpen}
-        isImageEditMode={isImageEditMode}
-        portraitGenerationMode={portraitGenerationMode}
-        productGenerationMode={productGenerationMode}
         onPromptChange={onPromptChange}
         onPromptDirty={onPromptDirty}
-        onAppendPrompt={onAppendPrompt}
-        onTogglePromptLibrary={onTogglePromptLibrary}
         onOptimizePrompt={onOptimizePrompt}
         canOptimizePrompt={canOptimizePrompt}
         optimizingPrompt={optimizingPrompt}
+        promptModelOptions={promptModelOptions}
+        selectedPromptModelConfigId={selectedPromptModelConfigId}
+        onPromptModelChange={onPromptModelChange}
         onClearWorkspace={onClearWorkspace}
+        onClearAllWorkspaces={onClearAllWorkspaces}
         canClearWorkspace={canClearWorkspace}
         onSubmitPreview={onSubmitPreview}
       />

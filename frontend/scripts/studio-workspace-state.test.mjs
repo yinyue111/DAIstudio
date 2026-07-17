@@ -22,6 +22,26 @@ const viewModelSource = readFileSync(join(root, "app/studio/viewModel.ts"), "utf
 const structuredEditorSource = readFileSync(join(root, "app/studio/StudioStructuredEditor.jsx"), "utf8");
 const generationControlsSource = readFileSync(join(root, "components/StudioGenerationControls.jsx"), "utf8");
 const studioSource = `${pageSource}\n${workspaceStateSource}\n${promptWorkspaceSource}\n${editPromptSource}\n${generationPayloadSource}\n${referenceParsingSource}\n${viewModelSource}\n${constantsSource}\n${generationControlsSource}`;
+assert.match(
+  constantsSource,
+  /MAX_PRODUCT_DETAIL_IMAGES\s*=\s*5/,
+  "the product detail image business limit should be five",
+);
+assert.match(
+  mediaUploadSource,
+  /productDetailAssets\.length \+ files\.length > MAX_PRODUCT_DETAIL_IMAGES/,
+  "product detail uploads should use the shared five-image limit",
+);
+assert.match(
+  pageSource,
+  /productDetailAssets:[\s\S]*?\.slice\(0, MAX_PRODUCT_DETAIL_IMAGES\)/,
+  "Studio drafts should retain all five product detail images",
+);
+assert.match(
+  referencePanelSource,
+  /最多 \{limit \|\| MAX_PRODUCT_DETAIL_IMAGES\} 张/,
+  "the reference panel should show the effective product detail limit",
+);
 assert.doesNotMatch(
   generationControlsSource,
   /applyVideoProductTemplate/,
@@ -41,6 +61,7 @@ const clearedWorkspace = clearWorkspaceContent({
   assets: [{ id: 1 }],
   selected: { id: 1 },
   productAsset: { id: 2 },
+  productDetailAssets: [{ id: 3 }, { id: 4 }],
   productProfile: { final_text: "旧主体档案" },
   structured: { 主体: "旧反推主体" },
   reverseVideoAnalysis: { source: { duration_seconds: 10 } },
@@ -51,6 +72,7 @@ assert.equal(clearedWorkspace.negative, "");
 assert.deepEqual(clearedWorkspace.assets, []);
 assert.equal(clearedWorkspace.selected, null);
 assert.equal(clearedWorkspace.productAsset, null);
+assert.deepEqual(clearedWorkspace.productDetailAssets, []);
 assert.equal(clearedWorkspace.productProfile, null);
 assert.deepEqual(clearedWorkspace.structured, {});
 assert.equal(clearedWorkspace.reverseVideoAnalysis, null);
@@ -80,11 +102,17 @@ assert.equal(clearedWorkspaces.video_edit.productAsset, null);
 assert.equal(clearedWorkspaces.video_edit.productProfile, null);
 assert.deepEqual(clearedWorkspaces.video_edit.structured, {});
 assert.equal(clearedWorkspaces.video_edit.vDuration, 10, "clear all should preserve video settings");
-assert.match(
-  pageSource,
-  /function clearCurrentWorkspace\(\)[\s\S]*resetOwnerReferenceParsing\(\)[\s\S]*resetOwnerMediaUpload\(\)[\s\S]*setWorkspaces\(clearAllWorkspaceContent\)/,
-  "clear should cancel all mode requests, revoke local previews, and clear every workspace",
-);
+const clearCurrentWorkspaceSource = pageSource.match(
+  /async function clearCurrentWorkspace\(\)[\s\S]*?(?=\n  async function clearAllWorkspaces)/,
+)?.[0] || "";
+const clearAllWorkspacesSource = pageSource.match(
+  /async function clearAllWorkspaces\(\)[\s\S]*?(?=\n  async function saveReversePromptToLibrary)/,
+)?.[0] || "";
+assert.match(clearCurrentWorkspaceSource, /cancelReverseOperationForMode\(mode\)/);
+assert.match(clearCurrentWorkspaceSource, /clearWorkspaceContent\(current\)/);
+assert.doesNotMatch(clearCurrentWorkspaceSource, /clearAllWorkspaceContent/);
+assert.match(clearAllWorkspacesSource, /window\.confirm\(/, "clear all should require explicit confirmation");
+assert.match(clearAllWorkspacesSource, /setWorkspaces\(clearAllWorkspaceContent\)/);
 
 assert.equal(
   typeof startSubjectProtectionPreview,
@@ -296,8 +324,8 @@ assert.match(
 );
 assert.match(
   referenceParsingSource,
-  /const transferPrompt = composeSafeVideoTransferPrompt\(structured,\s*subjectMode\)[\s\S]*const reversePrompt = isVideo[\s\S]*isEditMode[\s\S]*transferPrompt[\s\S]*composeStyleTransferPrompt[\s\S]*result\.final_text[\s\S]*composePromptFromStructured/,
-  "video reverse should separate authoritative replication text from identity-safe transfer prompts",
+  /const validatedFinalText = String\(result\.final_text[\s\S]*const evidenceTransferPrompt = composeEvidenceBackedVideoTransferPrompt\([\s\S]*const reversePrompt = targetIsEditMode[\s\S]*evidenceTransferPrompt[\s\S]*: validatedFinalText \|\| composePromptFromStructured/,
+  "video reverse should use evidence-backed transfer prompts while preserving validated direct final text",
 );
 assert.match(
   referenceParsingSource,
@@ -351,8 +379,8 @@ assert.match(
 );
 assert.match(
   pageSource,
-  /productBusy=\{submitting \|\| productProfiling\}/,
-  "subject replacement controls should be disabled while submit-time profiling is running",
+  /productBusy=\{submitting\}[\s\S]*productProfiling=\{productProfiling\}/,
+  "subject replacement should stay available during profiling so replacing the asset can cancel the old profile operation",
 );
 assert.doesNotMatch(
   generationSubmitSource,
@@ -562,8 +590,8 @@ assert.match(
 );
 assert.match(
   pageSource,
-  /disabled=\{missingRequiredSource \|\| generationSubmitDisabled/,
-  "generation must stay disabled until the required product or portrait source is uploaded",
+  /disabled=\{missingRequiredSource \|\| structuredDirty \|\| generationSubmitDisabled/,
+  "generation must stay disabled until the required source exists and structured conflicts are resolved",
 );
 assert.match(
   pageSource,
@@ -666,7 +694,6 @@ for (const phrase of [
   "产品与包装文字保真优先",
   "产品正面文字被重排",
   "顶部文字被改写",
-  "保留人像身份",
   "上传人像是唯一人物身份",
   "人物重构",
   "当前为人物参考驱动重构，非逐帧换脸",

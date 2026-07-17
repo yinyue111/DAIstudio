@@ -1,7 +1,103 @@
 "use client";
 
+import { useEffect, useState } from "react";
 import { ReferenceAssetPreview } from "./StudioMedia.jsx";
+import StudioModelSelector from "./StudioModelSelector";
 import { assetDims, selectedLabel } from "./helpers";
+import { MAX_PRODUCT_DETAIL_IMAGES } from "./constants";
+
+const REVERSE_VIDEO_PRESET_COSTS = { fast: 5, standard: 5, fine: 5 };
+
+export function analysisModeLabel(mode) {
+  return {
+    keyframes: "多帧分析",
+    multi_frame: "多帧分析",
+    cover_fallback: "封面单帧",
+    cover: "封面单帧",
+    image_motion: "单图运动设计",
+  }[mode] || "视频分析";
+}
+
+function confirmationTime(value) {
+  if (!value) return "15 分钟内";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "15 分钟内";
+  return `${date.toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" })} 前`;
+}
+
+export function videoAnalysisEvidenceData(analysis) {
+  if (!analysis || typeof analysis !== "object") return null;
+  const source = analysis.source || {};
+  const frames = Array.isArray(analysis.sampled_frames) ? analysis.sampled_frames : [];
+  const gaps = Array.isArray(analysis.analysis_gaps) ? analysis.analysis_gaps : [];
+  const coverage = analysis.evidence_coverage && typeof analysis.evidence_coverage === "object"
+    ? analysis.evidence_coverage
+    : {};
+  const numericFrameTimes = frames
+    .map((frame) => Number(frame?.timestamp_seconds))
+    .filter(Number.isFinite);
+  const frameTimes = numericFrameTimes.map((time) => `${time.toFixed(1)}s`);
+  const explicitStart = coverage.start_seconds == null ? NaN : Number(coverage.start_seconds);
+  const explicitEnd = coverage.end_seconds == null ? NaN : Number(coverage.end_seconds);
+  const coverageStart = Number.isFinite(explicitStart) ? explicitStart : numericFrameTimes[0];
+  const coverageEnd = Number.isFinite(explicitEnd)
+    ? explicitEnd
+    : numericFrameTimes[numericFrameTimes.length - 1];
+  const degradedReason = analysis.degraded_reason || analysis.fallback_reason || "";
+  const gapTexts = gaps.map((gap) => {
+    if (typeof gap === "string") return gap;
+    if (!gap || typeof gap !== "object") return "";
+    if (gap.message || gap.label || gap.field) return gap.message || gap.label || gap.field;
+    const start = Number(gap.start_seconds);
+    const end = Number(gap.end_seconds);
+    if (Number.isFinite(start) && Number.isFinite(end)) {
+      return `${start.toFixed(1)}s - ${end.toFixed(1)}s 未覆盖`;
+    }
+    if (Number.isFinite(start)) return `${start.toFixed(1)}s 后未覆盖`;
+    if (Number.isFinite(end)) return `${end.toFixed(1)}s 前未覆盖`;
+    return "存在未标注时间的分析缺口";
+  }).filter(Boolean);
+  return {
+    source,
+    frameTimes,
+    coverageStart,
+    coverageEnd,
+    degradedReason,
+    gapTexts,
+  };
+}
+
+function VideoAnalysisEvidence({ analysis }) {
+  const evidence = videoAnalysisEvidenceData(analysis);
+  if (!evidence) return null;
+  const {
+    source,
+    frameTimes,
+    coverageStart,
+    coverageEnd,
+    degradedReason,
+    gapTexts,
+  } = evidence;
+
+  return (
+    <div className="mt-2 border-t border-line pt-2 text-[11px] leading-relaxed text-fog">
+      <div className="flex flex-wrap gap-x-3 gap-y-1 text-mist">
+        <span>{analysisModeLabel(analysis.analysis_mode)}</span>
+        {frameTimes.length > 0 && <span>采样 {frameTimes.join(" / ")}</span>}
+        {(Number.isFinite(coverageStart) || Number.isFinite(coverageEnd)) && (
+          <span>
+            证据覆盖 {Number(coverageStart || 0).toFixed(1)}s - {Number(coverageEnd || coverageStart || 0).toFixed(1)}s
+          </span>
+        )}
+      </div>
+      {degradedReason && <p className="mt-1 text-warn">降级原因：{degradedReason}</p>}
+      {source.audio_analyzed === false && (
+        <p className="mt-1 text-warn">音频未分析：旁白、音效和镜头音频提示不会自动补写。</p>
+      )}
+      {gapTexts.length > 0 && <p className="mt-1">分析缺口：{gapTexts.join("；")}</p>}
+    </div>
+  );
+}
 
 function referencePreviewFrameProps(asset) {
   const dims = assetDims(asset);
@@ -18,6 +114,55 @@ function referencePreviewFrameProps(asset) {
   };
 }
 
+function ProductDetailImages({
+  assets = [],
+  enabled,
+  limit = 0,
+  validation,
+  busy,
+  uploadInputRef,
+  onOpenPicker,
+  onRemove,
+  onMove,
+}) {
+  const canAdd = enabled && assets.length < limit && !busy;
+  return (
+    <div className="mt-3 border-t border-aqua/20 pt-3">
+      <div className="mb-2 flex items-start justify-between gap-2">
+        <div>
+          <p className="text-xs font-display font-semibold text-snow">产品细节图</p>
+          <p className="mt-0.5 text-[11px] text-fog">按从左到右顺序提交，最多 {limit || MAX_PRODUCT_DETAIL_IMAGES} 张，同一商品不同角度或局部。</p>
+        </div>
+        <span className="text-[11px] text-fog">{assets.length}/{Math.max(assets.length, limit || MAX_PRODUCT_DETAIL_IMAGES)}</span>
+      </div>
+      {assets.length > 0 && (
+        <div className="mb-2 grid grid-cols-3 gap-2">
+          {assets.map((asset, index) => (
+            <div key={asset.asset_ref || asset.url || index} className="relative aspect-square overflow-hidden rounded-lg border border-aqua/35 bg-black/25">
+              <ReferenceAssetPreview asset={asset} compact />
+              <span className="badge absolute left-1 top-1 bg-black/70 text-[10px] text-white">{index + 1}</span>
+              <div className="absolute inset-x-1 bottom-1 grid grid-cols-3 gap-1">
+                <button type="button" onClick={() => onMove?.(index, -1)} disabled={busy || index === 0} className="rounded bg-black/75 py-1 text-[10px] text-white disabled:opacity-30" aria-label={`细节图 ${index + 1} 前移`}>←</button>
+                <button type="button" onClick={() => onRemove?.(index)} disabled={busy} className="rounded bg-black/75 py-1 text-[10px] text-white disabled:opacity-30" aria-label={`移除细节图 ${index + 1}`}>×</button>
+                <button type="button" onClick={() => onMove?.(index, 1)} disabled={busy || index === assets.length - 1} className="rounded bg-black/75 py-1 text-[10px] text-white disabled:opacity-30" aria-label={`细节图 ${index + 1} 后移`}>→</button>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+      {!enabled && (
+        <p className="mb-2 rounded-lg border border-warn/30 bg-warn/10 px-2.5 py-2 text-[11px] leading-relaxed text-warn">
+          {validation?.message || "当前模型没有明确声明多参考图能力，产品细节图暂不可用。"}
+        </p>
+      )}
+      <div className="grid grid-cols-2 gap-2">
+        <button type="button" onClick={() => uploadInputRef.current?.click()} disabled={!canAdd} className="btn-secondary btn-sm justify-center">上传细节图</button>
+        <button type="button" onClick={() => onOpenPicker?.("product_detail")} disabled={!canAdd} className="btn-secondary btn-sm justify-center">从我的资产选择</button>
+      </div>
+    </div>
+  );
+}
+
 export default function StudioReferencePanel({
   category,
   creationMode,
@@ -26,33 +171,51 @@ export default function StudioReferencePanel({
   isEditMode = false,
   selected,
   productAsset,
+  productDetailAssets = [],
+  productDetailValidation = { ok: true, message: "" },
+  productDetailLimit = 0,
   url,
+  appliedUrl = "",
   setUrl,
   parsing,
   uploading,
   productBusy = false,
+  productProfiling = false,
+  profileOperation = null,
   assets,
   refOpen,
   setRefOpen,
   reversing,
   reverseEnabled,
+  reverseImageCost,
   selectedReverseCost,
   selectedReverseCostLabel,
   videoAnalysisPreset,
   videoAnalysisPresets = [],
   reverseVideoAnalysis = null,
+  reverseOperation = null,
+  visionModelOptions = [],
+  selectedVisionModelConfigId = null,
+  onVisionModelChange,
   setVideoAnalysisPreset,
   imageUploadInputRef,
   productUploadInputRef,
+  productDetailUploadInputRef,
   videoUploadInputRef,
   onClear,
   onClearProductAsset,
   onParse,
   onUploadImage,
   onUploadProductImage,
+  onUploadProductDetailImages,
+  onOpenAssetPicker,
+  onRemoveProductDetail,
+  onMoveProductDetail,
   onUploadVideo,
   onPickAsset,
   onReverse,
+  onConfirmCover,
+  onCancelReverse,
 }) {
   const isImageEditMode = creationMode === "image_edit";
   const directProductVideoMode = creationMode === "video";
@@ -96,7 +259,13 @@ export default function StudioReferencePanel({
     : isEditMode
     ? (portraitGenerationMode ? "上传目标视频或粘贴链接，先反推镜头和风格，再上传人物照片做重构" : "也可粘贴小红书、抖音或网页链接抓取素材")
     : (category === "video" ? "点击上传视频，下方也可改传图片或粘贴链接" : "点击上传图片，下方也可粘贴链接抓取素材");
-  const productTitle = portraitGenerationMode ? "人物照片" : productSubjectMode ? "产品主体图片" : (isImageEditMode ? "编辑源图片" : "产品主体");
+  const productTitle = portraitGenerationMode ? "人物照片" : productSubjectMode ? "产品主题图" : (isImageEditMode ? "编辑源图片" : "产品主体");
+  const detailImagesEnabled = Boolean(
+    category === "video"
+    && productSubjectMode
+    && productDetailLimit > 0
+    && productDetailValidation.ok,
+  );
   const productHint = isImageEditMode
     ? (portraitGenerationMode
         ? "上传需要保留身份的人像照片，生成时强保护五官、脸型、发型和人物身份"
@@ -106,6 +275,13 @@ export default function StudioReferencePanel({
     : (portraitGenerationMode
         ? "上传要生成进目标视频风格的人物照片，参考视频只提供动作、镜头和风格"
         : "上传产品图作为视频中的唯一商品主体，不作为风格参考；保留Logo、包装、颜色、形状和文字标识");
+  const [fallbackCoverFile, setFallbackCoverFile] = useState(null);
+  const reverseNeedsConfirmation = reverseOperation?.status === "needs_confirmation";
+  const imageMotionSource = category === "video" && selected?.type === "image";
+
+  useEffect(() => {
+    setFallbackCoverFile(null);
+  }, [reverseOperation?.id, reverseOperation?.status]);
 
   return (
     <aside className="relative min-w-0 overflow-hidden rounded-xl3 border border-iris/35 bg-gradient-to-b from-iris/20 via-base2/80 to-rose/10 p-3 shadow-glow-sm">
@@ -123,6 +299,14 @@ export default function StudioReferencePanel({
               清除参考
             </button>
           )}
+        </div>
+        <div className="mb-3 flex min-w-0 justify-end border-b border-line/80 pb-2">
+          <StudioModelSelector
+            use="vision"
+            options={visionModelOptions}
+            value={selectedVisionModelConfigId}
+            onChange={onVisionModelChange}
+          />
         </div>
 
         {(isImageEditMode || directProductVideoMode) && (
@@ -187,16 +371,36 @@ export default function StudioReferencePanel({
                 </div>
               </div>
             )}
-            <button
-              type="button"
-              onClick={() => productUploadInputRef.current?.click()}
-              disabled={productActionBusy}
-              className="btn-secondary btn-sm mt-2 w-full justify-center border-aqua/30 bg-aqua/10 text-snow"
-            >
-              {uploading ? "上传中…" : productBusy ? "识别中…" : productAsset
-                ? (portraitGenerationMode ? "替换人物照片" : productSubjectMode ? "替换产品图片" : "替换编辑源图片")
-                : (portraitGenerationMode ? "上传人物照片" : productSubjectMode ? "上传产品图片" : "上传编辑源图片")}
-            </button>
+            <div className={`mt-2 grid gap-2 ${productSubjectMode ? "grid-cols-2" : "grid-cols-1"}`}>
+              <button
+                type="button"
+                onClick={() => productUploadInputRef.current?.click()}
+                disabled={productActionBusy}
+                className="btn-secondary btn-sm justify-center border-aqua/30 bg-aqua/10 text-snow"
+              >
+                {uploading ? "上传中…" : productBusy ? "处理中…" : productProfiling ? "识别中，可替换" : productAsset
+                  ? (portraitGenerationMode ? "替换人物照片" : productSubjectMode ? "替换主题图" : "替换编辑源图片")
+                  : (portraitGenerationMode ? "上传人物照片" : productSubjectMode ? "上传主题图" : "上传编辑源图片")}
+              </button>
+              {productSubjectMode && (
+                <button type="button" onClick={() => onOpenAssetPicker?.("product_theme")} disabled={productActionBusy} className="btn-secondary btn-sm justify-center">
+                  从我的资产选择
+                </button>
+              )}
+            </div>
+            {directProductVideoMode && productSubjectMode && (
+              <ProductDetailImages
+                assets={productDetailAssets}
+                enabled={detailImagesEnabled}
+                limit={productDetailLimit}
+                validation={productDetailValidation}
+                busy={productActionBusy}
+                uploadInputRef={productDetailUploadInputRef}
+                onOpenPicker={onOpenAssetPicker}
+                onRemove={onRemoveProductDetail}
+                onMove={onMoveProductDetail}
+              />
+            )}
           </div>
         )}
 
@@ -326,14 +530,37 @@ export default function StudioReferencePanel({
               disabled={productActionBusy}
               className="btn-secondary btn-sm mt-2 w-full justify-center border-aqua/30 bg-aqua/10 text-snow"
             >
-              {uploading ? "上传中…" : productBusy ? "识别中…" : productAsset
+              {uploading ? "上传中…" : productBusy ? "处理中…" : productProfiling ? "识别中，可替换" : productAsset
                 ? (portraitGenerationMode ? "替换人物照片" : isImageEditMode ? "替换编辑源图片" : "替换产品图片")
                 : (portraitGenerationMode ? "上传人物照片" : isImageEditMode ? "上传编辑源图片" : "上传产品图片")}
             </button>
+            {productGenerationMode && (
+              <>
+                <button type="button" onClick={() => onOpenAssetPicker?.("product_theme")} disabled={productActionBusy} className="btn-secondary btn-sm mt-2 w-full justify-center">
+                  从我的资产选择主题图
+                </button>
+                <ProductDetailImages
+                  assets={productDetailAssets}
+                  enabled={detailImagesEnabled}
+                  limit={productDetailLimit}
+                  validation={productDetailValidation}
+                  busy={productActionBusy}
+                  uploadInputRef={productDetailUploadInputRef}
+                  onOpenPicker={onOpenAssetPicker}
+                  onRemove={onRemoveProductDetail}
+                  onMove={onMoveProductDetail}
+                />
+              </>
+            )}
           </div>
         )}
 
         <div className="space-y-2">
+          {profileOperation && ["queued", "running"].includes(profileOperation.status) && (
+            <p className="rounded-xl border border-aqua/25 bg-aqua/10 px-3 py-2 text-xs text-mist" role="status">
+              {profileOperation.phase || "正在识别主体身份档案"} · {Math.round(Number(profileOperation.progress || 0))}%
+            </p>
+          )}
           <div className="grid min-w-0 grid-cols-[minmax(0,1fr)_auto] gap-2">
             <input
               className="input min-w-0 px-3 py-2 text-xs"
@@ -346,6 +573,9 @@ export default function StudioReferencePanel({
               {parsing ? "抓取中" : "抓取"}
             </button>
           </div>
+          {appliedUrl && appliedUrl !== url.trim() && (
+            <p className="truncate text-[11px] text-fog" title={appliedUrl}>当前素材仍来自：{appliedUrl}</p>
+          )}
           <div className="grid grid-cols-2 gap-2">
             <button
               type="button"
@@ -368,11 +598,11 @@ export default function StudioReferencePanel({
               {uploading ? "上传中…" : "上传视频"}
             </button>
           </div>
-          {selected?.type === "video" && videoAnalysisPresets.length > 0 && (
+          {category === "video" && selected && videoAnalysisPresets.length > 0 && (
             <div className="rounded-xl border border-line bg-black/15 p-2">
               <div className="mb-2 flex items-center justify-between gap-2 text-xs">
                 <span className="font-display font-medium text-mist">分析精度</span>
-                <span className="text-fog">优先镜头切换关键帧</span>
+                <span className="text-fog">{imageMotionSource ? `单图成功后结算 ${reverseImageCost} 积分` : "优先镜头切换关键帧"}</span>
               </div>
               <div className="grid grid-cols-3 gap-1.5">
                 {videoAnalysisPresets.map((preset) => (
@@ -388,13 +618,27 @@ export default function StudioReferencePanel({
                   >
                     <span className="block text-xs font-display font-semibold">{preset.label}</span>
                     <span className="mt-1 block text-[10px] leading-snug">
-                      {preset.short_range} / {preset.long_range}
+                      {imageMotionSource
+                        ? `冻结 ${Number(preset.max_cost ?? REVERSE_VIDEO_PRESET_COSTS[preset.key] ?? 5)} 积分`
+                        : `${preset.short_range} / ${preset.long_range}`}
                     </span>
                   </button>
                 ))}
               </div>
-              {reverseVideoAnalysis?.source && (
-                <div className="mt-2 text-xs text-mist">
+              {imageMotionSource && (
+                <p className="mt-2 text-[11px] leading-relaxed text-fog">
+                  当前档位先冻结 {selectedReverseCost} 积分；单图运动设计成功后结算 {reverseImageCost} 积分
+                  {Number(selectedReverseCost || 0) > Number(reverseImageCost || 0)
+                    ? `，并退还 ${Number(selectedReverseCost) - Number(reverseImageCost)} 积分差额。`
+                    : "。"}
+                </p>
+              )}
+            </div>
+          )}
+          {reverseVideoAnalysis && (
+            <div className="rounded-xl border border-line bg-black/15 p-2">
+              {reverseVideoAnalysis.source && (
+                <div className="text-xs text-mist">
                   已识别 {reverseVideoAnalysis.source.ratio || "未知画幅"}
                   {Number.isFinite(Number(reverseVideoAnalysis.source.duration_seconds))
                     ? ` · ${Number(reverseVideoAnalysis.source.duration_seconds).toFixed(2)}s`
@@ -404,20 +648,69 @@ export default function StudioReferencePanel({
                     : ""}
                 </div>
               )}
+              <VideoAnalysisEvidence analysis={reverseVideoAnalysis} />
+            </div>
+          )}
+          {reverseNeedsConfirmation && (
+            <div className="rounded-xl border border-warn/40 bg-warn/10 p-3" role="alert">
+              <p className="text-sm font-display font-semibold text-snow">视频抽帧失败</p>
+              <p className="mt-1 text-xs leading-relaxed text-fog">
+                是否改用封面单帧设计视频运动？确认后仅结算 2 积分，并退还
+                {Math.max(0, Number(reverseOperation.cost_frozen || 0) - 2)} 积分差额；
+                {confirmationTime(reverseOperation.confirmation_expires_at)}未确认将自动取消并全额退款。
+              </p>
+              <label className="mt-2 block text-[11px] text-mist">
+                可选：上传新的封面图片
+                <input
+                  type="file"
+                  accept="image/jpeg,image/png,image/webp"
+                  onChange={(event) => setFallbackCoverFile(event.target.files?.[0] || null)}
+                  className="mt-1 block w-full min-w-0 text-[11px] text-fog file:mr-2 file:rounded-full file:border-0 file:bg-white/10 file:px-2.5 file:py-1.5 file:text-[11px] file:text-mist hover:file:bg-white/15"
+                />
+              </label>
+              <p className="mt-1 truncate text-[11px] text-fog" aria-live="polite">
+                {fallbackCoverFile ? `将使用：${fallbackCoverFile.name}` : "未选择时使用任务中已有封面"}
+              </p>
+              <div className="mt-2 grid grid-cols-2 gap-2">
+                <button type="button" onClick={onCancelReverse} className="btn-secondary btn-sm justify-center">
+                  取消并退款
+                </button>
+                <button type="button" onClick={() => onConfirmCover?.(fallbackCoverFile)} className="btn-primary btn-sm justify-center">
+                  使用封面分析
+                </button>
+              </div>
+            </div>
+          )}
+          {reverseOperation && ["queued", "running"].includes(reverseOperation.status) && (
+            <div className="rounded-xl border border-aqua/30 bg-aqua/10 px-3 py-2" role="status" aria-live="polite">
+              <div className="flex items-center justify-between gap-2 text-xs text-mist">
+                <span>{reverseOperation.phase || (reverseOperation.status === "queued" ? "等待反推" : "正在分析")}</span>
+                <span>{Math.round(Number(reverseOperation.progress || 0))}%</span>
+              </div>
+              <div className="mt-1.5 h-1.5 overflow-hidden rounded-full bg-black/25">
+                <div className="h-full bg-aqua transition-[width]" style={{ width: `${Math.max(2, Number(reverseOperation.progress || 0))}%` }} />
+              </div>
+              <button type="button" onClick={onCancelReverse} className="mt-2 text-xs text-fog underline-offset-2 hover:text-snow hover:underline">
+                取消反推
+              </button>
             </div>
           )}
           <div className="grid grid-cols-1 gap-2">
             <button
               type="button"
               onClick={onReverse}
-              disabled={!selected || !reverseEnabled || reversing}
+              disabled={!selected || !reverseEnabled || reversing || reverseNeedsConfirmation}
               className={`btn-sm justify-center rounded-full font-display font-medium transition ${
                 selected && reverseEnabled
                   ? "bg-brand text-white shadow-glow-sm hover:brightness-110 active:scale-[0.98]"
                   : "cursor-not-allowed border border-line bg-white/5 text-fog"
               }`}
             >
-              {reversing ? "反推中…" : `${isImageEditMode ? "反推可选风格" : "反推提示词"}${selected && selectedReverseCost ? ` · ${selectedReverseCostLabel}` : ""}`}
+              {reverseNeedsConfirmation
+                ? "请先处理封面确认"
+                : reversing
+                  ? "反推中…"
+                  : `${isImageEditMode ? "反推可选风格" : "反推提示词"}${selected && selectedReverseCost ? ` · ${selectedReverseCostLabel}` : ""}`}
             </button>
           </div>
           <input
@@ -441,6 +734,16 @@ export default function StudioReferencePanel({
               accept="image/jpeg,image/png,image/webp,image/gif"
               className="hidden"
               onChange={(e) => onUploadProductImage(e.target.files?.[0])}
+            />
+          )}
+          {category === "video" && productSubjectMode && (
+            <input
+              ref={productDetailUploadInputRef}
+              type="file"
+              multiple
+              accept="image/jpeg,image/png,image/webp,image/gif"
+              className="hidden"
+              onChange={(e) => onUploadProductDetailImages(e.target.files)}
             />
           )}
         </div>

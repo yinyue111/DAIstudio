@@ -13,6 +13,8 @@ import {
 } from "./helpers";
 import { shouldBlockNewGeneration } from "./taskConcurrency";
 
+const DEFAULT_REVERSE_VIDEO_PRESET_COSTS = { fast: 5, standard: 5, fine: 5 };
+
 export function studioCreationFacts({ creationMode, imageEditProductMode, editSubjectMode, productAsset = null }) {
   const category = creationMode === "video" || creationMode === "video_edit" ? "video" : "image";
   const isEditMode = creationMode === "image_edit" || creationMode === "video_edit";
@@ -69,11 +71,19 @@ export function buildStudioDerivedViewState({
   const reverseVideoPresets = Array.isArray(cfg?.reverse?.video_presets) ? cfg.reverse.video_presets : [];
   const reverseVideoPreset = reverseVideoPresets.find((p) => p.key === videoAnalysisPreset) || reverseVideoPresets[0] || null;
   const reverseVideoFrameCount = Number(reverseVideoPreset?.max_frames || cfg?.reverse?.video_frame_count || 1);
-  const reverseVideoMaxCost = reverseVideoPreset?.max_cost ?? cfg?.reverse?.video_max_cost ?? (reverseCost * reverseVideoFrameCount);
-  const selectedReverseCost = selected?.type === "video" ? reverseVideoMaxCost : reverseImageCost;
-  const selectedReverseCostLabel = selected?.type === "video" && reverseVideoFrameCount > 1
-    ? `${selectedReverseCost}积分(最多${reverseVideoFrameCount}帧)`
-    : `${selectedReverseCost}积分`;
+  const reverseVideoMaxCost = reverseVideoPreset?.max_cost
+    ?? cfg?.reverse?.video_max_cost
+    ?? DEFAULT_REVERSE_VIDEO_PRESET_COSTS[videoAnalysisPreset]
+    ?? DEFAULT_REVERSE_VIDEO_PRESET_COSTS.standard;
+  const reverseTargetsVideo = category === "video";
+  const selectedReverseCost = reverseTargetsVideo ? reverseVideoMaxCost : reverseImageCost;
+  const selectedReverseCostLabel = reverseTargetsVideo && selected?.type === "image"
+    ? selectedReverseCost === reverseImageCost
+      ? `${reverseImageCost}积分`
+      : `冻结${selectedReverseCost}积分，结算${reverseImageCost}积分`
+    : selected?.type === "video" && reverseVideoFrameCount > 1
+      ? `冻结${selectedReverseCost}积分(最多${reverseVideoFrameCount}帧)`
+      : `${selectedReverseCost}积分`;
   const reverseEnabled = cfg?.features?.reverse_prompt_enabled !== false;
   const ratioOptions = category === "video" ? videoRatioOptions() : RATIOS;
   const ratioOption = ratioOptions.find((r) => r.key === ratio) || ratioOptions[0];
@@ -159,6 +169,7 @@ export function buildStudioDerivedViewState({
     blockingGeneration,
     running,
     reverseVideoPresets,
+    reverseImageCost,
     selectedReverseCost,
     selectedReverseCostLabel,
     reverseEnabled,

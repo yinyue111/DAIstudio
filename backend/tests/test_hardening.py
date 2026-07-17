@@ -96,9 +96,9 @@ def test_image_partial_success_settles_actual_count(client, make_user, auth, mon
     assert task["requested_count"] == 4
     assert task["saved_count"] == 2
     assert task["skipped_count"] == 2
-    assert task["cost_frozen"] == 60
-    assert task["cost_settled"] == 30
-    assert client.get("/api/me", headers=h).json()["balance_credits"] == 970
+    assert task["cost_frozen"] == 32
+    assert task["cost_settled"] == 16
+    assert client.get("/api/me", headers=h).json()["balance_credits"] == 984
 
 
 def test_generated_image_over_pixel_limit_is_rejected(client, make_user, auth, monkeypatch):
@@ -899,8 +899,8 @@ def test_partial_image_generation_exposes_gateway_slot_failure(client, make_user
     assert task["saved_count"] == 2
     assert task["skipped_count"] == 2
     assert task["partial_errors"] == ["temporary account unavailable"]
-    assert task["cost_frozen"] == 60
-    assert task["cost_settled"] == 30
+    assert task["cost_frozen"] == 32
+    assert task["cost_settled"] == 16
 
 
 def test_partial_image_generation_unknown_slot_returns_saved_images(
@@ -943,11 +943,11 @@ def test_partial_image_generation_unknown_slot_returns_saved_images(
     assert task["skipped_count"] == 2
     assert task["partial_errors"] == ["read timed out"]
     assert len(task["assets"]) == 2
-    assert task["cost_frozen"] == 60
+    assert task["cost_frozen"] == 32
     assert task["cost_settled"] == 0
     me = client.get("/api/me", headers=h).json()
-    assert me["balance_credits"] == 940
-    assert me["frozen_credits"] == 60
+    assert me["balance_credits"] == 968
+    assert me["frozen_credits"] == 32
 
     db = SessionLocal()
     try:
@@ -994,12 +994,12 @@ def test_full_image_generation_unknown_submit_holds_for_review(
     assert task["requested_count"] == 4
     assert task["saved_count"] == 0
     assert task["skipped_count"] == 4
-    assert task["cost_frozen"] == 60
+    assert task["cost_frozen"] == 32
     assert task["cost_settled"] == 0
     assert len(task["assets"]) == 0
     me = client.get("/api/me", headers=h).json()
-    assert me["balance_credits"] == 940
-    assert me["frozen_credits"] == 60
+    assert me["balance_credits"] == 968
+    assert me["frozen_credits"] == 32
 
     db = SessionLocal()
     try:

@@ -264,7 +264,7 @@ def test_preview_capacity_keeps_all_actions_for_actual_preview_duration(
         assert db.query(GenTask).filter(GenTask.user_id == user_id).count() == 1
 
 
-def test_direct_product_video_submits_original_copy_and_keeps_post_metadata(
+def test_direct_product_video_submits_visual_copy_and_keeps_post_metadata(
     client, make_user, auth, monkeypatch
 ):
     make_user("13900003103", balance=1000)
@@ -319,8 +319,8 @@ def test_direct_product_video_submits_original_copy_and_keeps_post_metadata(
 
     assert response.status_code == 200, response.text
     assert submitted["prompt"].count("产品身份约束") == 1
-    assert "干湿两用" in submitted["prompt"]
-    assert "让洗脸这件事，成为一天温柔的开始" in submitted["prompt"]
+    assert "干湿两用" not in submitted["prompt"]
+    assert "让洗脸这件事，成为一天温柔的开始" not in submitted["prompt"]
     assert "底部抽出一张洗脸巾" in submitted["prompt"]
     assert "3D如意云纹" in submitted["prompt"]
     assert "Shot 1" in submitted["prompt"]

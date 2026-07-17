@@ -9,24 +9,29 @@ import logging
 from sqlalchemy.orm import Session
 
 from ..db import SessionLocal
-from ..models import GatewayCall
+from ..models import GatewayCall, GenTask
 
 log = logging.getLogger("usage")
 
 
 def record_call(db: Session, *, kind: str, model_id: str | None = None,
                 user_id: int | None = None, task_id: int | None = None,
+                model_config_id: int | None = None,
                 status: str = "ok", latency_ms: int | None = None,
                 usage: dict | None = None, detail: dict | None = None) -> None:
     del db  # logging must not commit or roll back the caller's business transaction
     u = usage or {}
     usage_db = SessionLocal()
     try:
+        if model_config_id is None and task_id is not None and kind != "reverse":
+            task = usage_db.get(GenTask, task_id)
+            model_config_id = getattr(task, "model_config_id", None) if task else None
         usage_db.add(GatewayCall(
             user_id=user_id,
             task_id=task_id,
             kind=kind,
             model_id=model_id,
+            model_config_id=model_config_id,
             status=status,
             latency_ms=latency_ms,
             prompt_tokens=u.get("prompt_tokens"),

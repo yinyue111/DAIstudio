@@ -32,7 +32,11 @@ from .generation_media import (
     gateway_reference_image,
     reference_dimensions,
 )
-from .generation_model_runtime import gen_image_with_model_config, model_from_snapshot
+from .generation_model_runtime import (
+    gen_image_with_model_config,
+    model_config_for_task,
+    model_from_snapshot,
+)
 from .generation_prompts import (
     generation_prompt_for_model,
     is_portrait_generation_task,
@@ -45,6 +49,7 @@ from .generation_prompts import (
 from .generation_state import NEEDS_REVIEW, claim_terminal
 from .generation_state import TERMINAL_STATUSES as TERMINAL_STATUSES
 from .generation_video_flow import unlink_keys
+from .media_sidecars import storage_bytes_for_asset_urls, storage_bytes_for_keys
 from .progress import set_progress
 from .watermark import dimensions, image_ext, make_image_preview, make_model_reference
 
@@ -142,12 +147,16 @@ def persist_local_image_result_assets(db, task: GenTask, keys: list[str] | None)
                 task_id=task.id,
                 user_id=task.user_id,
                 type="image",
-                        preview_url=storage.public_url(preview_key),
-                        hd_url=hd_url,
-                        watermarked=False,
-                        unlocked=True,
+                preview_url=storage.public_url(preview_key),
+                hd_url=hd_url,
+                watermarked=False,
+                unlocked=True,
                 width=hd_w,
                 height=hd_h,
+                bytes=storage_bytes_for_asset_urls(
+                    storage.public_url(preview_key),
+                    hd_url,
+                ),
             )
         )
         existing_hd_urls.add(hd_url)
@@ -300,7 +309,7 @@ def run_image_task(task_id: int, *, gen_image_fn=None) -> None:
         raise_if_cancel_requested(db, task)
         set_progress(task_id, 10, "running")
 
-        model = get_model_config(db, "image")
+        model = model_config_for_task(db, task, "image", get_model_config)
         if not model or not model.enabled:
             raise RuntimeError("未配置可用的图像模型")
         model = model_from_snapshot(task, model)
@@ -611,6 +620,7 @@ def run_image_task(task_id: int, *, gen_image_fn=None) -> None:
                         unlocked=True,
                         width=hd_w,
                         height=hd_h,
+                        bytes=storage_bytes_for_keys(item_keys),
                     )
                 )
                 saved_count += 1

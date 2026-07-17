@@ -165,7 +165,7 @@ class BodySizeLimitMiddleware:
             "/api/prompt/optimize",
             "/api/parse",
             "/api/subject-protection/preview",
-        }:
+        } or path.startswith("/api/prompt/reverse-operations"):
             return 256 * 1024
         return None
 
@@ -258,7 +258,7 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
-    expose_headers=["x-request-id"],
+    expose_headers=["x-request-id", "Deprecation", "Sunset", "Link"],
 )
 
 # Only low-risk previews are public. HD images and final videos stay behind

@@ -10,7 +10,7 @@ import BrandLogo from "./BrandLogo";
 const LINKS = [
   ["studio", "创作", "/"],
   ["prompts", "提示词库", "/prompts"],
-  ["profile", "我的作品", "/profile"],
+  ["profile", "我的资产", "/profile"],
   ["recharge", "充值", "/recharge"],
   ["history", "历史", "/history"],
 ];

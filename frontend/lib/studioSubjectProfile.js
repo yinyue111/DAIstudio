@@ -7,14 +7,16 @@ export function buildSubjectProfileRequestIdentity({
   subjectMode,
   assetUrl,
   assetSignature,
+  modelConfigId,
 }) {
   const request = {
     mode: normalized(mode),
     subjectMode: normalized(subjectMode),
     assetUrl: normalized(assetUrl),
     assetSignature: normalized(assetSignature),
+    modelConfigId: normalized(modelConfigId) || "default",
     sourceType: "image",
-    target: "product_profile",
+    target: normalized(subjectMode) === "portrait" ? "portrait_profile" : "product_profile",
   };
   return {
     scope: `subject-profile:${request.mode}`,

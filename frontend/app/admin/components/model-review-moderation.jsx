@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
+import { ChevronDown, Plus, Search } from "lucide-react";
 import { api } from "../../../lib/api";
 import {
   confirmReviewTaskAction,
@@ -10,6 +11,7 @@ import {
   reportStatusLabel,
 } from "./admin-helpers";
 import { Card, Th } from "./admin-ui";
+import { ModelCatalogImporter } from "./model-catalog-importer";
 
 function validateExternalResultUrl(value, category) {
   const trimmed = String(value || "").trim();
@@ -38,29 +40,79 @@ function validateExternalResultUrl(value, category) {
 export function Models() {
   const [rows, setRows] = useState([]);
   const [providers, setProviders] = useState({});
+  const [providerConnections, setProviderConnections] = useState([]);
   const [msg, setMsg] = useState("");
   const [msgType, setMsgType] = useState("ok");
   const [probing, setProbing] = useState({});
+  const [busy, setBusy] = useState({});
+  const [expanded, setExpanded] = useState({});
+  const [useFilter, setUseFilter] = useState("all");
+  const [query, setQuery] = useState("");
   const probeSeqRef = useRef(new Map());
-  const PROBE_KEYS = new Set(["provider", "base_url", "gateway_format", "api_key", "api_key_clear"]);
+  const draftSeqRef = useRef(0);
+  const PROBE_KEYS = new Set(["use", "provider_config_id", "provider", "base_url", "gateway_format", "api_key", "api_key_clear"]);
+
+  function rowKey(row) {
+    return row.id == null ? row.draftKey : String(row.id);
+  }
+
+  function normalizeRow(row) {
+    const { api_key: _apiKey, api_key_encrypted: _encryptedKey, ...safeRow } = row || {};
+    return {
+      ...safeRow,
+      provider_config_id: row.provider_config_id || null,
+      display_name: row.display_name || row.model_id || "",
+      provider: row.provider === "env" ? "" : (row.provider || ""),
+      base_url: row.base_url || "",
+      gateway_format: row.gateway_format || (row.use === "prompt" ? "anthropic" : row.use === "video" ? "ark" : "openai"),
+      api_key: "",
+      api_key_clear: false,
+      is_default: !!row.is_default,
+      sort_order: Number(row.sort_order || 0),
+      probeModels: [],
+      probeSignature: "",
+      extraText: row.extra ? JSON.stringify(row.extra, null, 2) : "",
+    };
+  }
+
   const load = () => api.adminModels()
     .then((payload) => {
       const list = Array.isArray(payload) ? payload : (payload.models || []);
       setProviders(payload.providers || {});
-      setRows(list.map((r) => ({
-        ...r,
-        provider: r.provider || "",
-        base_url: r.base_url || "",
-        gateway_format: r.gateway_format || (r.use === "prompt" ? "anthropic" : r.use === "video" ? "ark" : "openai"),
-        api_key: "",
-        api_key_clear: false,
-        probeModels: [],
-        probeSignature: "",
-        extraText: r.extra ? JSON.stringify(r.extra, null, 2) : "",
-      })));
+      setProviderConnections(payload.provider_connections || []);
+      setRows(list.map(normalizeRow));
     })
-    .catch((e) => setMsg(e.message));
+    .catch((e) => {
+      setMsgType("bad");
+      setMsg(e.message);
+    });
   useEffect(() => { load(); }, []);
+
+  function addDraft() {
+    const draftKey = `draft-${++draftSeqRef.current}`;
+    setExpanded((current) => ({ ...current, [draftKey]: true }));
+    setRows((prev) => [
+      normalizeRow({
+        id: null,
+        draftKey,
+        use: "vision",
+        display_name: "",
+        model_id: "",
+        cost_credits: 2,
+        unlock_cost: 0,
+        enabled: true,
+        is_default: false,
+        sort_order: prev.length * 10 + 10,
+        extra: null,
+      }),
+      ...prev,
+    ]);
+    setMsg("");
+  }
+
+  function removeDraft(row) {
+    setRows((prev) => prev.filter((item) => rowKey(item) !== rowKey(row)));
+  }
 
   function set(i, key, val) {
     setRows((prev) => {
@@ -69,7 +121,7 @@ export function Models() {
       if (PROBE_KEYS.has(key)) {
         next.probeModels = [];
         next.probeSignature = "";
-        probeSeqRef.current.delete(next.use);
+        probeSeqRef.current.delete(rowKey(next));
       }
       copy[i] = next;
       return copy;
@@ -79,6 +131,7 @@ export function Models() {
   function probeSignature(r) {
     return JSON.stringify({
       use: r.use || "",
+      provider_config_id: r.provider_config_id || null,
       provider: r.provider || "",
       base_url: r.base_url || "",
       gateway_format: r.gateway_format || "",
@@ -98,99 +151,216 @@ export function Models() {
       copy[i] = {
         ...current,
         provider,
-        base_url: hasPresetBaseUrl ? (preset.base_url || "") : (current.base_url || ""),
+        base_url: !provider ? "" : hasPresetBaseUrl ? (preset.base_url || "") : (current.base_url || ""),
         gateway_format: preset.gateway_format || current.gateway_format || "openai",
+        api_key_clear: !provider && current.api_key_configured ? true : current.api_key_clear,
         probeModels: [],
         probeSignature: "",
       };
-      probeSeqRef.current.delete(current.use);
+      probeSeqRef.current.delete(rowKey(current));
       return copy;
     });
+  }
+
+  function setProviderConnection(i, value) {
+    const providerConfigId = Number(value) || null;
+    const connection = providerConnections.find((item) => item.id === providerConfigId) || null;
+    setRows((prev) => {
+      const copy = [...prev];
+      const current = copy[i];
+      copy[i] = {
+        ...current,
+        provider_config_id: providerConfigId,
+        provider: connection?.provider || "",
+        gateway_format: connection?.gateway_format || "openai",
+        base_url: "",
+        api_key: "",
+        api_key_clear: false,
+        display_name: current.display_name === current.model_id ? "" : current.display_name,
+        model_id: "",
+        extraText: "",
+        probeModels: [],
+        probeSignature: "",
+      };
+      probeSeqRef.current.delete(rowKey(current));
+      return copy;
+    });
+    setMsg("");
+  }
+
+  function chooseProbedModel(i, modelId) {
+    setRows((prev) => {
+      const copy = [...prev];
+      const current = copy[i];
+      const model = (current.probeModels || []).find((item) => item.id === modelId);
+      if (!model) return prev;
+      copy[i] = {
+        ...current,
+        model_id: model.id,
+        display_name: current.display_name || model.id,
+        extraText: model.default_extra ? JSON.stringify(model.default_extra, null, 2) : "",
+      };
+      return copy;
+    });
+  }
+
+  function parseAndValidate(row) {
+    const displayName = String(row.display_name || "").trim();
+    const modelId = String(row.model_id || "").trim();
+    if (!displayName) throw new Error("请填写前端显示名称。");
+    if (!modelId) throw new Error("请填写模型 ID。");
+    let extra = null;
+    if ((row.extraText || "").trim()) {
+      extra = JSON.parse(row.extraText);
+      if (!extra || Array.isArray(extra) || typeof extra !== "object") {
+        throw new Error("extra 必须是 JSON 对象。");
+      }
+    }
+    const cost = Number(row.cost_credits);
+    const unlockCost = Number(row.unlock_cost);
+    const sortOrder = Number(row.sort_order);
+    if (!Number.isFinite(cost) || cost < 1) throw new Error("调用消耗积分必须大于等于 1。");
+    if (!Number.isFinite(unlockCost) || unlockCost < 0) throw new Error("解锁消耗积分不能小于 0。");
+    if (!Number.isInteger(sortOrder)) throw new Error("排序值必须是整数。");
+    const gatewayPayload = row.id == null
+      ? { provider_config_id: Number(row.provider_config_id) || null }
+      : {
+          provider: row.provider || null,
+          base_url: row.base_url || null,
+          gateway_format: row.gateway_format || null,
+          api_key: row.api_key || null,
+          api_key_clear: !!row.api_key_clear,
+        };
+    if (row.id == null && !gatewayPayload.provider_config_id) {
+      throw new Error("请选择已有供应商并完成模型探测。");
+    }
+    return {
+      use: row.use,
+      display_name: displayName,
+      model_id: modelId,
+      ...gatewayPayload,
+      cost_credits: cost,
+      unlock_cost: unlockCost,
+      enabled: !!row.enabled,
+      is_default: !!row.is_default,
+      sort_order: sortOrder,
+      extra,
+    };
   }
 
   async function save(r) {
     setMsg("");
     setMsgType("ok");
+    const key = rowKey(r);
     try {
-      let extra = null;
-      if ((r.extraText || "").trim()) {
-        extra = JSON.parse(r.extraText);
-      }
-      if (probing[r.use]) {
-        setMsgType("bad");
-        setMsg("模型探测仍在进行，请等待探测完成后再保存。");
-        return;
-      }
-      const cost = Number(r.cost_credits);
-      const unlockCost = Number(r.unlock_cost);
-      if (!Number.isFinite(cost) || cost < 1) {
-        setMsgType("bad");
-        setMsg("调用消耗积分必须大于等于 1。");
-        return;
-      }
-      if (!Number.isFinite(unlockCost) || unlockCost < 0) {
-        setMsgType("bad");
-        setMsg("解锁消耗积分不能小于 0。");
-        return;
-      }
+      if (probing[key]) throw new Error("模型探测仍在进行，请等待探测完成后再保存。");
+      const payload = parseAndValidate(r);
+      const providerConnection = providerConnections.find((item) => item.id === payload.provider_config_id);
       const summary = [
-        `用途：${modelUseLabel(r.use)}`,
-        `提供商：${r.provider || "环境变量兜底"}`,
-        `模型：${r.model_id || "-"}`,
-        `Base URL：${r.base_url || "-"}`,
-        `调用消耗：${Number.isFinite(cost) ? cost : "-"} 积分`,
-        `解锁消耗：${Number.isFinite(unlockCost) ? unlockCost : "-"} 积分`,
-        `状态：${r.enabled ? "启用" : "停用"}`,
+        `名称：${payload.display_name}`,
+        `用途：${modelUseLabel(payload.use)}`,
+        `提供商：${providerConnection?.label || payload.provider || "环境变量兜底"}`,
+        `模型：${payload.model_id}`,
+        `调用消耗：${payload.cost_credits} 积分`,
+        `解锁消耗：${payload.unlock_cost} 积分`,
+        `排序：${payload.sort_order}`,
+        `状态：${payload.enabled ? "启用" : "停用"}${payload.is_default ? " / 默认" : ""}`,
       ];
+      if (r.id != null) summary.splice(4, 0, `Base URL：${payload.base_url || "-"}`);
       if (r.api_key || r.api_key_clear) {
         summary.push(r.api_key_clear ? "API Key：将清空" : "API Key：将更新");
       }
-      if (!window.confirm(`确认保存模型配置？\n${summary.join("\n")}\n保存后新任务会使用该配置。`)) return;
-      await api.adminSaveModel({
-        use: r.use, model_id: r.model_id,
-        provider: r.provider || null,
-        base_url: r.base_url || null,
-        gateway_format: r.gateway_format || null,
-        api_key: r.api_key || null,
-        api_key_clear: !!r.api_key_clear,
-        cost_credits: cost, unlock_cost: unlockCost,
-        enabled: !!r.enabled, extra,
-      });
+      const action = r.id == null ? "新增" : "保存";
+      if (!window.confirm(`确认${action}模型配置？\n${summary.join("\n")}\n变更只影响后续新任务。`)) return;
+      setBusy((prev) => ({ ...prev, [key]: "save" }));
+      if (r.id == null) await api.adminCreateModel(payload);
+      else {
+        const { use: _immutableUse, ...updatePayload } = payload;
+        await api.adminUpdateModel(r.id, updatePayload);
+      }
       setMsgType("ok");
-      setMsg(`${r.use} 已保存`);
-      load();
+      setMsg(`${payload.display_name} 已${r.id == null ? "新增" : "保存"}`);
+      await load();
     } catch (e) {
       setMsgType("bad");
-      setMsg(e instanceof SyntaxError ? `${r.use} 的 extra 不是合法 JSON` : e.message);
+      setMsg(e instanceof SyntaxError ? `${r.display_name || modelUseLabel(r.use)} 的 extra 不是合法 JSON` : e.message);
+    } finally {
+      setBusy((prev) => {
+        const next = { ...prev };
+        delete next[key];
+        return next;
+      });
+    }
+  }
+
+  async function updateState(row, patch, actionLabel) {
+    const key = rowKey(row);
+    setMsg("");
+    setMsgType("ok");
+    if (row.id == null) {
+      setRows((prev) => prev.map((item) => rowKey(item) === key ? { ...item, ...patch } : item));
+      return;
+    }
+    if (patch.enabled === false && row.is_default) {
+      setMsgType("bad");
+      setMsg("默认模型不能直接停用，请先把同用途的其他模型设为默认。");
+      return;
+    }
+    const targetState = patch.is_default ? "设为默认并启用" : patch.enabled ? "启用" : "停用";
+    if (!window.confirm(`确认${targetState}「${row.display_name || row.model_id}」？\n变更只影响后续新任务。`)) return;
+    setBusy((prev) => ({ ...prev, [key]: actionLabel }));
+    try {
+      await api.adminUpdateModel(row.id, patch);
+      setMsgType("ok");
+      setMsg(`${row.display_name || row.model_id} 已${targetState}`);
+      await load();
+    } catch (e) {
+      setMsgType("bad");
+      setMsg(e.message);
+    } finally {
+      setBusy((prev) => {
+        const next = { ...prev };
+        delete next[key];
+        return next;
+      });
     }
   }
 
   async function probe(r, i) {
     setMsg("");
     setMsgType("ok");
+    const key = rowKey(r);
     const signature = probeSignature(r);
-    probeSeqRef.current.set(r.use, signature);
-    setProbing((prev) => ({ ...prev, [r.use]: signature }));
+    probeSeqRef.current.set(key, signature);
+    setProbing((prev) => ({ ...prev, [key]: signature }));
     try {
-      const res = await api.adminProbeModels({
-        use: r.use,
-        provider: r.provider || null,
-        base_url: r.base_url || null,
-        gateway_format: r.gateway_format || null,
-        api_key: r.api_key || null,
-      });
-      if (probeSeqRef.current.get(r.use) !== signature) {
+      if (r.id == null && !r.provider_config_id) {
+        throw new Error("请先选择已有供应商。");
+      }
+      const probePayload = r.id == null
+        ? { provider_config_id: r.provider_config_id, use: r.use }
+        : {
+            model_config_id: r.id,
+            use: r.use,
+            provider: r.provider || null,
+            base_url: r.base_url || null,
+            gateway_format: r.gateway_format || null,
+            api_key: r.api_key || null,
+          };
+      const res = await api.adminProbeModels(probePayload);
+      if (probeSeqRef.current.get(key) !== signature) {
         setMsgType("bad");
         setMsg("探测结果已过期，请按当前配置重新探测。");
         return;
       }
       setRows((prev) => {
         const copy = [...prev];
-        const current = copy[i];
-        if (!current || current.use !== r.use || probeSignature(current) !== signature) {
+        const currentIndex = copy.findIndex((item) => rowKey(item) === key);
+        const current = copy[currentIndex];
+        if (!current || rowKey(current) !== key || probeSignature(current) !== signature) {
           return prev;
         }
-        copy[i] = { ...current, probeModels: res.models || [], probeSignature: signature };
+        copy[currentIndex] = { ...current, probeModels: res.models || [], probeSignature: signature };
         return copy;
       });
       setMsgType("ok");
@@ -200,104 +370,262 @@ export function Models() {
       setMsg(e.message);
     } finally {
       setProbing((prev) => {
-        if (prev[r.use] !== signature) return prev;
+        if (prev[key] !== signature) return prev;
         const next = { ...prev };
-        delete next[r.use];
+        delete next[key];
         return next;
       });
     }
   }
 
   const providerEntries = Object.entries(providers);
+  const normalizedQuery = query.trim().toLowerCase();
+  const filteredRows = rows
+    .map((row, index) => ({ row, index }))
+    .filter(({ row }) => (
+      (useFilter === "all" || row.use === useFilter)
+      && (!normalizedQuery || `${row.display_name || ""} ${row.model_id || ""}`.toLowerCase().includes(normalizedQuery))
+    ));
+  const enabledCount = rows.filter((row) => row.enabled).length;
 
   return (
-    <Card>
+    <div className="space-y-4">
+      <ModelCatalogImporter providers={providers} rows={rows} onImported={load} />
+      <Card>
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div>
+          <div className="font-display text-sm font-semibold text-snow">模型目录</div>
+          <div className="mt-1 text-xs text-fog">后台启用后会自动出现在对应前端模型下拉框；默认项供旧客户端和未主动选择的任务使用。</div>
+        </div>
+        <button type="button" className="btn-primary btn-sm inline-flex items-center gap-1.5" onClick={addDraft}>
+          <Plus className="h-3.5 w-3.5" aria-hidden="true" />
+          手动新增
+        </button>
+      </div>
+      <div className="mt-3 flex flex-wrap gap-1.5 text-xs">
+        <span className="badge bg-white/10 text-mist">全部 {rows.length}</span>
+        <span className="badge bg-ok/15 text-ok">已启用 {enabledCount}</span>
+        {[
+          ["vision", "视觉"],
+          ["image", "图片"],
+          ["video", "视频"],
+          ["prompt", "对话"],
+        ].map(([use, label]) => (
+          <span key={use} className="badge bg-white/10 text-mist">{label} {rows.filter((row) => row.use === use).length}</span>
+        ))}
+      </div>
+      <div className="mt-4 grid gap-2 sm:grid-cols-[10rem_minmax(0,1fr)]">
+        <select className="select w-full text-xs" value={useFilter} onChange={(event) => setUseFilter(event.target.value)} aria-label="按用途筛选模型">
+          <option value="all">全部用途</option>
+          <option value="vision">反推 / 视觉理解</option>
+          <option value="image">图片生成</option>
+          <option value="video">视频生成</option>
+          <option value="prompt">对话 / 提示词</option>
+        </select>
+        <label className="relative block">
+          <Search className="pointer-events-none absolute left-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-fog" aria-hidden="true" />
+          <input className="input w-full pl-9 text-xs" value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索模型名称或 ID" aria-label="搜索模型目录" />
+        </label>
+      </div>
       {msg && <p className={`mb-2 text-sm ${msgType === "bad" ? "text-bad" : "text-ok"}`}>{msg}</p>}
-      <div className="space-y-4">
-        {rows.map((r, i) => (
-          <div key={r.use} className="rounded-xl border border-line bg-white/[0.03] p-4">
-            <div className="mb-4 flex flex-wrap items-center justify-between gap-2">
+      <div className="mt-4 space-y-3">
+        {filteredRows.map(({ row: r, index: i }) => {
+          const key = rowKey(r);
+          const isExpanded = r.id == null || !!expanded[key];
+          return (
+          <div key={rowKey(r)} className="rounded-lg border border-line bg-white/[0.03] p-4">
+            <div className={`flex flex-wrap items-center justify-between gap-2 ${isExpanded ? "mb-4" : ""}`}>
               <div>
-                <div className="font-display text-sm font-semibold text-snow">{modelUseLabel(r.use)}</div>
+                <div className="font-display text-sm font-semibold text-snow">
+                  {r.display_name || (r.id == null ? "新模型" : r.model_id)}
+                  {r.id != null ? <span className="ml-2 font-normal text-fog">#{r.id}</span> : null}
+                </div>
                 <div className="mt-1 flex flex-wrap items-center gap-1 text-xs">
                   <span className={`badge ${r.enabled ? "bg-ok/15 text-ok" : "bg-white/10 text-fog"}`}>
                     {r.enabled ? "已启用" : "已停用"}
                   </span>
+                  {r.is_default ? <span className="badge bg-iris/15 text-iris">默认</span> : null}
+                  <span className="badge bg-white/10 text-mist">{modelUseLabel(r.use)}</span>
                   {r.api_key_configured ? <span className="badge bg-aqua/15 text-aqua">API Key 已配置</span> : null}
                   <span className="badge bg-white/10 text-mist">{r.gateway_format || "openai"}</span>
                 </div>
               </div>
               <div className="flex flex-wrap gap-2">
-                <button onClick={() => probe(r, i)} disabled={!!probing[r.use]} className="btn-secondary btn-sm">
-                  {probing[r.use] ? "探测中" : "探测模型"}
+                {r.id == null ? (
+                  <button type="button" onClick={() => removeDraft(r)} disabled={!!busy[rowKey(r)]} className="btn-ghost btn-sm">取消</button>
+                ) : (
+                  <>
+                    {!r.is_default ? (
+                      <button type="button" onClick={() => updateState(r, { is_default: true, enabled: true }, "default")}
+                        disabled={!!busy[rowKey(r)]} className="btn-secondary btn-sm">设为默认</button>
+                    ) : null}
+                    <button type="button" onClick={() => updateState(r, { enabled: !r.enabled }, "toggle")}
+                      disabled={!!busy[rowKey(r)] || (r.is_default && r.enabled)} className="btn-ghost btn-sm">
+                      {r.enabled ? "停用" : "启用"}
+                    </button>
+                  </>
+                )}
+                <button
+                  type="button"
+                  onClick={() => probe(r, i)}
+                  disabled={!!probing[rowKey(r)] || !!busy[rowKey(r)] || (r.id == null && !r.provider_config_id)}
+                  className="btn-secondary btn-sm"
+                >
+                  {probing[rowKey(r)] ? "探测中" : "探测模型"}
                 </button>
-                <button onClick={() => save(r)} disabled={!!probing[r.use]} className="btn-primary btn-sm">保存配置</button>
+                <button
+                  type="button"
+                  onClick={() => save(r)}
+                  disabled={
+                    !!probing[rowKey(r)]
+                    || !!busy[rowKey(r)]
+                    || (r.id == null && (!r.provider_config_id || !r.model_id))
+                  }
+                  className="btn-primary btn-sm"
+                >
+                  {busy[rowKey(r)] === "save" ? "保存中" : r.id == null ? "新增并保存" : "保存配置"}
+                </button>
+                {r.id != null ? (
+                  <button
+                    type="button"
+                    className="btn-ghost btn-sm inline-flex items-center gap-1"
+                    aria-expanded={isExpanded}
+                    onClick={() => setExpanded((current) => ({ ...current, [key]: !current[key] }))}
+                  >
+                    {isExpanded ? "收起" : "编辑"}
+                    <ChevronDown className={`h-3.5 w-3.5 transition-transform ${isExpanded ? "rotate-180" : ""}`} aria-hidden="true" />
+                  </button>
+                ) : null}
               </div>
             </div>
 
+            {isExpanded ? (
             <div className="grid gap-3 md:grid-cols-2">
               <label className="grid gap-1 text-xs text-fog">
-                <span>模型提供商</span>
-                <select className="select w-full" value={r.provider || ""}
-                  onChange={(e) => setProvider(i, e.target.value)}>
-                  <option value="">使用环境变量兜底</option>
-                  {providerEntries.map(([key, p]) => (
-                    <option key={key} value={key}>{p.label || key}</option>
-                  ))}
-                </select>
+                <span>前端显示名称</span>
+                <input className="input w-full" value={r.display_name || ""} placeholder="例如 GPT Image 2 高清"
+                  onChange={(e) => set(i, "display_name", e.target.value)} />
               </label>
               <label className="grid gap-1 text-xs text-fog">
-                <span>网关格式</span>
-                <select className="select w-full" value={r.gateway_format || "openai"}
-                  onChange={(e) => set(i, "gateway_format", e.target.value)}>
-                  <option value="openai">OpenAI-Compatible</option>
-                  <option value="ark">火山方舟 Ark</option>
-                  <option value="anthropic">Anthropic Messages</option>
+                <span>用途</span>
+                <select className="select w-full" value={r.use || "vision"} disabled={r.id != null}
+                  onChange={(e) => set(i, "use", e.target.value)}>
+                  <option value="vision">反推 / 视觉理解</option>
+                  <option value="image">图片生成</option>
+                  <option value="video">视频生成</option>
+                  <option value="prompt">对话 / 提示词</option>
                 </select>
+                {r.id != null ? <span className="text-[11px] text-fog">用途创建后不可修改</span> : null}
               </label>
-              <label className="grid gap-1 text-xs text-fog md:col-span-2">
-                <span>Base URL</span>
-                <input className="input w-full" value={r.base_url || ""}
-                  placeholder="例如 https://api.openai.com/v1 或 https://ark.cn-beijing.volces.com/api/v3"
-                  onChange={(e) => set(i, "base_url", e.target.value)} />
-              </label>
-              <label className="grid gap-1 text-xs text-fog md:col-span-2">
-                <span className="flex items-center justify-between gap-2">
-                  <span>API Key{r.api_key_configured ? <b className="ml-2 font-normal text-ok">已配置</b> : null}</span>
-                  {r.api_key_configured ? (
-                    <button type="button" className="text-warn hover:text-snow"
-                      onClick={() => {
-                        if (window.confirm(`确认清空 ${modelUseLabel(r.use)} API Key？保存后生效。`)) {
-                          set(i, "api_key_clear", true);
-                          set(i, "api_key", "");
-                        }
-                      }}>
-                      清空
-                    </button>
-                  ) : null}
-                </span>
-                <input type="password" className="input w-full" value={r.api_key || ""}
-                  placeholder={r.api_key_clear ? "保存后清空 API Key" : "留空表示不修改"}
-                  onChange={(e) => {
-                    set(i, "api_key", e.target.value);
-                    if (e.target.value) set(i, "api_key_clear", false);
-                  }} />
-              </label>
-              <label className="grid gap-1 text-xs text-fog">
-                <span>模型 ID</span>
-                <input className="input w-full" value={r.model_id || ""}
-                  onChange={(e) => set(i, "model_id", e.target.value)} />
-              </label>
-              <label className="grid gap-1 text-xs text-fog">
-                <span>从探测结果选择</span>
-                <select className="select w-full" value=""
-                  onChange={(e) => e.target.value && set(i, "model_id", e.target.value)}>
-                  <option value="">选择模型 ID</option>
-                  {(r.probeModels || []).map((m) => (
-                    <option key={m.id} value={m.id}>{m.id}{m.owned_by ? ` · ${m.owned_by}` : ""}</option>
-                  ))}
-                </select>
-              </label>
+              {r.id == null ? (
+                <label className="grid gap-1 text-xs text-fog md:col-span-2">
+                  <span>已有供应商</span>
+                  <select
+                    className="select w-full"
+                    value={r.provider_config_id || ""}
+                    onChange={(event) => setProviderConnection(i, event.target.value)}
+                    disabled={providerConnections.length === 0}
+                  >
+                    <option value="">选择已保存的供应商</option>
+                    {providerConnections.map((connection) => (
+                      <option key={connection.id} value={connection.id}>
+                        {connection.label} · 凭据来源：{connection.source_display_name}
+                      </option>
+                    ))}
+                  </select>
+                  <span className="text-[11px] leading-relaxed text-fog">
+                    {providerConnections.length
+                      ? "复用已加密保存的供应商连接，无需再次填写 Base URL 和 API Key。"
+                      : "暂无可复用供应商，请先使用上方“提供商接入向导”完成一次接入。"}
+                  </span>
+                </label>
+              ) : (
+                <>
+                  <label className="grid gap-1 text-xs text-fog">
+                    <span>模型提供商</span>
+                    <select className="select w-full" value={r.provider || ""}
+                      onChange={(e) => setProvider(i, e.target.value)}>
+                      <option value="">使用环境变量兜底</option>
+                      {providerEntries.map(([providerKey, p]) => (
+                        <option key={providerKey} value={providerKey}>{p.label || providerKey}</option>
+                      ))}
+                    </select>
+                  </label>
+                  <label className="grid gap-1 text-xs text-fog">
+                    <span>网关格式</span>
+                    <select className="select w-full" value={r.gateway_format || "openai"}
+                      onChange={(e) => set(i, "gateway_format", e.target.value)}>
+                      <option value="openai">OpenAI-Compatible</option>
+                      <option value="ark">火山方舟 Ark</option>
+                      <option value="anthropic">Anthropic Messages</option>
+                    </select>
+                  </label>
+                  <label className="grid gap-1 text-xs text-fog md:col-span-2">
+                    <span>Base URL</span>
+                    <input className="input w-full" value={r.base_url || ""}
+                      placeholder="例如 https://api.openai.com/v1 或 https://ark.cn-beijing.volces.com/api/v3"
+                      onChange={(e) => set(i, "base_url", e.target.value)} />
+                  </label>
+                  <label className="grid gap-1 text-xs text-fog md:col-span-2">
+                    <span className="flex items-center justify-between gap-2">
+                      <span>API Key{r.api_key_configured ? <b className="ml-2 font-normal text-ok">已配置</b> : null}</span>
+                      {r.api_key_configured ? (
+                        <button type="button" className="text-warn hover:text-snow"
+                          onClick={() => {
+                            if (window.confirm(`确认清空 ${modelUseLabel(r.use)} API Key？保存后生效。`)) {
+                              set(i, "api_key_clear", true);
+                              set(i, "api_key", "");
+                            }
+                          }}>
+                          清空
+                        </button>
+                      ) : null}
+                    </span>
+                    <input type="password" className="input w-full" value={r.api_key || ""}
+                      placeholder={r.api_key_clear ? "保存后清空 API Key" : "留空表示不修改"}
+                      onChange={(e) => {
+                        set(i, "api_key", e.target.value);
+                        if (e.target.value) set(i, "api_key_clear", false);
+                      }} />
+                  </label>
+                </>
+              )}
+              {r.id == null ? (
+                <label className="grid gap-1 text-xs text-fog md:col-span-2">
+                  <span>从探测结果选择模型</span>
+                  <select
+                    className="select w-full"
+                    value={(r.probeModels || []).some((model) => model.id === r.model_id) ? r.model_id : ""}
+                    onChange={(event) => event.target.value && chooseProbedModel(i, event.target.value)}
+                    disabled={!r.provider_config_id || (r.probeModels || []).length === 0}
+                  >
+                    <option value="">{r.probeModels?.length ? "选择模型" : "请先探测模型"}</option>
+                    {(r.probeModels || []).map((model) => (
+                      <option key={model.id} value={model.id}>
+                        {model.id}{model.capability_label ? ` · ${model.capability_label}` : ""}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+              ) : (
+                <>
+                  <label className="grid gap-1 text-xs text-fog">
+                    <span>模型 ID</span>
+                    <input className="input w-full" value={r.model_id || ""}
+                      onChange={(e) => set(i, "model_id", e.target.value)} />
+                  </label>
+                  <label className="grid gap-1 text-xs text-fog">
+                    <span>从探测结果选择</span>
+                    <select className="select w-full" value=""
+                      onChange={(e) => e.target.value && set(i, "model_id", e.target.value)}>
+                      <option value="">选择模型 ID</option>
+                      {(r.probeModels || []).map((model) => (
+                        <option key={model.id} value={model.id}>{model.id}{model.owned_by ? ` · ${model.owned_by}` : ""}</option>
+                      ))}
+                    </select>
+                  </label>
+                </>
+              )}
               <label className="grid gap-1 text-xs text-fog">
                 <span>调用消耗积分</span>
                 <input className="input w-full" type="number" min="1" value={r.cost_credits}
@@ -308,11 +636,28 @@ export function Models() {
                 <input className="input w-full" type="number" min="0" value={r.unlock_cost}
                   onChange={(e) => set(i, "unlock_cost", e.target.value)} />
               </label>
-              <label className="flex items-center gap-2 text-xs text-fog">
-                <input type="checkbox" className="accent-iris" checked={!!r.enabled}
-                  onChange={(e) => set(i, "enabled", e.target.checked)} />
-                启用该模型
+              <label className="grid gap-1 text-xs text-fog">
+                <span>排序</span>
+                <input className="input w-full" type="number" step="1" value={r.sort_order}
+                  onChange={(e) => set(i, "sort_order", e.target.value)} />
               </label>
+              {r.id == null ? (
+                <div className="flex flex-wrap items-end gap-5 pb-2 text-xs text-fog">
+                  <label className="flex items-center gap-2">
+                    <input type="checkbox" className="accent-iris" checked={!!r.enabled} disabled={!!r.is_default}
+                      onChange={(e) => set(i, "enabled", e.target.checked)} />
+                    创建后启用
+                  </label>
+                  <label className="flex items-center gap-2">
+                    <input type="checkbox" className="accent-iris" checked={!!r.is_default}
+                      onChange={(e) => {
+                        set(i, "is_default", e.target.checked);
+                        if (e.target.checked) set(i, "enabled", true);
+                      }} />
+                    设为该用途默认模型
+                  </label>
+                </div>
+              ) : null}
               <label className="grid gap-1 text-xs text-fog md:col-span-2">
                 <span>extra(JSON)</span>
                 <textarea
@@ -323,11 +668,15 @@ export function Models() {
                 />
               </label>
             </div>
+            ) : null}
           </div>
-        ))}
+          );
+        })}
       </div>
-      <p className="mt-3 text-xs text-fog">提示:API Key 只写入后端加密存储，不会回显；Base URL 建议填写平台 OpenAI-Compatible 地址，火山方舟视频选择 Ark 格式。</p>
+      {filteredRows.length === 0 ? <p className="py-8 text-center text-sm text-fog">{rows.length ? "没有匹配的模型。" : "暂无模型配置，请先新增模型。"}</p> : null}
+      <p className="mt-3 text-xs text-fog">提示：API Key 只写入后端加密存储，页面永不回显；留空表示不修改。默认模型不能直接停用，请先设置同用途的其他默认项。</p>
     </Card>
+    </div>
   );
 }
 

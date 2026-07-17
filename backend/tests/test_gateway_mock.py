@@ -7,6 +7,7 @@ import pytest
 
 from app.config import settings
 from app.services import gateway, video_frames
+from app.services.model_discovery import annotate_discovered_models
 from app.services.model_gateway_config import RuntimeGatewayConfig
 from app.services.safe_logging import redact_url_for_log
 from app.services.watermark import image_ext, make_image_preview
@@ -21,6 +22,96 @@ def test_mock_image_and_preview():
     preview, w, h = make_image_preview(imgs[0])
     assert preview[:4] == b"\x89PNG"
     assert (w, h) == (256, 256)
+
+
+def test_antigravity_messages_image_transport_decodes_markdown_data_uri(monkeypatch):
+    monkeypatch.setattr(settings, "mock_mode", False)
+    raw = b"\xff\xd8\xff\xe0antigravity-image"
+    encoded = base64.b64encode(raw).decode()
+    seen = {}
+
+    def fake_post(path, payload, **kwargs):
+        seen.update(path=path, payload=payload, kwargs=kwargs)
+        return {
+            "content": [
+                {"type": "text", "text": f"![image](data:image/jpeg;base64,{encoded})"}
+            ]
+        }
+
+    monkeypatch.setattr(gateway, "_post", fake_post)
+    cfg = RuntimeGatewayConfig(
+        use="image",
+        provider="antigravity",
+        base_url="https://gateway.example.com/antigravity",
+        api_key="secret",
+        gateway_format="anthropic",
+    )
+
+    images = gateway.gen_image(
+        "a product photo",
+        "gemini-3.1-flash-image",
+        n=1,
+        size="1024x1024",
+        extra_payload={"image_transport": "anthropic_messages"},
+        gateway_config=cfg,
+    )
+
+    assert images == [raw]
+    assert seen["path"] == "/messages"
+    assert seen["payload"]["model"] == "gemini-3.1-flash-image"
+
+
+def test_grok_image_transport_maps_canvas_to_native_fields(monkeypatch):
+    monkeypatch.setattr(settings, "mock_mode", False)
+    seen = {}
+
+    def fake_submit(path, payload, n, config=None):
+        seen.update(path=path, payload=payload, n=n, config=config)
+        return gateway.ImageBatchResult([b"image"])
+
+    monkeypatch.setattr(gateway, "_post_single_image_repeated", fake_submit)
+    cfg = RuntimeGatewayConfig(
+        use="image",
+        provider="grok",
+        base_url="https://gateway.example.com/v1",
+        api_key="secret",
+        gateway_format="openai",
+    )
+
+    images = gateway.gen_image(
+        "a product photo",
+        "grok-imagine-image",
+        n=1,
+        size="1792x1024",
+        extra_payload={"image_transport": "grok_images"},
+        gateway_config=cfg,
+    )
+
+    assert images == [b"image"]
+    assert seen["path"] == "/images/generations"
+    assert seen["payload"]["aspect_ratio"] == "16:9"
+    assert seen["payload"]["resolution"] == "2k"
+    assert seen["payload"]["response_format"] == "b64_json"
+    assert "size" not in seen["payload"]
+
+
+def test_discovery_marks_only_explicit_media_models_as_importable():
+    models = annotate_discovered_models(
+        [
+            {"id": "gemini-3.1-flash-image"},
+            {"id": "grok-imagine-video-1.5"},
+            {"id": "grok-imagine-edit"},
+            {"id": "grok-4.5"},
+        ],
+        provider="grok",
+        gateway_format="openai",
+    )
+
+    assert models[0]["recommended_uses"] == ["image"]
+    assert models[0]["default_extra"]["image_transport"] == "grok_images"
+    assert models[1]["recommended_uses"] == ["video"]
+    assert models[2]["recommended_uses"] == []
+    assert models[3]["recommended_uses"] == ["prompt"]
 
 
 def test_mock_video_is_a_playable_mp4(tmp_path):
@@ -59,8 +150,12 @@ def test_mock_reverse_video():
     settings.mock_mode = True
     r = gateway.reverse_prompt("http://x/cover.png", "gpt-4o", target="video")
     s = r["structured"]
-    # video-specific motion/temporal dimensions present
-    assert "镜头运动" in s and "主体动作" in s and "时序分镜" in s
+    # Mock output is subject to the same evidence gate as a real provider.
+    assert all(key not in s for key in ("镜头运动", "主体动作", "时序分镜"))
+    assert r["shots"] == []
+    assert r["analysis_gaps"] == [{"message": "缺少视频帧分析证据"}]
+    assert r["structured"]["旁白"] == "未分析"
+    assert r["structured"]["音效"] == "未分析"
     assert r["final_text"]
 
 
@@ -507,7 +602,7 @@ def test_video_reverse_separates_post_production_from_final_text(monkeypatch):
         "_post",
         lambda *_args, **_kwargs: {
             "choices": [{"message": {"content": (
-                '{"主体":"洗脸巾广告","shots":[],"final_text":'
+                '{"主体":"洗脸巾广告","细节特征":"微距展开如意云纹","shots":[],"final_text":'
                 '"微距展开如意云纹。字幕‘干湿两用’。旁白‘温柔开启新一天’。SFX‘水滴声’"}'
             )}}],
             "usage": {"total_tokens": 9},
@@ -526,12 +621,15 @@ def test_video_reverse_separates_post_production_from_final_text(monkeypatch):
     )
 
     assert "微距展开如意云纹" in result["final_text"]
+    assert "洗脸巾广告" in result["final_text"]
+    assert result["shots"] == []
+    assert result["analysis_gaps"] == [{"start_seconds": 0.0, "end_seconds": 10.0}]
     assert "干湿两用" not in result["final_text"]
     assert "温柔开启新一天" not in result["final_text"]
     assert "水滴声" not in result["final_text"]
     assert result["structured"]["字幕卖点"] == "干湿两用"
-    assert result["structured"]["旁白"] == "温柔开启新一天"
-    assert result["structured"]["音效"] == "水滴声"
+    assert result["structured"]["旁白"] == "未分析"
+    assert result["structured"]["音效"] == "未分析"
 
 
 def test_video_reverse_separates_post_production_without_video_metadata(monkeypatch):
@@ -548,7 +646,7 @@ def test_video_reverse_separates_post_production_without_video_metadata(monkeypa
         "_post",
         lambda *_args, **_kwargs: {
             "choices": [{"message": {"content": (
-                '{"主体":"洗脸巾广告","final_text":'
+                '{"主体":"洗脸巾广告","细节特征":"微距展开云纹","final_text":'
                 '"微距展开云纹。字幕‘干湿两用’。旁白‘温柔开始’。SFX‘水滴声’"}'
             )}}],
             "usage": {"total_tokens": 9},
@@ -562,10 +660,12 @@ def test_video_reverse_separates_post_production_without_video_metadata(monkeypa
         gateway_config=cfg,
     )
 
-    assert result["final_text"] == "微距展开云纹"
+    assert "洗脸巾广告" in result["final_text"]
+    assert "微距展开云纹" in result["final_text"]
+    assert result["analysis_gaps"] == [{"message": "缺少视频帧分析证据"}]
     assert result["structured"]["字幕卖点"] == "干湿两用"
-    assert result["structured"]["旁白"] == "温柔开始"
-    assert result["structured"]["音效"] == "水滴声"
+    assert result["structured"]["旁白"] == "未分析"
+    assert result["structured"]["音效"] == "未分析"
 
 
 def test_compose_final_uses_reverse_dimension_order():
@@ -580,10 +680,10 @@ def test_compose_final_uses_reverse_dimension_order():
     assert text.index("主体") < text.index("场景背景") < text.index("风格") < text.index("光线")
 
 
-def test_parse_structured_fenced():
+def test_parse_structured_rejects_fenced_json():
     r = gateway._parse_structured('```json\n{"主体":"x","final_text":"hello"}\n```')
-    assert r["structured"]["主体"] == "x"
-    assert r["final_text"] == "hello"
+    assert r["structured"] == {}
+    assert r["final_text"].startswith("```json")
 
 
 def test_decode_image_response_downloads_each_url_once(monkeypatch):
@@ -1183,7 +1283,8 @@ def test_reverse_uses_per_model_gateway_config(monkeypatch):
     monkeypatch.setattr(gateway, "_post", fake_post)
     res = gateway.reverse_prompt("https://example.com/ref.png", "vision-model", gateway_config=cfg)
 
-    assert res["final_text"] == "same style"
+    assert res["final_text"] == "cat"
+    assert res["provider_final_text"] == "same style"
     assert seen["path"] == "/chat/completions"
     assert seen["timeout"] == settings.reverse_gateway_timeout_seconds
     assert seen["config"] is cfg

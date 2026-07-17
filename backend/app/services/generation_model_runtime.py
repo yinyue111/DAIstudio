@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 from ..models import GenTask
 from . import gateway
+from .config_store import get_model_config, resolve_model_config
 from .generation_pricing import snapshot_credit_pricing
 from .model_gateway_config import (
     RuntimeGatewayConfig,
@@ -23,6 +24,8 @@ def model_snapshot(model) -> dict:
     extra = dict(model.extra or {})
     extra["credit_pricing"] = snapshot_credit_pricing(extra)
     return {
+        "model_config_id": int(model.id) if getattr(model, "id", None) is not None else None,
+        "model_name": str(getattr(model, "display_name", None) or model.model_id),
         "model_id": model.model_id,
         "cost_credits": int(model.cost_credits or 0),
         "unlock_cost": int(model.unlock_cost or 0),
@@ -33,6 +36,29 @@ def model_snapshot(model) -> dict:
         "gateway_source": gateway_cfg.source,
         "gateway_key_fingerprint": gateway_key_fingerprint(gateway_cfg),
     }
+
+
+def model_config_for_task(db, task: GenTask, use: str, legacy_loader=None):
+    """Load the exact catalog row selected at submission time.
+
+    Test hooks written before multi-model support still receive the old two
+    argument loader contract. Production tasks with a persisted catalog id are
+    always resolved by id so changing the default cannot redirect queued work.
+    """
+    selected_id = getattr(task, "model_config_id", None)
+    if selected_id is not None and (legacy_loader is None or legacy_loader is get_model_config):
+        return resolve_model_config(
+            db,
+            use,
+            int(selected_id),
+            require_enabled=False,
+        )
+    model = legacy_loader(db, use) if legacy_loader is not None else get_model_config(db, use)
+    if selected_id is not None and model is not None:
+        loaded_id = getattr(model, "id", None)
+        if loaded_id is not None and int(loaded_id) != int(selected_id):
+            raise ModelSnapshotMismatchError("任务绑定的模型配置与运行时模型不一致")
+    return model
 
 
 def assert_model_snapshot_compatible(model, snapshot: dict) -> None:
@@ -52,6 +78,8 @@ def model_from_snapshot(task: GenTask, fallback_model):
         return fallback_model
     assert_model_snapshot_compatible(fallback_model, snapshot)
     return SimpleNamespace(
+        id=snapshot.get("model_config_id") or getattr(fallback_model, "id", None),
+        display_name=snapshot.get("model_name") or getattr(fallback_model, "display_name", None),
         model_id=snapshot.get("model_id") or fallback_model.model_id,
         cost_credits=int(snapshot.get("cost_credits") or 0),
         unlock_cost=int(snapshot.get("unlock_cost") or 0),
@@ -103,12 +131,17 @@ def gen_image_with_model_config(model, prompt: str, *, n: int, size: str,
                                 edit_path: str | None,
                                 extra_payload: dict | None,
                                 reference_image_urls: list[str] | None = None) -> list[bytes]:
+    model_extra = dict(model.extra or {})
+    configured_payload = dict(model_extra.get("image_payload") or {})
+    for field in ("image_transport", "response_format", "message_max_tokens"):
+        if model_extra.get(field) not in (None, ""):
+            configured_payload[field] = model_extra[field]
     kwargs = {
         "n": n,
         "size": size,
         "reference_image_url": reference_image_url,
         "edit_path": edit_path,
-        "extra_payload": extra_payload,
+        "extra_payload": {**configured_payload, **(extra_payload or {})},
     }
     if _accepts_parameter(gateway.gen_image, "reference_image_urls"):
         kwargs["reference_image_urls"] = reference_image_urls

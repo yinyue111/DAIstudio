@@ -193,8 +193,8 @@ def test_default_n_image_charges_for_all_images(client, make_user, auth):
     t = client.get(f"/api/tasks/{r.json()['id']}", headers=h).json()
     assert t["status"] == "succeeded", t
     assert len(t["assets"]) == 1          # seeded image_n default
-    assert t["cost_settled"] == 15        # 1K image cost 15 * n(1)
-    assert client.get("/api/me", headers=h).json()["balance_credits"] == 985
+    assert t["cost_settled"] == 8         # image cost 8 * n(1)
+    assert client.get("/api/me", headers=h).json()["balance_credits"] == 992
 
 
 def test_generate_response_exposes_only_public_params(client, make_user, auth):
@@ -2242,8 +2242,8 @@ def test_image_finalize_holds_for_review_when_settle_fails(client, make_user, au
     }
     assert after - before
     me = client.get("/api/me", headers=h).json()
-    assert me["balance_credits"] == 985
-    assert me["frozen_credits"] == 15
+    assert me["balance_credits"] == 992
+    assert me["frozen_credits"] == 8
 
 
 def test_admin_quota_grant_idempotency_replays_duplicate(client, make_user, auth):

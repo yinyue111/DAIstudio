@@ -75,6 +75,12 @@ def test_migrated_schema_has_core_integrity_constraints(tmp_path, monkeypatch):
             "ck_gen_tasks_cost_frozen_nonnegative",
             "ck_gen_tasks_cost_settled_nonnegative",
         },
+        "reverse_operations": {
+            "ck_reverse_operations_status_valid",
+            "ck_reverse_operations_progress_range",
+            "ck_reverse_operations_cost_frozen_nonnegative",
+            "ck_reverse_operations_cost_settled_nonnegative",
+        },
         "model_configs": {
             "ck_model_configs_use_valid",
             "ck_model_configs_cost_credits_nonnegative",
@@ -131,6 +137,237 @@ def test_migrated_schema_has_core_integrity_constraints(tmp_path, monkeypatch):
     ]
 
 
+def test_0037_unified_user_assets_sqlite_round_trip(tmp_path, monkeypatch):
+    db_path = tmp_path / "unified-user-assets.db"
+    monkeypatch.setattr(settings, "database_url", f"sqlite:///{db_path}")
+    backend = Path(__file__).resolve().parents[1]
+    cfg = Config(str(backend / "alembic.ini"))
+    cfg.set_main_option("script_location", str(backend / "alembic"))
+    command.upgrade(cfg, "0036_multi_model_catalog")
+
+    engine = sa.create_engine(f"sqlite:///{db_path}")
+    before = sa.inspect(engine)
+    assert "retained_at" not in {c["name"] for c in before.get_columns("gen_assets")}
+    assert "favorite" not in {c["name"] for c in before.get_columns("uploaded_assets")}
+
+    command.upgrade(cfg, "0037_unified_user_assets")
+    upgraded = sa.inspect(engine)
+    assert {"bytes", "retained_at"} <= {
+        c["name"] for c in upgraded.get_columns("gen_assets")
+    }
+    assert {"duration", "favorite", "retained_at"} <= {
+        c["name"] for c in upgraded.get_columns("uploaded_assets")
+    }
+    assert {
+        "ix_gen_assets_user_created",
+        "ix_gen_assets_user_favorite_created",
+        "ix_gen_assets_user_retained",
+    } <= {idx["name"] for idx in upgraded.get_indexes("gen_assets")}
+    assert {
+        "ix_uploaded_assets_user_created",
+        "ix_uploaded_assets_user_favorite_created",
+        "ix_uploaded_assets_user_retained",
+    } <= {idx["name"] for idx in upgraded.get_indexes("uploaded_assets")}
+
+    command.downgrade(cfg, "0036_multi_model_catalog")
+    downgraded = sa.inspect(engine)
+    assert "retained_at" not in {c["name"] for c in downgraded.get_columns("gen_assets")}
+    assert "favorite" not in {c["name"] for c in downgraded.get_columns("uploaded_assets")}
+
+    command.upgrade(cfg, "0037_unified_user_assets")
+    reupgraded = sa.inspect(engine)
+    assert "retained_at" in {c["name"] for c in reupgraded.get_columns("gen_assets")}
+    assert "favorite" in {c["name"] for c in reupgraded.get_columns("uploaded_assets")}
+
+
+def test_0038_declares_multi_reference_only_for_ark_seedance_2(tmp_path, monkeypatch):
+    db_path = tmp_path / "seedance-multi-reference.db"
+    monkeypatch.setattr(settings, "database_url", f"sqlite:///{db_path}")
+    backend = Path(__file__).resolve().parents[1]
+    cfg = Config(str(backend / "alembic.ini"))
+    cfg.set_main_option("script_location", str(backend / "alembic"))
+    command.upgrade(cfg, "0037_unified_user_assets")
+
+    engine = sa.create_engine(f"sqlite:///{db_path}")
+    metadata = sa.MetaData()
+    model_configs = sa.Table("model_configs", metadata, autoload_with=engine)
+    with engine.begin() as conn:
+        conn.execute(
+            model_configs.insert(),
+            [
+                {
+                    "use": "video",
+                    "model_id": "doubao-seedance-2-0-mini-260615",
+                    "display_name": "Seedance 2.0 Mini",
+                    "is_default": True,
+                    "sort_order": 0,
+                    "provider": "volcengine_ark",
+                    "gateway_format": "ark",
+                    "cost_credits": 16,
+                    "unlock_cost": 0,
+                    "enabled": True,
+                    "extra": {"preview_cost": 15},
+                },
+                {
+                    "use": "video",
+                    "model_id": "generic-video-model",
+                    "display_name": "Generic Video",
+                    "is_default": False,
+                    "sort_order": 1,
+                    "provider": "custom",
+                    "gateway_format": "openai",
+                    "cost_credits": 16,
+                    "unlock_cost": 0,
+                    "enabled": True,
+                    "extra": {},
+                },
+            ],
+        )
+
+    command.upgrade(cfg, "0038_seedance_multi_reference")
+    with engine.connect() as conn:
+        rows = {
+            row.model_id: row.extra
+            for row in conn.execute(
+                sa.select(model_configs.c.model_id, model_configs.c.extra)
+            )
+        }
+    assert rows["doubao-seedance-2-0-mini-260615"]["capabilities"] == {
+        "multi_reference": True,
+        "max_reference_images": 10,
+    }
+    assert "capabilities" not in rows["generic-video-model"]
+
+
+def test_0039_applies_target_margin_packages_and_model_prices(tmp_path, monkeypatch):
+    db_path = tmp_path / "margin-credit-pricing.db"
+    monkeypatch.setattr(settings, "database_url", f"sqlite:///{db_path}")
+    backend = Path(__file__).resolve().parents[1]
+    cfg = Config(str(backend / "alembic.ini"))
+    cfg.set_main_option("script_location", str(backend / "alembic"))
+    command.upgrade(cfg, "0038_seedance_multi_reference")
+
+    engine = sa.create_engine(f"sqlite:///{db_path}")
+    metadata = sa.MetaData()
+    model_configs = sa.Table("model_configs", metadata, autoload_with=engine)
+    payment_packages = sa.Table("payment_packages", metadata, autoload_with=engine)
+    with engine.begin() as conn:
+        conn.execute(
+            model_configs.update()
+            .where(model_configs.c.use == "prompt")
+            .values(cost_credits=1, unlock_cost=4)
+        )
+        conn.execute(
+            model_configs.insert(),
+            [
+                {
+                    "use": "vision",
+                    "model_id": "vision-test",
+                    "display_name": "Vision Test",
+                    "is_default": True,
+                    "sort_order": 0,
+                    "cost_credits": 10,
+                    "unlock_cost": 3,
+                    "enabled": True,
+                    "extra": {"keep": "vision"},
+                },
+                {
+                    "use": "image",
+                    "model_id": "image-test",
+                    "display_name": "Image Test",
+                    "is_default": True,
+                    "sort_order": 0,
+                    "cost_credits": 15,
+                    "unlock_cost": 2,
+                    "enabled": True,
+                    "extra": {"keep": "image"},
+                },
+                {
+                    "use": "video",
+                    "model_id": "video-test",
+                    "display_name": "Video Test",
+                    "is_default": True,
+                    "sort_order": 0,
+                    "cost_credits": 16,
+                    "unlock_cost": 1,
+                    "enabled": True,
+                    "extra": {"preview_cost": 15, "submit_path": "/custom/submit"},
+                },
+            ],
+        )
+        conn.execute(
+            payment_packages.update()
+            .where(payment_packages.c.id == "starter")
+            .values(amount_cents=990, credits=100, enabled=False)
+        )
+
+    command.upgrade(cfg, "0039_margin_credit_pricing")
+    with engine.connect() as conn:
+        packages = [
+            tuple(row)
+            for row in conn.execute(
+                sa.select(
+                    payment_packages.c.id,
+                    payment_packages.c.amount_cents,
+                    payment_packages.c.credits,
+                    payment_packages.c.enabled,
+                )
+                .where(
+                    payment_packages.c.id.in_(
+                        ["starter", "creator", "pro", "team", "enterprise"]
+                    )
+                )
+                .order_by(payment_packages.c.sort_order)
+            )
+        ]
+        model_rows = {
+            row.use: (row.cost_credits, row.unlock_cost, row.extra)
+            for row in conn.execute(
+                sa.select(
+                    model_configs.c.use,
+                    model_configs.c.cost_credits,
+                    model_configs.c.unlock_cost,
+                    model_configs.c.extra,
+                )
+            )
+        }
+
+    assert packages == [
+        ("starter", 2990, 300, True),
+        ("creator", 9900, 1050, True),
+        ("pro", 29900, 3300, True),
+        ("team", 69900, 8000, True),
+        ("enterprise", 99900, 12000, True),
+    ]
+    assert {use: values[:2] for use, values in model_rows.items()} == {
+        "prompt": (3, 0),
+        "vision": (5, 0),
+        "image": (8, 0),
+        "video": (100, 0),
+    }
+    assert model_rows["video"][2] == {
+        "preview_cost": 50,
+        "submit_path": "/custom/submit",
+    }
+    assert model_rows["vision"][2] == {"keep": "vision"}
+    assert model_rows["image"][2] == {"keep": "image"}
+
+    full_capacity_costs = [
+        (5, 0.2),
+        (3, 0.1),
+        (8, 0.3),
+        (100, 3.125 + 105 / 160),
+        (108, 3.125 + 105 / 160 + 0.2 + 0.1),
+        (116, 3.125 + 105 / 160 + 0.2 + 0.1 + 0.3),
+    ]
+    revenue_per_credit = [29.9 / 300, 99 / 1050, 299 / 3300, 699 / 8000, 999 / 12000]
+    for unit_revenue in revenue_per_credit:
+        for credits, cost in full_capacity_costs:
+            revenue = credits * unit_revenue
+            gross_margin = (revenue - cost) / revenue
+            assert 0.5 <= gross_margin <= 0.7
+
+
 def test_0032_admin_quota_business_window_can_downgrade_and_reupgrade(tmp_path, monkeypatch):
     db_path = tmp_path / "admin-quota-window.db"
     monkeypatch.setattr(settings, "database_url", f"sqlite:///{db_path}")
@@ -150,7 +387,9 @@ def test_0032_admin_quota_business_window_can_downgrade_and_reupgrade(tmp_path, 
     model_config_indexes = {
         idx["name"]: idx for idx in insp.get_indexes("model_configs")
     }
-    assert model_config_indexes["ix_model_configs_use"]["unique"]
+    assert not model_config_indexes["ix_model_configs_use"]["unique"]
+    assert model_config_indexes["uq_model_configs_default_per_use"]["unique"]
+    assert model_config_indexes["uq_model_configs_use_model_id"]["unique"]
     assert "asset_reports" in insp.get_table_names()
     asset_report_columns = {c["name"] for c in insp.get_columns("asset_reports")}
     assert {
@@ -255,6 +494,75 @@ def test_0030_downgrade_blocks_when_anonymous_reverse_operations_exist(tmp_path,
 
     with pytest.raises(RuntimeError, match="without client_request_id exist"):
         command.downgrade(cfg, "0029_default_image_n_one")
+
+
+def test_0035_backfills_legacy_reverse_cost_and_lifecycle_timestamps(tmp_path, monkeypatch):
+    db_path = tmp_path / "migration-0035-backfill.db"
+    monkeypatch.setattr(settings, "database_url", f"sqlite:///{db_path}")
+    backend = Path(__file__).resolve().parents[1]
+    cfg = Config(str(backend / "alembic.ini"))
+    cfg.set_main_option("script_location", str(backend / "alembic"))
+    command.upgrade(cfg, "0034_anthropic_gateway_format")
+    engine = sa.create_engine(f"sqlite:///{db_path}")
+    with engine.begin() as conn:
+        conn.execute(sa.text(
+            "insert into users "
+            "(id, phone, password_hash, balance_credits, frozen_credits, is_admin, status) "
+            "values (1, '13900000998', 'hash', 0, 0, 0, 'active')"
+        ))
+        conn.execute(sa.text(
+            "insert into reverse_operations "
+            "(id, user_id, client_request_id, request_fingerprint, target, asset_url, "
+            "status, charged_credits, created_at, updated_at) values "
+            "(1, 1, 'legacy-success', :success_fp, 'image', 'https://cdn/a.jpg', "
+            "'succeeded', 7, '2026-07-01 10:00:00', '2026-07-01 10:01:00'), "
+            "(2, 1, 'legacy-failed', :failed_fp, 'image', 'https://cdn/b.jpg', "
+            "'failed', 0, '2026-07-01 11:00:00', '2026-07-01 11:01:00')"
+        ), {"success_fp": "e" * 64, "failed_fp": "f" * 64})
+
+    command.upgrade(cfg, "0035_async_reverse_operations")
+    with engine.connect() as conn:
+        rows = conn.execute(sa.text(
+            "select id, cost_settled, progress, finished_at "
+            "from reverse_operations order by id"
+        )).all()
+    assert rows[0][1:3] == (7, 100)
+    assert rows[1][1:3] == (0, 100)
+    assert rows[0][3] is not None
+    assert rows[1][3] is not None
+
+    command.downgrade(cfg, "0034_anthropic_gateway_format")
+    columns = {column["name"] for column in sa.inspect(engine).get_columns("reverse_operations")}
+    assert "cost_settled" not in columns
+    command.upgrade(cfg, "0035_async_reverse_operations")
+    with engine.connect() as conn:
+        assert conn.execute(sa.text(
+            "select cost_settled from reverse_operations where id = 1"
+        )).scalar_one() == 7
+
+
+def test_0035_downgrade_blocks_async_only_statuses(tmp_path, monkeypatch):
+    db_path = tmp_path / "migration-0035-active.db"
+    monkeypatch.setattr(settings, "database_url", f"sqlite:///{db_path}")
+    backend = Path(__file__).resolve().parents[1]
+    cfg = Config(str(backend / "alembic.ini"))
+    cfg.set_main_option("script_location", str(backend / "alembic"))
+    command.upgrade(cfg, "0035_async_reverse_operations")
+    engine = sa.create_engine(f"sqlite:///{db_path}")
+    with engine.begin() as conn:
+        conn.execute(sa.text(
+            "insert into users "
+            "(id, phone, password_hash, balance_credits, frozen_credits, is_admin, status) "
+            "values (1, '13900000999', 'hash', 0, 0, 0, 'active')"
+        ))
+        conn.execute(sa.text(
+            "insert into reverse_operations "
+            "(id, user_id, client_request_id, request_fingerprint, target, asset_url, status) "
+            "values (1, 1, 'async-queued', :fingerprint, 'image', 'https://cdn/a.jpg', 'queued')"
+        ), {"fingerprint": "9" * 64})
+
+    with pytest.raises(RuntimeError, match="asynchronous reverse operations exist"):
+        command.downgrade(cfg, "0034_anthropic_gateway_format")
 
 
 def _load_migration_module(revision: str):

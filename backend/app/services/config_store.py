@@ -24,14 +24,58 @@ DEFAULT_SETTINGS = {
 }
 
 
+class ModelConfigResolutionError(ValueError):
+    """The requested catalog entry cannot be used for the requested purpose."""
+
+
 def get_model_config(db: Session, use: str) -> ModelConfig | None:
     return db.execute(
-        select(ModelConfig).where(ModelConfig.use == use)
+        select(ModelConfig)
+        .where(ModelConfig.use == use)
+        .order_by(ModelConfig.is_default.desc(), ModelConfig.sort_order, ModelConfig.id)
+        .limit(1)
     ).scalar_one_or_none()
 
 
+def resolve_model_config(
+    db: Session,
+    use: str,
+    model_config_id: int | None = None,
+    *,
+    require_enabled: bool = True,
+) -> ModelConfig:
+    """Resolve a trusted catalog row instead of accepting runtime config from clients."""
+    if model_config_id is not None:
+        row = db.get(ModelConfig, int(model_config_id))
+        if row is None:
+            raise ModelConfigResolutionError("所选模型不存在")
+        if row.use != use:
+            raise ModelConfigResolutionError(f"所选模型不支持 {use} 用途")
+    else:
+        row = db.execute(
+            select(ModelConfig)
+            .where(ModelConfig.use == use, ModelConfig.is_default.is_(True))
+            .order_by(ModelConfig.sort_order, ModelConfig.id)
+            .limit(1)
+        ).scalar_one_or_none()
+        if row is None:
+            raise ModelConfigResolutionError(f"{use} 未配置默认模型")
+    if require_enabled and not row.enabled:
+        raise ModelConfigResolutionError("所选模型已停用")
+    return row
+
+
 def get_all_model_configs(db: Session) -> list[ModelConfig]:
-    return list(db.execute(select(ModelConfig).order_by(ModelConfig.use)).scalars())
+    return list(
+        db.execute(
+            select(ModelConfig).order_by(
+                ModelConfig.use,
+                ModelConfig.is_default.desc(),
+                ModelConfig.sort_order,
+                ModelConfig.id,
+            )
+        ).scalars()
+    )
 
 
 def get_setting(db: Session, key: str, default=None):
@@ -91,6 +135,13 @@ def seed_from_yaml(db: Session) -> None:
                     if key == "official_pricing" and current_extra.get(key) != value:
                         current_extra[key] = value
                         changed = True
+                    if (
+                        key == "capabilities"
+                        and existing.model_id == m.get("model_id")
+                        and "capabilities" not in current_extra
+                    ):
+                        current_extra[key] = value
+                        changed = True
                 if changed:
                     existing.extra = current_extra
             continue
@@ -98,6 +149,9 @@ def seed_from_yaml(db: Session) -> None:
             ModelConfig(
                 use=use,
                 model_id=m.get("model_id", ""),
+                display_name=m.get("display_name") or m.get("model_id", ""),
+                is_default=True,
+                sort_order=int(m.get("sort_order", 0)),
                 cost_credits=int(m.get("cost_credits", 1)),
                 unlock_cost=int(m.get("unlock_cost", 0)),
                 enabled=bool(m.get("enabled", True)),

@@ -3,7 +3,7 @@ from datetime import datetime, timezone
 from types import SimpleNamespace
 
 from app.db import SessionLocal
-from app.models import AuditLog, CreditTransaction, GatewayCall, GenTask, User
+from app.models import AuditLog, CreditTransaction, GatewayCall, GenTask, ReverseOperation, User
 from app.services import audit, credits, gateway, usage, video_analysis, video_frames
 
 
@@ -21,7 +21,7 @@ def test_reverse_logs_gateway_call(client, make_user, auth):
         db.close()
 
 
-def test_reverse_charges_configured_vision_cost(client, make_user, auth):
+def test_reverse_uses_fixed_operation_price(client, make_user, auth):
     uid = make_user("13900000035", balance=1000, admin=True)
     h = auth("13900000035")
 
@@ -39,15 +39,19 @@ def test_reverse_charges_configured_vision_cost(client, make_user, auth):
                     json={"asset_url": "http://x/y.png", "target": "image"}, headers=h)
     assert r.status_code == 200, r.text
 
-    assert client.get("/api/me", headers=h).json()["balance_credits"] == 998
+    assert client.get("/api/me", headers=h).json()["balance_credits"] == 995
     db = SessionLocal()
     try:
-        tx = db.query(CreditTransaction).filter(
+        transactions = db.query(CreditTransaction).filter(
             CreditTransaction.user_id == uid,
-            CreditTransaction.type == "consume",
-            CreditTransaction.biz_type == "reverse",
-        ).one()
-        assert tx.change == -2
+            CreditTransaction.biz_type == "reverse_operation",
+        ).order_by(CreditTransaction.id).all()
+        assert [(tx.type, tx.change) for tx in transactions] == [
+            ("freeze", -5),
+            ("settle", 0),
+        ]
+        assert transactions[-1].reserved_amount == 5
+        assert transactions[-1].real_cost == 5
     finally:
         db.close()
 
@@ -119,7 +123,273 @@ def test_admin_report_includes_reverse_model_call_spend(client, make_user, auth)
 
     report = client.get("/api/admin/usage/report", headers=h).json()
     row = next(x for x in report["per_user"] if x["phone"] == "13900000037")
-    assert row["spend_credits"] == 2
+    assert row["spend_credits"] == 5
+
+
+def test_admin_report_and_reverse_dashboard_include_async_settlement(
+    client,
+    make_user,
+    auth,
+):
+    phone = "13900000038"
+    uid = make_user(phone, balance=1000, admin=True)
+    headers = auth(phone)
+    now = datetime(2099, 1, 1, 12, tzinfo=timezone.utc)
+    db = SessionLocal()
+    try:
+        operation = ReverseOperation(
+            user_id=uid,
+            client_request_id="reverse-usage-0001",
+            request_fingerprint="a" * 64,
+            target="video",
+            asset_url="http://x/reference.mp4",
+            status="succeeded",
+            phase=None,
+            progress=100,
+            request_context={
+                "cover_confirmation_required": True,
+                "cover_confirmed": True,
+            },
+            result={
+                "structured": {"主体": "产品"},
+                "final_text": "产品运动提示词",
+                "repair_attempted": True,
+                "video_analysis": {
+                    "analysis_mode": "cover_fallback",
+                    "source": {"duration_seconds": 10, "audio_analyzed": False},
+                    "analysis_gaps": [
+                        {"start_seconds": 8, "end_seconds": 10},
+                        {"start_seconds": 9, "end_seconds": 10},
+                    ],
+                },
+            },
+            charged_credits=2,
+            cost_frozen=0,
+            cost_settled=2,
+            reference_count=1,
+            started_at=now,
+            finished_at=now,
+            created_at=now,
+            updated_at=now,
+        )
+        db.add(operation)
+        db.flush()
+        credits.consume(
+            db,
+            uid,
+            2,
+            biz_type="reverse_operation",
+            biz_ref=operation.id,
+            note="compatibility transaction that must not be counted twice",
+            commit=False,
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    date_filter = "?start=2099-01-01&end=2099-01-01"
+    report = client.get(f"/api/admin/usage/report{date_filter}", headers=headers)
+    assert report.status_code == 200, report.text
+    user_row = next(row for row in report.json()["per_user"] if row["phone"] == phone)
+    assert user_row["spend_credits"] == 2
+    assert user_row["tasks"]["reverse"] == 1
+
+    dashboard = client.get(
+        f"/api/admin/usage/reverse-operations{date_filter}",
+        headers=headers,
+    )
+    assert dashboard.status_code == 200, dashboard.text
+    body = dashboard.json()
+    assert body["summary"]["succeeded"] == 1
+    assert body["summary"]["settled_credits"] == 2
+    assert body["summary"]["failure_rate"] == 0
+    assert body["summary"]["cancel_rate"] == 0
+    assert body["quality"]["cover_fallback_rate"] == 1
+    assert body["quality"]["cover_confirmation_required_count"] == 1
+    assert body["quality"]["cover_confirmed_count"] == 1
+    assert body["quality"]["cover_confirmation_rate"] == 1
+    assert body["quality"]["repair_rate"] == 1
+    assert body["quality"]["repair_succeeded_count"] == 1
+    assert body["quality"]["repair_failed_count"] == 0
+    assert body["quality"]["avg_evidence_coverage"] == 0.8
+    assert body["by_preset"] == [{
+        "preset": "standard",
+        "operation_count": 1,
+        "succeeded": 1,
+        "settled_credits": 2,
+    }]
+    assert body["by_target"] == [{
+        "target": "video",
+        "operation_count": 1,
+        "succeeded": 1,
+        "settled_credits": 2,
+    }]
+
+
+def test_reverse_dashboard_counts_pending_confirmation_and_failed_repair(
+    client,
+    make_user,
+    auth,
+):
+    phone = "13900000039"
+    uid = make_user(phone, balance=1000, admin=True)
+    headers = auth(phone)
+    now = datetime(2099, 2, 1, 12, tzinfo=timezone.utc)
+    db = SessionLocal()
+    try:
+        confirmed = ReverseOperation(
+            user_id=uid,
+            client_request_id="reverse-quality-confirmed",
+            request_fingerprint="b" * 64,
+            target="video",
+            asset_url="http://x/confirmed.mp4",
+            status="succeeded",
+            progress=100,
+            request_context={
+                "cover_confirmation_required": True,
+                "cover_confirmed": True,
+            },
+            result={
+                "repair_attempted": True,
+                "repair_succeeded": True,
+                "video_analysis": {"analysis_mode": "cover_fallback"},
+            },
+            cost_frozen=0,
+            cost_settled=2,
+            finished_at=now,
+            created_at=now,
+            updated_at=now,
+        )
+        declined = ReverseOperation(
+            user_id=uid,
+            client_request_id="reverse-quality-declined",
+            request_fingerprint="c" * 64,
+            target="video",
+            asset_url="http://x/declined.mp4",
+            status="canceled",
+            progress=100,
+            request_context={"cover_confirmation_required": True},
+            result={"video_analysis": {"analysis_mode": "unavailable"}},
+            cost_frozen=0,
+            cost_settled=0,
+            finished_at=now,
+            created_at=now,
+            updated_at=now,
+        )
+        failed_repair = ReverseOperation(
+            user_id=uid,
+            client_request_id="reverse-quality-repair-failed",
+            request_fingerprint="d" * 64,
+            target="image",
+            asset_url="http://x/failed.png",
+            status="failed",
+            progress=100,
+            cost_frozen=0,
+            cost_settled=0,
+            error_code="REPAIR_FAILED",
+            finished_at=now,
+            created_at=now,
+            updated_at=now,
+        )
+        db.add_all([confirmed, declined, failed_repair])
+        db.flush()
+        db.add(GatewayCall(
+            user_id=uid,
+            kind="reverse",
+            model_id="mock-vision",
+            status="failed",
+            detail={
+                "operation_id": failed_repair.id,
+                "phase": "repairing",
+                "error_code": "REPAIR_FAILED",
+                "repair_attempted": True,
+                "cost_credits": 0,
+            },
+            created_at=now,
+        ))
+        db.commit()
+    finally:
+        db.close()
+
+    response = client.get(
+        "/api/admin/usage/reverse-operations?start=2099-02-01&end=2099-02-01",
+        headers=headers,
+    )
+
+    assert response.status_code == 200, response.text
+    quality = response.json()["quality"]
+    assert quality["cover_confirmation_required_count"] == 2
+    assert quality["cover_confirmed_count"] == 1
+    assert quality["cover_confirmation_rate"] == 0.5
+    assert quality["repair_count"] == 2
+    assert quality["repair_succeeded_count"] == 1
+    assert quality["repair_failed_count"] == 1
+    assert quality["repair_rate"] == 0.6667
+
+
+def test_reverse_dashboard_attributes_operation_and_model_cost_to_finished_date(
+    client,
+    make_user,
+    auth,
+):
+    phone = "13900000040"
+    uid = make_user(phone, balance=1000, admin=True)
+    headers = auth(phone)
+    created_at = datetime(2099, 3, 1, 23, 59, tzinfo=timezone.utc)
+    finished_at = datetime(2099, 3, 2, 0, 1, tzinfo=timezone.utc)
+    db = SessionLocal()
+    try:
+        operation = ReverseOperation(
+            user_id=uid,
+            client_request_id="reverse-cross-day-reporting",
+            request_fingerprint="e" * 64,
+            target="image",
+            asset_url="http://x/cross-day.png",
+            status="succeeded",
+            progress=100,
+            result={"structured": {"subject": "cup"}, "final_text": "red cup"},
+            cost_frozen=0,
+            cost_settled=2,
+            started_at=created_at,
+            finished_at=finished_at,
+            created_at=created_at,
+            updated_at=finished_at,
+        )
+        db.add(operation)
+        db.flush()
+        db.add(GatewayCall(
+            user_id=uid,
+            kind="reverse",
+            model_id="mock-vision",
+            status="ok",
+            detail={"operation_id": operation.id, "cost_credits": 3},
+            created_at=created_at,
+        ))
+        db.commit()
+    finally:
+        db.close()
+
+    first_day = client.get(
+        "/api/admin/usage/reverse-operations?start=2099-03-01&end=2099-03-01",
+        headers=headers,
+    ).json()
+    second_day = client.get(
+        "/api/admin/usage/reverse-operations?start=2099-03-02&end=2099-03-02",
+        headers=headers,
+    ).json()
+
+    assert first_day["summary"]["operation_count"] == 0
+    assert first_day["summary"]["settled_credits"] == 0
+    assert first_day["model_costs"] == []
+    assert second_day["summary"]["operation_count"] == 1
+    assert second_day["summary"]["settled_credits"] == 2
+    assert second_day["model_costs"] == [{
+        "model_id": "mock-vision",
+        "call_count": 1,
+        "failed_count": 0,
+        "total_tokens": 0,
+        "cost_credits": 3,
+    }]
 
 
 def test_usage_report_does_not_count_refunds_as_negative_spend(client, make_user, auth):
@@ -314,19 +584,23 @@ def test_failed_image_generation_logs_gateway_call(client, make_user, auth, monk
         db.close()
 
 
-def test_video_reverse_uses_fallback_in_mock(client, make_user, auth):
+def test_video_reverse_requires_cover_confirmation_in_mock(client, make_user, auth):
     make_user("13900000032", balance=1000)
     h = auth("13900000032")
-    # mock mode: keyframe sampling is skipped; the cover (fallback_image) is used
+    # Mock mode has no extracted keyframes. Even with a supplied cover, the
+    # compatibility endpoint must not silently downgrade a video analysis.
     r = client.post("/api/prompt/reverse", json={
         "asset_url": "http://x/clip.mp4", "target": "video",
         "fallback_image": "http://x/cover.jpg",
     }, headers=h)
-    assert r.status_code == 200, r.text
-    assert "主体" in r.json()["structured"]
+    assert r.status_code == 409, r.text
+    detail = r.json()["detail"]
+    assert detail["status"] == "needs_confirmation"
+    assert detail["operation_id"] > 0
+    assert detail["confirmation_expires_at"]
 
 
-def test_video_reverse_charges_per_reference_frame(client, make_user, auth, monkeypatch):
+def test_video_reverse_uses_fixed_operation_price(client, make_user, auth, monkeypatch):
     make_user("13900009042", balance=1000, admin=True)
     h = auth("13900009042")
     assert client.put("/api/admin/models", json={
@@ -373,7 +647,7 @@ def test_video_reverse_charges_per_reference_frame(client, make_user, auth, monk
     assert r.status_code == 200, r.text
     assert seen["n"] == 24
     assert seen["preset"] == "standard"
-    assert client.get("/api/me", headers=h).json()["balance_credits"] == 982
+    assert client.get("/api/me", headers=h).json()["balance_credits"] == 995
 
 
 def test_video_reverse_returns_authoritative_source_analysis(client, make_user, auth, monkeypatch):
@@ -475,7 +749,7 @@ def test_video_reverse_rejects_video_url_for_image_target(client, make_user, aut
         "asset_url": "http://x/clip.mp4", "target": "image",
     }, headers=h)
     assert r.status_code == 400
-    assert "反推只支持图片素材" in r.text
+    assert "视频素材仅支持视频反推" in r.text
 
 
 def test_keyframe_sampling_blocked_url_returns_empty():

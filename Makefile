@@ -2,7 +2,7 @@
 VENV := backend/.venv
 PY := $(VENV)/bin
 
-.PHONY: help install install-frontend test test-frontend lint fmt compile migrate alembic-check audit compose-check docker-build-check \
+.PHONY: help install install-frontend test test-frontend frontend-typecheck reverse-golden-eval lint fmt compile migrate alembic-check audit compose-check docker-build-check \
         worker-topology-check run-api run-worker run-beat run-frontend build-frontend docker-up docker-down release-check release-check-worktree release-source clean
 
 help: ## Show this help
@@ -22,6 +22,12 @@ test: ## Run backend tests
 
 test-frontend: ## Run frontend unit tests
 	cd frontend && npm run test:unit
+
+frontend-typecheck: ## Type-check the frontend public contracts and application
+	cd frontend && npm run typecheck
+
+reverse-golden-eval: ## Evaluate sanitized offline reverse-prompt golden samples
+	cd backend && .venv/bin/python scripts/evaluate_reverse_golden.py tests/fixtures/reverse_golden_samples.json
 
 lint: ## Lint backend (ruff)
 	cd backend && .venv/bin/ruff check .
@@ -73,12 +79,12 @@ docker-build-check: ## Build backend/frontend Docker images without starting ser
 	POSTGRES_PASSWORD="$${POSTGRES_PASSWORD:-release-check-postgres-password}" \
 		REDIS_PASSWORD="$${REDIS_PASSWORD:-release-check-redis-password}" \
 		BACKEND_ENV_FILE="$${BACKEND_ENV_FILE:-./backend/.env.example}" \
-		docker compose build api worker worker_image worker_video worker_video_download worker_parse beat frontend
+		docker compose build api worker worker_image worker_video worker_video_download worker_parse worker_reverse beat frontend
 
 worker-topology-check: ## Validate isolated worker roles and compose services
 	./scripts/test_worker_parallelism.sh
 
-release-check: compile lint migrate alembic-check test test-frontend build-frontend compose-check worker-topology-check docker-build-check audit ## Run local release gates against the same clean HEAD artifact as CI
+release-check: compile lint migrate alembic-check test reverse-golden-eval test-frontend frontend-typecheck build-frontend compose-check worker-topology-check docker-build-check audit ## Run local release gates against the same clean HEAD artifact as CI
 	@test -z "$$(git status --porcelain)" || \
 		(echo "release-check archives HEAD; commit or stash worktree changes first, or use release-check-worktree" >&2; exit 1)
 	tmp="$$(mktemp -d)" && \
@@ -87,7 +93,7 @@ release-check: compile lint migrate alembic-check test test-frontend build-front
 		rm -rf "$$tmp"
 	find . -maxdepth 3 \( -name .venv -o -name .next -o -name node_modules \) -type d -print | sort
 
-release-check-worktree: compile lint migrate alembic-check test test-frontend build-frontend compose-check worker-topology-check docker-build-check audit ## Run release gates against tracked + untracked worktree files
+release-check-worktree: compile lint migrate alembic-check test reverse-golden-eval test-frontend frontend-typecheck build-frontend compose-check worker-topology-check docker-build-check audit ## Run release gates against tracked + untracked worktree files
 	tmp="$$(mktemp -d)" && \
 		deleted="$$(git ls-files --deleted)" && \
 		if [ -n "$$deleted" ]; then \

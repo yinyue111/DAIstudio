@@ -41,17 +41,26 @@ case "$ROLE" in
     DEFAULT_CONCURRENCY=1
     DEFAULT_POOL="solo"
     ;;
+  reverse)
+    DEFAULT_QUEUES="reverse"
+    DEFAULT_CONCURRENCY=2
+    DEFAULT_POOL="threads"
+    ;;
   all)
-    DEFAULT_QUEUES="default,image,video_submit,video_poll,video_download,parse,cleanup,payment"
+    DEFAULT_QUEUES="default,image,video_submit,video_poll,video_download,parse,reverse,cleanup,payment"
     DEFAULT_CONCURRENCY=4
     ;;
   *)
-    echo "unknown WORKER_ROLE=$ROLE; expected critical/image/video/video-submit/video-download/parse/all" >&2
+    echo "unknown WORKER_ROLE=$ROLE; expected critical/image/video/video-submit/video-download/parse/reverse/all" >&2
     exit 2
     ;;
 esac
 QUEUES="${WORKER_QUEUES:-$DEFAULT_QUEUES}"
 POOL="${WORKER_POOL:-$DEFAULT_POOL}"
+if [[ "$ROLE" == "reverse" && "$POOL" != "threads" ]]; then
+  echo "reverse worker requires WORKER_POOL=threads for cooperative cancellation" >&2
+  exit 2
+fi
 CONCURRENCY="${WORKER_CONCURRENCY:-$DEFAULT_CONCURRENCY}"
 NODE_NAME="${WORKER_NAME:-${ROLE}@%h}"
 CMD=(celery -A app.celery_app.celery_app worker -l info -n "$NODE_NAME" --pool="$POOL" --concurrency="$CONCURRENCY" -Q "$QUEUES")

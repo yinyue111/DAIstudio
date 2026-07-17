@@ -18,11 +18,19 @@ _LOCK_RETRY_MAX = max(
 )
 
 
-def enqueue_with_request_context(task, *args, countdown: int | None = None, **kwargs):
+def enqueue_with_request_context(
+    task,
+    *args,
+    countdown: int | None = None,
+    task_id: str | None = None,
+    **kwargs,
+):
     """Enqueue a Celery task and propagate the current HTTP request id."""
     options = {"headers": {"x-request-id": current_request_id()}}
     if countdown is not None:
         options["countdown"] = countdown
+    if task_id is not None:
+        options["task_id"] = task_id
     return task.apply_async(args=args, kwargs=kwargs, **options)
 
 
@@ -173,16 +181,30 @@ def reap_stuck_parse_records_task() -> int:
 
 
 @celery_app.task(name="cleanup.reap_reverse")
-def reap_stuck_reverse_operations_task() -> int:
-    """Refund reverse calls abandoned by an API process crash."""
-    from .db import SessionLocal
-    from .services import retention
+def reap_stuck_reverse_operations_task() -> dict[str, int]:
+    """Maintain async reverse operations and their frozen credits."""
+    from .services import reverse_operations
 
-    db = SessionLocal()
+    return reverse_operations.reap_operations()
+
+
+@celery_app.task(
+    name="reverse.run",
+    acks_late=True,
+    reject_on_worker_lost=True,
+)
+def reverse_operation_task(operation_id: int) -> None:
+    """Execute one idempotently claimed reverse-prompt operation."""
+    from .services import reverse_operations
+
     try:
-        return retention.reap_stuck_reverse_operations(db)
-    finally:
-        db.close()
+        reverse_operations.run_operation(operation_id)
+    except SoftTimeLimitExceeded:
+        reverse_operations.fail_operation(
+            operation_id,
+            code="OPERATION_TIMEOUT",
+            error="反推任务超时,已退回冻结积分",
+        )
 
 
 @celery_app.task(name="payments.reconcile")

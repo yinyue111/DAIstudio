@@ -74,6 +74,8 @@ function loopbackApiAliases(value) {
 /** @type {import('next').NextConfig} */
 const nextConfig = {
   reactStrictMode: true,
+  // Keep Playwright's isolated dev build away from a locally running .next build.
+  distDir: process.env.NEXT_DIST_DIR || ".next",
   output: "standalone",
   outputFileTracingRoot: path.join(__dirname),
   allowedDevOrigins: ["127.0.0.1", "localhost"],
