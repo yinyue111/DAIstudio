@@ -133,6 +133,33 @@ def auth(client):
     return _login
 
 
+@pytest.fixture()
+def quote_generation(client):
+    """Create an explicit server quote for a valid generation request."""
+    def _quote(payload, *, headers=None):
+        request_payload = dict(payload)
+        request_payload.pop("quote_id", None)
+        response = client.post("/api/quotes", json=request_payload, headers=headers)
+        assert response.status_code == 201, response.text
+        return response.json()
+
+    return _quote
+
+
+@pytest.fixture()
+def quote_and_generate(client, quote_generation):
+    """Quote and submit a valid generation request without hiding either API call."""
+    def _submit(payload, *, headers=None):
+        quote = quote_generation(payload, headers=headers)
+        return client.post(
+            "/api/generate",
+            json={**payload, "quote_id": quote["quote_id"]},
+            headers=headers,
+        )
+
+    return _submit
+
+
 @pytest.fixture(scope="session")
 def tiny_mp4():
     """A real (tiny) mp4 so video content-validation passes."""
