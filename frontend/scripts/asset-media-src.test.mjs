@@ -135,6 +135,18 @@ assert.equal(
   "interactive uploaded-video previews should render a video player",
 );
 
+const fetchedImage = {
+  origin: "fetched",
+  type: "image",
+  url: "/api/uploads/upload/fetched-product.png",
+  unlocked: true,
+};
+assert.equal(
+  assetDisplaySrc(fetchedImage),
+  fetchedImage.url,
+  "fetched materials should use the same owner-controlled media path as manual uploads",
+);
+
 const studioUploadedVideo = {
   type: "video",
   display_url: "blob:http://127.0.0.1:3010/local-video",

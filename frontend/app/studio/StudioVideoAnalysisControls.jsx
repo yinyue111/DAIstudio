@@ -138,7 +138,7 @@ export default function StudioVideoAnalysisControls({
         {selectedCost > 0 && <span className="text-[11px] text-fog">预计冻结 {selectedCost} 积分</span>}
       </div>
 
-      <div className="mt-2 grid grid-cols-3 gap-1.5" role="radiogroup" aria-label="分析精度">
+      <div className="mt-2 grid grid-cols-2 gap-1.5 sm:grid-cols-4" role="radiogroup" aria-label="分析精度">
         {presets.map((preset) => {
           const active = config.analysis_precision === preset.key;
           return (
@@ -157,7 +157,7 @@ export default function StudioVideoAnalysisControls({
             >
               <span className="block text-xs font-display font-semibold">{preset.label}</span>
               <span className="mt-0.5 block text-[10px] leading-snug">
-                {preset.short_range || preset.description || preset.long_range || ""}
+                {preset.frame_range || preset.short_range || preset.description || preset.long_range || ""}
               </span>
             </button>
           );

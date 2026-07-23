@@ -198,6 +198,7 @@ def _localize_media_url(
                         height=height,
                         bytes=len(normalized_png),
                         original_filename="parsed-image.png",
+                        origin="fetched",
                     )
                 )
             db.merge(
@@ -209,6 +210,7 @@ def _localize_media_url(
                     height=preview_h,
                     bytes=len(preview_png),
                     original_filename="parsed-preview.png",
+                    origin="fetched",
                 )
             )
             db.merge(
@@ -220,6 +222,7 @@ def _localize_media_url(
                     height=preview_h,
                     bytes=len(model_ref_jpeg),
                     original_filename="parsed-model-ref.jpg",
+                    origin="fetched",
                 )
             )
         return LocalizedMedia(

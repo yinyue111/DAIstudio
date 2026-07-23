@@ -58,6 +58,7 @@ def _upload_group(
     *,
     created_at: datetime,
     favorite: bool = False,
+    origin: str = "uploaded",
 ) -> tuple[str, str, str]:
     root = storage.save_bytes_named(b"root", "upload", f"{stem}.png")
     preview = storage.save_bytes_named(b"preview", "upload_preview", f"{stem}.png")
@@ -73,6 +74,7 @@ def _upload_group(
             mime="image/png",
             bytes=size,
             original_filename=name,
+            origin=origin,
             favorite=favorite,
             created_at=created_at,
         ))
@@ -147,6 +149,7 @@ def test_unified_asset_list_filters_roots_retention_and_cursor(client, make_user
     assert body["stats"] == {
         "generated": 2,
         "uploaded": 1,
+        "fetched": 0,
         "images": 2,
         "videos": 1,
         "favorites": 2,
@@ -186,6 +189,49 @@ def test_unified_asset_list_filters_roots_retention_and_cursor(client, make_user
     assert second["total"] == 3
     assert client.get("/api/me/assets?cursor=", headers=headers).status_code == 400
     assert client.get("/api/me/assets?cursor=not-a-cursor", headers=headers).status_code == 400
+
+
+def test_asset_list_separates_fetched_materials_from_manual_uploads(client, make_user, auth):
+    user_id = make_user("13900000503")
+    headers = auth("13900000503")
+    now = datetime.now(timezone.utc)
+
+    db = SessionLocal()
+    try:
+        uploaded_key, _, _ = _upload_group(
+            db,
+            user_id,
+            "manual-material",
+            created_at=now,
+        )
+        fetched_key, _, _ = _upload_group(
+            db,
+            user_id,
+            "fetched-material",
+            created_at=now - timedelta(seconds=1),
+            origin="fetched",
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    uploaded = client.get("/api/me/assets?origin=uploaded", headers=headers)
+    assert uploaded.status_code == 200, uploaded.text
+    assert [item["asset_ref"] for item in uploaded.json()["items"]] == [
+        user_assets.uploaded_asset_ref(uploaded_key),
+    ]
+    assert uploaded.json()["items"][0]["origin"] == "uploaded"
+
+    fetched = client.get("/api/me/assets?origin=fetched", headers=headers)
+    assert fetched.status_code == 200, fetched.text
+    assert [item["asset_ref"] for item in fetched.json()["items"]] == [
+        user_assets.uploaded_asset_ref(fetched_key),
+    ]
+    assert fetched.json()["items"][0]["origin"] == "fetched"
+
+    all_assets = client.get("/api/me/assets", headers=headers).json()
+    assert all_assets["stats"]["uploaded"] == 1
+    assert all_assets["stats"]["fetched"] == 1
 
 
 def test_asset_discovery_search_tags_and_folder_ownership(client, make_user, auth):

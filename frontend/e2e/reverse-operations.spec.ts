@@ -169,6 +169,10 @@ test("提示词优化静默校验计费并直接生成建议", async ({ page }) 
   expect(mock.quoteRequests[0].kind).toBe("prompt_optimization");
   expect(mock.promptOptimizationBodies).toHaveLength(1);
   expect(mock.promptOptimizationBodies[0].quote_id).toBe(5001);
+
+  await page.getByRole("button", { name: "应用编译稿", exact: true }).click();
+  await expect(page.getByPlaceholder(/描述你想要的画面/)).toHaveValue("E2E 目标模型编译稿");
+  await expect(page.getByText("工作区已变更，未自动覆盖", { exact: true })).toHaveCount(0);
 });
 
 test("目标模型编译预览展示处理动作、字段和警告说明", async ({ page }) => {
@@ -197,6 +201,11 @@ test("正常多帧视频反推展示采样、证据覆盖和分析缺口", async
   await openStudio(page);
   await page.getByRole("button", { name: /文生视频/ }).click();
   await page.locator('input[type="file"][accept*="video/mp4"]').setInputFiles(VIDEO_FILE);
+  const analysisPrecision = page.getByRole("radiogroup", { name: "分析精度" });
+  await expect(analysisPrecision.getByRole("radio")).toHaveCount(4);
+  for (const range of ["4-8帧", "8-14帧", "14-22帧", "22-36帧"]) {
+    await expect(analysisPrecision.getByText(range, { exact: true })).toBeVisible();
+  }
   await page.getByRole("button", { name: /反推提示词.*18积分/ }).click();
   await expect(page.getByText("服务端权威报价", { exact: true })).toHaveCount(0);
 

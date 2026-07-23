@@ -245,7 +245,7 @@ export default function AssetPickerDialog({
 
         <div className="flex flex-wrap items-center gap-2 border-b border-line px-4 py-3 sm:px-5">
           <div className="inline-flex gap-1 rounded-full border border-line bg-white/5 p-1" aria-label="资产来源">
-            {[["all", "全部"], ["uploaded", "我的上传"], ["generated", "生成作品"]].map(([value, label]) => (
+            {[["all", "全部"], ["uploaded", "我的上传"], ["fetched", "素材抓取"], ["generated", "生成作品"]].map(([value, label]) => (
               <button
                 key={value}
                 type="button"
@@ -379,16 +379,16 @@ export default function AssetPickerDialog({
                       fallbackClassName="flex h-full w-full items-center justify-center px-3 text-center text-xs text-fog"
                     />
                     <span className="badge absolute left-2 top-2 bg-black/70 text-white">
-                      {asset.origin === "uploaded" ? "上传" : "生成"}
+                      {asset.origin === "fetched" ? "抓取" : asset.origin === "uploaded" ? "上传" : "生成"}
                     </span>
                     <span className={`absolute right-2 top-2 flex h-6 w-6 items-center justify-center rounded-full border text-xs font-bold ${
                       checked ? "border-brand bg-brand text-white" : "border-white/30 bg-black/60 text-white"
                     }`} aria-hidden>
                       {checked ? "✓" : "+"}
                     </span>
-                    {asset.filename && (
+                    {(asset.filename || asset.origin === "fetched") && (
                       <span className="absolute inset-x-0 bottom-0 truncate bg-black/70 px-2 py-1.5 text-[11px] text-white">
-                        {asset.filename}
+                        {asset.origin === "fetched" ? "抓取素材" : asset.filename}
                       </span>
                     )}
                   </button>

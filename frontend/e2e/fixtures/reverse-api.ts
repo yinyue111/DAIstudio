@@ -40,7 +40,7 @@ function configPayload() {
       ],
     },
     pricing: {
-      reverse: { image_cost: 2, video_preset_costs: { fast: 8, standard: 18, fine: 32 } },
+      reverse: { image_cost: 2, video_preset_costs: { fast: 8, standard: 18, fine: 32, ultra: 48 } },
       image: {
         unit_costs: { "1k": 15, "2k": 40, "4k": 100 },
         edit_unit_costs: { "1k": 20, "2k": 55, "4k": 130 },
@@ -55,12 +55,13 @@ function configPayload() {
     reverse: {
       image_cost: 2,
       video_default_preset: "standard",
-      video_frame_count: 24,
+      video_frame_count: 14,
       video_max_cost: 18,
       video_presets: [
-        { key: "fast", label: "快速", short_range: "4帧", long_range: "8-12帧", max_frames: 12, max_cost: 8 },
-        { key: "standard", label: "标准", short_range: "6-8帧", long_range: "16-24帧", max_frames: 24, max_cost: 18 },
-        { key: "fine", label: "精细", short_range: "10-12帧", long_range: "24-36帧", max_frames: 36, max_cost: 32 },
+        { key: "fast", label: "快速", frame_range: "4-8帧", short_range: "4-8帧", long_range: "4-8帧", max_frames: 8, max_cost: 8 },
+        { key: "standard", label: "标准", frame_range: "8-14帧", short_range: "8-14帧", long_range: "8-14帧", max_frames: 14, max_cost: 18 },
+        { key: "fine", label: "精细", frame_range: "14-22帧", short_range: "14-22帧", long_range: "14-22帧", max_frames: 22, max_cost: 32 },
+        { key: "ultra", label: "超精细", frame_range: "22-36帧", short_range: "22-36帧", long_range: "22-36帧", max_frames: 36, max_cost: 48 },
       ],
     },
     mock_mode: true,
@@ -663,6 +664,18 @@ export async function installReverseApiMock(
         },
         charged_credits: 0,
       }, 201);
+    }
+    if (path === "/api/studio/prompt-optimizations/9101/accept" && method === "POST") {
+      const body = request.postDataJSON() as JsonRecord;
+      return fulfillJson(route, {
+        proposal_id: 9101,
+        proposal_version: 2,
+        status: "accepted",
+        accepted_segment_ids: body.accepted_segment_ids || ["segment-final-text"],
+        rejected_segment_ids: body.rejected_segment_ids || [],
+        result: { final_text: "E2E 目标模型编译稿" },
+        revision: null,
+      });
     }
     if (path === "/api/studio/prompt-optimizations" && method === "GET") {
       return fulfillJson(route, { items: [], limit: 8, offset: 0, has_more: false });

@@ -1327,7 +1327,7 @@ def test_video_reverse_uses_fixed_operation_price(client, make_user, auth, monke
         "asset_url": "http://x/clip.mp4", "target": "video",
     }, headers=h)
     assert r.status_code == 200, r.text
-    assert seen["n"] == 24
+    assert seen["n"] == 14
     assert seen["preset"] == "standard"
     assert client.get("/api/me", headers=h).json()["balance_credits"] == 995
 
@@ -1422,14 +1422,17 @@ def test_video_reverse_returns_authoritative_source_analysis(client, make_user, 
 
 def test_video_analysis_presets_match_product_frame_ranges():
     assert video_analysis.frame_count_for_duration(10, "fast") == 4
-    assert video_analysis.frame_count_for_duration(10, "standard") == 7
-    assert video_analysis.frame_count_for_duration(10, "fine") == 11
-    assert video_analysis.frame_count_for_duration(120, "fast") == 8
-    assert video_analysis.frame_count_for_duration(120, "standard") == 16
-    assert video_analysis.frame_count_for_duration(120, "fine") == 24
-    assert video_analysis.frame_count_for_duration(300, "fast") == 12
-    assert video_analysis.frame_count_for_duration(300, "standard") == 24
-    assert video_analysis.frame_count_for_duration(300, "fine") == 36
+    assert video_analysis.frame_count_for_duration(10, "standard") == 8
+    assert video_analysis.frame_count_for_duration(10, "fine") == 14
+    assert video_analysis.frame_count_for_duration(10, "ultra") == 22
+    assert video_analysis.frame_count_for_duration(120, "fast") == 5
+    assert video_analysis.frame_count_for_duration(120, "standard") == 10
+    assert video_analysis.frame_count_for_duration(120, "fine") == 17
+    assert video_analysis.frame_count_for_duration(120, "ultra") == 27
+    assert video_analysis.frame_count_for_duration(300, "fast") == 8
+    assert video_analysis.frame_count_for_duration(300, "standard") == 14
+    assert video_analysis.frame_count_for_duration(300, "fine") == 22
+    assert video_analysis.frame_count_for_duration(300, "ultra") == 36
 
 
 def test_video_reverse_rejects_video_url_for_image_target(client, make_user, auth):
@@ -1537,8 +1540,8 @@ def test_keyframe_sampling_preset_uses_downloaded_duration(monkeypatch):
 
     monkeypatch.setattr(video_frames, "_grab_frame", fake_grab)
 
-    assert video_frames.sample_keyframes("http://x/short.mp4", n=36, preset="fine") == [b"jpg"] * 11
-    assert len(stamps) == 11
+    assert video_frames.sample_keyframes("http://x/short.mp4", n=36, preset="fine") == [b"jpg"] * 14
+    assert len(stamps) == 14
 
 
 def test_keyframe_sampling_backs_off_when_container_tail_has_no_decodable_frame(monkeypatch):

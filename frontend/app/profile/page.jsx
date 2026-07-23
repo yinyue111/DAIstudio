@@ -474,7 +474,7 @@ export default function ProfilePage() {
             <input type="checkbox" checked={selected} onChange={() => toggleSelected(ref)} className="h-3.5 w-3.5 accent-brand" aria-label="选择资产" />
           </label>
           <div className="pointer-events-none absolute left-2 top-2 flex flex-wrap gap-1">
-            <span className="badge bg-black/70 text-white">{asset.origin === "uploaded" ? "上传" : "生成"}</span>
+            <span className="badge bg-black/70 text-white">{asset.origin === "fetched" ? "抓取" : asset.origin === "uploaded" ? "上传" : "生成"}</span>
             <span className="badge bg-black/70 text-white">{asset.type === "video" ? "视频" : "图片"}</span>
           </div>
           <div className="pointer-events-none absolute bottom-2 left-2 flex flex-wrap gap-1">
@@ -484,7 +484,7 @@ export default function ProfilePage() {
         </div>
         <div className="space-y-2 p-3">
           <div className="flex min-w-0 items-center justify-between gap-2 text-xs text-fog">
-            <span className="truncate">{asset.filename || (asset.origin === "uploaded" ? "上传素材" : `生成资产 ${generatedAssetId(asset) || ""}`)}</span>
+            <span className="truncate">{asset.origin === "fetched" ? "抓取素材" : asset.filename || (asset.origin === "uploaded" ? "上传素材" : `生成资产 ${generatedAssetId(asset) || ""}`)}</span>
             {asset.bytes ? <span className="shrink-0">{formatBytes(asset.bytes)}</span> : null}
           </div>
           {metadata && <p className="truncate text-[11px] text-fog">{metadata}</p>}
@@ -576,7 +576,7 @@ export default function ProfilePage() {
         </section>
 
         <section className="mb-5 flex flex-wrap items-center gap-2 border-b border-line pb-4" aria-label="资产筛选">
-          <FilterSelect label="来源" value={filters.origin} onChange={(origin) => setFilters((current) => ({ ...current, origin }))} options={[["all", "全部来源"], ["uploaded", "我的上传"], ["generated", "生成作品"]]} />
+          <FilterSelect label="来源" value={filters.origin} onChange={(origin) => setFilters((current) => ({ ...current, origin }))} options={[["all", "全部来源"], ["uploaded", "我的上传"], ["fetched", "素材抓取"], ["generated", "生成作品"]]} />
           <FilterSelect label="类型" value={filters.type} onChange={(type) => setFilters((current) => ({ ...current, type }))} options={[["all", "全部类型"], ["image", "图片"], ["video", "视频"]]} />
           <FilterSelect label="保留" value={filters.retention} onChange={(retention) => setFilters((current) => ({ ...current, retention }))} options={[["all", "全部策略"], ["retained", "长期保留"], ["expiring", "默认保留"]]} />
           <label className="chip cursor-pointer gap-2 px-3 py-2">

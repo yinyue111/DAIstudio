@@ -1599,6 +1599,7 @@ def test_parsed_preview_reference_is_owner_bound(
         row = db.get(UploadedAsset, key)
         assert row is not None
         assert row.user_id == user_a
+        assert row.origin == "fetched"
     finally:
         db.close()
 
@@ -1675,6 +1676,7 @@ def test_orphaned_parsed_preview_file_cannot_drive_reference_generation(
         row = db.get(UploadedAsset, key)
         assert row is not None
         assert row.user_id == user_id
+        assert row.origin == "fetched"
         db.delete(row)
         db.commit()
     finally:

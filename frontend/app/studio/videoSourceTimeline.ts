@@ -39,7 +39,7 @@ export function videoTimelineConfigIssues(
   keyframeValue: unknown,
   durationValue: unknown,
   maxRanges = 8,
-  maxKeyframes = 24,
+  maxKeyframes = 36,
 ): VideoTimelineConfigIssue[] {
   const duration = videoTimelineDuration(durationValue);
   if (!duration) return [];
@@ -146,7 +146,7 @@ export function normalizeVideoKeyframes(
   value: unknown,
   durationValue: unknown,
   rangeValue: unknown = [],
-  maxKeyframes = 24,
+  maxKeyframes = 36,
 ) {
   const duration = videoTimelineDuration(durationValue);
   if (!duration || !Array.isArray(value)) return [];

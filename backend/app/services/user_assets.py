@@ -68,6 +68,10 @@ class _ListEntry:
     item: dict
 
 
+def _uploaded_asset_origin(row: UploadedAsset) -> str:
+    return "fetched" if row.origin == "fetched" else "uploaded"
+
+
 def _aware(value: datetime | None) -> datetime | None:
     if value is None:
         return None
@@ -637,7 +641,7 @@ def list_user_assets(
                 },
             ))
 
-    if origin in ("all", "uploaded"):
+    if origin in ("all", "uploaded", "fetched"):
         all_upload_rows = list(db.execute(
             select(UploadedAsset).where(UploadedAsset.user_id == user_id)
         ).scalars())
@@ -650,8 +654,9 @@ def list_user_assets(
             if not retained_value and created is not None and created < cutoff:
                 continue
             row_type = "video" if row.key.startswith("upload_video/") else "image"
+            row_origin = _uploaded_asset_origin(row)
             if not _matches_filters(
-                origin="uploaded",
+                origin=row_origin,
                 asset_type=row_type,
                 favorite_value=bool(row.favorite),
                 retained_value=retained_value,
@@ -678,7 +683,7 @@ def list_user_assets(
                 sort_key=(_timestamp_micros(row.created_at), 0, row.key),
                 item={
                     "asset_ref": asset_ref,
-                    "origin": "uploaded",
+                    "origin": row_origin,
                     "type": row_type,
                     "url": url,
                     "preview_url": preview_url,
@@ -779,6 +784,7 @@ def list_user_assets(
     stats = {
         "generated": sum(entry.item["origin"] == "generated" for entry in entries),
         "uploaded": sum(entry.item["origin"] == "uploaded" for entry in entries),
+        "fetched": sum(entry.item["origin"] == "fetched" for entry in entries),
         "images": sum(entry.item["type"] == "image" for entry in entries),
         "videos": sum(entry.item["type"] == "video" for entry in entries),
         "favorites": sum(bool(entry.item["favorite"]) for entry in entries),
@@ -1000,7 +1006,7 @@ def asset_items_for_refs(
         )
         items[item.asset_ref] = _apply_metadata({
             "asset_ref": item.asset_ref,
-            "origin": "uploaded",
+            "origin": _uploaded_asset_origin(row),
             "type": "video" if row.key.startswith("upload_video/") else "image",
             "url": url,
             "preview_url": preview_url,

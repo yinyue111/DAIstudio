@@ -512,6 +512,70 @@ def test_generation_video_reverse_repairs_missing_sampled_frame_coverage(monkeyp
     } == {1, 2}
 
 
+def test_generation_video_reverse_repairs_frames_with_placeholder_visuals(monkeypatch):
+    monkeypatch.setattr(settings, "mock_mode", False)
+    calls = []
+    responses = iter([
+        {
+            "choices": [{"message": {"content": (
+                '{"主体":"精华瓶","shots":['
+                '{"start_seconds":0,"end_seconds":4,"visual":"未见",'
+                '"evidence_frame_indices":[1,2],"confidence":0.9}],'
+                '"final_text":"精华瓶产品视频"}'
+            )}}],
+            "usage": {"total_tokens": 7},
+        },
+        {
+            "choices": [{"message": {"content": (
+                '{"frames":['
+                '{"frame_index":1,"visual":"银色瓶盖微距特写",'
+                '"lighting":"冷白侧光","confidence":0.9},'
+                '{"frame_index":2,"visual":"完整精华瓶立于水面",'
+                '"lighting":"冷白轮廓光","confidence":0.9}]}'
+            )}}],
+            "usage": {"total_tokens": 3},
+        },
+    ])
+
+    def fake_post(_path, payload, **_kwargs):
+        calls.append(payload)
+        return next(responses)
+
+    monkeypatch.setattr(gateway, "_post", fake_post)
+    cfg = RuntimeGatewayConfig(
+        use="vision",
+        provider="custom_openai",
+        base_url="https://vision-gateway.example.com/v1",
+        api_key="vision-key",
+        gateway_format="openai",
+    )
+    result = gateway.reverse_prompt(
+        ["data:image/jpeg;base64,Zmlyc3Q=", "data:image/jpeg;base64,c2Vjb25k"],
+        "vision-model",
+        target="video",
+        video_analysis={
+            "source": {"duration_seconds": 4.0, "audio_analyzed": False},
+            "sampled_frames": [
+                {"index": 1, "timestamp_seconds": 0.0},
+                {"index": 2, "timestamp_seconds": 3.9},
+            ],
+        },
+        require_video_frame_coverage=True,
+        gateway_config=cfg,
+    )
+
+    assert len(calls) == 2
+    repair_content = calls[1]["messages"][0]["content"]
+    assert isinstance(repair_content, list)
+    assert [item["type"] for item in repair_content].count("image_url") == 2
+    assert result["repair_attempted"] is True
+    assert {
+        index
+        for shot in result["shots"]
+        for index in shot["evidence_frame_indices"]
+    } == {1, 2}
+
+
 def test_video_shots_are_sorted_before_normalization():
     shots = gateway._normalize_video_shots(
         [

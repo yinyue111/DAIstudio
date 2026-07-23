@@ -14,7 +14,7 @@ import {
 import { shouldBlockNewGeneration } from "./taskConcurrency";
 import { studioQuoteRequestFingerprint } from "./generationQuote";
 
-const DEFAULT_REVERSE_VIDEO_PRESET_COSTS = { fast: 5, standard: 5, fine: 5 };
+const DEFAULT_REVERSE_VIDEO_PRESET_COSTS = { fast: 5, standard: 5, fine: 5, ultra: 5 };
 
 export function studioCreationFacts({ creationMode, imageEditProductMode, editSubjectMode, productAsset = null }) {
   const category = creationMode === "video" || creationMode === "video_edit" ? "video" : "image";

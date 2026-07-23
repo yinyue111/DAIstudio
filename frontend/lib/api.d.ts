@@ -1300,7 +1300,7 @@ export interface CreationRecipeUsageSummary {
 export interface Asset {
   id?: number;
   asset_ref?: string;
-  origin?: "generated" | "uploaded";
+  origin?: "generated" | "uploaded" | "fetched";
   type: AssetType;
   url?: string;
   thumb?: string | null;
@@ -1957,7 +1957,7 @@ export const api: {
   profile(): Promise<unknown>;
   profileAssets(query?: ProfileAssetQuery): Promise<Asset[]>;
   meAssets(query?: {
-    origin?: "all" | "generated" | "uploaded";
+    origin?: "all" | "generated" | "uploaded" | "fetched";
     type?: "all" | AssetType;
     favorite?: boolean | "";
     retention?: "all" | "retained" | "expiring";

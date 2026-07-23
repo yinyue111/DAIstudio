@@ -135,6 +135,16 @@ assert.match(
   /applyPromptOptimizationDecision\([\s\S]*decision\?\.result[\s\S]*setWorkspacePatch\(\{[\s\S]*\.\.\.\(applied\.applied \? applied\.workspace : \{\}\)/,
   "accepting an optimization proposal should atomically apply the authoritative workspace",
 );
+assert.match(
+  pageSource,
+  /workspacesRef\.current = workspaces;/,
+  "async prompt decisions should read the workspace currently rendered to the user",
+);
+assert.doesNotMatch(
+  pageSource,
+  /useEffect\(\(\) => \{\s*workspacesRef\.current = workspaces;\s*\}, \[workspaces\]\);/,
+  "the current workspace ref must not lag behind rendering until an effect runs",
+);
 assert.doesNotMatch(
   rejectPromptOptimizationSource,
   /setWorkspacePatch\(/,

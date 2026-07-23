@@ -173,13 +173,18 @@ def test_public_config_exposes_video_reverse_presets(client, make_user, auth):
         ],
         "audio_policies": ["inherit", "exclude", "analyze"],
     }
-    assert [p["key"] for p in presets] == ["fast", "standard", "fine"]
-    assert presets[0]["short_range"] == "4帧"
+    assert [p["key"] for p in presets] == ["fast", "standard", "fine", "ultra"]
+    assert [p["frame_range"] for p in presets] == [
+        "4-8帧", "8-14帧", "14-22帧", "22-36帧",
+    ]
+    assert presets[0]["short_range"] == "4-8帧"
     assert presets[0]["max_cost"] == 5
-    assert presets[1]["long_range"] == "16-24帧"
+    assert presets[1]["long_range"] == "8-14帧"
     assert presets[1]["max_cost"] == 5
-    assert presets[2]["max_frames"] == 36
+    assert presets[2]["max_frames"] == 22
     assert presets[2]["max_cost"] == 5
+    assert presets[3]["max_frames"] == 36
+    assert presets[3]["max_cost"] == 5
     assert data["pricing"]["reverse"]["image_cost"] == 5
     assert data["pricing"]["image"]["unit_costs"] == {"1k": 8, "2k": 8, "4k": 8}
     assert data["pricing"]["image"]["edit_unit_costs"] == {"1k": 8, "2k": 8, "4k": 8}

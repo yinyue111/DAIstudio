@@ -12,6 +12,7 @@ import {
   canInvalidateQuoteConfirmation,
   createQuoteConfirmationAction,
   executeQuoteActionAutomatically,
+  quoteConfirmationBusyResult,
   settleQuoteConfirmationAction,
 } from "../app/studio/quoteConfirmationAction";
 
@@ -59,7 +60,7 @@ export default function useStudioQuoteConfirmation({ balanceCredits = null } = {
     }
     const previous = actionRef.current;
     if (previous?.executing) {
-      return Promise.resolve({ status: "execution_in_progress" });
+      return Promise.resolve(quoteConfirmationBusyResult());
     }
     if (previous) settleQuoteConfirmationAction(previous, { status: "superseded" });
 

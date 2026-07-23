@@ -3,6 +3,7 @@
 import { useEffect, useState } from "react";
 import { API_BASE, api, assetDownloadObjectUrl } from "../lib/api";
 import { normalizeLoopbackPlatformMediaUrl } from "../lib/platformMedia";
+import { isStoredUserAsset } from "../lib/unifiedAssets";
 
 const PLATFORM_MEDIA_PREFIXES = ["/media/", "/api/uploads/"];
 
@@ -87,7 +88,7 @@ export function assetUnavailableText(asset) {
 }
 
 export function assetDisplaySrc(asset, { playbackUrl = "", interactive = false } = {}) {
-  if (asset?.origin === "uploaded") {
+  if (isStoredUserAsset(asset)) {
     if (asset?.type === "video") {
       return safeAssetMediaSrc(
         interactive
@@ -107,7 +108,7 @@ export function assetDisplaySrc(asset, { playbackUrl = "", interactive = false }
 
 export function shouldRenderVideo(asset, { playbackUrl = "", interactive = false } = {}) {
   if (asset?.type !== "video") return false;
-  if (asset?.origin === "uploaded") {
+  if (isStoredUserAsset(asset)) {
     const playableUrl = playbackUrl || asset.url || asset.hd_url || "";
     if (interactive) return Boolean(playableUrl);
     const posterOrPreview = asset.preview_url || asset.thumb || "";
@@ -136,12 +137,13 @@ export function canDownloadAsset(asset) {
   return Boolean(
     asset?.available !== false
     && !isAssetTakenDown(asset)
-    && (asset?.origin === "uploaded" || asset?.unlocked),
+    && (isStoredUserAsset(asset) || asset?.unlocked),
   );
 }
 
 export function assetPreviewLabel(asset) {
   if (isAssetTakenDown(asset)) return "素材已下架";
+  if (asset?.origin === "fetched") return "素材抓取 · 可用于创作";
   if (asset?.origin === "uploaded") return "我的上传 · 可用于创作";
   if (!asset?.unlocked) return "预览 · 带水印";
   return isPreviewVideoAsset(asset) ? "视频 · 可下载" : "预览 · 已解锁，可下载";
@@ -187,7 +189,7 @@ export default function AssetMedia({
     setImagePreviewUrl("");
     setError("");
     if (!interactive || !asset?.unlocked || isAssetTakenDown(asset)) return;
-    if (asset?.origin === "uploaded") return;
+    if (isStoredUserAsset(asset)) return;
     if (asset.type === "image" && asset.hd_url) {
       let objectUrl = "";
       assetDownloadObjectUrl(asset.id)

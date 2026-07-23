@@ -7,6 +7,7 @@ import {
   createQuoteConfirmationAction,
   endQuoteConfirmationExecution,
   executeQuoteActionAutomatically,
+  quoteConfirmationBusyResult,
   settleQuoteConfirmationAction,
 } from "../app/studio/quoteConfirmationAction.js";
 
@@ -37,6 +38,15 @@ assert.equal(settleQuoteConfirmationAction(action, { status: "executed" }), true
 assert.equal(settleQuoteConfirmationAction(action, { status: "executed-again" }), false);
 assert.deepEqual(settlements, [{ status: "executed" }], "one action promise settles exactly once");
 assert.equal(canInvalidateQuoteConfirmation(action), false);
+
+const busyResult = quoteConfirmationBusyResult();
+assert.equal(busyResult.status, "execution_failed");
+assert.match(busyResult.error.message, /已有操作正在提交/);
+assert.match(
+  hookSource,
+  /previous\?\.executing[\s\S]*quoteConfirmationBusyResult\(\)/,
+  "a concurrent paid action must return a visible error instead of being ignored",
+);
 
 assert.match(
   hookSource,

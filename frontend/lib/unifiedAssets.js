@@ -5,9 +5,15 @@ export function unifiedAssetKey(asset) {
   return String(asset.id ?? asset.url ?? asset.preview_url ?? "");
 }
 
+export function isStoredUserAsset(asset) {
+  return asset?.origin === "uploaded" || asset?.origin === "fetched";
+}
+
 export function normalizeUnifiedAsset(raw) {
   const asset = raw && typeof raw === "object" ? raw : {};
-  const origin = asset.origin === "uploaded" ? "uploaded" : "generated";
+  const origin = asset.origin === "fetched"
+    ? "fetched"
+    : asset.origin === "uploaded" ? "uploaded" : "generated";
   const preview = asset.preview_url || asset.thumb || asset.url || asset.hd_url || "";
   const original = asset.url || asset.hd_url || preview;
   const assetRef = String(
@@ -26,8 +32,8 @@ export function normalizeUnifiedAsset(raw) {
     url: original,
     thumb: asset.thumb || preview || null,
     preview_url: preview || null,
-    hd_url: origin === "uploaded" ? original : (asset.hd_url || null),
-    unlocked: origin === "uploaded" ? true : Boolean(asset.unlocked),
+    hd_url: origin !== "generated" ? original : (asset.hd_url || null),
+    unlocked: origin !== "generated" ? true : Boolean(asset.unlocked),
     available: asset.available !== false,
     favorite: Boolean(asset.favorite),
     retained: Boolean(asset.retained),

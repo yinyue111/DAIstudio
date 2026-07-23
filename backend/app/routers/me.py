@@ -119,7 +119,7 @@ def _asset_error(error: Exception) -> HTTPException:
 
 @router.get("/me/assets", response_model=UserAssetListOut)
 def list_me_assets(
-    origin: str = Query(default="all", pattern="^(all|generated|uploaded)$"),
+    origin: str = Query(default="all", pattern="^(all|generated|uploaded|fetched)$"),
     type: str = Query(default="all", pattern="^(all|image|video)$"),
     favorite: str | None = None,
     retention: str = Query(default="all", pattern="^(all|retained|expiring)$"),

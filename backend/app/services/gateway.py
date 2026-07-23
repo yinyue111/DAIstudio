@@ -38,6 +38,7 @@ from .gateway_mocks import mock_video as mock_video
 from .gateway_mocks import mock_video_preview_image as mock_video_preview_image
 from .gateway_prompting import ReverseResultValidationError
 from .gateway_prompting import _decode_json_object as _decode_reverse_json_object
+from .gateway_prompting import clean_visual_generation_clause as _clean_visual_generation_clause
 from .gateway_prompting import compose_visual_final_text as _compose_visual_final_text
 from .gateway_prompting import mock_reverse as _mock_reverse
 from .gateway_prompting import (
@@ -945,6 +946,7 @@ def _missing_required_video_frame_indices(
         int(index)
         for shot in payload.get("shots") or []
         if isinstance(shot, dict)
+        and _clean_visual_generation_clause(shot.get("visual"))
         for index in shot.get("evidence_frame_indices") or []
         if isinstance(index, int) and not isinstance(index, bool) and index > 0
     }
