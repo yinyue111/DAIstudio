@@ -18,6 +18,7 @@ REVERSE_VIDEO_PRESET_COSTS = {
     "fast": 5,
     "standard": 5,
     "fine": 5,
+    "ultra": 5,
 }
 REVERSE_AUDIO_SURCHARGE_COST = 2
 

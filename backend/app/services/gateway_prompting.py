@@ -792,7 +792,7 @@ class ReverseMissingVideoFrame(BaseModel):
 class ReverseMissingVideoFramesResult(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    frames: list[ReverseMissingVideoFrame] = Field(min_length=1, max_length=24)
+    frames: list[ReverseMissingVideoFrame] = Field(min_length=1, max_length=36)
 
 
 class _ReverseResultBase(BaseModel):

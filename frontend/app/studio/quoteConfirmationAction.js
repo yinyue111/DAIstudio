@@ -14,6 +14,13 @@ export function createQuoteConfirmationAction({
   };
 }
 
+export function quoteConfirmationBusyResult() {
+  return {
+    status: "execution_failed",
+    error: new Error("已有操作正在提交，请稍候再试。"),
+  };
+}
+
 export function beginQuoteConfirmationExecution(action) {
   if (!action || action.settled || action.executing) return false;
   action.executing = true;

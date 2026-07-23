@@ -12,6 +12,7 @@ import {
 } from "../lib/reverseOperations";
 
 const POLL_INTERVAL_MS = 1400;
+const WS_WATCHDOG_INTERVAL_MS = 5000;
 const MAX_WS_RECONNECTS = 2;
 
 function operationMode(operation, fallback = "image") {
@@ -138,7 +139,12 @@ export default function useReverseOperationTracking({
           return;
         }
       }
-      if (isCurrent()) tracker.timer = setTimeout(poll, POLL_INTERVAL_MS);
+      if (isCurrent()) {
+        tracker.timer = setTimeout(
+          poll,
+          tracker.polling ? POLL_INTERVAL_MS : WS_WATCHDOG_INTERVAL_MS,
+        );
+      }
     };
 
     const fallbackToPolling = () => {
@@ -146,6 +152,8 @@ export default function useReverseOperationTracking({
       tracker.polling = true;
       if (tracker.reconnectTimer) clearTimeout(tracker.reconnectTimer);
       tracker.reconnectTimer = null;
+      if (tracker.timer) clearTimeout(tracker.timer);
+      tracker.timer = null;
       if (tracker.ws) {
         const ws = tracker.ws;
         tracker.ws = null;
@@ -196,6 +204,7 @@ export default function useReverseOperationTracking({
       settle(initial, mode, context, trackingKey);
     } else {
       connect();
+      tracker.timer = setTimeout(poll, WS_WATCHDOG_INTERVAL_MS);
     }
     return Promise.resolve(initial);
   }, [publish, settle, stopTracker]);

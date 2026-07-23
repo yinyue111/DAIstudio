@@ -1,6 +1,6 @@
 """Video reverse-prompt analysis presets.
 
-The UI exposes three presets. The backend translates each preset and source
+The UI exposes four presets. The backend translates each preset and source
 duration into a concrete keyframe budget; billing uses one fixed reverse price
 rather than multiplying by the extracted frame count.
 """
@@ -18,14 +18,8 @@ class VideoAnalysisPreset:
     key: str
     label: str
     description: str
-    short_min_frames: int
-    short_max_frames: int
-    long_min_frames: int
-    long_max_frames: int
-
-    @property
-    def max_frames(self) -> int:
-        return self.long_max_frames
+    min_frames: int
+    max_frames: int
 
 
 VIDEO_ANALYSIS_PRESETS: dict[str, VideoAnalysisPreset] = {
@@ -33,28 +27,29 @@ VIDEO_ANALYSIS_PRESETS: dict[str, VideoAnalysisPreset] = {
         key="fast",
         label="快速",
         description="便宜、粗略",
-        short_min_frames=4,
-        short_max_frames=4,
-        long_min_frames=8,
-        long_max_frames=12,
+        min_frames=4,
+        max_frames=8,
     ),
     "standard": VideoAnalysisPreset(
         key="standard",
         label="标准",
         description="推荐默认",
-        short_min_frames=6,
-        short_max_frames=8,
-        long_min_frames=16,
-        long_max_frames=24,
+        min_frames=8,
+        max_frames=14,
     ),
     "fine": VideoAnalysisPreset(
         key="fine",
         label="精细",
         description="更接近原视频风格",
-        short_min_frames=10,
-        short_max_frames=12,
-        long_min_frames=24,
-        long_max_frames=36,
+        min_frames=14,
+        max_frames=22,
+    ),
+    "ultra": VideoAnalysisPreset(
+        key="ultra",
+        label="超精细",
+        description="高密度镜头与动作分析",
+        min_frames=22,
+        max_frames=36,
     ),
 }
 
@@ -79,26 +74,19 @@ def _interp(duration: float, start_s: float, end_s: float, start_n: int, end_n: 
 def frame_count_for_duration(duration_seconds: float | None, preset_key: str | None) -> int:
     """Return the target frame budget for a source duration.
 
-    Mapping follows the product rule:
-    - 5-15s: fast 4, standard 6-8, fine 10-12
-    - 2-5min: fast 8-12, standard 16-24, fine 24-36
-
-    Durations between 15s and 2min are smoothly interpolated to avoid jumps.
+    Videos up to 15 seconds use the preset minimum. Longer sources scale
+    smoothly to the preset maximum at five minutes.
     Unknown duration uses the preset maximum so extraction remains bounded.
     """
     preset = VIDEO_ANALYSIS_PRESETS[normalize_video_analysis_preset(preset_key)]
     if not duration_seconds or duration_seconds <= 0:
         return preset.max_frames
     duration = float(duration_seconds)
-    if duration <= 5:
-        return preset.short_min_frames
     if duration <= 15:
-        return _interp(duration, 5, 15, preset.short_min_frames, preset.short_max_frames)
-    if duration <= 120:
-        return _interp(duration, 15, 120, preset.short_max_frames, preset.long_min_frames)
+        return preset.min_frames
     if duration <= 300:
-        return _interp(duration, 120, 300, preset.long_min_frames, preset.long_max_frames)
-    return preset.long_max_frames
+        return _interp(duration, 15, 300, preset.min_frames, preset.max_frames)
+    return preset.max_frames
 
 
 def preset_options(vision_cost: int = 0, preset_costs: dict[str, int] | None = None) -> list[dict]:
@@ -109,16 +97,10 @@ def preset_options(vision_cost: int = 0, preset_costs: dict[str, int] | None = N
             "key": preset.key,
             "label": preset.label,
             "description": preset.description,
-            "short_range": (
-                f"{preset.short_min_frames}帧"
-                if preset.short_min_frames == preset.short_max_frames
-                else f"{preset.short_min_frames}-{preset.short_max_frames}帧"
-            ),
-            "long_range": (
-                f"{preset.long_min_frames}帧"
-                if preset.long_min_frames == preset.long_max_frames
-                else f"{preset.long_min_frames}-{preset.long_max_frames}帧"
-            ),
+            "frame_range": f"{preset.min_frames}-{preset.max_frames}帧",
+            # Keep both legacy fields until older clients have refreshed config.
+            "short_range": f"{preset.min_frames}-{preset.max_frames}帧",
+            "long_range": f"{preset.min_frames}-{preset.max_frames}帧",
             "max_frames": preset.max_frames,
             "max_cost": int(preset_costs[preset.key]),
         }

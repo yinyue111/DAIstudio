@@ -836,9 +836,8 @@ export default function Home() {
     productVideoTemplate,
   ]);
 
-  useEffect(() => {
-    workspacesRef.current = workspaces;
-  }, [workspaces]);
+  // Async decisions must compare against the workspace currently rendered to the user.
+  workspacesRef.current = workspaces;
 
   modelSelectionsRef.current = modelSelections;
 

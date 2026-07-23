@@ -123,6 +123,16 @@ assert.match(trackingSource, /reverseOperationWsTicket\(tracker\.id\)/);
 assert.match(trackingSource, /new WebSocket\(wsUrl\(/);
 assert.match(trackingSource, /ws\.onclose[\s\S]*fallbackToPolling\(\)/);
 assert.match(trackingSource, /tracker\.polling = true/);
+assert.match(
+  trackingSource,
+  /connect\(\);\s*tracker\.timer = setTimeout\(poll, WS_WATCHDOG_INTERVAL_MS\)/,
+  "a connected websocket must retain a low-frequency poll so missed terminal events cannot freeze the UI",
+);
+assert.match(
+  trackingSource,
+  /tracker\.polling \? POLL_INTERVAL_MS : WS_WATCHDOG_INTERVAL_MS/,
+  "websocket watchdog polling should stay slower than full fallback polling",
+);
 assert.doesNotMatch(
   trackingSource,
   /ws\.onopen\s*=\s*\(\)\s*=>\s*\{\s*tracker\.wsAttempts\s*=\s*0/,
