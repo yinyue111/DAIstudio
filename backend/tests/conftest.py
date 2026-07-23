@@ -18,6 +18,7 @@ os.environ["PAYMENT_CONFIG_SECRET"] = "test-payment-config-secret-32-bytes-min"
 os.environ["PUBLIC_BASE_URL"] = "http://localhost:8000"
 os.environ["PAYMENT_FRONTEND_BASE_URL"] = "http://localhost:3000"
 os.environ["STORAGE_DIR"] = tempfile.mkdtemp(prefix="storage_")
+os.environ["PRODUCT_EDITION"] = "full"
 
 import io  # noqa: E402
 import ipaddress  # noqa: E402
@@ -61,7 +62,7 @@ celery_app.conf.task_eager_propagates = True
 import pytest  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
-from app.db import SessionLocal  # noqa: E402
+from app.db import Base, SessionLocal, engine  # noqa: E402
 from app.main import app  # noqa: E402
 from app.models import PhoneWhitelist, User  # noqa: E402
 from app.security import hash_password  # noqa: E402
@@ -92,9 +93,15 @@ def mock_external_image_download(monkeypatch):
     )
 
 
+@pytest.fixture(scope="session", autouse=True)
+def create_test_schema():
+    Base.metadata.create_all(bind=engine)
+    yield
+
+
 @pytest.fixture()
 def client():
-    with TestClient(app) as c:  # triggers lifespan -> create_all + seed
+    with TestClient(app) as c:
         yield c
 
 
@@ -153,6 +160,118 @@ def quote_and_generate(client, quote_generation):
         quote = quote_generation(payload, headers=headers)
         return client.post(
             "/api/generate",
+            json={**payload, "quote_id": quote["quote_id"]},
+            headers=headers,
+        )
+
+    return _submit
+
+
+@pytest.fixture()
+def quote_reverse(client):
+    """Create a server-authoritative quote for one modern reverse operation."""
+    def _quote(payload, *, headers=None):
+        request_payload = dict(payload)
+        request_payload.pop("quote_id", None)
+        client_request_id = request_payload["client_request_id"]
+        response = client.post(
+            "/api/quotes",
+            json={
+                "kind": "reverse",
+                "client_request_id": client_request_id,
+                "request": request_payload,
+            },
+            headers=headers,
+        )
+        assert response.status_code == 201, response.text
+        return response.json()
+
+    return _quote
+
+
+@pytest.fixture()
+def quote_and_reverse(client, quote_reverse):
+    """Quote and submit one modern reverse operation."""
+    def _submit(payload, *, headers=None):
+        quote = quote_reverse(payload, headers=headers)
+        return client.post(
+            "/api/prompt/reverse-operations",
+            json={**payload, "quote_id": quote["quote_id"]},
+            headers=headers,
+        )
+
+    return _submit
+
+
+@pytest.fixture()
+def quote_reverse_batch(client):
+    """Create a server-authoritative quote for a reverse batch."""
+    def _quote(payload, *, headers=None):
+        request_payload = dict(payload)
+        request_payload.pop("quote_id", None)
+        client_request_id = request_payload["client_request_id"]
+        response = client.post(
+            "/api/quotes",
+            json={
+                "kind": "reverse_batch",
+                "client_request_id": client_request_id,
+                "request": request_payload,
+            },
+            headers=headers,
+        )
+        assert response.status_code == 201, response.text
+        return response.json()
+
+    return _quote
+
+
+@pytest.fixture()
+def quote_and_reverse_batch(client, quote_reverse_batch):
+    """Quote and submit a reverse batch."""
+    def _submit(payload, *, headers=None):
+        quote = quote_reverse_batch(payload, headers=headers)
+        return client.post(
+            "/api/prompt/reverse-batches",
+            json={**payload, "quote_id": quote["quote_id"]},
+            headers=headers,
+        )
+
+    return _submit
+
+
+@pytest.fixture()
+def quote_reverse_retry(client):
+    """Create the minimal source-bound quote required by reverse retry."""
+    def _quote(operation_id, payload, *, headers=None):
+        client_request_id = payload["client_request_id"]
+        request_payload = {
+            "reverse_operation_id": int(operation_id),
+            "client_request_id": client_request_id,
+        }
+        if payload.get("model_config_id") is not None:
+            request_payload["model_config_id"] = payload["model_config_id"]
+        response = client.post(
+            "/api/quotes",
+            json={
+                "kind": "reverse",
+                "client_request_id": client_request_id,
+                "request": request_payload,
+            },
+            headers=headers,
+        )
+        assert response.status_code == 201, response.text
+        return response.json()
+
+    return _quote
+
+
+@pytest.fixture()
+def quote_and_retry_reverse(client, quote_reverse_retry):
+    """Quote and submit a reverse retry while preserving its source binding."""
+    def _submit(operation_id, payload, *, headers=None):
+        quote = quote_reverse_retry(operation_id, payload, headers=headers)
+        return client.post(
+            f"/api/prompt/reverse-operations/{operation_id}/retry",
             json={**payload, "quote_id": quote["quote_id"]},
             headers=headers,
         )

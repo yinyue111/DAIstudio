@@ -1,3 +1,5 @@
+import base64
+import hashlib
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -18,22 +20,26 @@ from app.services import (
 )
 
 
-class _Model:
-    enabled = True
-    model_id = "gpt-5.5"
-    cost_credits = 0
+def _data_image_ref(payload: bytes, media_type: str = "image/jpeg") -> str:
+    encoded = base64.b64encode(payload).decode("ascii")
+    return f"data:{media_type};base64,{encoded}"
 
 
-def test_reverse_image_template_captures_commercial_material_dimensions():
+def _data_image_ref_with_hash(
+    payload: bytes,
+    media_type: str = "image/jpeg",
+) -> tuple[str, str]:
+    return _data_image_ref(payload, media_type), hashlib.sha256(payload).hexdigest()
+
+
+def test_reverse_image_template_is_compact_and_generation_focused():
     template = gateway_prompting.reverse_template("image")
 
-    assert "社媒商业素材复刻" in template
+    assert "商业图片复刻分析器" in template
     assert '"图像类型"' in template
-    assert '"反推重点"' in template
     assert "产品图" in template
     assert "人物图" in template
     assert "人物+产品混合图" in template
-    assert "按图像类型自动取舍" in template
     assert '"商品服装"' in template
     assert '"人像意图"' in template
     assert '"人物比例"' in template
@@ -42,28 +48,21 @@ def test_reverse_image_template_captures_commercial_material_dimensions():
     assert '"服装结构"' in template
     assert '"服装覆盖"' in template
     assert '"妆发五官"' in template
-    assert '"广告目标"' in template
     assert '"文字版式"' in template
     assert '"一致性约束"' in template
-    assert "头身比" in template
-    assert "服装覆盖范围" in template
     assert "商业人像" in template
-    assert "品牌 Lookbook" in template
-    assert "不得写三围尺寸" in template
-    assert "解剖比例与镜头透视畸变分开记录" in template
-    assert "不得默认写成纤细修长、7.5 头身或长颈" in template
-    assert "机位高度、主体距离、仰角" in template
-    assert "近镜前景放大" in template
-    assert "人物自身左/右" in template
-    assert "画面左/右" in template
-    assert "不得臆造婚纱蕾丝" in template
-    assert "不得臆造浅色隐形眼镜" in template
-    assert (
-        "姿态重心/整体轮廓/视角镜头 → 妆发五官/服装结构/服装覆盖 "
-        "→ 光线/材质纹理/后期质感"
-    ) in template
-    assert "控制在 180-300 个中文字符" in template
-    assert "不要写成普通美图描述" in template
+    assert "不写三围" in template
+    assert "控制在 80-140 个中文字符" in template
+    assert "可选字段直接省略" in template
+    assert "最多 8 条" in template
+    assert "通用质量修饰词" in template
+    assert '"反推重点"' not in template
+    assert '"广告目标"' not in template
+    assert '"平台质感"' not in template
+    assert '"标签"' not in template
+    assert "直接可见事实" not in template
+    assert "视觉估计" not in template
+    assert "高置信推断" not in template
     assert '"身材曲线"' not in template
     assert '"尺码三围"' not in template
     assert '"露肤度"' not in template
@@ -177,6 +176,35 @@ def test_video_reverse_cover_fallback_handles_sampler_exception(monkeypatch):
     assert analysis["sampled_frames"] == []
 
 
+def test_video_reverse_selection_error_never_falls_back_to_cover(monkeypatch):
+    monkeypatch.setattr(settings, "mock_mode", False)
+    monkeypatch.setattr(video_frames, "available", lambda: True)
+    monkeypatch.setattr(
+        video_frames,
+        "sample_video",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            video_frames.VideoSelectionError("视频分析片段结束时间超过素材时长")
+        ),
+    )
+    monkeypatch.setattr(prompt, "_gateway_ref", lambda *_args, **_kwargs: "resolved:cover")
+
+    with pytest.raises(HTTPException) as caught:
+        prompt._collect_refs(
+            ReverseIn(
+                asset_url="https://cdn.example.com/reference.mp4",
+                fallback_image="https://cdn.example.com/cover.jpg",
+                source_type="video",
+                target="video",
+            ),
+            db=object(),
+            user=User(id=1, phone="13800000000", status="active"),
+            gateway_mock=False,
+        )
+
+    assert caught.value.status_code == 422
+    assert "超过素材时长" in str(caught.value.detail)
+
+
 def test_video_reverse_local_cover_fallback_probes_source_when_sampler_returns_none(
     monkeypatch,
 ):
@@ -279,7 +307,11 @@ def test_video_reverse_local_upload_samples_frames_in_mock_mode(monkeypatch):
     assert refs == ["data:image/jpeg;base64,bG9jYWwtZnJhbWU="]
     assert analysis["analysis_mode"] == "keyframes"
     assert analysis["source"]["audio_analyzed"] is False
-    assert analysis["sampled_frames"] == [{"index": 1, "timestamp_seconds": 0.0}]
+    assert analysis["sampled_frames"] == [{
+        "index": 1,
+        "timestamp_seconds": 0.0,
+        "absolute_timestamp_seconds": 0.0,
+    }]
 
 
 @pytest.mark.parametrize("sampler_available", [False, True])
@@ -313,7 +345,6 @@ def test_video_reverse_cover_fallback_always_reports_degraded_analysis(
 
 
 def test_reverse_rejects_video_url_before_gateway(monkeypatch):
-    monkeypatch.setattr(prompt, "get_model_config", lambda db, use: _Model())
     monkeypatch.setattr(prompt, "_assert_text_allowed", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(
         gateway,
@@ -336,14 +367,16 @@ def test_reverse_source_type_video_uses_video_template_without_suffix(client, ma
     seen = {}
     uid = make_user("13800000011", balance=100)
 
-    monkeypatch.setattr(prompt, "get_model_config", lambda db, use: _Model())
     monkeypatch.setattr(prompt, "get_setting", lambda db, key, default=None: True)
     monkeypatch.setattr(prompt, "_assert_text_allowed", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(
         prompt,
         "_collect_refs",
         lambda *_args, **_kwargs: (
-            ["data:image/png;base64,frame-1", "data:image/png;base64,frame-2"],
+            [
+                _data_image_ref(b"frame-1", "image/png"),
+                _data_image_ref(b"frame-2", "image/png"),
+            ],
             {
                 "analysis_mode": "multi_frame",
                 "source": {"audio_analyzed": False},
@@ -354,7 +387,7 @@ def test_reverse_source_type_video_uses_video_template_without_suffix(client, ma
             },
         ),
     )
-    monkeypatch.setattr(prompt.usage, "record_call", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(reverse_operations.usage, "record_call", lambda *_args, **_kwargs: None)
 
     def fake_reverse(refs, model_id, target="image"):
         seen.update({"refs": refs, "model_id": model_id, "target": target})
@@ -380,8 +413,8 @@ def test_reverse_source_type_video_uses_video_template_without_suffix(client, ma
     assert out.final_text == "x"
     assert seen["target"] == "video"
     assert seen["refs"] == [
-        "data:image/png;base64,frame-1",
-        "data:image/png;base64,frame-2",
+        _data_image_ref(b"frame-1", "image/png"),
+        _data_image_ref(b"frame-2", "image/png"),
     ]
 
 
@@ -389,12 +422,14 @@ def test_reverse_product_profile_uses_single_image_ref(client, make_user, monkey
     seen = {}
     uid = make_user("13800000012", balance=100)
 
-    monkeypatch.setattr(prompt, "get_model_config", lambda db, use: _Model())
     monkeypatch.setattr(prompt, "get_setting", lambda db, key, default=None: True)
     monkeypatch.setattr(prompt, "_assert_text_allowed", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(prompt, "_gateway_ref", lambda db, user, url: "data:image/png;base64,product")
-    monkeypatch.setattr(prompt.credits, "consume", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(prompt.usage, "record_call", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        prompt,
+        "_gateway_ref_with_content_hash",
+        lambda db, user, url: _data_image_ref_with_hash(b"product", "image/png"),
+    )
+    monkeypatch.setattr(reverse_operations.usage, "record_call", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(reverse_operations, "_remember_history", lambda *_args, **_kwargs: None)
 
     def fake_reverse(refs, model_id, target="image"):
@@ -424,7 +459,7 @@ def test_reverse_product_profile_uses_single_image_ref(client, make_user, monkey
     assert out.reference_count == 1
     assert out.final_text.startswith("上传产品是唯一商品主角")
     assert seen["target"] == "product_profile"
-    assert seen["refs"] == ["data:image/png;base64,product"]
+    assert seen["refs"] == [_data_image_ref(b"product", "image/png")]
 
 
 def test_reverse_video_usage_cost_is_not_multiplied_by_frame_count(client, make_user, monkeypatch):
@@ -451,10 +486,10 @@ def test_reverse_video_usage_cost_is_not_multiplied_by_frame_count(client, make_
     monkeypatch.setattr(prompt, "_assert_text_allowed", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(prompt, "assert_safe_user_asset_url", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(prompt, "_collect_refs", lambda *_args, **_kwargs: [
-        "data:image/jpeg;base64,a",
-        "data:image/jpeg;base64,b",
-        "data:image/jpeg;base64,c",
-        "data:image/jpeg;base64,d",
+        _data_image_ref(b"frame-a"),
+        _data_image_ref(b"frame-b"),
+        _data_image_ref(b"frame-c"),
+        _data_image_ref(b"frame-d"),
     ])
     monkeypatch.setattr(
         gateway,
@@ -465,7 +500,7 @@ def test_reverse_video_usage_cost_is_not_multiplied_by_frame_count(client, make_
             "usage": {"total_tokens": 10},
         },
     )
-    monkeypatch.setattr(prompt.usage, "record_call", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(reverse_operations.usage, "record_call", lambda *_args, **_kwargs: None)
 
     db = SessionLocal()
     try:
@@ -489,7 +524,11 @@ def test_reverse_video_usage_cost_is_not_multiplied_by_frame_count(client, make_
 def test_reverse_blocks_unsafe_gateway_output_before_history(client, make_user, monkeypatch):
     uid = make_user("13800000004", balance=100)
     monkeypatch.setattr(prompt, "assert_safe_user_asset_url", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(prompt, "_collect_refs", lambda *_args, **_kwargs: ["data:image/jpeg;base64,a"])
+    monkeypatch.setattr(
+        prompt,
+        "_collect_refs",
+        lambda *_args, **_kwargs: [_data_image_ref(b"unsafe-output-source")],
+    )
     monkeypatch.setattr(
         gateway,
         "reverse_prompt",
@@ -558,7 +597,11 @@ def test_reverse_usage_metadata_does_not_override_fixed_image_price(client, make
     monkeypatch.setattr(prompt, "get_setting", lambda db, key, default=None: True)
     monkeypatch.setattr(prompt, "_assert_text_allowed", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(prompt, "assert_safe_user_asset_url", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(prompt, "_collect_refs", lambda *_args, **_kwargs: ["data:image/jpeg;base64,a"])
+    monkeypatch.setattr(
+        prompt,
+        "_collect_refs",
+        lambda *_args, **_kwargs: [_data_image_ref(b"fixed-price-source")],
+    )
     monkeypatch.setattr(
         gateway,
         "reverse_prompt",
@@ -590,7 +633,11 @@ def test_reverse_client_request_id_replays_without_double_charge(client, make_us
 
     monkeypatch.setattr(prompt, "assert_safe_user_asset_url", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(prompt, "_assert_text_allowed", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(prompt, "_collect_refs", lambda *_args, **_kwargs: ["data:image/jpeg;base64,a"])
+    monkeypatch.setattr(
+        prompt,
+        "_collect_refs",
+        lambda *_args, **_kwargs: [_data_image_ref(b"replay-source")],
+    )
 
     def fake_rate(*_args, **_kwargs):
         calls["rate"] += 1
@@ -606,7 +653,7 @@ def test_reverse_client_request_id_replays_without_double_charge(client, make_us
 
     monkeypatch.setattr(prompt, "incr_window", fake_rate)
     monkeypatch.setattr(gateway, "reverse_prompt", fake_reverse)
-    monkeypatch.setattr(prompt.usage, "record_call", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(reverse_operations.usage, "record_call", lambda *_args, **_kwargs: None)
     body = {
         "client_request_id": "reverse-retry-001",
         "asset_url": "https://cdn.example.com/a.jpg",
@@ -686,7 +733,11 @@ def test_reverse_empty_structured_result_fails_and_refunds_without_settlement(
 
     monkeypatch.setattr(prompt, "assert_safe_user_asset_url", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(prompt, "_assert_text_allowed", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(prompt, "_collect_refs", lambda *_args, **_kwargs: ["data:image/jpeg;base64,a"])
+    monkeypatch.setattr(
+        prompt,
+        "_collect_refs",
+        lambda *_args, **_kwargs: [_data_image_ref(b"empty-result-source")],
+    )
 
     def fake_reverse(*_args, **_kwargs):
         calls["gateway"] += 1
@@ -697,7 +748,7 @@ def test_reverse_empty_structured_result_fails_and_refunds_without_settlement(
         }
 
     monkeypatch.setattr(gateway, "reverse_prompt", fake_reverse)
-    monkeypatch.setattr(prompt.usage, "record_call", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(reverse_operations.usage, "record_call", lambda *_args, **_kwargs: None)
     body = {
         "client_request_id": "reverse-text-fallback-001",
         "asset_url": "https://cdn.example.com/fallback.jpg",
@@ -749,7 +800,7 @@ def test_reverse_without_client_request_id_persists_operation_and_uses_it_for_bi
     monkeypatch.setattr(
         prompt,
         "_collect_refs",
-        lambda *_args, **_kwargs: ["data:image/jpeg;base64,a"],
+        lambda *_args, **_kwargs: [_data_image_ref(b"no-request-id-source")],
     )
     monkeypatch.setattr(
         gateway,
@@ -760,7 +811,7 @@ def test_reverse_without_client_request_id_persists_operation_and_uses_it_for_bi
             "usage": {"total_tokens": 10},
         },
     )
-    monkeypatch.setattr(prompt.usage, "record_call", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(reverse_operations.usage, "record_call", lambda *_args, **_kwargs: None)
 
     response = client.post(
         "/api/prompt/reverse",
@@ -798,7 +849,11 @@ def test_reverse_client_request_id_rejects_different_payload(client, make_user, 
     headers = auth("13800000006")
     monkeypatch.setattr(prompt, "assert_safe_user_asset_url", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(prompt, "_assert_text_allowed", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(prompt, "_collect_refs", lambda *_args, **_kwargs: ["data:image/jpeg;base64,a"])
+    monkeypatch.setattr(
+        prompt,
+        "_collect_refs",
+        lambda *_args, **_kwargs: [_data_image_ref(b"conflict-source")],
+    )
     monkeypatch.setattr(
         gateway,
         "reverse_prompt",
@@ -808,7 +863,7 @@ def test_reverse_client_request_id_rejects_different_payload(client, make_user, 
             "usage": {"total_tokens": 10},
         },
     )
-    monkeypatch.setattr(prompt.usage, "record_call", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(reverse_operations.usage, "record_call", lambda *_args, **_kwargs: None)
 
     body = {
         "client_request_id": "reverse-retry-002",
@@ -830,13 +885,17 @@ def test_reverse_http_exception_refunds_and_marks_operation_failed(client, make_
     headers = auth("13800000007")
     monkeypatch.setattr(prompt, "assert_safe_user_asset_url", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(prompt, "_assert_text_allowed", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(prompt, "_collect_refs", lambda *_args, **_kwargs: ["data:image/jpeg;base64,a"])
+    monkeypatch.setattr(
+        prompt,
+        "_collect_refs",
+        lambda *_args, **_kwargs: [_data_image_ref(b"provider-error-source")],
+    )
     monkeypatch.setattr(
         gateway,
         "reverse_prompt",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(HTTPException(502, "provider rejected")),
     )
-    monkeypatch.setattr(prompt.usage, "record_call", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(reverse_operations.usage, "record_call", lambda *_args, **_kwargs: None)
 
     body = {
         "client_request_id": "reverse-retry-003",
@@ -868,8 +927,12 @@ def test_reverse_completion_cannot_overwrite_stale_refund(client, make_user, aut
     headers = auth("13800000009")
     monkeypatch.setattr(prompt, "assert_safe_user_asset_url", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(prompt, "_assert_text_allowed", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(prompt, "_collect_refs", lambda *_args, **_kwargs: ["data:image/jpeg;base64,a"])
-    monkeypatch.setattr(prompt.usage, "record_call", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        prompt,
+        "_collect_refs",
+        lambda *_args, **_kwargs: [_data_image_ref(b"race-refund-source")],
+    )
+    monkeypatch.setattr(reverse_operations.usage, "record_call", lambda *_args, **_kwargs: None)
 
     def reverse_after_reaper(*_args, **_kwargs):
         reaper_db = SessionLocal()

@@ -188,8 +188,8 @@ assert.match(
 );
 assert.match(
   pageSource,
-  /async function unlock[\s\S]*?\.capture\(\)[\s\S]*?await api\.unlock[\s\S]*?ownerRequest\.commit/,
-  "asset unlock must capture the owner before awaiting and commit through the shared guard",
+  /async function unlock[\s\S]*?\.capture\(\)[\s\S]*?await requestQuoteConfirmation[\s\S]*?ownerRequest\.isCurrent\(\)[\s\S]*?api\.unlock[\s\S]*?ownerRequest\.commit/,
+  "asset unlock must capture the owner before quote confirmation and commit through the shared guard",
 );
 assert.match(
   pageSource,
@@ -1156,8 +1156,8 @@ assert.match(
 );
 assert.match(
   pageSource,
-  /if \(promptTransferApplied\) \{[\s\S]*?}\s*removeStudioUserDraft\(window\.localStorage, STUDIO_DRAFT_PROMPT_KEY, u\?\.id\);/,
-  "the one-shot prompt intent should be consumed after its guarded apply attempt",
+  /const checkpoint = buildStudioSessionDraftFromState\([\s\S]*?saveStudioUserDraft\([\s\S]*?STUDIO_SESSION_DRAFT_KEY[\s\S]*?if \(checkpointSaved\) \{[\s\S]*?removeStudioUserDraft\(window\.localStorage, STUDIO_DRAFT_PROMPT_KEY, u\?\.id\);/,
+  "the one-shot prompt intent should only be consumed after its adopted state is checkpointed",
 );
 assert.match(
   pageSource,

@@ -37,7 +37,7 @@ async function openStudio(page) {
 async function expectPromptOptimizerOnly(page) {
   await expect(page.getByLabel("优化模型", { exact: true })).toBeVisible();
   await expect(page.getByLabel(/优化模型消耗 单次 \d+ 积分/)).toBeVisible();
-  await expect(page.getByRole("button", { name: /优化提示词/ })).toBeVisible();
+  await expect(page.getByRole("button", { name: "生成优化建议" })).toBeVisible();
   await expect(page.getByRole("button", { name: "提示词库", exact: true })).toHaveCount(0);
   for (const preset of [
     "赛博朋克城市夜景",
@@ -74,6 +74,7 @@ async function uploadImageReference(page) {
 async function startImageReverse(page) {
   await uploadImageReference(page);
   await page.getByRole("button", { name: /反推提示词.*2积分/ }).click();
+  await expect(page.getByText("服务端权威报价", { exact: true })).toHaveCount(0);
 }
 
 test("图片反推成功，WebSocket 失败后轮询，并拦截结构化冲突", async ({ page }) => {
@@ -83,25 +84,43 @@ test("图片反推成功，WebSocket 失败后轮询，并拦截结构化冲突"
   await startImageReverse(page);
 
   await expect(page.getByText("反推完成，已结算 2 积分")).toBeVisible();
-  await expect(page.getByRole("button", { name: /反推维度/ })).toBeVisible();
+  const structureTab = page.getByRole("tab", { name: "结构参数" });
+  await expect(structureTab).toBeVisible();
   await expect.poll(() => mock.wsTicketRequests).toBeGreaterThan(0);
   await expect.poll(() => mock.operationReads).toBeGreaterThan(0);
+  expect(mock.quoteRequests).toHaveLength(1);
+  expect(mock.quoteRequests[0].kind).toBe("reverse");
+  expect(mock.quoteRequests[0].request.model_config_id).toBe(12);
+  expect(mock.quoteRequests[0].request.workspace_snapshot_v3.version).toBe(3);
   expect(mock.createBodies).toHaveLength(1);
   expect(mock.createBodies[0].model_config_id).toBe(12);
+  expect(mock.createBodies[0].quote_id).toBe(5001);
   expect(mock.createBodies[0].client_request_id).toMatch(/^studio-reverse-image-/);
-  expect(mock.createBodies[0].workspace_snapshot_v2.version).toBe(2);
+  expect(mock.createBodies[0].workspace_snapshot_v3.version).toBe(3);
 
+  await structureTab.click();
+  await page.getByRole("tabpanel").getByRole("textbox", { name: "主体", exact: true })
+    .fill("改后的 E2E 主体");
+  await expect(page.getByText("7/7", { exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "替换当前" }).click();
+  await expect(page.getByText("反推结果已应用，可随时撤销本次字段变更。")).toBeVisible();
+  expect(mock.applyBodies).toHaveLength(1);
+
+  await page.getByRole("tab", { name: "生成稿" }).click();
+  const dimensionsToggle = page.getByRole("button", { name: /反推维度/ });
+  await expect(dimensionsToggle).toBeVisible();
+  const subjectField = page.locator("label").filter({ hasText: /^主体$/ }).locator("xpath=following-sibling::input");
+  if (!await subjectField.isVisible()) await dimensionsToggle.click();
   const prompt = page.getByPlaceholder(/描述你想要的画面/);
   await prompt.fill("用户手工改写的提示词");
-  const subjectField = page.locator("label").filter({ hasText: /^主体$/ }).locator("xpath=following-sibling::input");
-  await subjectField.fill("改后的 E2E 主体");
+  await subjectField.fill("二次修改的 E2E 主体");
 
   const conflict = page.getByRole("alert").filter({ hasText: "提示词已手工修改" });
   await expect(conflict).toBeVisible();
   await expect(page.getByRole("button", { name: /立即生成/ })).toBeDisabled();
   await conflict.getByRole("button", { name: "应用结构修改" }).click();
   await expect(conflict).toBeHidden();
-  await expect(prompt).toHaveValue(/改后的 E2E 主体/);
+  await expect(prompt).toHaveValue(/二次修改的 E2E 主体/);
   await expect(page.getByRole("button", { name: /立即生成/ })).toBeEnabled();
 });
 
@@ -136,19 +155,63 @@ test("四种创作模式仅保留提示词优化控件，不展示预制提示�
   await expectAllStudioModesWithoutPresets(page);
 });
 
+test("提示词优化静默校验计费并直接生成建议", async ({ page }) => {
+  const mock = await installReverseApiMock(page, { scenario: "image_success" });
+  await openStudio(page);
+
+  await page.getByPlaceholder(/描述你想要的画面/).fill("玻璃杯产品广告，柔和侧光");
+  await page.getByRole("button", { name: "生成优化建议", exact: true }).click();
+
+  await expect(page.getByRole("dialog", { name: "确认提示词优化" })).toHaveCount(0);
+  await expect(page.getByText("优化建议已生成，请对比后选择接受或拒绝。")).toBeVisible();
+  await expect(page.getByText("E2E 目标模型编译稿", { exact: true })).toBeVisible();
+  expect(mock.quoteRequests).toHaveLength(1);
+  expect(mock.quoteRequests[0].kind).toBe("prompt_optimization");
+  expect(mock.promptOptimizationBodies).toHaveLength(1);
+  expect(mock.promptOptimizationBodies[0].quote_id).toBe(5001);
+});
+
+test("目标模型编译预览展示处理动作、字段和警告说明", async ({ page }) => {
+  const mock = await installReverseApiMock(page, { scenario: "image_success" });
+  await openStudio(page);
+
+  await page.getByPlaceholder(/描述你想要的画面/).fill("品牌杯子广告，包含运镜和旁白");
+  await page.getByLabel("提示词优化方向").selectOption("target_model_adaptation");
+  await page.getByRole("button", { name: "编译到当前模型" }).click();
+
+  const warnings = page.getByRole("list", { name: "优化风险提示" });
+  await expect(warnings).toBeVisible();
+  await expect(warnings.getByText("已丢弃", { exact: true })).toBeVisible();
+  await expect(warnings.getByText("字段：audio.voiceover", { exact: true })).toBeVisible();
+  await expect(warnings.getByText("当前图片模型不接收旁白轨。", { exact: true })).toBeVisible();
+  await expect(warnings.getByText("已转换", { exact: true })).toBeVisible();
+  await expect(warnings.getByText("字段：structured.camera", { exact: true })).toBeVisible();
+  await expect(warnings.getByText("未验证", { exact: true })).toBeVisible();
+  await expect(warnings.getByText("字段：protected.brand_text", { exact: true })).toBeVisible();
+  expect(mock.promptOptimizationBodies).toHaveLength(1);
+  expect(mock.promptOptimizationBodies[0].mode).toBe("target_model_adaptation");
+});
+
 test("正常多帧视频反推展示采样、证据覆盖和分析缺口", async ({ page }) => {
   const mock = await installReverseApiMock(page, { scenario: "video_success" });
   await openStudio(page);
   await page.getByRole("button", { name: /文生视频/ }).click();
   await page.locator('input[type="file"][accept*="video/mp4"]').setInputFiles(VIDEO_FILE);
   await page.getByRole("button", { name: /反推提示词.*18积分/ }).click();
+  await expect(page.getByText("服务端权威报价", { exact: true })).toHaveCount(0);
 
   await expect(page.getByText("反推完成，已结算 18 积分（3 帧）")).toBeVisible();
-  await expect(page.getByText("多帧分析", { exact: true })).toBeVisible();
-  await expect(page.getByText("采样 0.0s / 3.5s / 7.0s", { exact: true })).toBeVisible();
-  await expect(page.getByText("证据覆盖 0.0s - 7.0s", { exact: true })).toBeVisible();
-  await expect(page.getByText("分析缺口：7.0s - 8.0s 未覆盖", { exact: true })).toBeVisible();
-  await expect(page.getByText(/音频未分析：旁白、音效和镜头音频提示不会自动补写/)).toBeVisible();
+  await page.getByRole("tab", { name: "分析证据" }).click();
+  const evidencePanel = page.getByRole("tabpanel");
+  await expect(evidencePanel.getByText("分析模式 多帧分析", { exact: true })).toBeVisible();
+  await expect(evidencePanel.getByText("采样时间", { exact: true })).toBeVisible();
+  await expect(evidencePanel.getByText("0.00s", { exact: true })).toBeVisible();
+  await expect(evidencePanel.getByText("3.50s", { exact: true })).toBeVisible();
+  await expect(evidencePanel.getByText("7.00s", { exact: true })).toBeVisible();
+  await expect(evidencePanel.getByText(/视觉证据覆盖 7\.00\/8\.00s（88%）/)).toBeVisible();
+  await expect(evidencePanel.getByText(/证据缺口：1 个选区尚无可验证分镜证据/)).toBeVisible();
+  await expect(evidencePanel.getByText("- 7.00-8.00s 未覆盖", { exact: true })).toBeVisible();
+  await expect(evidencePanel.getByText("ASR · 未请求", { exact: true })).toBeVisible();
   expect(mock.createBodies).toHaveLength(1);
   expect(mock.createBodies[0].target).toBe("video");
   expect(mock.createBodies[0].video_analysis_preset).toBe("standard");
@@ -175,10 +238,16 @@ test("刷新后从 V2 草稿和活动任务恢复进度并继续结算", async (
   await expect.poll(() => mock.draftWrites, { timeout: 10_000 }).toBeGreaterThan(0);
   await uploadImageReference(page);
   await expect.poll(
-    () => mock.draftPayload?.workspaces?.image?.selected?.id || null,
+    () => mock.draftPayloads.some((draft) => draft?.workspaces?.image?.selected?.id === 7001),
     { timeout: 10_000 },
+  ).toBe(true);
+  await expect.poll(
+    () => mock.draftPayload?.workspaces?.image?.selected?.id || null,
+    { timeout: 5_000 },
   ).toBe(7001);
+  await expect(page.getByRole("button", { name: /image$/ })).toBeVisible();
   await page.getByRole("button", { name: /反推提示词.*2积分/ }).click();
+  await expect(page.getByText("服务端权威报价", { exact: true })).toHaveCount(0);
   await expect(page.getByText("E2E 后台分析")).toBeVisible();
   await expect.poll(() => page.evaluate(() => {
     const raw = window.localStorage.getItem("studio_session_draft_v1:user:9001");
@@ -222,6 +291,7 @@ test.describe("移动端", () => {
     await page.getByRole("button", { name: /文生视频/ }).click();
     await page.locator('input[type="file"][accept*="video/mp4"]').setInputFiles(VIDEO_FILE);
     await page.getByRole("button", { name: /反推提示词.*18积分/ }).click();
+    await expect(page.getByText("服务端权威报价", { exact: true })).toHaveCount(0);
 
     const confirmation = page.getByRole("alert").filter({ hasText: "视频抽帧失败" });
     await expect(confirmation).toBeVisible();
@@ -230,8 +300,15 @@ test.describe("移动端", () => {
     await confirmation.getByRole("button", { name: "使用封面分析" }).click();
 
     await expect(page.getByText("反推完成，已结算 2 积分")).toBeVisible();
-    await expect(page.getByText("封面单帧", { exact: true })).toBeVisible();
-    await expect(page.getByText(/音频未分析/)).toBeVisible();
+    await page.getByRole("tab", { name: "分析证据" }).click();
+    const evidencePanel = page.getByRole("tabpanel");
+    await expect(evidencePanel.getByText("分析模式 封面单帧", { exact: true })).toBeVisible();
+    await expect(evidencePanel.getByText("降级原因：抽帧失败，已经用户确认使用封面", { exact: true })).toBeVisible();
+    await expect(evidencePanel.getByText("采样时间", { exact: true })).toBeVisible();
+    await expect(evidencePanel.getByText("0.00s", { exact: true })).toBeVisible();
+    await expect(evidencePanel.getByText(/视觉证据覆盖 0\.00\/5\.00s（0%）/)).toBeVisible();
+    await expect(evidencePanel.getByText(/证据缺口/).first()).toBeVisible();
+    await expect(evidencePanel.getByText("ASR · 未请求", { exact: true })).toBeVisible();
     expect(mock.confirmRequests).toBe(1);
     expect(mock.operation?.cost_settled).toBe(2);
   });

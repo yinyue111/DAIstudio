@@ -24,8 +24,8 @@
 | 异步任务 | Celery、Redis |
 | 数据库 | PostgreSQL |
 | 链接抓取 | Playwright、httpx、BeautifulSoup |
-| 视频分析 | ffmpeg 关键帧抽取 |
-| 存储 | 本地文件系统，已通过服务层封装，后续可替换 OSS/MinIO |
+| 图片/视频分析 | ffmpeg、Tesseract、可选自托管检测/分割、视频语义和 Faster-Whisper ASR |
+| 存储 | 本地文件系统或 S3/MinIO，通过统一存储服务和签名访问 |
 | 部署 | Docker Compose、Nginx 反向代理 |
 
 ## 业务流程
@@ -57,6 +57,9 @@
 │   ├── app/                 # 页面与组件
 │   ├── components/          # 公共组件
 │   └── lib/                 # API 客户端
+├── evidence_provider/       # 可选图片检测/分割服务
+├── video_semantic_provider/ # 可选视频运动区域和视觉转场服务
+├── audio_provider/          # 可选 Faster-Whisper ASR 服务
 ├── deploy/nginx/            # dream.aiwuq.cn Nginx 模板
 ├── docs/security/           # 发布安全和密钥轮换 Runbook
 ├── scripts/                 # 初始化、启动、发布检查脚本
@@ -198,9 +201,44 @@ ADMIN_PASSWORD='<strong-admin-password>' docker compose run --rm -e ADMIN_PASSWO
   python -m scripts.init_db --admin-phone 13800000000 --credits 1000
 ```
 
-### 3. Worker 队列
+### 3. 可选证据分析服务
 
-Docker Compose 默认拆成四类 Worker，避免长任务把支付、清理和视频轮询饿死：
+需要证据化图片/视频反推时，先在 `backend/.env.production` 配置三个私网
+provider 的 URL 和同名 Bearer key，再启用可选 `evidence` profile：
+
+```env
+IMAGE_EVIDENCE_DETECTOR_URL=http://evidence_provider:8090/v1/region/analyze
+IMAGE_EVIDENCE_DETECTOR_HEALTH_URL=http://evidence_provider:8090/health/detector
+IMAGE_EVIDENCE_DETECTOR_API_KEY=<image-provider-key>
+IMAGE_EVIDENCE_SEGMENTER_URL=http://evidence_provider:8090/v1/region/analyze
+IMAGE_EVIDENCE_SEGMENTER_HEALTH_URL=http://evidence_provider:8090/health/segmenter
+IMAGE_EVIDENCE_SEGMENTER_API_KEY=<image-provider-key>
+VIDEO_EVIDENCE_SEMANTIC_URL=http://video_semantic_provider:8091/v1/video-semantic/analyze
+VIDEO_EVIDENCE_SEMANTIC_HEALTH_URL=http://video_semantic_provider:8091/health
+VIDEO_EVIDENCE_SEMANTIC_API_KEY=<video-provider-key>
+AUDIO_GATEWAY_ENABLED=true
+AUDIO_GATEWAY_BASE_URL=http://audio_provider:8092
+AUDIO_GATEWAY_HEALTH_URL=http://audio_provider:8092/health
+AUDIO_GATEWAY_API_KEY=<audio-provider-key>
+AUDIO_TRANSCRIPTION_MODEL=small
+TRUSTED_ANALYZER_HOSTS=evidence_provider,video_semantic_provider,audio_provider
+```
+
+```bash
+EVIDENCE_PROVIDER_API_KEY='<image-provider-key>' \
+VIDEO_SEMANTIC_PROVIDER_API_KEY='<video-provider-key>' \
+ASR_PROVIDER_API_KEY='<audio-provider-key>' \
+docker compose --profile evidence up -d --build
+```
+
+三个 provider 只绑定宿主机 `127.0.0.1`，通过 `backend_internal` 接受 API/
+worker 调用，并使用独立 `analyzer_edge` 提供本机运维探针，不与前端网络共享。
+当前自托管视频语义服务只提供运动区域和视觉突变，说话人、姿态和动作能力
+会明确返回 `unsupported`，不会由普通文案伪装成分析证据。
+
+### 4. Worker 队列
+
+Docker Compose 默认按工作负载拆分 Worker，避免长任务把支付、清理和视频轮询饿死：
 
 ```text
 worker        default,payment,video_poll,cleanup
@@ -209,6 +247,7 @@ worker_video  video_submit
 worker_video_download  video_download
 worker_parse  parse
 worker_reverse  reverse
+worker_workflow  workflow
 ```
 
 `make run-worker` 本地默认仍可消费全部队列，方便开发；生产裸机部署可以用 `WORKER_ROLE` 直接拆：
@@ -220,6 +259,7 @@ WORKER_ROLE=video-submit ./scripts/run_worker.sh
 WORKER_ROLE=video-download ./scripts/run_worker.sh
 WORKER_ROLE=parse ./scripts/run_worker.sh
 WORKER_ROLE=reverse ./scripts/run_worker.sh
+WORKER_ROLE=workflow ./scripts/run_worker.sh
 ```
 
 `WORKER_ROLE=video` 仍作为本地兼容别名存在，但会同时消费 `video_submit,video_download`，生产不建议使用。特殊场景仍可直接覆盖 `WORKER_QUEUES`。需要兼容 macOS fork 调试时，可显式设置 `WORKER_POOL=solo WORKER_CONCURRENCY=1`，但这会让对应 worker 串行执行。`beat` 服务只能保留一个实例，负责支付对账、卡死任务回收、视频轮询恢复和清理任务。
@@ -270,11 +310,14 @@ deploy/nginx/dream.aiwuq.cn.conf
 图片和视频生成时间较长，相关超时在 `backend/.env.example` 中已拆分：
 
 ```env
-REVERSE_GATEWAY_TIMEOUT_SECONDS=150
+REVERSE_GATEWAY_TIMEOUT_SECONDS=240
+REVERSE_GATEWAY_MAX_RETRIES=0
+REVERSE_GATEWAY_MAX_TOKENS=4096
+REVERSE_GATEWAY_REASONING_EFFORT=low
 IMAGE_GATEWAY_TIMEOUT_SECONDS=600
 IMAGE_DOWNLOAD_TIMEOUT_SECONDS=600
 VIDEO_SUBMIT_TIMEOUT_SECONDS=300
-VIDEO_POLL_MAX_SECONDS=7200
+VIDEO_POLL_MAX_SECONDS=600
 VIDEO_DOWNLOAD_TIMEOUT_SECONDS=3600
 ```
 
@@ -370,7 +413,7 @@ Docker Compose 部署时，在线升级配置同样写在 `backend/.env.producti
 
 1. `ONLINE_UPDATE_REPO_DIR` 指向宿主机真实 checkout 的挂载目录。
 2. `ONLINE_UPDATE_APPLY_COMMAND` 指向一个不会直接重启 API 的固定命令，例如写入一个队列文件、调用宿主机 systemd oneshot、或通知外部 supervisor。
-3. 宿主机 oneshot/supervisor 再执行 `docker compose up -d --build migrate api worker worker_image worker_video worker_video_download worker_parse worker_reverse beat frontend`。
+3. 宿主机 oneshot/supervisor 再执行 `docker compose up -d --build migrate api worker worker_image worker_video worker_video_download worker_parse worker_reverse worker_workflow beat frontend`。
 4. 重启完成后先用 `https://dream.aiwuq.cn/api/live` 确认进程存活，再用 `https://dream.aiwuq.cn/api/ready` 确认 DB/Redis 就绪，最后检查容器状态和后台版本页。
 
 提示词反推异步化版本必须按以下顺序发布，不能把 API 或前端先于数据库迁移上线：
@@ -466,9 +509,10 @@ SMS_TEMPLATE_CODE=<your-template-code>
 | `REDIS_SOCKET_CONNECT_TIMEOUT_SECONDS` / `REDIS_SOCKET_TIMEOUT_SECONDS` | Redis 连接和读写超时 |
 | `JWT_SECRET` | 登录态签名密钥，生产必须强随机 |
 | `PUBLIC_BASE_URL` | 后端公开访问地址，用于媒体 URL |
-| `STORAGE_BACKEND` | 媒体存储后端，当前版本仅支持 `local`；S3/MinIO 配置为预留骨架，运行时会拒绝启用 |
-| `STORAGE_S3_ENDPOINT_URL` / `STORAGE_S3_BUCKET` | 预留的 S3/MinIO endpoint 与 bucket，当前不要启用 |
-| `STORAGE_S3_PUBLIC_BASE_URL` | 预留的对象存储公开访问前缀，当前不要启用 |
+| `STORAGE_BACKEND` | 媒体存储后端：`local` 或 S3/MinIO 兼容的 `s3` |
+| `STORAGE_MIRROR_LOCAL` | S3 灰度期同时保留新对象的本地镜像，便于回滚 |
+| `STORAGE_S3_ENDPOINT_URL` / `STORAGE_S3_BUCKET` | S3/MinIO endpoint 与 bucket；AWS S3 可留空 endpoint |
+| `STORAGE_S3_PUBLIC_BASE_URL` | 对象存储或 CDN 的媒体访问前缀；生产必须 HTTPS |
 | `CORS_ORIGINS` | 前端允许来源 |
 | `TRUSTED_PROXY_IPS` | 可传递 `X-Forwarded-For` 的反代 IP |
 | `GATEWAY_BASE_URL` / `GATEWAY_API_KEY` | OpenAI 兼容模型网关兜底配置 |
@@ -502,6 +546,37 @@ SMS_TEMPLATE_CODE=<your-template-code>
 
 完整配置见 `backend/.env.example`。
 
+### 本地媒体迁移到 S3/MinIO
+
+迁移脚本保持原有对象 key，默认只演练且永不删除本地文件。推荐先配置
+`STORAGE_BACKEND=s3`、bucket 和访问凭据，并在灰度期启用
+`STORAGE_MIRROR_LOCAL=true`：
+
+```bash
+cd backend
+
+# 1. 只列出待迁移对象，不写入远端
+.venv/bin/python -m scripts.migrate_media_storage
+
+# 2. 上传并逐对象下载计算 SHA-256 校验
+.venv/bin/python -m scripts.migrate_media_storage --execute --verify sha256
+
+# 3. 服务切流前再次只校验，不重复上传
+.venv/bin/python -m scripts.migrate_media_storage --verify-only --verify sha256
+
+# 4. 可选：只安装终止残留分片的非破坏性生命周期规则
+.venv/bin/python -m scripts.migrate_media_storage \
+  --verify-only --verify sha256 --configure-lifecycle --execute
+```
+
+如果远端已有同 key 但大小不同，脚本会失败而不是覆盖；确认以本地副本为准时才使用
+`--overwrite`。灰度期不要清理 `STORAGE_DIR`。回滚时停止写入后将
+`STORAGE_BACKEND` 改回 `local` 并重启 API/Worker，原 URL 和对象 key 无需修改。
+
+完整备份、逐对象校验、非生产恢复演练和 S3/MinIO 恢复命令见
+`docs/storage-backup-recovery-runbook.md`。备份中的媒体包不再依赖本地镜像：
+`STORAGE_BACKEND=s3` 时会直接遍历 bucket 中的稳定对象 key，生成带 SHA-256 清单的快照。
+
 ## 测试与发布检查
 
 常用质量门禁：
@@ -515,6 +590,7 @@ make build-frontend
 make alembic-check
 make compose-check
 make release-check-worktree
+make release-source-worktree
 ```
 
 发布源码包：

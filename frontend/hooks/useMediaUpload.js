@@ -107,6 +107,7 @@ export default function useMediaUpload({
   subjectMode = "",
   productAsset = null,
   productDetailAssets = [],
+  productDetailLimit = MAX_PRODUCT_DETAIL_IMAGES,
   visionModelConfigId = null,
   uploading,
   setMsg,
@@ -125,12 +126,14 @@ export default function useMediaUpload({
   profileOperation = null,
   cancelRecoveredProfileOperation = null,
   trackProfileReverseOperation = null,
+  requestQuoteConfirmation = null,
 }) {
   const uploadRequestRef = useRef({});
   const productUploadRequestRef = useRef({});
   const imageUploadInputRef = useRef(null);
   const productUploadInputRef = useRef(null);
   const productDetailUploadInputRef = useRef(null);
+  const lastFrameUploadInputRef = useRef(null);
   const videoUploadInputRef = useRef(null);
   const objectUrlsByModeRef = useRef({});
   const productObjectUrlsRef = useRef({});
@@ -223,7 +226,9 @@ export default function useMediaUpload({
   async function prefetchProductProfile(mode, asset, uploadReqId, ownerRequest) {
     const profileSubjectMode = creationMode === "video" ? "product" : subjectMode;
     if (
-      (!isEditMode && creationMode !== "video")
+      !ownerRequest.isCurrent()
+      || !isRequestCurrent(productUploadRequestRef, mode, uploadReqId)
+      || (!isEditMode && creationMode !== "video")
       || !asset?.url
       || !["product", "portrait"].includes(profileSubjectMode)
     ) return;
@@ -252,7 +257,7 @@ export default function useMediaUpload({
       profileAbortControllersRef.current[mode]?.abort();
       profileAbortControllersRef.current[mode] = profileAbortController;
       const profileTarget = profileSubjectMode === "portrait" ? "portrait_profile" : "product_profile";
-      const createdOperation = normalizeReverseOperation(await api.createReverseOperation({
+      const profileRequest = {
         asset_url: asset.url,
         target: profileTarget,
         source_type: "image",
@@ -268,7 +273,36 @@ export default function useMediaUpload({
           source_signature: signature,
           ...(visionModelConfigId ? { model_config_id: Number(visionModelConfigId) } : {}),
         },
-      }));
+      };
+      if (typeof requestQuoteConfirmation !== "function") {
+        throw new Error("主体识别服务不可用，本次未识别主体档案。");
+      }
+      const profileConfirmation = await requestQuoteConfirmation({
+        kind: "reverse",
+        request: profileRequest,
+        clientRequestId: profileRequestId,
+        execute: ({ request }) => api.createReverseOperation(request),
+      });
+      if (profileConfirmation.status !== "executed") {
+        clearPendingReverseRequest(pendingProfileReverseRequestRef, profileRequestId);
+        setWorkspacePatch({
+          productProfile: null,
+          productProfileSource: "",
+          portraitProfile: null,
+          portraitProfileSource: "",
+          productProfiling: false,
+          profileOperation: null,
+        }, mode);
+        delete profileAbortControllersRef.current[mode];
+        if (["quote_failed", "execution_failed"].includes(profileConfirmation.status)) {
+          throw profileConfirmation.error || new Error("主体档案提交失败。");
+        }
+        if (profileConfirmation.status === "invalidated" && isModeVisible(mode)) {
+          setMsg(profileConfirmation.reason || "主体素材或模型已变化，请重新执行识别。");
+        }
+        return;
+      }
+      const createdOperation = normalizeReverseOperation(profileConfirmation.result);
       profileOperationsRef.current[mode] = createdOperation;
       const settledOperation = await waitForTrackedProfileOperation(createdOperation, {
         mode,
@@ -495,7 +529,9 @@ export default function useMediaUpload({
         variationSource: null,
       }, mode);
       setRefOpen(true);
-      prefetchProductProfile(mode, asset, productReqId, ownerRequest);
+      window.setTimeout(() => {
+        prefetchProductProfile(mode, asset, productReqId, ownerRequest);
+      }, 0);
     } catch (e) {
       if (ownerRequest.isCurrent() && isModeVisible(mode)) setMsg(e.message);
     } finally {
@@ -537,11 +573,16 @@ export default function useMediaUpload({
       variationSource: null,
     }, mode);
     setRefOpen(true);
-    prefetchProductProfile(mode, asset, productReqId, ownerRequest);
+    window.setTimeout(() => {
+      prefetchProductProfile(mode, asset, productReqId, ownerRequest);
+    }, 0);
   }
 
   async function doUploadProductDetailImages(fileList) {
     const files = Array.from(fileList || []);
+    const effectiveProductDetailLimit = Number.isInteger(productDetailLimit)
+      ? Math.min(MAX_PRODUCT_DETAIL_IMAGES, Math.max(0, productDetailLimit))
+      : MAX_PRODUCT_DETAIL_IMAGES;
     if (!files.length || uploading) return;
     if (!productAsset?.url) {
       setMsg("请先选择产品主题图");
@@ -560,6 +601,11 @@ export default function useMediaUpload({
     }
     if (productDetailAssets.length + files.length > MAX_PRODUCT_DETAIL_IMAGES) {
       setMsg(`产品细节图最多 ${MAX_PRODUCT_DETAIL_IMAGES} 张，当前已有 ${productDetailAssets.length} 张。`);
+      resetInput(productDetailUploadInputRef);
+      return;
+    }
+    if (productDetailAssets.length + files.length > effectiveProductDetailLimit) {
+      setMsg(`当前模型最多支持 ${effectiveProductDetailLimit} 张产品细节图，当前已有 ${productDetailAssets.length} 张。`);
       resetInput(productDetailUploadInputRef);
       return;
     }
@@ -582,6 +628,7 @@ export default function useMediaUpload({
         const urls = new Set([current.productAsset?.url, ...existing.map((item) => item?.url)].filter(Boolean));
         const additions = uploadedRows.filter((item) => item?.url && !urls.has(item.url));
         if (existing.length + additions.length > MAX_PRODUCT_DETAIL_IMAGES) return current;
+        if (existing.length + additions.length > effectiveProductDetailLimit) return current;
         return { productDetailAssets: [...existing, ...additions] };
       }, mode);
       setRefOpen(true);
@@ -594,6 +641,50 @@ export default function useMediaUpload({
         resetInput(productDetailUploadInputRef);
       }
     }
+  }
+
+  async function doUploadLastFrameImage(file) {
+    if (!file || uploading) return;
+    const ownerRequest = ownerRequestContextRef.current.capture();
+    const mode = creationMode;
+    if (!file.type?.startsWith("image/")) {
+      setMsg("视频尾帧只支持图片文件");
+      resetInput(lastFrameUploadInputRef);
+      return;
+    }
+    if (uploadLimitExceeded(file, "image")) {
+      resetInput(lastFrameUploadInputRef);
+      return;
+    }
+    const reqId = bumpRequest(uploadRequestRef, mode);
+    setMsg("");
+    setWorkspacePatch({ uploading: true }, mode);
+    const uploadRequest = activeUploadRequestsRef.current.capture();
+    try {
+      const uploaded = await api.uploadImage(file, { signal: uploadRequest.signal });
+      if (!ownerRequest.isCurrent() || !isRequestCurrent(uploadRequestRef, mode, reqId)) return;
+      const { previewUrl, asset } = buildDisplayAsset(uploaded, file);
+      rememberUploadedObjectUrl(mode, previewUrl);
+      setWorkspacePatch({ lastFrameAsset: asset }, mode);
+      setRefOpen(true);
+    } catch (error) {
+      if (ownerRequest.isCurrent() && isModeVisible(mode)) {
+        setMsg(error.message || "视频尾帧上传失败");
+      }
+    } finally {
+      uploadRequest.release();
+      if (ownerRequest.isCurrent() && isRequestCurrent(uploadRequestRef, mode, reqId)) {
+        setWorkspacePatch({ uploading: false }, mode);
+        resetInput(lastFrameUploadInputRef);
+      }
+    }
+  }
+
+  function selectLastFrameAsset(asset) {
+    if (!asset?.url || asset.type !== "image" || uploading) return false;
+    setWorkspacePatch({ lastFrameAsset: asset }, creationMode);
+    setRefOpen(true);
+    return true;
   }
 
   async function doUploadVideo(file) {
@@ -659,6 +750,7 @@ export default function useMediaUpload({
     resetInput(imageUploadInputRef);
     resetInput(productUploadInputRef);
     resetInput(productDetailUploadInputRef);
+    resetInput(lastFrameUploadInputRef);
     resetInput(videoUploadInputRef);
   }
 
@@ -677,6 +769,7 @@ export default function useMediaUpload({
     imageUploadInputRef,
     productUploadInputRef,
     productDetailUploadInputRef,
+    lastFrameUploadInputRef,
     videoUploadInputRef,
     bumpUploadRequest: (mode = creationMode) => bumpRequest(uploadRequestRef, mode),
     bumpProductUploadRequest: (mode = creationMode) => bumpRequest(productUploadRequestRef, mode),
@@ -690,7 +783,9 @@ export default function useMediaUpload({
     doUploadImage,
     doUploadProductImage,
     doUploadProductDetailImages,
+    doUploadLastFrameImage,
     selectProductAsset,
+    selectLastFrameAsset,
     doUploadVideo,
   };
 }

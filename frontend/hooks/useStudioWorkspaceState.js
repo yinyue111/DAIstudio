@@ -1,6 +1,7 @@
 "use client";
 
 import { useState } from "react";
+import { DEFAULT_REVERSE_CONFIG } from "../app/studio/reverseConfig";
 
 export function createWorkspaceState() {
   return {
@@ -14,6 +15,7 @@ export function createWorkspaceState() {
     seed: "",
     vDuration: 5,
     vResolution: "720p",
+    productVideoTemplate: "prompt_driven",
     editMaskMode: "protect_subject",
     productPixelLockMode: "auto",
     videoAnalysisPreset: "standard",
@@ -26,6 +28,7 @@ export function createWorkspaceState() {
     profileOperation: null,
     assets: [],
     selected: null,
+    lastFrameAsset: null,
     productAsset: null,
     productDetailAssets: [],
     productProfile: null,
@@ -42,6 +45,22 @@ export function createWorkspaceState() {
     structuredDirty: false,
     structuredSource: "",
     reverseVideoAnalysis: null,
+    reverseSources: [],
+    reverseConfig: { ...DEFAULT_REVERSE_CONFIG, source_ranges: [], custom_keyframes: [] },
+    pendingReverseResult: null,
+    reverseResultTab: "draft",
+    reverseResultSchemaVersion: "",
+    reverseAppliedVersion: null,
+    reverseAppliedRevisionId: null,
+    reverseUndoSnapshot: null,
+    reverseApplyConflict: null,
+    reverseResultRevisions: [],
+    reverseFeedback: null,
+    batchReverseAssets: [],
+    creationRecipeId: null,
+    creationRecipeVersion: null,
+    creationRecipeShareSlug: "",
+    creationRecipeSource: "",
     promptSourceSignature: "",
     negativeTouched: false,
     promptDirty: false,
@@ -98,9 +117,11 @@ export default function useStudioWorkspaceState({ creationMode, modes }) {
   const setSeed = (value) => updateWorkspaceField("seed", value);
   const setVDuration = (value) => updateWorkspaceField("vDuration", value);
   const setVResolution = (value) => updateWorkspaceField("vResolution", value);
+  const setProductVideoTemplate = (value) => updateWorkspaceField("productVideoTemplate", value);
   const setEditMaskMode = (value) => updateWorkspaceField("editMaskMode", value);
   const setProductPixelLockMode = (value) => updateWorkspaceField("productPixelLockMode", value);
   const setVideoAnalysisPreset = (value) => updateWorkspaceField("videoAnalysisPreset", value);
+  const setReverseConfig = (value) => updateWorkspaceField("reverseConfig", value);
   const setUrl = (value) => updateWorkspaceField("url", value);
   const setStructured = (value) => updateWorkspaceField("structured", value);
   const setNegativeTouched = (value) => updateWorkspaceField("negativeTouched", value);
@@ -133,9 +154,11 @@ export default function useStudioWorkspaceState({ creationMode, modes }) {
     setSeed,
     setVDuration,
     setVResolution,
+    setProductVideoTemplate,
     setEditMaskMode,
     setProductPixelLockMode,
     setVideoAnalysisPreset,
+    setReverseConfig,
     setUrl,
     setStructured,
     setNegativeTouched,

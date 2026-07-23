@@ -23,7 +23,7 @@ import time
 from dataclasses import dataclass
 from fractions import Fraction
 from io import BytesIO
-from math import gcd
+from math import gcd, isfinite
 
 from PIL import Image
 
@@ -41,6 +41,7 @@ DOWNLOAD_TIMEOUT = 30.0
 SCENE_THRESHOLD = 0.28
 MIN_FRAME_GAP_SECONDS = 0.7
 FRAME_BACKOFF_SECONDS = (0.0, 0.1, 0.25, 0.5)
+SELECTION_TIME_EPSILON_SECONDS = 0.001
 _SAMPLE_SEMAPHORE = threading.BoundedSemaphore(
     max(1, int(settings.reverse_video_parallelism or 1))
 )
@@ -51,6 +52,10 @@ UA = (
 )
 
 
+class VideoSelectionError(ValueError):
+    """The requested source range or keyframe is outside the probed video."""
+
+
 @dataclass(frozen=True)
 class VideoMetadata:
     width: int | None = None
@@ -58,6 +63,10 @@ class VideoMetadata:
     duration_seconds: float | None = None
     fps: float | None = None
     has_audio: bool = False
+    total_duration_seconds: float | None = None
+    range_start_seconds: float | None = None
+    range_end_seconds: float | None = None
+    source_ranges: tuple[tuple[float, float], ...] = ()
 
     @property
     def ratio(self) -> str | None:
@@ -67,7 +76,7 @@ class VideoMetadata:
         return f"{int(self.width) // divisor}:{int(self.height) // divisor}"
 
     def to_dict(self) -> dict:
-        return {
+        result = {
             "width": self.width,
             "height": self.height,
             "ratio": self.ratio,
@@ -76,6 +85,28 @@ class VideoMetadata:
             "has_audio": self.has_audio,
             "audio_analyzed": False,
         }
+        if self.total_duration_seconds is not None:
+            result["total_duration_seconds"] = self.total_duration_seconds
+        if self.source_ranges:
+            result["source_ranges"] = [
+                {"start_seconds": start, "end_seconds": end}
+                for start, end in self.source_ranges
+            ]
+        if (
+            len(self.source_ranges) == 1
+            or self.range_start_seconds is not None
+            and self.range_end_seconds is not None
+        ):
+            start, end = (
+                self.source_ranges[0]
+                if len(self.source_ranges) == 1
+                else (self.range_start_seconds, self.range_end_seconds)
+            )
+            result["source_range"] = {
+                "start_seconds": start,
+                "end_seconds": end,
+            }
+        return result
 
 
 @dataclass(frozen=True)
@@ -85,21 +116,35 @@ class SampledVideoFrame:
     # Endpoint frames outrank scene-change frames, which outrank uniform fill
     # frames when the aggregate model payload must be reduced.
     priority: int = 1
+    relative_timestamp_seconds: float | None = None
+    source_segment_index: int | None = None
 
 
 @dataclass(frozen=True)
 class VideoSample:
     frames: tuple[SampledVideoFrame, ...]
     source: VideoMetadata
+    shot_detection: dict | None = None
 
     def analysis(self) -> dict:
-        return {
+        result = {
             "source": self.source.to_dict(),
             "sampled_frames": [
-                {"index": index, "timestamp_seconds": frame.timestamp_seconds}
+                {
+                    "index": index,
+                    "timestamp_seconds": frame.timestamp_seconds,
+                    "absolute_timestamp_seconds": frame.timestamp_seconds,
+                }
+                | ({"relative_timestamp_seconds": frame.relative_timestamp_seconds}
+                   if frame.relative_timestamp_seconds is not None else {})
+                | ({"source_segment_index": frame.source_segment_index}
+                   if frame.source_segment_index is not None else {})
                 for index, frame in enumerate(self.frames, start=1)
             ],
         }
+        if isinstance(self.shot_detection, dict):
+            result["shot_detection"] = self.shot_detection
+        return result
 
 
 def available() -> bool:
@@ -433,6 +478,214 @@ def _target_frame_count(n: int, dur: float | None, preset: str | None = None) ->
     return max(1, frame_count_for_duration(dur, None) if n < 1 else n)
 
 
+def _allocate_frame_budget(total: int, durations: list[float | None]) -> list[int]:
+    """Give every selected segment evidence, then distribute remaining frames."""
+    if not durations:
+        return []
+    budget = max(len(durations), int(total))
+    counts = [1] * len(durations)
+    remaining = budget - len(durations)
+    if remaining <= 0:
+        return counts
+    weights = [max(0.001, float(duration or 0)) for duration in durations]
+    if not any(duration for duration in durations):
+        weights = [1.0] * len(durations)
+    weight_total = sum(weights)
+    raw = [remaining * weight / weight_total for weight in weights]
+    floors = [int(value) for value in raw]
+    for index, value in enumerate(floors):
+        counts[index] += value
+    leftover = remaining - sum(floors)
+    order = sorted(
+        range(len(raw)),
+        key=lambda index: (raw[index] - floors[index], weights[index]),
+        reverse=True,
+    )
+    for index in order[:leftover]:
+        counts[index] += 1
+    return counts
+
+
+def _normalize_source_ranges(
+    source_ranges,
+    *,
+    start_seconds: float,
+    end_seconds: float | None,
+    total_duration: float | None,
+) -> tuple[list[tuple[float, float | None]], bool]:
+    explicit = bool(source_ranges) or start_seconds > 0 or end_seconds is not None
+    raw_ranges = list(source_ranges or [])
+    if not raw_ranges:
+        raw_ranges = [{"start_seconds": start_seconds, "end_seconds": end_seconds}]
+    normalized: list[tuple[float, float | None]] = []
+    for raw in raw_ranges:
+        if isinstance(raw, dict):
+            raw_start = raw.get("start_seconds", 0)
+            raw_end = raw.get("end_seconds")
+        else:
+            raw_start = getattr(raw, "start_seconds", 0)
+            raw_end = getattr(raw, "end_seconds", None)
+        start = float(raw_start or 0)
+        end = float(raw_end) if raw_end is not None else total_duration
+        if not isfinite(start) or (end is not None and not isfinite(end)):
+            raise VideoSelectionError("视频分析时间必须是有限数字")
+        if start < 0:
+            raise VideoSelectionError("视频分析片段开始时间不能小于 0 秒")
+        if total_duration is not None:
+            if start > total_duration + SELECTION_TIME_EPSILON_SECONDS:
+                raise VideoSelectionError(
+                    f"视频分析片段开始时间 {start:g} 秒超过素材时长 {total_duration:g} 秒"
+                )
+            if end is not None and end > total_duration + SELECTION_TIME_EPSILON_SECONDS:
+                raise VideoSelectionError(
+                    f"视频分析片段结束时间 {end:g} 秒超过素材时长 {total_duration:g} 秒"
+                )
+            start = min(start, total_duration)
+            end = min(float(end if end is not None else total_duration), total_duration)
+        if end is not None and end <= start:
+            raise VideoSelectionError("视频分析片段结束时间必须大于开始时间")
+        normalized.append((start, end))
+    normalized.sort(key=lambda item: (item[0], float("inf") if item[1] is None else item[1]))
+    merged: list[tuple[float, float | None]] = []
+    for start, end in normalized:
+        if not merged:
+            merged.append((start, end))
+            continue
+        previous_start, previous_end = merged[-1]
+        if previous_end is None or start <= previous_end:
+            merged_end = (
+                None
+                if previous_end is None or end is None
+                else max(previous_end, end)
+            )
+            merged[-1] = (previous_start, merged_end)
+        else:
+            merged.append((start, end))
+    return merged, explicit
+
+
+def _validate_custom_timestamps(
+    custom_timestamps,
+    *,
+    ranges: list[tuple[float, float | None]],
+    total_duration: float | None,
+) -> list[float]:
+    validated: list[float] = []
+    for raw in custom_timestamps or []:
+        timestamp = float(raw)
+        if not isfinite(timestamp) or timestamp < 0:
+            raise VideoSelectionError("视频关键帧时间必须是大于等于 0 的有限数字")
+        if (
+            total_duration is not None
+            and timestamp > total_duration + SELECTION_TIME_EPSILON_SECONDS
+        ):
+            raise VideoSelectionError(
+                f"视频关键帧时间 {timestamp:g} 秒超过素材时长 {total_duration:g} 秒"
+            )
+        if ranges and not any(
+            timestamp + SELECTION_TIME_EPSILON_SECONDS >= start
+            and (end is None or timestamp <= end + SELECTION_TIME_EPSILON_SECONDS)
+            for start, end in ranges
+        ):
+            raise VideoSelectionError("视频关键帧必须位于已选分析片段内")
+        validated.append(min(timestamp, total_duration) if total_duration is not None else timestamp)
+    return validated
+
+
+def validate_video_selection(
+    *,
+    source_ranges=None,
+    start_seconds: float = 0,
+    end_seconds: float | None = None,
+    custom_timestamps=None,
+    total_duration: float | None,
+) -> tuple[list[tuple[float, float | None]], list[float]]:
+    """Validate user-selected times against authoritative media duration."""
+    ranges, _explicit = _normalize_source_ranges(
+        source_ranges,
+        start_seconds=start_seconds,
+        end_seconds=end_seconds,
+        total_duration=total_duration,
+    )
+    timestamps = _validate_custom_timestamps(
+        custom_timestamps,
+        ranges=ranges,
+        total_duration=total_duration,
+    )
+    return ranges, timestamps
+
+
+def _shot_detection_contract(
+    ranges: list[tuple[float, float | None]],
+    scene_timestamps: list[float],
+) -> dict:
+    """Turn FFmpeg cut timestamps into stable, source-time shot evidence."""
+    boundaries: list[dict] = []
+    shots: list[dict] = []
+    scene_count = 0
+    unknown_duration = False
+    for segment_index, (start, end) in enumerate(ranges, start=1):
+        if end is None:
+            unknown_duration = True
+            continue
+        segment_scenes = [
+            round(float(timestamp), 3)
+            for timestamp in scene_timestamps
+            if start + 0.05 < float(timestamp) < end - 0.05
+        ]
+        points = [round(float(start), 3), *segment_scenes, round(float(end), 3)]
+        point_ids: list[str] = []
+        for point_index, timestamp in enumerate(points):
+            boundary_type = (
+                "source_range_start" if point_index == 0
+                else "source_range_end" if point_index == len(points) - 1
+                else "scene_change"
+            )
+            if boundary_type == "scene_change":
+                scene_count += 1
+            boundary_id = (
+                f"shot-boundary-{segment_index}-{int(round(timestamp * 1000))}-"
+                f"{boundary_type}"
+            )
+            point_ids.append(boundary_id)
+            boundaries.append({
+                "boundary_id": boundary_id,
+                "source_segment_index": segment_index,
+                "timestamp_seconds": timestamp,
+                "relative_timestamp_seconds": round(timestamp - start, 3),
+                "boundary_type": boundary_type,
+                "analyzer": "ffmpeg_scene",
+                "analyzer_version": "scene-threshold-v1",
+            })
+        for shot_index, (shot_start, shot_end) in enumerate(
+            zip(points, points[1:], strict=False),
+            start=1,
+        ):
+            shots.append({
+                "detected_shot_id": (
+                    f"detected-shot-{segment_index}-{int(round(shot_start * 1000))}-"
+                    f"{int(round(shot_end * 1000))}"
+                ),
+                "source_segment_index": segment_index,
+                "start_seconds": shot_start,
+                "end_seconds": shot_end,
+                "relative_start_seconds": round(shot_start - start, 3),
+                "relative_end_seconds": round(shot_end - start, 3),
+                "boundary_refs": [point_ids[shot_index - 1], point_ids[shot_index]],
+            })
+    return {
+        "contract_version": 1,
+        "status": "degraded" if unknown_duration else "analyzed",
+        "analyzer": "ffmpeg_scene",
+        "analyzer_version": "scene-threshold-v1",
+        "scene_threshold": SCENE_THRESHOLD,
+        "scene_boundary_count": scene_count,
+        "boundaries": boundaries,
+        "shots": shots,
+        "degraded_reason": "源视频时长未知，无法形成完整镜头区间" if unknown_duration else None,
+    }
+
+
 def _reencode_jpeg(jpeg: bytes, *, quality: int, max_edge: int) -> bytes:
     try:
         with Image.open(BytesIO(jpeg)) as image:
@@ -485,6 +738,8 @@ def fit_frame_payload_budget(
                 jpeg=_reencode_jpeg(frame.jpeg, quality=quality, max_edge=max_edge),
                 timestamp_seconds=frame.timestamp_seconds,
                 priority=frame.priority,
+                relative_timestamp_seconds=frame.relative_timestamp_seconds,
+                source_segment_index=frame.source_segment_index,
             )
             for frame in candidates
         ]
@@ -528,41 +783,97 @@ def _sample_video_from_file(
     *,
     duration: float | None = None,
     preset: str | None = None,
+    start_seconds: float = 0,
+    end_seconds: float | None = None,
+    source_ranges: list[dict] | None = None,
+    custom_timestamps: list[float] | None = None,
 ) -> VideoSample:
     frames: list[SampledVideoFrame] = []
     probed = probe_media(src)
-    dur = duration if duration is not None else (
+    total_dur = duration if duration is not None else (
         probed.get("duration_seconds") or probed.get("duration") or _duration_seconds(src)
     )
+    total_value = float(total_dur) if total_dur else None
+    ranges, explicit_ranges = _normalize_source_ranges(
+        source_ranges,
+        start_seconds=max(0.0, float(start_seconds or 0)),
+        end_seconds=end_seconds,
+        total_duration=total_value,
+    )
+    validated_timestamps = _validate_custom_timestamps(
+        custom_timestamps,
+        ranges=ranges,
+        total_duration=total_value,
+    )
+    durations = [end - start if end is not None else total_value for start, end in ranges]
+    known_durations = [float(value) for value in durations if value is not None]
+    selected_duration = sum(known_durations) if len(known_durations) == len(durations) else total_value
+    metadata_ranges = tuple(
+        (round(start, 3), round(float(end), 3))
+        for start, end in ranges
+        if end is not None
+    ) if explicit_ranges else ()
+    single_range = metadata_ranges[0] if len(metadata_ranges) == 1 else (None, None)
     source = VideoMetadata(
         width=probed.get("width"),
         height=probed.get("height"),
-        duration_seconds=round(float(dur), 3) if dur else None,
+        duration_seconds=round(float(selected_duration), 3) if selected_duration else None,
         fps=probed.get("fps"),
         has_audio=bool(probed.get("has_audio")),
+        total_duration_seconds=(round(total_value, 3) if explicit_ranges and total_value else None),
+        range_start_seconds=single_range[0],
+        range_end_seconds=single_range[1],
+        source_ranges=metadata_ranges,
     )
-    target = _target_frame_count(n, dur, preset)
-    scene_stamps = _scene_change_timestamps(src, max(0, target - 1))
-    stamps = _merge_timestamps(scene_stamps, _uniform_timestamps(dur, target), target, dur)
-    if not stamps:
-        return VideoSample(frames=(), source=source)
+    target = _target_frame_count(n, selected_duration, preset)
+    allocations = _allocate_frame_budget(target, durations)
+    absolute_scenes = _scene_change_timestamps(src, max(256, target * 3))
+    shot_detection = _shot_detection_contract(ranges, absolute_scenes)
 
     with tempfile.TemporaryDirectory() as td:
-        for i, ts in enumerate(stamps):
-            dst = os.path.join(td, f"f_{i:02d}.jpg")
-            actual_ts = _grab_frame_with_backoff(src, max(0.0, ts), dst)
-            if actual_ts is not None:
+        frame_number = 0
+        for segment_index, ((start, end), segment_dur, segment_target) in enumerate(
+            zip(ranges, durations, allocations, strict=True),
+            start=1,
+        ):
+            scene_stamps = [
+                timestamp - start for timestamp in absolute_scenes
+                if timestamp >= start and (end is None or timestamp <= end)
+            ]
+            requested = [
+                float(timestamp) - start for timestamp in validated_timestamps
+                if float(timestamp) >= start and (end is None or float(timestamp) <= end)
+            ]
+            relative_stamps = _merge_timestamps(
+                sorted(set(requested + scene_stamps)),
+                _uniform_timestamps(segment_dur, segment_target),
+                segment_target,
+                segment_dur,
+            )
+            for local_index, relative_ts in enumerate(relative_stamps):
+                timestamp = start + relative_ts
+                dst = os.path.join(td, f"f_{frame_number:03d}.jpg")
+                frame_number += 1
+                actual_ts = _grab_frame_with_backoff(src, max(0.0, timestamp), dst)
+                if actual_ts is None:
+                    continue
                 with open(dst, "rb") as f:
                     frames.append(SampledVideoFrame(
                         jpeg=f.read(),
                         timestamp_seconds=round(float(actual_ts), 3),
                         priority=(
-                            3 if i in {0, len(stamps) - 1}
-                            else 2 if any(abs(float(ts) - float(scene_ts)) < 0.001 for scene_ts in scene_stamps)
+                            3 if local_index in {0, len(relative_stamps) - 1}
+                            else 2 if any(abs(relative_ts - scene_ts) < 0.001 for scene_ts in scene_stamps)
                             else 1
                         ),
+                        relative_timestamp_seconds=round(max(0.0, float(actual_ts) - start), 3),
+                        source_segment_index=segment_index if explicit_ranges else None,
                     ))
-    return VideoSample(frames=fit_frame_payload_budget(frames), source=source)
+    return VideoSample(
+        frames=fit_frame_payload_budget(frames),
+        source=source,
+        shot_detection=shot_detection,
+    )
 
 
 def _sample_keyframes_from_file(
@@ -581,6 +892,10 @@ def sample_video_from_path(
     n: int = 4,
     *,
     preset: str | None = None,
+    start_seconds: float = 0,
+    end_seconds: float | None = None,
+    source_ranges: list[dict] | None = None,
+    custom_timestamps: list[float] | None = None,
 ) -> VideoSample | None:
     """Return timestamped frames and source facts from an owner-checked video."""
     if not FFMPEG or n < 1:
@@ -589,9 +904,19 @@ def sample_video_from_path(
         log.warning("video keyframe sampler is busy, skipping reverse-video frames")
         return None
     try:
-        sample = _sample_video_from_file(video_path, n, preset=preset)
+        sample = _sample_video_from_file(
+            video_path,
+            n,
+            preset=preset,
+            start_seconds=start_seconds,
+            end_seconds=end_seconds,
+            source_ranges=source_ranges,
+            custom_timestamps=custom_timestamps,
+        )
         log.info("sampled %s timestamped frame(s) from local video", len(sample.frames))
         return sample
+    except VideoSelectionError:
+        raise
     except Exception as e:  # noqa: BLE001
         log.warning("local keyframe sampling failed: %s", e)
         return None
@@ -637,6 +962,10 @@ def sample_video(
     referer: str | None = None,
     *,
     preset: str | None = None,
+    start_seconds: float = 0,
+    end_seconds: float | None = None,
+    source_ranges: list[dict] | None = None,
+    custom_timestamps: list[float] | None = None,
 ) -> VideoSample | None:
     """Return timestamped frames and source facts from a remote video."""
     if not FFMPEG or n < 1:
@@ -660,7 +989,15 @@ def sample_video(
             src = os.path.join(td, "input")
             with open(src, "wb") as f:
                 f.write(data)
-            sample = _sample_video_from_file(src, n, preset=preset)
+            sample = _sample_video_from_file(
+                src,
+                n,
+                preset=preset,
+                start_seconds=start_seconds,
+                end_seconds=end_seconds,
+                source_ranges=source_ranges,
+                custom_timestamps=custom_timestamps,
+            )
         log.info("sampled %s timestamped frame(s) from video", len(sample.frames))
         return sample
     finally:

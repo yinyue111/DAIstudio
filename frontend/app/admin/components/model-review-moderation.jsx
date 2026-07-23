@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import { ChevronDown, Plus, Search } from "lucide-react";
+import { ChevronDown, Plus, Search, Trash2 } from "lucide-react";
 import { api } from "../../../lib/api";
 import {
   confirmReviewTaskAction,
@@ -274,16 +274,40 @@ export function Models() {
       if (!window.confirm(`确认${action}模型配置？\n${summary.join("\n")}\n变更只影响后续新任务。`)) return;
       setBusy((prev) => ({ ...prev, [key]: "save" }));
       if (r.id == null) await api.adminCreateModel(payload);
-      else {
-        const { use: _immutableUse, ...updatePayload } = payload;
-        await api.adminUpdateModel(r.id, updatePayload);
-      }
+      else await api.adminUpdateModel(r.id, payload);
       setMsgType("ok");
-      setMsg(`${payload.display_name} 已${r.id == null ? "新增" : "保存"}`);
+      setMsg(
+        r.id == null && payload.enabled
+          ? `${payload.display_name} 已新增，可在创作页对应模型下拉框选择`
+          : `${payload.display_name} 已${r.id == null ? "新增，启用后将进入创作页模型下拉框" : "保存"}`,
+      );
       await load();
     } catch (e) {
       setMsgType("bad");
       setMsg(e instanceof SyntaxError ? `${r.display_name || modelUseLabel(r.use)} 的 extra 不是合法 JSON` : e.message);
+    } finally {
+      setBusy((prev) => {
+        const next = { ...prev };
+        delete next[key];
+        return next;
+      });
+    }
+  }
+
+  async function removeModel(row) {
+    const key = rowKey(row);
+    const name = row.display_name || row.model_id;
+    if (!window.confirm(`确认删除「${name}」？\n删除后将不再出现在模型配置和创作页中，历史任务记录会保留。`)) return;
+    setBusy((prev) => ({ ...prev, [key]: "delete" }));
+    setMsg("");
+    try {
+      await api.adminDeleteModel(row.id);
+      setMsgType("ok");
+      setMsg(`${name} 已删除`);
+      await load();
+    } catch (e) {
+      setMsgType("bad");
+      setMsg(e.message);
     } finally {
       setBusy((prev) => {
         const next = { ...prev };
@@ -312,7 +336,11 @@ export function Models() {
     try {
       await api.adminUpdateModel(row.id, patch);
       setMsgType("ok");
-      setMsg(`${row.display_name || row.model_id} 已${targetState}`);
+      setMsg(
+        patch.enabled === true
+          ? `${row.display_name || row.model_id} 已${targetState}，可在创作页对应模型下拉框选择`
+          : `${row.display_name || row.model_id} 已${targetState}`,
+      );
       await load();
     } catch (e) {
       setMsgType("bad");
@@ -496,6 +524,18 @@ export function Models() {
                     <ChevronDown className={`h-3.5 w-3.5 transition-transform ${isExpanded ? "rotate-180" : ""}`} aria-hidden="true" />
                   </button>
                 ) : null}
+                {r.id != null ? (
+                  <button
+                    type="button"
+                    onClick={() => removeModel(r)}
+                    disabled={!!busy[key]}
+                    className="btn-ghost btn-sm px-2 text-bad"
+                    title="删除模型"
+                    aria-label={`删除模型 ${r.display_name || r.model_id}`}
+                  >
+                    <Trash2 className="h-3.5 w-3.5" aria-hidden="true" />
+                  </button>
+                ) : null}
               </div>
             </div>
 
@@ -508,14 +548,14 @@ export function Models() {
               </label>
               <label className="grid gap-1 text-xs text-fog">
                 <span>用途</span>
-                <select className="select w-full" value={r.use || "vision"} disabled={r.id != null}
+                <select className="select w-full" value={r.use || "vision"}
                   onChange={(e) => set(i, "use", e.target.value)}>
                   <option value="vision">反推 / 视觉理解</option>
                   <option value="image">图片生成</option>
                   <option value="video">视频生成</option>
                   <option value="prompt">对话 / 提示词</option>
                 </select>
-                {r.id != null ? <span className="text-[11px] text-fog">用途创建后不可修改</span> : null}
+                {r.id != null ? <span className="text-[11px] text-fog">修改后会从原用途移到新用途，仅影响后续任务。</span> : null}
               </label>
               {r.id == null ? (
                 <label className="grid gap-1 text-xs text-fog md:col-span-2">

@@ -9,6 +9,7 @@ from fastapi.responses import FileResponse
 from sqlalchemy import update
 from sqlalchemy.orm import Session
 
+from ..billing_schemas import BillingEntryPageOut, CreditTransactionPageOut
 from ..config import settings
 from ..db import get_db
 from ..deps import get_client_ip, get_current_user
@@ -16,17 +17,20 @@ from ..models import User, UserDraft
 from ..password_policy import MIN_PASSWORD_LEN
 from ..redis_client import redis_client
 from ..schemas import (
+    AssetSimilarityOut,
     ChangePasswordIn,
     UserAssetBatchDeleteIn,
     UserAssetListOut,
     UserAssetMetadataIn,
+    UserAssetMetadataOut,
     UserAssetMutationOut,
+    UserAssetTagsIn,
     UserDraftIn,
     UserDraftOut,
     UserOut,
 )
 from ..security import hash_password, verify_password
-from ..services import audit, storage, user_assets
+from ..services import audit, billing, storage, user_assets
 from ..services.rate_limit import incr_window
 
 router = APIRouter(prefix="/api", tags=["me"])
@@ -41,6 +45,55 @@ _DRAFT_KEY_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 @router.get("/me", response_model=UserOut)
 def me(user: User = Depends(get_current_user)):
     return user
+
+
+@router.get("/me/credit-transactions", response_model=CreditTransactionPageOut)
+def list_me_credit_transactions(
+    transaction_type: str = Query(
+        default="all",
+        alias="type",
+        pattern="^(all|grant|freeze|settle|refund|unlock|consume)$",
+    ),
+    biz_type: str | None = Query(default=None, max_length=32),
+    limit: int = Query(default=30, ge=1, le=100),
+    cursor: str | None = Query(default=None, max_length=512),
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    try:
+        return billing.list_credit_transactions(
+            db,
+            user_id=user.id,
+            transaction_type=transaction_type,
+            biz_type=biz_type,
+            limit=limit,
+            cursor=cursor,
+        )
+    except billing.InvalidBillingCursor as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@router.get("/me/billing/entries", response_model=BillingEntryPageOut)
+def list_me_billing_entries(
+    kind: str = Query(
+        default="all",
+        pattern="^(all|generation|reverse|workflow|prompt|unlock|recharge|grant|other)$",
+    ),
+    limit: int = Query(default=30, ge=1, le=100),
+    cursor: str | None = Query(default=None, max_length=512),
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    try:
+        return billing.list_billing_entries(
+            db,
+            user_id=user.id,
+            kind=kind,
+            limit=limit,
+            cursor=cursor,
+        )
+    except billing.InvalidBillingCursor as exc:
+        raise HTTPException(400, str(exc)) from exc
 
 
 def _optional_bool(value: str | None) -> bool | None:
@@ -70,6 +123,9 @@ def list_me_assets(
     type: str = Query(default="all", pattern="^(all|image|video)$"),
     favorite: str | None = None,
     retention: str = Query(default="all", pattern="^(all|retained|expiring)$"),
+    q: str | None = Query(default=None, max_length=100),
+    tag: str | None = Query(default=None, max_length=32),
+    folder: str = Query(default="all", pattern=r"^(all|unfiled|[1-9][0-9]*)$"),
     limit: int = Query(default=60, ge=1, le=200),
     offset: int = Query(default=0, ge=0),
     cursor: str | None = None,
@@ -84,11 +140,18 @@ def list_me_assets(
             asset_type=type,
             favorite=_optional_bool(favorite),
             retention_filter=retention,
+            search_query=q,
+            tag_filter=tag,
+            folder_filter=folder,
             limit=limit,
             offset=offset,
             cursor=cursor,
         )
-    except (user_assets.InvalidCursor, user_assets.InvalidAssetRef) as error:
+    except (
+        user_assets.InvalidCursor,
+        user_assets.InvalidAssetRef,
+        user_assets.AssetNotFound,
+    ) as error:
         raise _asset_error(error) from None
 
 
@@ -110,6 +173,7 @@ def update_me_asset_metadata(
     except (user_assets.InvalidAssetRef, user_assets.AssetNotFound) as error:
         db.rollback()
         raise _asset_error(error) from None
+    db.commit()
     audit.log(
         db,
         user_id=user.id,
@@ -123,6 +187,81 @@ def update_me_asset_metadata(
         },
     )
     return UserAssetMutationOut(asset_refs=asset_refs)
+
+
+@router.put("/me/assets/{asset_ref}/tags", response_model=UserAssetMetadataOut)
+def update_me_asset_tags(
+    asset_ref: str,
+    body: UserAssetTagsIn,
+    request: Request,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    try:
+        row = user_assets.update_asset_tags(db, user.id, asset_ref, body.tags)
+    except (user_assets.InvalidAssetRef, user_assets.AssetNotFound) as error:
+        db.rollback()
+        raise _asset_error(error) from None
+    db.commit()
+    audit.log(
+        db,
+        user_id=user.id,
+        action="update_user_asset_tags",
+        biz_type="user_asset",
+        ip=get_client_ip(request),
+        detail={"asset_ref": asset_ref, "tags": body.tags},
+    )
+    db.refresh(row)
+    return row
+
+
+@router.post("/me/assets/{asset_ref}/similar", response_model=AssetSimilarityOut)
+def find_me_similar_assets(
+    asset_ref: str,
+    request: Request,
+    max_distance: int = Query(default=8, ge=0, le=64),
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    try:
+        library = user_assets.list_user_assets(
+            db,
+            user.id,
+            origin="all",
+            asset_type="all",
+            favorite=None,
+            retention_filter="all",
+            search_query=None,
+            tag_filter=None,
+            folder_filter="all",
+            limit=1_000_000,
+            offset=0,
+            cursor=None,
+        )
+        result = user_assets.find_similar_assets(
+            db,
+            user.id,
+            asset_ref,
+            [item["asset_ref"] for item in library["items"]],
+            max_distance=max_distance,
+        )
+    except (user_assets.InvalidAssetRef, user_assets.AssetNotFound) as error:
+        db.rollback()
+        raise _asset_error(error) from None
+    db.commit()
+    audit.log(
+        db,
+        user_id=user.id,
+        action="analyze_user_asset_similarity",
+        biz_type="user_asset",
+        ip=get_client_ip(request),
+        detail={
+            "asset_ref": asset_ref,
+            "status": result["status"],
+            "match_count": len(result["matches"]),
+        },
+    )
+    return result
 
 
 @router.post("/me/assets/batch-delete", response_model=UserAssetMutationOut)

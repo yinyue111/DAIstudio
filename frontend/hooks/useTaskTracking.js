@@ -260,7 +260,7 @@ export default function useTaskTracking({
     connect(0);
   }, [loadWorks, refreshMe, setTrackedTask, startPolling, stopActiveTracking]);
 
-  const startBackgroundTracking = useCallback((target) => {
+  const startBackgroundTracking = useCallback((target, callbacks = {}) => {
     const ownerRequest = ownerRequestContextRef.current.capture();
     const id = typeof target === "object" ? target?.id : target;
     if (!id) return () => {};
@@ -285,6 +285,9 @@ export default function useTaskTracking({
         if (isTerminalTaskStatus(nextTask.status)) {
           stop();
           backgroundTrackersRef.current.delete(id);
+          Promise.resolve(callbacks.onTerminal?.(nextTask)).catch((error) => {
+            reportBackgroundError(error, "handle terminal background task");
+          });
           refreshMe();
           loadWorks();
           return;
@@ -311,10 +314,10 @@ export default function useTaskTracking({
     return stop;
   }, [loadWorks, refreshMe, upsertBackgroundTask]);
 
-  const trackBackgroundTask = useCallback((target) => {
+  const trackBackgroundTask = useCallback((target, callbacks = {}) => {
     const id = typeof target === "object" ? target?.id : target;
     if (!id || backgroundTrackersRef.current.has(id)) return;
-    backgroundTrackersRef.current.set(id, startBackgroundTracking(target));
+    backgroundTrackersRef.current.set(id, startBackgroundTracking(target, callbacks));
   }, [startBackgroundTracking]);
 
   const cancelBackgroundTask = useCallback(async (id) => {

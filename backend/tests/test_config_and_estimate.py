@@ -18,9 +18,18 @@ import app.models  # noqa: F401  (register tables)
 from app.celery_app import celery_app
 from app.config import Settings, settings
 from app.db import Base, SessionLocal
-from app.redis_client import celery_redis_url, redis_connection_kwargs
-from app.runtime_config import validate_model_gateway_rows, validate_runtime_config
+from app.redis_client import (
+    blocking_redis_connection_kwargs,
+    celery_redis_url,
+    redis_connection_kwargs,
+)
+from app.runtime_config import (
+    _validate_analyzer_http_url,
+    validate_model_gateway_rows,
+    validate_runtime_config,
+)
 from app.services import config_store, locks
+from app.services.generation_media import final_prompt
 from app.services.generation_model_runtime import model_snapshot
 from app.services.generation_pricing import generation_cost_from_snapshot
 from app.services.generation_prompts import (
@@ -40,6 +49,13 @@ def make_session():
     eng = create_engine(f"sqlite:///{path}")
     Base.metadata.create_all(eng)
     return sessionmaker(bind=eng)()
+
+
+def test_reference_only_fallback_prompt_uses_visual_constraints_without_quality_boosters():
+    prompt = final_prompt(SimpleNamespace(prompt={}))
+
+    assert prompt == "Match the reference subject, composition, lighting, color palette, and materials."
+    assert "high quality" not in prompt.lower()
 
 
 def test_setup_script_creates_local_env_not_production_debug():
@@ -62,13 +78,38 @@ def test_compose_isolates_and_authenticates_redis_and_uses_readiness_probe():
     assert services["redis"]["networks"] == ["backend_internal"]
     assert services["frontend"]["networks"] == ["frontend_edge"]
     assert set(services["api"]["networks"]) == {"backend_internal", "frontend_edge"}
-    for name in ("worker", "worker_image", "worker_video", "worker_video_download", "worker_parse", "beat"):
+    for name in (
+        "worker",
+        "worker_image",
+        "worker_video",
+        "worker_video_download",
+        "worker_parse",
+        "worker_reverse",
+        "worker_workflow",
+        "beat",
+    ):
         assert services[name]["depends_on"]["redis"]["condition"] == "service_healthy"
         assert set(services[name]["networks"]) == {"backend_internal", "external_access"}
         assert "${POSTGRES_PASSWORD" not in services[name]["environment"]["DATABASE_URL"]
         assert "${REDIS_PASSWORD" not in services[name]["environment"]["REDIS_URL"]
     assert compose["networks"]["backend_internal"]["internal"] is True
     assert compose["networks"]["external_access"] is None
+    assert compose["networks"]["analyzer_edge"] is None
+    analyzer_ports = {
+        "evidence_provider": 8090,
+        "video_semantic_provider": 8091,
+        "audio_provider": 8092,
+    }
+    for name, port in analyzer_ports.items():
+        service = services[name]
+        assert service["profiles"] == ["evidence"]
+        assert set(service["networks"]) == {"backend_internal", "analyzer_edge"}
+        assert service["ports"] == [f"127.0.0.1:${{{name.upper()}_PORT:-{port}}}:{port}"]
+        health = " ".join(service["healthcheck"]["test"])
+        assert f"http://localhost:{port}/health" in health
+        assert "Authorization" in health and "Bearer" in health
+    assert "volumes" not in services["evidence_provider"]
+    assert "volumes" not in services["audio_provider"]
     beat_health = " ".join(services["beat"]["healthcheck"]["test"])
     assert "/proc/1/cmdline" in beat_health
     assert "celery" in beat_health and "beat" in beat_health
@@ -124,6 +165,14 @@ def test_public_config_exposes_video_reverse_presets(client, make_user, auth):
     data = client.get("/api/config", headers=h).json()
     presets = data["reverse"]["video_presets"]
     assert data["reverse"]["video_default_preset"] == "standard"
+    assert data["reverse"]["batch_capabilities"] == {
+        "schema_version": "reverse-batch-capabilities.v2",
+        "item_overrides": True,
+        "supported_override_keys": [
+            "target", "analysis_precision", "source_ranges", "custom_keyframes", "audio_policy",
+        ],
+        "audio_policies": ["inherit", "exclude", "analyze"],
+    }
     assert [p["key"] for p in presets] == ["fast", "standard", "fine"]
     assert presets[0]["short_range"] == "4帧"
     assert presets[0]["max_cost"] == 5
@@ -143,11 +192,13 @@ def test_public_config_exposes_video_reverse_presets(client, make_user, auth):
 
 
 def test_redis_blocking_client_uses_bounded_pool_settings():
-    kwargs = redis_connection_kwargs()
+    normal = redis_connection_kwargs()
+    kwargs = blocking_redis_connection_kwargs()
 
-    assert kwargs["max_connections"] >= 1
+    assert 2 <= kwargs["max_connections"] <= 10
     assert kwargs["socket_connect_timeout"] > 0
-    assert kwargs["socket_timeout"] > 0
+    assert kwargs["socket_timeout"] >= 30
+    assert kwargs["socket_timeout"] > normal["socket_timeout"]
 
 
 def test_redis_password_is_structured_for_client_and_encoded_for_celery(monkeypatch):
@@ -547,6 +598,80 @@ def test_deploy_env_production_requires_signed_online_update(monkeypatch):
     validate_runtime_config()
 
 
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("image_evidence_detector_api_key", "orphan-secret"),
+        (
+            "image_evidence_detector_health_url",
+            "https://detector.example.test/health",
+        ),
+    ],
+)
+def test_runtime_rejects_dangling_image_analyzer_config(monkeypatch, field, value):
+    monkeypatch.setattr(settings, "debug", True)
+    monkeypatch.setattr(settings, "image_evidence_detector_url", "")
+    monkeypatch.setattr(settings, "image_evidence_detector_api_key", "")
+    monkeypatch.setattr(settings, "image_evidence_detector_health_url", "")
+    monkeypatch.setattr(settings, field, value)
+
+    with pytest.raises(RuntimeError, match="IMAGE_EVIDENCE_DETECTOR_URL"):
+        validate_runtime_config()
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "detector.example.test/analyze",
+        "ftp://detector.example.test/analyze",
+        "https://user:secret@detector.example.test/analyze",
+        "https://detector.example.test/analyze#fragment",
+    ],
+)
+def test_runtime_rejects_invalid_image_analyzer_url(monkeypatch, url):
+    monkeypatch.setattr(settings, "debug", True)
+    monkeypatch.setattr(settings, "image_evidence_detector_url", url)
+    monkeypatch.setattr(settings, "image_evidence_detector_api_key", "")
+    monkeypatch.setattr(settings, "image_evidence_detector_health_url", "")
+
+    with pytest.raises(RuntimeError, match="IMAGE_EVIDENCE_DETECTOR_URL"):
+        validate_runtime_config()
+
+
+def test_runtime_accepts_consistent_debug_image_analyzer_config(monkeypatch):
+    monkeypatch.setattr(settings, "debug", True)
+    monkeypatch.setattr(
+        settings,
+        "image_evidence_detector_url",
+        "http://detector.local:8080/analyze",
+    )
+    monkeypatch.setattr(settings, "image_evidence_detector_api_key", "local-secret")
+    monkeypatch.setattr(
+        settings,
+        "image_evidence_detector_health_url",
+        "http://detector.local:8080/health",
+    )
+
+    validate_runtime_config()
+
+
+def test_production_accepts_only_explicit_named_private_analyzer_host(monkeypatch):
+    monkeypatch.setattr(settings, "debug", False)
+    monkeypatch.setattr(settings, "trusted_analyzer_hosts", "evidence_provider")
+
+    _validate_analyzer_http_url(
+        "IMAGE_EVIDENCE_DETECTOR_URL",
+        "http://evidence_provider:8090/v1/region/analyze",
+    )
+
+    monkeypatch.setattr(settings, "trusted_analyzer_hosts", "127.0.0.1")
+    with pytest.raises(RuntimeError, match="不能使用 IP"):
+        _validate_analyzer_http_url(
+            "IMAGE_EVIDENCE_DETECTOR_URL",
+            "http://127.0.0.1:8090/v1/region/analyze",
+        )
+
+
 def test_public_config_exposes_normalized_feature_flags(client, make_user, auth):
     make_user("13900000182", balance=100)
     db = SessionLocal()
@@ -666,6 +791,71 @@ def test_product_generation_prompt_uses_reference_style_not_reference_product():
     assert "Estee Lauder" not in out
     assert "Advanced Night Repair" not in out
     assert "dropper bottle" not in out
+
+
+def test_product_replica_prompt_preserves_ice_scene_light_palette_and_frame_under_budget():
+    product_url = "http://localhost:8000/api/uploads/upload/damah-pack.png"
+    task = SimpleNamespace(
+        category="image",
+        source_type="image",
+        source_asset_url=product_url,
+        params={
+            "subject_mode": "product",
+            "reference_image_url": product_url,
+            "style_reference_image": "http://localhost:8000/media/preview/ice-style.png",
+            "size": "768x1024",
+        },
+        prompt={
+            "产品身份档案": (
+                "不可改项: 保持DAMAH 168PCS白色吊挂式长方体包装、顶部三个孔洞、Logo和底部黑色波纹；"
+                "品牌Logo: 正面中部为黑底白字DAMAH标识；包装结构: 正面与右侧面同时可见。"
+            ),
+            "场景背景": (
+                "直接可见事实：多块半透明蓝色冰块从前景、左右中景及后景包围产品，中央下方有平整冰台，"
+                "远景为淡蓝到粉橙色天空；视觉估计：冰块形成天然框景；未知：真实拍摄场地不确定。"
+            ),
+            "构图": (
+                "直接可见事实：中心构图和冰块框架构图，产品位于画面水平中心并由冰台承托；"
+                "视觉估计：竖幅约3:4，顶部保留少量天空留白。"
+            ),
+            "光线": (
+                "直接可见事实：主暖光从左后方射入，形成橙金色透射高光，右侧与底部保留冷蓝环境光；"
+                "视觉估计：正面使用柔和补光；未知：灯具功率不确定。"
+            ),
+            "色调配色": (
+                "直接可见事实：背景主色为深海军蓝、冰蓝、青蓝，辅色为白色商品包装，"
+                "点缀色为橙金和粉橙天空；黑色Logo与底带形成最高明度反差。"
+                "视觉估计：蓝色区域约65%-75%，白色包装约15%-25%，暖橙色约5%-10%，"
+                "黑色印刷约3%-6%；近似采样色仅作视觉估计：深蓝约#0B2D43、"
+                "冰蓝约#327A9D、暖橙约#F3A067、包装白约#F3F3F1、印刷黑约#111111；"
+                "整体中高饱和冷调，配合局部暖色互补对比。"
+            ),
+            "风格": "直接可见事实：竖版奢侈品式产品摄影；视觉估计：高端商业广告精修质感。",
+            "景别": "视觉估计：产品近景至中近景，包装完整入镜。",
+            "后期质感": "中高锐度、轻微电影式高光扩散，暗部保留冷蓝层次。",
+            "final_text": "参考图复刻",
+            "instruction": "参考图复刻",
+        },
+    )
+
+    compact = generation_prompt_for_model(task.prompt["final_text"], task)
+    out = product_fidelity_prompt(compact, task)
+
+    assert len(out) <= 800
+    for expected in (
+        "半透明蓝色冰块",
+        "中心构图",
+        "冰台承托",
+        "左后方",
+        "橙金色透射高光",
+        "深海军蓝",
+        "暖色互补对比",
+        "奢侈品式产品摄影",
+        "竖版3:4",
+    ):
+        assert expected in out
+    for scaffold in ("直接可见事实", "视觉估计", "未知"):
+        assert scaffold not in out
 
 
 def test_product_video_prompt_keeps_motion_request_not_reference_product():
@@ -1503,8 +1693,16 @@ def test_celery_task_routes_are_split_by_workload():
     assert router.route({}, "poll.video", args=(), kwargs={})["queue"].name == "video_poll"
     assert router.route({}, "download.video", args=(), kwargs={})["queue"].name == "video_download"
     assert router.route({}, "parse.url", args=(), kwargs={})["queue"].name == "parse"
+    assert router.route({}, "workflow.run", args=(), kwargs={})["queue"].name == "workflow"
+    assert router.route({}, "workflow.node", args=(), kwargs={})["queue"].name == "workflow"
     assert router.route({}, "cleanup.reap_stuck", args=(), kwargs={})["queue"].name == "cleanup"
     assert router.route({}, "cleanup.reap_reverse", args=(), kwargs={})["queue"].name == "cleanup"
+    assert (
+        router.route({}, "cleanup.reap_prompt_optimizations", args=(), kwargs={})[
+            "queue"
+        ].name
+        == "cleanup"
+    )
     assert router.route({}, "payments.reconcile", args=(), kwargs={})["queue"].name == "payment"
 
 
@@ -1512,6 +1710,22 @@ def test_reverse_reaper_is_registered_and_scheduled():
     assert "cleanup.reap_reverse" in celery_app.tasks
     assert any(
         entry.get("task") == "cleanup.reap_reverse"
+        for entry in celery_app.conf.beat_schedule.values()
+    )
+
+
+def test_prompt_optimization_reaper_is_registered_and_scheduled():
+    assert "cleanup.reap_prompt_optimizations" in celery_app.tasks
+    assert any(
+        entry.get("task") == "cleanup.reap_prompt_optimizations"
+        for entry in celery_app.conf.beat_schedule.values()
+    )
+
+
+def test_workflow_dispatch_reconciler_is_registered_and_scheduled():
+    assert "cleanup.reconcile_workflow_dispatches" in celery_app.tasks
+    assert any(
+        entry.get("task") == "cleanup.reconcile_workflow_dispatches"
         for entry in celery_app.conf.beat_schedule.values()
     )
 

@@ -11,6 +11,7 @@ DEFAULT_SETTINGS = {
     "reverse_prompt_enabled": True,
     "sms_auth_enabled": False,
     "payment_enabled": False,
+    "navigation_states": {},
     "content_safety_enabled": False,
     "content_safety_banned_terms": "",
     "image_n": 1,
@@ -31,7 +32,7 @@ class ModelConfigResolutionError(ValueError):
 def get_model_config(db: Session, use: str) -> ModelConfig | None:
     return db.execute(
         select(ModelConfig)
-        .where(ModelConfig.use == use)
+        .where(ModelConfig.use == use, ModelConfig.deleted_at.is_(None))
         .order_by(ModelConfig.is_default.desc(), ModelConfig.sort_order, ModelConfig.id)
         .limit(1)
     ).scalar_one_or_none()
@@ -47,14 +48,18 @@ def resolve_model_config(
     """Resolve a trusted catalog row instead of accepting runtime config from clients."""
     if model_config_id is not None:
         row = db.get(ModelConfig, int(model_config_id))
-        if row is None:
+        if row is None or row.deleted_at is not None:
             raise ModelConfigResolutionError("所选模型不存在")
         if row.use != use:
             raise ModelConfigResolutionError(f"所选模型不支持 {use} 用途")
     else:
         row = db.execute(
             select(ModelConfig)
-            .where(ModelConfig.use == use, ModelConfig.is_default.is_(True))
+            .where(
+                ModelConfig.use == use,
+                ModelConfig.is_default.is_(True),
+                ModelConfig.deleted_at.is_(None),
+            )
             .order_by(ModelConfig.sort_order, ModelConfig.id)
             .limit(1)
         ).scalar_one_or_none()
@@ -68,7 +73,7 @@ def resolve_model_config(
 def get_all_model_configs(db: Session) -> list[ModelConfig]:
     return list(
         db.execute(
-            select(ModelConfig).order_by(
+            select(ModelConfig).where(ModelConfig.deleted_at.is_(None)).order_by(
                 ModelConfig.use,
                 ModelConfig.is_default.desc(),
                 ModelConfig.sort_order,
@@ -158,6 +163,14 @@ def seed_from_yaml(db: Session) -> None:
                 extra=m.get("extra"),
             )
         )
+    db.commit()
+
+    # Development/test databases use metadata.create_all instead of Alembic,
+    # so seed the same immutable catalog versions production receives in 0044.
+    from .model_versions import sync_model_versions
+
+    for row in db.scalars(select(ModelConfig).order_by(ModelConfig.id)):
+        sync_model_versions(db, row)
     db.commit()
 
     defaults = data.get("defaults", {})

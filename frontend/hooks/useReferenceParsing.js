@@ -22,9 +22,7 @@ import {
   composeStyleTransferPrompt,
   isRequestTimeoutError,
   nearestRatio,
-  reverseVideoWorkspacePatch,
   visualStructuredFields,
-  videoDurationLimit,
   videoRatioOptions,
 } from "../app/studio/helpers";
 import {
@@ -33,9 +31,14 @@ import {
   shouldKeepPendingReverseRequest,
 } from "../app/studio/generationRequestId";
 import {
-  buildReverseOperationRequestSnapshotV2,
+  buildReverseOperationRequestSnapshotV3,
   workspacePatchFromReverseSnapshot,
 } from "../app/studio/reverseSnapshot";
+import {
+  normalizeReverseConfig,
+  reverseConfigForSourceChange,
+  validateReverseConfig,
+} from "../app/studio/reverseConfig";
 import useReverseOperationTracking from "./useReverseOperationTracking";
 
 function bumpRequest(ref, mode) {
@@ -52,11 +55,35 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function assetIdField(value) {
+  const parsed = Number(value);
+  return Number.isInteger(parsed) && parsed > 0 ? { asset_id: parsed } : {};
+}
+
+function reverseWorkspaceSnapshot(operation) {
+  return operation?.workspace_snapshot_v3 || operation?.workspace_snapshot_v2 || {};
+}
+
+export async function cancelStaleReverseOperation(
+  operation,
+  cancelOperation = (operationId) => api.cancelReverseOperation(operationId),
+  reportError = reportBackgroundError,
+) {
+  if (!operation?.id) return false;
+  try {
+    await cancelOperation(operation.id);
+    return true;
+  } catch (error) {
+    reportError(error, "cancel stale reverse operation after confirmed execution");
+    return false;
+  }
+}
+
 function recoveredSourceAsset(operation, restoredWorkspace, target) {
   const profileTarget = ["product_profile", "portrait_profile"].includes(target);
   const restored = profileTarget ? restoredWorkspace?.productAsset : restoredWorkspace?.selected;
   if (restored) return restored;
-  const snapshot = operation?.workspace_snapshot_v2 || {};
+  const snapshot = reverseWorkspaceSnapshot(operation);
   const requestContext = operation?.request_context || {};
   const signature = String(snapshot.source_signature || requestContext.source_signature || "");
   const [signatureType, signatureUrl, ...signatureThumb] = signature.split("|");
@@ -86,6 +113,8 @@ export default function useReferenceParsing({
   negative,
   negativeTouched,
   videoAnalysisPreset,
+  reverseConfig = null,
+  reverseSources = [],
   modelConfigId = null,
   modelSelections = null,
   ratio,
@@ -105,6 +134,7 @@ export default function useReferenceParsing({
   getOwnerSession,
   ownerKey = "",
   resumeOperations = [],
+  requestQuoteConfirmation = null,
 }) {
   const selectedByModeRef = useRef({});
   const profileAssetByModeRef = useRef({});
@@ -148,7 +178,7 @@ export default function useReferenceParsing({
 
   function bindRecoveredOperationWorkspace(operation, mode, runtimeContext = null) {
     if (!runtimeContext?.recovered) return;
-    const snapshot = operation.workspace_snapshot_v2 || {};
+    const snapshot = reverseWorkspaceSnapshot(operation);
     const restored = workspacePatchFromReverseSnapshot(snapshot);
     const restoredWorkspace = restored?.workspace || {};
     const operationTarget = operation.target || snapshot.target || "image";
@@ -216,7 +246,7 @@ export default function useReferenceParsing({
       clearReverseRuntimeContext(mode, runtimeContext || reverseContextsRef.current[mode] || null);
       return;
     }
-    const snapshot = operation.workspace_snapshot_v2 || {};
+    const snapshot = reverseWorkspaceSnapshot(operation);
     const context = runtimeContext || reverseContextsRef.current[mode] || {};
     const operationTarget = operation.target || snapshot.target || "image";
     const targetSignature = (
@@ -311,46 +341,44 @@ export default function useReferenceParsing({
       category: targetCategory,
       operationId: operation.id,
     };
-    setWorkspacePatch((current) => {
-      const startedPrompt = String(context.startedPrompt ?? snapshot.final_text ?? current.prompt ?? "");
-      const startedNegative = String(context.startedNegative ?? current.negative ?? "");
-      const promptUnchanged = String(current.prompt || "") === startedPrompt && !current.promptDirty;
-      const negativeUnchanged = (
-        String(current.negative || "") === startedNegative
-        && !current.negativeTouched
-        && !context.targetNegativeTouched
-      );
-      const preserveRecoveredStructuredEdits = Boolean(context.recovered && current.structuredDirty);
-      return {
-        reversing: false,
-        reverseOperation: operation,
-        ...(preserveRecoveredStructuredEdits ? {} : {
-          structured,
-          structuredBaseline: structured,
-          structuredDirty: false,
-          structuredSource: targetSignature,
-        }),
-        ...(isVideo
-          ? reverseVideoWorkspacePatch({
-              analysis: videoAnalysis,
-              current,
-              startedRatio: context.startedRatio ?? current.ratio,
-              startedDuration: context.startedDuration ?? current.vDuration,
-              maxDuration: videoDurationLimit(videoDurationMaxSeconds),
-            })
-          : {}),
-        ...(promptUnchanged
-          ? { prompt: reversePrompt, promptSourceSignature: targetSignature, promptDirty: false }
-          : {}),
-        ...(structured["负向"] && negativeUnchanged ? { negative: structured["负向"] } : {}),
-      };
+    const source = videoAnalysis?.source && typeof videoAnalysis.source === "object"
+      ? videoAnalysis.source
+      : {};
+    const pendingResult = {
+      kind: "pending_reverse_review",
+      operation_id: operation.id,
+      category: isVideo ? "video" : "image",
+      target: operationTarget,
+      source_signature: targetSignature,
+      received_at: new Date().toISOString(),
+      dirty: false,
+      result: {
+        ...result,
+        structured,
+        final_text: reversePrompt,
+        video_analysis: videoAnalysis,
+        shots: Array.isArray(result.shots) ? result.shots : [],
+        generation_parameters: {
+          ...(result.generation_parameters && typeof result.generation_parameters === "object"
+            ? result.generation_parameters
+            : {}),
+          ...(source.ratio ? { ratio: source.ratio } : {}),
+          ...(Number.isFinite(Number(source.duration_seconds))
+            ? { duration: Math.max(1, Math.round(Number(source.duration_seconds))) }
+            : {}),
+        },
+      },
+    };
+    setWorkspacePatch({
+      reversing: false,
+      reverseOperation: operation,
+      pendingReverseResult: pendingResult,
+      reverseResultTab: "draft",
     }, mode);
     if (isModeVisible(mode)) {
-      setStructOpen(true);
-      if (structured["负向"] && !context.targetNegativeTouched) setShowNegative(true);
       const cost = Number(operation.cost_settled ?? result.charged_credits ?? 0);
       const suffix = Number(result.reference_count || 0) > 1 ? `（${result.reference_count} 帧）` : "";
-      setMsg(`反推完成，已结算 ${cost} 积分${suffix}`);
+      setMsg(`反推完成，已结算 ${cost} 积分${suffix}。请预览后选择应用方式。`);
     }
     clearReverseRuntimeContext(mode, context);
     refreshMe();
@@ -358,7 +386,7 @@ export default function useReferenceParsing({
 
   function handleReverseOperationUpdate(operation, mode, runtimeContext = null) {
     bindRecoveredOperationWorkspace(operation, mode, runtimeContext);
-    const operationTarget = operation.target || operation.workspace_snapshot_v2?.target || "";
+    const operationTarget = operation.target || reverseWorkspaceSnapshot(operation).target || "";
     if (["product_profile", "portrait_profile"].includes(operationTarget)) {
       runtimeContext?.onUpdate?.(operation);
       setWorkspacePatch({
@@ -375,7 +403,7 @@ export default function useReferenceParsing({
 
   function handleReverseOperationSettled(operation, mode, runtimeContext) {
     const context = runtimeContext || reverseContextsRef.current[mode] || null;
-    const operationTarget = operation.target || operation.workspace_snapshot_v2?.target || "";
+    const operationTarget = operation.target || reverseWorkspaceSnapshot(operation).target || "";
     const isProfileOperation = ["product_profile", "portrait_profile"].includes(operationTarget);
     if (isProfileOperation) runtimeContext?.onSettled?.(operation);
     const sourceRef = isProfileOperation ? profileAssetByModeRef : selectedByModeRef;
@@ -487,6 +515,7 @@ export default function useReferenceParsing({
             structuredSource: "",
             reverseVideoAnalysis: null,
             reverseOperation: null,
+            reverseConfig: reverseConfigForSourceChange(current.reverseConfig),
             ...(
               current.promptSourceSignature
               && current.promptSourceSignature !== nextSignature
@@ -616,7 +645,21 @@ export default function useReferenceParsing({
     const ownerRequest = ownerRequestContextRef.current.capture();
     const mode = creationMode;
     const targetCategory = category;
-    const targetVideoPreset = videoAnalysisPreset;
+    const rawConfig = {
+      ...(reverseConfig || {}),
+      analysis_precision: reverseConfig?.analysis_precision || videoAnalysisPreset || "standard",
+    };
+    const configValidation = validateReverseConfig(rawConfig, {
+      category: category === "video" ? "video" : "image",
+      selectedType: selected.type,
+      duration: selected.duration,
+    });
+    if (!configValidation.valid) {
+      setMsg(configValidation.errors[0]?.message || "反推设置不完整，请检查后重试。");
+      return;
+    }
+    const normalizedConfig = configValidation.value;
+    const targetVideoPreset = normalizedConfig.analysis_precision;
     const targetNegativeTouched = negativeTouched;
     const startedPrompt = String(prompt || "");
     const startedNegative = String(negative || "");
@@ -643,15 +686,40 @@ export default function useReferenceParsing({
       const isVideoTarget = targetCategory === "video";
       const refUrl = isVideo ? target.url || target.thumb : target.url;
       const reverseTarget = isVideo ? "video" : targetCategory;
+      const configuredSources = Array.isArray(reverseSources)
+        ? reverseSources.filter((source) => source?.role !== "primary" && source?.asset_url)
+        : [];
+      const sources = [
+        {
+          asset_url: refUrl,
+          source_type: target.type,
+          role: "primary",
+          ...assetIdField(target.id),
+        },
+        ...configuredSources,
+        ...(configuredSources.length === 0 && productAsset && productAsset.type === "image" && assetSignature(productAsset) !== targetSignature
+          ? [{
+              asset_url: productAsset.url || productAsset.preview_url || productAsset.thumb,
+              source_type: "image",
+              role: subjectMode === "portrait" ? "subject" : "product",
+              ...assetIdField(productAsset.id),
+            }]
+          : []),
+      ].filter((source, index, rows) => (
+        source.asset_url
+        && rows.findIndex((item) => item.asset_url === source.asset_url && item.role === source.role) === index
+      ));
       const workspaceSnapshot = {
-        ...buildReverseOperationRequestSnapshotV2({
+        ...buildReverseOperationRequestSnapshotV3({
           creationMode: mode,
           subjectMode,
           target: reverseTarget,
           selected: target,
           productAsset,
           assets,
+          sources,
           videoAnalysisPreset: isVideoTarget ? targetVideoPreset : "standard",
+          reverseConfig: normalizedConfig,
           subjectProfile: productProfile,
         }),
         source_signature: targetSignature,
@@ -660,11 +728,20 @@ export default function useReferenceParsing({
       };
       const reverseBody = {
         asset_url: refUrl,
+        sources,
         target: reverseTarget,
         fallback_image: isVideo ? target.thumb : null,
         source_type: target.type,
-        video_analysis_preset: isVideoTarget ? targetVideoPreset : null,
-        workspace_snapshot_v2: workspaceSnapshot,
+        video_analysis_preset: targetVideoPreset,
+        analysis_precision: targetVideoPreset,
+        analysis_focus: normalizedConfig.analysis_focus,
+        output_purpose: normalizedConfig.output_purpose,
+        custom_instruction: normalizedConfig.custom_instruction || null,
+        source_range: selected.type === "video" ? normalizedConfig.source_range : null,
+        source_ranges: selected.type === "video" ? normalizedConfig.source_ranges : [],
+        custom_keyframes: selected.type === "video" ? normalizedConfig.custom_keyframes : [],
+        include_audio: selected.type === "video" && normalizedConfig.include_audio,
+        workspace_snapshot_v3: workspaceSnapshot,
         ...(modelConfigId ? { model_config_id: Number(modelConfigId) } : {}),
       };
       clientRequestId = generateReverseClientRequestId(
@@ -686,16 +763,34 @@ export default function useReferenceParsing({
         subjectMode,
       };
       reverseContextsRef.current[mode] = context;
-      const operation = normalizeReverseOperation(await api.createReverseOperation({
+      if (typeof requestQuoteConfirmation !== "function") {
+        throw new Error("反推服务不可用，本次未执行反推。");
+      }
+      const executableRequest = {
         ...reverseBody,
         client_request_id: clientRequestId,
-      }));
-      if (!isCurrent()) {
-        try {
-          await api.cancelReverseOperation(operation.id);
-        } catch (cancelError) {
-          reportBackgroundError(cancelError, "cancel stale reverse operation after create");
+      };
+      const confirmation = await requestQuoteConfirmation({
+        kind: "reverse",
+        request: executableRequest,
+        clientRequestId,
+        execute: ({ request }) => api.createReverseOperation(request),
+      });
+      if (confirmation.status !== "executed") {
+        clearPendingReverseRequest(pendingReverseRequestRef, clientRequestId);
+        if (["quote_failed", "execution_failed"].includes(confirmation.status)) {
+          throw confirmation.error || new Error("反推提交失败。");
         }
+        if (confirmation.status === "invalidated" && isModeVisible(mode)) {
+          setMsg(confirmation.reason || "反推参数已变化，请重新执行。");
+        }
+        setWorkspacePatch({ reversing: false }, mode);
+        delete reverseContextsRef.current[mode];
+        return;
+      }
+      const operation = normalizeReverseOperation(confirmation.result);
+      if (!isCurrent()) {
+        await cancelStaleReverseOperation(operation);
         clearPendingReverseRequest(pendingReverseRequestRef, clientRequestId);
         if (reverseContextsRef.current[mode] === context) delete reverseContextsRef.current[mode];
         return;
@@ -774,6 +869,16 @@ export default function useReferenceParsing({
     });
   }
 
+  function trackReverseOperation(operation, mode = creationMode, context = {}) {
+    return startReverseTracking(operation, {
+      mode,
+      context: {
+        recovered: true,
+        ...context,
+      },
+    });
+  }
+
   function cancelAllReverseOperations() {
     const candidates = new Map();
     for (const [trackingKey, operation] of Object.entries(operationsByMode)) {
@@ -827,6 +932,7 @@ export default function useReferenceParsing({
     confirmReverseCover,
     cancelReverseOperationForMode,
     cancelRecoveredProfileOperationForMode,
+    trackReverseOperation,
     trackProfileReverseOperation,
     cancelAllReverseOperations,
     reverseOperation: operationsByMode[creationMode] || null,

@@ -26,30 +26,45 @@ from ..models import ReverseOperation, User
 from ..redis_client import redis_client
 from ..schemas import (
     PromptOptimizeIn,
-    PromptOptimizeOut,
+    ReverseBatchCreate,
+    ReverseBatchOut,
     ReverseIn,
     ReverseOperationConfirm,
     ReverseOperationCreate,
+    ReverseOperationFeedbackIn,
+    ReverseOperationFeedbackOut,
     ReverseOperationOut,
+    ReverseOperationRetryIn,
     ReverseOut,
+    ReverseResultApplyIn,
+    ReverseResultApplyOut,
+    ReverseResultRevisionIn,
+    ReverseResultRevisionOut,
+    ReverseShotGenerationPrepareIn,
+    ReverseShotGenerationPrepareOut,
+    ReverseShotReanalyzeIn,
+    ReverseShotTimelineEditIn,
 )
 from ..services import (
     asset_refs,
     credits,
-    gateway,
+    image_evidence_analysis,
+    locks,
+    project_collection,
+    reverse_lineage,
     reverse_operations,
     storage,
-    usage,
+    video_audio,
+    video_evidence_analysis,
     video_frames,
 )
-from ..services.config_store import (
-    ModelConfigResolutionError,
-    get_model_config,
-    get_setting,
-    resolve_model_config,
-)
+from ..services.config_store import get_setting
 from ..services.content_safety import assert_text_allowed
-from ..services.model_gateway_config import runtime_config_for_model
+from ..services.generation_image_evidence import (
+    ReviewedEvidenceMaskError,
+    validate_saved_reviewed_image_evidence,
+)
+from ..services.product_edition import is_launch_lite
 from ..services.rate_limit import incr_window
 from ..services.ssrf import SsrfError, assert_safe_user_asset_url
 
@@ -60,8 +75,8 @@ _VIDEO_EXTS = (".mp4", ".webm", ".mov")
 _UNSUPPORTED_VIDEO_EXTS = (".m3u8",)
 _REVERSE_RATE_LIMIT = 30
 _REVERSE_RATE_WINDOW = 3600
-_OPTIMIZE_RATE_LIMIT = 60
 _REVERSE_WS_TICKET_TTL_SECONDS = 60
+_CLIENT_REVISION_SOURCES = frozenset({"user_edit", "applied"})
 _REVERSE_STATUSES = {
     "queued", "running", "needs_confirmation", "succeeded", "failed", "canceled",
 }
@@ -73,6 +88,33 @@ _LEGACY_REVERSE_HEADERS = {
     "Sunset": "Wed, 16 Sep 2026 00:00:00 GMT",
     "Link": '</api/prompt/reverse-operations>; rel="successor-version"',
 }
+
+
+def _acquire_reverse_quote_lock(user_id: int, quote_id: int | None) -> tuple[str, str]:
+    if quote_id is None:
+        raise HTTPException(
+            400,
+            detail={"code": "QUOTE_REQUIRED", "message": "反推执行前必须确认有效报价"},
+        )
+    key = f"reverse:quote:consume:{int(user_id)}:{int(quote_id)}"
+    token = locks.acquire(key, ttl=60)
+    if not token:
+        raise HTTPException(
+            409,
+            detail={"code": "QUOTE_IN_USE", "message": "报价正在使用，请稍后刷新"},
+        )
+    return key, token
+
+
+@router.get("/reverse-analyzers/status")
+def reverse_analyzer_status(
+    _user: User = Depends(get_current_user),
+):
+    return {
+        "image": image_evidence_analysis.analyzer_health(),
+        "video": video_evidence_analysis.analyzer_health(),
+        "audio": video_audio.analyzer_health(),
+    }
 
 
 def _deprecated_reverse_endpoint(fn):
@@ -103,132 +145,23 @@ def _deprecated_reverse_endpoint(fn):
     return wrapped
 
 
-@router.post("/optimize", response_model=PromptOptimizeOut)
+@router.post("/optimize", status_code=410)
 def optimize_prompt_text(
-    body: PromptOptimizeIn,
-    db: Session = Depends(get_db),
-    user: User = Depends(get_current_user),
+    _body: PromptOptimizeIn,
+    _user: User = Depends(get_current_user),
 ):
-    source = body.prompt.strip()
-    _assert_text_allowed(db, source)
-    count = incr_window(f"prompt_optimize:{user.id}", _REVERSE_RATE_WINDOW)
-    if count > _OPTIMIZE_RATE_LIMIT:
-        raise HTTPException(429, "提示词优化过于频繁，请稍后再试")
-    optimizer_config_id = getattr(body, "optimizer_model_config_id", None)
-    try:
-        model = (
-            resolve_model_config(db, "prompt", optimizer_config_id)
-            if optimizer_config_id is not None
-            else get_model_config(db, "prompt")
-        )
-    except ModelConfigResolutionError as exc:
-        raise HTTPException(400, str(exc)) from exc
-    if model is None or not model.enabled:
-        raise HTTPException(503, "提示词优化模型未启用")
-
-    target_use = body.category
-    target_config_id = getattr(body, "target_model_config_id", None)
-    try:
-        target_model = (
-            resolve_model_config(db, target_use, target_config_id)
-            if target_config_id is not None
-            else get_model_config(db, target_use)
-        )
-    except ModelConfigResolutionError as exc:
-        raise HTTPException(400, str(exc)) from exc
-    if target_model is None or not target_model.enabled:
-        raise HTTPException(503, f"{target_use} 生成模型未启用")
-    target_model_id = target_model.model_id
-    target_model_provider = (
-        target_model.provider
-        or runtime_config_for_model(target_model, target_use).provider
-    )
-    # Deprecated raw target identifiers are accepted only when they match a
-    # catalog row selected by id/default. They can no longer route a request.
-    if body.target_model_id and body.target_model_id != target_model_id:
-        raise HTTPException(400, "target_model_id 与后台模型目录不匹配")
-    if body.target_model_provider and body.target_model_provider != target_model_provider:
-        raise HTTPException(400, "target_model_provider 与后台模型目录不匹配")
-    target_model_extra = dict(target_model.extra) if isinstance(target_model.extra, dict) else None
-    cost = max(0, int(model.cost_credits or 0))
-    if cost:
-        try:
-            credits.consume(
-                db,
-                user.id,
-                cost,
-                biz_type="prompt_optimize",
-                note=f"model={model.model_id}",
-            )
-        except credits.InsufficientCredits as e:
-            raise HTTPException(400, str(e)) from e
-    try:
-        result = gateway.optimize_prompt(
-            source,
-            model.model_id,
-            category=body.category,
-            product_mode=body.product_mode,
-            duration=body.duration,
-            subject_mode=body.subject_mode,
-            reference_type=body.reference_type,
-            subject_profile=body.subject_profile,
-            target_model_id=target_model_id,
-            target_model_provider=target_model_provider,
-            aspect_ratio=body.aspect_ratio,
-            resolution=body.resolution,
-            product_lock_mode=body.product_lock_mode,
-            product_video_template=body.product_video_template,
-            target_model_extra=target_model_extra,
-            gateway_config=runtime_config_for_model(model, "prompt"),
-        )
-        optimized = str(result.get("prompt") or "").strip()
-        if not optimized:
-            raise gateway.GatewayError("提示词优化模型返回了空结果")
-        _assert_text_allowed(db, optimized)
-    except Exception as e:
-        usage.record_call(
-            db,
-            kind="prompt_optimize",
-            model_id=model.model_id,
-            model_config_id=getattr(model, "id", None),
-            user_id=user.id,
-            status="failed",
-            detail={
-                "category": body.category,
-                "product_mode": body.product_mode,
-                "error": str(e)[:300],
-            },
-        )
-        if cost:
-            credits.refund_consumed(
-                db,
-                user.id,
-                cost,
-                biz_type="prompt_optimize",
-                note=f"failed model={model.model_id}",
-            )
-        if isinstance(e, gateway.GatewayError):
-            raise HTTPException(502, f"提示词优化失败：{e}") from e
-        raise
-    usage.record_call(
-        db,
-        kind="prompt_optimize",
-        model_id=model.model_id,
-        model_config_id=getattr(model, "id", None),
-        user_id=user.id,
-        status="ok",
-        latency_ms=result.get("latency_ms"),
-        usage=result.get("usage"),
-        detail={"category": body.category, "product_mode": body.product_mode},
-    )
-    return PromptOptimizeOut(
-        prompt=optimized,
-        model_id=model.model_id,
-        optimizer_model_id=model.model_id,
-        optimizer_model_config_id=getattr(model, "id", None),
-        optimizer_model_name=(getattr(model, "display_name", None) or model.model_id),
-        compiler_metadata=result.get("compiler_metadata"),
-        context_metadata=result.get("context_metadata"),
+    raise HTTPException(
+        status_code=410,
+        detail={
+            "code": "PROMPT_OPTIMIZATION_MOVED",
+            "message": (
+                "旧提示词优化端点已退役，请先创建统一报价，"
+                "再通过 Studio 提示词优化建议流程执行。"
+            ),
+            "quote_endpoint": "/api/quotes",
+            "quote_kind": "prompt_optimization",
+            "proposal_endpoint": "/api/studio/prompt-optimizations",
+        },
     )
 
 
@@ -241,7 +174,21 @@ def _is_unsupported_video_url(url: str) -> bool:
 
 
 def _is_video_source(body: ReverseIn) -> bool:
-    return body.source_type == "video" or _looks_like_video_url(body.asset_url)
+    return body.source_type == "video" or _looks_like_video_url(str(body.asset_url or ""))
+
+
+def _reverse_sources(body: ReverseIn | ReverseOperationCreate) -> list[dict]:
+    sources = getattr(body, "sources", None) or []
+    if sources:
+        return [
+            item.model_dump(mode="json") if hasattr(item, "model_dump") else dict(item)
+            for item in sources
+        ]
+    return [{
+        "asset_url": str(body.asset_url or ""),
+        "source_type": body.source_type or ("video" if _is_video_source(body) else "image"),
+        "role": "primary",
+    }]
 
 
 def _gateway_ref(db: Session, user: User, url: str | None) -> str | None:
@@ -259,6 +206,31 @@ def _gateway_ref(db: Session, user: User, url: str | None) -> str | None:
         raise HTTPException(404, str(e))
 
 
+def _gateway_ref_with_content_hash(
+    db: Session,
+    user: User,
+    url: str | None,
+) -> tuple[str | None, str | None]:
+    try:
+        resolved = asset_refs.gateway_ref_for_user_asset(
+            db,
+            user.id,
+            url,
+            max_side=REVERSE_IMAGE_REFERENCE_MAX_SIDE,
+            prefer_original_upload=True,
+            quality=REVERSE_IMAGE_REFERENCE_QUALITY,
+            subsampling=0,
+            return_content_hash=True,
+        )
+    except asset_refs.AssetRefError as e:
+        raise HTTPException(404, str(e))
+    if resolved is None:
+        return None, None
+    if isinstance(resolved, tuple):
+        return resolved
+    return resolved, reverse_lineage.data_uri_content_hash(resolved)
+
+
 def _collect_refs(
     body: ReverseIn,
     db: Session,
@@ -267,15 +239,42 @@ def _collect_refs(
     frame_budget: int | None = None,
     video_preset: str | None = None,
     gateway_mock: bool | None = None,
-) -> tuple[list[str], dict | None]:
+    include_source_fingerprints: bool = False,
+) -> tuple[list[str], dict | None] | tuple[list[str], dict | None, list[dict]]:
     """Resolve the asset into one or more image refs (URLs or base64 data-URIs)
     to feed the vision model. The image-target/video-url mismatch is rejected by
     the caller before this runs."""
     if not _is_video_source(body):
-        ref = _gateway_ref(db, user, body.asset_url)
-        return ([ref] if ref else []), None
+        refs = []
+        reference_context = []
+        source_fingerprints = []
+        for source in _reverse_sources(body):
+            if include_source_fingerprints:
+                ref, content_hash = _gateway_ref_with_content_hash(
+                    db, user, source.get("asset_url")
+                )
+            else:
+                ref = _gateway_ref(db, user, source.get("asset_url"))
+                content_hash = None
+            if ref:
+                refs.append(ref)
+                if content_hash:
+                    source_fingerprints.append(reverse_lineage.build_source_fingerprint(
+                        source_index=len(refs),
+                        content_hash=content_hash,
+                        locator=source.get("asset_url"),
+                    ))
+                reference_context.append({
+                    "role": source.get("role") or "primary",
+                    "label": source.get("label"),
+                    "source_type": "image",
+                })
+        analysis = {"reference_context": reference_context} if len(refs) > 1 else None
+        if include_source_fingerprints:
+            return refs, analysis, source_fingerprints
+        return refs, analysis
 
-    key = storage.key_from_url(body.asset_url)
+    key = storage.key_from_url(str(body.asset_url or ""))
     local_video_path = None
     sample = None
     if key:
@@ -289,41 +288,97 @@ def _collect_refs(
     # Mock mode must still exercise FFmpeg for user-owned local uploads so the
     # offline E2E path can validate real keyframe evidence. Keep remote video
     # downloads disabled in mock mode to avoid unexpected network access.
+    source_ranges, range_start, range_end, custom_timestamps = _video_selection_payload(body)
     if video_frames.available() and (local_video_path is not None or not effective_gateway_mock):
         n_frames = max(1, int(frame_budget or settings.reverse_video_frames or 1))
+        sample_kwargs = {"n": n_frames, "preset": video_preset}
+        if source_ranges or custom_timestamps:
+            sample_kwargs.update({
+                "start_seconds": range_start,
+                "end_seconds": range_end,
+                "source_ranges": source_ranges,
+                "custom_timestamps": custom_timestamps,
+            })
         try:
             if local_video_path is not None:
                 sample = video_frames.sample_video_from_path(
                     str(local_video_path),
-                    n=n_frames,
-                    preset=video_preset,
+                    **sample_kwargs,
                 )
             else:
                 sample = video_frames.sample_video(
-                    body.asset_url,
-                    n=n_frames,
-                    preset=video_preset,
+                    str(body.asset_url or ""),
+                    **sample_kwargs,
                 )
         except asset_refs.AssetRefError as e:
             raise HTTPException(404, str(e))
+        except video_frames.VideoSelectionError as e:
+            # A user-selected time outside the real source is not a decoder
+            # failure and must never be converted into cover-mode analysis.
+            raise HTTPException(422, str(e)) from e
         except Exception as e:  # noqa: BLE001
             log.warning("video keyframe sampling failed, using cover fallback: %s", e)
             sample = None
         if sample and sample.frames:
             analysis = sample.analysis()
-            analysis["analysis_mode"] = "keyframes"
-            return (
-                [
+            analysis["analysis_mode"] = (
+                "keyframes_multi_segment" if len(source_ranges) > 1 else "keyframes"
+            )
+            refs = [
                     "data:image/jpeg;base64," + base64.b64encode(frame.jpeg).decode()
                     for frame in sample.frames
-                ],
-                analysis,
-            )
+                ]
+            source_fingerprints = [
+                reverse_lineage.build_source_fingerprint(
+                    source_index=index,
+                    content_hash=reverse_lineage.bytes_content_hash(frame.jpeg),
+                    locator=f"{body.asset_url}#sampled-frame:{index}",
+                    method="sampled_frame_sha256",
+                )
+                for index, frame in enumerate(sample.frames, start=1)
+            ]
+            reference_context = [
+                {
+                    "role": "frame",
+                    "source_type": "video",
+                    **row,
+                }
+                for row in analysis.get("sampled_frames") or []
+            ]
+            for source in _reverse_sources(body)[1:]:
+                if include_source_fingerprints:
+                    ref, content_hash = _gateway_ref_with_content_hash(
+                        db, user, source.get("asset_url")
+                    )
+                else:
+                    ref = _gateway_ref(db, user, source.get("asset_url"))
+                    content_hash = None
+                if ref:
+                    refs.append(ref)
+                    if content_hash:
+                        source_fingerprints.append(reverse_lineage.build_source_fingerprint(
+                            source_index=len(refs),
+                            content_hash=content_hash,
+                            locator=source.get("asset_url"),
+                        ))
+                    reference_context.append({
+                        "role": source.get("role") or "style",
+                        "label": source.get("label"),
+                        "source_type": "image",
+                    })
+            analysis["reference_context"] = reference_context
+            if include_source_fingerprints:
+                return refs, analysis, source_fingerprints
+            return refs, analysis
 
     # fall back to a provided cover/keyframe image
     cover = body.fallback_image
     if cover and not _looks_like_video_url(cover):
-        ref = _gateway_ref(db, user, cover)
+        if include_source_fingerprints:
+            ref, content_hash = _gateway_ref_with_content_hash(db, user, cover)
+        else:
+            ref = _gateway_ref(db, user, cover)
+            content_hash = None
         if sample:
             analysis = sample.analysis()
         else:
@@ -344,7 +399,19 @@ def _collect_refs(
             "analysis_mode": "cover_fallback",
             "degraded_reason": "未能从源视频抽取可用关键帧，已降级为封面单帧分析",
         })
-        return ([ref] if ref else []), analysis
+        refs = [ref] if ref else []
+        if include_source_fingerprints:
+            fingerprints = (
+                [reverse_lineage.build_source_fingerprint(
+                    source_index=1,
+                    content_hash=content_hash,
+                    locator=cover,
+                )]
+                if ref and content_hash
+                else []
+            )
+            return refs, analysis, fingerprints
+        return refs, analysis
     raise HTTPException(400, "无法从该视频抽取关键帧,请改用封面图进行反推")
 
 
@@ -364,6 +431,8 @@ def _reverse_request_fingerprint(body: ReverseIn) -> str:
         "fallback_image": body.fallback_image,
         "model_config_id": getattr(body, "model_config_id", None),
     }
+    if body.project_id is not None:
+        payload["project_id"] = int(body.project_id)
     raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(raw.encode()).hexdigest()
 
@@ -374,9 +443,19 @@ def _reverse_operation_response(op: ReverseOperation) -> ReverseOut:
     final_text = str(result.get("final_text") or "")
     if not final_text:
         raise HTTPException(409, "该反推请求结果不完整,请重新发起")
+    evidence_fields = {
+        "evidence_type", "bbox", "field_key", "evidence_text", "confidence",
+        "source_index", "fact_status", "protected", "editable",
+    }
+    legacy_image_evidence = [
+        {key: row[key] for key in evidence_fields if key in row}
+        for row in result.get("image_evidence", [])
+        if isinstance(row, dict)
+    ]
     return ReverseOut(
         structured=structured,
         final_text=final_text,
+        image_evidence=legacy_image_evidence,
         charged_credits=int(op.cost_settled or op.charged_credits or 0),
         reference_count=max(1, int(op.reference_count or 1)),
         video_analysis=(
@@ -411,6 +490,8 @@ def _existing_reverse_operation_replay(
         return None
     if existing.request_fingerprint != fingerprint:
         raise HTTPException(409, "client_request_id 已用于不同反推请求")
+    if existing.error_code == "RESULT_EXPIRED":
+        raise HTTPException(409, "该反推结果已超过保留期，请使用新的 client_request_id 重新发起")
     if existing.status == "succeeded":
         return _reverse_operation_response(existing)
     if existing.status == "needs_confirmation":
@@ -423,7 +504,16 @@ def _existing_reverse_operation_replay(
 def _video_duration_for_reverse(body: ReverseIn, db: Session, user: User) -> float | None:
     if not _is_video_source(body):
         return None
-    key = storage.key_from_url(body.asset_url)
+    source_ranges = list(getattr(body, "source_ranges", None) or [])
+    if source_ranges:
+        return sum(
+            max(0.0, float(item.end_seconds) - float(item.start_seconds))
+            for item in source_ranges
+        )
+    source_range = getattr(body, "source_range", None)
+    if source_range is not None:
+        return max(0.0, float(source_range.end_seconds) - float(source_range.start_seconds))
+    key = storage.key_from_url(str(body.asset_url or ""))
     if not key:
         return None
     try:
@@ -433,6 +523,56 @@ def _video_duration_for_reverse(body: ReverseIn, db: Session, user: User) -> flo
     meta = video_frames.probe_media(str(path))
     duration = meta.get("duration")
     return float(duration) if duration else None
+
+
+def _video_selection_payload(body):
+    source_ranges = [
+        item.model_dump(mode="json") if hasattr(item, "model_dump") else dict(item)
+        for item in (getattr(body, "source_ranges", None) or [])
+    ]
+    source_range = getattr(body, "source_range", None)
+    if not source_ranges and source_range is not None:
+        source_ranges = [
+            source_range.model_dump(mode="json")
+            if hasattr(source_range, "model_dump")
+            else dict(source_range)
+        ]
+    range_start = float(getattr(source_range, "start_seconds", 0) or 0)
+    range_end = getattr(source_range, "end_seconds", None)
+    custom_timestamps = list(getattr(body, "custom_keyframes", None) or [])
+    return source_ranges, range_start, range_end, custom_timestamps
+
+
+def _validate_local_video_selection(
+    body: ReverseIn | ReverseOperationCreate,
+    db: Session,
+    user: User,
+) -> None:
+    """Reject invalid local-video selections before any credits are frozen."""
+    if not _is_video_source(body):
+        return
+    key = storage.key_from_url(str(body.asset_url or ""))
+    if not key:
+        return
+    try:
+        path = asset_refs.generated_video_reference_path(db, user.id, key)
+    except asset_refs.AssetRefError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    metadata = video_frames.probe_media(str(path))
+    raw_duration = metadata.get("duration_seconds") or metadata.get("duration")
+    if not raw_duration:
+        return
+    source_ranges, range_start, range_end, custom_timestamps = _video_selection_payload(body)
+    try:
+        video_frames.validate_video_selection(
+            source_ranges=source_ranges,
+            start_seconds=range_start,
+            end_seconds=range_end,
+            custom_timestamps=custom_timestamps,
+            total_duration=float(raw_duration),
+        )
+    except video_frames.VideoSelectionError as exc:
+        raise HTTPException(400, str(exc)) from exc
 
 
 def _accepts_keyword(fn, name: str) -> bool:
@@ -493,6 +633,145 @@ def _legacy_cover_confirmation_required(operation: ReverseOperation) -> HTTPExce
 
 
 @router.post(
+    "/reverse-batches",
+    response_model=ReverseBatchOut,
+    status_code=202,
+)
+def create_reverse_batch(
+    body: ReverseBatchCreate,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    lock_key, lock_token = _acquire_reverse_quote_lock(user.id, body.quote_id)
+    try:
+        try:
+            replay = reverse_operations.find_quoted_idempotent_batch(
+                db,
+                user_id=user.id,
+                body=body,
+            )
+        except reverse_operations.ReverseOperationConflict as exc:
+            raise HTTPException(409, str(exc)) from exc
+        except reverse_operations.ReverseOperationInvalid as exc:
+            raise HTTPException(400, str(exc)) from exc
+        if replay is not None:
+            return reverse_operations.serialize_batch(db, replay, include_items=True)
+
+        if body.project_id is not None:
+            try:
+                project_collection.require_owned_project(db, user.id, body.project_id)
+            except project_collection.ProjectNotFound as exc:
+                raise HTTPException(404, str(exc)) from exc
+        operation_bodies = reverse_operations.batch_operation_bodies(body)
+        for operation_body in operation_bodies:
+            for source in operation_body.sources:
+                _validate_reverse_asset_request(
+                    db,
+                    asset_url=source.asset_url,
+                    fallback_image=(
+                        operation_body.fallback_image
+                        if source.role == "primary"
+                        else None
+                    ),
+                    target=operation_body.target,
+                    source_type=source.source_type,
+                )
+            _validate_local_video_selection(operation_body, db, user)
+        if not get_setting(db, "reverse_prompt_enabled", True):
+            raise HTTPException(403, "反推功能已被管理员关闭")
+        for _ in operation_bodies:
+            _rate_limit(user.id)
+        try:
+            batch, created, operation_ids = reverse_operations.create_quoted_batch(
+                db,
+                user_id=user.id,
+                body=body,
+            )
+        except reverse_operations.ReverseOperationConflict as exc:
+            raise HTTPException(409, str(exc)) from exc
+        except reverse_operations.ReverseOperationInvalid as exc:
+            raise HTTPException(400, str(exc)) from exc
+        except project_collection.ProjectNotFound as exc:
+            raise HTTPException(404, str(exc)) from exc
+        except credits.InsufficientCredits as exc:
+            raise HTTPException(400, str(exc)) from exc
+    finally:
+        locks.release(lock_key, lock_token)
+
+    if created:
+        for operation_id in operation_ids:
+            try:
+                reverse_operations.enqueue_operation(operation_id)
+            except Exception:  # noqa: BLE001
+                log.exception("failed to enqueue reverse batch item %s", operation_id)
+                reverse_operations.fail_queued_submission(
+                    operation_id,
+                    code="BROKER_UNAVAILABLE",
+                    error="反推任务队列暂时不可用,该批次单项已退回冻结积分",
+                )
+    db.expire_all()
+    batch = reverse_operations.get_owned_batch(
+        db,
+        batch_id=int(batch.id),
+        user_id=user.id,
+    )
+    return reverse_operations.serialize_batch(db, batch, include_items=True)
+
+
+@router.get("/reverse-batches", response_model=list[ReverseBatchOut])
+def list_reverse_batches(
+    limit: int = 30,
+    offset: int = 0,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    batches = reverse_operations.list_owned_batches(
+        db,
+        user_id=user.id,
+        limit=limit,
+        offset=offset,
+    )
+    return [
+        reverse_operations.serialize_batch(db, batch, include_items=False)
+        for batch in batches
+    ]
+
+
+@router.get("/reverse-batches/{batch_id}", response_model=ReverseBatchOut)
+def get_reverse_batch(
+    batch_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    try:
+        batch = reverse_operations.get_owned_batch(
+            db,
+            batch_id=batch_id,
+            user_id=user.id,
+        )
+    except reverse_operations.ReverseOperationNotFound as exc:
+        raise HTTPException(404, str(exc)) from exc
+    return reverse_operations.serialize_batch(db, batch, include_items=True)
+
+
+@router.post("/reverse-batches/{batch_id}/cancel", response_model=ReverseBatchOut)
+def cancel_reverse_batch(
+    batch_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    try:
+        batch = reverse_operations.request_batch_cancel(
+            db,
+            batch_id=batch_id,
+            user_id=user.id,
+        )
+    except reverse_operations.ReverseOperationNotFound as exc:
+        raise HTTPException(404, str(exc)) from exc
+    return reverse_operations.serialize_batch(db, batch, include_items=True)
+
+
+@router.post(
     "/reverse-operations",
     response_model=ReverseOperationOut,
     status_code=202,
@@ -502,38 +781,56 @@ def create_reverse_operation(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
+    if is_launch_lite() and body.project_id is not None:
+        raise HTTPException(404, "not found")
+    lock_key, lock_token = _acquire_reverse_quote_lock(user.id, body.quote_id)
     try:
-        replay = reverse_operations.find_idempotent_operation(
-            db,
-            user_id=user.id,
-            body=body,
-        )
-    except reverse_operations.ReverseOperationConflict as exc:
-        raise HTTPException(409, str(exc)) from exc
-    if replay is not None:
-        return reverse_operations.serialize_operation(replay)
-    _validate_reverse_asset_request(
-        db,
-        asset_url=body.asset_url,
-        fallback_image=body.fallback_image,
-        target=body.target,
-        source_type=body.source_type,
-    )
-    if not get_setting(db, "reverse_prompt_enabled", True):
-        raise HTTPException(403, "反推功能已被管理员关闭")
-    _rate_limit(user.id)
-    try:
-        operation, created = reverse_operations.create_operation(
-            db,
-            user_id=user.id,
-            body=body,
-        )
-    except reverse_operations.ReverseOperationConflict as exc:
-        raise HTTPException(409, str(exc)) from exc
-    except reverse_operations.ReverseOperationInvalid as exc:
-        raise HTTPException(400, str(exc)) from exc
-    except credits.InsufficientCredits as exc:
-        raise HTTPException(400, str(exc)) from exc
+        try:
+            replay = reverse_operations.find_quoted_idempotent_operation(
+                db,
+                user_id=user.id,
+                body=body,
+            )
+        except reverse_operations.ReverseOperationConflict as exc:
+            raise HTTPException(409, str(exc)) from exc
+        except reverse_operations.ReverseOperationInvalid as exc:
+            raise HTTPException(400, str(exc)) from exc
+        if replay is not None:
+            return reverse_operations.serialize_operation(replay)
+
+        if body.project_id is not None:
+            try:
+                project_collection.require_owned_project(db, user.id, body.project_id)
+            except project_collection.ProjectNotFound as exc:
+                raise HTTPException(404, str(exc)) from exc
+        for source in body.sources:
+            _validate_reverse_asset_request(
+                db,
+                asset_url=source.asset_url,
+                fallback_image=body.fallback_image if source.role == "primary" else None,
+                target=body.target,
+                source_type=source.source_type,
+            )
+        _validate_local_video_selection(body, db, user)
+        if not get_setting(db, "reverse_prompt_enabled", True):
+            raise HTTPException(403, "反推功能已被管理员关闭")
+        _rate_limit(user.id)
+        try:
+            operation, created = reverse_operations.create_quoted_operation(
+                db,
+                user_id=user.id,
+                body=body,
+            )
+        except reverse_operations.ReverseOperationConflict as exc:
+            raise HTTPException(409, str(exc)) from exc
+        except reverse_operations.ReverseOperationInvalid as exc:
+            raise HTTPException(400, str(exc)) from exc
+        except project_collection.ProjectNotFound as exc:
+            raise HTTPException(404, str(exc)) from exc
+        except credits.InsufficientCredits as exc:
+            raise HTTPException(400, str(exc)) from exc
+    finally:
+        locks.release(lock_key, lock_token)
     if created:
         try:
             reverse_operations.enqueue_operation(int(operation.id))
@@ -566,6 +863,10 @@ def create_reverse_operation(
 @router.get("/reverse-operations", response_model=list[ReverseOperationOut])
 def list_reverse_operations(
     status: str | None = None,
+    target: str | None = None,
+    source_type: str | None = None,
+    analysis_focus: str | None = None,
+    include_audio: bool | None = None,
     limit: int = 30,
     offset: int = 0,
     db: Session = Depends(get_db),
@@ -577,6 +878,10 @@ def list_reverse_operations(
         db,
         user_id=user.id,
         status=status,
+        target=target,
+        source_type=source_type,
+        analysis_focus=analysis_focus,
+        include_audio=include_audio,
         limit=limit,
         offset=offset,
     )
@@ -594,6 +899,331 @@ def get_reverse_operation(
     except reverse_operations.ReverseOperationNotFound as exc:
         raise HTTPException(404, str(exc)) from exc
     return reverse_operations.serialize_operation(operation)
+
+
+@router.get(
+    "/reverse-operations/{operation_id}/revisions",
+    response_model=list[ReverseResultRevisionOut],
+)
+def list_reverse_operation_revisions(
+    operation_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    try:
+        return reverse_operations.list_result_revisions(
+            db, operation_id=operation_id, user_id=user.id
+        )
+    except reverse_operations.ReverseOperationNotFound as exc:
+        raise HTTPException(404, str(exc)) from exc
+
+
+@router.post(
+    "/reverse-operations/{operation_id}/revisions",
+    response_model=ReverseResultRevisionOut,
+)
+def create_reverse_operation_revision(
+    operation_id: int,
+    body: ReverseResultRevisionIn,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    if body.source not in _CLIENT_REVISION_SOURCES:
+        raise HTTPException(422, "客户端只能创建 user_edit 或 applied 反推结果版本")
+    try:
+        operation = reverse_operations.get_owned_operation(db, operation_id, user.id)
+        validate_saved_reviewed_image_evidence(
+            operation,
+            body.payload,
+            require_all_confirmed=body.source == "applied",
+        )
+    except reverse_operations.ReverseOperationNotFound as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except ReviewedEvidenceMaskError as exc:
+        raise HTTPException(422, f"图片证据审阅数据无效：{exc}") from exc
+    _assert_text_allowed(db, body.payload)
+    try:
+        return reverse_operations.create_result_revision(
+            db,
+            operation_id=operation_id,
+            user_id=user.id,
+            source=body.source,
+            payload=body.payload,
+            parent_revision_id=body.parent_revision_id,
+            clear_image_evidence=body.clear_image_evidence,
+        )
+    except reverse_operations.ReverseOperationNotFound as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except reverse_operations.ReverseOperationConflict as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except reverse_operations.ReverseOperationInvalid as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
+@router.post(
+    "/reverse-operations/{operation_id}/apply",
+    response_model=ReverseResultApplyOut,
+)
+def apply_reverse_operation_result(
+    operation_id: int,
+    body: ReverseResultApplyIn,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    _assert_text_allowed(db, body.payload)
+    try:
+        edited, applied = reverse_operations.apply_result_revision(
+            db,
+            operation_id=operation_id,
+            user_id=user.id,
+            payload=body.payload,
+            parent_revision_id=body.parent_revision_id,
+            clear_image_evidence=body.clear_image_evidence,
+        )
+        return {"user_edit": edited, "applied": applied}
+    except reverse_operations.ReverseOperationNotFound as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except reverse_operations.ReverseOperationConflict as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except reverse_operations.ReverseOperationInvalid as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
+@router.post(
+    "/reverse-operations/{operation_id}/shots/edit",
+    response_model=ReverseResultRevisionOut,
+)
+def edit_reverse_operation_shots(
+    operation_id: int,
+    body: ReverseShotTimelineEditIn,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    try:
+        return reverse_operations.edit_shot_timeline(
+            db, operation_id=operation_id, user_id=user.id, body=body,
+        )
+    except reverse_operations.ReverseOperationNotFound as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except reverse_operations.ReverseOperationConflict as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except reverse_operations.ReverseOperationInvalid as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
+@router.post(
+    "/reverse-operations/{operation_id}/shots/reanalyze",
+    response_model=ReverseOperationOut,
+    status_code=202,
+)
+def reanalyze_reverse_operation_shot(
+    operation_id: int,
+    body: ReverseShotReanalyzeIn,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    try:
+        _rate_limit(user.id)
+        operation_body, reanalysis_context = reverse_operations.shot_reanalysis_body(
+            db,
+            operation_id=operation_id,
+            user_id=user.id,
+            client_request_id=body.client_request_id,
+            shot_id=body.shot_id,
+            analysis_precision=body.analysis_precision,
+            include_audio=body.include_audio,
+        )
+        operation, created = reverse_operations.create_operation(
+            db, user_id=user.id, body=operation_body,
+        )
+        operation = reverse_operations.attach_shot_reanalysis_context(
+            db,
+            operation=operation,
+            user_id=user.id,
+            context=reanalysis_context,
+        )
+        if created:
+            try:
+                reverse_operations.enqueue_operation(int(operation.id))
+            except Exception as exc:  # noqa: BLE001
+                if reverse_operations.fail_queued_submission(
+                    int(operation.id),
+                    code="BROKER_UNAVAILABLE",
+                    error="单镜头重分析任务队列暂时不可用,已退回冻结积分",
+                ):
+                    raise HTTPException(503, "单镜头重分析任务队列暂时不可用") from exc
+                db.expire_all()
+                operation = db.get(ReverseOperation, int(operation.id)) or operation
+        return reverse_operations.serialize_operation(operation)
+    except reverse_operations.ReverseOperationNotFound as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except reverse_operations.ReverseOperationConflict as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except reverse_operations.ReverseOperationInvalid as exc:
+        raise HTTPException(422, str(exc)) from exc
+    except credits.InsufficientCredits as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@router.post(
+    "/reverse-operations/{operation_id}/shots/prepare-generation",
+    response_model=ReverseShotGenerationPrepareOut,
+)
+def prepare_reverse_operation_shot_generation(
+    operation_id: int,
+    body: ReverseShotGenerationPrepareIn,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    try:
+        return reverse_operations.prepare_shot_generation(
+            db,
+            operation_id=operation_id,
+            user_id=user.id,
+            shot_id=body.shot_id,
+            revision_id=body.revision_id,
+            client_request_id=body.client_request_id,
+            model_config_id=body.model_config_id,
+            params=body.params,
+        )
+    except reverse_operations.ReverseOperationNotFound as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except reverse_operations.ReverseOperationConflict as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except reverse_operations.ReverseOperationInvalid as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
+@router.get(
+    "/reverse-operations/{operation_id}/feedback",
+    response_model=ReverseOperationFeedbackOut | None,
+)
+def get_reverse_operation_feedback(
+    operation_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    try:
+        return reverse_operations.get_feedback(
+            db,
+            operation_id=operation_id,
+            user_id=user.id,
+        )
+    except reverse_operations.ReverseOperationNotFound as exc:
+        raise HTTPException(404, str(exc)) from exc
+
+
+@router.put(
+    "/reverse-operations/{operation_id}/feedback",
+    response_model=ReverseOperationFeedbackOut,
+)
+def save_reverse_operation_feedback(
+    operation_id: int,
+    body: ReverseOperationFeedbackIn,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    _assert_text_allowed(db, body.note)
+    try:
+        return reverse_operations.upsert_feedback(
+            db,
+            operation_id=operation_id,
+            user_id=user.id,
+            rating=body.rating,
+            issue_types=body.issue_types,
+            note=body.note,
+        )
+    except reverse_operations.ReverseOperationNotFound as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except reverse_operations.ReverseOperationConflict as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+
+@router.post(
+    "/reverse-operations/{operation_id}/retry",
+    response_model=ReverseOperationOut,
+    status_code=202,
+)
+def retry_reverse_operation(
+    operation_id: int,
+    body: ReverseOperationRetryIn,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    lock_key, lock_token = _acquire_reverse_quote_lock(user.id, body.quote_id)
+    try:
+        previous, retry_body = reverse_operations.build_retry_operation_body(
+            db,
+            operation_id=operation_id,
+            user_id=user.id,
+            client_request_id=body.client_request_id,
+            model_config_id=body.model_config_id,
+            quote_id=body.quote_id,
+        )
+        replay = reverse_operations.find_quoted_idempotent_operation(
+            db,
+            user_id=user.id,
+            body=retry_body,
+            retry_of_operation_id=int(previous.id),
+        )
+        if replay is not None:
+            return reverse_operations.serialize_operation(replay)
+        context = dict(previous.request_context or {})
+        sources = context.get("sources") if isinstance(context.get("sources"), list) else []
+        if sources:
+            for source in sources:
+                _validate_reverse_asset_request(
+                    db,
+                    asset_url=str(source.get("asset_url") or ""),
+                    fallback_image=(
+                        context.get("fallback_image") if source.get("role") == "primary" else None
+                    ),
+                    target=previous.target,
+                    source_type=source.get("source_type"),
+                )
+        else:
+            _validate_reverse_asset_request(
+                db,
+                asset_url=previous.asset_url,
+                fallback_image=context.get("fallback_image"),
+                target=previous.target,
+                source_type=context.get("source_type"),
+            )
+        operation, created = reverse_operations.retry_operation(
+            db,
+            operation_id=operation_id,
+            user_id=user.id,
+            client_request_id=body.client_request_id,
+            quote_id=body.quote_id,
+            model_config_id=body.model_config_id,
+        )
+    except reverse_operations.ReverseOperationNotFound as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except reverse_operations.ReverseOperationConflict as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except reverse_operations.ReverseOperationInvalid as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except project_collection.ProjectNotFound as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except credits.InsufficientCredits as exc:
+        raise HTTPException(400, str(exc)) from exc
+    finally:
+        locks.release(lock_key, lock_token)
+    if created:
+        try:
+            reverse_operations.enqueue_operation(int(operation.id))
+        except Exception as exc:  # noqa: BLE001
+            log.exception("failed to enqueue reverse retry %s", operation.id)
+            if reverse_operations.fail_queued_submission(
+                int(operation.id),
+                code="BROKER_UNAVAILABLE",
+                error="反推任务队列暂时不可用,已退回冻结积分",
+            ):
+                raise HTTPException(503, "反推任务队列暂时不可用,请稍后重试") from exc
+    db.expire_all()
+    return reverse_operations.serialize_operation(
+        db.get(ReverseOperation, int(operation.id)) or operation
+    )
 
 
 @router.post(
@@ -697,6 +1327,13 @@ def create_reverse_operation_ws_ticket(
 @_deprecated_reverse_endpoint
 def reverse(body: ReverseIn, db: Session = Depends(get_db),
             user: User = Depends(get_current_user), response: Response = None):
+    if is_launch_lite() and body.project_id is not None:
+        raise HTTPException(404, "not found")
+    if body.project_id is not None:
+        try:
+            project_collection.require_owned_project(db, user.id, body.project_id)
+        except project_collection.ProjectNotFound as exc:
+            raise HTTPException(404, str(exc)) from exc
     replay = _existing_reverse_operation_replay(db, user_id=user.id, body=body)
     if replay is not None:
         return replay
@@ -707,6 +1344,7 @@ def reverse(body: ReverseIn, db: Session = Depends(get_db),
         target=body.target,
         source_type=body.source_type,
     )
+    _validate_local_video_selection(body, db, user)
     if not get_setting(db, "reverse_prompt_enabled", True):
         raise HTTPException(403, "反推功能已被管理员关闭")
     _rate_limit(user.id)
@@ -722,6 +1360,8 @@ def reverse(body: ReverseIn, db: Session = Depends(get_db),
     except reverse_operations.ReverseOperationInvalid as exc:
         status_code = 403 if str(exc) == "反推功能已被管理员关闭" else 400
         raise HTTPException(status_code, str(exc)) from exc
+    except project_collection.ProjectNotFound as exc:
+        raise HTTPException(404, str(exc)) from exc
     except credits.InsufficientCredits as exc:
         raise HTTPException(400, str(exc)) from exc
 

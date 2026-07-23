@@ -3,31 +3,27 @@
 import { useEffect, useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
+import { ListChecks, Menu, X } from "lucide-react";
 import { api, clearToken, loginPath } from "../lib/api";
 import { reportBackgroundError } from "../lib/errorHandling";
 import BrandLogo from "./BrandLogo";
+import GlobalTaskCenter from "./GlobalTaskCenter";
+import useUnifiedTaskCenter from "../hooks/useUnifiedTaskCenter";
+import { APP_NAV_ITEMS, canAccessNavItem } from "./AppShellContract";
+import { useAppShellContext } from "./AppShellContext";
 
-const LINKS = [
-  ["studio", "创作", "/"],
-  ["prompts", "提示词库", "/prompts"],
-  ["profile", "我的资产", "/profile"],
-  ["recharge", "充值", "/recharge"],
-  ["history", "历史", "/history"],
-];
-const DESKTOP_LINKS = [...LINKS, ["admin", "管理后台", "/admin"]];
-const LINK_WIDTH = {
-  studio: "w-16",
-  prompts: "w-24",
-  profile: "w-24",
-  recharge: "w-16",
-  history: "w-16",
-  admin: "w-24",
-};
+export default function Nav({ me, active, items = APP_NAV_ITEMS, shellOwner = false }) {
+  const shell = useAppShellContext();
+  if (shell?.managed && !shellOwner) return null;
+  return <NavContent me={me} active={active} items={items} shell={shellOwner ? shell : null} />;
+}
 
-export default function Nav({ me, active }) {
+function NavContent({ me, active, items, shell }) {
   const router = useRouter();
   const [open, setOpen] = useState(false);
+  const [taskCenterOpen, setTaskCenterOpen] = useState(false);
   const [loginHref, setLoginHref] = useState("/login");
+  const taskCenter = useUnifiedTaskCenter({ enabled: Boolean(me), limit: 8 });
 
   useEffect(() => {
     setLoginHref(loginPath());
@@ -36,12 +32,12 @@ export default function Nav({ me, active }) {
   async function logout() {
     try { await api.logout(); } catch (e) { reportBackgroundError(e, "logout request"); }
     clearToken();
+    shell?.clearSession?.();
     router.push("/login");
   }
 
-  const mobileLinks = me?.is_admin
-    ? [...LINKS, ["admin", "管理后台", "/admin"]]
-    : LINKS;
+  const navigationItems = Array.isArray(items) && items.length ? items : APP_NAV_ITEMS;
+  const mobileLinks = navigationItems.filter((item) => canAccessNavItem(item, me));
 
   return (
     <header className="sticky top-0 z-40 border-b border-line bg-base/70 backdrop-blur-xl">
@@ -61,29 +57,41 @@ export default function Nav({ me, active }) {
             aria-label={open ? "关闭导航" : "打开导航"}
             aria-expanded={open}
           >
-            <span className="block h-4 w-4">
-              <span className={`mb-1 block h-0.5 rounded bg-current transition ${open ? "translate-y-1.5 rotate-45" : ""}`} />
-              <span className={`mb-1 block h-0.5 rounded bg-current transition ${open ? "opacity-0" : ""}`} />
-              <span className={`block h-0.5 rounded bg-current transition ${open ? "-translate-y-1.5 -rotate-45" : ""}`} />
-            </span>
+            {open ? <X size={18} aria-hidden="true" /> : <Menu size={18} aria-hidden="true" />}
           </button>
           <div className="mr-1 hidden h-11 items-center gap-1 rounded-full border border-line bg-white/5 p-1 xl:flex">
-            {DESKTOP_LINKS.map(([key, label, href]) => {
-              const visible = key !== "admin" || me?.is_admin;
+            {navigationItems.map((item) => {
+              const visible = canAccessNavItem(item, me);
+              const disabled = item.enabled === false;
+              const itemClassName = `${item.width || "w-20"} rounded-full px-3 py-1.5 text-center text-sm font-display font-medium transition-colors ${
+                disabled
+                  ? "cursor-not-allowed text-fog opacity-45"
+                  : active === item.key
+                    ? "bg-brand text-white shadow-glow-sm"
+                    : "text-mist hover:bg-white/5 hover:text-snow"
+              } ${visible ? "" : item.reserveDesktop ? "invisible pointer-events-none" : "hidden"}`;
+              if (disabled) {
+                return (
+                  <span
+                    key={item.key}
+                    className={itemClassName}
+                    aria-disabled="true"
+                    title={item.disabledReason || "当前入口暂不可用"}
+                  >
+                    {item.label}
+                  </span>
+                );
+              }
               return (
                 <Link
-                  key={key}
-                  href={href}
-                  className={`${LINK_WIDTH[key] || "w-20"} rounded-full px-3 py-1.5 text-center text-sm font-display font-medium transition-colors ${
-                    active === key
-                      ? "bg-brand text-white shadow-glow-sm"
-                      : "text-mist hover:bg-white/5 hover:text-snow"
-                  } ${visible ? "" : "invisible pointer-events-none"}`}
-                  aria-current={active === key ? "page" : undefined}
+                  key={item.key}
+                  href={item.href}
+                  className={itemClassName}
+                  aria-current={active === item.key ? "page" : undefined}
                   aria-hidden={visible ? undefined : true}
                   tabIndex={visible ? undefined : -1}
                 >
-                  {label}
+                  {item.label}
                 </Link>
               );
             })}
@@ -92,6 +100,20 @@ export default function Nav({ me, active }) {
           <div className="hidden min-w-[274px] items-center justify-end gap-1 xl:flex">
             {me ? (
               <>
+                <button
+                  type="button"
+                  onClick={() => setTaskCenterOpen(true)}
+                  className="relative flex h-9 w-9 shrink-0 items-center justify-center rounded-full text-mist transition hover:bg-white/5 hover:text-snow"
+                  aria-label={`打开任务中心${taskCenter.activeCount ? `，${taskCenter.activeCount} 个进行中任务` : ""}`}
+                  title="任务中心"
+                >
+                  <ListChecks size={17} aria-hidden="true" />
+                  {taskCenter.activeCount > 0 && (
+                    <span className="absolute -right-1 -top-1 flex h-4 min-w-4 items-center justify-center rounded-full bg-brand px-1 text-[10px] font-semibold leading-none text-white">
+                      {taskCenter.activeCount > 99 ? "99+" : taskCenter.activeCount}
+                    </span>
+                  )}
+                </button>
                 <span
                   className="inline-flex h-9 w-[176px] items-center justify-center gap-1.5 rounded-full border border-iris/30 bg-iris/10 px-3 text-xs"
                   aria-label={`可用积分 ${me.balance_credits}${me.frozen_credits ? `，冻结积分 ${me.frozen_credits}` : ""}`}
@@ -119,11 +141,21 @@ export default function Nav({ me, active }) {
           </div>
 
           <div className="xl:hidden">
-            {me && (
+            {me && <div className="flex items-center gap-1">
+              <button
+                type="button"
+                onClick={() => setTaskCenterOpen(true)}
+                className="relative flex h-9 w-9 shrink-0 items-center justify-center rounded-full text-mist transition hover:bg-white/5 hover:text-snow"
+                aria-label={`打开任务中心${taskCenter.activeCount ? `，${taskCenter.activeCount} 个进行中任务` : ""}`}
+                title="任务中心"
+              >
+                <ListChecks size={17} aria-hidden="true" />
+                {taskCenter.activeCount > 0 && <span className="absolute -right-1 -top-1 flex h-4 min-w-4 items-center justify-center rounded-full bg-brand px-1 text-[10px] font-semibold leading-none text-white">{taskCenter.activeCount > 99 ? "99+" : taskCenter.activeCount}</span>}
+              </button>
               <div className="flex h-9 w-9 items-center justify-center rounded-full bg-brand text-sm font-display font-semibold text-white shadow-glow-sm">
                 {(me.nickname || me.phone || "U").slice(-2)}
               </div>
-            )}
+            </div>}
             {!me && (
               <Link href={loginHref} className="btn-ghost btn-sm ml-0.5">登录</Link>
             )}
@@ -138,18 +170,24 @@ export default function Nav({ me, active }) {
       {open && (
         <div className="border-t border-line bg-base/95 px-4 py-3 shadow-2xl backdrop-blur-xl xl:hidden">
           <div className="grid grid-cols-2 gap-2">
-            {mobileLinks.map(([key, label, href]) => (
-              <Link
-                key={key}
-                href={href}
-                className={`rounded-xl border px-3 py-2 text-center text-sm font-display font-medium ${
-                  active === key
-                    ? "border-brand bg-brand text-white"
-                    : "border-line bg-white/5 text-mist"
-                }`}
-              >
-                {label}
-              </Link>
+            {mobileLinks.map((item) => (
+              item.enabled === false ? (
+                <span key={item.key} aria-disabled="true" title={item.disabledReason || "当前入口暂不可用"} className="rounded-xl border border-line bg-white/[0.03] px-3 py-2 text-center text-sm font-display font-medium text-fog opacity-45">
+                  {item.label}
+                </span>
+              ) : (
+                <Link
+                  key={item.key}
+                  href={item.href}
+                  className={`rounded-xl border px-3 py-2 text-center text-sm font-display font-medium ${
+                    active === item.key
+                      ? "border-brand bg-brand text-white"
+                      : "border-line bg-white/5 text-mist"
+                  }`}
+                >
+                  {item.label}
+                </Link>
+              )
             ))}
           </div>
           {me && (
@@ -167,6 +205,7 @@ export default function Nav({ me, active }) {
           </div>
         </div>
       )}
+      <GlobalTaskCenter center={taskCenter} open={taskCenterOpen} onClose={() => setTaskCenterOpen(false)} />
     </header>
   );
 }

@@ -8,16 +8,19 @@ ENV PYTHONUNBUFFERED=1 \
 WORKDIR /app
 
 # Minimal system deps (libpq for psycopg, curl for healthcheck, git + ssh for
-# optional admin online updates, ffmpeg for
-# sampling keyframes from reference videos in the reverse-prompt step).
-RUN sed -i 's|http://deb.debian.org|https://deb.debian.org|g' /etc/apt/sources.list.d/debian.sources \
+# optional admin online updates, ffmpeg for sampling keyframes/audio evidence,
+# and Tesseract with Simplified Chinese data for independent image/frame OCR).
+ARG DEBIAN_MIRROR=https://deb.debian.org
+RUN sed -i "s|http://deb.debian.org|$DEBIAN_MIRROR|g" /etc/apt/sources.list.d/debian.sources \
     && apt-get -o Acquire::Retries=5 update \
     && apt-get -o Acquire::Retries=5 install -y --no-install-recommends \
-    build-essential libpq-dev curl git openssh-client ffmpeg \
+    build-essential libpq-dev curl git openssh-client ffmpeg fonts-noto-cjk \
+    tesseract-ocr tesseract-ocr-chi-sim \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
-RUN pip install -r requirements.txt
+ARG PIP_INDEX_URL=https://pypi.org/simple
+RUN pip install --index-url "$PIP_INDEX_URL" -r requirements.txt
 # Dynamic-page scraping (XHS and other lazy-loaded sites) needs Chromium inside
 # the container; installed to a shared path so the non-root runtime user can use it.
 # Keep OS packages and the browser download in separate layers so a transient

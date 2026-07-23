@@ -96,10 +96,54 @@ assert.match(
   /async function clearAllWorkspaces\(\)[\s\S]*window\.confirm\([\s\S]*for \(const \{ key: mode \} of CREATION_MODES\)[\s\S]*invalidatePromptOptimization\(mode\);[\s\S]*resetOwnerReferenceParsing\(\);[\s\S]*resetOwnerMediaUpload\(\);/,
   "confirmed clear-all should invalidate stale optimizer, reverse and upload responses",
 );
+const optimizePromptStart = pageSource.indexOf("async function optimizeDirectPrompt()");
+const compileStoryboardShotStart = pageSource.indexOf("async function compileStoryboardShot(");
+const acceptPromptOptimizationStart = pageSource.indexOf("async function acceptPromptOptimization(");
+const rejectPromptOptimizationStart = pageSource.indexOf("function rejectPromptOptimization()");
+const undoPromptOptimizationStart = pageSource.indexOf("function undoAcceptedPromptOptimization()");
+const updatePromptFromUserStart = pageSource.indexOf("function updatePromptFromUser(");
+assert.ok(
+  optimizePromptStart >= 0
+    && compileStoryboardShotStart > optimizePromptStart
+    && acceptPromptOptimizationStart > optimizePromptStart
+    && rejectPromptOptimizationStart > acceptPromptOptimizationStart
+    && undoPromptOptimizationStart > rejectPromptOptimizationStart
+    && updatePromptFromUserStart > undoPromptOptimizationStart,
+  "prompt optimization proposal lifecycle should remain explicit and ordered",
+);
+const optimizePromptSource = pageSource.slice(optimizePromptStart, compileStoryboardShotStart);
+const acceptPromptOptimizationSource = pageSource.slice(
+  acceptPromptOptimizationStart,
+  rejectPromptOptimizationStart,
+);
+const rejectPromptOptimizationSource = pageSource.slice(
+  rejectPromptOptimizationStart,
+  undoPromptOptimizationStart,
+);
 assert.match(
-  pageSource,
-  /setWorkspacePatch\(\{[\s\S]*prompt: optimized[\s\S]*\}, mode\);/,
-  "prompt optimization should write back to the mode where the request started",
+  optimizePromptSource,
+  /setPromptOptimizationProposals\([\s\S]*\[mode\]:\s*\{[\s\S]*optimized_text:\s*optimized/,
+  "prompt optimization should save a review proposal in the mode where the request started",
+);
+assert.doesNotMatch(
+  optimizePromptSource,
+  /setWorkspacePatch\(/,
+  "creating an optimization proposal must not silently replace the current prompt",
+);
+assert.match(
+  acceptPromptOptimizationSource,
+  /applyPromptOptimizationDecision\([\s\S]*decision\?\.result[\s\S]*setWorkspacePatch\(\{[\s\S]*\.\.\.\(applied\.applied \? applied\.workspace : \{\}\)/,
+  "accepting an optimization proposal should atomically apply the authoritative workspace",
+);
+assert.doesNotMatch(
+  rejectPromptOptimizationSource,
+  /setWorkspacePatch\(/,
+  "rejecting an optimization proposal should preserve the current prompt",
+);
+assert.match(
+  rejectPromptOptimizationSource,
+  /setMsg\("\u5df2\u4fdd\u7559\u539f\u63d0\u793a\u8bcd\u3002"\)/,
+  "rejecting an optimization proposal should confirm that the original prompt was retained",
 );
 assert.match(
   referenceParsingSource,

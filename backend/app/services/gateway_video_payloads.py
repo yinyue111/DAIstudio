@@ -24,6 +24,10 @@ GENERIC_VIDEO_ALLOWED_PARAMS = {
 }
 
 
+def _reference_payload_value(value, item_field: str) -> object:
+    return {item_field: value} if item_field else value
+
+
 def generic_video_payload_params(params: dict, extra: dict, model_id: str = "") -> dict:
     allowed = set(GENERIC_VIDEO_ALLOWED_PARAMS)
     allowed.update(str(k) for k in (extra.get("allowed_param_fields") or []))
@@ -45,13 +49,28 @@ def generic_video_payload_params(params: dict, extra: dict, model_id: str = "") 
     }
     first_frame = (params or {}).get("first_frame_image")
     is_grok_video = "grok" in str(model_id or "").strip().lower()
+    ratio = payload_params.pop("ratio", None)
+    ratio_field = (
+        extra.get("ratio_field")
+        if "ratio_field" in extra
+        else "aspect_ratio" if is_grok_video else "ratio"
+    )
+    if ratio not in (None, "") and ratio_field:
+        payload_params[str(ratio_field)] = ratio
     first_frame_field = (
         extra.get("first_frame_field")
         if "first_frame_field" in extra
-        else "image_url" if is_grok_video else "first_frame_image"
+        else "image" if is_grok_video else "first_frame_image"
     )
     if first_frame and first_frame_field:
-        payload_params[str(first_frame_field)] = first_frame
+        first_frame_item_field = str(
+            extra.get("first_frame_item_field")
+            or ("url" if is_grok_video else "")
+        ).strip()
+        payload_params[str(first_frame_field)] = _reference_payload_value(
+            first_frame,
+            first_frame_item_field,
+        )
     last_frame = (params or {}).get("last_frame_image")
     last_frame_field = (
         extra.get("last_frame_field")
@@ -61,10 +80,33 @@ def generic_video_payload_params(params: dict, extra: dict, model_id: str = "") 
     if last_frame and last_frame_field:
         payload_params[str(last_frame_field)] = last_frame
     product = (params or {}).get("product_reference_image")
+    product_details = (params or {}).get("product_detail_images")
+    product_images_field = str(extra.get("product_images_field") or "").strip()
+    if is_grok_video and product_images_field in {"", "images"}:
+        # Migrate frozen pre-0076 task snapshots at execution time. Product
+        # identity inputs are R2V references; only an explicit frame uses image.
+        product_images_field = "reference_images"
+    if product_images_field and (product_details or (is_grok_video and product)):
+        if not product:
+            raise ValueError("产品细节图必须配合产品主题图使用")
+        if product_images_field in payload_params:
+            raise ValueError("产品多图与其他参考图映射到了同一上游字段")
+        ordered_images = [product, *list(product_details or [])]
+        item_field = str(
+            extra.get("product_images_item_field")
+            or ("url" if is_grok_video else "")
+        ).strip()
+        payload_params[product_images_field] = (
+            [{item_field: value} for value in ordered_images]
+            if item_field
+            else ordered_images
+        )
+        product = None
+        product_details = None
     product_field = (
         extra.get("product_image_field")
         if "product_image_field" in extra
-        else "image_url" if is_grok_video else "product_reference_image"
+        else "image" if is_grok_video else "product_reference_image"
     )
     if (
         product
@@ -76,16 +118,31 @@ def generic_video_payload_params(params: dict, extra: dict, model_id: str = "") 
     ):
         raise ValueError("产品身份参考与首帧不能映射到同一供应商字段")
     if product and product_field:
-        payload_params[str(product_field)] = product
-    product_details = (params or {}).get("product_detail_images")
+        product_item_field = str(
+            extra.get("product_image_item_field")
+            or ("url" if is_grok_video else "")
+        ).strip()
+        payload_params[str(product_field)] = _reference_payload_value(
+            product,
+            product_item_field,
+        )
     if product_details:
-        detail_field = extra.get("product_detail_images_field")
+        detail_field = extra.get("product_detail_images_field") or (
+            "reference_images" if is_grok_video else None
+        )
         if not detail_field:
             raise ValueError("当前视频模型未配置产品细节图上游字段")
         detail_field = str(detail_field)
         if detail_field in payload_params:
             raise ValueError("产品细节图与其他参考图映射到了同一上游字段")
-        payload_params[detail_field] = list(product_details)
+        detail_item_field = str(
+            extra.get("product_detail_images_item_field")
+            or ("url" if is_grok_video else "")
+        ).strip()
+        payload_params[detail_field] = [
+            _reference_payload_value(value, detail_item_field)
+            for value in product_details
+        ]
     character = (params or {}).get("character_reference_image")
     character_field = extra.get("character_image_field", "character_reference_image")
     if character and character_field:

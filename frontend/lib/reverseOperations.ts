@@ -2,6 +2,9 @@ import { api } from "./api";
 import type {
   ReverseOperation,
   ReverseOperationCreate,
+  ReverseOperationFeedback,
+  ReverseResult,
+  ReverseResultRevision,
   ReverseOperationStatus,
 } from "./api";
 
@@ -43,14 +46,52 @@ export function normalizeReverseOperation(payload: unknown): ReverseOperation {
   }
   const status = String(raw.status || "queued") as ReverseOperationStatus;
   const result = raw.result && typeof raw.result === "object"
-    ? raw.result as Record<string, unknown>
+    ? raw.result as ReverseResult
     : null;
+  const sourceRange = raw.source_range && typeof raw.source_range === "object" && !Array.isArray(raw.source_range)
+    ? raw.source_range as Record<string, unknown>
+    : null;
+  const sourceRanges = (Array.isArray(raw.source_ranges) ? raw.source_ranges : sourceRange ? [sourceRange] : [])
+    .flatMap((item) => {
+      if (!item || typeof item !== "object" || Array.isArray(item)) return [];
+      const row = item as Record<string, unknown>;
+      const start = Number(row.start_seconds);
+      const end = Number(row.end_seconds);
+      return Number.isFinite(start) && Number.isFinite(end) && end > start
+        ? [{ start_seconds: start, end_seconds: end }]
+        : [];
+    });
+  const appliedResultVersion = Number(raw.applied_result_version);
+  const retryOfOperationId = Number(raw.retry_of_operation_id);
   return {
     ...raw,
     id: raw.id,
     status,
     progress: Math.max(0, Math.min(100, Number(raw.progress ?? raw.percent ?? 0) || 0)),
     result,
+    workspace_snapshot_v2: raw.workspace_snapshot_v2 && typeof raw.workspace_snapshot_v2 === "object"
+      ? raw.workspace_snapshot_v2 as Record<string, unknown>
+      : null,
+    workspace_snapshot_v3: raw.workspace_snapshot_v3 && typeof raw.workspace_snapshot_v3 === "object"
+      ? raw.workspace_snapshot_v3 as Record<string, unknown>
+      : null,
+    analysis_focus: String(raw.analysis_focus || "comprehensive"),
+    analysis_precision: String(raw.analysis_precision || raw.video_analysis_preset || "standard"),
+    output_purpose: String(raw.output_purpose || "generation"),
+    include_audio: Boolean(raw.include_audio),
+    source_range: sourceRanges.length === 1 ? sourceRanges[0] : null,
+    source_ranges: sourceRanges,
+    result_schema_version: String(raw.result_schema_version || "reverse.v2"),
+    ...(Object.prototype.hasOwnProperty.call(raw, "applied_result_version")
+      ? {
+          applied_result_version: Number.isInteger(appliedResultVersion) && appliedResultVersion > 0
+            ? appliedResultVersion
+            : null,
+        }
+      : {}),
+    retry_of_operation_id: Number.isInteger(retryOfOperationId) && retryOfOperationId > 0
+      ? retryOfOperationId
+      : null,
     video_analysis: (
       raw.video_analysis && typeof raw.video_analysis === "object"
         ? raw.video_analysis
@@ -59,6 +100,7 @@ export function normalizeReverseOperation(payload: unknown): ReverseOperation {
     cost_frozen: Number(raw.cost_frozen ?? raw.frozen_credits ?? 0) || 0,
     cost_settled: Number(raw.cost_settled ?? raw.charged_credits ?? 0) || 0,
     cancel_requested: Boolean(raw.cancel_requested),
+    expired: Boolean(raw.expired || raw.error_code === "RESULT_EXPIRED"),
   } as ReverseOperation;
 }
 
@@ -71,6 +113,79 @@ export function normalizeReverseOperationList(payload: unknown): ReverseOperatio
   return rows.map(normalizeReverseOperation);
 }
 
+export function normalizeReverseResultRevision(payload: unknown): ReverseResultRevision {
+  const raw = payload && typeof payload === "object" && !Array.isArray(payload)
+    ? payload as Record<string, unknown>
+    : null;
+  const id = Number(raw?.id);
+  const operationId = Number(raw?.operation_id);
+  const version = Number(raw?.version);
+  const source = String(raw?.source || "");
+  const revisionPayload = raw?.payload && typeof raw.payload === "object" && !Array.isArray(raw.payload)
+    ? raw.payload as ReverseResult
+    : null;
+  if (
+    !Number.isInteger(id)
+    || id <= 0
+    || !Number.isInteger(operationId)
+    || operationId <= 0
+    || !Number.isInteger(version)
+    || version <= 0
+    || !["provider_raw", "normalized", "user_edit", "applied", "model_compiled", "generation"].includes(source)
+    || !revisionPayload
+  ) throw new Error("服务端未返回有效的反推结果版本");
+  return {
+    id,
+    operation_id: operationId,
+    version,
+    source: source as ReverseResultRevision["source"],
+    payload: revisionPayload,
+    parent_revision_id: Number.isInteger(Number(raw?.parent_revision_id)) && Number(raw?.parent_revision_id) > 0
+      ? Number(raw?.parent_revision_id)
+      : null,
+    source_content_hash: raw?.source_content_hash ? String(raw.source_content_hash) : null,
+    source_fingerprints: Array.isArray(raw?.source_fingerprints)
+      ? raw.source_fingerprints.filter((item) => item && typeof item === "object" && !Array.isArray(item)) as Array<Record<string, unknown>>
+      : null,
+    payload_hash: raw?.payload_hash ? String(raw.payload_hash) : null,
+    lineage_status: raw?.lineage_status === "verified" ? "verified" : "legacy_unverified",
+    evidence_review_action: ["not_applicable", "inherited", "updated", "cleared"].includes(String(raw?.evidence_review_action || ""))
+      ? raw?.evidence_review_action as ReverseResultRevision["evidence_review_action"]
+      : null,
+    created_at: raw?.created_at ? String(raw.created_at) : null,
+  };
+}
+
+export function normalizeReverseResultRevisionList(payload: unknown): ReverseResultRevision[] {
+  const rows = Array.isArray(payload)
+    ? payload
+    : payload && typeof payload === "object" && Array.isArray((payload as { items?: unknown[] }).items)
+      ? (payload as { items: unknown[] }).items
+      : [];
+  return rows.map(normalizeReverseResultRevision);
+}
+
+export function normalizeReverseOperationFeedback(payload: unknown): ReverseOperationFeedback {
+  const raw = payload && typeof payload === "object" && !Array.isArray(payload)
+    ? payload as Record<string, unknown>
+    : null;
+  const operationId = Number(raw?.operation_id);
+  const rating = String(raw?.rating || "");
+  if (!Number.isInteger(operationId) || operationId <= 0 || !["useful", "not_useful"].includes(rating)) {
+    throw new Error("服务端未返回有效的反推反馈");
+  }
+  return {
+    operation_id: operationId,
+    rating: rating as ReverseOperationFeedback["rating"],
+    issue_types: Array.isArray(raw?.issue_types)
+      ? raw.issue_types.map(String) as ReverseOperationFeedback["issue_types"]
+      : [],
+    note: raw?.note == null ? null : String(raw.note),
+    created_at: raw?.created_at ? String(raw.created_at) : null,
+    updated_at: raw?.updated_at ? String(raw.updated_at) : null,
+  };
+}
+
 export function reverseOperationResult(operation: ReverseOperation | null | undefined) {
   if (!operation) return null;
   const result = operation.result && typeof operation.result === "object"
@@ -81,6 +196,8 @@ export function reverseOperationResult(operation: ReverseOperation | null | unde
     ...result,
     video_analysis: operation.video_analysis || result.video_analysis || null,
     charged_credits: operation.cost_settled ?? result.charged_credits ?? 0,
+    result_schema_version: operation.result_schema_version,
+    applied_result_version: operation.applied_result_version,
   };
 }
 

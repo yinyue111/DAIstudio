@@ -1,7 +1,14 @@
-#!/usr/bin/env bash
+#!/bin/bash
 # Verify a bundle against a generated, disposable PostgreSQL database.
 set -euo pipefail
 umask 077
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+PYTHON_BIN="${PYTHON_BIN:-$ROOT/.venv/bin/python}"
+if [ ! -x "$PYTHON_BIN" ]; then
+  PYTHON_BIN="$(command -v python3 || true)"
+fi
+[ -n "$PYTHON_BIN" ] || { echo "[restore] Python runtime not found" >&2; exit 1; }
 
 usage() { echo "Usage: TARGET_DATABASE_URL=... RESTORE_VERIFY_NON_PRODUCTION=1 $0 --bundle DIR" >&2; exit 2; }
 BUNDLE=""
@@ -31,7 +38,7 @@ trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-TARGET_URL_VALUE="$TARGET_DATABASE_URL" PGPASSWORD_VALUE="${PGPASSWORD:-}" PGPASS_PATH="$PGPASS" PARSED_PATH="$PARSED" python3 - <<'PY'
+TARGET_URL_VALUE="$TARGET_DATABASE_URL" PGPASSWORD_VALUE="${PGPASSWORD:-}" PGPASS_PATH="$PGPASS" PARSED_PATH="$PARSED" "$PYTHON_BIN" - <<'PY'
 import os
 import re
 import secrets
@@ -87,8 +94,15 @@ verify_digest() {
 verify_digest database.sql.gz
 verify_digest media.tar.gz
 gzip -t "$BUNDLE/database.sql.gz"
+if ! (
+  cd "$ROOT"
+  "$PYTHON_BIN" -m scripts.media_snapshot verify --archive "$BUNDLE/media.tar.gz"
+); then
+  echo "[restore] unsafe media archive member or invalid media snapshot" >&2
+  exit 1
+fi
 
-ARCHIVE_PATH="$BUNDLE/media.tar.gz" EXTRACT_PATH="$WORK/media" python3 - <<'PY'
+ARCHIVE_PATH="$BUNDLE/media.tar.gz" EXTRACT_PATH="$WORK/media" "$PYTHON_BIN" - <<'PY'
 import os
 import tarfile
 from pathlib import Path, PurePosixPath
@@ -119,5 +133,5 @@ SCHEMA_PROBE="$(psql "${DB_ARGS[@]}" --dbname="$TEMP_DATABASE" --tuples-only --n
     AND EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'users' AND column_name = 'id')
     AND EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'gen_tasks' AND column_name = 'id')
   )::text")"
-[ "$(printf '%s' "$SCHEMA_PROBE" | tr -d '[:space:]')" = t ] || { echo "[restore] required schema probe failed" >&2; exit 1; }
+[ "$(printf '%s' "$SCHEMA_PROBE" | tr -d '[:space:]')" = true ] || { echo "[restore] required schema probe failed" >&2; exit 1; }
 echo "[restore] corruption checks, media extraction, and temporary database schema probe passed"

@@ -10,6 +10,20 @@ BACKUP = ROOT / "scripts" / "backup_db.sh"
 VERIFY = ROOT / "scripts" / "verify_restore.sh"
 
 
+def _run_script(path: Path, *args, **kwargs):
+    """Use posix_spawn so the threaded app test harness cannot deadlock after fork."""
+    return subprocess.run(
+        [path, *args],
+        close_fds=False,
+        timeout=15,
+        **kwargs,
+    )
+
+
+def _popen_script(path: Path, *args, **kwargs):
+    return subprocess.Popen([path, *args], close_fds=False, **kwargs)
+
+
 def _executable(path: Path, body: str) -> None:
     path.write_text("#!/usr/bin/env bash\nset -euo pipefail\n" + body, encoding="utf-8")
     path.chmod(0o755)
@@ -35,7 +49,7 @@ def _fake_tools(tmp_path: Path) -> tuple[Path, Path]:
         bin_dir / "psql",
         'printf "psql %s\\n" "$*" >> "$COMMAND_LOG"\n'
         '[[ "${ASSERT_PGPASSWORD_UNSET:-}" != 1 || -z "${PGPASSWORD+x}" ]]\n'
-        'if [[ "$*" == *"--command="* ]]; then [[ "${FAIL_SCHEMA_PROBE:-}" != 1 ]] && printf "t\\n" || printf "f\\n"; else cat >/dev/null; fi\n'
+        'if [[ "$*" == *"--command="* ]]; then [[ "${FAIL_SCHEMA_PROBE:-}" != 1 ]] && printf "true\\n" || printf "false\\n"; else cat >/dev/null; fi\n'
         '[[ "${FAIL_PSQL:-}" != 1 ]] || exit 43\n',
     )
     _executable(
@@ -79,7 +93,7 @@ def test_backup_publishes_verified_private_bundle_without_password_in_argv(tmp_p
     bin_dir, log = _fake_tools(tmp_path)
     env = _backup_env(tmp_path, bin_dir, log)
 
-    result = subprocess.run([BACKUP], env=env, text=True, capture_output=True)
+    result = _run_script(BACKUP, env=env, text=True, capture_output=True)
 
     assert result.returncode == 0, result.stderr
     out_dir = tmp_path / "backups"
@@ -110,7 +124,7 @@ def test_backup_accepts_passwordless_url_with_pgpassword(tmp_path):
     env["EXPECTED_PGPASS"] = "env-secret"
     env["ASSERT_PGPASSWORD_UNSET"] = "1"
 
-    result = subprocess.run([BACKUP], env=env, text=True, capture_output=True)
+    result = _run_script(BACKUP, env=env, text=True, capture_output=True)
 
     assert result.returncode == 0, result.stderr
     assert "env-secret" not in log.read_text(encoding="utf-8")
@@ -120,11 +134,11 @@ def test_backup_rejects_disagreeing_password_sources_and_decoded_newline(tmp_pat
     bin_dir, log = _fake_tools(tmp_path)
     env = _backup_env(tmp_path, bin_dir, log)
     env["PGPASSWORD"] = "different"
-    assert subprocess.run([BACKUP], env=env, capture_output=True).returncode != 0
+    assert _run_script(BACKUP, env=env, capture_output=True).returncode != 0
     env["BACKUP_STAMP"] = "20260712_010204"
     env["PGPASSWORD"] = ""
     env["DATABASE_URL"] = "postgresql://backup_user:bad%0Asecret@db.example/studio"
-    assert subprocess.run([BACKUP], env=env, capture_output=True).returncode != 0
+    assert _run_script(BACKUP, env=env, capture_output=True).returncode != 0
     assert not log.exists()
 
 
@@ -133,7 +147,7 @@ def test_backup_failure_leaves_no_final_or_temporary_bundle(tmp_path):
     env = _backup_env(tmp_path, bin_dir, log)
     env["FAIL_PG_DUMP"] = "1"
 
-    result = subprocess.run([BACKUP], env=env, text=True, capture_output=True)
+    result = _run_script(BACKUP, env=env, text=True, capture_output=True)
 
     assert result.returncode != 0
     out_dir = tmp_path / "backups"
@@ -157,8 +171,10 @@ def test_verify_restore_rejects_checksum_corruption_before_database_commands(tmp
     db.write_bytes(db.read_bytes() + b"tampered")
     env = _restore_env(bin_dir, log)
 
-    result = subprocess.run(
-        [VERIFY, "--bundle", bundle],
+    result = _run_script(
+        VERIFY,
+        "--bundle",
+        bundle,
         env=env,
         text=True,
         capture_output=True,
@@ -173,8 +189,10 @@ def test_verify_restore_rejects_production_like_target(tmp_path):
     bin_dir, log = _fake_tools(tmp_path)
     env = _restore_env(bin_dir, log, TARGET_DATABASE_URL="postgresql://admin@prod.example/postgres")
 
-    result = subprocess.run(
-        [VERIFY, "--bundle", tmp_path],
+    result = _run_script(
+        VERIFY,
+        "--bundle",
+        tmp_path,
         env=env,
         text=True,
         capture_output=True,
@@ -188,13 +206,15 @@ def test_verify_restore_rejects_production_like_target(tmp_path):
 def test_verify_restore_uses_sanitized_argv_and_drops_temporary_target(tmp_path):
     bin_dir, log = _fake_tools(tmp_path)
     backup_env = _backup_env(tmp_path, bin_dir, log)
-    assert subprocess.run([BACKUP], env=backup_env, capture_output=True).returncode == 0
+    assert _run_script(BACKUP, env=backup_env, capture_output=True).returncode == 0
     log.unlink()
     bundle = tmp_path / "backups" / "ai_studio_20260712_010203"
     env = _restore_env(bin_dir, log)
 
-    result = subprocess.run(
-        [VERIFY, "--bundle", bundle],
+    result = _run_script(
+        VERIFY,
+        "--bundle",
+        bundle,
         env=env,
         text=True,
         capture_output=True,
@@ -219,13 +239,15 @@ def test_verify_restore_uses_sanitized_argv_and_drops_temporary_target(tmp_path)
 def test_verify_restore_cleans_up_target_when_import_fails(tmp_path):
     bin_dir, log = _fake_tools(tmp_path)
     backup_env = _backup_env(tmp_path, bin_dir, log)
-    assert subprocess.run([BACKUP], env=backup_env, capture_output=True).returncode == 0
+    assert _run_script(BACKUP, env=backup_env, capture_output=True).returncode == 0
     log.unlink()
     bundle = tmp_path / "backups" / "ai_studio_20260712_010203"
     env = _restore_env(bin_dir, log, FAIL_PSQL="1")
 
-    result = subprocess.run(
-        [VERIFY, "--bundle", bundle],
+    result = _run_script(
+        VERIFY,
+        "--bundle",
+        bundle,
         env=env,
         text=True,
         capture_output=True,
@@ -240,11 +262,11 @@ def test_verify_restore_cleans_up_target_when_import_fails(tmp_path):
 def test_verify_restore_createdb_failure_never_drops_an_existing_target(tmp_path):
     bin_dir, log = _fake_tools(tmp_path)
     backup_env = _backup_env(tmp_path, bin_dir, log)
-    assert subprocess.run([BACKUP], env=backup_env, capture_output=True).returncode == 0
+    assert _run_script(BACKUP, env=backup_env, capture_output=True).returncode == 0
     log.unlink()
     bundle = tmp_path / "backups" / "ai_studio_20260712_010203"
     env = _restore_env(bin_dir, log, FAIL_CREATEDB="1")
-    result = subprocess.run([VERIFY, "--bundle", bundle], env=env, text=True, capture_output=True)
+    result = _run_script(VERIFY, "--bundle", bundle, env=env, text=True, capture_output=True)
 
     assert result.returncode != 0
     command_log = log.read_text(encoding="utf-8")
@@ -255,12 +277,12 @@ def test_verify_restore_createdb_failure_never_drops_an_existing_target(tmp_path
 def test_verify_restore_schema_probe_failure_cleans_up_created_database(tmp_path):
     bin_dir, log = _fake_tools(tmp_path)
     backup_env = _backup_env(tmp_path, bin_dir, log)
-    assert subprocess.run([BACKUP], env=backup_env, capture_output=True).returncode == 0
+    assert _run_script(BACKUP, env=backup_env, capture_output=True).returncode == 0
     log.unlink()
     bundle = tmp_path / "backups" / "ai_studio_20260712_010203"
     env = _restore_env(bin_dir, log, FAIL_SCHEMA_PROBE="1")
 
-    result = subprocess.run([VERIFY, "--bundle", bundle], env=env, text=True, capture_output=True)
+    result = _run_script(VERIFY, "--bundle", bundle, env=env, text=True, capture_output=True)
 
     assert result.returncode != 0
     assert "schema probe" in (result.stdout + result.stderr).lower()
@@ -272,13 +294,13 @@ def test_same_stamp_concurrent_backup_cannot_publish_into_existing_bundle(tmp_pa
     env = _backup_env(tmp_path, bin_dir, log)
     entered, release = tmp_path / "entered", tmp_path / "release"
     env.update(DUMP_ENTERED_FILE=str(entered), DUMP_RELEASE_FILE=str(release))
-    first = subprocess.Popen([BACKUP], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    first = _popen_script(BACKUP, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     deadline = time.monotonic() + 5
     while not entered.exists() and time.monotonic() < deadline:
         time.sleep(0.01)
     assert entered.exists()
 
-    second = subprocess.run([BACKUP], env=env, text=True, capture_output=True)
+    second = _run_script(BACKUP, env=env, text=True, capture_output=True)
     release.touch()
     _, first_stderr = first.communicate(timeout=5)
 
@@ -291,7 +313,7 @@ def test_same_stamp_concurrent_backup_cannot_publish_into_existing_bundle(tmp_pa
 def test_verify_restore_rejects_link_member_even_with_matching_checksum(tmp_path):
     bin_dir, log = _fake_tools(tmp_path)
     backup_env = _backup_env(tmp_path, bin_dir, log)
-    assert subprocess.run([BACKUP], env=backup_env, capture_output=True).returncode == 0
+    assert _run_script(BACKUP, env=backup_env, capture_output=True).returncode == 0
     log.unlink()
     bundle = tmp_path / "backups" / "ai_studio_20260712_010203"
     media = bundle / "media.tar.gz"
@@ -307,8 +329,13 @@ def test_verify_restore_rejects_link_member_even_with_matching_checksum(tmp_path
         encoding="ascii",
     )
 
-    result = subprocess.run(
-        [VERIFY, "--bundle", bundle], env=_restore_env(bin_dir, log), text=True, capture_output=True
+    result = _run_script(
+        VERIFY,
+        "--bundle",
+        bundle,
+        env=_restore_env(bin_dir, log),
+        text=True,
+        capture_output=True,
     )
 
     assert result.returncode != 0

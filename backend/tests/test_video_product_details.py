@@ -78,7 +78,7 @@ def product_detail_model(client):
     [
         ("https://example.com/detail.png", "必须是图片链接数组"),
         (["https://example.com/a.png", 2], "product_detail_images\\[1\\] 非法"),
-        (["https://example.com/a.png"] * 6, "最多 5 张"),
+        (["https://example.com/a.png"] * 11, "最多 10 张"),
         (["https://example.com/a.png", "https://example.com/a.png"], "不能重复"),
     ],
 )
@@ -113,20 +113,12 @@ def test_product_detail_contract_requires_distinct_theme_and_preserves_order():
         {
             "product_reference_image": " https://example.com/product.png ",
             "product_detail_images": [
-                " https://example.com/detail-b.png ",
-                "https://example.com/detail-a.png",
-                "https://example.com/detail-c.png",
-                "https://example.com/detail-d.png",
-                "https://example.com/detail-e.png",
+                f" https://example.com/detail-{index}.png " for index in range(10)
             ],
         },
     )
     assert params["product_detail_images"] == [
-        "https://example.com/detail-b.png",
-        "https://example.com/detail-a.png",
-        "https://example.com/detail-c.png",
-        "https://example.com/detail-d.png",
-        "https://example.com/detail-e.png",
+        f"https://example.com/detail-{index}.png" for index in range(10)
     ]
 
 
@@ -141,7 +133,7 @@ def test_every_product_detail_url_gets_ssrf_validation(
     theme = _upload_image(client, headers, "theme.png")
 
     response = client.post(
-        "/api/generate",
+        "/api/quotes",
         json=_request(
             theme,
             [theme.replace("/api/uploads/", "/api/uploads/") + "-safe", "http://169.254.169.254/meta"],
@@ -167,7 +159,7 @@ def test_product_detail_owner_isolation(
     foreign_detail = _upload_image(client, owner_headers, "foreign-detail.png")
 
     response = client.post(
-        "/api/generate",
+        "/api/quotes",
         json=_request(theme, [foreign_detail]),
         headers=other_headers,
     )
@@ -204,7 +196,7 @@ def test_product_references_reject_video_mime(
     details = [] if target == "theme" else [video_url]
 
     response = client.post(
-        "/api/generate",
+        "/api/quotes",
         json=_request(theme, details),
         headers=headers,
     )
@@ -247,7 +239,7 @@ def test_product_references_reject_expired_images(
     details = [] if target == "theme" else [expired_url]
 
     response = client.post(
-        "/api/generate",
+        "/api/quotes",
         json=_request(theme, details),
         headers=headers,
     )
@@ -278,7 +270,7 @@ def test_product_theme_rejects_missing_local_file(
         db.commit()
 
     response = client.post(
-        "/api/generate",
+        "/api/quotes",
         json=_request(storage.upload_api_url(missing_key), []),
         headers=headers,
     )
@@ -327,7 +319,7 @@ def test_final_render_revalidates_inherited_product_details(
         parent_id = parent.id
 
     response = client.post(
-        "/api/generate",
+        "/api/quotes",
         json={
             "category": "video",
             "stage": "final",
@@ -348,6 +340,7 @@ def test_worker_localizes_ordered_details_but_persists_original_urls(
     auth,
     monkeypatch,
     product_detail_model,
+    quote_and_generate,
 ):
     make_user("13900003232", balance=1000)
     headers = auth("13900003232")
@@ -366,9 +359,8 @@ def test_worker_localizes_ordered_details_but_persists_original_urls(
         return "video-product-details"
 
     monkeypatch.setattr("app.services.gateway.submit_video", fake_submit)
-    response = client.post(
-        "/api/generate",
-        json=_request(theme, details),
+    response = quote_and_generate(
+        _request(theme, details),
         headers=headers,
     )
 

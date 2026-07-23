@@ -15,6 +15,7 @@ from app.schemas import ModelConfigIn, ReverseOperationCreate, ReverseOperationO
 from app.services import gateway, video_frames
 from app.services.gateway_prompting import (
     ReverseResultValidationError,
+    constrain_video_shots_to_evidence,
     reverse_template,
     validate_reverse_result,
 )
@@ -49,7 +50,7 @@ def test_target_contracts_require_typed_core_fields(target, payload):
         validate_reverse_result(invalid, target)
 
 
-def test_profile_visual_prompts_keep_identity_prefix_and_negative_constraints():
+def test_profile_visual_prompts_keep_identity_prefix_and_separate_negative_constraints():
     product = validate_reverse_result(
         {
             "产品品类": "精华瓶",
@@ -69,9 +70,345 @@ def test_profile_visual_prompts_keep_identity_prefix_and_negative_constraints():
     )
 
     assert product["final_text"].startswith("上传产品是唯一商品主角")
-    assert "避免：Logo变形,多余产品" in product["final_text"]
+    assert product["structured"]["负向"] == "Logo变形,多余产品"
+    assert "Logo变形" not in product["final_text"]
     assert portrait["final_text"].startswith("保持上传人物身份稳定")
-    assert "避免：换脸,年龄突变" in portrait["final_text"]
+    assert portrait["structured"]["负向"] == "换脸,年龄突变"
+    assert "换脸" not in portrait["final_text"]
+
+
+def test_image_visual_prompt_filters_placeholders_keeps_layout_and_enforces_budget():
+    payload = {
+        "图像类型": "产品图",
+        "主体": "红色玻璃精华瓶居中展示",
+        "人像意图": "无",
+        "商品服装": "透明红色玻璃瓶、银色泵头",
+        "细节特征": "瓶肩有环形高光",
+        "场景背景": "浅灰色无缝背景",
+        "构图": "竖版中心构图，顶部保留标题空间",
+        "光线": "左前方大面积柔光",
+        "色调配色": "红、银、浅灰低饱和配色",
+        "文字版式": "顶部一行白色无衬线标题，底部小号说明文字",
+        "一致性约束": "保持瓶身比例、泵头结构和标题层级",
+        "负向": "乱码、水印、产品变形",
+        "final_text": "供应商自由文本",
+    }
+
+    result = validate_reverse_result(payload, "image")
+
+    assert len(result["final_text"]) <= 420
+    assert "顶部一行白色无衬线标题" in result["final_text"]
+    assert "无" not in result["final_text"].split("；")
+    assert "乱码" not in result["final_text"]
+    assert result["structured"]["负向"] == "乱码、水印、产品变形"
+
+
+def test_image_visual_prompt_keeps_replica_palette_and_strips_analysis_scaffolding():
+    result = validate_reverse_result(
+        {
+            "图像类型": "产品图",
+            "主体": "直接可见事实：一盒白色长方体商品包装居中直立。",
+            "场景背景": (
+                "直接可见事实：参考1中半透明蓝色冰块从前景和两侧形成框景，中央有平整冰台；"
+                "视觉估计：远景为淡蓝到粉橙色天空；未知：真实拍摄地点不确定。"
+            ),
+            "构图": "直接可见事实：竖版3:4中心构图，主体由冰台承托。",
+            "光线": "直接可见事实：左后方橙金暖光穿透冰块，右侧保留冷蓝环境光。",
+            "色调配色": "直接可见事实：深海军蓝、冰蓝、青蓝为主，橙金为点缀，冷暖互补。",
+            "风格": (
+                "视觉估计：参考图1呈现高质量、广告级品质、UHD、award-winning的"
+                "奢侈品式商业产品摄影；可迁移为小红书、抖音及品牌网页广告素材。"
+            ),
+            "材质纹理": "直接可见事实：冰块半透明，可见裂纹、气泡和湿润反光。",
+            "final_text": "供应商分析过程文本",
+        },
+        "image",
+    )
+
+    for expected in (
+        "半透明蓝色冰块",
+        "竖版3:4中心构图",
+        "左后方橙金暖光",
+        "深海军蓝",
+        "冷暖互补",
+        "奢侈品式商业产品摄影",
+    ):
+        assert expected in result["final_text"]
+    for scaffold in (
+        "直接可见事实", "视觉估计", "未知", "不确定", "参考图1", "高质量", "广告级品质",
+        "UHD", "award-winning", "小红书", "抖音", "品牌网页广告", "；、",
+    ):
+        assert scaffold not in result["final_text"]
+
+
+def test_video_visual_prompt_removes_uncertainty_precision_and_long_source_timing():
+    result = validate_reverse_result(
+        {
+            "图像类型": "产品视频",
+            "主体": "深蓝渐变玻璃精华瓶居中直立",
+            "场景背景": "冰蓝雾化棚景，产品约占画面37.5%",
+            "色调配色": "主色视觉估计为#102A56，辅色#D8EEFA",
+            "shots": [
+                {
+                    "start_seconds": 0.0,
+                    "end_seconds": 8.0,
+                    "visual": "黑场中产品轮廓被窄束冷白光勾勒",
+                    "action": "商品是否发生实体运动不确定",
+                    "camera": "可能为缓慢推进",
+                    "evidence_frame_indices": [1, 2],
+                    "confidence": 0.9,
+                },
+                {
+                    "start_seconds": 8.0,
+                    "end_seconds": 25.408,
+                    "visual": "依次展示银色滴管盖、液滴和瓶身折射，最后切到浅水面正面定帧",
+                    "evidence_frame_indices": [3, 4],
+                    "confidence": 0.9,
+                },
+            ],
+            "final_text": "供应商自由文本",
+        },
+        "video",
+    )
+
+    prompt = result["final_text"]
+    assert len(prompt) <= 220
+    assert "按原镜头顺序压缩为单段核心版" in prompt
+    assert "25.408" not in prompt
+    assert "不确定" not in prompt
+    assert "可能" not in prompt
+    assert "#" not in prompt
+    assert "%" not in prompt
+
+
+def test_long_product_video_prompt_keeps_hero_reveal_and_drops_black_frame():
+    result = validate_reverse_result(
+        {
+            "图像类型": "产品视频",
+            "主体": "透明滴管、银色瓶盖与黑色渐变玻璃瓶身的精华液",
+            "shots": [
+                {"start_seconds": 0, "end_seconds": 7, "visual": "黑底品牌Logo与透明滴管底部特写", "evidence_frame_indices": [1, 2], "confidence": 0.9},
+                {"start_seconds": 8, "end_seconds": 10, "visual": "银色玫瑰浮雕瓶盖微距特写", "evidence_frame_indices": [3], "confidence": 0.9},
+                {"start_seconds": 11, "end_seconds": 13, "visual": "浅蓝背景透明水滴飞溅", "evidence_frame_indices": [4], "confidence": 0.9},
+                {"start_seconds": 14, "end_seconds": 16, "visual": "带水滴的黑色瓶身与白色品牌文字特写", "evidence_frame_indices": [5], "confidence": 0.9},
+                {"start_seconds": 17, "end_seconds": 19, "visual": "浅蓝色水波光影", "evidence_frame_indices": [6], "confidence": 0.8},
+                {"start_seconds": 21, "end_seconds": 23, "visual": "完整精华瓶矗立于浅蓝色水面，水面泛起涟漪", "evidence_frame_indices": [7], "confidence": 0.95},
+                {"start_seconds": 24, "end_seconds": 25.4, "visual": "纯黑画面", "evidence_frame_indices": [8], "confidence": 0.9},
+            ],
+            "final_text": "供应商自由文本",
+        },
+        "video",
+    )
+
+    prompt = result["final_text"]
+    assert len(prompt) <= 220
+    assert "完整精华瓶矗立于浅蓝色水面" in prompt
+    assert "瓶盖" in prompt
+    assert "瓶身" in prompt
+    assert "镜头间干净硬切" in prompt
+    assert "纯黑画面" not in prompt
+
+
+def test_video_temporal_fields_require_independent_evidence_refs():
+    constrained = constrain_video_shots_to_evidence([
+        {
+            "visual": "直接可见事实：产品居中。",
+            "lighting": "冷白轮廓光",
+            "action": "产品缓慢旋转",
+            "camera": "镜头缓慢推进",
+            "transition": "闪白转场",
+            "action_evidence_refs": [],
+            "camera_motion_evidence_refs": ["motion-1"],
+            "transition_evidence_refs": [],
+            "analyzer_status": {
+                "action": "unsupported",
+                "camera_motion": "analyzed",
+                "transition": "degraded",
+            },
+        }
+    ])
+
+    assert constrained[0]["visual"] == "产品居中"
+    assert constrained[0]["action"] == ""
+    assert constrained[0]["camera"] == "镜头缓慢推进"
+    assert constrained[0]["transition"] == ""
+
+
+def test_single_source_video_uses_authoritative_segment_index():
+    result = validate_reverse_result(
+        {
+            "主体": "产品",
+            "shots": [{
+                "source_segment_index": 9,
+                "start_seconds": 0.0,
+                "end_seconds": 1.0,
+                "visual": "产品居中",
+                "evidence_frame_indices": [9],
+                "confidence": 0.9,
+            }],
+            "final_text": "产品居中",
+        },
+        "video",
+        video_segment_count=1,
+    )
+
+    assert result["shots"][0]["source_segment_index"] == 1
+
+
+def test_multi_source_video_rejects_out_of_range_segment_index():
+    with pytest.raises(ReverseResultValidationError, match="超出本次 2 个源片段"):
+        validate_reverse_result(
+            {
+                "主体": "产品",
+                "shots": [{
+                    "source_segment_index": 3,
+                    "start_seconds": 0.0,
+                    "end_seconds": 1.0,
+                    "visual": "产品居中",
+                    "evidence_frame_indices": [1],
+                    "confidence": 0.9,
+                }],
+                "final_text": "产品居中",
+            },
+            "video",
+            video_segment_count=2,
+        )
+
+
+def test_generation_video_contract_requires_every_sampled_frame():
+    payload = {
+        "主体": "产品",
+        "shots": [{
+            "start_seconds": 0.0,
+            "end_seconds": 2.0,
+            "visual": "产品瓶身特写",
+            "evidence_frame_indices": [1, 2],
+            "confidence": 0.9,
+        }],
+        "final_text": "产品瓶身特写",
+    }
+
+    with pytest.raises(ReverseResultValidationError, match="缺少采样帧: 3"):
+        validate_reverse_result(
+            payload,
+            "video",
+            required_video_frame_indices=[1, 2, 3],
+        )
+
+    # Analysis/report callers keep the existing partial-coverage contract.
+    assert validate_reverse_result(payload, "video")["shots"][0]["visual"] == "产品瓶身特写"
+
+
+def test_generation_video_contract_rejects_unknown_sampled_frame_index():
+    with pytest.raises(ReverseResultValidationError, match="超出本次采样帧范围: 4"):
+        validate_reverse_result(
+            {
+                "主体": "产品",
+                "shots": [{
+                    "start_seconds": 0.0,
+                    "end_seconds": 2.0,
+                    "visual": "产品瓶身特写",
+                    "evidence_frame_indices": [1, 2, 3, 4],
+                    "confidence": 0.9,
+                }],
+                "final_text": "产品瓶身特写",
+            },
+            "video",
+            required_video_frame_indices=[1, 2, 3],
+        )
+
+
+def test_generation_video_contract_narrows_single_frame_time_claim():
+    result = validate_reverse_result(
+        {
+            "主体": "产品",
+            "shots": [{
+                "start_seconds": 0.0,
+                "end_seconds": 10.0,
+                "visual": "完整产品立于水面",
+                "evidence_frame_indices": [2],
+                "confidence": 0.9,
+            }],
+            "final_text": "完整产品立于水面",
+        },
+        "video",
+        required_video_frame_indices=[2],
+        video_frame_timestamps={2: 5.0},
+    )
+
+    assert result["shots"][0]["start_seconds"] == 4.25
+    assert result["shots"][0]["end_seconds"] == 5.75
+
+
+def test_generation_video_contract_keeps_visible_frame_when_confidence_is_placeholder():
+    result = validate_reverse_result(
+        {
+            "主体": "产品",
+            "shots": [{
+                "start_seconds": 0.0,
+                "end_seconds": 1.0,
+                "visual": "完整产品立于水面",
+                "evidence_frame_indices": [1],
+                "confidence": 0.0,
+            }],
+            "final_text": "完整产品立于水面",
+        },
+        "video",
+        required_video_frame_indices=[1],
+        video_frame_timestamps={1: 0.0},
+    )
+
+    assert result["shots"][0]["confidence"] == 0.5
+
+
+def test_generation_video_contract_rejects_empty_visual_frame_coverage():
+    with pytest.raises(ReverseResultValidationError, match="缺少采样帧: 1"):
+        validate_reverse_result(
+            {
+                "主体": "产品",
+                "shots": [{
+                    "start_seconds": 0.0,
+                    "end_seconds": 1.0,
+                    "visual": "",
+                    "evidence_frame_indices": [1],
+                    "confidence": 0.9,
+                }],
+                "final_text": "产品",
+            },
+            "video",
+            required_video_frame_indices=[1],
+            video_frame_timestamps={1: 0.0},
+        )
+
+
+def test_profile_visual_prompt_enforces_declared_budget_on_verbose_fields():
+    result = validate_reverse_result(
+        {
+            "产品品类": "精华液玻璃瓶" * 40,
+            "品牌Logo": "正面银色品牌标识" * 40,
+            "包装文字": "正面两行白色产品文字" * 40,
+            "包装结构": "圆柱瓶身与按压泵头" * 40,
+            "主色材质": "红色半透明玻璃" * 40,
+            "负向": "乱码和产品变形",
+            "final_text": "供应商超长自由文本",
+        },
+        "product_profile",
+    )
+
+    assert len(result["final_text"]) <= 420
+    assert result["final_text"].startswith("上传产品是唯一商品主角")
+    assert "乱码和产品变形" not in result["final_text"]
+
+
+def test_placeholder_only_core_field_cannot_produce_a_prefix_only_prompt():
+    with pytest.raises(
+        ReverseResultValidationError,
+        match="缺少可用于生成的视觉白名单字段",
+    ):
+        validate_reverse_result(
+            {"产品品类": "未分析", "final_text": "供应商自由文本"},
+            "product_profile",
+        )
 
 
 def test_reverse_json_decoder_accepts_one_bare_object_and_rejects_extra_content():
@@ -385,7 +722,7 @@ def test_provider_prose_and_unknown_evidence_never_enter_visual_prompt(monkeypat
     assert result["structured"]["未知审计字段"] == "证据帧中有BUY NOW"
     assert result["shots"][0]["ocr"] == "BUY NOW"
     assert result["shots"][0]["audio_cue"] == "未分析"
-    assert result["final_text"] == "红色产品；柔和侧光；1.000秒；镜头1: 产品居中"
+    assert result["final_text"] == "红色产品；柔和侧光；镜头1（0.000-1.000秒）：产品居中"
     for forbidden in ("欢迎回来", "限时优惠", "BUY NOW", "OCR", "证据帧"):
         assert forbidden not in result["final_text"]
 
@@ -588,23 +925,121 @@ def test_product_and_portrait_templates_are_isolated():
     assert "脸型五官" in portrait and "包装结构" not in portrait
 
 
-def test_vision_anthropic_is_rejected_by_schema_and_gateway(monkeypatch):
-    with pytest.raises(ValidationError, match="不支持 Anthropic"):
-        ModelConfigIn(
-            use="vision",
-            model_id="claude-vision",
-            provider="anthropic",
-            gateway_format="anthropic",
-            cost_credits=2,
-        )
+def test_vision_anthropic_messages_supports_multiple_images_and_usage(monkeypatch):
+    model = ModelConfigIn(
+        use="vision",
+        model_id="gemini-3.1-pro-high",
+        provider="antigravity",
+        gateway_format="anthropic",
+        cost_credits=5,
+    )
+    assert model.gateway_format == "anthropic"
     monkeypatch.setattr(settings, "mock_mode", False)
-    monkeypatch.setattr(gateway, "_post", lambda *_a, **_k: pytest.fail("不应调用网关"))
-    with pytest.raises(gateway.GatewayError, match="不支持 Anthropic"):
-        gateway.reverse_prompt(
+    calls = []
+
+    def fake_post(path, payload, **kwargs):
+        calls.append((path, payload, kwargs))
+        return {
+            "content": [{
+                "type": "text",
+                "text": '{"主体":"蓝色玻璃瓶","final_text":"蓝色玻璃瓶产品图"}',
+            }],
+            "usage": {"input_tokens": 120, "output_tokens": 30},
+        }
+
+    monkeypatch.setattr(gateway, "_post", fake_post)
+    result = gateway.reverse_prompt(
+        [
             "data:image/jpeg;base64,eA==",
-            "claude-vision",
-            gateway_config=_vision_config(provider="anthropic", gateway_format="anthropic"),
-        )
+            "https://cdn.example.com/reference.png",
+        ],
+        "gemini-3.1-pro-high",
+        gateway_config=_vision_config(
+            provider="antigravity",
+            gateway_format="anthropic",
+        ),
+    )
+
+    assert len(calls) == 1
+    path, payload, kwargs = calls[0]
+    assert path == "/messages"
+    assert kwargs["retries"] == 0
+    assert payload["model"] == "gemini-3.1-pro-high"
+    assert payload["max_tokens"] == 4096
+    assert "reasoning_effort" not in payload
+    blocks = payload["messages"][0]["content"]
+    assert [block["type"] for block in blocks] == ["image", "image", "text"]
+    assert blocks[0]["source"] == {
+        "type": "base64",
+        "media_type": "image/jpeg",
+        "data": "eA==",
+    }
+    assert blocks[1]["source"] == {
+        "type": "url",
+        "url": "https://cdn.example.com/reference.png",
+    }
+    assert result["usage"]["input_tokens"] == 120
+    assert result["usage"]["output_tokens"] == 30
+    assert result["usage"]["prompt_tokens"] == 120
+    assert result["usage"]["completion_tokens"] == 30
+    assert result["usage"]["total_tokens"] == 150
+
+
+def test_vision_anthropic_repair_stays_on_messages_without_images(monkeypatch):
+    monkeypatch.setattr(settings, "mock_mode", False)
+    calls = []
+    responses = iter([
+        {
+            "content": [{"type": "text", "text": '{"final_text":"缺少主体"}'}],
+            "usage": {"input_tokens": 10, "output_tokens": 2},
+        },
+        {
+            "content": [{
+                "type": "text",
+                "text": '{"主体":"猫","final_text":"猫肖像"}',
+            }],
+            "usage": {"input_tokens": 6, "output_tokens": 4},
+        },
+    ])
+
+    def fake_post(path, payload, **_kwargs):
+        calls.append((path, payload))
+        return next(responses)
+
+    monkeypatch.setattr(gateway, "_post", fake_post)
+    result = gateway.reverse_prompt(
+        "data:image/png;base64,eA==",
+        "gemini-3.1-pro-high",
+        gateway_config=_vision_config(
+            provider="antigravity",
+            gateway_format="anthropic",
+        ),
+    )
+
+    assert [path for path, _payload in calls] == ["/messages", "/messages"]
+    assert [block["type"] for block in calls[1][1]["messages"][0]["content"]] == ["text"]
+    assert "reasoning_effort" not in calls[1][1]
+    assert result["repair_succeeded"] is True
+    assert result["usage"]["total_tokens"] == 22
+
+
+def test_vision_anthropic_normalizes_image_mime_and_tolerates_bad_usage():
+    assert gateway._anthropic_image_source("data:image/jpg;base64,eA==") == {
+        "type": "base64",
+        "media_type": "image/jpeg",
+        "data": "eA==",
+    }
+    with pytest.raises(gateway.GatewayError, match="不支持图片格式"):
+        gateway._anthropic_image_source("data:image/svg+xml;base64,eA==")
+    assert gateway._reverse_usage({
+        "usage": {"input_tokens": "invalid", "output_tokens": None},
+    }) == {
+        "input_tokens": "invalid",
+        "output_tokens": None,
+        "prompt_tokens": 0,
+        "completion_tokens": 0,
+        "total_tokens": 0,
+    }
 
 
 def test_workspace_snapshot_rejects_credentials_and_embedded_media():

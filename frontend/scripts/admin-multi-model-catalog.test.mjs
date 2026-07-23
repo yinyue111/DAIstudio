@@ -10,8 +10,10 @@ const importerSource = readFileSync(join(root, "app/admin/components/model-catal
 
 test("admin model catalog creates and updates model rows through the multi-model API", () => {
   assert.match(source, /api\.adminCreateModel\(payload\)/);
-  assert.match(source, /api\.adminUpdateModel\(r\.id, updatePayload\)/);
+  assert.match(source, /api\.adminUpdateModel\(r\.id, payload\)/);
   assert.match(source, /api\.adminUpdateModel\(row\.id, patch\)/);
+  assert.match(source, /已新增，可在创作页对应模型下拉框选择/);
+  assert.match(source, /已\$\{targetState\}，可在创作页对应模型下拉框选择/);
   assert.match(source, /row\.id == null \? row\.draftKey : String\(row\.id\)/);
   assert.doesNotMatch(source, /key=\{r\.use\}/);
 });
@@ -47,10 +49,18 @@ test("admin model catalog never hydrates stored API keys into an input", () => {
   assert.doesNotMatch(source, /value=\{r\.api_key_configured/);
 });
 
-test("existing model purpose is immutable in the editor and omitted from PATCH", () => {
-  assert.match(source, /disabled=\{r\.id != null\}/);
-  assert.match(source, /用途创建后不可修改/);
-  assert.match(source, /\{ use: _immutableUse, \.\.\.updatePayload \} = payload/);
+test("existing model purpose can be edited and saved through PATCH", () => {
+  assert.doesNotMatch(source, /disabled=\{r\.id != null\}/);
+  assert.match(source, /修改后会从原用途移到新用途/);
+  assert.match(source, /api\.adminUpdateModel\(r\.id, payload\)/);
+  assert.doesNotMatch(source, /_immutableUse/);
+});
+
+test("configured models can be deleted while preserving historical tasks", () => {
+  assert.match(source, /api\.adminDeleteModel\(row\.id\)/);
+  assert.match(source, /历史任务记录会保留/);
+  assert.match(source, /<Trash2/);
+  assert.match(source, /aria-label=\{`删除模型/);
 });
 
 test("admin model probes and busy states are isolated by model config id", () => {

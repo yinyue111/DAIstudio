@@ -17,6 +17,11 @@ __pycache__/
 *.pyc
 .venv/
 backend/.venv/
+evidence_provider/.venv/
+evidence_provider/.torch/
+video_semantic_provider/.venv/
+audio_provider/.venv/
+audio_provider/.cache/
 venv/
 .pytest_cache/
 .ruff_cache/
@@ -54,6 +59,7 @@ logs/
 # node / next
 node_modules/
 .next/
+.next-*/
 frontend/node_modules/
 frontend/.next/
 frontend/out/

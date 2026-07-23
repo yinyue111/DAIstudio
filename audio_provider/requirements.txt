@@ -1,0 +1,9 @@
+fastapi==0.137.1
+uvicorn[standard]==0.30.1
+python-multipart==0.0.32
+faster-whisper==1.1.1
+ctranslate2==4.5.0
+av==13.1.0
+tokenizers==0.20.3
+huggingface-hub==0.27.1
+numpy==2.2.6

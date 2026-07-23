@@ -34,7 +34,7 @@ def _configure_video_model(
 
 
 def test_direct_video_prompt_compiles_without_inventing_a_reference(
-    client, make_user, auth, monkeypatch
+    client, make_user, auth, monkeypatch, quote_and_generate
 ):
     make_user("13900003101", balance=1000)
     headers = auth("13900003101")
@@ -46,9 +46,8 @@ def test_direct_video_prompt_compiles_without_inventing_a_reference(
         return "video-prompt-direct"
 
     monkeypatch.setattr("app.services.gateway.submit_video", fake_submit)
-    response = client.post(
-        "/api/generate",
-        json={
+    response = quote_and_generate(
+        {
             "category": "video",
             "stage": "final",
             "prompt": {
@@ -78,7 +77,7 @@ def test_direct_video_prompt_compiles_without_inventing_a_reference(
 
 
 def test_layered_video_prompt_submits_assembled_user_draft_and_keeps_history(
-    client, make_user, auth, monkeypatch
+    client, make_user, auth, monkeypatch, quote_and_generate
 ):
     make_user("13900003104", balance=1000)
     headers = auth("13900003104")
@@ -90,9 +89,8 @@ def test_layered_video_prompt_submits_assembled_user_draft_and_keeps_history(
         return "video-prompt-layered"
 
     monkeypatch.setattr("app.services.gateway.submit_video", fake_submit)
-    response = client.post(
-        "/api/generate",
-        json={
+    response = quote_and_generate(
+        {
             "category": "video",
             "stage": "final",
             "prompt": {
@@ -128,7 +126,7 @@ def test_layered_video_prompt_submits_assembled_user_draft_and_keeps_history(
 
 
 def test_dense_video_prompt_is_preserved_instead_of_requesting_a_sequence(
-    client, make_user, auth, monkeypatch
+    client, make_user, auth, monkeypatch, quote_and_generate
 ):
     user_id = make_user("13900003102", balance=1000)
     headers = auth("13900003102")
@@ -140,9 +138,8 @@ def test_dense_video_prompt_is_preserved_instead_of_requesting_a_sequence(
         return "video-condensed-overload"
 
     monkeypatch.setattr("app.services.gateway.submit_video", fake_submit)
-    response = client.post(
-        "/api/generate",
-        json={
+    response = quote_and_generate(
+        {
             "category": "video",
             "stage": "final",
             "prompt": {
@@ -178,7 +175,7 @@ def test_dense_video_prompt_is_preserved_instead_of_requesting_a_sequence(
 
 
 def test_default_video_generation_preserves_dense_prompt_and_submits(
-    client, make_user, auth, monkeypatch
+    client, make_user, auth, monkeypatch, quote_and_generate
 ):
     user_id = make_user("13900003108", balance=1000)
     headers = auth("13900003108")
@@ -196,9 +193,8 @@ def test_default_video_generation_preserves_dense_prompt_and_submits(
         "俯拍浸水；双手拧干；擦拭脸颊；擦拭手臂；"
         "撕开展示纤维；最后展示产品英雄镜头。"
     )
-    response = client.post(
-        "/api/generate",
-        json={
+    response = quote_and_generate(
+        {
             "category": "video",
             "stage": "final",
             "prompt": {"raw_text": raw_prompt, "final_text": raw_prompt},
@@ -227,7 +223,7 @@ def test_default_video_generation_preserves_dense_prompt_and_submits(
 
 
 def test_preview_capacity_keeps_all_actions_for_actual_preview_duration(
-    client, make_user, auth, monkeypatch
+    client, make_user, auth, monkeypatch, quote_and_generate
 ):
     user_id = make_user("13900003107", balance=1000)
     headers = auth("13900003107")
@@ -245,9 +241,8 @@ def test_preview_capacity_keeps_all_actions_for_actual_preview_duration(
         return "video-condensed-preview"
 
     monkeypatch.setattr("app.services.gateway.submit_video", fake_submit)
-    response = client.post(
-        "/api/generate",
-        json={
+    response = quote_and_generate(
+        {
             "category": "video",
             "stage": "preview",
             "prompt": {"final_text": "Shot 1：产品入镜；Shot 2：推近 Logo。"},
@@ -265,7 +260,7 @@ def test_preview_capacity_keeps_all_actions_for_actual_preview_duration(
 
 
 def test_direct_product_video_submits_visual_copy_and_keeps_post_metadata(
-    client, make_user, auth, monkeypatch
+    client, make_user, auth, monkeypatch, quote_and_generate
 ):
     make_user("13900003103", balance=1000)
     headers = auth("13900003103")
@@ -288,9 +283,8 @@ def test_direct_product_video_submits_visual_copy_and_keeps_post_metadata(
         "Shot 2：微距展开并展示3D如意云纹。字幕“干湿两用”；"
         "旁白：“让洗脸这件事，成为一天温柔的开始。”"
     )
-    response = client.post(
-        "/api/generate",
-        json={
+    response = quote_and_generate(
+        {
             "source_asset_url": upload.json()["url"],
             "source_type": "image",
             "category": "video",

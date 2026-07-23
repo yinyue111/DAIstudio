@@ -5,32 +5,50 @@ import secrets
 from datetime import datetime, timezone
 from types import SimpleNamespace
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Response
 from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
 from ..config import settings
 from ..db import get_db
 from ..deps import get_current_user
-from ..models import GenTask, User
+from ..models import GenerationQuote, GenTask, User
 from ..redis_client import redis_client
 from ..schemas import TaskOut
 from ..services import credits, generation
-from ..services.config_store import get_model_config
+from ..services.gateway_config_errors import raise_gateway_config_http
 from ..services.generation import assert_model_snapshot_compatible, model_snapshot
+from ..services.generation_dispatch import (
+    create_dispatch_intent,
+    publish_dispatch,
+    validate_dispatch_request,
+)
+from ..services.generation_model_runtime import (
+    model_config_for_task,
+    model_from_persisted_snapshot,
+)
+from ..services.generation_policy import (
+    assert_generation_request_policy,
+    assert_retry_submission_state_known,
+)
+from ..services.generation_quotes import validate_quote_snapshot_integrity
 from ..services.generation_request import (
-    assert_reference_access,
     default_image_n,
     estimate_generation_cost,
     estimate_generation_cost_from_snapshot,
     validate_generation_params,
 )
+from ..services.generation_retry import (
+    assert_retry_dispatch_reconciled,
+    assert_retry_generation_lineage,
+    public_retry_params,
+)
 from ..services.progress import set_progress
 from ..services.rate_limit import incr_window
-from ..services.ssrf import SsrfError, assert_safe_user_asset_url
 from ..services.task_eta import video_eta_for_task
 from ..services.task_output import build_task_out, build_task_outs
 from ..services.user_events import publish_user_event
+from ..services.video_prompt_compiler import source_video_is_analysis_only
 
 router = APIRouter(prefix="/api", tags=["tasks"])
 
@@ -52,11 +70,78 @@ def _page(limit: int, offset: int, cap: int) -> tuple[int, int]:
 
 def _retry_params(task: GenTask) -> dict:
     """Drop worker-internal lifecycle metadata before a user retry."""
+    return public_retry_params(task)
+
+
+_RETRY_STABLE_METADATA_KEYS = {
+    "_client_request_fingerprint",
+    "_quote",
+    "_reviewed_evidence_mask",
+    "_retry",
+    "_reverse_lineage",
+    "_source_trace",
+}
+
+
+def _retry_stable_metadata(task: GenTask) -> dict:
+    params = task.params if isinstance(task.params, dict) else {}
     return {
-        k: v
-        for k, v in dict(task.params or {}).items()
-        if not str(k).startswith("_")
+        key: params[key]
+        for key in _RETRY_STABLE_METADATA_KEYS
+        if key in params
     }
+
+
+def _retry_quote(
+    db: Session,
+    task: GenTask,
+    model,
+    original_snapshot: dict | None,
+) -> tuple[GenerationQuote | None, dict | None, object]:
+    if task.quote_id is None:
+        return None, None, model
+    quote = db.get(GenerationQuote, int(task.quote_id))
+    if (
+        quote is None
+        or int(quote.user_id) != int(task.user_id)
+        or quote.task_id is None
+        or int(quote.task_id) != int(task.id)
+        or quote.status != "consumed"
+        or quote.category != task.category
+        or quote.stage != task.stage
+        or (
+            task.model_config_id is not None
+            and int(quote.model_config_id) != int(task.model_config_id)
+        )
+    ):
+        raise HTTPException(409, "任务原始报价与生成快照不一致,无法重试")
+    if int(task.cost_frozen or 0) != int(quote.estimated_credits or 0):
+        raise HTTPException(409, "任务冻结价格与原始报价不一致,无法重试")
+    snapshot = validate_quote_snapshot_integrity(db, quote)
+    params = task.params if isinstance(task.params, dict) else {}
+    quote_meta = params.get("_quote")
+    expected_meta = {
+        "quote_id": int(quote.id),
+        "capability_version_id": int(quote.capability_version_id),
+        "price_version_id": int(quote.price_version_id),
+        "estimated_credits": int(quote.estimated_credits),
+    }
+    if (
+        not isinstance(quote_meta, dict)
+        or any(quote_meta.get(key) != value for key, value in expected_meta.items())
+        or original_snapshot != snapshot
+    ):
+        raise HTTPException(409, "任务报价元数据与冻结模型快照不一致,无法重试")
+    try:
+        policy_model = model_from_persisted_snapshot(
+            db,
+            snapshot,
+            model,
+            task.category,
+        )
+    except generation.ModelSnapshotMismatchError as exc:
+        raise_gateway_config_http(exc)
+    return quote, snapshot, policy_model
 
 
 @router.get("/tasks", response_model=list[TaskOut])
@@ -139,17 +224,33 @@ def create_event_ws_ticket(user: User = Depends(get_current_user)):
 
 
 @router.post("/tasks/{task_id}/retry", response_model=TaskOut)
-def retry_task(task_id: int, db: Session = Depends(get_db),
+def retry_task(task_id: int, response: Response, db: Session = Depends(get_db),
                user: User = Depends(get_current_user)):
     task = db.get(GenTask, task_id)
     if not task or task.user_id != user.id:
         raise HTTPException(404, "任务不存在")
     if task.status != "failed":
         raise HTTPException(400, "只有失败的任务可以重试")
+    validate_dispatch_request(task.category)
+    # A provider may already have accepted an unknown-state submit. This guard
+    # must run before internal metadata is stripped or any state/credit changes.
+    assert_retry_submission_state_known(task.params)
+    assert_retry_dispatch_reconciled(db, task)
+    assert_retry_generation_lineage(db, task)
 
-    model = get_model_config(db, task.category)
+    model = model_config_for_task(db, task, task.category)
     if not model or not model.enabled:
         raise HTTPException(400, f"未配置可用的{task.category}模型")
+    original_params = task.params if isinstance(task.params, dict) else {}
+    original_snapshot = original_params.get("_model_snapshot")
+    if original_snapshot is not None and not isinstance(original_snapshot, dict):
+        raise HTTPException(400, "任务模型快照非法,无法重试")
+    quote, quote_snapshot, policy_model = _retry_quote(
+        db,
+        task,
+        model,
+        original_snapshot,
+    )
     try:
         task_params = validate_generation_params(task.category, _retry_params(task))
         if task.category == "image" and task_params.get("n") is None:
@@ -157,39 +258,43 @@ def retry_task(task_id: int, db: Session = Depends(get_db),
         n_images = int(task_params.get("n") or 1) if task.category == "image" else 1
     except (TypeError, ValueError):
         raise HTTPException(400, "任务参数非法,无法重试")
-    try:
-        assert_safe_user_asset_url(task.source_asset_url)
-        for _url_key in (
-            "reference_image_url",
-            "product_reference_image",
-            "first_frame_image",
-            "last_frame_image",
-            "style_reference_image",
-            "character_reference_image",
-            "mask_image_url",
-        ):
-            assert_safe_user_asset_url(task_params.get(_url_key))
-    except SsrfError as e:
-        raise HTTPException(400, f"素材链接被安全策略拦截:{e}")
-    assert_reference_access(
+    prompt = task.prompt
+    if not isinstance(prompt, dict):
+        raise HTTPException(400, "任务提示词非法,无法重试")
+    assert_generation_request_policy(
         db,
-        user.id,
-        task.source_asset_url,
-        task_params.get("reference_image_url"),
-        task_params.get("product_reference_image"),
-        task_params.get("first_frame_image"),
-        task_params.get("last_frame_image"),
-        task_params.get("style_reference_image"),
-        task_params.get("character_reference_image"),
-        task_params.get("mask_image_url"),
+        user_id=int(user.id),
+        model=policy_model,
+        category=task.category,
+        source_asset_url=task.source_asset_url,
+        source_type=task.source_type,
+        prompt=prompt,
+        params=task_params,
+        require_actionable_video_reference=not (
+            task.category == "video"
+            and task.stage == "final"
+            and task.parent_task_id is not None
+        ),
+        analysis_only_source_video=(
+            task.category == "video"
+            and task.source_type == "video"
+            and source_video_is_analysis_only(original_params)
+        ),
     )
-    snapshot = (task.params or {}).get("_model_snapshot") or model_snapshot(model)
+    snapshot = quote_snapshot or original_snapshot or model_snapshot(model)
     try:
         assert_model_snapshot_compatible(model, snapshot)
     except generation.ModelSnapshotMismatchError as e:
-        raise HTTPException(409, str(e)) from e
+        raise_gateway_config_http(e)
+    task_params.update(_retry_stable_metadata(task))
     task_params["_model_snapshot"] = snapshot
-    if snapshot:
+    if quote is not None:
+        cost = int(quote.estimated_credits or 0)
+    elif original_snapshot:
+        # The persisted reservation is the authoritative price for historical
+        # snapshot tasks. Re-running today's pricing code could silently reprice.
+        cost = int(task.cost_frozen or 0)
+    elif snapshot:
         cost = estimate_generation_cost_from_snapshot(
             snapshot,
             task.category,
@@ -232,25 +337,15 @@ def retry_task(task_id: int, db: Session = Depends(get_db),
         except (credits.InsufficientCredits, ValueError) as e:
             db.rollback()  # reverts the claim too -> task stays failed, no freeze
             raise HTTPException(400, str(e))
+    dispatch = create_dispatch_intent(db, task)
     db.commit()
     db.refresh(task)
 
-    try:
-        from ..tasks import enqueue_with_request_context, generate_image_task, generate_video_task
-
-        if task.category == "image":
-            enqueue_with_request_context(generate_image_task, task_id)
-        else:
-            enqueue_with_request_context(generate_video_task, task_id)
-    except Exception as e:  # noqa: BLE001
-        if cost > 0:
-            credits.refund(db, user.id, cost, biz_ref=task_id, commit=False)
-        task.status = "failed"
-        task.error = f"入队失败:{e}"
-        db.commit()
-        raise HTTPException(503, "任务入队失败,已退回额度")
-
-    return build_task_out(db, task)
+    outcome = publish_dispatch(db, dispatch.id)
+    result = build_task_out(db, task)
+    if outcome.reconciliation_required:
+        response.status_code = 202
+    return result
 
 
 @router.post("/tasks/{task_id}/cancel", response_model=TaskOut)

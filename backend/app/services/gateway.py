@@ -17,11 +17,12 @@ from __future__ import annotations
 import base64
 import json
 import logging
+import math
 import random
 import re
 import tempfile
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Collection
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -36,14 +37,22 @@ from .gateway_mocks import mock_image as _mock_image
 from .gateway_mocks import mock_video as mock_video
 from .gateway_mocks import mock_video_preview_image as mock_video_preview_image
 from .gateway_prompting import ReverseResultValidationError
+from .gateway_prompting import _decode_json_object as _decode_reverse_json_object
 from .gateway_prompting import compose_visual_final_text as _compose_visual_final_text
 from .gateway_prompting import mock_reverse as _mock_reverse
+from .gateway_prompting import (
+    normalize_video_audio_feature_statuses as _normalize_video_audio_feature_statuses,
+)
 from .gateway_prompting import normalize_video_shots as _normalize_video_shots
 from .gateway_prompting import (
     parse_structured as _parse_structured,  # noqa: F401 - legacy test hook
 )
 from .gateway_prompting import reverse_repair_template as _reverse_repair_template
 from .gateway_prompting import reverse_template as _reverse_template
+from .gateway_prompting import sanitize_video_audio_evidence as _sanitize_video_audio_evidence
+from .gateway_prompting import (
+    validate_missing_video_frame_result as _validate_missing_video_frame_result,
+)
 from .gateway_prompting import validate_reverse_result as _validate_reverse_result
 from .gateway_prompting import video_analysis_gaps as _video_analysis_gaps
 from .gateway_video_payloads import VIDEO_STATUS as _VIDEO_STATUS
@@ -202,6 +211,11 @@ def _pin_required(url: str) -> bool:
     return bool(urlparse(url).hostname)
 
 
+def _trusted_configured_host(url: str, trusted_hosts: Collection[str] | None) -> bool:
+    host = (urlparse(url).hostname or "").rstrip(".").lower()
+    return bool(host and host in {str(item).rstrip(".").lower() for item in trusted_hosts or ()})
+
+
 @contextmanager
 def _guarded_stream(client: httpx.Client, method: str, url: str, **kwargs):
     if _pin_required(url):
@@ -228,6 +242,7 @@ def _request(
     files: list | None = None,
     timeout: int,
     retries: int,
+    trusted_hosts: Collection[str] | None = None,
 ) -> httpx.Response:
     """Single HTTP path for every gateway call (image + video).
 
@@ -239,7 +254,13 @@ def _request(
     for attempt in range(retries + 1):
         try:
             t0 = time.time()
-            if _pin_required(url):
+            if _trusted_configured_host(url, trusted_hosts):
+                client_ctx = httpx.Client(
+                    timeout=timeout,
+                    follow_redirects=False,
+                    trust_env=False,
+                )
+            elif _pin_required(url):
                 client_ctx = pinned_client(url, timeout=timeout, follow_redirects=False)
             else:
                 client_ctx = httpx.Client(timeout=timeout, follow_redirects=False)
@@ -339,9 +360,24 @@ def _post(
 
 
 def _request_json(
-    method: str, url: str, *, headers: dict, payload: dict | None, timeout: int, retries: int
+    method: str,
+    url: str,
+    *,
+    headers: dict,
+    payload: dict | None,
+    timeout: int,
+    retries: int,
+    trusted_hosts: Collection[str] | None = None,
 ) -> dict:
-    r = _request(method, url, headers=headers, json=payload, timeout=timeout, retries=retries)
+    r = _request(
+        method,
+        url,
+        headers=headers,
+        json=payload,
+        timeout=timeout,
+        retries=retries,
+        trusted_hosts=trusted_hosts,
+    )
     return r.json()
 
 
@@ -354,6 +390,7 @@ def _request_multipart_json(
     files: list,
     timeout: int,
     retries: int,
+    trusted_hosts: Collection[str] | None = None,
 ) -> dict:
     r = _request(
         method,
@@ -363,6 +400,7 @@ def _request_multipart_json(
         files=files,
         timeout=timeout,
         retries=retries,
+        trusted_hosts=trusted_hosts,
     )
     return r.json()
 
@@ -455,11 +493,28 @@ def _video_analysis_context_text(video_analysis: dict) -> str:
     source = video_analysis.get("source") or {}
     duration = source.get("duration_seconds")
     fps = source.get("fps")
-    audio_state = "已检测到音轨,但未分析内容" if source.get("has_audio") else "未检测到音轨"
+    audio = video_analysis.get("audio") if isinstance(video_analysis.get("audio"), dict) else {}
+    audio_segments = audio.get("segments") if isinstance(audio.get("segments"), list) else []
+    audio_feature_statuses = _normalize_video_audio_feature_statuses(
+        audio,
+        audio_analyzed=bool(source.get("audio_analyzed")),
+    )
+    audio_evidence = bool(
+        audio_feature_statuses["asr"] in {"analyzed", "partial"}
+        and any(isinstance(item, dict) and str(item.get("text") or "").strip() for item in audio_segments)
+    )
+    if audio_evidence:
+        audio_state = "已完成带时间戳的音频转写，可依据下方证据分析"
+    elif source.get("has_audio"):
+        audio_state = "已检测到音轨,但未形成可验证的转写证据"
+    else:
+        audio_state = "未检测到音轨"
     analysis_mode = video_analysis.get("analysis_mode")
     mode_text = (
         "封面单帧降级分析,只能确认静态画面,不得推断完整时序动作"
         if analysis_mode == "cover_fallback"
+        else "多片段关键帧分析"
+        if analysis_mode == "keyframes_multi_segment"
         else "全时段关键帧分析"
     )
     lines = [
@@ -469,10 +524,109 @@ def _video_analysis_context_text(video_analysis: dict) -> str:
         if source.get("width") and source.get("height")
         else "- 显示尺寸: 未知",
         f"- 画幅比例: {source.get('ratio') or '未知'}",
-        f"- 真实时长: {float(duration):.3f} 秒" if duration is not None else "- 真实时长: 未知",
+        f"- 本次分析片段时长: {float(duration):.3f} 秒" if duration is not None else "- 本次分析片段时长: 未知",
         f"- 帧率: 约 {float(fps):.3f} fps" if fps is not None else "- 帧率: 未知",
         f"- 音频: {audio_state}",
     ]
+    if audio:
+        lines.append(
+            "- 音频子能力状态: "
+            + ", ".join(
+                f"{feature}={audio_feature_statuses[feature]}"
+                for feature in ("asr", "speaker", "music", "beat", "sfx")
+            )
+        )
+        lines.append(
+            "- 每项音频结论必须由对应子能力独立支撑;"
+            "ASR 仅支撑转写文字,不得推断说话人、音乐、BPM/节拍或音效。"
+        )
+    source_range = source.get("source_range")
+    if isinstance(source_range, dict):
+        lines.append(
+            "- 原视频分析范围: "
+            f"{float(source_range.get('start_seconds') or 0):.3f}-"
+            f"{float(source_range.get('end_seconds') or 0):.3f} 秒；"
+            "分镜起止时间必须使用片段内相对时间"
+        )
+    source_ranges = source.get("source_ranges")
+    if isinstance(source_ranges, list) and len(source_ranges) > 1:
+        lines.append("- 本次选中多个原视频片段：")
+        for index, item in enumerate(source_ranges, start=1):
+            if not isinstance(item, dict):
+                continue
+            lines.append(
+                f"  - 片段 {index}: "
+                f"{float(item.get('start_seconds') or 0):.3f}-"
+                f"{float(item.get('end_seconds') or 0):.3f} 秒"
+            )
+        lines.append(
+            "- 多片段分镜必须输出 source_segment_index，"
+            "start_seconds/end_seconds 使用原视频绝对时间，不得跨片段。"
+        )
+    else:
+        lines.append(
+            "- 本次只有 1 个源片段；source_segment_index 是源片段号而不是帧号，"
+            "如输出该字段必须固定为 1。"
+        )
+    if source.get("total_duration_seconds") is not None:
+        lines.append(f"- 原视频总时长: {float(source['total_duration_seconds']):.3f} 秒")
+    shot_detection = (
+        video_analysis.get("shot_detection")
+        if isinstance(video_analysis.get("shot_detection"), dict)
+        else {}
+    )
+    detected_shots = (
+        shot_detection.get("shots")
+        if isinstance(shot_detection.get("shots"), list)
+        else []
+    )
+    if shot_detection:
+        lines.append(
+            "- FFmpeg 场景切分: "
+            f"{shot_detection.get('status') or 'unknown'}，"
+            f"检测到 {int(shot_detection.get('scene_boundary_count') or 0)} 个场景变化边界；"
+            "这些边界是服务端时序证据，分镜应优先与其对齐，除非采样帧明确支持不同边界。"
+        )
+        multi_segment = isinstance(source_ranges, list) and len(source_ranges) > 1
+        for shot in detected_shots[:100]:
+            if not isinstance(shot, dict):
+                continue
+            start_key = "start_seconds" if multi_segment else "relative_start_seconds"
+            end_key = "end_seconds" if multi_segment else "relative_end_seconds"
+            try:
+                start = float(shot.get(start_key))
+                end = float(shot.get(end_key))
+            except (TypeError, ValueError):
+                continue
+            segment = int(shot.get("source_segment_index") or 1)
+            segment_text = f"片段 {segment} " if multi_segment else ""
+            lines.append(f"  - {segment_text}{start:.3f}-{end:.3f} 秒")
+        if shot_detection.get("degraded_reason"):
+            lines.append(
+                f"- 场景切分降级原因: {str(shot_detection['degraded_reason'])[:300]}"
+            )
+    if audio_evidence:
+        lines.append("- 音频证据时间使用原视频绝对时间；只可依据以下分段转写描述旁白/对白：")
+        evidence_chars = 0
+        for segment in audio_segments:
+            if not isinstance(segment, dict):
+                continue
+            text = str(segment.get("text") or "").strip()
+            if not text:
+                continue
+            try:
+                start = float(segment.get("start_seconds"))
+                end = float(segment.get("end_seconds"))
+            except (TypeError, ValueError):
+                continue
+            row = f"  - [{start:.3f}-{end:.3f}] {text[:500]}"
+            if evidence_chars + len(row) > 12_000:
+                lines.append("  - [其余音频证据因上下文长度限制省略]")
+                break
+            lines.append(row)
+            evidence_chars += len(row)
+    elif audio.get("degraded_reason"):
+        lines.append(f"- 音频分析降级原因: {str(audio['degraded_reason'])[:300]}")
     return "\n".join(lines) + "\n"
 
 
@@ -488,6 +642,24 @@ def _video_source_spec(video_analysis: dict) -> str:
     if source.get("fps") is not None:
         parts.append(f"约{float(source['fps']):.3f}fps")
     return "，".join(parts)
+
+
+def _video_generation_duration_suggestion(duration_seconds: object) -> str:
+    """Translate source duration into a duration current video models can render."""
+    try:
+        duration = float(duration_seconds)
+    except (TypeError, ValueError):
+        return "建议按所选生成模型的时长上限设置"
+    if not math.isfinite(duration) or duration <= 0:
+        return "建议按所选生成模型的时长上限设置"
+    if duration <= 15:
+        display = f"{duration:.1f}".rstrip("0").rstrip(".")
+        return f"建议生成约 {display} 秒单段视频"
+    segment_count = max(2, math.ceil(duration / 15))
+    return (
+        "建议压缩为 15 秒以内的单段核心版；"
+        f"如需保留完整内容，拆分为 {segment_count} 段分别生成后剪辑"
+    )
 
 
 def _video_shots_timeline(shots: list[dict]) -> str:
@@ -547,13 +719,90 @@ def _without_conflicting_video_durations(text: str, duration_seconds: float | No
 
 
 def _reverse_response_content(data: dict) -> str:
+    """Read text from OpenAI Chat Completions or Anthropic Messages."""
     try:
-        content = data["choices"][0]["message"]["content"]
+        choices = data.get("choices")
+        if isinstance(choices, list) and choices:
+            content = choices[0]["message"]["content"]
+        else:
+            content = data["content"]
     except (KeyError, IndexError, TypeError) as exc:
-        raise GatewayError("反推网关返回结构不符合预期:缺少 choices.message.content") from exc
+        raise GatewayError(
+            "反推网关返回结构不符合预期:缺少 choices.message.content 或 content"
+        ) from exc
+    if isinstance(content, list):
+        content = "".join(
+            str(block.get("text") or "")
+            for block in content
+            if isinstance(block, dict) and block.get("type") in {None, "text"}
+        )
     if not isinstance(content, str):
-        raise GatewayError("反推网关返回的 message.content 必须是字符串")
+        raise GatewayError("反推网关返回的文本内容必须是字符串或文本块列表")
     return content
+
+
+def _reverse_usage(data: dict) -> dict | None:
+    usage = data.get("usage") if isinstance(data, dict) else None
+    if not isinstance(usage, dict):
+        return None
+    normalized = dict(usage)
+    if "input_tokens" in normalized or "output_tokens" in normalized:
+        try:
+            prompt_tokens = max(0, int(normalized.get("input_tokens") or 0))
+        except (TypeError, ValueError):
+            prompt_tokens = 0
+        try:
+            completion_tokens = max(0, int(normalized.get("output_tokens") or 0))
+        except (TypeError, ValueError):
+            completion_tokens = 0
+        normalized.setdefault("prompt_tokens", prompt_tokens)
+        normalized.setdefault("completion_tokens", completion_tokens)
+        normalized.setdefault("total_tokens", prompt_tokens + completion_tokens)
+    return normalized
+
+
+def _anthropic_image_source(ref: str) -> dict:
+    value = str(ref or "").strip()
+    if value.startswith("data:"):
+        match = re.fullmatch(
+            r"data:(?P<media_type>image/[A-Za-z0-9.+-]+);base64,(?P<data>.+)",
+            value,
+            flags=re.DOTALL,
+        )
+        if match is None:
+            raise GatewayError("Anthropic 视觉反推仅支持 Base64 data URI 图片")
+        media_type = match.group("media_type").lower()
+        if media_type == "image/jpg":
+            media_type = "image/jpeg"
+        if media_type not in {"image/jpeg", "image/png", "image/gif", "image/webp"}:
+            raise GatewayError(f"Anthropic 视觉反推不支持图片格式: {media_type}")
+        encoded = "".join(match.group("data").split())
+        if not encoded:
+            raise GatewayError("Anthropic 视觉反推图片 Base64 数据为空")
+        return {
+            "type": "base64",
+            "media_type": media_type,
+            "data": encoded,
+        }
+    parsed = urlparse(value)
+    if parsed.scheme in {"http", "https"} and parsed.netloc:
+        return {"type": "url", "url": value}
+    raise GatewayError("Anthropic 视觉反推图片必须是 HTTP(S) URL 或 Base64 data URI")
+
+
+def _anthropic_reverse_content(content: list[dict]) -> list[dict]:
+    blocks: list[dict] = []
+    for item in content:
+        if item.get("type") == "text":
+            blocks.append({"type": "text", "text": str(item.get("text") or "")})
+            continue
+        if item.get("type") == "image_url":
+            image_url = item.get("image_url")
+            ref = image_url.get("url") if isinstance(image_url, dict) else image_url
+            blocks.append({"type": "image", "source": _anthropic_image_source(str(ref or ""))})
+            continue
+        raise GatewayError(f"Anthropic 视觉反推不支持内容块类型: {item.get('type')}")
+    return blocks
 
 
 def _merge_gateway_usage(*rows: dict | None) -> dict | None:
@@ -580,6 +829,23 @@ _VIDEO_TEMPORAL_EVIDENCE_FIELDS = frozenset({
     "时序分镜",
     "转场",
 })
+
+_REVERSE_REASONING_MODEL_RE = re.compile(
+    r"(?:^|/)(?:gpt-5(?:[.\-]|$)|o(?:1|3|4)(?:[.\-]|$))",
+    re.IGNORECASE,
+)
+
+
+def _reverse_completion_controls(model_id: str) -> dict:
+    controls = {
+        "max_tokens": max(512, int(settings.reverse_gateway_max_tokens or 4096)),
+    }
+    effort = str(settings.reverse_gateway_reasoning_effort or "").strip().lower()
+    if effort in {"low", "medium", "high"} and _REVERSE_REASONING_MODEL_RE.search(
+        str(model_id or "")
+    ):
+        controls["reasoning_effort"] = effort
+    return controls
 
 
 def _drop_unverified_video_timeline(result: dict) -> None:
@@ -615,26 +881,46 @@ def _repair_reverse_result_once(
     target: str,
     vision_model_id: str,
     gateway_config: RuntimeGatewayConfig | None,
+    source_count: int | None = None,
+    video_segment_count: int | None = None,
+    required_video_frame_indices: Collection[int] | None = None,
+    video_frame_timestamps: dict[int, float] | None = None,
 ) -> tuple[dict, dict | None]:
     """Make exactly one text-only request to repair an invalid model result."""
+    anthropic = bool(
+        gateway_config is not None and gateway_config.gateway_format == "anthropic"
+    )
+    repair_text = _reverse_repair_template(content, str(error), target)
     payload = {
         "model": vision_model_id,
         "messages": [{
             "role": "user",
-            "content": _reverse_repair_template(content, str(error), target),
+            "content": (
+                [{"type": "text", "text": repair_text}]
+                if anthropic
+                else repair_text
+            ),
         }],
         "temperature": 0,
+        **_reverse_completion_controls(vision_model_id),
     }
     repair_data = _post(
-        "/chat/completions",
+        "/messages" if anthropic else "/chat/completions",
         payload,
-        timeout=int(settings.reverse_gateway_timeout_seconds or 150),
+        timeout=int(settings.reverse_gateway_timeout_seconds or 240),
         config=gateway_config,
         retries=0,
     )
     repaired_content = _reverse_response_content(repair_data)
     try:
-        result = _validate_reverse_result(repaired_content, target)
+        result = _validate_reverse_result(
+            repaired_content,
+            target,
+            source_count=source_count,
+            video_segment_count=video_segment_count,
+            required_video_frame_indices=required_video_frame_indices,
+            video_frame_timestamps=video_frame_timestamps,
+        )
     except ReverseResultValidationError as repair_error:
         raise GatewayError(
             "反推结果不符合结构契约,且一次自动修复后仍无效: "
@@ -642,7 +928,146 @@ def _repair_reverse_result_once(
             error_code="INVALID_REVERSE_RESULT",
             phase="repairing",
         ) from repair_error
-    return result, repair_data.get("usage")
+    return result, _reverse_usage(repair_data)
+
+
+def _missing_required_video_frame_indices(
+    content: str,
+    required_frame_indices: Collection[int] | None,
+) -> list[int]:
+    if not required_frame_indices:
+        return []
+    try:
+        payload = _decode_reverse_json_object(content)
+    except ReverseResultValidationError:
+        return []
+    covered = {
+        int(index)
+        for shot in payload.get("shots") or []
+        if isinstance(shot, dict)
+        for index in shot.get("evidence_frame_indices") or []
+        if isinstance(index, int) and not isinstance(index, bool) and index > 0
+    }
+    return sorted({int(index) for index in required_frame_indices} - covered)
+
+
+def _repair_missing_video_frames_once(
+    content: str,
+    *,
+    missing_frame_indices: list[int],
+    frame_refs: dict[int, str],
+    frame_timestamps: dict[int, float],
+    frame_segments: dict[int, int],
+    target: str,
+    vision_model_id: str,
+    gateway_config: RuntimeGatewayConfig | None,
+    source_count: int | None,
+    video_segment_count: int | None,
+    required_video_frame_indices: Collection[int],
+) -> tuple[dict, dict | None]:
+    """Analyze only uncovered frames and merge them into the original provider JSON."""
+    missing_refs = {
+        index: frame_refs[index]
+        for index in missing_frame_indices
+        if index in frame_refs
+    }
+    if set(missing_refs) != set(missing_frame_indices):
+        raise GatewayError(
+            "缺失采样帧没有可用图像引用",
+            error_code="INVALID_REVERSE_RESULT",
+            phase="repairing",
+        )
+    frame_contract = ", ".join(
+        f"{index}@{frame_timestamps[index]:.3f}s"
+        if index in frame_timestamps
+        else str(index)
+        for index in missing_frame_indices
+    )
+    blocks: list[dict] = [{
+        "type": "text",
+        "text": (
+            "你只分析下方尚未覆盖的视频采样帧，不重写已有结果。"
+            f"必须为这些帧各返回一项: {frame_contract}。"
+            "只写当帧直接可见的主体、场景、构图、材质和光线；"
+            "不推断动作、运镜、转场、声音或帧外事件，不输出未知、可能、高级感等分析或提升词。"
+            "输出唯一 JSON 对象，不要 markdown 或解释，结构为:"
+            '{"frames":[{"frame_index":8,"visual":"直接可见画面",'
+            '"lighting":"可见光线或空字符串","confidence":0.0}]}'
+        ),
+    }]
+    for index in missing_frame_indices:
+        timestamp = frame_timestamps.get(index)
+        label = f"采样帧 {index}"
+        if timestamp is not None:
+            label += f"，时间戳 {timestamp:.3f} 秒"
+        blocks.append({"type": "text", "text": label})
+        blocks.append({"type": "image_url", "image_url": {"url": missing_refs[index]}})
+    anthropic = bool(
+        gateway_config is not None and gateway_config.gateway_format == "anthropic"
+    )
+    repair_data = _post(
+        "/messages" if anthropic else "/chat/completions",
+        {
+            "model": vision_model_id,
+            "messages": [{
+                "role": "user",
+                "content": _anthropic_reverse_content(blocks) if anthropic else blocks,
+            }],
+            "temperature": 0,
+            **_reverse_completion_controls(vision_model_id),
+        },
+        timeout=int(settings.reverse_gateway_timeout_seconds or 240),
+        config=gateway_config,
+        retries=0,
+    )
+    repaired_content = _reverse_response_content(repair_data)
+    try:
+        descriptions = _validate_missing_video_frame_result(
+            repaired_content,
+            missing_frame_indices,
+        )
+        merged_payload = _decode_reverse_json_object(content)
+        merged_shots = list(merged_payload.get("shots") or [])
+        for description in descriptions:
+            frame_index = int(description["frame_index"])
+            timestamp = float(frame_timestamps.get(frame_index) or 0.0)
+            merged_shots.append({
+                "source_segment_index": int(frame_segments.get(frame_index) or 1),
+                "start_seconds": round(max(0.0, timestamp - 0.75), 3),
+                "end_seconds": round(timestamp + 0.75, 3),
+                "visual": description["visual"],
+                "action": "",
+                "camera": "",
+                "lighting": description["lighting"],
+                "transition": "",
+                "ocr": "",
+                "audio_cue": "",
+                "evidence_frame_indices": [frame_index],
+                "confidence": description["confidence"],
+            })
+        merged_payload["shots"] = sorted(
+            merged_shots,
+            key=lambda shot: (
+                int(shot.get("source_segment_index") or 1),
+                float(shot.get("start_seconds") or 0),
+            ) if isinstance(shot, dict) else (0, 0.0),
+        )
+        result = _validate_reverse_result(
+            merged_payload,
+            target,
+            source_count=source_count,
+            video_segment_count=video_segment_count,
+            required_video_frame_indices=required_video_frame_indices,
+            video_frame_timestamps=frame_timestamps,
+        )
+    except (ReverseResultValidationError, TypeError, ValueError) as repair_error:
+        raise GatewayError(
+            "缺失视频帧增量补全后仍不符合契约: "
+            f"{str(repair_error)[:300]}",
+            error_code="INVALID_REVERSE_RESULT",
+            phase="repairing",
+        ) from repair_error
+    return result, _reverse_usage(repair_data)
 
 
 def _reverse_prompt_impl(
@@ -654,6 +1079,8 @@ def _reverse_prompt_impl(
     before_repair: Callable[[], bool | None] | None = None,
     audit_context: dict | None = None,
     template_override: str | None = None,
+    reference_context: list[dict] | None = None,
+    require_video_frame_coverage: bool = False,
 ) -> dict:
     """Reverse one or more images into a structured prompt.
 
@@ -663,15 +1090,70 @@ def _reverse_prompt_impl(
     provider ``usage`` (real token consumption) and call latency."""
     if target not in {"image", "video", "product_profile", "portrait_profile", "image_to_video"}:
         raise GatewayError(f"不支持的反推目标: {target}")
-    if gateway_config is not None and (
-        gateway_config.provider == "anthropic" or gateway_config.gateway_format == "anthropic"
-    ):
-        raise GatewayError("视觉反推不支持 Anthropic 原生协议,请使用 OpenAI-compatible 视觉网关")
     _ensure_gateway_configured(gateway_config, "反推")
     t0 = time.time()
     repair_attempted = False
     repair_usage = None
     data: dict = {}
+    candidate_refs = (
+        [image_refs]
+        if isinstance(image_refs, str)
+        else [ref for ref in image_refs if ref]
+    )
+    source_count = max(1, len(candidate_refs))
+    video_segment_count = None
+    if target == "video" and isinstance(video_analysis, dict):
+        source = video_analysis.get("source")
+        source = source if isinstance(source, dict) else {}
+        ranges = source.get("source_ranges")
+        video_segment_count = (
+            len([row for row in ranges if isinstance(row, dict)])
+            if isinstance(ranges, list) and ranges
+            else 1
+        )
+    frame_rows = (video_analysis or {}).get("sampled_frames") or []
+    required_video_frame_indices = None
+    video_frame_timestamps: dict[int, float] = {}
+    video_frame_segments: dict[int, int] = {}
+    if (
+        target == "video"
+        and require_video_frame_coverage
+        and not _gateway_mock(gateway_config)
+        and isinstance(frame_rows, list)
+        and frame_rows
+    ):
+        required_video_frame_indices = [
+            int(row.get("index"))
+            if isinstance(row, dict)
+            and isinstance(row.get("index"), int)
+            and not isinstance(row.get("index"), bool)
+            and int(row["index"]) > 0
+            else index
+            for index, row in enumerate(frame_rows, start=1)
+        ]
+        for index, row in zip(required_video_frame_indices, frame_rows, strict=True):
+            if not isinstance(row, dict):
+                continue
+            timestamp_value = (
+                row.get("absolute_timestamp_seconds")
+                if video_segment_count and video_segment_count > 1
+                and row.get("absolute_timestamp_seconds") is not None
+                else row.get("relative_timestamp_seconds")
+                if row.get("relative_timestamp_seconds") is not None
+                else row.get("timestamp_seconds")
+            )
+            try:
+                timestamp = float(timestamp_value)
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(timestamp):
+                video_frame_timestamps[index] = timestamp
+            try:
+                video_frame_segments[index] = max(
+                    1, int(row.get("source_segment_index") or 1)
+                )
+            except (TypeError, ValueError):
+                video_frame_segments[index] = 1
     if _gateway_mock(gateway_config):
         # Mock mode replaces only the provider response. It must still pass
         # through the same audio, temporal-evidence, and analysis-gap gates as
@@ -681,24 +1163,47 @@ def _reverse_prompt_impl(
         mock_payload["final_text"] = mock_result.get("final_text")
         if "shots" in mock_result:
             mock_payload["shots"] = mock_result.get("shots")
-        result = _validate_reverse_result(mock_payload, target)
+        result = _validate_reverse_result(
+            mock_payload,
+            target,
+            source_count=source_count,
+            video_segment_count=video_segment_count,
+            required_video_frame_indices=required_video_frame_indices,
+            video_frame_timestamps=video_frame_timestamps,
+        )
     else:
-        refs = [image_refs] if isinstance(image_refs, str) else [r for r in image_refs if r]
+        refs = candidate_refs
         if not refs:
             raise GatewayError("反推缺少可用的参考图")
         content = []
-        frame_rows = (video_analysis or {}).get("sampled_frames") or []
         if target == "video" and video_analysis:
             content.append({"type": "text", "text": _video_analysis_context_text(video_analysis)})
         for index, ref in enumerate(refs, start=1):
-            if target == "video" and video_analysis:
+            context_row = (
+                reference_context[index - 1]
+                if reference_context and index <= len(reference_context)
+                else {}
+            )
+            if context_row:
+                role = str(context_row.get("role") or "reference")
+                timestamp = context_row.get("timestamp_seconds")
+                relative = context_row.get("relative_timestamp_seconds")
+                if role == "frame":
+                    source_segment_index = context_row.get("source_segment_index")
+                    label = f"第 {index} 帧，源视频时间戳 {float(timestamp):.3f} 秒" if timestamp is not None else f"第 {index} 帧"
+                    if source_segment_index is not None:
+                        label += f"，来自已选片段 {int(source_segment_index)}"
+                    if relative is not None:
+                        label += f"，分析片段内 {float(relative):.3f} 秒"
+                else:
+                    label = f"参考 {index}，角色 {role}"
+                    if context_row.get("label"):
+                        label += f"，说明 {str(context_row['label'])[:64]}"
+                content.append({"type": "text", "text": label})
+            elif target == "video" and video_analysis:
                 row = frame_rows[index - 1] if index <= len(frame_rows) else {}
                 timestamp = row.get("timestamp_seconds")
-                label = (
-                    f"第 {index} 帧，时间戳 {float(timestamp):.3f} 秒"
-                    if timestamp is not None
-                    else f"第 {index} 帧，时间戳未知"
-                )
+                label = f"第 {index} 帧，时间戳 {float(timestamp):.3f} 秒" if timestamp is not None else f"第 {index} 帧，时间戳未知"
                 content.append({"type": "text", "text": label})
             content.append({"type": "image_url", "image_url": {"url": ref}})
         template = (
@@ -706,25 +1211,61 @@ def _reverse_prompt_impl(
             if isinstance(template_override, str) and template_override.strip()
             else _reverse_template(target, n_frames=len(refs))
         )
+        if target == "video" and required_video_frame_indices:
+            required_text = ", ".join(
+                (
+                    f"{index}@{video_frame_timestamps[index]:.3f}s"
+                    if index in video_frame_timestamps
+                    else str(index)
+                )
+                for index in required_video_frame_indices
+            )
+            template = (
+                "本次用于生成的视频反推必须完整覆盖采样帧编号 "
+                f"{required_text}；每个编号至少出现在一个 shot 的 "
+                "evidence_frame_indices 中，不得遗漏或用空镜头占位。"
+                "仅由一个采样帧支撑的静态 shot，时间范围必须围绕该帧时间戳且跨度不超过 1.5 秒。\n"
+                + template
+            )
         content.append({"type": "text", "text": template})
         payload = {
             "model": vision_model_id,
-            "messages": [{"role": "user", "content": content}],
+            "messages": [{
+                "role": "user",
+                "content": (
+                    _anthropic_reverse_content(content)
+                    if gateway_config is not None
+                    and gateway_config.gateway_format == "anthropic"
+                    else content
+                ),
+            }],
             "temperature": 0.2,  # low temp -> more faithful, repeatable description
+            **_reverse_completion_controls(vision_model_id),
         }
         data = _post(
-            "/chat/completions",
+            (
+                "/messages"
+                if gateway_config is not None
+                and gateway_config.gateway_format == "anthropic"
+                else "/chat/completions"
+            ),
             payload,
-            timeout=int(settings.reverse_gateway_timeout_seconds or 150),
+            timeout=int(settings.reverse_gateway_timeout_seconds or 240),
             config=gateway_config,
-            # Reverse/profile analysis is safe to replay. Absorb brief upstream
-            # 429/5xx/connectivity blips instead of blocking image generation on
-            # the first transient failure.
-            retries=settings.gateway_max_retries,
+            # A client timeout does not prove the paid upstream request failed.
+            # Replaying here can double both latency and provider cost.
+            retries=max(0, int(settings.reverse_gateway_max_retries or 0)),
         )
         content_text = _reverse_response_content(data)
         try:
-            result = _validate_reverse_result(content_text, target)
+            result = _validate_reverse_result(
+                content_text,
+                target,
+                source_count=source_count,
+                video_segment_count=video_segment_count,
+                required_video_frame_indices=required_video_frame_indices,
+                video_frame_timestamps=video_frame_timestamps,
+            )
         except ReverseResultValidationError as validation_error:
             repair_attempted = True
             _log_reverse_audit_event(
@@ -749,19 +1290,51 @@ def _reverse_prompt_impl(
                         phase="repairing",
                     )
             try:
-                result, repair_usage = _repair_reverse_result_once(
+                missing_frame_indices = _missing_required_video_frame_indices(
                     content_text,
-                    validation_error,
-                    target=target,
-                    vision_model_id=vision_model_id,
-                    gateway_config=gateway_config,
+                    required_video_frame_indices,
                 )
+                if target == "video" and missing_frame_indices:
+                    result, repair_usage = _repair_missing_video_frames_once(
+                        content_text,
+                        missing_frame_indices=missing_frame_indices,
+                        frame_refs={
+                            index: refs[index - 1]
+                            for index in missing_frame_indices
+                            if 1 <= index <= len(refs)
+                        },
+                        frame_timestamps=video_frame_timestamps,
+                        frame_segments=video_frame_segments,
+                        target=target,
+                        vision_model_id=vision_model_id,
+                        gateway_config=gateway_config,
+                        source_count=source_count,
+                        video_segment_count=video_segment_count,
+                        required_video_frame_indices=required_video_frame_indices or (),
+                    )
+                else:
+                    result, repair_usage = _repair_reverse_result_once(
+                        content_text,
+                        validation_error,
+                        target=target,
+                        vision_model_id=vision_model_id,
+                        gateway_config=gateway_config,
+                        source_count=source_count,
+                        video_segment_count=video_segment_count,
+                        required_video_frame_indices=required_video_frame_indices,
+                        video_frame_timestamps=video_frame_timestamps,
+                    )
             except GatewayError as repair_error:
                 repair_error.phase = repair_error.phase or "repairing"
                 repair_error.error_code = repair_error.error_code or "REPAIR_FAILED"
                 raise
     frame_rows = (video_analysis or {}).get("sampled_frames") or []
     video_target = target in {"video", "image_to_video"}
+    audio_evidence = (
+        (video_analysis or {}).get("audio")
+        if isinstance((video_analysis or {}).get("audio"), dict)
+        else None
+    )
     audio_analyzed = bool(
         target == "video" and ((video_analysis or {}).get("source") or {}).get("audio_analyzed")
     )
@@ -775,11 +1348,7 @@ def _reverse_prompt_impl(
         for key, value in (("字幕卖点", "；".join(post["post_overlays"])),):
             if value and str(result["structured"].get(key) or "").strip() in {"", "无", "未分析"}:
                 result["structured"][key] = value
-        if audio_analyzed:
-            for key, value in (("旁白", post["voiceover"]), ("音效", "；".join(post["sfx"]))):
-                if value and str(result["structured"].get(key) or "").strip() in {"", "无", "未分析"}:
-                    result["structured"][key] = value
-        else:
+        if target != "video":
             result["structured"]["旁白"] = "未分析"
             result["structured"]["音效"] = "未分析"
             for shot in result.get("shots") or []:
@@ -789,6 +1358,18 @@ def _reverse_prompt_impl(
         # same-named provider extra so it cannot claim an unobserved format.
         result["structured"].pop("源视频规格", None)
         source = (video_analysis or {}).get("source") or {}
+        source_ranges = source.get("source_ranges")
+        source_range = source.get("source_range")
+        if not isinstance(source_range, dict) and isinstance(source_ranges, list) and len(source_ranges) == 1:
+            source_range = source_ranges[0]
+        try:
+            audio_time_offset = (
+                float(source_range.get("start_seconds") or 0)
+                if isinstance(source_range, dict)
+                else 0.0
+            )
+        except (TypeError, ValueError):
+            audio_time_offset = 0.0
         if video_analysis:
             result["shots"] = _normalize_video_shots(
                 result.get("shots"),
@@ -796,15 +1377,42 @@ def _reverse_prompt_impl(
                 frame_count=len(frame_rows),
                 sampled_frames=frame_rows,
                 audio_analyzed=bool(source.get("audio_analyzed")),
+                audio_evidence=audio_evidence,
+                audio_time_offset_seconds=audio_time_offset,
+                source_ranges=source_ranges,
             )
+            if required_video_frame_indices is not None:
+                normalized_coverage = {
+                    int(index)
+                    for shot in result["shots"]
+                    for index in shot.get("evidence_frame_indices") or []
+                }
+                missing_after_normalization = sorted(
+                    set(required_video_frame_indices) - normalized_coverage
+                )
+                if missing_after_normalization:
+                    joined = ", ".join(str(index) for index in missing_after_normalization)
+                    raise GatewayError(
+                        f"视频反推在证据归一化后丢失采样帧: {joined}",
+                        error_code="INVALID_REVERSE_RESULT",
+                        phase="validating",
+                    )
             result["analysis_gaps"] = _video_analysis_gaps(
                 result["shots"],
                 duration_seconds=source.get("duration_seconds"),
                 analysis_mode=video_analysis.get("analysis_mode"),
+                source_ranges=source.get("source_ranges"),
             )
         else:
             result["shots"] = []
             result["analysis_gaps"] = [{"message": "缺少视频帧分析证据"}]
+        _sanitize_video_audio_evidence(
+            result["structured"],
+            result["shots"],
+            audio_evidence=audio_evidence,
+            audio_analyzed=audio_analyzed,
+            shot_time_offset_seconds=audio_time_offset,
+        )
         _drop_unverified_video_timeline(result)
         timeline = _video_shots_timeline(result["shots"])
         if timeline:
@@ -812,10 +1420,8 @@ def _reverse_prompt_impl(
         source_spec = _video_source_spec(video_analysis or {})
         if source_spec:
             result["structured"]["源视频规格"] = source_spec
-            result["structured"]["时长建议"] = (
-                f"严格复刻源视频 {float(source['duration_seconds']):.3f} 秒"
-                if source.get("duration_seconds") is not None
-                else source_spec
+            result["structured"]["时长建议"] = _video_generation_duration_suggestion(
+                source.get("duration_seconds")
             )
     try:
         result["final_text"] = _compose_visual_final_text(
@@ -829,7 +1435,7 @@ def _reverse_prompt_impl(
             error_code="INVALID_REVERSE_RESULT",
             phase="validating",
         ) from error
-    result["usage"] = _merge_gateway_usage(data.get("usage"), repair_usage)
+    result["usage"] = _merge_gateway_usage(_reverse_usage(data), repair_usage)
     result["latency_ms"] = int((time.time() - t0) * 1000)
     result["repair_attempted"] = repair_attempted
     result["repair_succeeded"] = repair_attempted
@@ -876,6 +1482,8 @@ def reverse_prompt(
     before_repair: Callable[[], bool | None] | None = None,
     audit_context: dict | None = None,
     template_override: str | None = None,
+    reference_context: list[dict] | None = None,
+    require_video_frame_coverage: bool = False,
 ) -> dict:
     """Run reverse analysis and emit one bounded audit event for its outcome."""
     started = time.time()
@@ -895,6 +1503,8 @@ def reverse_prompt(
             before_repair=before_repair,
             audit_context=audit_context,
             template_override=template_override,
+            reference_context=reference_context,
+            require_video_frame_coverage=require_video_frame_coverage,
         )
         if target == "image_to_video":
             result = _attach_image_to_video_analysis(result, video_analysis)
@@ -1158,6 +1768,122 @@ def _assert_complete_video_optimizer_output(prompt: str, *, max_chars: int = 400
         )
 
 
+_PROMPT_OPTIMIZATION_DIRECTION_LABELS = {
+    "faithful": "忠实整理",
+    "concise": "精简压缩",
+    "expand": "细节扩写",
+    "commercial": "商业增强",
+    "cinematic": "电影化",
+    "model_adaptation": "模型适配",
+    "constraints": "约束强化",
+    "translate": "翻译转换",
+}
+
+_PROMPT_OPTIMIZATION_DIRECTION_INSTRUCTIONS = {
+    "faithful": "只整理表达、消除歧义和重复，不添加用户没有要求的新主体、动作、道具或卖点。",
+    "concise": "压缩冗余和空话，保留全部主体、动作、品牌、文字、时序和禁改项，用更少文字表达。",
+    "expand": "在不改变事实和需求的前提下，补充能被生成模型执行的构图、光线、材质、动作和镜头细节。",
+    "commercial": "强化商品卖点、主体层级、商业构图和展示节奏，但不得编造功效、品牌信息或用户未提供的道具。",
+    "cinematic": "增强景别、机位、镜头运动、光影、色彩和节奏，同时完整保留原始主体、动作和约束。",
+    "model_adaptation": "只针对目标生成模型调整语序、密度和技术表达，不改变创作意图，不重新分析素材。",
+    "constraints": "优先补全主体一致性、禁止变化、负向要求和失败边界，不擅自扩写创意内容。",
+    "translate": "只做专业视觉提示词翻译，保留专有名词、数字、单位、品牌、文字内容、时序和约束，不增删需求。",
+}
+
+_PROMPT_CONSTRAINT_RE = re.compile(
+    r"必须|务必|保留|保持|不得|禁止|不要|避免|不可|不能|准确|一致|锁定|不变|无字|仅|只"
+)
+_PROMPT_FORBIDDEN_RE = re.compile(r"不得|禁止|不要|避免|不可|不能|不允许|无字|不变")
+_PROMPT_CRITICAL_LITERAL_RE = re.compile(
+    r"[A-Za-z][A-Za-z0-9._-]{1,}|\d+(?:\.\d+)?(?:K|P|秒|分钟|帧|张|个|倍|%|:|×|x)?|[“\"']([^“”\"']{2,40})[”\"']"
+)
+
+
+def _dedupe_prompt_items(values: list[str], *, limit: int = 12) -> list[str]:
+    result: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        item = re.sub(r"\s+", " ", str(value or "")).strip(" ，,。；;\n\t")
+        key = item.casefold()
+        if not item or key in seen:
+            continue
+        seen.add(key)
+        result.append(item)
+        if len(result) >= limit:
+            break
+    return result
+
+
+def _prompt_constraint_clauses(source: str) -> list[str]:
+    clauses = re.split(r"[。；;\n]+", str(source or ""))
+    return _dedupe_prompt_items([item for item in clauses if _PROMPT_CONSTRAINT_RE.search(item)])
+
+
+def _prompt_critical_literals(source: str) -> list[str]:
+    values: list[str] = []
+    for match in _PROMPT_CRITICAL_LITERAL_RE.finditer(str(source or "")):
+        value = match.group(1) or match.group(0)
+        if value.casefold() in {"shot", "logo", "sku"}:
+            values.append(value)
+        elif any(char.isdigit() for char in value) or match.group(1):
+            values.append(value)
+        elif value.isupper() or any(char.isdigit() for char in value):
+            values.append(value)
+    return _dedupe_prompt_items(values, limit=16)
+
+
+def review_prompt_optimization(
+    source: str,
+    optimized: str,
+    *,
+    direction: str = "faithful",
+    target_language: str | None = None,
+    target_model_id: str | None = None,
+    product_mode: bool = False,
+) -> dict[str, list[str]]:
+    """Build deterministic review metadata without trusting model-authored claims."""
+    normalized_direction = direction if direction in _PROMPT_OPTIMIZATION_DIRECTION_LABELS else "faithful"
+    label = _PROMPT_OPTIMIZATION_DIRECTION_LABELS[normalized_direction]
+    source_text = str(source or "").strip()
+    optimized_text = str(optimized or "").strip()
+    constraints = _prompt_constraint_clauses(source_text)
+    forbidden = [item for item in constraints if _PROMPT_FORBIDDEN_RE.search(item)]
+    preserved = list(constraints)
+    if not preserved:
+        preserved = ["保留用户原始主体、数量、动作顺序和创作意图"]
+    standard_forbidden = "不得改变主体数量、身份、品牌名、可见文字、明确动作和时序"
+    if product_mode:
+        standard_forbidden = "不得改变商品 SKU、包装结构、Logo、品牌色、可见文字、材质和比例"
+    forbidden = _dedupe_prompt_items([standard_forbidden, *forbidden])
+    missing_literals = [
+        item for item in _prompt_critical_literals(source_text)
+        if item.casefold() not in optimized_text.casefold()
+    ]
+    warnings = [f"优化稿可能遗漏关键字面要求：{item}" for item in missing_literals[:6]]
+    if not optimized_text:
+        warnings.append("优化模型未返回有效内容")
+    change_summary = [f"按“{label}”方向处理"]
+    delta = len(optimized_text) - len(source_text)
+    if delta > 0:
+        change_summary.append(f"文本增加 {delta} 个字符")
+    elif delta < 0:
+        change_summary.append(f"文本减少 {abs(delta)} 个字符")
+    else:
+        change_summary.append("文本长度保持不变")
+    if normalized_direction == "model_adaptation" and target_model_id:
+        change_summary.append(f"已针对目标模型 {target_model_id} 编译")
+    if normalized_direction == "translate":
+        change_summary.append(f"目标语言：{'英文' if target_language == 'en' else '中文'}")
+    if constraints:
+        change_summary.append(f"识别并保留 {len(constraints)} 条显式约束")
+    return {
+        "change_summary": _dedupe_prompt_items(change_summary),
+        "preserved_requirements": _dedupe_prompt_items(preserved),
+        "forbidden_changes": forbidden,
+        "warnings": _dedupe_prompt_items(warnings),
+    }
+
+
 def optimize_prompt(
     prompt: str,
     model_id: str,
@@ -1175,6 +1901,8 @@ def optimize_prompt(
     product_lock_mode: str | None = None,
     product_video_template: str | None = None,
     target_model_extra: dict | None = None,
+    direction: str = "faithful",
+    target_language: str = "en",
     gateway_config: RuntimeGatewayConfig | None = None,
 ) -> dict:
     """Rewrite a user-authored generation prompt without changing its intent."""
@@ -1186,6 +1914,8 @@ def optimize_prompt(
         product_mode=product_mode,
         subject_mode=subject_mode,
     )
+    normalized_direction = direction if direction in _PROMPT_OPTIMIZATION_DIRECTION_LABELS else "faithful"
+    normalized_target_language = target_language if target_language in {"zh-CN", "en"} else "en"
     context_metadata = {
         key: value
         for key, value in {
@@ -1200,6 +1930,8 @@ def optimize_prompt(
             "product_video_template": product_video_template,
             "effective_product_mode": effective_product_mode if category == "video" else None,
             "product_mode_source": product_mode_source if category == "video" else None,
+            "direction": normalized_direction,
+            "target_language": normalized_target_language if normalized_direction == "translate" else None,
         }.items()
         if value not in (None, "")
     }
@@ -1212,6 +1944,10 @@ def optimize_prompt(
         if category == "video"
         else {"version": "prompt-optimizer-v2", "output_format": "single_text"}
     )
+    compiler_metadata.update({
+        "direction": normalized_direction,
+        "kind": "model_compile" if normalized_direction == "model_adaptation" else "rewrite",
+    })
     required_video_constraints: list[str] = []
     max_shots = 1
     prompt_budget_chars = 1600
@@ -1267,6 +2003,14 @@ def optimize_prompt(
             compiler_metadata.update(normalized["metadata"])
         else:
             optimized_prompt = f"{prefix}生成：{source}"
+        review = review_prompt_optimization(
+            source,
+            optimized_prompt,
+            direction=normalized_direction,
+            target_language=normalized_target_language,
+            target_model_id=target_model_id,
+            product_mode=effective_product_mode,
+        )
         return {
             "prompt": optimized_prompt,
             "usage": None,
@@ -1274,6 +2018,7 @@ def optimize_prompt(
             "optimizer_model_id": model_id,
             "compiler_metadata": compiler_metadata,
             "context_metadata": context_metadata,
+            **review,
         }
     if effective_product_mode:
         prompt_driven_product_video = (
@@ -1349,9 +2094,17 @@ def optimize_prompt(
         )
     else:
         structured_contract = ""
+    direction_instruction = _PROMPT_OPTIMIZATION_DIRECTION_INSTRUCTIONS[normalized_direction]
+    if normalized_direction == "translate":
+        direction_instruction += (
+            "目标语言为英文，除品牌和用户指定原文外全部使用英文。"
+            if normalized_target_language == "en"
+            else "目标语言为简体中文，保留品牌和用户指定原文。"
+        )
     base_system = (
         "你是专业的中文生成式视觉提示词编辑器。保持用户原始意图、主体数量、品牌名、文字、动作和禁改项，"
         "删除空话与同义重复，补足真正影响生成结果的视觉信息。"
+        f"本次优化方向：{_PROMPT_OPTIMIZATION_DIRECTION_LABELS[normalized_direction]}。{direction_instruction}"
     )
     system = (
         base_system + structured_contract + focus + video_constraints
@@ -1427,13 +2180,23 @@ def optimize_prompt(
             "completion_tokens": completion_tokens,
             "total_tokens": prompt_tokens + completion_tokens,
         }
+    final_prompt = optimized if category == "video" else optimized[:1200]
+    review = review_prompt_optimization(
+        source,
+        final_prompt,
+        direction=normalized_direction,
+        target_language=normalized_target_language,
+        target_model_id=target_model_id,
+        product_mode=effective_product_mode,
+    )
     return {
-        "prompt": optimized if category == "video" else optimized[:1200],
+        "prompt": final_prompt,
         "usage": usage_data,
         "latency_ms": int((time.time() - t0) * 1000),
         "optimizer_model_id": model_id,
         "compiler_metadata": compiler_metadata,
         "context_metadata": context_metadata,
+        **review,
     }
 
 
@@ -1557,19 +2320,36 @@ def _gen_image_via_anthropic_messages(
     *,
     n: int,
     size: str,
+    refs: list[str],
     extra: dict,
     gateway_config: RuntimeGatewayConfig,
 ) -> ImageBatchResult:
     max_tokens = int(extra.pop("message_max_tokens", 4096) or 4096)
-    request_prompt = (
-        f"{prompt.strip()}\n\n"
-        f"Generate exactly one image. Target canvas: {size}. "
-        "Return the generated image directly."
-    )
+    if refs:
+        request_prompt = (
+            f"{prompt.strip()}\n\n"
+            "Edit the supplied reference image(s) according to the instruction. "
+            f"Return exactly one edited image. Target canvas: {size}. "
+            "Return the edited image directly."
+        )
+        content: str | list[dict] = [
+            *(
+                {"type": "image", "source": _anthropic_image_source(ref)}
+                for ref in refs
+            ),
+            {"type": "text", "text": request_prompt},
+        ]
+    else:
+        request_prompt = (
+            f"{prompt.strip()}\n\n"
+            f"Generate exactly one image. Target canvas: {size}. "
+            "Return the generated image directly."
+        )
+        content = request_prompt
     payload = {
         "model": image_model_id,
         "max_tokens": max_tokens,
-        "messages": [{"role": "user", "content": request_prompt}],
+        "messages": [{"role": "user", "content": content}],
     }
 
     def one() -> bytes:
@@ -1620,6 +2400,27 @@ def _grok_image_payload(
         "response_format": extra.pop("response_format", "b64_json"),
         **extra,
     }
+
+
+def _grok_image_edit_payload(
+    image_model_id: str,
+    prompt: str,
+    size: str,
+    refs: list[str],
+    extra: dict,
+) -> dict:
+    # Grok Imagine uses JSON for /images/edits. A single source is sent as
+    # `image`; multi-image editing (up to three references) uses `images`.
+    extra.pop("edit_payload_format", None)
+    extra.pop("_edit_payload_format", None)
+    extra.pop("mask", None)  # xAI has no mask field; local pixel-lock still runs.
+    payload = _grok_image_payload(image_model_id, prompt, size, extra)
+    sources = [{"type": "image_url", "url": ref} for ref in refs]
+    if len(sources) == 1:
+        payload["image"] = sources[0]
+    else:
+        payload["images"] = sources
+    return payload
 
 
 def _image_quality_for_size(size: str | None) -> str:
@@ -1694,6 +2495,64 @@ def _image_edit_multipart_parts(
     if mask:
         files.append(("mask", _data_uri_file(str(mask), "mask")))
     return data, files
+
+
+_RESERVED_OUTBOUND_PAYLOAD_FIELDS = frozenset(
+    {
+        "field_map",
+        "prompt_profile",
+        "generation_path",
+        "edit_path",
+        "submit_path",
+        "poll_path",
+        "schema_version",
+    }
+)
+
+
+def map_outbound_payload_fields(payload: dict, field_map: dict[str, str] | None) -> dict:
+    """Map one concrete outbound shape and reject mapped/unmapped collisions."""
+    mapping = field_map or {}
+    mapped: dict = {}
+    owners: dict[str, str] = {}
+    for logical_key, value in payload.items():
+        target = mapping.get(logical_key, logical_key)
+        if target in _RESERVED_OUTBOUND_PAYLOAD_FIELDS:
+            raise GatewayError(f"出站字段 {target} 为保留控制字段")
+        previous = owners.get(target)
+        if previous is not None and previous != logical_key:
+            raise GatewayError(
+                f"field_map 将 {previous} 与 {logical_key} 映射到冲突字段 {target}"
+            )
+        owners[target] = logical_key
+        mapped[target] = value
+    return mapped
+
+
+def _mapped_multipart_parts(
+    data: dict,
+    files: list,
+    field_map: dict[str, str] | None,
+) -> tuple[dict, list]:
+    mapping = field_map or {}
+    logical_shape = dict(data)
+    logical_shape.update({logical_key: None for logical_key, _value in files})
+    map_outbound_payload_fields(logical_shape, mapping)
+    mapped_data = map_outbound_payload_fields(data, mapping)
+    target_owners = {mapping.get(source, source): source for source in data}
+    mapped_files = []
+    for logical_key, value in files:
+        target = mapping.get(logical_key, logical_key)
+        if target in _RESERVED_OUTBOUND_PAYLOAD_FIELDS:
+            raise GatewayError(f"出站字段 {target} 为保留控制字段")
+        previous = target_owners.get(target)
+        if previous is not None and previous != logical_key:
+            raise GatewayError(
+                f"field_map 将 {previous} 与 {logical_key} 映射到冲突字段 {target}"
+            )
+        target_owners[target] = logical_key
+        mapped_files.append((target, value))
+    return mapped_data, mapped_files
 
 
 def _reject_compressed_download(response: httpx.Response) -> None:
@@ -2017,6 +2876,8 @@ def gen_image(
     edit_path: str | None = None,
     extra_payload: dict | None = None,
     gateway_config: RuntimeGatewayConfig | None = None,
+    generation_path: str = "/images/generations",
+    field_map: dict[str, str] | None = None,
 ) -> list[bytes]:
     """Returns a list of raw image bytes (already downloaded / decoded).
 
@@ -2031,29 +2892,54 @@ def gen_image(
 
     n = max(1, int(n))
     extra = {k: v for k, v in (extra_payload or {}).items() if v not in (None, "")}
+    for control_field in _RESERVED_OUTBOUND_PAYLOAD_FIELDS:
+        extra.pop(control_field, None)
     refs = [str(x) for x in (reference_image_urls or []) if x]
     if reference_image_url and not refs:
         refs = [reference_image_url]
     image_transport = str(extra.pop("image_transport", "openai_images") or "openai_images")
     if image_transport == "anthropic_messages":
-        if refs or reference_image_url:
-            raise GatewayError("当前 Antigravity Gemini 图片适配仅支持文生图")
         if gateway_config is None or gateway_config.gateway_format != "anthropic":
             raise GatewayError("Anthropic Messages 图片模型需要 Anthropic 网关格式")
+        if field_map or generation_path != "/images/generations":
+            raise GatewayError(
+                "Anthropic Messages 图片适配器不支持 generation_path/field_map 覆盖"
+            )
         return _gen_image_via_anthropic_messages(
             prompt,
             image_model_id,
             n=n,
             size=size,
+            refs=refs,
             extra=extra,
             gateway_config=gateway_config,
         )
     if image_transport == "grok_images":
-        if refs or reference_image_url:
-            raise GatewayError("当前 Grok 图片适配仅支持文生图")
-        payload = _grok_image_payload(image_model_id, prompt, size, extra)
+        if refs:
+            if not edit_path:
+                raise GatewayError("Grok 图片编辑需要配置 edit_path")
+            payload = map_outbound_payload_fields(
+                _grok_image_edit_payload(
+                    image_model_id,
+                    prompt,
+                    size,
+                    refs,
+                    extra,
+                ),
+                field_map,
+            )
+            return _post_single_image_repeated(
+                edit_path,
+                payload,
+                n,
+                config=gateway_config,
+            )
+        payload = map_outbound_payload_fields(
+            _grok_image_payload(image_model_id, prompt, size, extra),
+            field_map,
+        )
         return _post_single_image_repeated(
-            "/images/generations", payload, n, config=gateway_config
+            generation_path, payload, n, config=gateway_config
         )
     extra.setdefault("quality", _image_quality_for_size(size))
     extra.setdefault("output_format", "jpeg")
@@ -2071,23 +2957,30 @@ def gen_image(
                 refs=refs,
                 extra=extra,
             )
+            form_data, files = _mapped_multipart_parts(form_data, files, field_map)
             out = _post_single_image_multipart_repeated(
                 edit_path, form_data, files, n, config=gateway_config
             )
         else:
-            payload = {
-                "model": image_model_id,
-                "images": [{"image_url": ref} for ref in refs],
-                "prompt": prompt,
-                "size": size,
-                **extra,
-            }
+            payload = map_outbound_payload_fields(
+                {
+                    "model": image_model_id,
+                    "images": [{"image_url": ref} for ref in refs],
+                    "prompt": prompt,
+                    "size": size,
+                    **extra,
+                },
+                field_map,
+            )
             out = _post_single_image_repeated(edit_path, payload, n, config=gateway_config)
     else:
         # The configured gateway maps image generation through an image tool
         # where `tools[0].n` is invalid. Repeat single-image requests instead.
-        payload = {"model": image_model_id, "prompt": prompt, "size": size, **extra}
-        out = _post_single_image_repeated("/images/generations", payload, n, config=gateway_config)
+        payload = map_outbound_payload_fields(
+            {"model": image_model_id, "prompt": prompt, "size": size, **extra},
+            field_map,
+        )
+        out = _post_single_image_repeated(generation_path, payload, n, config=gateway_config)
     if not out:
         raise GatewayError("图像网关未返回任何结果")
     return out
@@ -2244,21 +3137,26 @@ def download_to_path(
     progress_callback=None,
     low_speed_timeout_seconds: int | None = None,
     low_speed_min_bytes_per_second: int | None = None,
+    request_headers: dict[str, str] | None = None,
 ) -> int:
     """Download a gateway result directly to disk with SSRF/redirect checks."""
     try:
         assert_safe_url(url)
+        credential_origin = _url_origin(url) if request_headers else None
         timeout = int(timeout_seconds or settings.image_download_timeout_seconds)
         deadline = time.monotonic() + timeout
         with httpx.Client(follow_redirects=False, timeout=_download_httpx_timeout(timeout)) as c:
             for _ in range(MAX_REDIRECTS + 1):
                 remaining = _remaining_download_timeout(deadline)
+                headers = dict(_DOWNLOAD_HEADERS)
+                if credential_origin is not None and _url_origin(url) == credential_origin:
+                    headers.update(request_headers or {})
                 with _guarded_stream(
                     c,
                     "GET",
                     url,
                     timeout=_download_httpx_timeout(remaining),
-                    headers=_DOWNLOAD_HEADERS,
+                    headers=headers,
                 ) as r:
                     if r.is_redirect and r.headers.get("location"):
                         url = urljoin(url, r.headers["location"])
@@ -2322,6 +3220,7 @@ def download_to_storage(
     progress_callback=None,
     low_speed_timeout_seconds: int | None = None,
     low_speed_min_bytes_per_second: int | None = None,
+    request_headers: dict[str, str] | None = None,
 ) -> str:
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=f".{ext.lstrip('.')}")
     path = Path(tmp.name)
@@ -2336,6 +3235,7 @@ def download_to_storage(
             progress_callback=progress_callback,
             low_speed_timeout_seconds=low_speed_timeout_seconds,
             low_speed_min_bytes_per_second=low_speed_min_bytes_per_second,
+            request_headers=request_headers,
         )
         return storage.save_file(path, subdir, ext)
     finally:
@@ -2365,6 +3265,43 @@ def _video_url(path: str, config: RuntimeGatewayConfig | None = None) -> str:
     if fmt == "openai" and base.endswith("/v1") and path.startswith("/v1/"):
         return f"{base}{path[3:]}"
     return f"{base}{path}"
+
+
+def _normalise_video_result_url(
+    value, config: RuntimeGatewayConfig | None = None
+) -> str | None:
+    url = str(value or "").strip()
+    if not url:
+        return None
+    parsed = urlparse(url)
+    if parsed.scheme or url.startswith("//"):
+        return url
+    path = url if url.startswith("/") else f"/{url}"
+    return _video_url(path, config)
+
+
+def _url_origin(url: str) -> tuple[str, str, int | None] | None:
+    try:
+        parsed = urlparse(url)
+        scheme = parsed.scheme.lower()
+        host = (parsed.hostname or "").rstrip(".").lower()
+        if not scheme or not host:
+            return None
+        port = parsed.port
+    except ValueError:
+        return None
+    if port is None:
+        port = 443 if scheme == "https" else 80 if scheme == "http" else None
+    return scheme, host, port
+
+
+def video_result_download_headers(
+    url: str, config: RuntimeGatewayConfig | None = None
+) -> dict[str, str]:
+    """Authenticate provider-owned content endpoints without leaking to CDNs."""
+    if _url_origin(url) != _url_origin(_video_base(config)):
+        return {}
+    return _video_auth(config)
 
 
 def _format_gateway_path(template: str, **values: str) -> str:
@@ -2467,7 +3404,18 @@ def submit_video(
     submit_path = extra.get("submit_path", "/v1/videos/generations")
     id_field = extra.get("id_field", "id")
     payload_params = _generic_video_payload_params(params or {}, extra, video_model_id)
-    payload = {"model": video_model_id, "prompt": prompt, **payload_params}
+    payload_prompt = prompt
+    negative_prompt_mode = str(
+        extra.get("negative_prompt_mode")
+        or ("append_to_prompt" if "grok" in str(video_model_id).strip().lower() else "")
+    ).strip().lower()
+    if negative_prompt_mode == "append_to_prompt":
+        negative_prompt = str(payload_params.pop("negative_prompt", "") or "").strip()
+        if negative_prompt and negative_prompt not in str(payload_prompt):
+            payload_prompt = (
+                f"{str(payload_prompt).rstrip()}\nNegative constraints: {negative_prompt}"
+            )
+    payload = {"model": video_model_id, "prompt": payload_prompt, **payload_params}
     if gateway_config is None:
         data = _video_post(submit_path, payload)
     else:
@@ -2516,6 +3464,7 @@ def poll_video(
             or _nested_video_url(data.get("data"))
             or _nested_video_url(data.get("output"))
         )
+        url = _normalise_video_result_url(url, gateway_config)
     return {
         "status": norm,
         "url": url,
@@ -2566,7 +3515,7 @@ def find_video_by_request_id(
     return {
         "external_task_id": str(ext_id),
         "status": norm,
-        "url": _nested_video_url(record),
+        "url": _normalise_video_result_url(_nested_video_url(record), gateway_config),
         "error": err,
         "error_code": err_code,
         "raw_status": raw_status or None,
@@ -2604,6 +3553,7 @@ def _poll_video_ark(task_id: str, gateway_config: RuntimeGatewayConfig | None = 
             or _nested_video_url(data.get("data"))
             or _nested_video_url(data)
         )
+        url = _normalise_video_result_url(url, gateway_config)
     return {
         "status": norm,
         "url": url,

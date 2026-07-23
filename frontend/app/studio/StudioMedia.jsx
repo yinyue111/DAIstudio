@@ -28,6 +28,72 @@ function isPlatformSrc(src) {
   }
 }
 
+export function referenceVideoRawSrc(asset) {
+  if (asset?.type !== "video") return "";
+  return String(asset?.display_url || asset?.url || "").trim();
+}
+
+export function useReferenceVideoSource(asset) {
+  const rawSrc = referenceVideoRawSrc(asset);
+  const [source, setSource] = useState({
+    src: "",
+    status: "idle",
+    message: "",
+  });
+
+  useEffect(() => {
+    let cancelled = false;
+    let objectUrl = "";
+    if (!rawSrc) {
+      setSource({
+        src: "",
+        status: asset?.type === "video" ? "unavailable" : "idle",
+        message: asset?.type === "video" ? "当前素材只有封面，无法读取视频时间线。" : "",
+      });
+      return undefined;
+    }
+    if (!isProtectedUploadSrc(rawSrc)) {
+      if (!isPlatformSrc(rawSrc)) {
+        setSource({
+          src: "",
+          status: "unavailable",
+          message: "当前视频源不允许浏览器逐帧读取，请先上传到平台素材库。",
+        });
+      } else {
+        setSource({ src: rawSrc, status: "ready", message: "" });
+      }
+      return undefined;
+    }
+
+    setSource({ src: "", status: "loading", message: "正在加载受保护视频…" });
+    authenticatedObjectUrl(rawSrc)
+      .then((url) => {
+        if (cancelled) {
+          URL.revokeObjectURL(url);
+          return;
+        }
+        objectUrl = url;
+        setSource({ src: url, status: "ready", message: "" });
+      })
+      .catch((error) => {
+        reportBackgroundError(error, "load protected video timeline source");
+        if (!cancelled) {
+          setSource({
+            src: "",
+            status: "unavailable",
+            message: error?.message || "视频源加载失败，暂时无法读取时间线。",
+          });
+        }
+      });
+    return () => {
+      cancelled = true;
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
+    };
+  }, [asset?.type, rawSrc]);
+
+  return source;
+}
+
 function PreviewLoading() {
   return (
     <div className="flex h-full w-full items-center justify-center bg-base2 text-[10px] text-fog">
@@ -37,7 +103,9 @@ function PreviewLoading() {
 }
 
 export function ReferenceAssetPreview({ asset, compact = false }) {
-  const [failed, setFailed] = useState(false);
+  const [imageFailed, setImageFailed] = useState(false);
+  const [videoPlaybackFailed, setVideoPlaybackFailed] = useState(false);
+  const [posterFailed, setPosterFailed] = useState(false);
   const [secureSrc, setSecureSrc] = useState("");
   const [securePosterSrc, setSecurePosterSrc] = useState("");
   const videoRawSrc = asset?.type === "video" ? (asset?.display_url || asset?.url || "") : "";
@@ -46,7 +114,8 @@ export function ReferenceAssetPreview({ asset, compact = false }) {
   const protectedSrc = isProtectedUploadSrc(rawSrc);
   const protectedPosterSrc = isProtectedUploadSrc(videoPosterSrc);
   useEffect(() => {
-    setFailed(false);
+    setImageFailed(false);
+    setVideoPlaybackFailed(false);
     setSecureSrc("");
     if (!rawSrc || !isProtectedUploadSrc(rawSrc)) return;
     let cancelled = false;
@@ -62,14 +131,18 @@ export function ReferenceAssetPreview({ asset, compact = false }) {
       })
       .catch((e) => {
         reportBackgroundError(e, "load protected reference preview");
-        if (!cancelled) setFailed(true);
+        if (!cancelled) {
+          if (asset?.type === "video") setVideoPlaybackFailed(true);
+          else setImageFailed(true);
+        }
       });
     return () => {
       cancelled = true;
       if (objectUrl) URL.revokeObjectURL(objectUrl);
     };
-  }, [rawSrc]);
+  }, [asset?.type, rawSrc]);
   useEffect(() => {
+    setPosterFailed(false);
     setSecurePosterSrc("");
     if (!videoPosterSrc || !protectedPosterSrc) return;
     let cancelled = false;
@@ -85,13 +158,14 @@ export function ReferenceAssetPreview({ asset, compact = false }) {
       })
       .catch((e) => {
         reportBackgroundError(e, "load protected reference poster");
+        if (!cancelled) setPosterFailed(true);
       });
     return () => {
       cancelled = true;
       if (objectUrl) URL.revokeObjectURL(objectUrl);
     };
   }, [protectedPosterSrc, videoPosterSrc]);
-  if (failed) {
+  if (imageFailed) {
     return (
       <div className="flex h-full w-full flex-col items-center justify-center gap-1 bg-base2 text-[10px] text-fog">
         <span>{asset?.type === "video" ? "🎬" : "图片"}</span>
@@ -100,12 +174,12 @@ export function ReferenceAssetPreview({ asset, compact = false }) {
     );
   }
   if (asset?.type === "video") {
-    if (protectedSrc && !secureSrc) return <PreviewLoading />;
+    if (protectedSrc && !secureSrc && !videoPlaybackFailed) return <PreviewLoading />;
     const src = secureSrc || rawSrc;
     const posterSrc = securePosterSrc || (protectedPosterSrc ? "" : videoPosterSrc);
     const rawIsPosterOnly = !videoRawSrc && rawSrc === videoPosterSrc;
     const canRenderVideo = Boolean(!rawIsPosterOnly && src && (String(src).startsWith("blob:") || protectedSrc || isPlatformSrc(src)));
-    const videoSrc = canRenderVideo ? src : "";
+    const videoSrc = canRenderVideo && !videoPlaybackFailed ? src : "";
     if (videoSrc) {
       return (
         <video
@@ -116,20 +190,20 @@ export function ReferenceAssetPreview({ asset, compact = false }) {
           preload="metadata"
           poster={posterSrc || undefined}
           className="h-full w-full bg-black/20 object-contain"
-          onError={() => setFailed(true)}
+          onError={() => setVideoPlaybackFailed(true)}
         />
       );
     }
-    if (protectedPosterSrc && !securePosterSrc) return <PreviewLoading />;
-    if (posterSrc) {
-      return <img src={posterSrc} alt="" loading="lazy" className="h-full w-full bg-black/20 object-contain" onError={() => setFailed(true)} />;
+    if (protectedPosterSrc && !securePosterSrc && !posterFailed) return <PreviewLoading />;
+    if (posterSrc && !posterFailed) {
+      return <img src={posterSrc} alt="" loading="lazy" className="h-full w-full bg-black/20 object-contain" onError={() => setPosterFailed(true)} />;
     }
     return <div className="flex h-full w-full items-center justify-center text-fog">🎬</div>;
   }
   if (protectedSrc && !secureSrc) return <PreviewLoading />;
   const src = secureSrc || rawSrc;
   if (!src) return <div className="flex h-full w-full items-center justify-center bg-base2 text-xs text-fog">无预览</div>;
-  return <img src={src} alt="" loading="lazy" className="h-full w-full bg-black/20 object-contain" onError={() => setFailed(true)} />;
+  return <img src={src} alt="" loading="lazy" className="h-full w-full bg-black/20 object-contain" onError={() => setImageFailed(true)} />;
 }
 
 function isPreviewVideoAsset(a) {

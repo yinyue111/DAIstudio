@@ -65,6 +65,86 @@ assert.equal(
   validateMultiReferenceSelection({ capabilities: { multi_reference: true, max_reference_images: 10 } }, 4, 2).ok,
   true,
 );
+const seedance15Option = {
+  id: 15,
+  model_id: "doubao-seedance-1-5-pro-251215",
+  capabilities: {
+    image_to_video: true,
+    reference_image: false,
+    first_last_frame: true,
+    multi_reference: false,
+  },
+};
+assert.equal(strictMultiReferenceLimit(seedance15Option), 0);
+assert.equal(
+  validateMultiReferenceSelection(seedance15Option, 2, 1).ok,
+  false,
+  "Seedance 1.5 Pro must reject product detail references",
+);
+assert.deepEqual(
+  filterModelOptions([seedance15Option], {
+    use: "video",
+    creationMode: "video",
+    selected: null,
+    productAsset: { type: "image", url: "/product.png" },
+  }),
+  [],
+  "Seedance 1.5 Pro must not be offered for independent product references",
+);
+assert.deepEqual(
+  filterModelOptions([seedance15Option], {
+    use: "video",
+    creationMode: "video",
+    selected: { type: "image", url: "/first.png" },
+    productAsset: null,
+  }).map((item) => item.id),
+  [15],
+  "Seedance 1.5 Pro must remain available for first-frame image-to-video",
+);
+const grokReferenceOption = {
+  id: 20,
+  model_id: "grok-imagine-video",
+  capabilities: {
+    image_to_video: true,
+    reference_image: true,
+    multi_reference: true,
+    max_reference_images: 3,
+  },
+};
+const grok15Option = {
+  id: 21,
+  model_id: "grok-imagine-video-1.5",
+  capabilities: {
+    image_to_video: true,
+    reference_image: false,
+    multi_reference: false,
+  },
+};
+assert.deepEqual(
+  filterModelOptions([grokReferenceOption, grok15Option], {
+    use: "video",
+    creationMode: "video",
+    selected: null,
+    productAsset: { type: "image", url: "/product.png" },
+  }).map((item) => item.id),
+  [20],
+  "product reference mode must offer grok-imagine-video and hide Grok 1.5",
+);
+const seedance20Option = {
+  model_id: "doubao-seedance-2-0-mini-260615",
+  capabilities: { multi_reference: true, max_reference_images: 10 },
+};
+assert.equal(strictMultiReferenceLimit(seedance20Option), 10);
+assert.equal(
+  validateMultiReferenceSelection(seedance20Option, 10, 9).ok,
+  true,
+  "Seedance 2.0 must allow one theme image plus nine detail images",
+);
+assert.equal(
+  validateMultiReferenceSelection(seedance20Option, 11, 10).ok,
+  false,
+  "Seedance 2.0 must reject more than ten total reference images",
+);
 assert.deepEqual(
   filterModelOptions(options.vision, { use: "vision", selected: { type: "video" } }).map((item) => item.id),
   [2],
@@ -118,5 +198,15 @@ assert.match(pageSource, /visionModelConfigId: selectedVisionModelConfigId/, "pr
 assert.match(uploadSource, /model_config_id: Number\(visionModelConfigId\)/, "profile prefetch must submit the selected vision model id");
 assert.match(pageSource, /message: "请先选择产品主题图"/, "detail image controls must require a product theme image");
 assert.match(uploadSource, /if \(!productAsset\?\.url\)/, "detail uploads must enforce the theme image gate internally");
+assert.match(
+  pageSource,
+  /productDetailModelLimit[\s\S]*?- \(productAsset \? 0 : 1\)/,
+  "detail capacity must reserve one model reference slot for the required theme image",
+);
+assert.match(
+  uploadSource,
+  /productDetailAssets\.length \+ files\.length > effectiveProductDetailLimit/,
+  "detail uploads must enforce the selected model's remaining reference limit before upload",
+);
 
 console.log("studio model selection tests passed");

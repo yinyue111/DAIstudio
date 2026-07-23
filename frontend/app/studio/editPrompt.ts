@@ -100,7 +100,7 @@ export function buildEditPrompt(baseText, {
   const styleScope = hasStyleReference
     ? (isPortrait
         ? "风格参考只用于迁移场景、构图、镜头、光线、色调、服化道和氛围，不迁移其中的人物身份或文字。"
-        : "风格参考只用于迁移场景、构图、镜头、光线、色调和广告质感，不迁移其中的主体、品牌或文字。")
+        : "风格参考只用于迁移场景、构图、镜头、光线、色调、材质和后期质感，不迁移其中的主体、品牌或文字。")
     : "";
   if (generalEdit) {
     return `以用户上传的图片作为唯一编辑源，严格按照用户提示词执行局部或整体编辑；保留未被要求修改的主体、构图、Logo、文字、颜色、比例和关键细节，不要无故替换主体或品牌。${styleScope}编辑要求：${base}`;
@@ -110,13 +110,13 @@ export function buildEditPrompt(baseText, {
       ? "上传人像是唯一人物身份参考；保持脸型、五官、发型、肤色、年龄感、体态与可识别身份，不迁移参考视频里的人物身份；"
       : "上传人像是唯一人物身份和编辑源；保持脸型、五官、发型、肤色、年龄感、体态与可识别身份，不替换或混合人物；";
     const fidelity = "人脸清晰自然，保持服装覆盖下可见的身体轮廓、比例与姿态；表达成年、自然、得体的专业商业人像。冲突时人物身份和身体比例优先。";
-    return `${guard}${styleScope}${fidelity}生成高质量人像/商业视觉素材。迁移要求：${base}`;
+    return `${guard}${styleScope}${fidelity}生成商业人像。迁移要求：${base}`;
   }
   const guard = video
     ? "上传产品是唯一产品身份，用上传产品替换参考视频中的原主体；保持同一SKU的外形、比例、包装、材质、Logo和可见文字，不改款或改品牌；"
     : "上传产品是唯一产品身份和编辑源；保持同一SKU的外形、比例、包装结构、品牌色、材质、Logo和可见文字，不替换、重绘或改款；";
-  const fidelity = `产品清晰完整入镜，不裁切、遮挡或变形；只改变背景、道具、光线、构图和广告质感。${video ? "允许可适配到产品的展示动作，避免快速旋转和运动模糊；" : ""}冲突时产品与包装文字保真优先。`;
-  return `${guard}${styleScope}${fidelity}生成广告级商业素材。迁移要求：${base}`;
+  const fidelity = `产品清晰完整入镜，不裁切、遮挡或变形；只改变背景、道具、光线、构图、材质表现和后期质感。${video ? "允许可适配到产品的展示动作，避免快速旋转和运动模糊；" : ""}冲突时产品与包装文字保真优先。`;
+  return `${guard}${styleScope}${fidelity}生成商业产品图。迁移要求：${base}`;
 }
 
 export function buildEditNegativePrompt(value, { productMode = false, portraitMode = false, editMode = true } = {}) {

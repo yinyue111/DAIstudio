@@ -57,7 +57,12 @@ def claim_terminal(
     if expected_params is not None:
         conditions.append(GenTask.params == expected_params)
     res = db.execute(update(GenTask).where(*conditions).values(**values))
-    return (res.rowcount or 0) == 1
+    claimed = (res.rowcount or 0) == 1
+    if claimed and status == "succeeded":
+        from .project_collection import collect_generation_outputs
+
+        collect_generation_outputs(db, task_id)
+    return claimed
 
 
 def is_terminal_status(status: str | None) -> bool:

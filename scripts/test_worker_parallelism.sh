@@ -50,6 +50,15 @@ case "$reverse_cmd" in
     ;;
 esac
 
+workflow_cmd="$(WORKER_ROLE=workflow "$ROOT/scripts/run_worker.sh" --print-command)"
+case "$workflow_cmd" in
+  *"--pool=threads"*"--concurrency=2"*" -Q workflow"*) ;;
+  *)
+    echo "expected workflow worker role to use threads concurrency=2 and isolate workflow queue, got: $workflow_cmd" >&2
+    exit 1
+    ;;
+esac
+
 if WORKER_ROLE=reverse WORKER_POOL=solo "$ROOT/scripts/run_worker.sh" --print-command >/dev/null 2>&1; then
   echo "reverse worker must reject process pools that can hard-kill active tasks" >&2
   exit 1
@@ -73,7 +82,7 @@ case "$video_download_cmd" in
     ;;
 esac
 
-for service in worker_image worker_video worker_video_download worker_parse worker_reverse; do
+for service in worker_image worker_video worker_video_download worker_parse worker_reverse worker_workflow; do
   if ! grep -q "^  $service:" "$ROOT/docker-compose.yml"; then
     echo "docker-compose should define isolated $service service" >&2
     exit 1
@@ -132,6 +141,21 @@ fi
 
 if ! grep -q 'WORKER_REVERSE_CONCURRENCY:-2' "$ROOT/docker-compose.yml"; then
   echo "docker-compose reverse worker should default to concurrency=2" >&2
+  exit 1
+fi
+
+if ! grep -q 'WORKER_WORKFLOW_QUEUES:-workflow' "$ROOT/docker-compose.yml"; then
+  echo "docker-compose should isolate workflow queue" >&2
+  exit 1
+fi
+
+if ! grep -q 'WORKER_WORKFLOW_POOL:-threads' "$ROOT/docker-compose.yml"; then
+  echo "docker-compose workflow worker should default to threads pool" >&2
+  exit 1
+fi
+
+if ! grep -q 'WORKER_WORKFLOW_CONCURRENCY:-2' "$ROOT/docker-compose.yml"; then
+  echo "docker-compose workflow worker should default to concurrency=2" >&2
   exit 1
 fi
 

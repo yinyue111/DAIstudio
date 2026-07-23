@@ -22,6 +22,12 @@ from .generation_common import (
     raise_if_cancel_requested,
     settlement_cost,
 )
+from .generation_image_evidence import (
+    ReviewedEvidenceMaskError,
+    attach_mask_metadata_to_generation_revision,
+    rasterize_reviewed_evidence_mask,
+    resolve_reviewed_evidence_plan,
+)
 from .generation_media import (
     EDIT_MASK_SEND_CONFIDENCE,
     SubjectProtectionBusy,
@@ -58,6 +64,7 @@ log = logging.getLogger("generation")
 IMAGE_EDIT_REFERENCE_MAX_SIDE = 1024
 IMAGE_PRODUCT_EDIT_REFERENCE_MAX_SIDE = 1536
 IMAGE_PORTRAIT_EDIT_REFERENCE_MAX_SIDE = 1536
+IMAGE_STYLE_REFERENCE_MAX_SIDE = 768
 IMAGE_EDIT_MASK_RETRY_DELAY_SECONDS = 0.12
 
 
@@ -101,7 +108,7 @@ def image_review_has_local_results(task: GenTask) -> bool:
     if not hd_keys or not preview_keys:
         return False
     try:
-        return all(storage.local_path(key).exists() for key in [*hd_keys, *preview_keys])
+        return all(storage.exists(key) for key in [*hd_keys, *preview_keys])
     except ValueError:
         return False
 
@@ -243,6 +250,8 @@ def hold_image_submit_unknown_for_reconciliation(
 
 
 def public_image_error(exc: Exception) -> str:
+    if isinstance(exc, ReviewedEvidenceMaskError):
+        return f"已确认的图片证据蒙版无法安全应用，已停止生成并退回冻结积分：{str(exc)[:160]}"
     if isinstance(exc, ProductProtectionUnavailable):
         return (
             "产品主体保护未能可靠识别或应用蒙版，已停止本次生成并退回冻结积分。"
@@ -312,7 +321,7 @@ def run_image_task(task_id: int, *, gen_image_fn=None) -> None:
         model = model_config_for_task(db, task, "image", get_model_config)
         if not model or not model.enabled:
             raise RuntimeError("未配置可用的图像模型")
-        model = model_from_snapshot(task, model)
+        model = model_from_snapshot(task, model, db)
 
         n = int((task.params or {}).get("n") or get_setting(db, "image_n", 1))
         params = task.params or {}
@@ -331,6 +340,7 @@ def run_image_task(task_id: int, *, gen_image_fn=None) -> None:
         set_progress(task_id, 30, "running")
         raise_if_cancel_requested(db, db.get(GenTask, task_id))
         ref = None
+        ref_content_hash = None
         edit_refs: list[str] | None = None
         reference_max_side = (
             IMAGE_PRODUCT_EDIT_REFERENCE_MAX_SIDE
@@ -345,11 +355,12 @@ def run_image_task(task_id: int, *, gen_image_fn=None) -> None:
             params.get("reference_image_url")
             or params.get("character_reference_image")
         )
+        edit_source_url = explicit_reference_url or task.source_asset_url
         should_load_reference = bool(explicit_reference_url) or (
             bool((task.prompt or {}).get("instruction")) and task.source_type == "image"
         )
         if should_load_reference:
-            ref = gateway_reference_image(
+            resolved_ref = gateway_reference_image(
                 db,
                 task,
                 explicit_reference_url or task.source_asset_url,
@@ -357,21 +368,58 @@ def run_image_task(task_id: int, *, gen_image_fn=None) -> None:
                 prefer_original_upload=True,
                 quality=92,
                 subsampling=0,
+                return_content_hash=True,
             )
+            if isinstance(resolved_ref, tuple):
+                ref, ref_content_hash = resolved_ref
+            else:
+                ref = resolved_ref
             edit_refs = [ref] if ref else None
-            if ref and (model.extra or {}).get("multi_image_edit_enabled"):
+            style_reference_url = str(params.get("style_reference_image") or "").strip()
+            multi_image_setting = (model.extra or {}).get("multi_image_edit_enabled")
+            multi_image_disabled = multi_image_setting is False or str(
+                multi_image_setting or ""
+            ).strip().lower() in {"0", "false", "off", "no"}
+            style_reference_error = ""
+            if ref and style_reference_url and not multi_image_disabled:
                 try:
                     style_ref = gateway_reference_image(
                         db,
                         task,
-                        params.get("style_reference_image"),
-                        max_side=384,
+                        style_reference_url,
+                        max_side=IMAGE_STYLE_REFERENCE_MAX_SIDE,
+                        prefer_original_upload=True,
+                        quality=92,
+                        subsampling=0,
                     )
                 except Exception as e:  # noqa: BLE001
                     log.warning("image task %s style reference skipped: %s", task_id, e)
+                    style_reference_error = "invalid_or_unavailable"
                     style_ref = None
                 if style_ref:
                     edit_refs = [ref, style_ref]
+            reference_count = len(edit_refs or [])
+            style_reference_sent = reference_count >= 2
+            style_reference_skip_reason = ""
+            if style_reference_url and not style_reference_sent:
+                if multi_image_disabled:
+                    style_reference_skip_reason = "model_disabled"
+                elif not ref:
+                    style_reference_skip_reason = "primary_reference_unavailable"
+                else:
+                    style_reference_skip_reason = style_reference_error or "unavailable"
+            task.params = {
+                **(task.params or {}),
+                "_style_reference_requested": bool(style_reference_url),
+                "_style_reference_sent": style_reference_sent,
+                "_reference_image_count": reference_count,
+                **(
+                    {"_style_reference_skip_reason": style_reference_skip_reason}
+                    if style_reference_skip_reason
+                    else {}
+                ),
+            }
+            db.commit()
         edit_path = (model.extra or {}).get("edit_path", settings.image_edit_path) or None
         if ref and not edit_path:
             raise RuntimeError("参考图生成需要配置图片编辑接口")
@@ -393,16 +441,85 @@ def run_image_task(task_id: int, *, gen_image_fn=None) -> None:
         }
         edit_mask_mode = str(params.get("edit_mask_mode") or "").lower().strip()
         product_pixel_lock_mode = str(params.get("product_pixel_lock") or "auto").lower().strip()
+        reproduction_context = (
+            dict(params.get("_reproduction_context") or {})
+            if isinstance(params.get("_reproduction_context"), dict)
+            else None
+        )
         mask_result = None
+        reviewed_plan = None
+        if reproduction_context is not None:
+            from . import reproduction_remediation
+
+            if not ref:
+                raise ReviewedEvidenceMaskError("复刻纠偏局部重绘需要可用的编辑源图")
+            if not edit_path:
+                raise ReviewedEvidenceMaskError("所选图片模型不支持局部重绘")
+            mask_result = reproduction_remediation.rasterize_image_remediation_mask(
+                db,
+                task=task,
+                reference_data_uri=ref,
+                reference_content_hash=ref_content_hash,
+            )
+            extra_payload["mask"] = mask_result.data_uri
+            task.params = {
+                **(task.params or {}),
+                **mask_result.metadata,
+                "_edit_mask_requested_mode": "reproduction_remediation",
+                "_edit_mask_sent": True,
+            }
+            reproduction_remediation.attach_image_remediation_mask_metadata(
+                db,
+                task=task,
+                mask=mask_result,
+                commit=False,
+            )
+            db.commit()
+        else:
+            reviewed_plan = resolve_reviewed_evidence_plan(
+                db,
+                task,
+                edit_source_url=edit_source_url,
+            )
+        if reproduction_context is None and reviewed_plan is not None:
+            if not ref:
+                raise ReviewedEvidenceMaskError("已确认证据蒙版需要可用的编辑源图")
+            if not edit_path:
+                raise ReviewedEvidenceMaskError("所选图片模型不支持蒙版编辑")
+            mask_result = rasterize_reviewed_evidence_mask(
+                reviewed_plan,
+                reference_data_uri=ref,
+                reference_content_hash=ref_content_hash,
+            )
+            extra_payload["mask"] = mask_result.data_uri
+            task.params = {
+                **(task.params or {}),
+                **mask_result.metadata,
+                "_edit_mask_requested_mode": "reviewed_evidence",
+                "_edit_mask_sent": True,
+            }
+            attach_mask_metadata_to_generation_revision(db, task, mask_result)
+            db.commit()
         product_pixel_lock_label = "strict"
         product_pixel_lock = (
             is_product
             and ref
             and edit_path
-            and edit_mask_mode != "off"
+            and (
+                reproduction_context is not None
+                or reviewed_plan is not None
+                or edit_mask_mode != "off"
+            )
             and product_pixel_lock_mode not in {"off", "false", "0"}
         )
-        if is_product and ref and edit_path and edit_mask_mode != "off":
+        if reproduction_context is not None:
+            product_pixel_lock_label = "reproduction_remediation"
+        elif reviewed_plan is not None:
+            if product_pixel_lock_mode in {"strict", "on", "true", "1"}:
+                product_pixel_lock_label = "strict"
+            else:
+                product_pixel_lock_label = "reviewed_evidence"
+        elif is_product and ref and edit_path and edit_mask_mode != "off":
             mask_source = params.get("mask_image_url") or task.source_asset_url
             mask_failure_source = ""
             for mask_attempt in range(2):
@@ -579,7 +696,7 @@ def run_image_task(task_id: int, *, gen_image_fn=None) -> None:
                             db,
                             task,
                             raw,
-                            params.get("mask_image_url") or task.source_asset_url,
+                            edit_source_url,
                             mask_result,
                             max_side=reference_max_side,
                         )

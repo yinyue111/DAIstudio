@@ -14,7 +14,6 @@ from app.models import (
     User,
     UserDraft,
 )
-from app.routers import prompt
 from app.services import credits, retention, storage
 
 
@@ -564,17 +563,14 @@ def test_purge_all_expires_anonymous_and_tombstones_named_reverse_operations(
         named_success = db.get(ReverseOperation, operation_ids[4])
         assert named_success.status == "succeeded"
         assert named_success.asset_url == ""
-        assert named_success.result == {
-            "structured": {"subject": "x"},
-            "final_text": "named replay",
-        }
-        replay = prompt._reverse_operation_response(named_success)
-        assert replay.final_text == "named replay"
+        assert named_success.result is None
+        assert named_success.error_code == retention.REVERSE_RESULT_EXPIRED_CODE
         named_failure = db.get(ReverseOperation, operation_ids[5])
         assert named_failure.status == "failed"
         assert named_failure.asset_url == ""
         assert named_failure.error is None
         assert named_failure.result is None
+        assert named_failure.error_code == retention.REVERSE_RESULT_EXPIRED_CODE
 
         repeated = retention.purge_all(db)
         assert repeated["reverse_operations"] == 0

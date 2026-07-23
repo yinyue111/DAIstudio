@@ -1,6 +1,8 @@
 """Server-side enforcement for optional public model capabilities."""
 from __future__ import annotations
 
+from .video_prompt_compiler import PRODUCT_VIDEO_TEMPLATE_KEYS
+
 
 class ModelCapabilityError(ValueError):
     pass
@@ -69,6 +71,11 @@ def _require_strict_multi_reference(model, reference_count: int) -> None:
         )
 
 
+def _require_strict_first_last_frame(model) -> None:
+    if _capabilities(model).get("first_last_frame") is not True:
+        raise ModelCapabilityError("所选视频模型未明确支持首尾帧")
+
+
 def assert_generation_capability(
     model,
     *,
@@ -78,6 +85,27 @@ def assert_generation_capability(
     params: dict | None,
 ) -> None:
     params = params or {}
+    product_video_template = str(params.get("product_video_template") or "").strip()
+    if product_video_template:
+        if category != "video":
+            raise ModelCapabilityError("产品视频策略只能用于视频生成")
+        if product_video_template not in PRODUCT_VIDEO_TEMPLATE_KEYS:
+            raise ModelCapabilityError("产品视频策略不受支持")
+        if not str(params.get("product_reference_image") or "").strip():
+            raise ModelCapabilityError("产品视频策略必须配合产品参考图使用")
+        declared_templates = _capabilities(model).get("product_video_templates")
+        if declared_templates is not None:
+            supported_templates = (
+                {
+                    str(value).strip()
+                    for value in declared_templates
+                    if isinstance(value, str) and str(value).strip()
+                }
+                if isinstance(declared_templates, list)
+                else set()
+            )
+            if product_video_template not in supported_templates:
+                raise ModelCapabilityError("所选视频模型不支持当前产品视频策略")
     reference_urls = [
         params.get("reference_image_url"),
         params.get("product_reference_image"),
@@ -92,6 +120,16 @@ def assert_generation_capability(
         source_type,
         params,
     )
+    first_frame_url = str(
+        params.get("first_frame_image")
+        or params.get("reference_image_url")
+        or (source_asset_url if source_type == "image" else "")
+        or ""
+    ).strip()
+    last_frame_url = str(params.get("last_frame_image") or "").strip()
+    has_first_last_frame = bool(first_frame_url and last_frame_url)
+    if last_frame_url and not first_frame_url:
+        raise ModelCapabilityError("尾帧素材必须配合首帧素材使用")
     has_reference = bool(source_asset_url or any(reference_urls))
     if category == "image":
         _require(
@@ -108,8 +146,27 @@ def assert_generation_capability(
         if len(unique_reference_urls) > 1:
             _require(model, "multi_reference", "所选图片模型不支持多参考图")
         return
+    independent_reference_values = [
+        params.get("product_reference_image"),
+        params.get("style_reference_image"),
+        params.get("character_reference_image"),
+    ]
+    details = params.get("product_detail_images")
+    has_independent_reference = any(independent_reference_values) or bool(
+        details if isinstance(details, list) else []
+    )
+    if has_independent_reference:
+        _require(
+            model,
+            ("reference_image", "multi_reference"),
+            "所选视频模型不支持主体或风格参考图，请改用首帧图生视频或选择支持多参考图的模型",
+        )
+    if has_first_last_frame:
+        _require_strict_first_last_frame(model)
     if len(unique_reference_urls) > 1:
-        _require_strict_multi_reference(model, len(unique_reference_urls))
+        frame_urls = {first_frame_url, last_frame_url} if has_first_last_frame else set()
+        if not has_first_last_frame or not set(unique_reference_urls).issubset(frame_urls):
+            _require_strict_multi_reference(model, len(unique_reference_urls))
     if source_type == "video" and source_asset_url:
         _require(model, "video_to_video", "所选视频模型不支持视频参考生成")
     elif has_reference:

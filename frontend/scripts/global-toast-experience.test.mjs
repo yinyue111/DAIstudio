@@ -40,7 +40,7 @@ assert.match(errorSource, /error_type/, "generation error classifier should pref
 assert.match(taskTrackingSource, /eta_remaining_seconds|eta_total_seconds/, "video task tracking should use backend historical ETA fields");
 assert.match(pageSource, /saveDraft|loadDraft|getDraft/, "studio should sync recoverable drafts to the backend");
 assert.match(pageSource, /promptSaveTitle|promptSaveFavorite|promptSaveCategory/, "reverse prompt saving should support title, favorite, and category");
-assert.match(historySource, /compareSelection|Compare/, "history page should offer a comparison mode");
+assert.match(historySource, /UnifiedTaskList|useUnifiedTaskCenter/, "history page should use the unified task-center surface");
 assert.match(profileSource, /compareSelection|Compare/, "profile page should offer a comparison mode");
 assert.match(adminSource, /dashboard/, "admin page should expose a dashboard tab");
 assert.match(reportsSource, /adminUsageDashboard|adminModelCosts/, "admin report view should render business and model cost metrics");

@@ -2,39 +2,12 @@
 
 import { useEffect, useState } from "react";
 import { API_BASE, api, assetDownloadObjectUrl } from "../lib/api";
+import { normalizeLoopbackPlatformMediaUrl } from "../lib/platformMedia";
 
 const PLATFORM_MEDIA_PREFIXES = ["/media/", "/api/uploads/"];
-const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "::1"]);
 
 function isPlatformMediaPath(pathname) {
   return PLATFORM_MEDIA_PREFIXES.some((prefix) => String(pathname || "").startsWith(prefix));
-}
-
-function isLoopbackHost(hostname) {
-  return LOOPBACK_HOSTS.has(String(hostname || "").toLowerCase());
-}
-
-function portOf(url) {
-  if (url.port) return url.port;
-  if (url.protocol === "https:") return "443";
-  if (url.protocol === "http:") return "80";
-  return "";
-}
-
-function resolvedApiUrl() {
-  if (!API_BASE || typeof window === "undefined") return null;
-  try {
-    return new URL(API_BASE, window.location.origin);
-  } catch (e) {
-    return null;
-  }
-}
-
-function normalizeLoopbackPlatformMediaUrl(url) {
-  if (!isPlatformMediaPath(url.pathname) || !isLoopbackHost(url.hostname)) return "";
-  const apiUrl = resolvedApiUrl();
-  if (!apiUrl || portOf(url) !== portOf(apiUrl)) return "";
-  return `${apiUrl.origin}${url.pathname}${url.search}${url.hash}`;
 }
 
 function mediaAllowlistOrigins() {
@@ -70,7 +43,10 @@ export function safeAssetMediaSrc(src) {
     if (!["http:", "https:"].includes(url.protocol)) return "";
     const origins = mediaAllowlistOrigins();
     if (origins.has(url.origin)) return url.toString();
-    const normalized = normalizeLoopbackPlatformMediaUrl(url);
+    const normalized = normalizeLoopbackPlatformMediaUrl(url, {
+      apiBase: API_BASE,
+      pageOrigin: window.location.origin,
+    });
     if (!normalized) return "";
     return origins.has(new URL(normalized).origin) ? normalized : "";
   } catch (e) {
@@ -79,6 +55,17 @@ export function safeAssetMediaSrc(src) {
 }
 
 export function assetPreviewSrc(asset) {
+  if (asset?.type === "video") {
+    return safeAssetMediaSrc(
+      asset?.display_thumb
+      || asset?.preview_url
+      || asset?.thumb
+      || asset?.display_url
+      || asset?.hd_url
+      || asset?.url
+      || "",
+    );
+  }
   return safeAssetMediaSrc(
     asset?.display_url
     || asset?.display_thumb

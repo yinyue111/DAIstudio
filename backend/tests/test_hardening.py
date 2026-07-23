@@ -12,11 +12,11 @@ from app.services import gateway, generation, storage
 from app.services.progress import set_progress
 
 
-def test_text_to_image_without_reference(client, make_user, auth):
+def test_text_to_image_without_reference(client, make_user, auth, quote_and_generate):
     # 即梦-style pure text-to-image: no source_asset_url, just a prompt
     make_user("13900000040", balance=1000)
     h = auth("13900000040")
-    r = client.post("/api/generate", json={
+    r = quote_and_generate({
         "category": "image", "stage": "preview",
         "prompt": {"final_text": "a calm cat on a windowsill, soft light"},
         "params": {"n": 1, "size": "256x256"},
@@ -31,7 +31,7 @@ def test_text_to_image_without_reference(client, make_user, auth):
 def test_generate_rejects_unknown_video_params(client, make_user, auth):
     make_user("13900000140", balance=1000)
     h = auth("13900000140")
-    r = client.post("/api/generate", json={
+    r = client.post("/api/quotes", json={
         "category": "video",
         "stage": "preview",
         "prompt": {"final_text": "x"},
@@ -48,7 +48,7 @@ def test_generate_rejects_unknown_video_params(client, make_user, auth):
 def test_generate_rejects_invalid_subject_mode(client, make_user, auth):
     make_user("13900000143", balance=1000)
     h = auth("13900000143")
-    r = client.post("/api/generate", json={
+    r = client.post("/api/quotes", json={
         "category": "image",
         "stage": "preview",
         "prompt": {"final_text": "portrait style transfer"},
@@ -62,7 +62,7 @@ def test_generate_rejects_oversized_prompt(client, make_user, auth, monkeypatch)
     make_user("13900000141", balance=1000)
     h = auth("13900000141")
     monkeypatch.setattr("app.routers.generate.settings.max_prompt_chars", 32)
-    r = client.post("/api/generate", json={
+    r = client.post("/api/quotes", json={
         "category": "image",
         "stage": "preview",
         "prompt": {"final_text": "x" * 128},
@@ -72,7 +72,9 @@ def test_generate_rejects_oversized_prompt(client, make_user, auth, monkeypatch)
     assert "prompt 过长" in r.text
 
 
-def test_image_partial_success_settles_actual_count(client, make_user, auth, monkeypatch):
+def test_image_partial_success_settles_actual_count(
+    client, make_user, auth, monkeypatch, quote_and_generate
+):
     make_user("13900000045", balance=1000)
     h = auth("13900000045")
 
@@ -84,7 +86,7 @@ def test_image_partial_success_settles_actual_count(client, make_user, auth, mon
         ]
 
     monkeypatch.setattr("app.services.gateway.gen_image", two_images)
-    r = client.post("/api/generate", json={
+    r = quote_and_generate({
         "category": "image", "stage": "preview",
         "prompt": {"final_text": "partial"}, "params": {"n": 4, "size": "256x256"},
     }, headers=h)
@@ -101,7 +103,9 @@ def test_image_partial_success_settles_actual_count(client, make_user, auth, mon
     assert client.get("/api/me", headers=h).json()["balance_credits"] == 984
 
 
-def test_generated_image_over_pixel_limit_is_rejected(client, make_user, auth, monkeypatch):
+def test_generated_image_over_pixel_limit_is_rejected(
+    client, make_user, auth, monkeypatch, quote_and_generate
+):
     make_user("13900000046", balance=1000)
     h = auth("13900000046")
     monkeypatch.setattr("app.services.generation.settings.generated_image_max_pixels", 1)
@@ -110,7 +114,7 @@ def test_generated_image_over_pixel_limit_is_rejected(client, make_user, auth, m
         lambda *_a, **_k: [gateway._mock_image("huge", "256x256", 0)],
     )
 
-    r = client.post("/api/generate", json={
+    r = quote_and_generate({
         "category": "image",
         "stage": "preview",
         "prompt": {"final_text": "too many pixels"},
@@ -124,7 +128,9 @@ def test_generated_image_over_pixel_limit_is_rejected(client, make_user, auth, m
     assert client.get("/api/me", headers=h).json()["balance_credits"] == 1000
 
 
-def test_partial_image_generation_exposes_skip_reason(client, make_user, auth, monkeypatch):
+def test_partial_image_generation_exposes_skip_reason(
+    client, make_user, auth, monkeypatch, quote_and_generate
+):
     make_user("13900000048", balance=1000)
     h = auth("13900000048")
     monkeypatch.setattr(
@@ -132,7 +138,7 @@ def test_partial_image_generation_exposes_skip_reason(client, make_user, auth, m
         lambda *_a, **_k: [gateway._mock_image("ok", "256x256", 0), b"not-an-image"],
     )
 
-    r = client.post("/api/generate", json={
+    r = quote_and_generate({
         "category": "image",
         "stage": "preview",
         "prompt": {"final_text": "partial"},
@@ -865,7 +871,9 @@ def test_image_terminal_persistence_error_preserves_recoverable_result(
         db.close()
 
 
-def test_partial_image_generation_exposes_gateway_slot_failure(client, make_user, auth, monkeypatch):
+def test_partial_image_generation_exposes_gateway_slot_failure(
+    client, make_user, auth, monkeypatch, quote_and_generate
+):
     make_user("13900000049", balance=1000)
     h = auth("13900000049")
 
@@ -884,7 +892,7 @@ def test_partial_image_generation_exposes_gateway_slot_failure(client, make_user
 
     monkeypatch.setattr("app.services.gateway.gen_image", partial_with_gateway_failure)
 
-    r = client.post("/api/generate", json={
+    r = quote_and_generate({
         "category": "image",
         "stage": "preview",
         "prompt": {"final_text": "partial"},
@@ -908,6 +916,7 @@ def test_partial_image_generation_unknown_slot_returns_saved_images(
     make_user,
     auth,
     monkeypatch,
+    quote_and_generate,
 ):
     make_user("13900000050", balance=1000)
     h = auth("13900000050")
@@ -927,7 +936,7 @@ def test_partial_image_generation_unknown_slot_returns_saved_images(
 
     monkeypatch.setattr("app.services.gateway.gen_image", partial_with_unknown_failure)
 
-    r = client.post("/api/generate", json={
+    r = quote_and_generate({
         "category": "image",
         "stage": "preview",
         "prompt": {"final_text": "partial unknown"},
@@ -966,6 +975,7 @@ def test_full_image_generation_unknown_submit_holds_for_review(
     make_user,
     auth,
     monkeypatch,
+    quote_and_generate,
 ):
     phone = "13900000352"
     make_user(phone, balance=1000)
@@ -980,7 +990,7 @@ def test_full_image_generation_unknown_submit_holds_for_review(
 
     monkeypatch.setattr("app.services.gateway.gen_image", all_unknown_failure)
 
-    r = client.post("/api/generate", json={
+    r = quote_and_generate({
         "category": "image",
         "stage": "preview",
         "prompt": {"final_text": "full unknown"},
@@ -1050,13 +1060,15 @@ def test_review_task_list_marks_image_local_results_availability(client, make_us
     assert by_id[missing_id]["has_local_results"] is False
 
 
-def test_task_list_batched_keeps_assets_per_task(client, make_user, auth):
+def test_task_list_batched_keeps_assets_per_task(
+    client, make_user, auth, quote_and_generate
+):
     # guards the batched (no-N+1) task-list builder against cross-task asset mixups
     make_user("13900000041", balance=1000)
     h = auth("13900000041")
     ids = []
     for _ in range(2):
-        r = client.post("/api/generate", json={
+        r = quote_and_generate({
             "category": "image", "stage": "preview",
             "prompt": {"final_text": "x"}, "params": {"n": 2, "size": "256x256"},
         }, headers=h)
@@ -1333,7 +1345,7 @@ def test_task_websocket_rechecks_revocation_before_next_status_frame(
 def test_generate_rejects_oversized_n(client, make_user, auth):
     make_user("13900000020", balance=1000)
     h = auth("13900000020")
-    r = client.post("/api/generate", json={
+    r = client.post("/api/quotes", json={
         "source_asset_url": "http://x/y.png", "source_type": "image",
         "category": "image", "stage": "preview", "instruction": "x",
         "params": {"n": 99999, "size": "256x256"},
@@ -1346,7 +1358,7 @@ def test_generate_rejects_bad_size(client, make_user, auth):
     make_user("13900000021", balance=1000)
     h = auth("13900000021")
     for bad in ("99999x99999", "abc", "1024X", "1024*1024"):
-        r = client.post("/api/generate", json={
+        r = client.post("/api/quotes", json={
             "source_asset_url": "http://x/y.png", "source_type": "image",
             "category": "image", "stage": "preview", "instruction": "x",
             "params": {"n": 1, "size": bad},
@@ -1367,7 +1379,7 @@ def test_video_reference_rejects_external_video_without_cover(client, make_user,
         "extra": {"preview_cost": 5},
     }, headers=h)
 
-    r = client.post("/api/generate", json={
+    r = client.post("/api/quotes", json={
         "source_asset_url": "https://cdn.example.com/source.mp4",
         "source_type": "video",
         "source_asset_meta": {"user_confirmed_rights": True},
@@ -1380,7 +1392,9 @@ def test_video_reference_rejects_external_video_without_cover(client, make_user,
     assert "视频参考缺少可用封面" in r.text
 
 
-def test_generate_accepts_2k_size(client, make_user, auth, monkeypatch):
+def test_generate_accepts_2k_size(
+    client, make_user, auth, monkeypatch, quote_and_generate
+):
     make_user("13900000029", balance=1000)
     h = auth("13900000029")
 
@@ -1394,7 +1408,7 @@ def test_generate_accepts_2k_size(client, make_user, auth, monkeypatch):
 
     monkeypatch.setattr("app.services.gateway.gen_image", fake_gen_image)
 
-    r = client.post("/api/generate", json={
+    r = quote_and_generate({
         "source_asset_url": "http://x/y.png", "source_type": "image",
         "source_asset_meta": {"user_confirmed_rights": True},
         "category": "image", "stage": "preview", "instruction": "x",
@@ -1409,7 +1423,7 @@ def test_generate_respects_lower_max_image_dim_area(client, make_user, auth, mon
     h = auth("13900000034")
     monkeypatch.setattr("app.routers.generate.settings.max_image_dim", 2048)
 
-    r = client.post("/api/generate", json={
+    r = client.post("/api/quotes", json={
         "category": "image",
         "stage": "preview",
         "prompt": {"final_text": "too many pixels for a 2k-limited deployment"},
@@ -1420,7 +1434,9 @@ def test_generate_respects_lower_max_image_dim_area(client, make_user, auth, mon
     assert "总像素不超过" in r.text
 
 
-def test_2k_generation_keeps_gateway_actual_result(client, make_user, auth, monkeypatch):
+def test_2k_generation_keeps_gateway_actual_result(
+    client, make_user, auth, monkeypatch, quote_and_generate
+):
     make_user("13900000239", balance=1000)
     h = auth("13900000239")
 
@@ -1431,7 +1447,7 @@ def test_2k_generation_keeps_gateway_actual_result(client, make_user, auth, monk
         ],
     )
 
-    r = client.post("/api/generate", json={
+    r = quote_and_generate({
         "category": "image",
         "stage": "preview",
         "prompt": {"final_text": "2k request accepts actual gateway result"},
@@ -1459,7 +1475,9 @@ def test_admin_settings_respects_lower_max_image_dim_area(client, make_user, aut
     assert "总像素不超过" in r.text
 
 
-def test_4k_generation_keeps_actual_gateway_result(client, make_user, auth, monkeypatch):
+def test_4k_generation_keeps_actual_gateway_result(
+    client, make_user, auth, monkeypatch, quote_and_generate
+):
     make_user("13900000032", balance=1000)
     h = auth("13900000032")
     monkeypatch.setattr("app.routers.generate.settings.max_image_dim", 3840)
@@ -1471,7 +1489,7 @@ def test_4k_generation_keeps_actual_gateway_result(client, make_user, auth, monk
         ],
     )
 
-    r = client.post("/api/generate", json={
+    r = quote_and_generate({
         "category": "image",
         "stage": "preview",
         "prompt": {"final_text": "4k request but gateway downscales"},
@@ -1502,7 +1520,9 @@ def test_4k_generation_keeps_actual_gateway_result(client, make_user, auth, monk
         db.close()
 
 
-def test_4k_generation_saves_gateway_auto_downgrade_result(client, make_user, auth, monkeypatch):
+def test_4k_generation_saves_gateway_auto_downgrade_result(
+    client, make_user, auth, monkeypatch, quote_and_generate
+):
     make_user("13900009039", balance=1000)
     h = auth("13900009039")
     monkeypatch.setattr("app.routers.generate.settings.max_image_dim", 3840)
@@ -1524,7 +1544,7 @@ def test_4k_generation_saves_gateway_auto_downgrade_result(client, make_user, au
 
     monkeypatch.setattr("app.services.gateway.gen_image", fake_gen_image)
 
-    r = client.post("/api/generate", json={
+    r = quote_and_generate({
         "category": "image",
         "stage": "preview",
         "prompt": {"final_text": "4k request but gateway auto-downgrades"},
@@ -1554,7 +1574,9 @@ def test_4k_generation_saves_gateway_auto_downgrade_result(client, make_user, au
         db.close()
 
 
-def test_4k_generation_keeps_gateway_full_resolution_result(client, make_user, auth, monkeypatch):
+def test_4k_generation_keeps_gateway_full_resolution_result(
+    client, make_user, auth, monkeypatch, quote_and_generate
+):
     make_user("13900000033", balance=1000)
     h = auth("13900000033")
     monkeypatch.setattr("app.routers.generate.settings.max_image_dim", 3840)
@@ -1566,7 +1588,7 @@ def test_4k_generation_keeps_gateway_full_resolution_result(client, make_user, a
         ],
     )
 
-    r = client.post("/api/generate", json={
+    r = quote_and_generate({
         "category": "image",
         "stage": "preview",
         "prompt": {"final_text": "near full 4k"},
@@ -1580,7 +1602,9 @@ def test_4k_generation_keeps_gateway_full_resolution_result(client, make_user, a
     assert task["assets"][0]["height"] == 2880
 
 
-def test_reverse_portrait_prompt_is_compacted_for_image_gateway(client, make_user, auth, monkeypatch):
+def test_reverse_portrait_prompt_is_compacted_for_image_gateway(
+    client, make_user, auth, monkeypatch, quote_and_generate
+):
     make_user("13900000031", balance=1000)
     h = auth("13900000031")
     seen = {}
@@ -1606,7 +1630,7 @@ def test_reverse_portrait_prompt_is_compacted_for_image_gateway(client, make_use
         * 80
     )
 
-    r = client.post("/api/generate", json={
+    r = quote_and_generate({
         "source_asset_url": "http://x/y.png",
         "source_type": "image",
         "source_asset_meta": {"subject_mode": "portrait"},
@@ -1659,7 +1683,7 @@ def test_generate_rejects_oversized_duration(client, make_user, auth):
         "unlock_cost": 0, "enabled": True, "extra": {"preview_cost": 5},
         "admin_password": "pass123456",
     }, headers=h)
-    r = client.post("/api/generate", json={
+    r = client.post("/api/quotes", json={
         "source_asset_url": "http://x/y.png", "source_type": "image",
         "category": "video", "stage": "preview", "instruction": "x",
         "params": {"duration": 9999, "resolution": "480p"},
@@ -1668,7 +1692,9 @@ def test_generate_rejects_oversized_duration(client, make_user, auth):
     assert "时长" in r.text
 
 
-def test_generate_accepts_max_15_second_video_duration(client, make_user, auth):
+def test_generate_accepts_max_15_second_video_duration(
+    client, make_user, auth, quote_and_generate
+):
     make_user("13900000028", balance=1000, admin=True)
     h = auth("13900000028")
     client.put("/api/admin/models", json={
@@ -1676,7 +1702,7 @@ def test_generate_accepts_max_15_second_video_duration(client, make_user, auth):
         "unlock_cost": 0, "enabled": True, "extra": {"preview_cost": 5},
         "admin_password": "pass123456",
     }, headers=h)
-    r = client.post("/api/generate", json={
+    r = quote_and_generate({
         "source_type": "image",
         "category": "video", "stage": "preview", "instruction": "x",
         "params": {"duration": 15, "resolution": "480p", "ratio": "9:16"},
@@ -1789,7 +1815,7 @@ def test_content_safety_blocks_configured_prompt_terms(client, make_user, auth):
     assert s.status_code == 200, s.text
     assert s.json()["content_safety_enabled"] is True
 
-    blocked = client.post("/api/generate", json={
+    blocked = client.post("/api/quotes", json={
         "category": "image",
         "stage": "preview",
         "prompt": {"final_text": "a calm forbidden-word poster"},
@@ -1810,7 +1836,9 @@ def test_content_safety_blocks_configured_prompt_terms(client, make_user, auth):
     )
 
 
-def test_content_safety_does_not_block_configured_word_inside_larger_latin_word(client, make_user, auth):
+def test_content_safety_does_not_block_configured_word_inside_larger_latin_word(
+    client, make_user, auth, quote_and_generate
+):
     make_user("13900000252", balance=1000, admin=True)
     h = auth("13900000252")
     s = client.put(
@@ -1824,7 +1852,7 @@ def test_content_safety_does_not_block_configured_word_inside_larger_latin_word(
     )
     assert s.status_code == 200, s.text
 
-    allowed = client.post("/api/generate", json={
+    allowed = quote_and_generate({
         "category": "image",
         "stage": "preview",
         "prompt": {"final_text": "a travel poster for Sussex cliffs"},
@@ -1832,7 +1860,7 @@ def test_content_safety_does_not_block_configured_word_inside_larger_latin_word(
     }, headers=h)
     assert allowed.status_code == 200, allowed.text
 
-    blocked = client.post("/api/generate", json={
+    blocked = client.post("/api/quotes", json={
         "category": "image",
         "stage": "preview",
         "prompt": {"final_text": "a poster containing sex as a standalone banned token"},
@@ -1852,10 +1880,12 @@ def test_content_safety_does_not_block_configured_word_inside_larger_latin_word(
     )
 
 
-def test_content_safety_disabled_by_default(client, make_user, auth):
+def test_content_safety_disabled_by_default(
+    client, make_user, auth, quote_and_generate
+):
     make_user("13900000197", balance=1000)
     h = auth("13900000197")
-    r = client.post("/api/generate", json={
+    r = quote_and_generate({
         "category": "image",
         "stage": "preview",
         "prompt": {"final_text": "forbidden-word is allowed while safety is off"},

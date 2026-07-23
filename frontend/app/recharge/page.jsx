@@ -7,6 +7,9 @@ import Nav from "../../components/Nav";
 import { useToast } from "../../components/ToastProvider";
 import { api, loginPath, wsUrl } from "../../lib/api";
 import { reportBackgroundError } from "../../lib/errorHandling";
+import AccountTabs, { ACCOUNT_TABS } from "./AccountTabs";
+import CreditLedger from "./CreditLedger";
+import PaymentOrdersPanel from "./PaymentOrdersPanel";
 import {
   createPaymentOrderPoller,
   selectMonotonicPaymentOrder,
@@ -27,12 +30,19 @@ export default function RechargePage() {
   const [packages, setPackages] = useState([]);
   const [providers, setProviders] = useState([]);
   const [paymentEnabled, setPaymentEnabled] = useState(false);
+  const [paymentCapabilityKnown, setPaymentCapabilityKnown] = useState(false);
   const [orders, setOrders] = useState([]);
   const [provider, setProvider] = useState("alipay");
   const [packageId, setPackageId] = useState("");
   const [activeOrder, setActiveOrder] = useState(null);
   const [qrImage, setQrImage] = useState("");
   const [loading, setLoading] = useState(false);
+  const [initialLoading, setInitialLoading] = useState(true);
+  const [ordersLoading, setOrdersLoading] = useState(true);
+  const [ordersError, setOrdersError] = useState("");
+  const [orderLimit, setOrderLimit] = useState(20);
+  const [activeTab, setActiveTab] = useState("packages");
+  const [billingRefreshKey, setBillingRefreshKey] = useState(0);
   const [msg, setMsg] = useState("");
   const [now, setNow] = useState(() => Date.now());
   const pollRef = useRef(null);
@@ -46,14 +56,17 @@ export default function RechargePage() {
   useEffect(() => {
     api.me()
       .then(async (u) => {
-        const [paymentCfg, rows] = await Promise.all([api.paymentConfig(), api.paymentOrders(12)]);
+        setMe(u);
+        const paymentCfg = await api.paymentConfig();
         const enabled = paymentCfg.enabled !== false;
+        const rows = enabled ? await api.paymentOrders(20) : [];
         const pkgs = paymentCfg.packages || [];
         const readyProviders = (paymentCfg.providers || [])
           .filter((p) => p.enabled && p.ready)
           .map((p) => p.provider);
-        setMe(u);
         setPaymentEnabled(enabled);
+        setPaymentCapabilityKnown(true);
+        if (!enabled) setActiveTab("billing");
         setPackages(pkgs);
         setProviders(readyProviders);
         replaceOrdersMonotonically(rows);
@@ -78,13 +91,41 @@ export default function RechargePage() {
           return;
         }
         setMsg(e.message);
+        setOrdersError(e.message || "充值订单加载失败");
         notify.error(e.message || "充值页加载失败");
+      })
+      .finally(() => {
+        setPaymentCapabilityKnown(true);
+        setInitialLoading(false);
+        setOrdersLoading(false);
       });
     return () => {
       if (pollRef.current) pollRef.current.stop();
       if (eventWsRef.current) eventWsRef.current.close();
     };
   }, []);
+
+  useEffect(() => {
+    const availableTabs = paymentCapabilityKnown && !paymentEnabled
+      ? ACCOUNT_TABS.filter((tab) => tab.id === "billing")
+      : ACCOUNT_TABS;
+    const knownTabs = new Set(availableTabs.map((tab) => tab.id));
+    const syncTabFromUrl = () => {
+      const tab = new URLSearchParams(window.location.search).get("tab");
+      if (knownTabs.has(tab)) setActiveTab(tab);
+      else if (paymentCapabilityKnown) setActiveTab(paymentEnabled ? "packages" : "billing");
+    };
+    syncTabFromUrl();
+    window.addEventListener("popstate", syncTabFromUrl);
+    return () => window.removeEventListener("popstate", syncTabFromUrl);
+  }, [paymentCapabilityKnown, paymentEnabled]);
+
+  const accountTabs = useMemo(
+    () => paymentCapabilityKnown && !paymentEnabled
+      ? ACCOUNT_TABS.filter((tab) => tab.id === "billing")
+      : ACCOUNT_TABS,
+    [paymentCapabilityKnown, paymentEnabled],
+  );
 
   useEffect(() => {
     let stopped = false;
@@ -113,7 +154,8 @@ export default function RechargePage() {
                   updateActiveOrder(next);
                 }
                 api.me().then(setMe).catch((e) => reportBackgroundError(e, "refresh current user after payment event"));
-                api.paymentOrders(12).then(replaceOrdersMonotonically).catch((e) => reportBackgroundError(e, "refresh payment orders after event"));
+                api.paymentOrders(20).then(replaceOrdersMonotonically).catch((e) => reportBackgroundError(e, "refresh payment orders after event"));
+                setBillingRefreshKey((value) => value + 1);
                 notify.success("支付成功，积分已到账。");
               })
               .catch((e) => reportBackgroundError(e, "load paid payment order from event"));
@@ -166,9 +208,10 @@ export default function RechargePage() {
         if (next.status === "paid") {
           notify.success("支付成功，积分已到账。");
           api.me().then(setMe).catch((e) => reportBackgroundError(e, "refresh current user after paid order poll"));
-          api.paymentOrders(12).then(replaceOrdersMonotonically).catch((e) => reportBackgroundError(e, "refresh payment orders after paid poll"));
+          api.paymentOrders(20).then(replaceOrdersMonotonically).catch((e) => reportBackgroundError(e, "refresh payment orders after paid poll"));
+          setBillingRefreshKey((value) => value + 1);
         } else if (next.status !== "pending") {
-          api.paymentOrders(12).then(replaceOrdersMonotonically).catch((e) => reportBackgroundError(e, "refresh payment orders after terminal poll"));
+          api.paymentOrders(20).then(replaceOrdersMonotonically).catch((e) => reportBackgroundError(e, "refresh payment orders after terminal poll"));
         }
         return next.status === "pending";
       },
@@ -253,7 +296,7 @@ export default function RechargePage() {
       const current = rows.find((row) => row.order_no === next.order_no);
       const selected = selectMonotonicPaymentOrder(current, next);
       if (selected === current) return rows;
-      return [selected, ...rows.filter((row) => row.order_no !== next.order_no)].slice(0, 12);
+      return [selected, ...rows.filter((row) => row.order_no !== next.order_no)].slice(0, 100);
     });
   }
 
@@ -275,16 +318,41 @@ export default function RechargePage() {
     setActiveOrder(null);
   }
 
-  async function refreshOrders() {
+  async function refreshOrders(limit = orderLimit, { visible = false } = {}) {
     const seq = createOrderSeqRef.current;
     const currentOrderNo = activeOrderRef.current?.order_no;
-    const rows = await api.paymentOrders(12);
-    replaceOrdersMonotonically(rows);
-    if (currentOrderNo && seq === createOrderSeqRef.current && activeOrderRef.current?.order_no === currentOrderNo) {
-      const current = rows.find((o) => o.order_no === currentOrderNo);
-      if (current) updateActiveOrder(current);
+    if (visible) {
+      setOrdersLoading(true);
+      setOrdersError("");
     }
-    return rows;
+    try {
+      const rows = await api.paymentOrders(limit);
+      replaceOrdersMonotonically(rows);
+      if (currentOrderNo && seq === createOrderSeqRef.current && activeOrderRef.current?.order_no === currentOrderNo) {
+        const current = rows.find((o) => o.order_no === currentOrderNo);
+        if (current) updateActiveOrder(current);
+      }
+      return rows;
+    } catch (error) {
+      if (visible) setOrdersError(error.message || "充值订单加载失败");
+      throw error;
+    } finally {
+      if (visible) setOrdersLoading(false);
+    }
+  }
+
+  async function loadMoreOrders() {
+    const nextLimit = Math.min(100, orderLimit + 20);
+    await refreshOrders(nextLimit, { visible: true });
+    setOrderLimit(nextLimit);
+  }
+
+  function selectAccountTab(tab) {
+    setActiveTab(tab);
+    const url = new URL(window.location.href);
+    if (tab === "packages") url.searchParams.delete("tab");
+    else url.searchParams.set("tab", tab);
+    window.history.replaceState({}, "", `${url.pathname}${url.search}${url.hash}`);
   }
 
   function clearPendingOrderForNewSelection() {
@@ -338,6 +406,7 @@ export default function RechargePage() {
         updateActiveOrder(paid);
       }
       api.me().then(setMe).catch((err) => reportBackgroundError(err, "refresh current user after mock pay"));
+      setBillingRefreshKey((value) => value + 1);
       notify.success("模拟支付成功，积分已到账。");
     } catch (e) {
       setMsg(e.message);
@@ -365,6 +434,7 @@ export default function RechargePage() {
       refreshOrders().catch((err) => reportBackgroundError(err, "refresh orders after active order refresh"));
       if (next.status === "paid") {
         api.me().then(setMe).catch((err) => reportBackgroundError(err, "refresh current user after active order paid"));
+        setBillingRefreshKey((value) => value + 1);
         notify.success("支付成功，积分已到账。");
       } else {
         notify.info("订单状态已刷新。");
@@ -379,12 +449,18 @@ export default function RechargePage() {
 
   async function viewOrder(orderNo) {
     const seq = ++createOrderSeqRef.current;
+    const row = orders.find((order) => order.order_no === orderNo);
+    if (row) {
+      setPackageId(row.package_id);
+      setProvider(row.provider);
+    }
     setLoading(true);
     setMsg("");
     try {
       const next = await api.paymentOrder(orderNo);
       patchOrder(next);
       if (seq === createOrderSeqRef.current) updateActiveOrder(next);
+      selectAccountTab("packages");
       if (next.status === "paid") api.me().then(setMe).catch((err) => reportBackgroundError(err, "refresh current user after viewing paid order"));
     } catch (e) {
       setMsg(e.message);
@@ -397,231 +473,193 @@ export default function RechargePage() {
   return (
     <div className="min-h-screen">
       <Nav me={me} active="recharge" />
-      <main className="mx-auto max-w-6xl px-4 pb-24 pt-10 sm:px-6">
-        <section className="mb-6 grid gap-4 lg:grid-cols-[1fr_360px]">
-          <div className="panel p-5 sm:p-6">
-            <div className="mb-5 flex flex-wrap items-end justify-between gap-3">
-              <div>
-                <h1 className="text-2xl font-bold">积分充值</h1>
-                <p className="mt-1 text-sm text-fog">扫码支付后自动入账，可用于反推、图片和视频生成。</p>
-              </div>
-              <div className="rounded-xl2 border border-iris/30 bg-iris/10 px-4 py-2 text-right">
-                <div className="font-display text-2xl font-bold text-grad">{me?.balance_credits ?? "--"}</div>
-                <div className="text-xs text-fog">当前可用积分</div>
-              </div>
-            </div>
-
-            {!paymentEnabled ? (
-              <div className="mb-5 rounded-xl border border-warn/30 bg-warn/10 px-3 py-2 text-sm text-warn">
-                支付充值功能未开启，请联系管理员在后台完成商户配置后启用。
-              </div>
-            ) : providerOptions.length > 0 ? (
-              <div className="mb-5 inline-flex gap-1 rounded-full border border-line bg-white/5 p-1">
-                {providerOptions.map(([key, label]) => (
-                  <button
-                    key={key}
-                    onClick={() => {
-                      if (loading) return;
-                      setProvider(key);
-                      clearPendingOrderForNewSelection();
-                    }}
-                    disabled={loading}
-                    className={provider === key ? "chip chip-active disabled:opacity-50" : "chip disabled:opacity-50"}
-                  >
-                    {label}
-                  </button>
-                ))}
-              </div>
-            ) : (
-              <div className="mb-5 rounded-xl border border-warn/30 bg-warn/10 px-3 py-2 text-sm text-warn">
-                暂无可用支付渠道，请联系管理员配置。
-              </div>
-            )}
-
-            {paymentEnabled && packages.length > 0 ? <div className="grid gap-3 sm:grid-cols-3">
-              {packages.map((p) => (
-                <button
-                  key={p.id}
-                  onClick={() => {
-                    if (loading) return;
-                    setPackageId(p.id);
-                    clearPendingOrderForNewSelection();
-                  }}
-                  disabled={loading}
-                  className={`relative rounded-xl2 border p-4 text-left transition ${
-                    packageId === p.id ? "border-iris bg-iris/15" : "border-line bg-base2/50 hover:border-line2"
-                  } disabled:cursor-not-allowed disabled:opacity-60`}
-                >
-                  {p.badge && <span className="badge absolute right-3 top-3 bg-brand text-white">{p.badge}</span>}
-                  <div className="text-sm text-fog">{p.title}</div>
-                  <div className="mt-2 font-display text-3xl font-bold text-snow">{p.credits}</div>
-                  <div className="mt-1 text-xs text-fog">积分</div>
-                  <div className="mt-4 text-sm text-mist">￥{(p.amount_cents / 100).toFixed(2)}</div>
-                </button>
-              ))}
-            </div> : paymentEnabled ? (
-              <div className="rounded-xl2 border border-line bg-base2/50 p-6 text-center text-sm text-fog">
-                暂无可购买套餐，请联系管理员配置。
-              </div>
-            ) : (
-              <div className="rounded-xl2 border border-line bg-base2/50 p-6 text-center text-sm text-fog">
-                充值入口已关闭。
-              </div>
-            )}
-
-            <div className="mt-5 flex flex-wrap items-center justify-between gap-3 rounded-xl2 border border-line bg-base2/40 p-4">
-              <div className="text-sm text-mist">
-                当前选择 <b className="text-snow">{selectedPackage?.credits || 0}</b> 积分 ·
-                <span className="text-fog"> {selectedProviderLabel}扫码</span>
-              </div>
-              <button onClick={createOrder} disabled={loading || !paymentEnabled || !selectedPackage || !providers.includes(provider)} className="btn-primary">
-                {loading ? "处理中…" : "生成支付二维码"}
-              </button>
-            </div>
+      <main className="mx-auto max-w-6xl px-4 pb-24 pt-8 sm:px-6">
+        <section className="mb-5 flex flex-col gap-4 border-b border-line pb-5 lg:flex-row lg:items-end lg:justify-between">
+          <div>
+            <h1 className="text-2xl font-bold">积分账户</h1>
+            <p className="mt-1 text-sm text-fog">
+              {paymentEnabled ? "查看余额、充值订单与每笔任务的结算明细。" : "查看积分余额与每笔任务的结算明细。"}
+            </p>
           </div>
-
-          <div className="panel p-5">
-            <h2 className="mb-3 text-lg font-bold">扫码支付</h2>
-            {!activeOrder ? (
-              <div className="flex aspect-square items-center justify-center rounded-xl2 border border-line bg-base2/50 p-6 text-center text-sm text-fog">
-                选择套餐后生成二维码
-              </div>
+          <div className="grid grid-cols-3 gap-2 sm:min-w-[420px]">
+            {initialLoading ? (
+              Array.from({ length: 3 }).map((_, index) => <div key={index} className="skeleton h-[68px]" />)
             ) : (
               <>
-                {qrActive ? (
-                  <div className="relative rounded-xl2 border border-line bg-white p-3">
-                    {qrImage ? (
-                      <img
-                        src={qrImage}
-                        alt="支付二维码"
-                        className="aspect-square w-full rounded-lg object-contain"
-                      />
-                    ) : (
-                      <div className="flex aspect-square w-full items-center justify-center rounded-lg bg-white text-sm text-slate-500">
-                        二维码生成中
-                      </div>
-                    )}
-                  </div>
-                ) : (
-                  <div className="flex aspect-square items-center justify-center rounded-xl2 border border-line bg-base2/50 p-6 text-center text-sm text-fog">
-                    {activeOrder.status === "paid"
-                      ? "支付已完成，积分已入账。"
-                      : orderExpired
-                        ? "二维码已过期，请重新生成。"
-                        : "该订单二维码已失效。"}
-                  </div>
-                )}
-                <div className="mt-3 flex items-center justify-between text-sm">
-                  <span className={`badge ${paymentStatusStyle(orderExpired ? "closed" : activeOrder.status)}`}>
-                    {orderExpired ? "已过期" : paymentStatusText(activeOrder.status)}
-                  </span>
-                  <span className="text-fog">￥{(activeOrder.amount_cents / 100).toFixed(2)}</span>
+                <div className="rounded-xl border border-iris/30 bg-iris/10 px-3 py-2.5">
+                  <div className="text-[11px] text-fog">可用积分</div>
+                  <div className="mt-1 truncate font-display text-xl font-bold text-snow">{me?.balance_credits ?? 0}</div>
                 </div>
-                <div className="mt-2 text-xs text-mist">
-                  {PROVIDERS.find((p) => p[0] === activeOrder.provider)?.[1] || activeOrder.provider}
-                  {" · "}
-                  {activeOrder.credits} 积分
+                <div className="rounded-xl border border-warn/25 bg-warn/10 px-3 py-2.5">
+                  <div className="text-[11px] text-fog">冻结积分</div>
+                  <div className="mt-1 truncate font-display text-xl font-bold text-warn">{me?.frozen_credits ?? 0}</div>
                 </div>
-                <p className="mt-2 break-all text-xs text-fog">订单号 {activeOrder.order_no}</p>
-                {canMockPay && (
-                  <button onClick={mockPay} disabled={loading} className="btn-secondary mt-3 w-full">
-                    本地模拟支付成功
-                  </button>
-                )}
-                {activeOrder.status === "pending" && (
-                  <button onClick={refreshActiveOrder} disabled={loading} className="btn-secondary mt-2 w-full">
-                    刷新订单状态
-                  </button>
-                )}
-                {activeOrder.status === "paid" && (
-                  <div className="mt-3 rounded-xl border border-ok/30 bg-ok/10 px-3 py-2 text-sm text-ok">
-                    已入账 {activeOrder.credits} 积分
+                <div className="rounded-xl border border-line bg-white/5 px-3 py-2.5">
+                  <div className="text-[11px] text-fog">账户总额</div>
+                  <div className="mt-1 truncate font-display text-xl font-bold text-mist">
+                    {Number(me?.balance_credits || 0) + Number(me?.frozen_credits || 0)}
                   </div>
-                )}
-                {orderExpired && (
-                  <p className="mt-2 rounded-xl border border-warn/30 bg-warn/10 px-3 py-2 text-xs text-warn">
-                    本地已到订单有效期，可刷新确认状态或重新生成二维码。
-                  </p>
-                )}
-                {orderClosed && activeOrder.status !== "paid" && (
-                  <button onClick={createOrder} disabled={loading || !paymentEnabled || !selectedPackage || !providers.includes(provider)} className="btn-primary mt-3 w-full">
-                    {loading ? "处理中…" : "重新生成二维码"}
-                  </button>
-                )}
+                </div>
               </>
             )}
           </div>
         </section>
 
-        {msg && <div className="mb-5 rounded-xl border border-bad/30 bg-bad/10 px-4 py-2.5 text-sm text-bad">{msg}</div>}
+        <AccountTabs activeTab={activeTab} onChange={selectAccountTab} tabs={accountTabs} />
+        {msg && <div role="alert" className="mt-4 rounded-xl border border-bad/30 bg-bad/10 px-4 py-2.5 text-sm text-bad">{msg}</div>}
 
-        <section className="card p-5">
-          <div className="mb-3 flex items-center justify-between">
-            <h2 className="text-lg font-bold">最近充值订单</h2>
-            <button
-              onClick={() => refreshOrders().catch((e) => {
-                setMsg(e.message);
-                notify.error(e.message || "订单列表刷新失败");
-              })}
-              className="btn-secondary btn-sm"
+        <div className="mt-5">
+          {activeTab === "packages" && (
+            <section
+              id="account-panel-packages"
+              role="tabpanel"
+              aria-labelledby="account-tab-packages"
+              className="grid gap-4 lg:grid-cols-[1fr_360px]"
             >
-              刷新
-            </button>
-          </div>
-          {orders.length === 0 ? (
-            <p className="py-8 text-center text-sm text-fog">还没有充值订单。</p>
-          ) : (
-            <div className="overflow-x-auto">
-              <table className="w-full text-left text-sm">
-                <thead className="text-xs text-fog">
-                  <tr>
-                    <th className="py-2 pr-3">订单</th>
-                    <th className="pr-3">渠道</th>
-                    <th className="pr-3">金额</th>
-                    <th className="pr-3">积分</th>
-                    <th className="pr-3">状态</th>
-                    <th className="pr-3">时间</th>
-                    <th className="pr-3">操作</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {orders.map((o) => (
-                    <tr key={o.order_no} className="border-t border-line">
-                      <td className="py-2 pr-3 font-mono text-xs text-mist">{o.order_no}</td>
-                      <td className="pr-3">{o.provider === "wechat" ? "微信" : "支付宝"}</td>
-                      <td className="pr-3">￥{(o.amount_cents / 100).toFixed(2)}</td>
-                      <td className="pr-3 font-display text-snow">{o.credits}</td>
-                      <td className="pr-3"><span className={`badge ${paymentStatusStyle(o.status)}`}>{paymentStatusText(o.status)}</span></td>
-                      <td className="pr-3 text-xs text-fog">{o.created_at ? new Date(o.created_at).toLocaleString() : "-"}</td>
-                      <td className="pr-3">
-                        {o.status === "pending" ? (
-                          <button onClick={() => viewOrder(o.order_no)} disabled={loading} className="btn-secondary btn-sm">
-                            继续支付
-                          </button>
-                        ) : o.status === "closed" || o.status === "failed" ? (
+              <div className="panel p-5 sm:p-6">
+                <h2 className="mb-5 text-lg font-bold">选择积分套餐</h2>
+                {initialLoading ? <div className="grid gap-3 sm:grid-cols-3">
+                  {Array.from({ length: 3 }).map((_, index) => <div key={index} className="skeleton h-40" />)}
+                </div> : (
+                  <>
+                    {!paymentEnabled ? (
+                      <div className="mb-5 rounded-xl border border-warn/30 bg-warn/10 px-3 py-2 text-sm text-warn">
+                        支付充值功能未开启，请联系管理员在后台完成商户配置后启用。
+                      </div>
+                    ) : providerOptions.length > 0 ? (
+                      <div className="mb-5 inline-flex gap-1 rounded-full border border-line bg-white/5 p-1">
+                        {providerOptions.map(([key, label]) => (
                           <button
+                            key={key}
+                            type="button"
                             onClick={() => {
-                              setPackageId(o.package_id);
-                              setProvider(o.provider);
-                              viewOrder(o.order_no);
+                              if (loading) return;
+                              setProvider(key);
+                              clearPendingOrderForNewSelection();
                             }}
-                            className="btn-ghost btn-sm"
+                            disabled={loading}
+                            className={provider === key ? "chip chip-active disabled:opacity-50" : "chip disabled:opacity-50"}
                           >
-                            查看
+                            {label}
                           </button>
+                        ))}
+                      </div>
+                    ) : (
+                      <div className="mb-5 rounded-xl border border-warn/30 bg-warn/10 px-3 py-2 text-sm text-warn">
+                        暂无可用支付渠道，请联系管理员配置。
+                      </div>
+                    )}
+
+                    {paymentEnabled && packages.length > 0 ? <div className="grid gap-3 sm:grid-cols-3">
+                      {packages.map((item) => (
+                        <button
+                          key={item.id}
+                          type="button"
+                          onClick={() => {
+                            if (loading) return;
+                            setPackageId(item.id);
+                            clearPendingOrderForNewSelection();
+                          }}
+                          disabled={loading}
+                          className={`relative rounded-xl2 border p-4 text-left transition-colors ${
+                            packageId === item.id ? "border-iris bg-iris/15" : "border-line bg-base2/50 hover:border-line2"
+                          } disabled:cursor-not-allowed disabled:opacity-60`}
+                        >
+                          {item.badge && <span className="badge absolute right-3 top-3 bg-brand text-white">{item.badge}</span>}
+                          <div className="text-sm text-fog">{item.title}</div>
+                          <div className="mt-2 font-display text-3xl font-bold text-snow">{item.credits}</div>
+                          <div className="mt-1 text-xs text-fog">积分</div>
+                          <div className="mt-4 text-sm text-mist">￥{(item.amount_cents / 100).toFixed(2)}</div>
+                        </button>
+                      ))}
+                    </div> : paymentEnabled ? (
+                      <div className="rounded-xl2 border border-line bg-base2/50 p-8 text-center text-sm text-fog">
+                        暂无可购买套餐，请联系管理员配置。
+                      </div>
+                    ) : (
+                      <div className="rounded-xl2 border border-line bg-base2/50 p-8 text-center text-sm text-fog">充值入口已关闭。</div>
+                    )}
+
+                    <div className="mt-5 flex flex-wrap items-center justify-between gap-3 border-t border-line pt-4">
+                      <div className="text-sm text-mist">
+                        当前选择 <b className="text-snow">{selectedPackage?.credits || 0}</b> 积分
+                        <span className="text-fog"> · {selectedProviderLabel}扫码</span>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={createOrder}
+                        disabled={loading || !paymentEnabled || !selectedPackage || !providers.includes(provider)}
+                        className="btn-primary"
+                      >
+                        {loading ? "处理中" : "生成支付二维码"}
+                      </button>
+                    </div>
+                  </>
+                )}
+              </div>
+
+              <div className="panel p-5">
+                <h2 className="mb-3 text-lg font-bold">扫码支付</h2>
+                {!activeOrder ? (
+                  <div className="flex aspect-square items-center justify-center rounded-xl2 border border-line bg-base2/50 p-6 text-center text-sm text-fog">
+                    选择套餐后生成二维码
+                  </div>
+                ) : (
+                  <>
+                    {qrActive ? (
+                      <div className="relative rounded-xl2 border border-line bg-white p-3">
+                        {qrImage ? (
+                          <img src={qrImage} alt="支付二维码" className="aspect-square w-full rounded-lg object-contain" />
                         ) : (
-                          <button onClick={() => viewOrder(o.order_no)} disabled={loading} className="btn-ghost btn-sm">
-                            查看
-                          </button>
+                          <div className="flex aspect-square w-full items-center justify-center rounded-lg bg-white text-sm text-slate-500">二维码生成中</div>
                         )}
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
+                      </div>
+                    ) : (
+                      <div className="flex aspect-square items-center justify-center rounded-xl2 border border-line bg-base2/50 p-6 text-center text-sm text-fog">
+                        {activeOrder.status === "paid" ? "支付已完成，积分已入账。" : orderExpired ? "二维码已过期，请重新生成。" : "该订单二维码已失效。"}
+                      </div>
+                    )}
+                    <div className="mt-3 flex items-center justify-between text-sm">
+                      <span className={`badge ${paymentStatusStyle(orderExpired ? "closed" : activeOrder.status)}`}>
+                        {orderExpired ? "已过期" : paymentStatusText(activeOrder.status)}
+                      </span>
+                      <span className="text-fog">￥{(activeOrder.amount_cents / 100).toFixed(2)}</span>
+                    </div>
+                    <div className="mt-2 text-xs text-mist">
+                      {PROVIDERS.find((item) => item[0] === activeOrder.provider)?.[1] || activeOrder.provider}
+                      {" · "}{activeOrder.credits} 积分
+                    </div>
+                    <p className="mt-2 break-all text-xs text-fog">订单号 {activeOrder.order_no}</p>
+                    {canMockPay && <button type="button" onClick={mockPay} disabled={loading} className="btn-secondary mt-3 w-full">本地模拟支付成功</button>}
+                    {activeOrder.status === "pending" && <button type="button" onClick={refreshActiveOrder} disabled={loading} className="btn-secondary mt-2 w-full">刷新订单状态</button>}
+                    {activeOrder.status === "paid" && <div className="mt-3 rounded-xl border border-ok/30 bg-ok/10 px-3 py-2 text-sm text-ok">已入账 {activeOrder.credits} 积分</div>}
+                    {orderExpired && <p className="mt-2 rounded-xl border border-warn/30 bg-warn/10 px-3 py-2 text-xs text-warn">本地已到订单有效期，可刷新确认状态或重新生成二维码。</p>}
+                    {orderClosed && activeOrder.status !== "paid" && (
+                      <button type="button" onClick={createOrder} disabled={loading || !paymentEnabled || !selectedPackage || !providers.includes(provider)} className="btn-primary mt-3 w-full">
+                        {loading ? "处理中" : "重新生成二维码"}
+                      </button>
+                    )}
+                  </>
+                )}
+              </div>
+            </section>
           )}
-        </section>
+
+          {activeTab === "orders" && (
+            <PaymentOrdersPanel
+              orders={orders}
+              loading={ordersLoading}
+              actionLoading={loading}
+              error={ordersError}
+              hasMore={orders.length >= orderLimit && orderLimit < 100}
+              onRefresh={() => refreshOrders(orderLimit, { visible: true }).catch((error) => notify.error(error.message || "订单列表刷新失败"))}
+              onLoadMore={() => loadMoreOrders().catch((error) => notify.error(error.message || "订单列表加载失败"))}
+              onOpen={viewOrder}
+            />
+          )}
+
+          {activeTab === "billing" && <CreditLedger refreshKey={billingRefreshKey} />}
+        </div>
       </main>
     </div>
   );

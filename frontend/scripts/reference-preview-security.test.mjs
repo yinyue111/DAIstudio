@@ -23,8 +23,8 @@ assert.match(
 );
 assert.match(
   previewSource,
-  /const\s+videoSrc\s*=\s*canRenderVideo\s*\?\s*src\s*:\s*""/,
-  "reference video preview should only use authenticated, local-upload, or same-origin object URLs",
+  /const\s+videoSrc\s*=\s*canRenderVideo\s*&&\s*!videoPlaybackFailed\s*\?\s*src\s*:\s*""/,
+  "reference video preview should only use allowed sources and should stop replaying a failed video source",
 );
 assert.match(
   previewSource,
@@ -33,13 +33,33 @@ assert.match(
 );
 assert.match(
   previewSource,
-  /if\s*\(posterSrc\)/,
+  /if\s*\(posterSrc\s*&&\s*!posterFailed\)/,
   "third-party video references should fall back to poster thumbnails instead of direct playback",
 );
 assert.match(
   previewSource,
   /authenticatedObjectUrl\(videoPosterSrc\)/,
   "protected upload video posters should load through authenticated blob URLs",
+);
+assert.match(
+  previewSource,
+  /setVideoPlaybackFailed\(true\)/,
+  "video decode failures should fall back to the authenticated poster instead of hiding the preview",
+);
+assert.match(
+  previewSource,
+  /if\s*\(asset\?\.type\s*===\s*"video"\)\s*setVideoPlaybackFailed\(true\);\s*else\s*setImageFailed\(true\)/,
+  "a protected primary video fetch failure should preserve the poster fallback",
+);
+assert.match(
+  previewSource,
+  /protectedSrc\s*&&\s*!secureSrc\s*&&\s*!videoPlaybackFailed/,
+  "a failed protected primary video request must not leave the poster fallback stuck loading",
+);
+assert.match(
+  readFileSync(join(root, "lib/api.js"), "utf8"),
+  /allowedPrefixes:\s*\["\/api\/uploads\/"\]/,
+  "authenticated object URL alias normalization must stay restricted to upload paths",
 );
 
 console.log("reference preview security test passed");

@@ -16,11 +16,33 @@ const imagePrompt = composeStyleTransferPrompt({
 });
 
 assert.match(imagePrompt, /白色摄影棚/);
-assert.match(imagePrompt, /小红书高级产品广告/);
+assert.match(imagePrompt, /主体居中偏右/);
 assert.match(imagePrompt, /左上 45 度柔光/);
+assert.match(imagePrompt, /奶白 #F7F2E8/);
+assert.doesNotMatch(imagePrompt, /小红书|平台|社媒/);
 assert.doesNotMatch(imagePrompt, /红色手提包/);
 assert.doesNotMatch(imagePrompt, /参考品牌 Logo/);
 assert.doesNotMatch(imagePrompt, /参考图促销文案/);
+
+const noisyImagePrompt = composeStyleTransferPrompt({
+  "场景背景": "直接可见事实：参考1中半透明蓝色冰块包围中央冰台；视觉估计：远景为淡蓝到粉橙天空；未知：真实拍摄地点不确定。",
+  "构图": "高置信推断：竖版3:4中心构图，主体由冰台承托。",
+  "光线": "观察事实：左后方橙金暖光穿透冰块，右侧保留冷蓝环境光。",
+  "色调配色": "事实层：深海军蓝、冰蓝为主，橙金为点缀，冷暖互补。",
+  "风格": "参考1呈现高质量、广告级品质的商业产品摄影。",
+  "广告目标": "视觉估计：传达清凉、专业和高识别度卖点。",
+  "平台质感": "视觉估计：社媒品牌广告素材。",
+  "标签": "masterpiece, best quality, ultra detailed, 8k",
+}, "", { subject: "product" });
+
+assert.match(noisyImagePrompt, /半透明蓝色冰块/);
+assert.match(noisyImagePrompt, /竖版3:4中心构图/);
+assert.match(noisyImagePrompt, /左后方橙金暖光/);
+assert.match(noisyImagePrompt, /冷暖互补/);
+assert.ok(noisyImagePrompt.length <= 420);
+assert.doesNotMatch(noisyImagePrompt, /直接可见事实|视觉估计|观察事实|事实层|高置信推断|未知|不确定|参考1/);
+assert.doesNotMatch(noisyImagePrompt, /masterpiece|best quality|ultra detailed|8k|平台|社媒品牌|高识别度/i);
+assert.doesNotMatch(noisyImagePrompt, /高质量|广告级品质/);
 
 const productStylePrompt = composeStyleTransferPrompt({
   "主体": "一瓶 Estee Lauder Advanced Night Repair 精华液",
@@ -35,8 +57,9 @@ const productStylePrompt = composeStyleTransferPrompt({
 }, "", { subject: "product" });
 
 assert.match(productStylePrompt, /暖棕色渐变背景/);
-assert.match(productStylePrompt, /高端护肤品社媒广告/);
 assert.match(productStylePrompt, /柔和电影感主光/);
+assert.doesNotMatch(productStylePrompt, /高端护肤品社媒广告/);
+assert.doesNotMatch(productStylePrompt, /premium texture/i);
 assert.doesNotMatch(productStylePrompt, /Estee Lauder/i);
 assert.doesNotMatch(productStylePrompt, /Advanced Night Repair/i);
 assert.doesNotMatch(productStylePrompt, /dropper bottle/i);

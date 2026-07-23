@@ -1,3 +1,5 @@
+import { DEFAULT_REVERSE_CONFIG } from "./reverseConfig";
+
 export function clearWorkspaceContent(current: Record<string, unknown>) {
   return {
     ...current,
@@ -12,6 +14,7 @@ export function clearWorkspaceContent(current: Record<string, unknown>) {
     profileOperation: null,
     assets: [],
     selected: null,
+    lastFrameAsset: null,
     productAsset: null,
     productDetailAssets: [],
     productProfile: null,
@@ -28,6 +31,22 @@ export function clearWorkspaceContent(current: Record<string, unknown>) {
     structuredDirty: false,
     structuredSource: "",
     reverseVideoAnalysis: null,
+    reverseSources: [],
+    reverseConfig: { ...DEFAULT_REVERSE_CONFIG, source_ranges: [], custom_keyframes: [] },
+    pendingReverseResult: null,
+    reverseResultTab: "draft",
+    reverseResultSchemaVersion: "",
+    reverseAppliedVersion: null,
+    reverseAppliedRevisionId: null,
+    reverseUndoSnapshot: null,
+    reverseApplyConflict: null,
+    reverseResultRevisions: [],
+    reverseFeedback: null,
+    batchReverseAssets: [],
+    creationRecipeId: null,
+    creationRecipeVersion: null,
+    creationRecipeShareSlug: "",
+    creationRecipeSource: "",
     promptSourceSignature: "",
     negativeTouched: false,
     promptDirty: false,

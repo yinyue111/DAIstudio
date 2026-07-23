@@ -8,6 +8,8 @@ import Nav from "../../components/Nav";
 import { AssetReports, Models, ReviewTasks } from "./components/model-review-moderation";
 import { Payments, Settings } from "./components/payments-settings";
 import { Audit, Dashboard, Report } from "./components/reports-audit";
+import { CatalogVersions } from "./components/catalog-versions";
+import { RecipeReviews } from "./components/recipe-reviews";
 import { VersionUpgrade } from "./components/version-upgrade";
 import { Users, Whitelist } from "./components/whitelist-users";
 
@@ -16,8 +18,10 @@ const TABS = [
   ["whitelist", "白名单"],
   ["users", "用户 / 额度"],
   ["models", "模型配置"],
+  ["catalog", "能力 / 工具"],
   ["review", "待对账"],
   ["moderation", "举报处理"],
+  ["recipes", "配方审核"],
   ["report", "用量报表"],
   ["payments", "支付设置"],
   ["settings", "平台设置"],
@@ -30,8 +34,10 @@ const TAB_COMPONENTS = {
   whitelist: Whitelist,
   users: Users,
   models: Models,
+  catalog: CatalogVersions,
   review: ReviewTasks,
   moderation: AssetReports,
+  recipes: RecipeReviews,
   report: Report,
   payments: Payments,
   settings: Settings,
@@ -43,12 +49,17 @@ export default function AdminPage() {
   const router = useRouter();
   const [tab, setTab] = useState("dashboard");
   const [me, setMe] = useState(null);
+  const [launchLite, setLaunchLite] = useState(false);
   const ActiveTab = TAB_COMPONENTS[tab] || Whitelist;
+  const visibleTabs = launchLite ? TABS.filter(([key]) => key !== "payments") : TABS;
 
   useEffect(() => {
-    api.me().then((u) => {
+    Promise.all([api.me(), api.config()]).then(([u, config]) => {
       if (!u.is_admin) router.push("/");
-      else setMe(u);
+      else {
+        setMe(u);
+        setLaunchLite(config.product_edition === "launch_lite");
+      }
     }).catch((e) => redirectOnAuthError(e, router, null, "admin session probe"));
   }, [router]);
 
@@ -57,6 +68,12 @@ export default function AdminPage() {
     const nextTab = params.get("tab");
     if (TAB_COMPONENTS[nextTab]) setTab(nextTab);
   }, []);
+
+  useEffect(() => {
+    if (!launchLite || tab !== "payments") return;
+    setTab("dashboard");
+    router.replace("/admin", { scroll: false });
+  }, [launchLite, router, tab]);
 
   function selectTab(nextTab) {
     setTab(nextTab);
@@ -79,7 +96,7 @@ export default function AdminPage() {
         <p className="mb-6 text-sm text-fog">白名单、用户额度、模型与平台设置、用量与审计一站式管控。</p>
 
         <div className="mb-6 inline-flex flex-wrap gap-1 rounded-full border border-line bg-white/5 p-1 backdrop-blur-xl">
-          {TABS.map(([k, label]) => (
+          {visibleTabs.map(([k, label]) => (
             <button
               key={k}
               onClick={() => selectTab(k)}
@@ -92,7 +109,7 @@ export default function AdminPage() {
           ))}
         </div>
 
-        <ActiveTab />
+        <ActiveTab launchLite={launchLite} />
       </main>
     </div>
   );

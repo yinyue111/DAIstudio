@@ -10,6 +10,14 @@ const MAX_PAYMENT_AMOUNT_CENTS = 100000000;
 const MAX_PAYMENT_PACKAGE_CREDITS = 100000000;
 const MAX_PAYMENT_CREDITS_PER_CENT = 10000;
 const PACKAGE_ID_RE = /^[A-Za-z0-9_-]+$/;
+const NAVIGATION_SETTINGS = [
+  ["catalog", "模型与工具"],
+  ["prompts", "灵感配方"],
+  ["projects", "项目"],
+  ["profile", "素材"],
+  ["recharge", "充值与账单"],
+  ["history", "历史"],
+];
 
 export function Payments() {
   const emptyPackage = {
@@ -400,7 +408,7 @@ export function Payments() {
   );
 }
 
-export function Settings() {
+export function Settings({ launchLite = false }) {
   const [s, setS] = useState(null);
   const [cfg, setCfg] = useState(null);
   const [gw, setGw] = useState(null);
@@ -426,7 +434,8 @@ export function Settings() {
       const r = await api.adminSaveSettings({
         reverse_prompt_enabled: !!s.reverse_prompt_enabled,
         sms_auth_enabled: !!s.sms_auth_enabled,
-        payment_enabled: !!s.payment_enabled,
+        payment_enabled: launchLite ? false : !!s.payment_enabled,
+        navigation_states: s.navigation_states || {},
         content_safety_enabled: !!s.content_safety_enabled,
         content_safety_banned_terms: s.content_safety_banned_terms || "",
         image_n: Number(s.image_n),
@@ -471,11 +480,13 @@ export function Settings() {
             <input type="checkbox" className="accent-iris" checked={!!s.sms_auth_enabled}
               onChange={(e) => setS({ ...s, sms_auth_enabled: e.target.checked })} />
           </label>
-          <label className="flex items-center gap-2">
-            支付充值功能
-            <input type="checkbox" className="accent-iris" checked={!!s.payment_enabled}
-              onChange={(e) => setS({ ...s, payment_enabled: e.target.checked })} />
-          </label>
+          {!launchLite && (
+            <label className="flex items-center gap-2">
+              支付充值功能
+              <input type="checkbox" className="accent-iris" checked={!!s.payment_enabled}
+                onChange={(e) => setS({ ...s, payment_enabled: e.target.checked })} />
+            </label>
+          )}
           <label className="flex items-center gap-2">
             出图数量
             <input type="number" min="1" max="8" className="input w-16"
@@ -528,6 +539,34 @@ export function Settings() {
         </div>
       </Card>
       <Card>
+        <div className="mb-3 text-sm font-display font-semibold text-snow">用户导航</div>
+        <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
+          {NAVIGATION_SETTINGS.map(([key, label]) => (
+            <label key={key} className="flex items-center justify-between gap-3 text-sm text-mist">
+              <span>{label}</span>
+              <select
+                className="select h-9 w-28 py-1 text-xs"
+                value={s.navigation_states?.[key] || "enabled"}
+                onChange={(event) => setS({
+                  ...s,
+                  navigation_states: {
+                    ...(s.navigation_states || {}),
+                    [key]: event.target.value,
+                  },
+                })}
+              >
+                <option value="enabled">启用</option>
+                <option value="disabled">暂停</option>
+                <option value="hidden">隐藏</option>
+              </select>
+            </label>
+          ))}
+        </div>
+        <p className="mt-3 text-xs text-fog">
+          创作台始终保留为默认入口；管理后台仅向管理员返回。暂停状态保留入口并展示原因，隐藏状态不会下发给普通用户。
+        </p>
+      </Card>
+      <Card>
         <div className="mb-3 text-sm font-display font-semibold text-snow">内容安全</div>
         <div className="space-y-3 text-sm text-mist">
           <label className="flex items-center gap-2">
@@ -556,16 +595,18 @@ export function Settings() {
       <Card>
         <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
           <div>
-            <div className="text-sm font-display font-semibold text-snow">短信认证与支付开启配置指引</div>
-            <div className="mt-1 text-xs text-fog">两个功能默认关闭。先完成环境变量和商户/短信渠道配置，再打开上方开关。</div>
+            <div className="text-sm font-display font-semibold text-snow">{launchLite ? "短信认证配置指引" : "短信认证与支付开启配置指引"}</div>
+            <div className="mt-1 text-xs text-fog">{launchLite ? "完成短信渠道配置后，再打开上方开关。" : "两个功能默认关闭。先完成环境变量和商户/短信渠道配置，再打开上方开关。"}</div>
           </div>
           <div className="flex flex-wrap gap-2 text-xs">
             <span className={`badge ${s.sms_auth_enabled ? "bg-ok/15 text-ok" : "bg-white/10 text-fog"}`}>
               短信{s.sms_auth_enabled ? "已开启" : "默认关闭"}
             </span>
-            <span className={`badge ${s.payment_enabled ? "bg-ok/15 text-ok" : "bg-white/10 text-fog"}`}>
-              支付{s.payment_enabled ? "已开启" : "默认关闭"}
-            </span>
+            {!launchLite && (
+              <span className={`badge ${s.payment_enabled ? "bg-ok/15 text-ok" : "bg-white/10 text-fog"}`}>
+                支付{s.payment_enabled ? "已开启" : "默认关闭"}
+              </span>
+            )}
           </div>
         </div>
         <div className="grid gap-5 lg:grid-cols-2">
@@ -579,7 +620,7 @@ export function Settings() {
               <li>重启后端服务，打开“短信验证码注册”，用新手机号测试发送验证码和注册。</li>
             </ol>
           </div>
-          <div className="space-y-3 text-sm text-mist">
+          {!launchLite && <div className="space-y-3 text-sm text-mist">
             <div className="font-display text-xs font-semibold uppercase tracking-wide text-fog">支付宝 / 微信支付</div>
             <ol className="list-decimal space-y-2 pl-5">
               <li>域名和回调先配置为你的 HTTPS 生产域名，例如 <code className="font-mono text-snow">PUBLIC_BASE_URL=https://dream.aiwuq.cn</code>、<code className="font-mono text-snow">PAYMENT_FRONTEND_BASE_URL=https://dream.aiwuq.cn</code>。</li>
@@ -588,7 +629,7 @@ export function Settings() {
               <li>支付平台后台配置回调：支付宝 <code className="font-mono text-snow">/api/payments/alipay/notify</code>，微信 <code className="font-mono text-snow">/api/payments/wechat/notify</code>。</li>
               <li>支付渠道显示“可用”后，打开“支付充值功能”，用小额套餐测试二维码、回调入账和订单状态。</li>
             </ol>
-          </div>
+          </div>}
         </div>
       </Card>
       {gw && (

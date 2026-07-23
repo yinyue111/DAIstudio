@@ -43,7 +43,7 @@ def keys_for_asset_urls(*urls: str | None) -> list[str]:
 
 
 def storage_bytes_for_keys(keys) -> int | None:
-    """Return bytes occupied by the existing local files in ``keys``."""
+    """Return bytes occupied by existing local or object-storage keys."""
     total = 0
     found = False
     seen: set[str] = set()
@@ -52,9 +52,9 @@ def storage_bytes_for_keys(keys) -> int | None:
             continue
         seen.add(key)
         try:
-            path = storage.local_path(key)
-            if path.exists() and path.is_file():
-                total += int(path.stat().st_size)
+            size = storage.object_size(key)
+            if size is not None:
+                total += int(size)
                 found = True
         except Exception:  # noqa: BLE001
             log.debug("asset size inspection skipped for %s", key, exc_info=True)
@@ -115,6 +115,6 @@ def safe_unlink_asset_files(db: Session, asset: GenAsset) -> None:
 def unlink_keys(keys) -> None:
     for key in keys or []:
         try:
-            storage.local_path(key).unlink(missing_ok=True)
+            storage.delete(key)
         except Exception:  # noqa: BLE001
             log.debug("media sidecar unlink skipped for %s", key, exc_info=True)

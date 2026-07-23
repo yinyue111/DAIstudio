@@ -15,24 +15,31 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from . import observability
 from .config import settings
-from .db import Base, SessionLocal, engine
+from .db import SessionLocal, engine
 from .observability import RequestContextMiddleware, init_sentry, setup_logging
 from .redis_client import redis_client
 from .routers import (
     admin,
     assets,
     auth,
+    catalog,
     generate,
     me,
     parse,
     payments,
     profile,
+    projects,
     prompt,
+    prompt_optimizations,
     prompts,
+    recipes,
+    reproduction_assessments,
     subject_protection,
+    task_center,
     tasks,
     uploads,
     v2,
+    workflows,
     ws,
 )
 from .routers import (
@@ -40,14 +47,32 @@ from .routers import (
 )
 from .runtime_config import validate_model_gateway_rows, validate_runtime_config
 from .services.config_store import seed_from_yaml
+from .services.gateway_config_errors import gateway_config_error_contract
+from .services.model_gateway_config import ModelGatewayConfigError
 from .services.payment_config import seed_defaults as seed_payment_defaults
+from .services.product_edition import api_path_enabled
+from .services.workflow_node_adapters import register_production_workflow_adapters
 
 setup_logging()
 log = logging.getLogger("main")
+register_production_workflow_adapters()
 
 
 class BodyTooLargeError(Exception):
     pass
+
+
+class ProductEditionMiddleware:
+    """Return 404 for advanced public APIs excluded from launch_lite."""
+
+    def __init__(self, app: ASGIApp):
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope.get("type") != "http" or api_path_enabled(str(scope.get("path") or "")):
+            await self.app(scope, receive, send)
+            return
+        await BodySizeLimitMiddleware._send_plain(send, 404, "not found")
 
 
 _SAFE_HTTP_METHODS = {"GET", "HEAD", "OPTIONS", "TRACE"}
@@ -225,10 +250,6 @@ class BodySizeLimitMiddleware:
 async def lifespan(app: FastAPI):
     validate_runtime_config()
     os.makedirs(settings.storage_dir, exist_ok=True)
-    # Dev convenience only: auto-create tables. Production (DEBUG=false) must use
-    # Alembic (alembic upgrade head) — never let the app silently build schema.
-    if settings.debug:
-        Base.metadata.create_all(bind=engine)
     db = SessionLocal()
     try:
         seed_from_yaml(db)
@@ -249,7 +270,14 @@ app = FastAPI(
     openapi_url="/openapi.json" if settings.debug else None,
 )
 
+
+@app.exception_handler(ModelGatewayConfigError)
+async def model_gateway_config_error_handler(_request, exc: ModelGatewayConfigError):
+    status_code, detail = gateway_config_error_contract(exc)
+    return JSONResponse(status_code=status_code, content={"detail": detail})
+
 app.add_middleware(BodySizeLimitMiddleware)
+app.add_middleware(ProductEditionMiddleware)
 app.add_middleware(CsrfOriginMiddleware)
 app.add_middleware(RequestContextMiddleware)
 app.add_middleware(
@@ -275,9 +303,10 @@ for public_subdir, mount_path in (
         name=f"media_{public_subdir}",
     )
 
-for r in (auth.router, me.router, config_router.router, profile.router, parse.router,
-          prompt.router, prompts.router, subject_protection.router, generate.router, tasks.router, uploads.router, assets.router,
-          payments.router, admin.router, ws.router, v2.router):
+for r in (auth.router, me.router, config_router.router, catalog.router, profile.router, projects.router, parse.router,
+          prompt.router, prompt_optimizations.router, prompts.router, reproduction_assessments.router, recipes.router, subject_protection.router, generate.router,
+          task_center.router, tasks.router, uploads.router, assets.router,
+          payments.router, admin.router, workflows.router, ws.router, v2.router):
     app.include_router(r)
 
 

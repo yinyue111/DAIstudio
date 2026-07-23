@@ -18,6 +18,141 @@ type ImagePricing = {
   unit_costs?: Record<string, number>;
 };
 
+const VISUAL_PROMPT_LIMITS = {
+  image: 420,
+  video: 220,
+  product_profile: 420,
+  portrait_profile: 420,
+  image_to_video: 280,
+};
+const VISUAL_CLAUSE_LIMITS = {
+  image: 56,
+  video: 64,
+  product_profile: 72,
+  portrait_profile: 72,
+  image_to_video: 64,
+};
+const IMAGE_VISUAL_FIELD_LIMITS = {
+  "主体": 48,
+  "商品服装": 52,
+  "妆发五官": 48,
+  "服装结构": 48,
+  "人物比例": 42,
+  "身材体态": 42,
+  "场景背景": 60,
+  "构图": 50,
+  "光线": 58,
+  "色调配色": 48,
+  "视角镜头": 48,
+  "景别": 28,
+  "风格": 32,
+  "材质纹理": 40,
+  "文字版式": 48,
+  "氛围情绪": 28,
+  "后期质感": 36,
+  "一致性约束": 48,
+  "细节特征": 36,
+};
+const VISUAL_PLACEHOLDER_VALUES = new Set([
+  "无", "暂无", "无相关内容", "不适用", "未见", "未见明确卖点", "未见明确广告目标",
+  "不确定", "未知", "未分析", "未支持", "无法确认", "无法判断", "证据不足",
+  "不清晰", "看不清", "未识别",
+]);
+
+function stripUncertainVisualSentences(value) {
+  const chunks = String(value || "").split(/([；;。.!！?？\n]+)/g);
+  const direct = [];
+  for (let index = 0; index < chunks.length; index += 2) {
+    const sentence = String(chunks[index] || "").trim();
+    const delimiter = String(chunks[index + 1] || "");
+    if (
+      sentence
+      && !/(?:不确定|无法确认|无法判断|证据不足|未见|未识别|看不清|不清晰|疑似|猜测|推测|可能)/i.test(sentence)
+    ) {
+      direct.push(`${sentence}${delimiter}`);
+    }
+  }
+  return direct.join("");
+}
+
+function stripVisualAnalysisScaffolding(value) {
+  const text = String(value || "")
+    .replace(
+      /(^|[；;。.!！?？,，\n])\s*(?:未知|不确定项?|无法确认|无法判断|证据不足)\s*[:：]\s*[^；;。.!！?？\n]*(?:[；;。.!！?？]|$)/gi,
+      "$1",
+    )
+    .replace(
+      /(?:直接可见事实|视觉估计|视觉推断|观察事实|事实层|估计层|高置信(?:度)?推断|模型推断|低置信(?:度)?推断)\s*[:：]\s*/gi,
+      "",
+    )
+    .replace(
+      /(?:第\s*[一二三四五六七八九十\d]+\s*张\s*)?参考\s*(?:图|图片|素材)?\s*[一二三四五六七八九十\d]+\s*(?:中(?!央)|为|呈现|采用|的)?\s*/gi,
+      "",
+    )
+    .replace(
+      /(?:[,，、]\s*)?(?:(?:可|适合)(?:用于|迁移为)?\s*)?(?:小红书|抖音|tiktok|instagram|pinterest|社(?:交)?媒体(?:品牌)?(?:广告)?素材|社媒(?:品牌)?(?:广告)?素材|品牌网页广告|网页广告|电商(?:详情页|主图|海报|素材|包装视觉升级)|发布平台|发布渠道|平台归因)[^；;。.!！?？\n]*/gi,
+      "",
+    )
+    .replace(
+      /\b(?:masterpiece|best quality|high quality|ultra quality|ultra[- ]?detailed|highly detailed|extremely detailed|insanely detailed|ultra[- ]?high resolution|high[- ]?resolution|hi[- ]?res|premium texture|award[- ]?winning|trending on artstation|uhd|(?:4|8|16)k(?: resolution| quality)?)\b|(?:杰作|最佳质量|顶级质量|超高质量|高质量|专业级品质|广告级品质|商业级品质|超高清|高清画质|超清画质|高分辨率|超高分辨率|极致细节|细节拉满|获奖作品|顶级画质|顶级品质)/gi,
+      "",
+    )
+    .replace(/(?:视觉估计\s*(?:接近|约为|约)?|接近|约为|约)\s*#[0-9a-f]{3,8}(?:\s*(?:-|~|至|到)\s*#[0-9a-f]{3,8})?/gi, "")
+    .replace(/(?:约|大约)?(?:占(?:画面)?\s*)?\d+(?:\.\d+)?\s*%(?:\s*(?:-|~|至|到)\s*\d+(?:\.\d+)?\s*%)?/gi, "")
+    .replace(/(?:[,，、]\s*)?(?:置信度|可信度)(?:为|约为)?\s*(?:高|中等?|低|\d+(?:\.\d+)?\s*%)/gi, "");
+  return stripUncertainVisualSentences(text)
+    .replace(/([,，;；、])(?:\s*[,，;；、])+/g, "$1")
+    .replace(/(^|[；;。.!！?？])\s*[,，、]+/g, "$1")
+    .replace(/(^|[；;。.!！?？,，、])\s*的(?=\S)/g, "$1")
+    .replace(/\s+/g, " ")
+    .replace(/^[,，;；、\s]+|[,，;；、\s]+$/g, "");
+}
+
+function cleanVisualStructuredValue(value) {
+  if (typeof value !== "string") return "";
+  const cleaned = stripVisualAnalysisScaffolding(value);
+  const text = cleaned.replace(/[。.!！?？,，;；:：、\s]+$/g, "");
+  if (!text || VISUAL_PLACEHOLDER_VALUES.has(text)) return "";
+  const tokens = text
+    .split(/[/|、,，;；]|或/g)
+    .map((item) => item.trim())
+    .filter(Boolean);
+  if (tokens.length && tokens.every((item) => VISUAL_PLACEHOLDER_VALUES.has(item))) return "";
+  return cleaned.replace(/[；;\s]+$/g, "");
+}
+
+function truncateVisualClause(value, limit) {
+  if (value.length <= limit) return value;
+  let candidate = value.slice(0, limit);
+  const cut = Math.max(...["。", "；", ";", "，", ","].map((mark) => candidate.lastIndexOf(mark)));
+  if (cut >= Math.max(12, Math.floor(limit / 2))) candidate = candidate.slice(0, cut);
+  return candidate.replace(/[。；;，,、\s]+$/g, "");
+}
+
+function compactVisualPrompt(parts, target = "image") {
+  const limit = VISUAL_PROMPT_LIMITS[target] || VISUAL_PROMPT_LIMITS.image;
+  const clauseLimit = VISUAL_CLAUSE_LIMITS[target] || VISUAL_CLAUSE_LIMITS.image;
+  const result = [];
+  const seen = new Set();
+  const clauses = parts.flatMap((part) => String(part || "").split(/[；;\n]+/));
+  for (const rawPart of clauses) {
+    let part = cleanVisualStructuredValue(rawPart);
+    if (!part) continue;
+    part = truncateVisualClause(part, clauseLimit);
+    const identity = part.replace(/[。；;，,、\s]+$/g, "");
+    if (!identity || seen.has(identity)) continue;
+    const used = result.reduce((total, item) => total + item.length, 0) + result.length;
+    const remaining = limit - used;
+    if (remaining <= 0) break;
+    if (part.length > remaining) {
+      continue;
+    }
+    result.push(part);
+    seen.add(identity);
+  }
+  return result.join("；").trim();
+}
+
 export function assetDims(a) {
   if (!a) return null;
   let w = Number(a.width), h = Number(a.height);
@@ -72,25 +207,44 @@ export function composePromptFromStructured(
   const order = visualStructuredFieldOrder(target);
   const parts = [];
   for (const key of order) {
-    const value = structured[key];
-    if (typeof value === "string" && value.trim()) parts.push(value.trim());
+    let value = cleanVisualStructuredValue(structured[key]);
+    if (target === "image" && value) {
+      value = truncateVisualClause(value, IMAGE_VISUAL_FIELD_LIMITS[key] || VISUAL_CLAUSE_LIMITS.image);
+    }
+    if (value) parts.push(value);
   }
-  const text = parts.join(", ");
+  const text = compactVisualPrompt(parts, target);
   return text.trim() || finalText;
+}
+
+const LEGACY_VISUAL_PROMPT_NOISE_RE = /(?:直接可见事实|视觉估计|视觉推断|观察事实|事实层|估计层|高置信(?:度)?推断|模型推断|低置信(?:度)?推断|(?:未知|不确定项?|无法确认|证据不足)\s*[:：]|参考\s*(?:图|图片|素材)?\s*[一二三四五六七八九十\d]+|masterpiece|best\s+quality|high\s+quality|ultra[- ]?detailed|high[- ]?resolution|uhd|(?:4|8|16)k(?:\s+(?:resolution|quality))?|高质量|超高质量|广告级品质|专业级品质|平台质感|小红书|抖音|社媒品牌|品牌网页广告|发布平台|发布渠道)/i;
+
+/** Recompile old provider prose only when it contains known analysis/output noise. */
+export function normalizeRecoveredVisualPrompt(
+  structured,
+  fallbackText = "",
+  { target = "image", preserveFallback = false } = {},
+) {
+  const fallback = String(fallbackText || "").trim();
+  if (preserveFallback || !fallback || !LEGACY_VISUAL_PROMPT_NOISE_RE.test(fallback)) {
+    return fallback || composePromptFromStructured(structured, "", { target });
+  }
+  return composePromptFromStructured(structured, "", { target })
+    || cleanVisualStructuredValue(fallback);
 }
 
 const VISUAL_STRUCTURED_FIELDS = {
   image: [
-    "主体", "人像意图", "人物比例", "身材体态", "体态线条", "服装结构", "服装覆盖", "妆发五官",
-    "商品服装", "细节特征", "场景背景", "广告目标", "风格", "景别", "构图",
-    "视角镜头", "光线", "色调配色", "材质纹理", "氛围情绪",
-    "后期质感", "一致性约束", "平台质感",
+    "主体", "商品服装", "妆发五官", "服装结构", "人物比例", "身材体态",
+    "场景背景", "构图", "光线", "色调配色", "视角镜头", "景别", "风格",
+    "材质纹理", "文字版式", "氛围情绪", "后期质感", "一致性约束",
+    "细节特征", "人像意图", "体态线条", "服装覆盖",
   ],
   video: [
     "主体", "人像意图", "人物比例", "身材体态", "体态线条", "服装结构", "服装覆盖", "妆发五官",
     "商品服装", "细节特征", "场景背景", "广告目标", "风格", "视角构图",
     "光线", "色调配色", "材质纹理", "氛围情绪",
-    "一致性约束", "源视频规格",
+    "一致性约束",
   ],
   product_profile: [
     "产品品类", "品牌Logo", "包装文字", "包装结构", "主色材质", "形状比例",
@@ -101,8 +255,8 @@ const VISUAL_STRUCTURED_FIELDS = {
     "身份稳定特征", "不可改项", "可调整项",
   ],
   image_to_video: [
-    "静态观察", "主体", "场景背景", "视角构图", "光线", "色调配色", "材质纹理",
-    "可动元素", "主体运动设计", "镜头运动设计", "时序设计", "一致性约束",
+    "主体", "主体运动设计", "镜头运动设计", "时序设计", "静态观察", "场景背景",
+    "视角构图", "光线", "色调配色", "材质纹理", "可动元素", "一致性约束",
   ],
 };
 
@@ -114,9 +268,9 @@ export function visualStructuredFields(structured, target = "image") {
   if (!structured || typeof structured !== "object") return {};
   const allowed = new Set(visualStructuredFieldOrder(target));
   return Object.fromEntries(
-    Object.entries(structured).filter(([key, value]) => (
-      allowed.has(key) && typeof value === "string" && value.trim()
-    )),
+    Object.entries(structured)
+      .map(([key, value]) => [key, cleanVisualStructuredValue(value)])
+      .filter(([key, value]) => allowed.has(key) && Boolean(value)),
   );
 }
 
@@ -151,9 +305,15 @@ export function composeEvidenceBackedVideoTransferPrompt(
   );
   const parts = [
     ...videoSubjectTransferRules(subject),
-    composePromptFromStructured(staticStructured, "", { target: "video" }),
+    ...visualStructuredFieldOrder("video")
+      .map((key) => cleanVisualStructuredValue(staticStructured[key]))
+      .filter(Boolean),
   ].filter(Boolean);
   const shots = Array.isArray(videoAnalysis?.shots) ? videoAnalysis.shots : [];
+  const compressLongVideo = shots.some((shot) => (
+    Number.isFinite(Number(shot?.end_seconds))
+    && Number(shot?.end_seconds) > MAX_VIDEO_DURATION_SECONDS
+  ));
   const frameTimes = new Map(
     (Array.isArray(videoAnalysis?.sampled_frames) ? videoAnalysis.sampled_frames : [])
       .map((frame) => [Number(frame?.index), Number(frame?.timestamp_seconds)])
@@ -174,18 +334,25 @@ export function composeEvidenceBackedVideoTransferPrompt(
       ? VIDEO_EVIDENCE_SHOT_FIELDS
       : ["visual", "lighting"];
     const details = allowedShotFields
-      .map((key) => String(shot[key] || "").trim())
+      .map((key) => cleanVisualStructuredValue(shot[key]))
       .filter((value) => value && !hasReferenceIdentityLeak(value, structured));
     const uniqueDetails = [...new Set(details)];
     if (!uniqueDetails.length) continue;
     const start = Number(shot.start_seconds);
     const end = Number(shot.end_seconds);
-    const range = Number.isFinite(start) && Number.isFinite(end) && end >= start
-      ? ` ${start}-${end}s`
+    const range = !compressLongVideo && Number.isFinite(start) && Number.isFinite(end) && end >= start
+      ? `（${start.toFixed(3)}-${end.toFixed(3)}秒）`
       : "";
-    parts.push(`镜头${index + 1}${range}: ${uniqueDetails.join("，")}`);
+    const segmentIndex = Number(shot.source_segment_index);
+    const segment = Number.isInteger(segmentIndex) && segmentIndex > 0
+      ? `片段${segmentIndex} `
+      : "";
+    parts.push(`${segment}镜头${index + 1}${range}：${uniqueDetails.join("，")}`);
   }
-  return [...new Set(parts)].join("；").trim();
+  if (compressLongVideo && parts.length) {
+    parts.splice(videoSubjectTransferRules(subject).length, 0, "按原镜头顺序压缩为15秒内核心版");
+  }
+  return compactVisualPrompt([...new Set(parts)], "video");
 }
 
 export function isStructuredPortrait(structured) {
@@ -197,12 +364,14 @@ export function shouldUseImageReference({
   sourceAsset = null,
   isEditMode = false,
   structured = {},
+  analysisFocus = "",
 } = {}) {
   return Boolean(
     !isFinal
     && sourceAsset?.type === "image"
     && (
       isEditMode
+      || analysisFocus === "replica"
       || Object.keys(structured || {}).length === 0
       || isStructuredPortrait(structured)
     )
@@ -210,8 +379,8 @@ export function shouldUseImageReference({
 }
 
 const IMAGE_STYLE_TRANSFER_KEYS = [
-  "场景背景", "广告目标", "风格", "构图", "景别", "视角镜头", "视角构图",
-  "光线", "色调配色", "氛围情绪", "后期质感", "平台质感",
+  "场景背景", "构图", "光线", "色调配色", "视角镜头", "视角构图",
+  "景别", "风格", "氛围情绪", "后期质感",
 ];
 
 const VIDEO_STYLE_TRANSFER_KEYS = [
@@ -220,7 +389,7 @@ const VIDEO_STYLE_TRANSFER_KEYS = [
   "时长建议", "后期质感", "平台质感",
 ];
 
-const GENERAL_STYLE_TRANSFER_EXTRA_KEYS = ["材质纹理", "标签"];
+const GENERAL_STYLE_TRANSFER_EXTRA_KEYS = ["材质纹理"];
 const VIDEO_SUBJECT_MOTION_KEYS = ["可迁移主体动作", "主体动作", "产品展示方式"];
 const VIDEO_SUBJECT_MOTION_TRANSFER_KEYS = new Set(["可迁移主体动作", "主体动作", "产品展示方式"]);
 
@@ -301,8 +470,8 @@ export function styleTransferStructured(structured, { video = false, subject = "
       continue;
     }
     if (!allowed.has(key) || REFERENCE_SUBJECT_KEYS.has(key)) continue;
-    const value = String(structured[key] || "").trim();
-    if (value && value !== "无" && value !== "未见" && value !== "不确定") out[key] = value;
+    const value = cleanVisualStructuredValue(structured[key]);
+    if (value) out[key] = value;
   }
   return out;
 }
@@ -314,14 +483,17 @@ export function composeStyleTransferPrompt(structured, fallbackText = "", { vide
   const parts = [];
   const seen = new Set();
   for (const key of styleTransferKeys({ video, subject })) {
-    const value = String(transferStructured[key] || "").trim();
+    let value = cleanVisualStructuredValue(transferStructured[key]);
+    if (!video && value) {
+      value = truncateVisualClause(value, IMAGE_VISUAL_FIELD_LIMITS[key] || VISUAL_CLAUSE_LIMITS.image);
+    }
     const identity = value.replace(/\s+/g, "").toLowerCase();
     if (identity && !seen.has(identity)) {
       seen.add(identity);
       parts.push(value);
     }
   }
-  return parts.join(", ").trim() || fallback;
+  return compactVisualPrompt(parts, video ? "video" : "image") || fallback;
 }
 
 function referenceIdentityTokens(structured) {

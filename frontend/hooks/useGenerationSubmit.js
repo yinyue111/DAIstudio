@@ -9,8 +9,10 @@ import {
 } from "../lib/reverseOperations";
 import { createStudioOwnerRequestContext } from "../lib/studioSession";
 import { buildGenerationPayload } from "../app/studio/generationPayload";
+import { resolveProductVideoStrategySelection } from "../app/studio/productVideoStrategy";
+import { validateImageEvidenceMaskPreflight } from "../app/studio/imageEvidenceReview";
 import { buildReverseOperationRequestSnapshotV2 } from "../app/studio/reverseSnapshot";
-import { classifyGenerationError } from "../lib/errorHandling";
+import { classifyGenerationError, reportBackgroundError } from "../lib/errorHandling";
 import {
   clearPendingGenerateRequest,
   clearPendingReverseRequest,
@@ -88,6 +90,8 @@ export default function useGenerationSubmit({
   promptDirty,
   promptSourceSignature,
   selected,
+  lastFrameAsset = null,
+  firstLastFrameEnabled = false,
   productAsset,
   productDetailAssets = [],
   productProfile,
@@ -99,6 +103,7 @@ export default function useGenerationSubmit({
   structuredDirty = false,
   structuredSource,
   reverseVideoAnalysis = null,
+  analysisFocus = "",
   ratio,
   imageQuality,
   n,
@@ -107,7 +112,12 @@ export default function useGenerationSubmit({
   productPixelLockMode,
   vDuration,
   vResolution,
+  productVideoTemplate = "prompt_driven",
   modelConfigId = null,
+  reverseOperationId = null,
+  reverseRevisionId = null,
+  reviewedImageEvidence = null,
+  reverseEvidenceOperation = null,
   modelOption = null,
   visionModelConfigId = null,
   resultsRef,
@@ -120,11 +130,13 @@ export default function useGenerationSubmit({
   trackBackgroundTask,
   refreshMe,
   startTracking,
+  onGenerationSubmitted = null,
   getOwnerSession,
   subjectProfilePendingRequestRef = null,
   subjectProfileResultCacheRef = null,
   subjectProfileOperationsRef = null,
   trackProfileReverseOperation = null,
+  requestQuoteConfirmation = null,
 }) {
   const [submitting, setSubmitting] = useState(false);
   const pendingGenerateRequestRef = useRef(null);
@@ -173,6 +185,41 @@ export default function useGenerationSubmit({
       setMsg("结构化维度与手工提示词存在冲突，请先应用结构修改或撤销结构修改。");
       return;
     }
+    const productVideoStrategy = resolveProductVideoStrategySelection(
+      modelOption?.capabilities,
+      productVideoTemplate,
+    );
+    const modelSupportsFirstLastFrame = Boolean(
+      category === "video"
+      && creationMode === "video"
+      && subjectMode === "general"
+      && modelOption?.capabilities
+      && !Array.isArray(modelOption.capabilities)
+      && modelOption.capabilities.first_last_frame === true,
+    );
+    const effectiveLastFrameAsset = firstLastFrameEnabled && modelSupportsFirstLastFrame
+      ? lastFrameAsset
+      : null;
+    if (category === "video" && subjectMode === "product" && !productVideoStrategy.supported) {
+      setMsg("当前视频模型未提供可用的产品视频策略，请切换模型后再生成。");
+      return;
+    }
+    if (effectiveLastFrameAsset) {
+      const firstFrameUrl = assetReferenceUrl(selected);
+      const lastFrameUrl = assetReferenceUrl(effectiveLastFrameAsset);
+      if (selected?.type !== "image") {
+        setMsg("首尾帧模式需要先选择图片作为视频首帧。");
+        return;
+      }
+      if (effectiveLastFrameAsset.type !== "image" || !lastFrameUrl) {
+        setMsg("视频尾帧只支持可用的图片素材，请重新上传或选择。");
+        return;
+      }
+      if (firstFrameUrl === lastFrameUrl) {
+        setMsg("视频首帧和尾帧不能使用同一张图片。");
+        return;
+      }
+    }
     if (productDetailAssets.length) {
       const urls = [productAsset, ...productDetailAssets, selected]
         .map(assetReferenceUrl)
@@ -210,6 +257,21 @@ export default function useGenerationSubmit({
     if (!isEditMode && !String(prompt || "").trim() && !selected) {
       setMsg("请输入提示词，或从参考反推");
       return;
+    }
+    if (
+      category === "image"
+      && Number(reverseOperationId) > 0
+      && Number(reverseRevisionId) > 0
+    ) {
+      const maskPreflight = validateImageEvidenceMaskPreflight(
+        reviewedImageEvidence,
+        reverseEvidenceOperation,
+        assetReferenceUrl(isEditMode ? productAsset : selected),
+      );
+      if (!maskPreflight.ok) {
+        setMsg(maskPreflight.message);
+        return;
+      }
     }
 
     setSubmitting(true);
@@ -290,7 +352,7 @@ export default function useGenerationSubmit({
           );
           try {
             const profileTarget = subjectMode === "portrait" ? "portrait_profile" : "product_profile";
-            const createdOperation = normalizeReverseOperation(await api.createReverseOperation({
+            const profileRequest = {
               asset_url: productAsset.url,
               target: profileTarget,
               source_type: "image",
@@ -306,7 +368,29 @@ export default function useGenerationSubmit({
                 source_signature: productSignature,
                 ...(visionModelConfigId ? { model_config_id: Number(visionModelConfigId) } : {}),
               },
-            }));
+            };
+            if (typeof requestQuoteConfirmation !== "function") {
+              throw new Error("主体识别服务不可用，本次未识别主体档案。");
+            }
+            const profileConfirmation = await requestQuoteConfirmation({
+              kind: "reverse",
+              request: profileRequest,
+              clientRequestId: profileRequestId,
+              execute: ({ request }) => api.createReverseOperation(request),
+            });
+            if (profileConfirmation.status !== "executed") {
+              clearPendingReverseRequest(pendingProfileReverseRequestRef, profileRequestId);
+              setWorkspacePatch?.(subjectProfilePatch(null, ""), creationMode);
+              if (["quote_failed", "execution_failed"].includes(profileConfirmation.status)) {
+                throw profileConfirmation.error || new Error("主体档案提交失败。");
+              }
+              if (profileConfirmation.status === "invalidated") {
+                setMsg(profileConfirmation.reason || "主体素材或模型已变化，请重新点击生成。");
+              }
+              clearPendingGenerateRequest(pendingGenerateRequestRef, requestId);
+              return;
+            }
+            const createdOperation = normalizeReverseOperation(profileConfirmation.result);
             profileOperationsRef.current[creationMode] = createdOperation;
             const settledOperation = await waitForTrackedProfileOperation(createdOperation, {
               mode: creationMode,
@@ -412,6 +496,8 @@ export default function useGenerationSubmit({
         promptDirty,
         promptSourceSignature,
         selected,
+        lastFrameAsset: effectiveLastFrameAsset,
+        firstLastFrameEnabled: Boolean(effectiveLastFrameAsset),
         productAsset,
         productDetailAssets,
         productProfile: resolvedProductProfile,
@@ -420,6 +506,7 @@ export default function useGenerationSubmit({
         structured,
         structuredSource,
         reverseVideoAnalysis,
+        analysisFocus,
         ratio,
         imageQuality,
         n,
@@ -428,7 +515,10 @@ export default function useGenerationSubmit({
         productPixelLockMode,
         vDuration,
         vResolution,
+        productVideoTemplate: productVideoStrategy.effectiveValue || productVideoTemplate,
         modelConfigId,
+        reverseOperationId,
+        reverseRevisionId,
       });
       payload.client_request_id = generateClientRequestId(
         pendingGenerateRequestRef,
@@ -437,7 +527,31 @@ export default function useGenerationSubmit({
       );
       requestId = payload.client_request_id;
 
-      const nextTask = await api.generate(payload);
+      if (typeof requestQuoteConfirmation !== "function") {
+        throw new Error("生成服务不可用，本次未执行生成。");
+      }
+      const confirmation = await requestQuoteConfirmation({
+        kind: "generation",
+        request: payload,
+        clientRequestId: payload.client_request_id,
+        execute: ({ request }) => api.generate(request),
+      });
+      if (confirmation.status !== "executed") {
+        clearPendingGenerateRequest(pendingGenerateRequestRef, requestId);
+        if (["quote_failed", "execution_failed"].includes(confirmation.status)) {
+          throw confirmation.error || new Error("任务提交失败。");
+        }
+        if (confirmation.status === "invalidated") {
+          setMsg(confirmation.reason || "参数已变化，请重新点击生成。");
+        }
+        return;
+      }
+      const submitted = {
+        task: confirmation.result,
+        quote: confirmation.quote?.raw,
+        payload: confirmation.request,
+      };
+      const nextTask = submitted.task;
       if (!isCurrent()) return;
       clearPendingGenerateRequest(pendingGenerateRequestRef, requestId);
       const previousTask = task;
@@ -450,6 +564,7 @@ export default function useGenerationSubmit({
         trackBackgroundTask(previousTask);
       }
       setTask(nextTask);
+      onGenerationSubmitted?.({ task: nextTask, payload: submitted.payload, stage });
       setTrackingLost(false);
       setRunningSnapshot({
         category: effCategory,
@@ -462,7 +577,7 @@ export default function useGenerationSubmit({
     } catch (e) {
       if (!isCurrent()) return;
       if (isRequestTimeoutError(e)) {
-        setMsg(`${e.message}。任务可能已提交，重新点击会复用同一次请求，避免重复扣费。`);
+        setMsg(`${e.message}。任务可能仍在处理中，重新点击会复用同一次请求，避免重复扣费。`);
       } else {
         clearPendingGenerateRequest(pendingGenerateRequestRef, requestId);
         setMsg(classifyGenerationError(e, { category }).message);

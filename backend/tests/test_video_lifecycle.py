@@ -80,12 +80,12 @@ def _stranded_video(uid, ext_id):
         db.close()
 
 
-def test_video_preview_completes_via_poll(client, make_user, auth):
+def test_video_preview_completes_via_poll(client, make_user, auth, quote_and_generate):
     make_user("13900000061", balance=1000, admin=True)
     h = auth("13900000061")
     _config_video(client, h)
 
-    r = client.post("/api/generate", json={
+    r = quote_and_generate({
         "category": "video", "stage": "preview",
         "prompt": {"final_text": "spin"}, "params": {"duration": 2},
     }, headers=h)
@@ -167,7 +167,7 @@ def test_legacy_video_worker_compiles_and_persists_prompt_before_submit(
         assert task.phase == "polling"
         assert task.external_task_id == "ext-legacy-compiled"
         assert params["_generation_prompt"] == submitted["prompt"]
-        assert params["_prompt_compiler_version"] == "video-prompt-v5"
+        assert params["_prompt_compiler_version"] == "video-prompt-v6"
         assert params["_video_submit_contract_version"] == "video-submit-v3"
         assert params["_post_overlays"] == ["新品上市"]
         assert params["_video_prompt_plan"]["shots"] == ["手持产品稳定入镜"]
@@ -305,7 +305,7 @@ def test_video_worker_rejects_mismatched_submit_contract_before_provider_call(
             params={
                 "duration": 5,
                 "_generation_prompt": "场景脚本：\nShot 1：产品稳定入镜",
-                "_prompt_compiler_version": "video-prompt-v5",
+                "_prompt_compiler_version": "video-prompt-v6",
                 "_video_submit_contract_version": "video-submit-v2",
             },
             cost_frozen=5,
@@ -371,7 +371,9 @@ def test_video_resubmit_skipped_when_external_id_present(client, make_user, auth
     assert client.get(f"/api/tasks/{tid}", headers=h).json()["status"] == "succeeded"
 
 
-def test_video_rejects_non_video_content(client, make_user, auth, monkeypatch):
+def test_video_rejects_non_video_content(
+    client, make_user, auth, monkeypatch, quote_and_generate
+):
     # Gateway "succeeds" with a URL but the bytes aren't a video. The upstream
     # task may have consumed provider resources, so hold for review instead of
     # refunding automatically.
@@ -385,7 +387,7 @@ def test_video_rejects_non_video_content(client, make_user, auth, monkeypatch):
                         lambda *_a, **_k: {"status": "succeeded", "url": "http://example.com/x.mp4"})
     monkeypatch.setattr("app.services.gateway.download_to_storage", lambda *_a, **_k: "video_preview/bad.mp4")
 
-    r = client.post("/api/generate", json={
+    r = quote_and_generate({
         "category": "video", "stage": "preview",
         "prompt": {"final_text": "x"}, "params": {"duration": 2},
     }, headers=h)
@@ -403,6 +405,7 @@ def test_video_submit_unknown_state_holds_for_review_without_refund(
     make_user,
     auth,
     monkeypatch,
+    quote_and_generate,
 ):
     make_user("13900000065", balance=1000, admin=True)
     h = auth("13900000065")
@@ -412,7 +415,7 @@ def test_video_submit_unknown_state_holds_for_review_without_refund(
         raise RuntimeError("submit accepted state unknown")
 
     monkeypatch.setattr("app.services.gateway.submit_video", fail_submit)
-    r = client.post("/api/generate", json={
+    r = quote_and_generate({
         "category": "video",
         "stage": "preview",
         "prompt": {"final_text": "request id"},
@@ -923,6 +926,7 @@ def test_video_unknown_submit_recovers_by_request_id(
     make_user,
     auth,
     monkeypatch,
+    quote_and_generate,
 ):
     make_user("13900000995", balance=1000, admin=True)
     h = auth("13900000995")
@@ -947,7 +951,7 @@ def test_video_unknown_submit_recovers_by_request_id(
             "status": "running",
         },
     )
-    r = client.post("/api/generate", json={
+    r = quote_and_generate({
         "category": "video",
         "stage": "preview",
         "prompt": {"final_text": "recover by request id"},
@@ -1155,6 +1159,7 @@ def test_video_unknown_submit_request_id_miss_holds_for_review(
     make_user,
     auth,
     monkeypatch,
+    quote_and_generate,
 ):
     make_user("13900000994", balance=1000, admin=True)
     h = auth("13900000994")
@@ -1174,7 +1179,7 @@ def test_video_unknown_submit_request_id_miss_holds_for_review(
     monkeypatch.setattr("app.services.gateway.submit_video", fail_submit)
     monkeypatch.setattr("app.services.gateway.find_video_by_request_id", lambda *_args, **_kwargs: None)
 
-    r = client.post("/api/generate", json={
+    r = quote_and_generate({
         "category": "video",
         "stage": "preview",
         "prompt": {"final_text": "recover miss by request id"},
@@ -1201,7 +1206,9 @@ def test_video_unknown_submit_request_id_miss_holds_for_review(
         db.close()
 
 
-def test_video_submit_account_pool_error_fails_and_refunds(client, make_user, auth, monkeypatch):
+def test_video_submit_account_pool_error_fails_and_refunds(
+    client, make_user, auth, monkeypatch, quote_and_generate
+):
     make_user("13900000973", balance=1000, admin=True)
     h = auth("13900000973")
     _config_video(client, h)
@@ -1215,7 +1222,7 @@ def test_video_submit_account_pool_error_fails_and_refunds(client, make_user, au
         )
 
     monkeypatch.setattr("app.services.gateway.submit_video", fail_submit)
-    r = client.post("/api/generate", json={
+    r = quote_and_generate({
         "category": "video",
         "stage": "preview",
         "prompt": {"final_text": "account pool exhausted"},
@@ -1417,7 +1424,9 @@ def test_admin_settle_download_failure_keeps_task_in_review(
     assert any(task["id"] == tid and task["status"] == "needs_review" for task in tasks)
 
 
-def test_image_gateway_timeout_fails_and_refunds(client, make_user, auth, monkeypatch):
+def test_image_gateway_timeout_fails_and_refunds(
+    client, make_user, auth, monkeypatch, quote_and_generate
+):
     make_user("13900000984", balance=1000, admin=True)
     h = auth("13900000984")
     monkeypatch.setattr(
@@ -1427,7 +1436,7 @@ def test_image_gateway_timeout_fails_and_refunds(client, make_user, auth, monkey
         ),
     )
 
-    r = client.post("/api/generate", json={
+    r = quote_and_generate({
         "category": "image",
         "stage": "preview",
         "prompt": {"final_text": "slow image"},
@@ -1685,7 +1694,9 @@ def test_preview_task_includes_final_summary_outside_current_page(client, make_u
     assert task["final_asset_count"] == 1
 
 
-def test_final_generation_drops_preview_video_runtime_params(client, make_user, auth, monkeypatch):
+def test_final_generation_drops_preview_video_runtime_params(
+    client, make_user, auth, monkeypatch, quote_and_generate
+):
     uid = make_user("13900000978", balance=1000, admin=True)
     h = auth("13900000978")
     _config_video(client, h)
@@ -1733,12 +1744,13 @@ def test_final_generation_drops_preview_video_runtime_params(client, make_user, 
     finally:
         db.close()
 
-    r = client.post(
-        "/api/generate",
-        json={"category": "video", "stage": "final", "parent_task_id": preview_id, "params": {}},
+    r = quote_and_generate(
+        {"category": "video", "stage": "final", "parent_task_id": preview_id, "params": {}},
         headers=h,
     )
-    assert r.status_code == 200, r.text
+    assert r.status_code == 202, r.text
+    assert r.json()["dispatch_status"] == "pending"
+    assert r.json()["dispatch_reconciliation_required"] is True
     db = SessionLocal()
     try:
         final = db.get(GenTask, r.json()["id"])
@@ -4319,7 +4331,7 @@ def test_reaper_holds_video_submitting_after_submit_timeout_before_generic_windo
         db.close()
 
 
-def test_reaper_holds_submitted_video_timeout_for_review(client, make_user, auth, monkeypatch):
+def test_reaper_fails_submitted_video_after_render_deadline(client, make_user, auth, monkeypatch):
     uid = make_user("13900000982", balance=1000, admin=True)
     h = auth("13900000982")
     _config_video(client, h)
@@ -4348,20 +4360,20 @@ def test_reaper_holds_submitted_video_timeout_for_review(client, make_user, auth
         balance_after_freeze = user.balance_credits
         frozen_after_freeze = user.frozen_credits
 
+        generation_video_flow.mark_poll_alive(tid, "ext-reaper-timeout")
         assert retention.reap_stuck_tasks(db, max_minutes=60) == 1
-        held = db.get(GenTask, tid)
+        failed = db.get(GenTask, tid)
         user = db.get(User, uid)
-        assert held.status == "needs_review"
-        assert held.phase == "reconciling"
-        assert "上游任务状态未知" in (held.error or "")
-        assert held.params["_video_poll_state_unknown"] is True
-        assert user.balance_credits == balance_after_freeze
-        assert user.frozen_credits == frozen_after_freeze
+        assert failed.status == "failed"
+        assert "超过 1 分钟" in (failed.error or "")
+        assert "_video_poll_state_unknown" not in (failed.params or {})
+        assert user.balance_credits == balance_after_freeze + 5
+        assert user.frozen_credits == frozen_after_freeze - 5
     finally:
         db.close()
 
 
-def test_video_render_timeout_holds_for_review(client, make_user, auth, monkeypatch):
+def test_video_render_timeout_fails_and_refunds(client, make_user, auth, monkeypatch):
     uid = make_user("13900000976", balance=1000, admin=True)
     h = auth("13900000976")
     _config_video(client, h)
@@ -4395,14 +4407,13 @@ def test_video_render_timeout_holds_for_review(client, make_user, auth, monkeypa
     db = SessionLocal()
     try:
         task = db.get(GenTask, tid)
-        assert task.status == "needs_review"
-        assert task.phase == "reconciling"
+        assert task.status == "failed"
         assert task.cost_settled == 0
-        assert "状态未知" in (task.error or "")
-        assert task.params["_video_poll_state_unknown"] is True
+        assert "超过 1 分钟" in (task.error or "")
+        assert "_video_poll_state_unknown" not in (task.params or {})
         user = db.get(User, uid)
-        assert user.balance_credits == balance_after_freeze
-        assert user.frozen_credits == frozen_after_freeze
+        assert user.balance_credits == balance_after_freeze + 5
+        assert user.frozen_credits == frozen_after_freeze - 5
     finally:
         db.close()
 

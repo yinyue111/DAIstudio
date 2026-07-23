@@ -28,6 +28,7 @@ def test_image_result_save_failure_removes_files_written_for_that_result(
     make_user,
     auth,
     monkeypatch,
+    quote_and_generate,
 ):
     make_user("13900001998", balance=1000)
     headers = auth("13900001998")
@@ -43,10 +44,9 @@ def test_image_result_save_failure_removes_files_written_for_that_result(
 
     monkeypatch.setattr("app.services.generation_image_flow.storage.save_bytes", fail_after_hd_write)
 
-    response = client.post(
-        "/api/generate",
+    response = quote_and_generate(
         headers=headers,
-        json={
+        payload={
             "source_asset_url": "http://x/y.png",
             "source_type": "image",
             "source_asset_meta": {"user_confirmed_rights": True},

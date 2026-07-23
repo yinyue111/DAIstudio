@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import io
 import mimetypes
 from pathlib import Path
@@ -31,7 +32,8 @@ def gateway_ref_for_user_asset(
     prefer_original_upload: bool = False,
     quality: int = 82,
     subsampling: int = 2,
-) -> str | None:
+    return_content_hash: bool = False,
+) -> str | tuple[str, str] | None:
     """Return a gateway-readable ref for a user-controlled asset URL.
 
     Never forward user-controlled external URLs directly to a model gateway.
@@ -43,6 +45,9 @@ def gateway_ref_for_user_asset(
         return None
     key = local_storage_key_from_user_asset_url(url)
     if not key and settings.effective_mock_mode:
+        if return_content_hash:
+            digest = hashlib.sha256(f"mock-url:{url}".encode()).hexdigest()
+            return url, digest
         return url
     if key:
         row_mime = None
@@ -69,7 +74,7 @@ def gateway_ref_for_user_asset(
             raise AssetRefError("素材文件不存在")
         raw = path.read_bytes()
         mime = mimetypes.guess_type(path.name)[0] or row_mime
-        return _image_data_uri(
+        data_uri = _image_data_uri(
             raw,
             fallback_mime=mime,
             compress_for_gateway=True,
@@ -78,6 +83,7 @@ def gateway_ref_for_user_asset(
             quality=quality,
             subsampling=subsampling,
         )
+        return (data_uri, hashlib.sha256(raw).hexdigest()) if return_content_hash else data_uri
 
     try:
         raw = gateway.download_bytes_limited(
@@ -87,7 +93,7 @@ def gateway_ref_for_user_asset(
         )
     except gateway.GatewayError as e:
         raise AssetRefError(f"素材下载失败:{e}") from e
-    return _image_data_uri(
+    data_uri = _image_data_uri(
         raw,
         compress_for_gateway=True,
         min_side=min_side,
@@ -95,6 +101,7 @@ def gateway_ref_for_user_asset(
         quality=quality,
         subsampling=subsampling,
     )
+    return (data_uri, hashlib.sha256(raw).hexdigest()) if return_content_hash else data_uri
 
 
 def _image_data_uri(

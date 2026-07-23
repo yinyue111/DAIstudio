@@ -1,15 +1,16 @@
 """Prompt compaction and fidelity guards for generation tasks."""
 from __future__ import annotations
 
+import math
 import re
 
 from ..models import GenTask
 
 PRODUCT_FIDELITY_GUARD = (
-    "产品高保真硬约束：上传产品是唯一产品身份，保持同一SKU的外形、比例、包装结构、品牌色、"
-    "材质纹理、Logo、标签版式和可见文字，不得改写、翻译或替换。只可改变背景、道具、光线、"
-    "构图和广告质感；产品须清晰完整入镜并保留安全边距，不得裁切、遮挡、变形、重复或出现抠图白边。"
-    "视频中用上传产品替换参考主体，尽量让文字面朝向镜头并避免快速旋转和运动模糊。冲突时产品保真优先。"
+    "产品高保真硬约束：输入图1是唯一产品身份和编辑源，保持同一SKU的外形、比例、包装结构、"
+    "品牌色、材质纹理、Logo、标签版式和可见文字，不得改写、翻译、替换或重绘；只改变背景、"
+    "道具、光线、构图、材质表现和后期质感。产品完整清晰入镜并保留安全边距，不得裁切、遮挡、变形、"
+    "重复或出现抠图白边；冲突时产品保真优先。"
 )
 TISSUE_DISPENSING_GUARD = (
     "抽取结构约束：仅一张纸巾从包装原有抽口连续伸出，根部收束并与抽口自然连接；"
@@ -36,7 +37,7 @@ _TISSUE_DISPENSING_NEGATION_RE = re.compile(
 PORTRAIT_FIDELITY_GUARD = (
     "人像高保真硬约束：上传人像是唯一人物身份，保持同一个人的脸型、五官比例、发际线、发型、"
     "肤色、年龄感和可识别特征；保持服装覆盖下可见的肩宽、胸廓、腰胯、四肢比例与姿态重心，"
-    "不得主动瘦身、拉长或重塑体型。风格参考只迁移场景、构图、服化道、动作、镜头与广告质感，"
+    "不得主动瘦身、拉长或重塑体型。风格参考只迁移场景、构图、服化道、动作、镜头、材质与后期质感，"
     "不得混入参考人物身份。保持原图主光方向、明暗关系、高光阴影和材质反射；表达成年、自然、得体。"
     "冲突时人物身份、身体比例和光影关系优先。"
 )
@@ -56,6 +57,30 @@ _STYLE_TRANSFER_KEEP_KEYS = (
     "可迁移主体动作", "主体动作", "产品展示方式", "镜头运动", "剪辑节奏", "时序分镜", "字幕卖点", "光线", "色调配色",
     "氛围情绪", "后期质感", "平台质感", "转场", "时长建议",
 )
+_STYLE_TRANSFER_IMAGE_KEEP_KEYS = (
+    # Replica-critical fields come first. The generation gateway has a hard
+    # prompt budget, so scene geometry, lighting and palette must never be
+    # displaced by lower-value platform or mood prose.
+    "场景背景", "构图", "光线", "色调配色", "风格", "视角镜头", "后期质感",
+    "景别", "材质纹理", "文字版式", "氛围情绪",
+)
+_STYLE_TRANSFER_IMAGE_FIELD_LIMITS = {
+    "场景背景": 100,
+    "构图": 85,
+    "光线": 95,
+    "色调配色": 75,
+    "风格": 45,
+    "视角镜头": 60,
+    "后期质感": 50,
+    "景别": 55,
+    "材质纹理": 55,
+    "广告目标": 55,
+    "氛围情绪": 55,
+    "平台质感": 45,
+    "文字版式": 45,
+}
+_STYLE_TRANSFER_IMAGE_MAX_CHARS = 520
+_STYLE_TRANSFER_IMAGE_PROFILE_MAX_CHARS = 80
 _STYLE_TRANSFER_MOTION_KEYS = {"可迁移主体动作", "主体动作", "产品展示方式"}
 _REFERENCE_PRODUCT_NOUN_RE = re.compile(
     r"KaHi|Kahf|Dior|Estee\s+Lauder|Advanced\s+Night\s+Repair|Eau\s+de\s+Toilette|"
@@ -304,11 +329,18 @@ def _tissue_dispensing_requested(prompt_obj: dict) -> bool:
 
 
 def product_fidelity_prompt(prompt: str, task: GenTask) -> str:
+    frame_clause = _image_frame_clause(task.params)
     if is_portrait_generation_task(task):
         text = str(prompt or "")
         if "人像高保真硬约束" in text:
-            return _trim_generation_prompt(text)
-        return _trim_generation_prompt(f"{PORTRAIT_FIDELITY_GUARD}{text}")
+            return _trim_generation_prompt(text, required_clause=frame_clause)
+        body_budget = GENERATION_PROMPT_MAX_CHARS - len(PORTRAIT_FIDELITY_GUARD)
+        body = _trim_generation_prompt(
+            text,
+            max_chars=max(1, body_budget),
+            required_clause=frame_clause,
+        )
+        return f"{PORTRAIT_FIDELITY_GUARD}{body}"
     if not is_product_generation_task(task):
         return prompt
     text = str(prompt or "")
@@ -317,17 +349,75 @@ def product_fidelity_prompt(prompt: str, task: GenTask) -> str:
     if "产品高保真硬约束" in text:
         if tissue_guard and "抽取结构约束" not in text:
             text = f"{text}{tissue_guard}"
-        return _trim_generation_prompt(text)
-    return _trim_generation_prompt(f"{PRODUCT_FIDELITY_GUARD}{tissue_guard}{text}")
+        return _trim_generation_prompt(text, required_clause=frame_clause)
+    guard = f"{PRODUCT_FIDELITY_GUARD}{tissue_guard}"
+    body_budget = GENERATION_PROMPT_MAX_CHARS - len(guard)
+    body = _trim_generation_prompt(
+        text,
+        max_chars=max(1, body_budget),
+        required_clause=frame_clause,
+    )
+    return f"{guard}{body}"
+
+
+def _strip_analysis_scaffolding(value: str) -> str:
+    text = str(value or "")
+    text = re.sub(
+        r"(^|[；;。.!！?？\n])\s*(?:未知|不确定项|无法确认)\s*[:：]\s*"
+        r"[^；;。.!！?？\n]*(?:[；;。.!！?？]|$)",
+        r"\1",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(
+        r"(^|[；;。.!！?？\n])\s*"
+        r"(?:直接可见事实|视觉估计|视觉推断|观察事实|事实层|估计层)\s*[:：]\s*",
+        r"\1",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(
+        r"(?:直接可见事实|视觉估计|视觉推断|观察事实)\s*[:：]\s*",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(r"近似采样色仅作视觉估计\s*[:：]", "近似色：", text)
+    text = re.sub(
+        r"(?:[,，、]\s*)?(?:(?:可|适合)(?:用于|迁移为)?\s*)?"
+        r"(?:小红书|抖音|tiktok|instagram|pinterest|"
+        r"社(?:交)?媒体(?:品牌)?(?:广告)?素材|社媒(?:品牌)?(?:广告)?素材|"
+        r"品牌网页广告|网页广告|电商(?:详情页|主图|海报|素材|包装视觉升级)|"
+        r"发布平台|发布渠道|平台归因)"
+        r"[^；;。.!！?？\n]*",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(
+        r"(?<![A-Za-z0-9_])(?:masterpiece|best quality|high quality|ultra quality|ultra[- ]?detailed|"
+        r"highly detailed|extremely detailed|insanely detailed|ultra[- ]?high resolution|"
+        r"high[- ]?resolution|hi[- ]?res|premium texture|award[- ]?winning|"
+        r"trending on artstation|uhd|(?:4|8|16)k(?: resolution| quality)?)(?![A-Za-z0-9_])|"
+        r"(?:杰作|最佳质量|顶级质量|超高质量|高质量|专业级品质|广告级品质|商业级品质|"
+        r"超高清|高清画质|超清画质|高分辨率|超高分辨率|极致细节|细节拉满|获奖作品|"
+        r"顶级画质|顶级品质)",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(r"([,，;；、])(?:\s*[,，;；、])+", r"\1", text)
+    text = re.sub(r"(^|[；;。.!！?？,，、])\s*的(?=\S)", r"\1", text)
+    return text
 
 
 def _normalise_prompt_fragment(value) -> str:
-    text = str(value or "").strip()
+    text = _strip_analysis_scaffolding(str(value or "").strip())
     if not text or text in {"无", "未见", "不确定", "不适用"}:
         return ""
     for pattern, replacement in _GENERATION_PROMPT_SENSITIVE_PATTERNS:
         text = pattern.sub(replacement, text)
-    return re.sub(r"\s+", " ", text).strip(" ,，;；。")
+    return re.sub(r"\s+", " ", text).strip(" ,，;；。、")
 
 
 _PROMPT_FIELD_LIMITS = {
@@ -338,14 +428,35 @@ _PROMPT_FIELD_LIMITS = {
     "身材体态": 170,
     "身材曲线": 170,
     "体态线条": 170,
-    "光线": 220,
+    "场景背景": 150,
+    "构图": 135,
+    "景别": 85,
+    "视角镜头": 125,
+    "视角构图": 110,
+    "光线": 165,
+    "色调配色": 115,
+    "风格": 90,
     "材质纹理": 150,
-    "后期质感": 170,
+    "后期质感": 105,
+    "广告目标": 90,
+    "氛围情绪": 85,
+    "平台质感": 80,
+    "文字版式": 80,
     "服装结构": 150,
     "服装覆盖": 100,
     "妆发五官": 130,
     "时序分镜": 520,
 }
+
+
+def _truncate_prompt_fragment(text: str, limit: int) -> str:
+    if len(text) <= limit:
+        return text
+    candidate = text[:limit]
+    cut = max(candidate.rfind(mark) for mark in ("。", "；", ";", "，", ","))
+    if cut >= max(12, int(limit * 0.45)):
+        candidate = candidate[:cut]
+    return candidate.rstrip(" ,，;；。")
 
 
 def _compact_prompt_field(key: str, value) -> str:
@@ -362,9 +473,100 @@ def _compact_prompt_field(key: str, value) -> str:
                 continue
             seen.add(normalized)
             unique.append(chunk)
-        text = "".join(unique)
+        if key == "色调配色":
+            # Palette relationships carry more visual value than sampled color
+            # percentages/hex values when the generation prompt is budget-bound.
+            unique = [
+                chunk
+                for _index, chunk in sorted(
+                    enumerate(unique),
+                    key=lambda item: (
+                        0
+                        if re.search(r"主色|辅色|点缀色|配色", item[1])
+                        else (
+                            1
+                            if re.search(r"冷暖|互补|饱和|冷调|暖调|色彩对比", item[1])
+                            else 2
+                        ),
+                        item[0],
+                    ),
+                )
+            ]
+            text = "；".join(chunk.rstrip("。；;.!?！？") for chunk in unique)
+        else:
+            text = "".join(unique)
     limit = _PROMPT_FIELD_LIMITS.get(key, 120)
-    return text[:limit].rstrip(" ,，;；。")
+    return _truncate_prompt_fragment(text, limit)
+
+
+_SUBJECT_PROFILE_PRIORITY = (
+    "不可改项", "主体身份", "品牌Logo", "人物身份", "产品品类", "包装结构",
+    "主色材质", "关键图案", "展示角度", "形状比例", "主角约束",
+)
+
+
+def _compact_subject_profile(value, *, max_chars: int = 100) -> str:
+    text = _normalise_prompt_fragment(value)
+    if not text:
+        return ""
+    chunks = [item.strip(" ,，;；。") for item in re.split(r"[；\n]|(?<=。)", text) if item.strip()]
+    if not chunks:
+        return text[:max_chars].rstrip(" ,，;；。")
+    ranked = sorted(
+        enumerate(chunks),
+        key=lambda item: (
+            next(
+                (rank for rank, hint in enumerate(_SUBJECT_PROFILE_PRIORITY) if hint in item[1]),
+                len(_SUBJECT_PROFILE_PRIORITY),
+            ),
+            item[0],
+        ),
+    )
+    selected: list[str] = []
+    remaining = max_chars
+    for _index, chunk in ranked:
+        if remaining <= 0:
+            break
+        separator = 1 if selected else 0
+        if remaining <= separator:
+            break
+        clipped = _truncate_prompt_fragment(chunk, remaining - separator)
+        if clipped:
+            selected.append(clipped)
+            remaining -= len(clipped) + separator
+        if len(clipped) < len(chunk):
+            break
+    return "；".join(selected)
+
+
+def _join_prompt_parts_bounded(parts: list[str], *, max_chars: int) -> str:
+    """Keep complete, prioritized clauses instead of slicing through a field."""
+    selected: list[str] = []
+    used = 0
+    for part in parts:
+        text = str(part or "").strip(" ,，;；。")
+        if not text:
+            continue
+        separator = 1 if selected else 0
+        if used + separator + len(text) > max_chars:
+            continue
+        selected.append(text)
+        used += separator + len(text)
+    return "；".join(selected)
+
+
+def _image_frame_clause(params: dict | None) -> str:
+    size = str((params or {}).get("size") or "").strip().lower()
+    match = re.fullmatch(r"(\d{2,5})x(\d{2,5})", size)
+    if not match:
+        return ""
+    width, height = int(match.group(1)), int(match.group(2))
+    if width <= 0 or height <= 0:
+        return ""
+    divisor = math.gcd(width, height)
+    ratio = f"{width // divisor}:{height // divisor}"
+    orientation = "方形" if width == height else ("竖版" if height > width else "横版")
+    return f"画幅硬约束：严格保持{orientation}{ratio}（{width}x{height}），不得改成其他画幅"
 
 
 def _meaningful_canonical_prompt(value, *, allow_short: bool = False) -> str:
@@ -468,16 +670,14 @@ def _rewrite_product_style_fragment(key: str, value, *, is_video: bool = False) 
         )
     if key == "景别":
         return (
-            "上传产品中近景/近景，完整产品主体入镜，主体占画幅约55%-75%，"
-            "包装、Logo和主要文字清晰可读。"
+            "上传产品近景，完整产品主体入镜，主体占画幅约五成五到七成五，Logo和主要文字清晰可读。"
         )
     if key in {"构图", "视角构图"}:
         cleaned = _REFERENCE_PRODUCT_NOUN_RE.sub("上传产品", text)
         cleaned = _REFERENCE_PRODUCT_DETAIL_RE.sub("上传产品对应结构与材质", cleaned)
         return (
-            "上传产品为画面唯一视觉中心，完整入镜，四周保留安全边距，包装正面、顶部、底部、"
-            "左右边缘、抽口/盖子/提手和外盒轮廓都可见；主体占画幅约55%-75%。"
-            f"参考构图只迁移背景留白、视线引导、景深和光影平衡：{cleaned}"
+            "上传产品为唯一视觉中心并保留安全边距；只迁移风格参考的框架、留白、视线引导、"
+            f"景深和光影平衡：{cleaned}"
         )
     if key == "场景背景":
         cleaned = re.sub(r"前景[^；。]*覆盖[^；。]*[；。]?", "前景元素只围绕产品底部和边缘，", text)
@@ -548,10 +748,19 @@ def _style_transfer_generation_prompt(
     parts: list[str] = []
     if product or portrait:
         for key in _SUBJECT_PROFILE_KEYS:
-            fragment = _normalise_prompt_fragment(prompt_obj.get(key))
+            fragment = _compact_subject_profile(
+                prompt_obj.get(key),
+                max_chars=(
+                    _STYLE_TRANSFER_IMAGE_PROFILE_MAX_CHARS
+                    if not is_video
+                    else 100
+                ),
+            )
             if fragment:
                 parts.append(f"{key}: {fragment}")
-    for key in _STYLE_TRANSFER_KEEP_KEYS:
+                break
+    transfer_keys = _STYLE_TRANSFER_KEEP_KEYS if is_video else _STYLE_TRANSFER_IMAGE_KEEP_KEYS
+    for key in transfer_keys:
         if key in _STYLE_TRANSFER_MOTION_KEYS and (product or portrait):
             fragment = _rewrite_transfer_motion(
                 prompt_obj.get(key),
@@ -576,6 +785,12 @@ def _style_transfer_generation_prompt(
             fragment = _rewrite_product_style_fragment(key, prompt_obj.get(key), is_video=is_video)
         else:
             fragment = _normalise_prompt_fragment(prompt_obj.get(key))
+        fragment = _compact_prompt_field(key, fragment)
+        if not is_video:
+            fragment = _truncate_prompt_fragment(
+                fragment,
+                _STYLE_TRANSFER_IMAGE_FIELD_LIMITS.get(key, 60),
+            )
         if fragment:
             parts.append(f"{key}: {fragment}")
     for key in _USER_INSTRUCTION_KEYS:
@@ -588,9 +803,17 @@ def _style_transfer_generation_prompt(
             fragment = _rewrite_locked_product_user_instruction(prompt_obj.get(key))
         else:
             fragment = _normalise_prompt_fragment(prompt_obj.get(key))
+        fragment = fragment[:120].rstrip(" ,，;；。")
         if fragment:
             parts.append(f"用户补充要求: {fragment}")
-    base = "；".join(parts)
+    base = (
+        "；".join(parts)
+        if is_video
+        else _join_prompt_parts_bounded(
+            parts,
+            max_chars=_STYLE_TRANSFER_IMAGE_MAX_CHARS,
+        )
+    )
     if base:
         return base
     return _normalise_prompt_fragment(fallback)
@@ -701,18 +924,23 @@ def compact_generation_prompt_text(
         source = _structured_generation_prompt(prompt_obj)
     if not source:
         source = str(fallback or "")
+    frame_clause = "" if is_video else _image_frame_clause(params)
     if product:
         if is_video:
             prefix = (
                 "生成版提示词：以上传产品图作为唯一商品主体和视频主角，用上传产品替换参考视频里的原主体、"
                 "原商品、人物或品牌；参考视频仅迁移场景、构图、镜头运动、剪辑节奏、展示动作、光线、"
-                "色调、背景道具和商业广告质感；不要生成参考视频里的商品、品牌、Logo、包装、人物或文字。"
+                "色调、背景道具、材质与后期质感；不要生成参考视频里的商品、品牌、Logo、包装、人物或文字。"
             )
         else:
-            prefix = (
-                "生成版提示词：以上传产品图作为唯一商品主体，参考图仅迁移场景、构图、光线、色调、"
-                "背景道具和商业广告质感；不要生成参考图里的商品、品牌、Logo、包装或文字。"
-            )
+            prefix = "上传产品图作为唯一商品主体，完整入镜并占画幅五成五到七成五；"
+            if str((params or {}).get("style_reference_image") or "").strip():
+                prefix += (
+                    "输入图1锁定产品身份；输入图2只迁移场景、构图、机位、光线、配色和质感，"
+                    "不迁移其中的主体、品牌或文字；"
+                )
+            else:
+                prefix += "参考素材只迁移场景、构图、光线、配色和质感；"
     elif portrait:
         if portrait_reference:
             prefix = (
@@ -722,10 +950,7 @@ def compact_generation_prompt_text(
         else:
             prefix = "生成版提示词：严格按反推记录复刻原图成年人物、构图、身体轮廓、服装、光影和质感。"
     else:
-        prefix = (
-            "生成版提示词：参考图复刻，保留主体身份、构图关系、光线方向、色调、场景和商业风格；"
-            "使用自然、中性的视觉描述。"
-        )
+        prefix = "生成版提示词：输入图1为复刻参考，优先保持构图关系、光线方向、配色、场景和商业风格。"
     if portrait:
         prefix += (
             "保持专业商业人像、品牌 Lookbook 或角色设定语境；复刻脸型五官、服装结构、肩宽、胸廓、"
@@ -759,17 +984,13 @@ def compact_generation_prompt_text(
                 f"{_product_video_template_prompt(product_video_template, locked=False)}"
             )
         else:
-            prefix += (
-                "产品生成需保持同一商品、Logo、包装结构、品牌色、文字和材质细节稳定；"
-                "图片构图必须让完整产品主体入镜，包装正面、顶部、底部、左右边缘、抽口、盖子、提手"
-                "和外盒轮廓全部可见，主体占画面五成五到七成五并保留安全边距；"
-                "不得裁掉包装、不得只显示局部、不得让草叶/水花/道具遮挡Logo和主要文字。"
-            )
+            prefix += ""
     timeline = _compact_prompt_field("时序分镜", prompt_obj.get("时序分镜")) if is_video else ""
     timeline_clause = f"时序分镜: {timeline}" if timeline else ""
+    required_clause = timeline_clause or frame_clause
     return _trim_generation_prompt(
-        f"{prefix}{source}",
-        required_clause=timeline_clause,
+        f"{prefix}{frame_clause}{source}",
+        required_clause=required_clause,
     )
 
 
@@ -912,3 +1133,13 @@ def generation_prompt_for_model(prompt: str, task: GenTask) -> str:
         is_portrait=True if explicit_portrait else None,
         is_product=is_product_generation_task(task),
     )
+
+
+def compile_image_prompt_profile(prompt: str, profile: dict | None) -> str:
+    """Apply the validated, frozen image adapter prompt envelope."""
+    values = profile if isinstance(profile, dict) else {}
+    source = str(prompt or "").strip()
+    prefix = str(values.get("prefix") or "").strip()
+    suffix = str(values.get("suffix") or "").strip()
+    separator = str(values.get("separator", "\n"))
+    return separator.join(part for part in (prefix, source, suffix) if part)

@@ -20,9 +20,8 @@ log = logging.getLogger("generation")
 VIDEO_POLL_MAX_SECONDS = settings.video_poll_max_seconds
 VIDEO_POLL_INTERVAL = settings.video_poll_interval_seconds
 POLL_LIVENESS_TTL = max(
-    180,
-    VIDEO_POLL_INTERVAL * 3,
-    min(VIDEO_POLL_MAX_SECONDS, 1800),
+    60,
+    VIDEO_POLL_INTERVAL * 6,
 )
 POLL_MAX_CONSEC_ERRORS = 3
 VIDEO_DOWNLOAD_MAX_ATTEMPTS = max(1, int(settings.video_download_max_attempts or 1))
@@ -50,7 +49,7 @@ def unlink_keys(keys) -> None:
     """Best-effort remove stored media files after a losing finalizer race."""
     for k in keys or []:
         try:
-            storage.local_path(k).unlink(missing_ok=True)
+            storage.delete(k)
         except Exception:  # noqa: BLE001
             log.warning("failed to unlink stale media key %s", k, exc_info=True)
 

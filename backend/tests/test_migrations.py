@@ -1,4 +1,7 @@
+import hashlib
 import importlib.util
+import json
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -11,6 +14,7 @@ from alembic.config import Config
 from alembic.script import ScriptDirectory
 from app.config import settings
 from app.db import Base
+from app.workflow_schemas import WorkflowSpec
 
 
 def test_alembic_revision_graph_is_linear_and_reaches_head():
@@ -19,7 +23,18 @@ def test_alembic_revision_graph_is_linear_and_reaches_head():
     assert len(heads) == 1
     revisions = list(script.walk_revisions(base="base", head=heads[0]))
     assert revisions
+    assert all(len(rev.revision) <= 32 for rev in revisions)
     assert all(len(rev._versioned_down_revisions) <= 1 for rev in revisions)
+
+
+def test_postgresql_constraint_names_fit_identifier_limit():
+    names = {
+        constraint.name
+        for table in Base.metadata.tables.values()
+        for constraint in table.constraints
+        if constraint.name
+    }
+    assert all(len(name) <= 63 for name in names)
 
 
 def test_migrated_schema_matches_model_nullability(tmp_path, monkeypatch):
@@ -135,6 +150,1324 @@ def test_migrated_schema_has_core_integrity_constraints(tmp_path, monkeypatch):
         "business_fingerprint",
         "fingerprint_expires_at",
     ]
+
+
+def test_0060_0061_execution_quotes_round_trip(tmp_path, monkeypatch):
+    db_path = tmp_path / "execution-quotes-round-trip.db"
+    database_url = f"sqlite:///{db_path}"
+    monkeypatch.setattr(settings, "database_url", database_url)
+    backend = Path(__file__).resolve().parents[1]
+    cfg = Config(str(backend / "alembic.ini"))
+    cfg.set_main_option("script_location", str(backend / "alembic"))
+
+    command.upgrade(cfg, "0059_recipe_usage_context_jsonb")
+    command.upgrade(cfg, "0061_paid_action_quotes")
+    engine = sa.create_engine(database_url)
+    upgraded = sa.inspect(engine)
+    quote_columns = {row["name"] for row in upgraded.get_columns("generation_quotes")}
+    proposal_columns = {
+        row["name"] for row in upgraded.get_columns("prompt_optimization_proposals")
+    }
+    assert {
+        "kind",
+        "client_request_id",
+        "subject_snapshot",
+        "warnings",
+        "consumed_ref_type",
+        "consumed_ref_id",
+    } <= quote_columns
+    assert "quote_id" in proposal_columns
+    kind_check = next(
+        row for row in upgraded.get_check_constraints("generation_quotes")
+        if row["name"] == "ck_generation_quotes_kind_valid"
+    )
+    assert "prompt_optimization" in kind_check["sqltext"]
+    assert "asset_unlock" in kind_check["sqltext"]
+
+    command.downgrade(cfg, "0059_recipe_usage_context_jsonb")
+    downgraded = sa.inspect(engine)
+    assert "kind" not in {
+        row["name"] for row in downgraded.get_columns("generation_quotes")
+    }
+    assert "quote_id" not in {
+        row["name"] for row in downgraded.get_columns("prompt_optimization_proposals")
+    }
+
+    command.upgrade(cfg, "0061_paid_action_quotes")
+    reupgraded = sa.inspect(engine)
+    assert "kind" in {
+        row["name"] for row in reupgraded.get_columns("generation_quotes")
+    }
+    assert "quote_id" in {
+        row["name"] for row in reupgraded.get_columns("prompt_optimization_proposals")
+    }
+
+
+def test_0062_gen_assets_task_nullable_round_trip_and_safe_downgrade(
+    tmp_path, monkeypatch
+):
+    db_path = tmp_path / "gen-assets-task-nullable.db"
+    database_url = f"sqlite:///{db_path}"
+    monkeypatch.setattr(settings, "database_url", database_url)
+    backend = Path(__file__).resolve().parents[1]
+    cfg = Config(str(backend / "alembic.ini"))
+    cfg.set_main_option("script_location", str(backend / "alembic"))
+
+    command.upgrade(cfg, "0061_paid_action_quotes")
+    engine = sa.create_engine(database_url)
+    assert {
+        column["name"]: column for column in sa.inspect(engine).get_columns("gen_assets")
+    }["task_id"]["nullable"] is False
+
+    command.upgrade(cfg, "0062_gen_assets_task_nullable")
+    assert {
+        column["name"]: column for column in sa.inspect(engine).get_columns("gen_assets")
+    }["task_id"]["nullable"] is True
+    with engine.begin() as connection:
+        connection.execute(
+            sa.text(
+                "INSERT INTO users "
+                "(id, phone, status, is_admin, balance_credits, frozen_credits) "
+                "VALUES (6201, '13976200001', 'active', 0, 0, 0)"
+            )
+        )
+        connection.execute(
+            sa.text(
+                "INSERT INTO gen_assets "
+                "(id, user_id, type, watermarked, unlocked, moderation_status) "
+                "VALUES (6202, 6201, 'image', 0, 0, 'active')"
+            )
+        )
+
+    with pytest.raises(RuntimeError, match=r"asset_ids=6202"):
+        command.downgrade(cfg, "0061_paid_action_quotes")
+    with engine.connect() as connection:
+        assert connection.scalar(sa.text("SELECT version_num FROM alembic_version")) == (
+            "0062_gen_assets_task_nullable"
+        )
+
+    with engine.begin() as connection:
+        connection.execute(sa.text("DELETE FROM gen_assets WHERE id = 6202"))
+    command.downgrade(cfg, "0061_paid_action_quotes")
+    assert {
+        column["name"]: column for column in sa.inspect(engine).get_columns("gen_assets")
+    }["task_id"]["nullable"] is False
+
+    command.upgrade(cfg, "0062_gen_assets_task_nullable")
+    assert {
+        column["name"]: column for column in sa.inspect(engine).get_columns("gen_assets")
+    }["task_id"]["nullable"] is True
+    engine.dispose()
+
+
+def test_0063_model_version_lifecycle_round_trip_and_backfill(tmp_path, monkeypatch):
+    db_path = tmp_path / "model-version-lifecycle.db"
+    database_url = f"sqlite:///{db_path}"
+    monkeypatch.setattr(settings, "database_url", database_url)
+    backend = Path(__file__).resolve().parents[1]
+    cfg = Config(str(backend / "alembic.ini"))
+    cfg.set_main_option("script_location", str(backend / "alembic"))
+
+    command.upgrade(cfg, "0062_gen_assets_task_nullable")
+    engine = sa.create_engine(database_url)
+    with engine.begin() as connection:
+        connection.execute(
+            sa.text(
+                "INSERT INTO model_configs "
+                "(id, use, model_id, display_name, is_default, sort_order, "
+                "cost_credits, unlock_cost, enabled, extra) "
+                "VALUES (6301, 'image', 'lifecycle-migration-test', "
+                "'Lifecycle Migration Test', 0, 6301, 7, 2, 1, '{}')"
+            )
+        )
+        connection.execute(
+            sa.text(
+                "INSERT INTO model_capability_versions "
+                "(id, model_config_id, version, schema_version, capabilities, "
+                "is_active, activated_at, retired_at) VALUES "
+                "(6311, 6301, 1, 'capability.v1', '{}', 1, CURRENT_TIMESTAMP, NULL), "
+                "(6312, 6301, 2, 'capability.v1', '{}', 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+            )
+        )
+        connection.execute(
+            sa.text(
+                "INSERT INTO model_price_versions "
+                "(id, model_config_id, version, schema_version, base_cost_credits, "
+                "unlock_cost_credits, pricing, is_active, activated_at, retired_at) VALUES "
+                "(6321, 6301, 1, 'credit-price.v1', 7, 2, '{}', 1, CURRENT_TIMESTAMP, NULL), "
+                "(6322, 6301, 2, 'credit-price.v1', 8, 3, '{}', 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
+            )
+        )
+
+    command.upgrade(cfg, "0063_model_version_lifecycle")
+    upgraded = sa.inspect(engine)
+    for table in ("model_capability_versions", "model_price_versions"):
+        columns = {column["name"]: column for column in upgraded.get_columns(table)}
+        assert {"status", "source_version_id", "disabled_at", "updated_at"} <= set(
+            columns
+        )
+        assert columns["activated_at"]["nullable"] is True
+        checks = {item["name"] for item in upgraded.get_check_constraints(table)}
+        assert f"ck_{table}_status_valid" in checks
+        assert f"ck_{table}_active_status" in checks
+        indexes = {item["name"] for item in upgraded.get_indexes(table)}
+        assert f"ix_{table}_source_version_id" in indexes
+        source_fks = [
+            item
+            for item in upgraded.get_foreign_keys(table)
+            if item["constrained_columns"] == ["source_version_id"]
+        ]
+        assert len(source_fks) == 1
+        assert source_fks[0]["referred_table"] == table
+        assert source_fks[0]["referred_columns"] == ["id"]
+
+    with engine.begin() as connection:
+        capability_rows = connection.execute(
+            sa.text(
+                "SELECT id, status, disabled_at, retired_at "
+                "FROM model_capability_versions WHERE model_config_id = 6301 ORDER BY version"
+            )
+        ).mappings().all()
+        assert capability_rows[0]["status"] == "published"
+        assert capability_rows[1]["status"] == "disabled"
+        assert capability_rows[1]["disabled_at"] is not None
+        assert capability_rows[1]["retired_at"] is None
+        connection.execute(
+            sa.text(
+                "INSERT INTO model_capability_versions "
+                "(id, model_config_id, version, schema_version, capabilities, status, "
+                "is_active, activated_at) VALUES "
+                "(6313, 6301, 3, 'capability.v2', '{}', 'draft', 0, NULL)"
+            )
+        )
+
+    command.downgrade(cfg, "0062_gen_assets_task_nullable")
+    downgraded = sa.inspect(engine)
+    capability_columns = {
+        column["name"]: column
+        for column in downgraded.get_columns("model_capability_versions")
+    }
+    assert "status" not in capability_columns
+    assert capability_columns["activated_at"]["nullable"] is False
+    with engine.connect() as connection:
+        draft_after_downgrade = connection.execute(
+            sa.text(
+                "SELECT activated_at, retired_at FROM model_capability_versions WHERE id = 6313"
+            )
+        ).mappings().one()
+        assert draft_after_downgrade["activated_at"] is not None
+        assert draft_after_downgrade["retired_at"] is not None
+
+    command.upgrade(cfg, "0063_model_version_lifecycle")
+    assert "status" in {
+        column["name"]
+        for column in sa.inspect(engine).get_columns("model_capability_versions")
+    }
+    engine.dispose()
+
+
+def test_0064_immutable_runtime_versions_backfills_compiled_workflow_snapshot(
+    tmp_path,
+    monkeypatch,
+):
+    db_path = tmp_path / "immutable-runtime-versions.db"
+    database_url = f"sqlite:///{db_path}"
+    monkeypatch.setattr(settings, "database_url", database_url)
+    backend = Path(__file__).resolve().parents[1]
+    cfg = Config(str(backend / "alembic.ini"))
+    cfg.set_main_option("script_location", str(backend / "alembic"))
+
+    command.upgrade(cfg, "0063_model_version_lifecycle")
+    engine = sa.create_engine(database_url)
+    metadata = sa.MetaData()
+    metadata.reflect(bind=engine)
+    tables = metadata.tables
+    workflow = {
+        "type": "workflow.v1",
+        "output_node": "export",
+        "studio_preset": {"creation_mode": "video_edit"},
+        "nodes": [
+            {
+                "key": "parse",
+                "type": "parse",
+                "depends_on": [],
+                "config": {"safety_policy": {"owner_required": True}},
+                "max_attempts": 2,
+                "side_effect": False,
+            },
+            {
+                "key": "export",
+                "type": "export",
+                "depends_on": ["parse"],
+                "config": {"format": "zip"},
+                "max_attempts": 1,
+                "side_effect": True,
+                "compensation": {"type": "delete_export", "config": {}},
+            },
+        ],
+    }
+    now = datetime.now(timezone.utc)
+    with engine.begin() as connection:
+        connection.execute(
+            tables["users"].insert().values(
+                id=6401,
+                phone="13976400001",
+                status="active",
+                is_admin=False,
+                balance_credits=100,
+                frozen_credits=7,
+            )
+        )
+        connection.execute(
+            tables["tool_definitions"].insert().values(
+                id=6402,
+                slug="legacy-export",
+                name="Legacy export",
+                description="legacy migration fixture",
+                category="workflow",
+                renderer="studio",
+                entry_path="/?tool=legacy-export",
+                sort_order=4,
+                enabled=True,
+                featured=True,
+            )
+        )
+        connection.execute(
+            tables["tool_versions"].insert().values(
+                id=6403,
+                tool_definition_id=6402,
+                version=1,
+                schema_version="tool.v1",
+                input_schema={"type": "object"},
+                workflow=workflow,
+                pricing_policy={"fixed_credits": 7},
+                capabilities={"safety_policy": {"content": "strict"}},
+                is_active=True,
+            )
+        )
+        connection.execute(
+            tables["generation_quotes"].insert().values(
+                id=6404,
+                user_id=6401,
+                kind="workflow",
+                client_request_id="legacy-workflow-quote",
+                tool_version_id=6403,
+                request_fingerprint="a" * 64,
+                category="workflow",
+                stage="preview",
+                request_snapshot={"project_id": 6407, "input": {"topic": "legacy"}},
+                model_snapshot={
+                    "model_config_id": 6410,
+                    "route_snapshot": {"route_id": 6408, "route_version_id": 6409},
+                },
+                pricing_snapshot={"fixed_credits": 7},
+                price_breakdown={"items": [{"key": "workflow", "credits": 7}]},
+                subject_snapshot={"tool_slug": "legacy-export"},
+                warnings=["legacy warning"],
+                estimated_credits=7,
+                status="active",
+                expires_at=now + timedelta(hours=1),
+            )
+        )
+        connection.execute(
+            tables["tool_runs"].insert().values(
+                id=6405,
+                user_id=6401,
+                tool_definition_id=6402,
+                tool_version_id=6403,
+                quote_id=6404,
+                client_request_id="legacy-workflow-run",
+                request_fingerprint="b" * 64,
+                status="queued",
+                input_snapshot={"topic": "legacy"},
+                pricing_snapshot={"fixed_credits": 7},
+                cost_frozen=7,
+                cost_settled=0,
+            )
+        )
+        connection.execute(
+            tables["workflow_runs"].insert().values(
+                id=6406,
+                tool_run_id=6405,
+                user_id=6401,
+                workflow_schema_version="workflow.v1",
+                workflow_snapshot=workflow,
+                status="queued",
+                revision=0,
+            )
+        )
+        connection.execute(
+            tables["media_projects"].insert().values(
+                id=6407,
+                user_id=6401,
+                title="Legacy workflow project",
+                project_type="video",
+                status="active",
+            )
+        )
+        connection.execute(
+            tables["media_project_tasks"].insert().values(
+                project_id=6407,
+                task_kind="workflow",
+                task_id=6406,
+            )
+        )
+
+    def assert_upgraded() -> None:
+        inspector = sa.inspect(engine)
+        columns = {row["name"]: row for row in inspector.get_columns("workflow_runs")}
+        assert {"compiled_snapshot", "compiled_snapshot_hash", "compiled_at"} <= set(
+            columns
+        )
+        assert columns["compiled_snapshot"]["nullable"] is False
+        assert columns["compiled_snapshot_hash"]["nullable"] is False
+        assert columns["compiled_snapshot_hash"]["default"] is None
+        assert columns["compiled_at"]["nullable"] is False
+        checks = {
+            row["name"] for row in inspector.get_check_constraints("workflow_runs")
+        }
+        assert "ck_workflow_runs_compiled_snapshot_hash_length" in checks
+        for table in ("model_route_versions", "tool_versions"):
+            source_fks = [
+                item
+                for item in inspector.get_foreign_keys(table)
+                if item["constrained_columns"] == ["source_version_id"]
+            ]
+            assert len(source_fks) == 1
+            assert source_fks[0]["referred_table"] == table
+            assert source_fks[0]["referred_columns"] == ["id"]
+        with engine.connect() as connection:
+            row = connection.execute(
+                sa.text(
+                    "SELECT compiled_snapshot, compiled_snapshot_hash, compiled_at "
+                    "FROM workflow_runs WHERE id = 6406"
+                )
+            ).mappings().one()
+            snapshot = json.loads(row["compiled_snapshot"])
+            current = connection.scalar(sa.text("SELECT version_num FROM alembic_version"))
+        assert current == "0064_immutable_runtime_versions"
+        assert row["compiled_at"] is not None
+        assert snapshot["schema_version"] == "workflow-compiled.v1"
+        assert snapshot["legacy_backfill"] is True
+        assert "node_graph" not in snapshot
+        assert snapshot["tool"]["definition"]["id"] == 6402
+        assert snapshot["tool"]["version"]["id"] == 6403
+        assert snapshot["input"] == {
+            "project_id": 6407,
+            "client_request_id": "legacy-workflow-run",
+            "request_fingerprint": "b" * 64,
+            "payload": {"topic": "legacy"},
+        }
+        assert snapshot["dag"]["declared_order"] == ["parse", "export"]
+        assert snapshot["dag"]["topological_order"] == ["parse", "export"]
+        assert snapshot["quote_binding"]["id"] == 6404
+        assert snapshot["pricing_binding"]["estimated_credits"] == 7
+        assert snapshot["runtime_references"]["route_ids"] == [6408]
+        assert snapshot["runtime_references"]["route_version_ids"] == [6409]
+        assert snapshot["retry_policy"]["nodes"] == [
+            {"key": "parse", "max_attempts": 2},
+            {"key": "export", "max_attempts": 1},
+        ]
+        assert snapshot["failure_policy"]["refund_unsettled_reservation"] is True
+        assert snapshot["compensation_policy"]["nodes"] == [
+            {
+                "key": "export",
+                "side_effect": True,
+                "compensation": {"type": "delete_export", "config": {}},
+            }
+        ]
+        canonical = json.dumps(
+            snapshot,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        assert row["compiled_snapshot_hash"] == hashlib.sha256(
+            canonical.encode("utf-8")
+        ).hexdigest()
+        assert len(row["compiled_snapshot_hash"]) == 64
+
+    command.upgrade(cfg, "0064_immutable_runtime_versions")
+    assert_upgraded()
+    with pytest.raises(sa.exc.IntegrityError), engine.begin() as connection:
+        connection.execute(
+            sa.text(
+                "UPDATE workflow_runs SET compiled_snapshot_hash = :digest WHERE id = 6406"
+            ),
+            {"digest": "x" * 63},
+        )
+
+    command.downgrade(cfg, "0063_model_version_lifecycle")
+    downgraded = sa.inspect(engine)
+    assert {
+        "compiled_snapshot",
+        "compiled_snapshot_hash",
+        "compiled_at",
+    }.isdisjoint({row["name"] for row in downgraded.get_columns("workflow_runs")})
+    assert "ck_workflow_runs_compiled_snapshot_hash_length" not in {
+        row["name"] for row in downgraded.get_check_constraints("workflow_runs")
+    }
+    assert "model_route_versions" not in downgraded.get_table_names()
+
+    command.upgrade(cfg, "0064_immutable_runtime_versions")
+    assert_upgraded()
+    engine.dispose()
+
+
+def test_0064_json_type_compiles_to_postgresql_jsonb():
+    migration = _load_migration_module("0064_immutable_runtime_versions")
+    assert str(migration.JSON_TYPE.compile(dialect=postgresql.dialect())) == "JSONB"
+
+
+def test_0067_recipe_revision_governance_backfills_and_round_trips(
+    tmp_path,
+    monkeypatch,
+):
+    db_path = tmp_path / "recipe-revision-governance.db"
+    database_url = f"sqlite:///{db_path}"
+    monkeypatch.setattr(settings, "database_url", database_url)
+    backend = Path(__file__).resolve().parents[1]
+    cfg = Config(str(backend / "alembic.ini"))
+    cfg.set_main_option("script_location", str(backend / "alembic"))
+
+    command.upgrade(cfg, "0066_version_source_fks")
+    engine = sa.create_engine(database_url)
+    metadata = sa.MetaData()
+    metadata.reflect(bind=engine)
+    with engine.begin() as connection:
+        connection.execute(
+            metadata.tables["users"].insert().values(
+                id=6701,
+                phone="13976700001",
+                status="active",
+                is_admin=False,
+                balance_credits=0,
+                frozen_credits=0,
+            )
+        )
+        connection.execute(
+            metadata.tables["creation_recipes"].insert().values(
+                id=6702,
+                user_id=6701,
+                title="Legacy current title",
+                category="image",
+                visibility="public",
+                favorite=False,
+                current_version=2,
+                cover_asset_url="/media/legacy-cover.png",
+                moderation_status="approved",
+                approved_version=2,
+            )
+        )
+        connection.execute(
+            metadata.tables["creation_recipe_versions"].insert(),
+            [
+                {
+                    "id": 6703,
+                    "recipe_id": 6702,
+                    "version": 1,
+                    "payload": {"prompt": "legacy version one"},
+                },
+                {
+                    "id": 6704,
+                    "recipe_id": 6702,
+                    "version": 2,
+                    "payload": {"prompt": "legacy version two"},
+                },
+            ],
+        )
+
+    def assert_upgraded() -> None:
+        inspector = sa.inspect(engine)
+        recipe_columns = {
+            column["name"]: column
+            for column in inspector.get_columns("creation_recipes")
+        }
+        version_columns = {
+            column["name"]: column
+            for column in inspector.get_columns("creation_recipe_versions")
+        }
+        assert recipe_columns["deleted_at"]["nullable"] is True
+        assert version_columns["metadata_snapshot"]["nullable"] is False
+        deleted_index = next(
+            index
+            for index in inspector.get_indexes("creation_recipes")
+            if index["name"] == "ix_creation_recipes_deleted_at"
+        )
+        assert deleted_index["column_names"] == ["deleted_at"]
+        assert deleted_index["unique"] == 0
+        with engine.connect() as connection:
+            rows = connection.execute(
+                sa.text(
+                    "SELECT version, payload, metadata_snapshot "
+                    "FROM creation_recipe_versions "
+                    "WHERE recipe_id = 6702 ORDER BY version"
+                )
+            ).mappings().all()
+            current = connection.scalar(
+                sa.text("SELECT version_num FROM alembic_version")
+            )
+        assert current == "0067_recipe_revision_governance"
+        assert [row["version"] for row in rows] == [1, 2]
+        assert [json.loads(row["payload"])["prompt"] for row in rows] == [
+            "legacy version one",
+            "legacy version two",
+        ]
+        snapshots = [json.loads(row["metadata_snapshot"]) for row in rows]
+        assert snapshots == [
+            {
+                "schema_version": "creation-recipe-metadata.v1",
+                "origin": "legacy_backfill",
+                "title": "Legacy current title",
+                "visibility": "public",
+                "cover_asset_url": "/media/legacy-cover.png",
+            },
+        ] * 2
+
+    def assert_downgraded() -> None:
+        inspector = sa.inspect(engine)
+        assert "deleted_at" not in {
+            column["name"] for column in inspector.get_columns("creation_recipes")
+        }
+        assert "metadata_snapshot" not in {
+            column["name"]
+            for column in inspector.get_columns("creation_recipe_versions")
+        }
+        assert "ix_creation_recipes_deleted_at" not in {
+            index["name"] for index in inspector.get_indexes("creation_recipes")
+        }
+        with engine.connect() as connection:
+            current = connection.scalar(
+                sa.text("SELECT version_num FROM alembic_version")
+            )
+            version_count = connection.scalar(
+                sa.text(
+                    "SELECT count(*) FROM creation_recipe_versions WHERE recipe_id = 6702"
+                )
+            )
+        assert current == "0066_version_source_fks"
+        assert version_count == 2
+
+    command.upgrade(cfg, "0067_recipe_revision_governance")
+    assert_upgraded()
+    command.downgrade(cfg, "0066_version_source_fks")
+    assert_downgraded()
+    command.upgrade(cfg, "0067_recipe_revision_governance")
+    assert_upgraded()
+    engine.dispose()
+
+
+def test_0067_recipe_revision_governance_blocks_soft_delete_downgrade(
+    tmp_path,
+    monkeypatch,
+):
+    db_path = tmp_path / "recipe-revision-governance-downgrade-guard.db"
+    database_url = f"sqlite:///{db_path}"
+    monkeypatch.setattr(settings, "database_url", database_url)
+    backend = Path(__file__).resolve().parents[1]
+    cfg = Config(str(backend / "alembic.ini"))
+    cfg.set_main_option("script_location", str(backend / "alembic"))
+
+    command.upgrade(cfg, "0067_recipe_revision_governance")
+    engine = sa.create_engine(database_url)
+    metadata = sa.MetaData()
+    metadata.reflect(bind=engine)
+    with engine.begin() as connection:
+        connection.execute(
+            metadata.tables["users"].insert().values(
+                id=6711,
+                phone="13976700002",
+                status="active",
+                is_admin=False,
+                balance_credits=0,
+                frozen_credits=0,
+            )
+        )
+        connection.execute(
+            metadata.tables["creation_recipes"].insert().values(
+                id=6712,
+                user_id=6711,
+                title="Retained soft-deleted recipe",
+                category="image",
+                visibility="private",
+                favorite=False,
+                current_version=1,
+                deleted_at=datetime.now(timezone.utc),
+            )
+        )
+        connection.execute(
+            metadata.tables["creation_recipe_versions"].insert().values(
+                id=6713,
+                recipe_id=6712,
+                version=1,
+                payload={"prompt": "retained after rejected downgrade"},
+                metadata_snapshot={"marker": "retained"},
+            )
+        )
+
+    with pytest.raises(
+        RuntimeError,
+        match="cannot downgrade recipe governance while soft-deleted recipes exist",
+    ):
+        command.downgrade(cfg, "0066_version_source_fks")
+
+    inspector = sa.inspect(engine)
+    assert "deleted_at" in {
+        column["name"] for column in inspector.get_columns("creation_recipes")
+    }
+    assert "metadata_snapshot" in {
+        column["name"]
+        for column in inspector.get_columns("creation_recipe_versions")
+    }
+    assert "ix_creation_recipes_deleted_at" in {
+        index["name"] for index in inspector.get_indexes("creation_recipes")
+    }
+    with engine.connect() as connection:
+        assert connection.scalar(
+            sa.text("SELECT version_num FROM alembic_version")
+        ) == "0067_recipe_revision_governance"
+        assert connection.scalar(
+            sa.text(
+                "SELECT count(*) FROM creation_recipes "
+                "WHERE id = 6712 AND deleted_at IS NOT NULL"
+            )
+        ) == 1
+        retained_version = connection.execute(
+            sa.text(
+                "SELECT payload, metadata_snapshot FROM creation_recipe_versions "
+                "WHERE id = 6713"
+            )
+        ).mappings().one()
+    assert json.loads(retained_version["payload"]) == {
+        "prompt": "retained after rejected downgrade"
+    }
+    assert json.loads(retained_version["metadata_snapshot"]) == {
+        "marker": "retained"
+    }
+    engine.dispose()
+
+
+def test_0068_catalog_metadata_snapshots_backfill_and_round_trip(
+    tmp_path,
+    monkeypatch,
+):
+    db_path = tmp_path / "catalog-metadata-snapshots.db"
+    database_url = f"sqlite:///{db_path}"
+    monkeypatch.setattr(settings, "database_url", database_url)
+    backend = Path(__file__).resolve().parents[1]
+    cfg = Config(str(backend / "alembic.ini"))
+    cfg.set_main_option("script_location", str(backend / "alembic"))
+
+    command.upgrade(cfg, "0067_recipe_revision_governance")
+    engine = sa.create_engine(database_url)
+    metadata = sa.MetaData()
+    metadata.reflect(bind=engine)
+    with engine.begin() as connection:
+        connection.execute(
+            metadata.tables["model_configs"].insert().values(
+                id=6801,
+                use="image",
+                model_id="legacy-catalog-image",
+                display_name="Legacy Catalog Image",
+                is_default=False,
+                sort_order=17,
+                cost_credits=9,
+                unlock_cost=2,
+                enabled=True,
+                extra={"legacy": True},
+            )
+        )
+        connection.execute(
+            metadata.tables["model_capability_versions"].insert(),
+            [
+                {
+                    "id": 6811,
+                    "model_config_id": 6801,
+                    "version": 1,
+                    "schema_version": "capability.v1",
+                    "capabilities": {"text_to_image": True},
+                    "status": "published",
+                    "is_active": True,
+                    "activated_at": datetime.now(timezone.utc),
+                },
+                {
+                    "id": 6812,
+                    "model_config_id": 6801,
+                    "version": 2,
+                    "schema_version": "capability.v1",
+                    "capabilities": {"image_to_image": True},
+                    "status": "draft",
+                    "is_active": False,
+                    "activated_at": None,
+                },
+            ],
+        )
+        connection.execute(
+            metadata.tables["tool_definitions"].insert().values(
+                id=6821,
+                slug="legacy-catalog-tool",
+                name="Legacy Catalog Tool",
+                description="Legacy tool metadata snapshot fixture",
+                category="image",
+                renderer="studio",
+                entry_path="/?tool=legacy-catalog-tool",
+                icon="wand-sparkles",
+                sort_order=23,
+                enabled=True,
+                featured=False,
+            )
+        )
+        connection.execute(
+            metadata.tables["tool_versions"].insert(),
+            [
+                {
+                    "id": 6822,
+                    "tool_definition_id": 6821,
+                    "version": 1,
+                    "schema_version": "tool.v1",
+                    "input_schema": {"type": "object"},
+                    "workflow": {"type": "workflow.v1", "nodes": []},
+                    "pricing_policy": {"fixed_credits": 3},
+                    "capabilities": {"image": True},
+                    "status": "published",
+                    "is_active": True,
+                    "activated_at": datetime.now(timezone.utc),
+                },
+                {
+                    "id": 6823,
+                    "tool_definition_id": 6821,
+                    "version": 2,
+                    "schema_version": "tool.v1",
+                    "input_schema": {"type": "object", "required": ["prompt"]},
+                    "workflow": {"type": "workflow.v1", "nodes": []},
+                    "pricing_policy": {"fixed_credits": 4},
+                    "capabilities": {"image": True, "draft": True},
+                    "status": "draft",
+                    "is_active": False,
+                    "activated_at": None,
+                },
+            ],
+        )
+
+    expected_model_snapshot = {
+        "schema_version": "model-catalog-metadata.v1",
+        "origin": "legacy_backfill",
+        "model_id": "legacy-catalog-image",
+        "display_name": "Legacy Catalog Image",
+        "is_default": False,
+        "sort_order": 17,
+        "enabled": True,
+    }
+    expected_tool_snapshot = {
+        "schema_version": "tool-catalog-metadata.v1",
+        "origin": "legacy_backfill",
+        "slug": "legacy-catalog-tool",
+        "name": "Legacy Catalog Tool",
+        "description": "Legacy tool metadata snapshot fixture",
+        "category": "image",
+        "renderer": "studio",
+        "entry_path": "/?tool=legacy-catalog-tool",
+        "icon": "wand-sparkles",
+        "sort_order": 23,
+        "enabled": True,
+        "featured": False,
+    }
+
+    def assert_upgraded() -> None:
+        inspector = sa.inspect(engine)
+        for table_name in ("model_capability_versions", "tool_versions"):
+            columns = {
+                column["name"]: column
+                for column in inspector.get_columns(table_name)
+            }
+            assert columns["metadata_snapshot"]["nullable"] is False
+        with engine.connect() as connection:
+            model_rows = connection.execute(
+                sa.text(
+                    "SELECT version, capabilities, metadata_snapshot "
+                    "FROM model_capability_versions "
+                    "WHERE model_config_id = 6801 ORDER BY version"
+                )
+            ).mappings().all()
+            tool_rows = connection.execute(
+                sa.text(
+                    "SELECT version, capabilities, metadata_snapshot FROM tool_versions "
+                    "WHERE tool_definition_id = 6821 ORDER BY version"
+                )
+            ).mappings().all()
+            current = connection.scalar(
+                sa.text("SELECT version_num FROM alembic_version")
+            )
+        assert current == "0068_catalog_metadata_snapshots"
+        assert [row["version"] for row in model_rows] == [1, 2]
+        assert [json.loads(row["metadata_snapshot"]) for row in model_rows] == [
+            expected_model_snapshot,
+        ] * 2
+        assert [json.loads(row["capabilities"]) for row in model_rows] == [
+            {"text_to_image": True},
+            {"image_to_image": True},
+        ]
+        assert [row["version"] for row in tool_rows] == [1, 2]
+        assert [json.loads(row["metadata_snapshot"]) for row in tool_rows] == [
+            expected_tool_snapshot,
+        ] * 2
+        assert [json.loads(row["capabilities"]) for row in tool_rows] == [
+            {"image": True},
+            {"image": True, "draft": True},
+        ]
+
+    def assert_downgraded() -> None:
+        inspector = sa.inspect(engine)
+        for table_name in ("model_capability_versions", "tool_versions"):
+            assert "metadata_snapshot" not in {
+                column["name"] for column in inspector.get_columns(table_name)
+            }
+        with engine.connect() as connection:
+            current = connection.scalar(
+                sa.text("SELECT version_num FROM alembic_version")
+            )
+            model_version_count = connection.scalar(
+                sa.text(
+                    "SELECT count(*) FROM model_capability_versions "
+                    "WHERE model_config_id = 6801"
+                )
+            )
+            tool_version_count = connection.scalar(
+                sa.text(
+                    "SELECT count(*) FROM tool_versions WHERE tool_definition_id = 6821"
+                )
+            )
+        assert current == "0067_recipe_revision_governance"
+        assert model_version_count == 2
+        assert tool_version_count == 2
+
+    command.upgrade(cfg, "0068_catalog_metadata_snapshots")
+    assert_upgraded()
+    command.downgrade(cfg, "0067_recipe_revision_governance")
+    assert_downgraded()
+    command.upgrade(cfg, "0068_catalog_metadata_snapshots")
+    assert_upgraded()
+    engine.dispose()
+
+
+@pytest.mark.parametrize(
+    "revision",
+    ["0067_recipe_revision_governance", "0068_catalog_metadata_snapshots"],
+)
+def test_catalog_metadata_snapshot_json_types_compile_to_postgresql_jsonb(revision):
+    migration = _load_migration_module(revision)
+    assert str(migration.JSON_TYPE.compile(dialect=postgresql.dialect())) == "JSONB"
+
+
+def test_0069_reproduction_remediations_round_trip_preserves_existing_data(
+    tmp_path,
+    monkeypatch,
+):
+    db_path = tmp_path / "reproduction-remediations.db"
+    database_url = f"sqlite:///{db_path}"
+    monkeypatch.setattr(settings, "database_url", database_url)
+    backend = Path(__file__).resolve().parents[1]
+    cfg = Config(str(backend / "alembic.ini"))
+    cfg.set_main_option("script_location", str(backend / "alembic"))
+
+    command.upgrade(cfg, "0068_catalog_metadata_snapshots")
+    engine = sa.create_engine(database_url)
+    metadata = sa.MetaData()
+    metadata.reflect(bind=engine)
+    with engine.begin() as connection:
+        connection.execute(
+            metadata.tables["model_configs"].insert().values(
+                id=6901,
+                use="image",
+                model_id="pre-remediation-model",
+                display_name="Pre-remediation model",
+                is_default=False,
+                sort_order=69,
+                cost_credits=1,
+                unlock_cost=0,
+                enabled=True,
+                extra={"migration_marker": "retained"},
+            )
+        )
+
+    expected_columns = {
+        "id",
+        "assessment_id",
+        "correction_id",
+        "user_id",
+        "parent_remediation_id",
+        "idempotency_key",
+        "request_fingerprint",
+        "mode",
+        "status",
+        "selected_finding_ids",
+        "selected_shot_ids",
+        "source_asset_ref",
+        "target_asset_ref",
+        "applied_revision_id",
+        "plan_snapshot",
+        "plan_hash",
+        "video_composition",
+        "generation_task_ids",
+        "composition_tool_run_id",
+        "composition_workflow_run_id",
+        "final_asset_id",
+        "successor_assessment_id",
+        "auto_reassess",
+        "error_code",
+        "error",
+        "started_at",
+        "finished_at",
+        "created_at",
+        "updated_at",
+    }
+    expected_indexes = {
+        "uq_reproduction_remediations_assessment_idempotency",
+        "uq_reproduction_remediations_correction",
+        "uq_reproduction_remediations_applied_revision",
+        "uq_reproduction_remediations_composition_tool_run",
+        "uq_reproduction_remediations_composition_workflow",
+        "uq_reproduction_remediations_final_asset",
+        "uq_reproduction_remediations_successor_assessment",
+        "ix_reproduction_remediations_assessment_created",
+        "ix_reproduction_remediations_user_status_created",
+        "ix_reproduction_remediations_parent",
+    }
+    expected_checks = {
+        "ck_reproduction_remediations_mode_valid",
+        "ck_reproduction_remediations_status_valid",
+        "ck_reproduction_remediations_fingerprint_length",
+        "ck_reproduction_remediations_plan_hash_length",
+        "ck_reproduction_remediations_parent_not_self",
+        "ck_reproduction_remediations_composition_pair",
+    }
+    expected_foreign_keys = {
+        ("assessment_id", "reproduction_assessments", "id"),
+        ("correction_id", "reproduction_corrections", "id"),
+        ("user_id", "users", "id"),
+        ("parent_remediation_id", "reproduction_remediations", "id"),
+        ("applied_revision_id", "reverse_result_revisions", "id"),
+        ("composition_tool_run_id", "tool_runs", "id"),
+        ("composition_workflow_run_id", "workflow_runs", "id"),
+        ("final_asset_id", "gen_assets", "id"),
+        ("successor_assessment_id", "reproduction_assessments", "id"),
+    }
+
+    def assert_marker_retained() -> None:
+        with engine.connect() as connection:
+            marker = connection.scalar(
+                sa.text("SELECT extra FROM model_configs WHERE id = 6901")
+            )
+        assert json.loads(marker) == {"migration_marker": "retained"}
+
+    def assert_upgraded() -> None:
+        inspector = sa.inspect(engine)
+        assert "reproduction_remediations" in inspector.get_table_names()
+        assert {column["name"] for column in inspector.get_columns(
+            "reproduction_remediations"
+        )} == expected_columns
+        assert {index["name"] for index in inspector.get_indexes(
+            "reproduction_remediations"
+        )} == expected_indexes
+        assert {check["name"] for check in inspector.get_check_constraints(
+            "reproduction_remediations"
+        )} == expected_checks
+        foreign_keys = {
+            (
+                item["constrained_columns"][0],
+                item["referred_table"],
+                item["referred_columns"][0],
+            )
+            for item in inspector.get_foreign_keys("reproduction_remediations")
+        }
+        assert foreign_keys == expected_foreign_keys
+        with engine.connect() as connection:
+            current = connection.scalar(
+                sa.text("SELECT version_num FROM alembic_version")
+            )
+        assert current == "0069_reproduction_remediations"
+        assert_marker_retained()
+
+    command.upgrade(cfg, "0069_reproduction_remediations")
+    assert_upgraded()
+    command.downgrade(cfg, "0068_catalog_metadata_snapshots")
+    assert "reproduction_remediations" not in sa.inspect(engine).get_table_names()
+    assert_marker_retained()
+    command.upgrade(cfg, "0069_reproduction_remediations")
+    assert_upgraded()
+    engine.dispose()
+
+
+def test_0069_reproduction_remediation_json_types_compile_to_postgresql_jsonb():
+    migration = _load_migration_module("0069_reproduction_remediations")
+    assert str(migration.JSON_TYPE.compile(dialect=postgresql.dialect())) == "JSONB"
+
+
+def test_0070_corrects_verified_video_capabilities_and_publishes_new_versions(
+    tmp_path,
+    monkeypatch,
+):
+    db_path = tmp_path / "video-model-capabilities.db"
+    database_url = f"sqlite:///{db_path}"
+    monkeypatch.setattr(settings, "database_url", database_url)
+    backend = Path(__file__).resolve().parents[1]
+    cfg = Config(str(backend / "alembic.ini"))
+    cfg.set_main_option("script_location", str(backend / "alembic"))
+    command.upgrade(cfg, "0069_reproduction_remediations")
+
+    engine = sa.create_engine(database_url)
+    metadata = sa.MetaData()
+    model_configs = sa.Table("model_configs", metadata, autoload_with=engine)
+    capability_versions = sa.Table(
+        "model_capability_versions",
+        metadata,
+        autoload_with=engine,
+    )
+    seedance_metadata = {
+        "schema_version": "model-catalog-metadata.v1",
+        "origin": "test",
+        "model_id": "doubao-seedance-1-5-pro-251215",
+        "display_name": "Seedance 1.5 Pro",
+        "is_default": True,
+        "sort_order": 1,
+        "enabled": True,
+    }
+    grok_metadata = {
+        **seedance_metadata,
+        "model_id": "grok-imagine-video-1.5",
+        "display_name": "Grok Video 1.5",
+        "is_default": False,
+        "sort_order": 2,
+    }
+    generic_metadata = {
+        **grok_metadata,
+        "model_id": "generic-video-model",
+        "display_name": "Generic Video",
+        "sort_order": 3,
+    }
+    now = datetime.now(timezone.utc)
+    with engine.begin() as connection:
+        connection.execute(
+            model_configs.insert(),
+            [
+                {
+                    "id": 7001,
+                    "use": "video",
+                    "model_id": seedance_metadata["model_id"],
+                    "display_name": seedance_metadata["display_name"],
+                    "is_default": True,
+                    "sort_order": 1,
+                    "provider": "volcengine_ark",
+                    "gateway_format": "ark",
+                    "cost_credits": 50,
+                    "unlock_cost": 0,
+                    "enabled": True,
+                    "extra": {
+                        "capabilities": {
+                            "multi_reference": True,
+                            "max_reference_images": 10,
+                            "custom_flag": "keep",
+                        }
+                    },
+                },
+                {
+                    "id": 7002,
+                    "use": "video",
+                    "model_id": grok_metadata["model_id"],
+                    "display_name": grok_metadata["display_name"],
+                    "is_default": False,
+                    "sort_order": 2,
+                    "provider": "grok",
+                    "gateway_format": "openai",
+                    "cost_credits": 40,
+                    "unlock_cost": 0,
+                    "enabled": True,
+                    "extra": {
+                        "capabilities": {
+                            "text_to_video": True,
+                            "image_to_video": False,
+                            "multi_reference": False,
+                        }
+                    },
+                },
+                {
+                    "id": 7003,
+                    "use": "video",
+                    "model_id": generic_metadata["model_id"],
+                    "display_name": generic_metadata["display_name"],
+                    "is_default": False,
+                    "sort_order": 3,
+                    "provider": "custom_openai",
+                    "gateway_format": "openai",
+                    "cost_credits": 30,
+                    "unlock_cost": 0,
+                    "enabled": True,
+                    "extra": {
+                        "capabilities": {
+                            "text_to_video": True,
+                            "image_to_video": False,
+                            "multi_reference": False,
+                        }
+                    },
+                },
+            ],
+        )
+        connection.execute(
+            capability_versions.insert(),
+            [
+                {
+                    "id": 7011,
+                    "model_config_id": 7001,
+                    "version": 1,
+                    "schema_version": "capability.v1",
+                    "capabilities": {
+                        "multi_reference": True,
+                        "max_reference_images": 10,
+                        "custom_flag": "keep",
+                    },
+                    "metadata_snapshot": seedance_metadata,
+                    "status": "published",
+                    "is_active": True,
+                    "activated_at": now,
+                },
+                {
+                    "id": 7012,
+                    "model_config_id": 7002,
+                    "version": 1,
+                    "schema_version": "capability.v1",
+                    "capabilities": {
+                        "text_to_video": True,
+                        "image_to_video": False,
+                        "multi_reference": False,
+                    },
+                    "metadata_snapshot": grok_metadata,
+                    "status": "published",
+                    "is_active": True,
+                    "activated_at": now,
+                },
+                {
+                    "id": 7013,
+                    "model_config_id": 7003,
+                    "version": 1,
+                    "schema_version": "capability.v1",
+                    "capabilities": {
+                        "text_to_video": True,
+                        "image_to_video": False,
+                        "multi_reference": False,
+                    },
+                    "metadata_snapshot": generic_metadata,
+                    "status": "published",
+                    "is_active": True,
+                    "activated_at": now,
+                },
+            ],
+        )
+
+    command.upgrade(cfg, "0070_video_model_capabilities")
+    with engine.connect() as connection:
+        model_rows = {
+            row.model_id: row.extra["capabilities"]
+            for row in connection.execute(
+                sa.select(model_configs.c.model_id, model_configs.c.extra).where(
+                    model_configs.c.id.in_([7001, 7002, 7003])
+                )
+            )
+        }
+        version_rows = connection.execute(
+            sa.select(
+                capability_versions.c.model_config_id,
+                capability_versions.c.version,
+                capability_versions.c.status,
+                capability_versions.c.is_active,
+                capability_versions.c.source_version_id,
+                capability_versions.c.capabilities,
+                capability_versions.c.metadata_snapshot,
+            )
+            .where(capability_versions.c.model_config_id.in_([7001, 7002, 7003]))
+            .order_by(
+                capability_versions.c.model_config_id,
+                capability_versions.c.version,
+            )
+        ).mappings().all()
+        current = connection.scalar(sa.text("SELECT version_num FROM alembic_version"))
+
+    assert current == "0070_video_model_capabilities"
+    assert model_rows[seedance_metadata["model_id"]] == {
+        "text_to_video": True,
+        "image_to_video": True,
+        "first_last_frame": True,
+        "multi_reference": False,
+        "max_reference_images": 2,
+        "custom_flag": "keep",
+    }
+    assert model_rows[grok_metadata["model_id"]] == {
+        "text_to_video": True,
+        "image_to_video": True,
+        "multi_reference": False,
+    }
+    assert model_rows[generic_metadata["model_id"]]["image_to_video"] is False
+
+    seedance_versions = [row for row in version_rows if row["model_config_id"] == 7001]
+    assert [(row["version"], row["status"], row["is_active"]) for row in seedance_versions] == [
+        (1, "disabled", False),
+        (2, "published", True),
+    ]
+    assert seedance_versions[1]["source_version_id"] == 7011
+    assert seedance_versions[1]["capabilities"] == model_rows[seedance_metadata["model_id"]]
+    assert seedance_versions[1]["metadata_snapshot"] == seedance_metadata
+
+    grok_versions = [row for row in version_rows if row["model_config_id"] == 7002]
+    assert [(row["version"], row["status"], row["is_active"]) for row in grok_versions] == [
+        (1, "disabled", False),
+        (2, "published", True),
+    ]
+    assert grok_versions[1]["source_version_id"] == 7012
+    generic_versions = [row for row in version_rows if row["model_config_id"] == 7003]
+    assert len(generic_versions) == 1
+    assert generic_versions[0]["is_active"] is True
+
+    command.downgrade(cfg, "0069_reproduction_remediations")
+    command.upgrade(cfg, "0070_video_model_capabilities")
+    with engine.connect() as connection:
+        counts = dict(
+            connection.execute(
+                sa.select(
+                    capability_versions.c.model_config_id,
+                    sa.func.count(capability_versions.c.id),
+                )
+                .where(capability_versions.c.model_config_id.in_([7001, 7002, 7003]))
+                .group_by(capability_versions.c.model_config_id)
+            ).all()
+        )
+    assert counts == {7001: 2, 7002: 2, 7003: 1}
+    engine.dispose()
+
+
+def test_head_has_immutable_version_source_foreign_keys(tmp_path, monkeypatch):
+    db_path = tmp_path / "immutable-version-source-fks.db"
+    database_url = f"sqlite:///{db_path}"
+    monkeypatch.setattr(settings, "database_url", database_url)
+    backend = Path(__file__).resolve().parents[1]
+    cfg = Config(str(backend / "alembic.ini"))
+    cfg.set_main_option("script_location", str(backend / "alembic"))
+
+    command.upgrade(cfg, "head")
+    inspector = sa.inspect(sa.create_engine(database_url))
+    for table in (
+        "model_capability_versions",
+        "model_price_versions",
+        "model_route_versions",
+        "tool_versions",
+    ):
+        source_foreign_keys = [
+            item
+            for item in inspector.get_foreign_keys(table)
+            if item["constrained_columns"] == ["source_version_id"]
+        ]
+        assert len(source_foreign_keys) == 1
+        assert source_foreign_keys[0]["referred_table"] == table
+        assert source_foreign_keys[0]["referred_columns"] == ["id"]
+        assert source_foreign_keys[0]["options"]["ondelete"] == "SET NULL"
 
 
 def test_0037_unified_user_assets_sqlite_round_trip(tmp_path, monkeypatch):
@@ -619,6 +1952,48 @@ def test_0031_is_a_noop_outside_postgresql(monkeypatch):
     migration.downgrade()
 
 
+def test_0051_aligns_reverse_fingerprints_with_postgres_jsonb(monkeypatch):
+    migration = _load_migration_module("0051_reverse_fingerprints_jsonb")
+    calls = []
+    bind = type("Bind", (), {"dialect": type("Dialect", (), {"name": "postgresql"})()})()
+    monkeypatch.setattr(migration.op, "get_bind", lambda: bind)
+    monkeypatch.setattr(
+        migration.op,
+        "alter_column",
+        lambda table, column, **kwargs: calls.append((table, column, kwargs)),
+    )
+
+    migration.upgrade()
+    assert len(calls) == 1
+    table, column, kwargs = calls.pop()
+    assert (table, column) == ("reverse_result_revisions", "source_fingerprints")
+    assert isinstance(kwargs["existing_type"], postgresql.JSON)
+    assert isinstance(kwargs["type_"], postgresql.JSONB)
+    assert kwargs["postgresql_using"] == '"source_fingerprints"::jsonb'
+
+    migration.downgrade()
+    assert len(calls) == 1
+    table, column, kwargs = calls.pop()
+    assert (table, column) == ("reverse_result_revisions", "source_fingerprints")
+    assert isinstance(kwargs["existing_type"], postgresql.JSONB)
+    assert isinstance(kwargs["type_"], postgresql.JSON)
+    assert kwargs["postgresql_using"] == '"source_fingerprints"::json'
+
+
+def test_0051_reverse_fingerprints_is_a_noop_outside_postgresql(monkeypatch):
+    migration = _load_migration_module("0051_reverse_fingerprints_jsonb")
+    bind = type("Bind", (), {"dialect": type("Dialect", (), {"name": "sqlite"})()})()
+    monkeypatch.setattr(migration.op, "get_bind", lambda: bind)
+    monkeypatch.setattr(
+        migration.op,
+        "alter_column",
+        lambda *_args, **_kwargs: pytest.fail("SQLite must not receive PostgreSQL JSONB DDL"),
+    )
+
+    migration.upgrade()
+    migration.downgrade()
+
+
 def test_0022_downgrade_preserves_preexisting_team_package(tmp_path, monkeypatch):
     db_path = tmp_path / "migration-0022-existing-team.db"
     monkeypatch.setattr(settings, "database_url", f"sqlite:///{db_path}")
@@ -981,3 +2356,1602 @@ def test_0033_seeds_prompt_without_copying_vision_gateway(tmp_path, monkeypatch)
         ).one()
 
     assert tuple(row) == (None, None, None, None)
+
+
+def test_0047_reverse_revision_lineage_backfills_and_round_trips(tmp_path, monkeypatch):
+    backend = Path(__file__).resolve().parents[1]
+    script = ScriptDirectory(str(backend / "alembic"))
+    revision = script.get_revision("0047_reverse_revision_lineage")
+    assert revision is not None
+    assert revision.down_revision == "0046_generation_lineage"
+
+    db_path = tmp_path / "reverse-revision-lineage.db"
+    database_url = f"sqlite:///{db_path}"
+    monkeypatch.setattr(settings, "database_url", database_url)
+    cfg = Config(str(backend / "alembic.ini"))
+    cfg.set_main_option("script_location", str(backend / "alembic"))
+    command.upgrade(cfg, "0046_generation_lineage")
+
+    engine = sa.create_engine(database_url)
+    metadata = sa.MetaData()
+    users = sa.Table("users", metadata, autoload_with=engine)
+    operations = sa.Table("reverse_operations", metadata, autoload_with=engine)
+    revisions = sa.Table("reverse_result_revisions", metadata, autoload_with=engine)
+    sources = (
+        "provider_raw",
+        "normalized",
+        "user_edit",
+        "applied",
+        "model_compiled",
+        "generation",
+    )
+    with engine.begin() as conn:
+        conn.execute(users.insert().values(
+            id=4701,
+            phone="13974700001",
+            password_hash="migration-test",
+            status="active",
+            is_admin=False,
+            balance_credits=0,
+            frozen_credits=0,
+        ))
+        conn.execute(operations.insert().values(
+            id=4702,
+            user_id=4701,
+            request_fingerprint="4" * 64,
+            target="image",
+            asset_url="http://example.com/legacy-lineage.png",
+            status="succeeded",
+            result={"final_text": "legacy"},
+            charged_credits=0,
+            reference_count=1,
+        ))
+        conn.execute(revisions.insert(), [
+            {
+                "id": 4710 + version,
+                "operation_id": 4702,
+                "user_id": 4701,
+                "version": version,
+                "source": source,
+                "payload": {"source": source, "version": version},
+            }
+            for version, source in enumerate(sources, start=1)
+        ])
+
+    expected_columns = {
+        "parent_revision_id",
+        "source_content_hash",
+        "source_fingerprints",
+        "payload_hash",
+        "lineage_status",
+        "evidence_review_action",
+    }
+    expected_checks = {
+        "ck_reverse_result_revisions_lineage_status_valid",
+        "ck_reverse_result_revisions_evidence_action_valid",
+        "ck_reverse_result_revisions_parent_not_self",
+    }
+    expected_indexes = {
+        "ix_reverse_result_revisions_user_id",
+        "ix_reverse_result_revisions_parent_revision_id",
+        "ix_reverse_result_revisions_lineage_status",
+    }
+
+    def assert_upgraded_schema_and_rows() -> None:
+        inspector = sa.inspect(engine)
+        assert expected_columns <= {
+            column["name"]
+            for column in inspector.get_columns("reverse_result_revisions")
+        }
+        assert expected_checks <= {
+            constraint["name"]
+            for constraint in inspector.get_check_constraints("reverse_result_revisions")
+        }
+        assert expected_indexes <= {
+            index["name"]
+            for index in inspector.get_indexes("reverse_result_revisions")
+        }
+        parent_fk = next(
+            foreign_key
+            for foreign_key in inspector.get_foreign_keys("reverse_result_revisions")
+            if foreign_key["name"] == "fk_reverse_result_revisions_parent_revision_id"
+        )
+        assert parent_fk["constrained_columns"] == ["parent_revision_id"]
+        assert parent_fk["referred_table"] == "reverse_result_revisions"
+        assert parent_fk["referred_columns"] == ["id"]
+
+        current = sa.Table(
+            "reverse_result_revisions",
+            sa.MetaData(),
+            autoload_with=engine,
+        )
+        with engine.connect() as conn:
+            rows = conn.execute(
+                sa.select(
+                    current.c.id,
+                    current.c.parent_revision_id,
+                    current.c.lineage_status,
+                )
+                .where(current.c.operation_id == 4702)
+                .order_by(current.c.version)
+            ).all()
+        ids = [4710 + version for version in range(1, 7)]
+        assert [row.id for row in rows] == ids
+        assert [row.parent_revision_id for row in rows] == [None, *ids[:-1]]
+        assert {row.lineage_status for row in rows} == {"legacy_unverified"}
+
+    command.upgrade(cfg, "0047_reverse_revision_lineage")
+    assert_upgraded_schema_and_rows()
+
+    command.downgrade(cfg, "0046_generation_lineage")
+    downgraded_columns = {
+        column["name"]
+        for column in sa.inspect(engine).get_columns("reverse_result_revisions")
+    }
+    assert expected_columns.isdisjoint(downgraded_columns)
+    downgraded_indexes = {
+        index["name"]
+        for index in sa.inspect(engine).get_indexes("reverse_result_revisions")
+    }
+    assert expected_indexes.isdisjoint(downgraded_indexes)
+
+    command.upgrade(cfg, "0047_reverse_revision_lineage")
+    assert_upgraded_schema_and_rows()
+    engine.dispose()
+
+
+def test_0048_generation_dispatch_outbox_round_trips(tmp_path, monkeypatch):
+    backend = Path(__file__).resolve().parents[1]
+    db_path = tmp_path / "generation-dispatch-outbox.db"
+    database_url = f"sqlite:///{db_path}"
+    monkeypatch.setattr(settings, "database_url", database_url)
+    cfg = Config(str(backend / "alembic.ini"))
+    cfg.set_main_option("script_location", str(backend / "alembic"))
+    command.upgrade(cfg, "0047_reverse_revision_lineage")
+
+    engine = sa.create_engine(database_url)
+
+    def assert_upgraded() -> None:
+        inspector = sa.inspect(engine)
+        assert "generation_dispatches" in inspector.get_table_names()
+        assert {
+            "id",
+            "task_id",
+            "attempt",
+            "task_name",
+            "celery_task_id",
+            "status",
+            "publish_attempts",
+            "next_attempt_at",
+            "last_error_code",
+            "last_error_at",
+            "published_at",
+            "completed_at",
+            "created_at",
+            "updated_at",
+        } == {column["name"] for column in inspector.get_columns("generation_dispatches")}
+        assert {
+            "ix_generation_dispatches_task_id",
+            "uq_generation_dispatches_task_attempt",
+            "uq_generation_dispatches_celery_task_id",
+            "ix_generation_dispatches_reconcile",
+        } <= {index["name"] for index in inspector.get_indexes("generation_dispatches")}
+        assert {
+            "ck_generation_dispatches_attempt_positive",
+            "ck_generation_dispatches_publish_attempts_nonnegative",
+            "ck_generation_dispatches_status_valid",
+        } <= {
+            constraint["name"]
+            for constraint in inspector.get_check_constraints("generation_dispatches")
+        }
+
+    command.upgrade(cfg, "0048_generation_dispatch_outbox")
+    assert_upgraded()
+    command.downgrade(cfg, "0047_reverse_revision_lineage")
+    assert "generation_dispatches" not in sa.inspect(engine).get_table_names()
+    command.upgrade(cfg, "0048_generation_dispatch_outbox")
+    assert_upgraded()
+    engine.dispose()
+
+
+def test_0049_prompt_optimization_proposals_round_trips_with_bounded_revision_id(
+    tmp_path, monkeypatch
+):
+    backend = Path(__file__).resolve().parents[1]
+    db_path = tmp_path / "prompt-optimization-proposals.db"
+    database_url = f"sqlite:///{db_path}"
+    monkeypatch.setattr(settings, "database_url", database_url)
+    cfg = Config(str(backend / "alembic.ini"))
+    cfg.set_main_option("script_location", str(backend / "alembic"))
+    command.upgrade(cfg, "0048_generation_dispatch_outbox")
+    engine = sa.create_engine(database_url)
+    assert "prompt_optimization_proposals" not in sa.inspect(engine).get_table_names()
+
+    command.upgrade(cfg, "0049_prompt_opt_proposals")
+    assert "prompt_optimization_proposals" in sa.inspect(engine).get_table_names()
+    with engine.connect() as connection:
+        current = connection.scalar(sa.text("select version_num from alembic_version"))
+    assert current == "0049_prompt_opt_proposals"
+    assert len(current) <= 32
+
+    command.downgrade(cfg, "0048_generation_dispatch_outbox")
+    assert "prompt_optimization_proposals" not in sa.inspect(engine).get_table_names()
+    command.upgrade(cfg, "0049_prompt_opt_proposals")
+    assert "prompt_optimization_proposals" in sa.inspect(engine).get_table_names()
+    engine.dispose()
+
+
+def test_0052_generation_retry_chain_round_trips(tmp_path, monkeypatch):
+    backend = Path(__file__).resolve().parents[1]
+    db_path = tmp_path / "generation-retry-chain.db"
+    database_url = f"sqlite:///{db_path}"
+    monkeypatch.setattr(settings, "database_url", database_url)
+    cfg = Config(str(backend / "alembic.ini"))
+    cfg.set_main_option("script_location", str(backend / "alembic"))
+    command.upgrade(cfg, "0051_reverse_fingerprints_jsonb")
+    engine = sa.create_engine(database_url)
+
+    def assert_downgraded() -> None:
+        inspector = sa.inspect(engine)
+        assert "retry_of_task_id" not in {
+            column["name"] for column in inspector.get_columns("gen_tasks")
+        }
+        assert "ix_gen_tasks_retry_of_task_id" not in {
+            index["name"] for index in inspector.get_indexes("gen_tasks")
+        }
+        assert "ck_gen_tasks_retry_not_self" not in {
+            constraint["name"] for constraint in inspector.get_check_constraints("gen_tasks")
+        }
+
+    def assert_upgraded() -> None:
+        inspector = sa.inspect(engine)
+        columns = {column["name"]: column for column in inspector.get_columns("gen_tasks")}
+        assert columns["retry_of_task_id"]["nullable"] is True
+        assert "ix_gen_tasks_retry_of_task_id" in {
+            index["name"] for index in inspector.get_indexes("gen_tasks")
+        }
+        assert "ck_gen_tasks_retry_not_self" in {
+            constraint["name"] for constraint in inspector.get_check_constraints("gen_tasks")
+        }
+        retry_fk = next(
+            foreign_key
+            for foreign_key in inspector.get_foreign_keys("gen_tasks")
+            if foreign_key["name"] == "fk_gen_tasks_retry_of_task_id_gen_tasks"
+        )
+        assert retry_fk["constrained_columns"] == ["retry_of_task_id"]
+        assert retry_fk["referred_table"] == "gen_tasks"
+        assert retry_fk["referred_columns"] == ["id"]
+        with engine.connect() as connection:
+            current = connection.scalar(sa.text("select version_num from alembic_version"))
+        assert current == "0052_generation_retry_chain"
+
+    assert_downgraded()
+    command.upgrade(cfg, "0052_generation_retry_chain")
+    assert_upgraded()
+    command.downgrade(cfg, "0051_reverse_fingerprints_jsonb")
+    assert_downgraded()
+    command.upgrade(cfg, "0052_generation_retry_chain")
+    assert_upgraded()
+    engine.dispose()
+
+
+def test_0053_tool_workflow_engine_round_trips(tmp_path, monkeypatch):
+    backend = Path(__file__).resolve().parents[1]
+    db_path = tmp_path / "tool-workflow-engine.db"
+    database_url = f"sqlite:///{db_path}"
+    monkeypatch.setattr(settings, "database_url", database_url)
+    cfg = Config(str(backend / "alembic.ini"))
+    cfg.set_main_option("script_location", str(backend / "alembic"))
+    command.upgrade(cfg, "0052_generation_retry_chain")
+    engine = sa.create_engine(database_url)
+
+    expected_tables = {
+        "tool_runs",
+        "workflow_runs",
+        "tool_node_runs",
+        "tool_node_attempts",
+    }
+
+    def assert_downgraded() -> None:
+        assert expected_tables.isdisjoint(sa.inspect(engine).get_table_names())
+
+    def assert_upgraded() -> None:
+        inspector = sa.inspect(engine)
+        assert expected_tables <= set(inspector.get_table_names())
+        assert {
+            "workflow_run_id",
+            "node_key",
+            "node_type",
+            "depends_on",
+            "status",
+            "attempt_count",
+            "revision",
+            "dispatch_token",
+            "compensation_status",
+        } <= {column["name"] for column in inspector.get_columns("tool_node_runs")}
+        assert {
+            "uq_tool_node_runs_workflow_node_key",
+            "ix_tool_node_runs_workflow_topology",
+            "ix_tool_node_runs_status_available",
+        } <= {index["name"] for index in inspector.get_indexes("tool_node_runs")}
+        assert {
+            "ck_tool_node_runs_type_valid",
+            "ck_tool_node_runs_status_valid",
+            "ck_tool_node_runs_compensation_status_valid",
+        } <= {
+            constraint["name"]
+            for constraint in inspector.get_check_constraints("tool_node_runs")
+        }
+        workflow_fk = next(
+            foreign_key
+            for foreign_key in inspector.get_foreign_keys("tool_node_runs")
+            if foreign_key["constrained_columns"] == ["workflow_run_id"]
+        )
+        assert workflow_fk["referred_table"] == "workflow_runs"
+        with engine.connect() as connection:
+            current = connection.scalar(sa.text("select version_num from alembic_version"))
+        assert current == "0053_tool_workflow_engine"
+
+    assert_downgraded()
+    command.upgrade(cfg, "0053_tool_workflow_engine")
+    assert_upgraded()
+    command.downgrade(cfg, "0052_generation_retry_chain")
+    assert_downgraded()
+    command.upgrade(cfg, "0053_tool_workflow_engine")
+    assert_upgraded()
+    engine.dispose()
+
+
+def test_0054_recipe_content_governance_round_trips(tmp_path, monkeypatch):
+    backend = Path(__file__).resolve().parents[1]
+    db_path = tmp_path / "recipe-content-governance.db"
+    database_url = f"sqlite:///{db_path}"
+    monkeypatch.setattr(settings, "database_url", database_url)
+    cfg = Config(str(backend / "alembic.ini"))
+    cfg.set_main_option("script_location", str(backend / "alembic"))
+    command.upgrade(cfg, "0053_tool_workflow_engine")
+    engine = sa.create_engine(database_url)
+
+    with engine.begin() as connection:
+        connection.execute(
+            sa.text(
+                "INSERT INTO users "
+                "(id, phone, status, is_admin, balance_credits, frozen_credits) "
+                "VALUES (1, '13800000000', 'active', 0, 0, 0)"
+            )
+        )
+        connection.execute(
+            sa.text(
+                "INSERT INTO creation_recipes "
+                "(id, user_id, title, category, visibility, favorite, current_version) "
+                "VALUES (1, 1, 'legacy public recipe', 'image', 'public', 0, 2)"
+            )
+        )
+
+    expected_tables = {
+        "creation_recipe_shares",
+        "creation_recipe_usage_events",
+    }
+    expected_columns = {
+        "moderation_status",
+        "approved_version",
+        "submitted_at",
+        "reviewed_at",
+        "reviewed_by",
+        "review_note",
+    }
+
+    def assert_downgraded() -> None:
+        inspector = sa.inspect(engine)
+        assert expected_tables.isdisjoint(inspector.get_table_names())
+        recipe_columns = {
+            column["name"] for column in inspector.get_columns("creation_recipes")
+        }
+        assert expected_columns.isdisjoint(recipe_columns)
+
+    def assert_upgraded() -> None:
+        inspector = sa.inspect(engine)
+        assert expected_tables <= set(inspector.get_table_names())
+        recipe_columns = {
+            column["name"] for column in inspector.get_columns("creation_recipes")
+        }
+        assert expected_columns <= recipe_columns
+        assert {
+            "ix_creation_recipes_reviewed_by",
+            "ix_creation_recipes_moderation_updated",
+        } <= {index["name"] for index in inspector.get_indexes("creation_recipes")}
+        assert {
+            "ck_creation_recipes_moderation_status_valid",
+            "ck_creation_recipes_approved_version_positive",
+        } <= {
+            constraint["name"]
+            for constraint in inspector.get_check_constraints("creation_recipes")
+        }
+        with engine.connect() as connection:
+            current = connection.scalar(sa.text("select version_num from alembic_version"))
+            legacy_recipe = connection.execute(
+                sa.text(
+                    "SELECT moderation_status, approved_version, submitted_at, reviewed_at "
+                    "FROM creation_recipes WHERE id = 1"
+                )
+            ).one()
+        assert current == "0054_recipe_content_governance"
+        assert legacy_recipe.moderation_status == "approved"
+        assert legacy_recipe.approved_version == 2
+        assert legacy_recipe.submitted_at is not None
+        assert legacy_recipe.reviewed_at is not None
+
+    assert_downgraded()
+    command.upgrade(cfg, "0054_recipe_content_governance")
+    assert_upgraded()
+    command.downgrade(cfg, "0053_tool_workflow_engine")
+    assert_downgraded()
+    command.upgrade(cfg, "0054_recipe_content_governance")
+    assert_upgraded()
+    engine.dispose()
+
+
+def test_0057_storyboard_compose_tool_round_trips(tmp_path, monkeypatch):
+    backend = Path(__file__).resolve().parents[1]
+    db_path = tmp_path / "storyboard-compose-tool.db"
+    database_url = f"sqlite:///{db_path}"
+    monkeypatch.setattr(settings, "database_url", database_url)
+    cfg = Config(str(backend / "alembic.ini"))
+    cfg.set_main_option("script_location", str(backend / "alembic"))
+    command.upgrade(cfg, "0056_workflow_dispatch_outbox")
+    engine = sa.create_engine(database_url)
+
+    metadata = sa.MetaData()
+    definitions = sa.Table("tool_definitions", metadata, autoload_with=engine)
+    versions = sa.Table("tool_versions", metadata, autoload_with=engine)
+
+    def load_tool():
+        with engine.connect() as connection:
+            return connection.execute(
+                sa.select(
+                    definitions.c.slug,
+                    definitions.c.enabled,
+                    versions.c.schema_version,
+                    versions.c.input_schema,
+                    versions.c.workflow,
+                    versions.c.capabilities,
+                )
+                .join(versions, versions.c.tool_definition_id == definitions.c.id)
+                .where(definitions.c.slug == "storyboard-compose")
+            ).one_or_none()
+
+    assert load_tool() is None
+    command.upgrade(cfg, "0057_storyboard_compose_tool")
+    row = load_tool()
+    assert row is not None
+    assert row.enabled is True
+    assert row.schema_version == "tool.v1"
+    assert row.input_schema["required"] == ["composition"]
+    assert row.capabilities["audio_mix"] is True
+    spec = WorkflowSpec.model_validate(row.workflow)
+    assert spec.studio_preset is not None
+    assert spec.studio_preset.creation_mode == "video_edit"
+    assert spec.studio_preset.analysis_focus == "storyboard"
+    assert spec.topological_keys() == ["compose", "export"]
+    assert spec.nodes[0].config["timeout_seconds"] == 2400
+    assert spec.nodes[0].compensation.type == "cleanup_video_composition"
+    with engine.connect() as connection:
+        assert connection.scalar(sa.text("select version_num from alembic_version")) == (
+            "0057_storyboard_compose_tool"
+        )
+
+    command.downgrade(cfg, "0056_workflow_dispatch_outbox")
+    assert load_tool() is None
+    command.upgrade(cfg, "0057_storyboard_compose_tool")
+    assert load_tool() is not None
+    engine.dispose()
+
+
+def test_0058_workflow_project_tasks_round_trips(tmp_path, monkeypatch):
+    backend = Path(__file__).resolve().parents[1]
+    db_path = tmp_path / "workflow-project-tasks.db"
+    database_url = f"sqlite:///{db_path}"
+    monkeypatch.setattr(settings, "database_url", database_url)
+    cfg = Config(str(backend / "alembic.ini"))
+    cfg.set_main_option("script_location", str(backend / "alembic"))
+    command.upgrade(cfg, "0057_storyboard_compose_tool")
+    engine = sa.create_engine(database_url)
+
+    with engine.begin() as connection:
+        connection.execute(sa.text(
+            "INSERT INTO users "
+            "(id, phone, status, is_admin, balance_credits, frozen_credits) "
+            "VALUES (5801, '13975800001', 'active', 0, 0, 0)"
+        ))
+        connection.execute(sa.text(
+            "INSERT INTO media_projects "
+            "(id, user_id, title, project_type, status) "
+            "VALUES (5802, 5801, '工作流迁移项目', 'video', 'active')"
+        ))
+
+    def kind_check_sql() -> str:
+        constraint = next(
+            item
+            for item in sa.inspect(engine).get_check_constraints("media_project_tasks")
+            if item["name"] == "ck_media_project_tasks_kind_valid"
+        )
+        return str(constraint["sqltext"])
+
+    assert "workflow" not in kind_check_sql()
+    command.upgrade(cfg, "0058_workflow_project_tasks")
+    assert "workflow" in kind_check_sql()
+    with engine.begin() as connection:
+        connection.execute(sa.text(
+            "INSERT INTO media_project_tasks "
+            "(project_id, task_kind, task_id) VALUES (5802, 'workflow', 5803)"
+        ))
+        current = connection.scalar(sa.text("select version_num from alembic_version"))
+    assert current == "0058_workflow_project_tasks"
+
+    command.downgrade(cfg, "0057_storyboard_compose_tool")
+    assert "workflow" not in kind_check_sql()
+    with engine.connect() as connection:
+        assert connection.scalar(sa.text(
+            "SELECT count(*) FROM media_project_tasks WHERE task_kind = 'workflow'"
+        )) == 0
+    with pytest.raises(sa.exc.IntegrityError), engine.begin() as connection:
+        connection.execute(sa.text(
+            "INSERT INTO media_project_tasks "
+            "(project_id, task_kind, task_id) VALUES (5802, 'workflow', 5804)"
+        ))
+
+    command.upgrade(cfg, "0058_workflow_project_tasks")
+    assert "workflow" in kind_check_sql()
+    engine.dispose()
+
+
+def test_0071_removes_unreferenced_migration_model_on_downgrade(
+    tmp_path,
+    monkeypatch,
+):
+    backend = Path(__file__).resolve().parents[1]
+    db_path = tmp_path / "gemini-vision-downgrade.db"
+    database_url = f"sqlite:///{db_path}"
+    monkeypatch.setattr(settings, "database_url", database_url)
+    cfg = Config(str(backend / "alembic.ini"))
+    cfg.set_main_option("script_location", str(backend / "alembic"))
+
+    command.upgrade(cfg, "0071_gemini_31_pro_high_vision")
+    engine = sa.create_engine(database_url)
+    with engine.connect() as connection:
+        assert connection.scalar(sa.text(
+            "SELECT count(*) FROM model_configs "
+            "WHERE use = 'vision' AND model_id = 'gemini-3.1-pro-high'"
+        )) == 1
+
+    command.downgrade(cfg, "0070_video_model_capabilities")
+    with engine.connect() as connection:
+        assert connection.scalar(sa.text(
+            "SELECT count(*) FROM model_configs "
+            "WHERE use = 'vision' AND model_id = 'gemini-3.1-pro-high'"
+        )) == 0
+    engine.dispose()
+
+
+def test_0071_blocks_downgrade_when_migration_model_is_referenced(
+    tmp_path,
+    monkeypatch,
+):
+    backend = Path(__file__).resolve().parents[1]
+    db_path = tmp_path / "referenced-gemini-vision-downgrade.db"
+    database_url = f"sqlite:///{db_path}"
+    monkeypatch.setattr(settings, "database_url", database_url)
+    cfg = Config(str(backend / "alembic.ini"))
+    cfg.set_main_option("script_location", str(backend / "alembic"))
+
+    command.upgrade(cfg, "0071_gemini_31_pro_high_vision")
+    engine = sa.create_engine(database_url)
+    with engine.begin() as connection:
+        model_config_id = connection.scalar(sa.text(
+            "SELECT id FROM model_configs "
+            "WHERE use = 'vision' AND model_id = 'gemini-3.1-pro-high'"
+        ))
+        connection.execute(sa.text(
+            "INSERT INTO users "
+            "(id, phone, password_hash, balance_credits, frozen_credits, is_admin, status) "
+            "VALUES (7101, '13900007101', 'hash', 0, 0, 0, 'active')"
+        ))
+        connection.execute(
+            sa.text(
+                "INSERT INTO reverse_operations "
+                "(id, user_id, model_config_id, client_request_id, request_fingerprint, "
+                "target, asset_url, status) VALUES "
+                "(7102, 7101, :model_config_id, 'gemini-history', :fingerprint, "
+                "'image', 'https://cdn.example.com/gemini-history.jpg', 'succeeded')"
+            ),
+            {"model_config_id": model_config_id, "fingerprint": "7" * 64},
+        )
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"referenced by reverse_operations\.model_config_id",
+    ):
+        command.downgrade(cfg, "0070_video_model_capabilities")
+    engine.dispose()
+
+
+def test_0072_skips_unconfigured_image_edit_models(tmp_path, monkeypatch):
+    backend = Path(__file__).resolve().parents[1]
+    db_path = tmp_path / "unconfigured-image-edit-models.db"
+    database_url = f"sqlite:///{db_path}"
+    monkeypatch.setattr(settings, "database_url", database_url)
+    cfg = Config(str(backend / "alembic.ini"))
+    cfg.set_main_option("script_location", str(backend / "alembic"))
+
+    command.upgrade(cfg, "0072_image_edit_models")
+    engine = sa.create_engine(database_url)
+    with engine.connect() as connection:
+        assert connection.scalar(sa.text(
+            "SELECT count(*) FROM model_configs WHERE use = 'image' "
+            "AND model_id IN ('gemini-3.1-flash-image', 'grok-imagine-image')"
+        )) == 0
+    engine.dispose()
+
+
+def test_0072_enables_verified_grok_and_gemini_image_edit_models(
+    tmp_path,
+    monkeypatch,
+):
+    backend = Path(__file__).resolve().parents[1]
+    db_path = tmp_path / "image-edit-models.db"
+    database_url = f"sqlite:///{db_path}"
+    monkeypatch.setattr(settings, "database_url", database_url)
+    cfg = Config(str(backend / "alembic.ini"))
+    cfg.set_main_option("script_location", str(backend / "alembic"))
+    command.upgrade(cfg, "0071_gemini_31_pro_high_vision")
+    engine = sa.create_engine(database_url)
+    metadata = sa.MetaData()
+    model_configs = sa.Table("model_configs", metadata, autoload_with=engine)
+    capability_versions = sa.Table(
+        "model_capability_versions",
+        metadata,
+        autoload_with=engine,
+    )
+    with engine.begin() as connection:
+        connection.execute(
+            model_configs.insert(),
+            [
+                {
+                    "use": "image",
+                    "model_id": "gemini-3.1-flash-image",
+                    "display_name": "gemini-3.1-flash-image",
+                    "is_default": False,
+                    "sort_order": 30,
+                    "provider": "antigravity",
+                    "base_url": "https://models.example.com/antigravity",
+                    "api_key_encrypted": "encrypted-gemini-key",
+                    "gateway_format": "anthropic",
+                    "cost_credits": 8,
+                    "unlock_cost": 0,
+                    "enabled": True,
+                    "extra": {
+                        "image_transport": "anthropic_messages",
+                        "capabilities": {
+                            "text_to_image": True,
+                            "image_to_image": False,
+                        },
+                    },
+                },
+                {
+                    "use": "image",
+                    "model_id": "grok-imagine-image",
+                    "display_name": "grok-imagine-image",
+                    "is_default": False,
+                    "sort_order": 40,
+                    "provider": "grok",
+                    "base_url": "https://models.example.com/v1",
+                    "api_key_encrypted": "encrypted-grok-key",
+                    "gateway_format": "openai",
+                    "cost_credits": 8,
+                    "unlock_cost": 0,
+                    "enabled": True,
+                    "extra": {
+                        "image_transport": "grok_images",
+                        "capabilities": {
+                            "text_to_image": True,
+                            "image_to_image": False,
+                        },
+                    },
+                },
+            ],
+        )
+
+    command.upgrade(cfg, "0072_image_edit_models")
+    with engine.connect() as connection:
+        rows = {
+            row.model_id: row
+            for row in connection.execute(
+                sa.select(
+                    model_configs.c.id,
+                    model_configs.c.model_id,
+                    model_configs.c.display_name,
+                    model_configs.c.extra,
+                ).where(
+                    model_configs.c.model_id.in_(
+                        ["gemini-3.1-flash-image", "grok-imagine-image"]
+                    )
+                )
+            )
+        }
+        active_versions = {
+            int(row.model_config_id): row.capabilities
+            for row in connection.execute(
+                sa.select(
+                    capability_versions.c.model_config_id,
+                    capability_versions.c.capabilities,
+                ).where(capability_versions.c.is_active.is_(True))
+            )
+        }
+
+    gemini = rows["gemini-3.1-flash-image"]
+    grok = rows["grok-imagine-image"]
+    assert gemini.display_name == "Gemini 3.1 Flash Image"
+    assert gemini.extra["edit_path"] == "/messages"
+    assert gemini.extra["capabilities"]["image_to_image"] is True
+    assert gemini.extra["capabilities"]["max_reference_images"] == 2
+    assert grok.display_name == "Grok Imagine Image"
+    assert grok.extra["edit_path"] == "/images/edits"
+    assert grok.extra["edit_payload_format"] == "json"
+    assert grok.extra["capabilities"]["image_to_image"] is True
+    assert grok.extra["capabilities"]["max_reference_images"] == 3
+    assert active_versions[int(gemini.id)] == gemini.extra["capabilities"]
+    assert active_versions[int(grok.id)] == grok.extra["capabilities"]
+    engine.dispose()
+
+
+def test_0073_enables_seedance_15_two_image_references_and_is_idempotent(
+    tmp_path,
+    monkeypatch,
+):
+    backend = Path(__file__).resolve().parents[1]
+    db_path = tmp_path / "seedance-15-two-images.db"
+    database_url = f"sqlite:///{db_path}"
+    monkeypatch.setattr(settings, "database_url", database_url)
+    cfg = Config(str(backend / "alembic.ini"))
+    cfg.set_main_option("script_location", str(backend / "alembic"))
+    command.upgrade(cfg, "0072_image_edit_models")
+
+    engine = sa.create_engine(database_url)
+    metadata = sa.MetaData()
+    model_configs = sa.Table("model_configs", metadata, autoload_with=engine)
+    capability_versions = sa.Table(
+        "model_capability_versions",
+        metadata,
+        autoload_with=engine,
+    )
+    model_id = "doubao-seedance-1-5-pro-251215"
+    metadata_snapshot = {
+        "schema_version": "model-catalog-metadata.v1",
+        "origin": "test",
+        "model_id": model_id,
+        "display_name": "Seedance 1.5 Pro",
+        "is_default": False,
+        "sort_order": 20,
+        "enabled": True,
+    }
+    old_capabilities = {
+        "text_to_video": True,
+        "image_to_video": True,
+        "first_last_frame": True,
+        "multi_reference": False,
+        "max_reference_images": 2,
+        "custom_flag": "keep",
+    }
+    now = datetime.now(timezone.utc)
+    with engine.begin() as connection:
+        result = connection.execute(
+            model_configs.insert().values(
+                use="video",
+                model_id=model_id,
+                display_name="Seedance 1.5 Pro",
+                is_default=False,
+                sort_order=20,
+                provider="volcengine_ark",
+                gateway_format="ark",
+                cost_credits=100,
+                unlock_cost=0,
+                enabled=True,
+                extra={
+                    "preview_cost": 50,
+                    "capabilities": old_capabilities,
+                },
+            )
+        )
+        model_config_id = int(result.inserted_primary_key[0])
+        connection.execute(
+            capability_versions.insert().values(
+                model_config_id=model_config_id,
+                version=1,
+                schema_version="capability.v1",
+                capabilities=old_capabilities,
+                metadata_snapshot=metadata_snapshot,
+                status="published",
+                is_active=True,
+                activated_at=now,
+            )
+        )
+
+    command.upgrade(cfg, "0073_seedance_15_multi_reference")
+    expected_capabilities = {
+        **old_capabilities,
+        "multi_reference": True,
+    }
+    with engine.connect() as connection:
+        model_extra = connection.scalar(
+            sa.select(model_configs.c.extra).where(model_configs.c.id == model_config_id)
+        )
+        versions = connection.execute(
+            sa.select(
+                capability_versions.c.version,
+                capability_versions.c.status,
+                capability_versions.c.is_active,
+                capability_versions.c.source_version_id,
+                capability_versions.c.capabilities,
+                capability_versions.c.metadata_snapshot,
+            )
+            .where(capability_versions.c.model_config_id == model_config_id)
+            .order_by(capability_versions.c.version)
+        ).mappings().all()
+
+    assert model_extra["preview_cost"] == 50
+    assert model_extra["capabilities"] == expected_capabilities
+    assert [
+        (row["version"], row["status"], row["is_active"])
+        for row in versions
+    ] == [
+        (1, "disabled", False),
+        (2, "published", True),
+    ]
+    assert versions[1]["source_version_id"] is not None
+    assert versions[1]["capabilities"] == expected_capabilities
+    assert versions[1]["metadata_snapshot"] == metadata_snapshot
+
+    command.downgrade(cfg, "0072_image_edit_models")
+    command.upgrade(cfg, "0073_seedance_15_multi_reference")
+    with engine.connect() as connection:
+        version_count = connection.scalar(
+            sa.select(sa.func.count(capability_versions.c.id)).where(
+                capability_versions.c.model_config_id == model_config_id
+            )
+        )
+    assert version_count == 2
+    engine.dispose()
+
+
+def test_0073_does_not_enable_unverified_seedance_provider(tmp_path, monkeypatch):
+    backend = Path(__file__).resolve().parents[1]
+    db_path = tmp_path / "seedance-15-unverified-provider.db"
+    database_url = f"sqlite:///{db_path}"
+    monkeypatch.setattr(settings, "database_url", database_url)
+    cfg = Config(str(backend / "alembic.ini"))
+    cfg.set_main_option("script_location", str(backend / "alembic"))
+    command.upgrade(cfg, "0072_image_edit_models")
+
+    engine = sa.create_engine(database_url)
+    metadata = sa.MetaData()
+    model_configs = sa.Table("model_configs", metadata, autoload_with=engine)
+    capability_versions = sa.Table(
+        "model_capability_versions",
+        metadata,
+        autoload_with=engine,
+    )
+    old_capabilities = {
+        "text_to_video": True,
+        "image_to_video": False,
+        "multi_reference": False,
+    }
+    with engine.begin() as connection:
+        result = connection.execute(
+            model_configs.insert().values(
+                use="video",
+                model_id="doubao-seedance-1-5-pro-251215",
+                display_name="Unverified Seedance Proxy",
+                is_default=False,
+                sort_order=30,
+                provider="custom_openai",
+                gateway_format="openai",
+                cost_credits=100,
+                unlock_cost=0,
+                enabled=True,
+                extra={"capabilities": old_capabilities},
+            )
+        )
+        model_config_id = int(result.inserted_primary_key[0])
+
+    command.upgrade(cfg, "0073_seedance_15_multi_reference")
+    with engine.connect() as connection:
+        model_extra = connection.scalar(
+            sa.select(model_configs.c.extra).where(model_configs.c.id == model_config_id)
+        )
+        version_count = connection.scalar(
+            sa.select(sa.func.count(capability_versions.c.id)).where(
+                capability_versions.c.model_config_id == model_config_id
+            )
+        )
+
+    assert model_extra["capabilities"] == old_capabilities
+    assert version_count == 0
+    engine.dispose()
+
+
+def test_0074_enables_all_ark_seedance_20_plus_models_and_is_idempotent(
+    tmp_path,
+    monkeypatch,
+):
+    backend = Path(__file__).resolve().parents[1]
+    db_path = tmp_path / "seedance-20-plus-ten-images.db"
+    database_url = f"sqlite:///{db_path}"
+    monkeypatch.setattr(settings, "database_url", database_url)
+    cfg = Config(str(backend / "alembic.ini"))
+    cfg.set_main_option("script_location", str(backend / "alembic"))
+    command.upgrade(cfg, "0073_seedance_15_multi_reference")
+
+    engine = sa.create_engine(database_url)
+    metadata = sa.MetaData()
+    model_configs = sa.Table("model_configs", metadata, autoload_with=engine)
+    capability_versions = sa.Table(
+        "model_capability_versions",
+        metadata,
+        autoload_with=engine,
+    )
+    old_capabilities = {
+        "text_to_video": True,
+        "image_to_video": False,
+        "multi_reference": False,
+        "max_reference_images": 3,
+        "custom_flag": "keep",
+    }
+    expected_capabilities = {
+        **old_capabilities,
+        "image_to_video": True,
+        "multi_reference": True,
+        "max_reference_images": 10,
+    }
+    already_current_capabilities = {
+        "text_to_video": True,
+        "image_to_video": True,
+        "multi_reference": True,
+        "max_reference_images": 10,
+        "custom_flag": "already-current",
+    }
+    model_rows = [
+        (
+            "doubao-seedance-2-0-mini-260615",
+            "Seedance 2.0 Mini",
+            "volcengine_ark",
+            "ark",
+            {"preview_cost": 25, "capabilities": old_capabilities},
+        ),
+        (
+            "doubao-seedance-2-1-pro-270101",
+            "Seedance 2.1 Pro",
+            "custom_gateway",
+            "ark",
+            {"preview_cost": 35, "capabilities": {"custom_flag": "gateway-ark"}},
+        ),
+        (
+            "doubao-seedance-3-0-pro-280101",
+            "Seedance 3.0 Pro",
+            "volcengine_ark",
+            "ark",
+            {"capabilities": already_current_capabilities},
+        ),
+        (
+            "doubao-seedance-2-0-pro-unverified",
+            "Unverified Seedance 2.0",
+            "custom_openai",
+            "openai",
+            {"capabilities": old_capabilities},
+        ),
+        (
+            "doubao-seedance-1-9-pro-legacy",
+            "Seedance 1.9",
+            "volcengine_ark",
+            "ark",
+            {"capabilities": old_capabilities},
+        ),
+    ]
+    model_ids = {}
+    now = datetime.now(timezone.utc)
+    with engine.begin() as connection:
+        for sort_order, (model_id, display_name, provider, gateway_format, extra) in enumerate(
+            model_rows,
+            start=40,
+        ):
+            result = connection.execute(
+                model_configs.insert().values(
+                    use="video",
+                    model_id=model_id,
+                    display_name=display_name,
+                    is_default=False,
+                    sort_order=sort_order,
+                    provider=provider,
+                    gateway_format=gateway_format,
+                    cost_credits=100,
+                    unlock_cost=0,
+                    enabled=True,
+                    extra=extra,
+                )
+            )
+            model_ids[model_id] = int(result.inserted_primary_key[0])
+
+        for model_id, capabilities in (
+            ("doubao-seedance-2-0-mini-260615", old_capabilities),
+            ("doubao-seedance-3-0-pro-280101", already_current_capabilities),
+        ):
+            connection.execute(
+                capability_versions.insert().values(
+                    model_config_id=model_ids[model_id],
+                    version=1,
+                    schema_version="capability.v1",
+                    capabilities=capabilities,
+                    metadata_snapshot={
+                        "schema_version": "model-catalog-metadata.v1",
+                        "origin": "test",
+                        "model_id": model_id,
+                        "display_name": next(
+                            row[1] for row in model_rows if row[0] == model_id
+                        ),
+                        "is_default": False,
+                        "sort_order": next(
+                            index for index, row in enumerate(model_rows, start=40)
+                            if row[0] == model_id
+                        ),
+                        "enabled": True,
+                    },
+                    status="published",
+                    is_active=True,
+                    activated_at=now,
+                )
+            )
+
+    command.upgrade(cfg, "0074_seedance_20_multi_reference")
+    with engine.connect() as connection:
+        extras = {
+            row.model_id: row.extra
+            for row in connection.execute(
+                sa.select(model_configs.c.model_id, model_configs.c.extra).where(
+                    model_configs.c.model_id.in_(list(model_ids))
+                )
+            )
+        }
+        version_rows = connection.execute(
+            sa.select(
+                capability_versions.c.model_config_id,
+                capability_versions.c.version,
+                capability_versions.c.status,
+                capability_versions.c.is_active,
+                capability_versions.c.capabilities,
+            )
+            .where(capability_versions.c.model_config_id.in_(list(model_ids.values())))
+            .order_by(
+                capability_versions.c.model_config_id,
+                capability_versions.c.version,
+            )
+        ).mappings().all()
+
+    assert extras["doubao-seedance-2-0-mini-260615"] == {
+        "preview_cost": 25,
+        "capabilities": expected_capabilities,
+    }
+    assert extras["doubao-seedance-2-1-pro-270101"]["capabilities"] == {
+        "custom_flag": "gateway-ark",
+        "text_to_video": True,
+        "image_to_video": True,
+        "multi_reference": True,
+        "max_reference_images": 10,
+    }
+    assert extras["doubao-seedance-3-0-pro-280101"]["capabilities"] == (
+        already_current_capabilities
+    )
+    assert extras["doubao-seedance-2-0-pro-unverified"]["capabilities"] == (
+        old_capabilities
+    )
+    assert extras["doubao-seedance-1-9-pro-legacy"]["capabilities"] == old_capabilities
+
+    versions_by_model = {
+        model_id: [
+            row
+            for row in version_rows
+            if row["model_config_id"] == model_config_id
+        ]
+        for model_id, model_config_id in model_ids.items()
+    }
+    assert [
+        (row["version"], row["status"], row["is_active"])
+        for row in versions_by_model["doubao-seedance-2-0-mini-260615"]
+    ] == [(1, "disabled", False), (2, "published", True)]
+    assert versions_by_model["doubao-seedance-2-0-mini-260615"][-1][
+        "capabilities"
+    ] == expected_capabilities
+    assert len(versions_by_model["doubao-seedance-2-1-pro-270101"]) == 1
+    assert len(versions_by_model["doubao-seedance-3-0-pro-280101"]) == 1
+    assert versions_by_model["doubao-seedance-2-0-pro-unverified"] == []
+    assert versions_by_model["doubao-seedance-1-9-pro-legacy"] == []
+
+    command.downgrade(cfg, "0073_seedance_15_multi_reference")
+    command.upgrade(cfg, "0074_seedance_20_multi_reference")
+    with engine.connect() as connection:
+        version_count = connection.scalar(
+            sa.select(sa.func.count(capability_versions.c.id)).where(
+                capability_versions.c.model_config_id.in_(list(model_ids.values()))
+            )
+        )
+    assert version_count == 4
+    engine.dispose()
+
+
+def test_0075_enables_grok_product_theme_and_detail_references_and_is_idempotent(
+    tmp_path,
+    monkeypatch,
+):
+    backend = Path(__file__).resolve().parents[1]
+    db_path = tmp_path / "grok-video-product-references.db"
+    database_url = f"sqlite:///{db_path}"
+    monkeypatch.setattr(settings, "database_url", database_url)
+    cfg = Config(str(backend / "alembic.ini"))
+    cfg.set_main_option("script_location", str(backend / "alembic"))
+    command.upgrade(cfg, "0074_seedance_20_multi_reference")
+
+    engine = sa.create_engine(database_url)
+    metadata = sa.MetaData()
+    model_configs = sa.Table("model_configs", metadata, autoload_with=engine)
+    capability_versions = sa.Table(
+        "model_capability_versions",
+        metadata,
+        autoload_with=engine,
+    )
+    model_id = "grok-imagine-video-1.5"
+    old_capabilities = {
+        "text_to_video": True,
+        "image_to_video": True,
+        "multi_reference": False,
+        "custom_flag": "keep",
+    }
+    expected_capabilities = {
+        **old_capabilities,
+        "multi_reference": True,
+        "max_reference_images": 2,
+    }
+    metadata_snapshot = {
+        "schema_version": "model-catalog-metadata.v1",
+        "origin": "test",
+        "model_id": model_id,
+        "display_name": "Grok Video 1.5",
+        "is_default": False,
+        "sort_order": 50,
+        "enabled": True,
+    }
+    now = datetime.now(timezone.utc)
+    with engine.begin() as connection:
+        result = connection.execute(
+            model_configs.insert().values(
+                use="video",
+                model_id=model_id,
+                display_name="Grok Video 1.5",
+                is_default=False,
+                sort_order=50,
+                provider="grok",
+                gateway_format="openai",
+                cost_credits=40,
+                unlock_cost=0,
+                enabled=True,
+                extra={
+                    "preview_cost": 20,
+                    "submit_path": "/v1/videos/generations",
+                    "capabilities": old_capabilities,
+                },
+            )
+        )
+        model_config_id = int(result.inserted_primary_key[0])
+        connection.execute(
+            capability_versions.insert().values(
+                model_config_id=model_config_id,
+                version=1,
+                schema_version="capability.v1",
+                capabilities=old_capabilities,
+                metadata_snapshot=metadata_snapshot,
+                status="published",
+                is_active=True,
+                activated_at=now,
+            )
+        )
+
+    command.upgrade(cfg, "0075_grok_video_product_refs")
+    with engine.connect() as connection:
+        extra = connection.scalar(
+            sa.select(model_configs.c.extra).where(model_configs.c.id == model_config_id)
+        )
+        versions = connection.execute(
+            sa.select(
+                capability_versions.c.version,
+                capability_versions.c.status,
+                capability_versions.c.is_active,
+                capability_versions.c.source_version_id,
+                capability_versions.c.capabilities,
+                capability_versions.c.metadata_snapshot,
+            )
+            .where(capability_versions.c.model_config_id == model_config_id)
+            .order_by(capability_versions.c.version)
+        ).mappings().all()
+
+    assert extra == {
+        "preview_cost": 20,
+        "submit_path": "/v1/videos/generations",
+        "product_images_field": "images",
+        "product_images_item_field": "url",
+        "capabilities": expected_capabilities,
+    }
+    assert [
+        (row["version"], row["status"], row["is_active"])
+        for row in versions
+    ] == [(1, "disabled", False), (2, "published", True)]
+    assert versions[1]["source_version_id"] is not None
+    assert versions[1]["capabilities"] == expected_capabilities
+    assert versions[1]["metadata_snapshot"] == metadata_snapshot
+
+    command.downgrade(cfg, "0074_seedance_20_multi_reference")
+    command.upgrade(cfg, "0075_grok_video_product_refs")
+    with engine.connect() as connection:
+        version_count = connection.scalar(
+            sa.select(sa.func.count(capability_versions.c.id)).where(
+                capability_versions.c.model_config_id == model_config_id
+            )
+        )
+    assert version_count == 2
+    engine.dispose()
+
+
+def test_0076_replaces_grok_video_images_with_native_reference_schema(
+    tmp_path,
+    monkeypatch,
+):
+    backend = Path(__file__).resolve().parents[1]
+    db_path = tmp_path / "grok-video-native-reference-schema.db"
+    database_url = f"sqlite:///{db_path}"
+    monkeypatch.setattr(settings, "database_url", database_url)
+    cfg = Config(str(backend / "alembic.ini"))
+    cfg.set_main_option("script_location", str(backend / "alembic"))
+    command.upgrade(cfg, "0075_grok_video_product_refs")
+
+    engine = sa.create_engine(database_url)
+    metadata = sa.MetaData()
+    model_configs = sa.Table("model_configs", metadata, autoload_with=engine)
+    old_extra = {
+        "preview_cost": 20,
+        "product_images_field": "images",
+        "product_images_item_field": "url",
+        "capabilities": {
+            "text_to_video": True,
+            "image_to_video": True,
+            "multi_reference": True,
+            "max_reference_images": 2,
+        },
+    }
+    with engine.begin() as connection:
+        result = connection.execute(
+            model_configs.insert().values(
+                use="video",
+                model_id="grok-imagine-video-1.5",
+                display_name="Grok Video 1.5",
+                is_default=False,
+                sort_order=50,
+                provider="grok",
+                gateway_format="openai",
+                cost_credits=40,
+                unlock_cost=0,
+                enabled=True,
+                extra=old_extra,
+            )
+        )
+        model_config_id = int(result.inserted_primary_key[0])
+
+    expected_extra = {
+        "preview_cost": 20,
+        "first_frame_field": "image",
+        "first_frame_item_field": "url",
+        "product_images_field": "reference_images",
+        "product_images_item_field": "url",
+        "negative_prompt_mode": "append_to_prompt",
+        "capabilities": old_extra["capabilities"],
+    }
+
+    command.upgrade(cfg, "0076_grok_video_ref_schema")
+    with engine.connect() as connection:
+        extra = connection.scalar(
+            sa.select(model_configs.c.extra).where(model_configs.c.id == model_config_id)
+        )
+    assert extra == expected_extra
+
+    command.downgrade(cfg, "0075_grok_video_product_refs")
+    with engine.connect() as connection:
+        downgraded_extra = connection.scalar(
+            sa.select(model_configs.c.extra).where(model_configs.c.id == model_config_id)
+        )
+    assert downgraded_extra == old_extra
+
+    command.upgrade(cfg, "0076_grok_video_ref_schema")
+    with engine.connect() as connection:
+        upgraded_again = connection.scalar(
+            sa.select(model_configs.c.extra).where(model_configs.c.id == model_config_id)
+        )
+    assert upgraded_again == expected_extra
+    engine.dispose()
+
+
+def test_0077_disables_seedance_15_reference_to_video_and_keeps_frames(
+    tmp_path,
+    monkeypatch,
+):
+    backend = Path(__file__).resolve().parents[1]
+    db_path = tmp_path / "seedance-15-frame-only.db"
+    database_url = f"sqlite:///{db_path}"
+    monkeypatch.setattr(settings, "database_url", database_url)
+    cfg = Config(str(backend / "alembic.ini"))
+    cfg.set_main_option("script_location", str(backend / "alembic"))
+    command.upgrade(cfg, "0076_grok_video_ref_schema")
+
+    engine = sa.create_engine(database_url)
+    metadata = sa.MetaData()
+    model_configs = sa.Table("model_configs", metadata, autoload_with=engine)
+    capability_versions = sa.Table(
+        "model_capability_versions",
+        metadata,
+        autoload_with=engine,
+    )
+    model_id = "doubao-seedance-1-5-pro-251215"
+    old_capabilities = {
+        "text_to_video": True,
+        "image_to_video": True,
+        "first_last_frame": True,
+        "multi_reference": True,
+        "max_reference_images": 2,
+        "custom_flag": "keep",
+    }
+    metadata_snapshot = {
+        "schema_version": "model-catalog-metadata.v1",
+        "origin": "test",
+        "model_id": model_id,
+        "display_name": "Seedance 1.5 Pro",
+        "is_default": False,
+        "sort_order": 20,
+        "enabled": True,
+    }
+    now = datetime.now(timezone.utc)
+    with engine.begin() as connection:
+        result = connection.execute(
+            model_configs.insert().values(
+                use="video",
+                model_id=model_id,
+                display_name="Seedance 1.5 Pro",
+                is_default=False,
+                sort_order=20,
+                provider="volcengine_ark",
+                gateway_format="ark",
+                cost_credits=100,
+                unlock_cost=0,
+                enabled=True,
+                extra={
+                    "preview_cost": 50,
+                    "capabilities": old_capabilities,
+                },
+            )
+        )
+        model_config_id = int(result.inserted_primary_key[0])
+        connection.execute(
+            capability_versions.insert().values(
+                model_config_id=model_config_id,
+                version=1,
+                schema_version="capability.v1",
+                capabilities=old_capabilities,
+                metadata_snapshot=metadata_snapshot,
+                status="published",
+                is_active=True,
+                activated_at=now,
+            )
+        )
+
+    command.upgrade(cfg, "0077_seedance_15_ref_fix")
+    expected_capabilities = {
+        "text_to_video": True,
+        "image_to_video": True,
+        "reference_image": False,
+        "first_last_frame": True,
+        "multi_reference": False,
+        "custom_flag": "keep",
+    }
+    with engine.connect() as connection:
+        extra = connection.scalar(
+            sa.select(model_configs.c.extra).where(model_configs.c.id == model_config_id)
+        )
+        versions = connection.execute(
+            sa.select(
+                capability_versions.c.version,
+                capability_versions.c.status,
+                capability_versions.c.is_active,
+                capability_versions.c.source_version_id,
+                capability_versions.c.capabilities,
+                capability_versions.c.metadata_snapshot,
+            )
+            .where(capability_versions.c.model_config_id == model_config_id)
+            .order_by(capability_versions.c.version)
+        ).mappings().all()
+
+    assert extra == {
+        "preview_cost": 50,
+        "capabilities": expected_capabilities,
+    }
+    assert [
+        (row["version"], row["status"], row["is_active"])
+        for row in versions
+    ] == [(1, "disabled", False), (2, "published", True)]
+    assert versions[1]["source_version_id"] is not None
+    assert versions[1]["capabilities"] == expected_capabilities
+    assert versions[1]["metadata_snapshot"] == metadata_snapshot
+
+    command.downgrade(cfg, "0076_grok_video_ref_schema")
+    command.upgrade(cfg, "0077_seedance_15_ref_fix")
+    with engine.connect() as connection:
+        version_count = connection.scalar(
+            sa.select(sa.func.count(capability_versions.c.id)).where(
+                capability_versions.c.model_config_id == model_config_id
+            )
+        )
+    assert version_count == 2
+    engine.dispose()
+
+
+def test_0078_splits_grok_reference_video_from_15_capabilities(tmp_path, monkeypatch):
+    backend = Path(__file__).resolve().parents[1]
+    db_path = tmp_path / "grok-video-model-split.db"
+    database_url = f"sqlite:///{db_path}"
+    monkeypatch.setattr(settings, "database_url", database_url)
+    cfg = Config(str(backend / "alembic.ini"))
+    cfg.set_main_option("script_location", str(backend / "alembic"))
+    command.upgrade(cfg, "0077_seedance_15_ref_fix")
+
+    engine = sa.create_engine(database_url)
+    metadata = sa.MetaData()
+    model_configs = sa.Table("model_configs", metadata, autoload_with=engine)
+    capability_versions = sa.Table(
+        "model_capability_versions",
+        metadata,
+        autoload_with=engine,
+    )
+    with engine.begin() as connection:
+        for model_id in ("grok-imagine-video", "grok-imagine-video-1.5"):
+            connection.execute(
+                model_configs.insert().values(
+                    use="video",
+                    model_id=model_id,
+                    display_name=model_id,
+                    is_default=False,
+                    sort_order=50,
+                    provider="grok",
+                    gateway_format="openai",
+                    cost_credits=40,
+                    unlock_cost=0,
+                    enabled=True,
+                    extra={
+                        "capabilities": {
+                            "text_to_video": True,
+                            "image_to_video": model_id.endswith("1.5"),
+                            "multi_reference": model_id.endswith("1.5"),
+                            "max_reference_images": 2,
+                        },
+                        "product_images_field": "reference_images",
+                        "product_images_item_field": "url",
+                    },
+                )
+            )
+
+    command.upgrade(cfg, "0078_grok_video_model_split")
+    with engine.connect() as connection:
+        rows = connection.execute(
+            sa.select(
+                model_configs.c.id,
+                model_configs.c.model_id,
+                model_configs.c.extra,
+            ).where(model_configs.c.model_id.in_([
+                "grok-imagine-video",
+                "grok-imagine-video-1.5",
+            ]))
+        ).mappings().all()
+        version_rows = connection.execute(
+            sa.select(
+                capability_versions.c.model_config_id,
+                capability_versions.c.status,
+                capability_versions.c.is_active,
+                capability_versions.c.capabilities,
+            ).where(capability_versions.c.model_config_id.in_([
+                int(row["id"]) for row in rows
+            ]))
+        ).mappings().all()
+
+    by_model = {row["model_id"]: row for row in rows}
+    reference_extra = by_model["grok-imagine-video"]["extra"]
+    assert reference_extra["product_images_field"] == "reference_images"
+    assert reference_extra["capabilities"] == {
+        "text_to_video": True,
+        "image_to_video": True,
+        "reference_image": True,
+        "multi_reference": True,
+        "max_reference_images": 3,
+    }
+
+    grok_15_extra = by_model["grok-imagine-video-1.5"]["extra"]
+    assert "product_images_field" not in grok_15_extra
+    assert grok_15_extra["first_frame_field"] == "image"
+    assert grok_15_extra["capabilities"] == {
+        "text_to_video": True,
+        "image_to_video": True,
+        "reference_image": False,
+        "multi_reference": False,
+    }
+    assert len(version_rows) == 2
+    assert all(row["status"] == "published" for row in version_rows)
+    assert all(row["is_active"] is True for row in version_rows)
+    engine.dispose()
+
+
+def test_0075_does_not_enable_unverified_grok_video_provider(tmp_path, monkeypatch):
+    backend = Path(__file__).resolve().parents[1]
+    db_path = tmp_path / "unverified-grok-video-product-references.db"
+    database_url = f"sqlite:///{db_path}"
+    monkeypatch.setattr(settings, "database_url", database_url)
+    cfg = Config(str(backend / "alembic.ini"))
+    cfg.set_main_option("script_location", str(backend / "alembic"))
+    command.upgrade(cfg, "0074_seedance_20_multi_reference")
+
+    engine = sa.create_engine(database_url)
+    metadata = sa.MetaData()
+    model_configs = sa.Table("model_configs", metadata, autoload_with=engine)
+    capability_versions = sa.Table(
+        "model_capability_versions",
+        metadata,
+        autoload_with=engine,
+    )
+    old_extra = {
+        "capabilities": {
+            "text_to_video": True,
+            "image_to_video": True,
+            "multi_reference": False,
+        }
+    }
+    with engine.begin() as connection:
+        result = connection.execute(
+            model_configs.insert().values(
+                use="video",
+                model_id="grok-imagine-video-1.5",
+                display_name="Unverified Grok Proxy",
+                is_default=False,
+                sort_order=60,
+                provider="custom_openai",
+                gateway_format="openai",
+                cost_credits=40,
+                unlock_cost=0,
+                enabled=True,
+                extra=old_extra,
+            )
+        )
+        model_config_id = int(result.inserted_primary_key[0])
+
+    command.upgrade(cfg, "0075_grok_video_product_refs")
+    with engine.connect() as connection:
+        extra = connection.scalar(
+            sa.select(model_configs.c.extra).where(model_configs.c.id == model_config_id)
+        )
+        version_count = connection.scalar(
+            sa.select(sa.func.count(capability_versions.c.id)).where(
+                capability_versions.c.model_config_id == model_config_id
+            )
+        )
+
+    assert extra == old_extra
+    assert version_count == 0
+    engine.dispose()

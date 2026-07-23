@@ -26,6 +26,17 @@ const portrait = promptOptimizationContextKey({
 
 assert.notEqual(general, product);
 assert.notEqual(product, portrait);
+assert.notEqual(
+  general,
+  promptOptimizationContextKey({
+    creationMode: "image_edit",
+    category: "image",
+    subjectMode: "general",
+    productGenerationMode: false,
+    optimizationDirection: "model_adaptation",
+  }),
+  "changing the optimization direction must invalidate in-flight and accepted results",
+);
 
 const fiveSecondVideo = promptOptimizationContextKey({
   creationMode: "video_edit",
@@ -58,6 +69,25 @@ const fifteenSecondVideo = promptOptimizationContextKey({
   targetModelProvider: "volcengine_ark",
 });
 assert.notEqual(fiveSecondVideo, fifteenSecondVideo);
+assert.notEqual(
+  fiveSecondVideo,
+  promptOptimizationContextKey({
+    creationMode: "video_edit",
+    category: "video",
+    subjectMode: "product",
+    productGenerationMode: true,
+    duration: 5,
+    aspectRatio: "9:16",
+    resolution: "1080p",
+    productLockMode: "locked",
+    productVideoTemplate: "soft_splash",
+    referenceSignature: "product-a|style-a",
+    subjectProfileSource: "product-a",
+    targetModelId: "seedance-mini",
+    targetModelProvider: "volcengine_ark",
+  }),
+  "changing only the product video strategy must invalidate prompt optimization context",
+);
 assert.notEqual(
   fiveSecondVideo,
   promptOptimizationContextKey({

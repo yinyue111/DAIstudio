@@ -21,7 +21,11 @@ from .generation_common import (
     settlement_cost,
 )
 from .generation_media import localize_video_poster, video_media_meta, video_poster_url
-from .generation_model_runtime import model_config_for_task, model_from_snapshot
+from .generation_model_runtime import (
+    gateway_config_from_model,
+    model_config_for_task,
+    model_from_snapshot,
+)
 from .generation_state import (
     NEEDS_REVIEW,
     LocalVideoSettlementError,
@@ -55,10 +59,10 @@ def _existing_local_key(keys: list[str], prefixes: tuple[str, ...]) -> str | Non
         if not key.startswith(prefixes):
             continue
         try:
-            path = storage.local_path(key)
+            present = storage.exists(key)
         except Exception:  # noqa: BLE001
             continue
-        if path.exists() and path.is_file():
+        if present:
             return key
     return None
 
@@ -429,7 +433,7 @@ def run_video_download_task(
                 expected_external_task_id=expected_external_task_id,
             )
             return
-        model = model_from_snapshot(task, model)
+        model = model_from_snapshot(task, model, db)
         finalize_or_retry_video_download(
             db,
             task,
@@ -565,6 +569,10 @@ def finalize_video_success(
 
             mark_download_progress()
             media_subdir = "video_hd" if task_stage == "final" else "video_preview"
+            request_headers = gateway.video_result_download_headers(
+                video_url,
+                gateway_config_from_model(model, "video"),
+            )
             media_key = gateway.download_to_storage(
                 video_url,
                 media_subdir,
@@ -575,6 +583,7 @@ def finalize_video_success(
                 progress_callback=mark_download_progress,
                 low_speed_timeout_seconds=int(settings.video_download_low_speed_timeout_seconds),
                 low_speed_min_bytes_per_second=int(settings.video_download_low_speed_bytes_per_second),
+                request_headers=request_headers or None,
             )
             mark_download_progress()
             written_keys.append(media_key)
@@ -721,7 +730,7 @@ def admin_settle_needs_review_video(
     model = model_config_for_task(db, task, "video", model_loader)
     if not model:
         raise ValueError("未配置视频模型")
-    model = model_from_snapshot(task, model)
+    model = model_from_snapshot(task, model, db)
     params = dict(task.params or {})
     if external_task_id:
         task.external_task_id = external_task_id
