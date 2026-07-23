@@ -23,6 +23,16 @@ def redis_connection_kwargs() -> dict:
     return kwargs
 
 
+def blocking_redis_connection_kwargs() -> dict:
+    """Use a socket timeout comfortably above the bounded Stream BLOCK calls."""
+    kwargs = redis_connection_kwargs()
+    kwargs.update({
+        "max_connections": max(2, min(10, int(settings.redis.max_connections))),
+        "socket_timeout": max(30.0, float(kwargs["socket_timeout"])),
+    })
+    return kwargs
+
+
 def celery_redis_url() -> str:
     """Return a broker URL with the separately supplied password encoded safely."""
     redis_settings = settings.redis
@@ -41,8 +51,5 @@ def celery_redis_url() -> str:
 redis_client = redis.from_url(settings.redis.url, **redis_connection_kwargs())
 blocking_redis_client = redis.from_url(
     settings.redis.url,
-    **{
-        **redis_connection_kwargs(),
-        "max_connections": max(2, min(10, int(settings.redis.max_connections))),
-    },
+    **blocking_redis_connection_kwargs(),
 )

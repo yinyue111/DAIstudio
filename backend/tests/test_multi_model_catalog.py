@@ -7,12 +7,23 @@ from alembic import command
 from alembic.config import Config
 from app.config import settings
 from app.db import SessionLocal
-from app.models import GatewayCall, GenTask, ModelConfig
+from app.models import (
+    GatewayCall,
+    GenAsset,
+    GenerationDispatch,
+    GenerationQuote,
+    GenTask,
+    ModelCapabilityVersion,
+    ModelConfig,
+    ModelPriceVersion,
+)
+from app.services.catalog import public_capabilities
 from app.services.config_store import (
     ModelConfigResolutionError,
     get_model_config,
     resolve_model_config,
 )
+from app.services.generation_model_runtime import model_snapshot
 from app.services.model_capabilities import (
     ModelCapabilityError,
     assert_generation_capability,
@@ -21,7 +32,24 @@ from app.services.model_capabilities import (
 from app.services.model_gateway_config import decrypt_row_api_key
 
 
-def test_admin_catalog_create_patch_and_public_secret_boundary(client, make_user, auth):
+def test_public_catalog_exposes_only_supported_product_video_templates():
+    assert public_capabilities(
+        {
+            "capabilities": {
+                "product_video_templates": [
+                    "stable_showcase",
+                    "unknown-template",
+                    "stable_showcase",
+                    3,
+                ],
+            }
+        }
+    ) == {"product_video_templates": ["stable_showcase"]}
+
+
+def test_admin_catalog_create_patch_and_public_secret_boundary(
+    client, make_user, auth, quote_and_generate
+):
     make_user("13900001901", admin=True)
     make_user("13900001902")
     admin_headers = auth("13900001901")
@@ -87,10 +115,9 @@ def test_admin_catalog_create_patch_and_public_secret_boundary(client, make_user
         assert "do-not-publish" not in public.text
         assert "internal_endpoint" not in public.text
 
-        generated = client.post(
-            "/api/generate",
+        generated = quote_and_generate(
             headers=user_headers,
-            json={
+            payload={
                 "client_request_id": "catalog-image-generation-001",
                 "category": "image",
                 "stage": "preview",
@@ -155,12 +182,258 @@ def test_admin_catalog_create_patch_and_public_secret_boundary(client, make_user
     finally:
         if created_id is not None:
             with SessionLocal() as db:
+                tasks = db.query(GenTask).filter_by(model_config_id=created_id).all()
+                task_ids = [int(task.id) for task in tasks]
+                quotes = db.query(GenerationQuote).filter_by(
+                    model_config_id=created_id
+                ).all()
+                for task in tasks:
+                    task.quote_id = None
+                for quote in quotes:
+                    quote.task_id = None
+                db.flush()
+                if task_ids:
+                    db.query(GenerationDispatch).filter(
+                        GenerationDispatch.task_id.in_(task_ids)
+                    ).delete(synchronize_session=False)
+                    db.query(GenAsset).filter(GenAsset.task_id.in_(task_ids)).delete(
+                        synchronize_session=False
+                    )
+                    db.query(GatewayCall).filter(
+                        GatewayCall.task_id.in_(task_ids)
+                    ).delete(synchronize_session=False)
+                    db.query(GenTask).filter(GenTask.id.in_(task_ids)).delete(
+                        synchronize_session=False
+                    )
+                for quote in quotes:
+                    db.delete(quote)
                 row = db.get(ModelConfig, created_id)
                 if row is not None:
                     db.delete(row)
                 original = db.get(ModelConfig, original_default_id)
                 if original is not None:
                     original.is_default = True
+                db.commit()
+
+
+def test_admin_model_purpose_can_change_and_soft_delete_preserves_history(
+    client, make_user, auth
+):
+    make_user("13900001921", admin=True)
+    headers = auth("13900001921")
+    payload = {
+        "use": "image",
+        "model_id": "movable-soft-delete-model",
+        "display_name": "Movable Soft Delete Model",
+        "cost_credits": 3,
+        "unlock_cost": 0,
+        "enabled": True,
+        "is_default": False,
+        "sort_order": 900,
+        "extra": {"capabilities": {"text_to_image": True}},
+    }
+    created = client.post("/api/admin/models", headers=headers, json=payload)
+    assert created.status_code == 201, created.text
+    model_config_id = int(created.json()["model"]["id"])
+
+    moved = client.patch(
+        f"/api/admin/models/{model_config_id}",
+        headers=headers,
+        json={"use": "video"},
+    )
+    assert moved.status_code == 200, moved.text
+    assert moved.json()["model"]["use"] == "video"
+
+    deleted = client.delete(f"/api/admin/models/{model_config_id}", headers=headers)
+    assert deleted.status_code == 200, deleted.text
+    assert deleted.json() == {"ok": True}
+    listed_ids = {
+        int(item["id"])
+        for item in client.get("/api/admin/models", headers=headers).json()["models"]
+    }
+    assert model_config_id not in listed_ids
+    with SessionLocal() as db:
+        historical_row = db.get(ModelConfig, model_config_id)
+        assert historical_row is not None
+        assert historical_row.deleted_at is not None
+        assert historical_row.enabled is False
+        assert historical_row.is_default is False
+        with pytest.raises(ModelConfigResolutionError, match="不存在"):
+            resolve_model_config(db, "video", model_config_id)
+
+    recreated = client.post(
+        "/api/admin/models",
+        headers=headers,
+        json={**payload, "use": "video"},
+    )
+    assert recreated.status_code == 201, recreated.text
+    recreated_id = int(recreated.json()["model"]["id"])
+    assert recreated_id != model_config_id
+    with SessionLocal() as db:
+        for row_id in (model_config_id, recreated_id):
+            row = db.get(ModelConfig, row_id)
+            if row is not None:
+                db.delete(row)
+        db.commit()
+
+
+def test_admin_cannot_move_or_delete_model_with_active_tasks(client, make_user, auth):
+    user_id = make_user("13900001922", admin=True)
+    headers = auth("13900001922")
+    with SessionLocal() as db:
+        default = get_model_config(db, "image")
+        assert default is not None
+        row = ModelConfig(
+            use="image",
+            model_id="active-task-protected-model",
+            display_name="Active Task Protected Model",
+            is_default=False,
+            sort_order=901,
+            provider=default.provider,
+            base_url=default.base_url,
+            api_key_encrypted=default.api_key_encrypted,
+            gateway_format=default.gateway_format,
+            cost_credits=1,
+            unlock_cost=0,
+            enabled=True,
+            extra=dict(default.extra or {}),
+        )
+        db.add(row)
+        db.flush()
+        task = GenTask(
+            user_id=user_id,
+            model_config_id=row.id,
+            category="image",
+            stage="preview",
+            prompt={"final_text": "active task"},
+            model_use="image",
+            params={},
+            status="running",
+            cost_frozen=0,
+            cost_settled=0,
+        )
+        db.add(task)
+        db.commit()
+        model_config_id = int(row.id)
+
+    moved = client.patch(
+        f"/api/admin/models/{model_config_id}", headers=headers, json={"use": "video"}
+    )
+    assert moved.status_code == 409
+    deleted = client.delete(f"/api/admin/models/{model_config_id}", headers=headers)
+    assert deleted.status_code == 409
+
+    with SessionLocal() as db:
+        db.query(GenTask).filter_by(model_config_id=model_config_id).delete()
+        row = db.get(ModelConfig, model_config_id)
+        if row is not None:
+            db.delete(row)
+        db.commit()
+
+
+def test_retry_keeps_task_bound_catalog_model_when_default_differs(client, make_user, auth):
+    uid = make_user("13900001912", balance=1000)
+    headers = auth("13900001912")
+    task_id = None
+    bound_model_id = None
+    try:
+        with SessionLocal() as db:
+            default_model = get_model_config(db, "image")
+            assert default_model is not None
+            bound_model = ModelConfig(
+                use="image",
+                model_id="retry-bound-catalog-image",
+                display_name="Retry Bound Catalog Image",
+                is_default=False,
+                sort_order=999,
+                provider=default_model.provider,
+                base_url=default_model.base_url,
+                api_key_encrypted=default_model.api_key_encrypted,
+                gateway_format=default_model.gateway_format,
+                cost_credits=3,
+                unlock_cost=0,
+                enabled=True,
+                extra=dict(default_model.extra or {}),
+            )
+            db.add(bound_model)
+            db.flush()
+            snapshot = model_snapshot(bound_model)
+            task = GenTask(
+                user_id=uid,
+                model_config_id=bound_model.id,
+                category="image",
+                stage="preview",
+                prompt={"final_text": "retry with the originally selected catalog model"},
+                model_use="image",
+                params={"n": 1, "size": "256x256", "_model_snapshot": snapshot},
+                status="failed",
+                cost_frozen=0,
+                cost_settled=0,
+            )
+            db.add(task)
+            db.commit()
+            task_id = task.id
+            bound_model_id = bound_model.id
+
+        response = client.post(f"/api/tasks/{task_id}/retry", headers=headers)
+        assert response.status_code == 200, response.text
+
+        with SessionLocal() as db:
+            retried = db.get(GenTask, task_id)
+            assert retried is not None
+            assert retried.model_config_id == bound_model_id
+            assert retried.params["_model_snapshot"]["model_config_id"] == bound_model_id
+            assert retried.params["_model_snapshot"]["model_id"] == "retry-bound-catalog-image"
+            call = (
+                db.query(GatewayCall)
+                .filter(GatewayCall.task_id == task_id, GatewayCall.kind == "image")
+                .one()
+            )
+            assert call.model_config_id == bound_model_id
+    finally:
+        if bound_model_id is not None:
+            with SessionLocal() as db:
+                tasks = (
+                    db.query(GenTask).filter(GenTask.id == task_id).all()
+                    if task_id is not None
+                    else []
+                )
+                task_ids = [int(task.id) for task in tasks]
+                quotes = db.query(GenerationQuote).filter(
+                    GenerationQuote.model_config_id == bound_model_id
+                ).all()
+                for task in tasks:
+                    task.quote_id = None
+                for quote in quotes:
+                    quote.task_id = None
+                db.flush()
+                if task_ids:
+                    db.query(GenerationDispatch).filter(
+                        GenerationDispatch.task_id.in_(task_ids)
+                    ).delete(synchronize_session=False)
+                    db.query(GenAsset).filter(GenAsset.task_id.in_(task_ids)).delete(
+                        synchronize_session=False
+                    )
+                    db.query(GatewayCall).filter(
+                        sa.or_(
+                            GatewayCall.task_id.in_(task_ids),
+                            GatewayCall.model_config_id == bound_model_id,
+                        )
+                    ).delete(synchronize_session=False)
+                    db.query(GenTask).filter(GenTask.id.in_(task_ids)).delete(
+                        synchronize_session=False
+                    )
+                for quote in quotes:
+                    db.delete(quote)
+                db.query(ModelCapabilityVersion).filter(
+                    ModelCapabilityVersion.model_config_id == bound_model_id
+                ).delete(synchronize_session=False)
+                db.query(ModelPriceVersion).filter(
+                    ModelPriceVersion.model_config_id == bound_model_id
+                ).delete(synchronize_session=False)
+                db.query(ModelConfig).filter(ModelConfig.id == bound_model_id).delete(
+                    synchronize_session=False
+                )
                 db.commit()
 
 
@@ -229,6 +502,12 @@ def test_admin_catalog_bulk_import_reuses_one_encrypted_provider_connection(
             assert all(row.api_key_encrypted != "bulk-import-secret" for row in rows)
     finally:
         with SessionLocal() as db:
+            db.query(ModelCapabilityVersion).filter(
+                ModelCapabilityVersion.model_config_id.in_(created_ids)
+            ).delete(synchronize_session=False)
+            db.query(ModelPriceVersion).filter(
+                ModelPriceVersion.model_config_id.in_(created_ids)
+            ).delete(synchronize_session=False)
             db.query(ModelConfig).filter(ModelConfig.id.in_(created_ids)).delete(
                 synchronize_session=False
             )
@@ -382,13 +661,19 @@ def test_admin_create_reuses_existing_provider_without_resubmitting_secret(
         assert "不能与 Base URL" in conflict.text
     finally:
         with SessionLocal() as db:
+            db.query(ModelCapabilityVersion).filter(
+                ModelCapabilityVersion.model_config_id.in_(created_ids)
+            ).delete(synchronize_session=False)
+            db.query(ModelPriceVersion).filter(
+                ModelPriceVersion.model_config_id.in_(created_ids)
+            ).delete(synchronize_session=False)
             db.query(ModelConfig).filter(ModelConfig.id.in_(created_ids)).delete(
                 synchronize_session=False
             )
             db.commit()
 
 
-def test_admin_catalog_enforces_supported_protocol_and_enabled_default(
+def test_admin_catalog_accepts_anthropic_vision_and_enforces_enabled_default(
     client, make_user, auth
 ):
     make_user("13900001905", admin=True)
@@ -398,14 +683,23 @@ def test_admin_catalog_enforces_supported_protocol_and_enabled_default(
         headers=headers,
         json={
             "use": "vision",
-            "model_id": "unsupported-anthropic-vision",
-            "provider": "anthropic",
+            "model_id": "supported-anthropic-vision",
+            "display_name": "Supported Anthropic Vision",
+            "provider": "antigravity",
+            "base_url": "https://vision.example.com/antigravity",
+            "api_key": "anthropic-vision-secret",
             "gateway_format": "anthropic",
             "cost_credits": 2,
         },
     )
-    assert anthropic_vision.status_code == 422
-    assert "不支持 Anthropic" in anthropic_vision.text
+    assert anthropic_vision.status_code == 201, anthropic_vision.text
+    anthropic_vision_id = anthropic_vision.json()["model"]["id"]
+    public_config = client.get("/api/config", headers=headers)
+    assert public_config.status_code == 200, public_config.text
+    assert any(
+        item["id"] == anthropic_vision_id
+        for item in public_config.json()["model_options"]["vision"]
+    )
 
     disabled_default = client.post(
         "/api/admin/models",
@@ -433,6 +727,18 @@ def test_admin_catalog_enforces_supported_protocol_and_enabled_default(
     )
     assert unset_only_default.status_code == 409
     assert "必须保留一个" in unset_only_default.text
+
+    with SessionLocal() as db:
+        db.query(ModelCapabilityVersion).filter_by(
+            model_config_id=anthropic_vision_id
+        ).delete(synchronize_session=False)
+        db.query(ModelPriceVersion).filter_by(
+            model_config_id=anthropic_vision_id
+        ).delete(synchronize_session=False)
+        db.query(ModelConfig).filter_by(id=anthropic_vision_id).delete(
+            synchronize_session=False
+        )
+        db.commit()
 
 
 def test_reverse_capabilities_only_reject_explicitly_unsupported_modes():
@@ -517,6 +823,256 @@ def test_product_detail_capability_counts_unique_reference_urls():
             "first_frame_image": "https://example.com/product.png",
         },
     )
+
+
+def test_seedance_15_supports_frame_pair_but_rejects_independent_references():
+    model = type(
+        "Seedance15Model",
+        (),
+        {
+            "extra": {
+                "capabilities": {
+                    "text_to_video": True,
+                    "image_to_video": True,
+                    "reference_image": False,
+                    "first_last_frame": True,
+                    "multi_reference": False,
+                }
+            }
+        },
+    )()
+
+    assert_generation_capability(
+        model,
+        category="video",
+        source_asset_url="https://example.com/first.png",
+        source_type="image",
+        params={"last_frame_image": "https://example.com/last.png"},
+    )
+
+    with pytest.raises(ModelCapabilityError, match="不支持主体或风格参考图"):
+        assert_generation_capability(
+            model,
+            category="video",
+            source_asset_url="https://example.com/product.png",
+            source_type="image",
+            params={
+                "product_reference_image": "https://example.com/product.png",
+                "product_detail_images": ["https://example.com/detail-a.png"],
+            },
+        )
+
+
+def test_seedance_20_limit_allows_theme_plus_nine_details_only():
+    model = type(
+        "Seedance20Model",
+        (),
+        {
+            "extra": {
+                "capabilities": {
+                    "image_to_video": True,
+                    "multi_reference": True,
+                    "max_reference_images": 10,
+                }
+            }
+        },
+    )()
+    nine_details = [f"https://example.com/detail-{index}.png" for index in range(9)]
+    base_params = {
+        "product_reference_image": "https://example.com/product.png",
+        "product_detail_images": nine_details,
+    }
+
+    assert_generation_capability(
+        model,
+        category="video",
+        source_asset_url=None,
+        source_type=None,
+        params=base_params,
+    )
+    with pytest.raises(ModelCapabilityError, match="最多支持 10 张"):
+        assert_generation_capability(
+            model,
+            category="video",
+            source_asset_url=None,
+            source_type=None,
+            params={
+                **base_params,
+                "product_detail_images": [
+                    *nine_details,
+                    "https://example.com/detail-10.png",
+                ],
+            },
+        )
+
+
+def test_first_last_frame_pair_uses_its_own_explicit_capability():
+    model = type(
+        "VideoModel",
+        (),
+        {
+            "extra": {
+                "capabilities": {
+                    "text_to_video": True,
+                    "image_to_video": True,
+                    "first_last_frame": True,
+                    "multi_reference": False,
+                    "max_reference_images": 2,
+                }
+            }
+        },
+    )()
+
+    assert_generation_capability(
+        model,
+        category="video",
+        source_asset_url="https://example.com/first.png",
+        source_type="image",
+        params={"last_frame_image": "https://example.com/last.png"},
+    )
+
+
+def test_first_last_frame_pair_does_not_bypass_general_multi_reference_gate():
+    model = type(
+        "VideoModel",
+        (),
+        {
+            "extra": {
+                "capabilities": {
+                    "image_to_video": True,
+                    "first_last_frame": True,
+                    "multi_reference": False,
+                    "max_reference_images": 2,
+                }
+            }
+        },
+    )()
+
+    with pytest.raises(ModelCapabilityError, match="不支持主体或风格参考图"):
+        assert_generation_capability(
+            model,
+            category="video",
+            source_asset_url="https://example.com/source.png",
+            source_type="image",
+            params={
+                "first_frame_image": "https://example.com/first.png",
+                "last_frame_image": "https://example.com/last.png",
+                "style_reference_image": "https://example.com/style.png",
+            },
+        )
+
+
+def test_first_last_frame_requires_explicit_support_and_a_resolvable_first_frame():
+    unsupported = type(
+        "VideoModel",
+        (),
+        {
+            "extra": {
+                "capabilities": {
+                    "image_to_video": True,
+                    "first_last_frame": False,
+                }
+            }
+        },
+    )()
+    with pytest.raises(ModelCapabilityError, match="未明确支持首尾帧"):
+        assert_generation_capability(
+            unsupported,
+            category="video",
+            source_asset_url="https://example.com/first.png",
+            source_type="image",
+            params={"last_frame_image": "https://example.com/last.png"},
+        )
+
+    supported = type(
+        "VideoModel",
+        (),
+        {"extra": {"capabilities": {"image_to_video": True, "first_last_frame": True}}},
+    )()
+    with pytest.raises(ModelCapabilityError, match="尾帧素材必须配合首帧"):
+        assert_generation_capability(
+            supported,
+            category="video",
+            source_asset_url=None,
+            source_type=None,
+            params={"last_frame_image": "https://example.com/last.png"},
+        )
+
+
+def test_same_url_first_last_roles_still_require_explicit_support():
+    model = type(
+        "VideoModel",
+        (),
+        {
+            "extra": {
+                "capabilities": {
+                    "image_to_video": True,
+                    "first_last_frame": False,
+                }
+            }
+        },
+    )()
+
+    with pytest.raises(ModelCapabilityError, match="未明确支持首尾帧"):
+        assert_generation_capability(
+            model,
+            category="video",
+            source_asset_url="https://example.com/loop.png",
+            source_type="image",
+            params={"last_frame_image": "https://example.com/loop.png"},
+        )
+
+
+@pytest.mark.parametrize(
+    ("capabilities", "template", "expected_error"),
+    [
+        ({}, "prompt_driven", None),
+        ({"product_video_templates": ["stable_showcase"]}, "stable_showcase", None),
+        (
+            {"product_video_templates": ["stable_showcase"]},
+            "prompt_driven",
+            "不支持当前产品视频策略",
+        ),
+        ({"product_video_templates": []}, "stable_showcase", "不支持当前产品视频策略"),
+        ({}, "unknown-template", "策略不受支持"),
+    ],
+)
+def test_product_video_template_is_capability_driven(
+    capabilities,
+    template,
+    expected_error,
+):
+    model = type("VideoModel", (), {"extra": {"capabilities": capabilities}})()
+    def assert_template_capability():
+        assert_generation_capability(
+            model,
+            category="video",
+            source_asset_url="https://example.com/product.png",
+            source_type="image",
+            params={
+                "product_reference_image": "https://example.com/product.png",
+                "product_video_template": template,
+            },
+        )
+
+    if expected_error:
+        with pytest.raises(ModelCapabilityError, match=expected_error):
+            assert_template_capability()
+    else:
+        assert_template_capability()
+
+
+def test_product_video_template_requires_product_reference_image():
+    model = type("VideoModel", (), {"extra": {"capabilities": {}}})()
+
+    with pytest.raises(ModelCapabilityError, match="必须配合产品参考图"):
+        assert_generation_capability(
+            model,
+            category="video",
+            source_asset_url=None,
+            source_type="image",
+            params={"product_video_template": "prompt_driven"},
+        )
 
 
 def test_admin_runtime_change_blocks_only_tasks_using_that_model(client, make_user, auth):

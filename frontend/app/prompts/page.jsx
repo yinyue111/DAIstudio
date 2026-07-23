@@ -6,9 +6,11 @@ import Nav from "../../components/Nav";
 import PromptLibraryBrowser, { STUDIO_DRAFT_PROMPT_KEY } from "../../components/PromptLibraryBrowser";
 import { useToast } from "../../components/ToastProvider";
 import { api } from "../../lib/api";
+import { buildCreationRecipeStudioDraft } from "../../lib/creationRecipeTransfer";
 import { redirectOnAuthError, reportBackgroundError } from "../../lib/errorHandling";
 import { saveStudioUserDraft } from "../../lib/studioSession";
 import { reverseSnapshotFromHistory } from "../studio/reverseSnapshot";
+import CreationRecipeBrowser from "./CreationRecipeBrowser";
 
 export default function PromptsPage() {
   const router = useRouter();
@@ -17,12 +19,20 @@ export default function PromptsPage() {
   const [msg, setMsg] = useState("");
   const [msgKind, setMsgKind] = useState("ok");
   const [activeTab, setActiveTab] = useState("system");
+  const [recipesEnabled, setRecipesEnabled] = useState(false);
   const [myPrompts, setMyPrompts] = useState([]);
   const [historyQuery, setHistoryQuery] = useState("");
   const [historyFilter, setHistoryFilter] = useState("all");
   const [manualPrompt, setManualPrompt] = useState("");
   const [manualTitle, setManualTitle] = useState("");
+  const [recipes, setRecipes] = useState([]);
+  const [recipeScope, setRecipeScope] = useState("mine");
+  const [recipeFilter, setRecipeFilter] = useState("all");
+  const [recipeQuery, setRecipeQuery] = useState("");
+  const [recipeLoading, setRecipeLoading] = useState(false);
+  const [recipeError, setRecipeError] = useState("");
   const historyReqRef = useRef(0);
+  const recipeReqRef = useRef(0);
 
   useEffect(() => {
     api.me().then((u) => {
@@ -30,6 +40,24 @@ export default function PromptsPage() {
       loadHistory();
     }).catch((e) => redirectOnAuthError(e, router, setMsg, "prompts session probe"));
   }, []);
+
+  useEffect(() => {
+    let active = true;
+    api.config()
+      .then((config) => {
+        if (active) setRecipesEnabled(config?.features?.recipes_enabled === true);
+      })
+      .catch((error) => reportBackgroundError(error, "prompt library feature config"));
+    return () => { active = false; };
+  }, []);
+
+  useEffect(() => {
+    if (recipesEnabled && activeTab === "recipes" && me?.id) loadRecipes();
+  }, [activeTab, me?.id, recipeFilter, recipeScope, recipesEnabled]);
+
+  useEffect(() => {
+    if (!recipesEnabled && activeTab === "recipes") setActiveTab("system");
+  }, [activeTab, recipesEnabled]);
 
   async function loadHistory(overrides = {}) {
     const req = ++historyReqRef.current;
@@ -53,14 +81,14 @@ export default function PromptsPage() {
   }
 
   function usePrompt(item, { trackUsage = true } = {}) {
-    const reverseSnapshotV2 = reverseSnapshotFromHistory(item);
+    const reverseSnapshotV3 = reverseSnapshotFromHistory(item);
     try {
       const saved = saveStudioUserDraft(window.localStorage, STUDIO_DRAFT_PROMPT_KEY, me?.id, {
         prompt: item.prompt || "",
         category: item.category || "general",
-        creationMode: reverseSnapshotV2?.creation_mode || (item.category === "video" ? "video" : "image"),
-        reverse_snapshot_v2: reverseSnapshotV2,
-        legacy_reverse: item.source === "reverse" && !reverseSnapshotV2,
+        creationMode: reverseSnapshotV3?.creation_mode || (item.category === "video" ? "video" : "image"),
+        reverse_snapshot_v3: reverseSnapshotV3,
+        legacy_reverse: item.source === "reverse" && !reverseSnapshotV3,
         savedAt: Date.now(),
       });
       if (!saved) throw new Error("无法保存当前用户的提示词草稿");
@@ -72,6 +100,153 @@ export default function PromptsPage() {
         .catch((e) => reportBackgroundError(e, "increment prompt usage"));
     }
     router.push("/");
+  }
+
+  async function loadRecipes() {
+    const request = ++recipeReqRef.current;
+    setRecipeLoading(true);
+    try {
+      const category = ["image", "video"].includes(recipeFilter) ? recipeFilter : "";
+      const rows = recipeScope === "discover"
+        ? await api.publicCreationRecipes({ category, q: recipeQuery.trim(), limit: 60 })
+        : await api.creationRecipes({
+          category,
+          favorite: recipeFilter === "favorite" ? true : null,
+          limit: 60,
+        });
+      if (request !== recipeReqRef.current) return;
+      setRecipes(rows);
+      setRecipeError("");
+    } catch (error) {
+      if (request !== recipeReqRef.current) return;
+      setRecipeError(error.message || "创作配方加载失败");
+    } finally {
+      if (request === recipeReqRef.current) setRecipeLoading(false);
+    }
+  }
+
+  function changeRecipeScope(scope) {
+    if (scope === recipeScope) return;
+    setRecipes([]);
+    setRecipeError("");
+    setRecipeScope(scope);
+    if (scope === "discover" && recipeFilter === "favorite") setRecipeFilter("all");
+  }
+
+  async function useRecipe(recipe, version = null) {
+    try {
+      const resolvedVersion = version?.payload
+        ? version
+        : recipe.version?.payload
+          ? recipe.version
+          : recipeScope === "discover"
+            ? (await api.publicCreationRecipe(recipe.id)).version
+            : (await api.creationRecipe(recipe.id)).version;
+      const draft = buildCreationRecipeStudioDraft(recipe, resolvedVersion, {
+        source: recipeScope === "discover" ? "public" : "owner",
+      });
+      const saved = saveStudioUserDraft(
+        window.localStorage,
+        STUDIO_DRAFT_PROMPT_KEY,
+        me?.id,
+        draft,
+      );
+      if (!saved) throw new Error("无法保存当前用户的创作配方草稿");
+      router.push("/");
+    } catch (error) {
+      setMsgKind("bad");
+      setMsg(error.message || "恢复创作配方失败");
+      notify.error(error.message || "恢复创作配方失败");
+    }
+  }
+
+  async function toggleRecipeFavorite(recipe) {
+    try {
+      const updated = await api.favoriteCreationRecipe(recipe.id);
+      setRecipes((rows) => (
+        recipeFilter === "favorite" && !updated.favorite
+          ? rows.filter((item) => item.id !== updated.id)
+          : rows.map((item) => item.id === updated.id ? updated : item)
+      ));
+      notify.success(updated.favorite ? "已收藏创作配方" : "已取消收藏");
+      return updated;
+    } catch (error) {
+      setRecipeError(error.message || "收藏操作失败");
+      throw error;
+    }
+  }
+
+  async function renameRecipe(recipe, title) {
+    try {
+      const updated = await api.updateCreationRecipe(recipe.id, { title });
+      setRecipes((rows) => rows.map((item) => item.id === updated.id ? updated : item));
+      notify.success("创作配方已重命名");
+      return updated;
+    } catch (error) {
+      setRecipeError(error.message || "创作配方重命名失败");
+      throw error;
+    }
+  }
+
+  async function toggleRecipeVisibility(recipe) {
+    const visibility = recipe.visibility === "public" ? "private" : "public";
+    try {
+      const updated = await api.updateCreationRecipe(recipe.id, { visibility });
+      setRecipes((rows) => rows.map((item) => item.id === updated.id ? updated : item));
+      notify.success(visibility === "public" ? "已公开创作配方" : "已转为私有配方");
+      return updated;
+    } catch (error) {
+      setRecipeError(error.message || "配方可见性更新失败");
+      throw error;
+    }
+  }
+
+  async function loadRecipeVersions(recipe) {
+    try {
+      return await api.creationRecipeVersions(recipe.id);
+    } catch (error) {
+      setRecipeError(error.message || "配方版本加载失败");
+      throw error;
+    }
+  }
+
+  async function activateRecipeVersion(recipe, version) {
+    try {
+      const updated = await api.activateCreationRecipeVersion(recipe.id, version);
+      setRecipes((rows) => rows.map((item) => item.id === updated.id ? updated : item));
+      notify.success(`已将 v${version} 设为当前版本`);
+      return updated;
+    } catch (error) {
+      setRecipeError(error.message || "配方版本激活失败");
+      throw error;
+    }
+  }
+
+  async function cloneRecipe(recipe, version) {
+    try {
+      const cloned = await api.cloneCreationRecipe(recipe.id, {
+        version: Number(version) || recipe.current_version,
+      });
+      if (recipeScope === "mine") setRecipes((rows) => [cloned, ...rows]);
+      notify.success("已派生为私有创作配方");
+      return cloned;
+    } catch (error) {
+      setRecipeError(error.message || "配方派生失败");
+      throw error;
+    }
+  }
+
+  async function deleteRecipe(recipe) {
+    if (!window.confirm("确认删除这个创作配方及其全部版本？")) return null;
+    try {
+      await api.deleteCreationRecipe(recipe.id);
+      setRecipes((rows) => rows.filter((item) => item.id !== recipe.id));
+      notify.success("创作配方已删除");
+      return { ok: true };
+    } catch (error) {
+      setRecipeError(error.message || "删除创作配方失败");
+      throw error;
+    }
   }
 
   function useSystemPrompt(item) {
@@ -191,6 +366,17 @@ export default function PromptsPage() {
             我的提示词
             <span className="text-[10px] opacity-70">{myPrompts.length ? `${myPrompts.length} 条` : "历史/收藏"}</span>
           </button>
+          {recipesEnabled && (
+            <button
+              type="button"
+              onClick={() => setActiveTab("recipes")}
+              className={`chip justify-center px-4 py-2 ${activeTab === "recipes" ? "chip-active" : ""}`}
+              aria-pressed={activeTab === "recipes"}
+            >
+              创作配方
+              <span className="text-[10px] opacity-70">{recipes.length ? `${recipes.length} 个` : "完整工作流"}</span>
+            </button>
+          )}
         </div>
 
         {activeTab === "system" ? (
@@ -203,7 +389,7 @@ export default function PromptsPage() {
             onPrimary={useSystemPrompt}
             onSecondary={copyPrompt}
           />
-        ) : (
+        ) : activeTab === "mine" ? (
           <section className="panel mb-6 p-4 sm:p-5">
             <div className="mb-3 flex flex-wrap items-end justify-between gap-3">
               <div>
@@ -271,6 +457,28 @@ export default function PromptsPage() {
               </div>
             )}
           </section>
+        ) : (
+          <CreationRecipeBrowser
+            recipes={recipes}
+            loading={recipeLoading}
+            error={recipeError}
+            scope={recipeScope}
+            filter={recipeFilter}
+            query={recipeQuery}
+            onScopeChange={changeRecipeScope}
+            onFilterChange={setRecipeFilter}
+            onQueryChange={setRecipeQuery}
+            onSearch={loadRecipes}
+            onRefresh={loadRecipes}
+            onRestore={useRecipe}
+            onFavorite={toggleRecipeFavorite}
+            onDelete={deleteRecipe}
+            onRename={renameRecipe}
+            onToggleVisibility={toggleRecipeVisibility}
+            onClone={cloneRecipe}
+            onLoadVersions={loadRecipeVersions}
+            onActivate={activateRecipeVersion}
+          />
         )}
       </main>
     </div>

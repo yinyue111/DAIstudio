@@ -1,9 +1,11 @@
 .DEFAULT_GOAL := help
 VENV := backend/.venv
 PY := $(VENV)/bin
+RELEASE_VERSION ?= launch-lite-20260721
+RELEASE_BASENAME := ai-studio-$(RELEASE_VERSION)-source
 
-.PHONY: help install install-frontend test test-frontend frontend-typecheck reverse-golden-eval lint fmt compile migrate alembic-check audit compose-check docker-build-check \
-        worker-topology-check run-api run-worker run-beat run-frontend build-frontend docker-up docker-down release-check release-check-worktree release-source clean
+.PHONY: help install install-frontend test test-evidence-provider test-video-semantic-provider test-audio-provider test-analyzer-providers test-frontend frontend-typecheck reverse-golden-eval lint fmt compile migrate alembic-check audit compose-check docker-build-check docker-build-analyzers \
+	        worker-topology-check run-api run-worker run-beat run-frontend build-frontend docker-up docker-down release-check release-check-worktree release-source release-source-worktree clean
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | \
@@ -18,7 +20,18 @@ install-frontend: ## Install frontend deps
 	cd frontend && npm ci
 
 test: ## Run backend tests
-	cd backend && .venv/bin/pytest
+	cd backend && .venv/bin/python -m pytest
+
+test-evidence-provider: ## Run the self-hosted image evidence provider contract tests
+	PYTHONPATH=. backend/.venv/bin/python -m pytest -q evidence_provider/tests
+
+test-video-semantic-provider: ## Run the self-hosted video semantic provider contract tests
+	PYTHONPATH=. backend/.venv/bin/python -m pytest -q video_semantic_provider/tests
+
+test-audio-provider: ## Run the self-hosted ASR provider contract tests
+	PYTHONPATH=. backend/.venv/bin/python -m pytest -q audio_provider/tests
+
+test-analyzer-providers: test-evidence-provider test-video-semantic-provider test-audio-provider ## Run all optional analyzer provider contract tests
 
 test-frontend: ## Run frontend unit tests
 	cd frontend && npm run test:unit
@@ -79,12 +92,18 @@ docker-build-check: ## Build backend/frontend Docker images without starting ser
 	POSTGRES_PASSWORD="$${POSTGRES_PASSWORD:-release-check-postgres-password}" \
 		REDIS_PASSWORD="$${REDIS_PASSWORD:-release-check-redis-password}" \
 		BACKEND_ENV_FILE="$${BACKEND_ENV_FILE:-./backend/.env.example}" \
-		docker compose build api worker worker_image worker_video worker_video_download worker_parse worker_reverse beat frontend
+		docker compose build api worker worker_image worker_video worker_video_download worker_parse worker_reverse worker_workflow beat frontend
+
+docker-build-analyzers: ## Build optional image, video semantic and ASR analyzer images
+	POSTGRES_PASSWORD="$${POSTGRES_PASSWORD:-release-check-postgres-password}" \
+		REDIS_PASSWORD="$${REDIS_PASSWORD:-release-check-redis-password}" \
+		BACKEND_ENV_FILE="$${BACKEND_ENV_FILE:-./backend/.env.example}" \
+		docker compose --profile evidence build evidence_provider video_semantic_provider audio_provider
 
 worker-topology-check: ## Validate isolated worker roles and compose services
 	./scripts/test_worker_parallelism.sh
 
-release-check: compile lint migrate alembic-check test reverse-golden-eval test-frontend frontend-typecheck build-frontend compose-check worker-topology-check docker-build-check audit ## Run local release gates against the same clean HEAD artifact as CI
+release-check: compile lint migrate alembic-check test test-analyzer-providers reverse-golden-eval test-frontend frontend-typecheck build-frontend compose-check worker-topology-check docker-build-check audit ## Run local release gates against the same clean HEAD artifact as CI
 	@test -z "$$(git status --porcelain)" || \
 		(echo "release-check archives HEAD; commit or stash worktree changes first, or use release-check-worktree" >&2; exit 1)
 	tmp="$$(mktemp -d)" && \
@@ -93,7 +112,7 @@ release-check: compile lint migrate alembic-check test reverse-golden-eval test-
 		rm -rf "$$tmp"
 	find . -maxdepth 3 \( -name .venv -o -name .next -o -name node_modules \) -type d -print | sort
 
-release-check-worktree: compile lint migrate alembic-check test reverse-golden-eval test-frontend frontend-typecheck build-frontend compose-check worker-topology-check docker-build-check audit ## Run release gates against tracked + untracked worktree files
+release-check-worktree: compile lint migrate alembic-check test test-analyzer-providers reverse-golden-eval test-frontend frontend-typecheck build-frontend compose-check worker-topology-check docker-build-check audit ## Run release gates against tracked + untracked worktree files
 	tmp="$$(mktemp -d)" && \
 		deleted="$$(git ls-files --deleted)" && \
 		if [ -n "$$deleted" ]; then \
@@ -114,6 +133,21 @@ release-source: ## Build a clean source tarball from git and verify artifact hyg
 	mkdir -p dist
 	git archive --format=tar.gz --output=dist/ai-studio-source.tar.gz HEAD
 	python3 scripts/check_release_artifact.py dist/ai-studio-source.tar.gz
+
+release-source-worktree: ## Build a verified source tarball from tracked + untracked worktree files
+	@deleted="$$(git ls-files --deleted)"; \
+		if [ -n "$$deleted" ]; then \
+			echo "release-source-worktree: tracked files are deleted in the worktree:" >&2; \
+			printf '%s\n' "$$deleted" >&2; \
+			exit 1; \
+		fi
+	mkdir -p dist
+	git ls-files -z --cached --others --exclude-standard | \
+		COPYFILE_DISABLE=1 tar --null -czf "dist/$(RELEASE_BASENAME).tar.gz" --files-from -
+	python3 scripts/check_release_artifact.py "dist/$(RELEASE_BASENAME).tar.gz"
+	cd dist && shasum -a 256 "$(RELEASE_BASENAME).tar.gz" > "$(RELEASE_BASENAME).tar.gz.sha256"
+	@echo "release artifact: dist/$(RELEASE_BASENAME).tar.gz"
+	@echo "checksum: dist/$(RELEASE_BASENAME).tar.gz.sha256"
 
 clean: ## Remove caches & build artifacts
 	find . -type d -name __pycache__ -prune -exec rm -rf {} + 2>/dev/null || true

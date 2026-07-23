@@ -45,21 +45,25 @@ models:
     # extra:
     #   edit_path: /v1/images/edits
 
-  - use: video         # 文生视频 (Volcengine Ark / Doubao Seedance, async)
-    model_id: doubao-seedance-2-0-pro
+  - use: video         # 文生/图生视频 (Volcengine Ark / Doubao Seedance, async)
+    model_id: doubao-seedance-1-5-pro-251215
+    display_name: Seedance 1.5 Pro
     cost_credits: 100    # fallback/admin display for a 10-second final render
     unlock_cost: 0
     enabled: true
     extra:
       preview_cost: 50   # fixed price for the 5-second preview stage
       capabilities:
-        multi_reference: true
-        max_reference_images: 10
+        text_to_video: true
+        image_to_video: true
+        reference_image: false
+        first_last_frame: true
+        multi_reference: false
       official_pricing:
         source: https://www.volcengine.com/docs/82379/1544106
         checked_at: "2026-06-21"
         provider: volcengine_ark
-        model_family: Seedance 2.0
+        model_family: Seedance 1.5 Pro
         currency: CNY
         unit: per_1m_tokens
         total_per_1m: 31.0

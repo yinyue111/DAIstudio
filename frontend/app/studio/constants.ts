@@ -6,7 +6,7 @@ export const CREATION_MODES = [
 ];
 
 export const EDIT_STYLE_KEYS = {
-  image: ["场景背景", "广告目标", "风格", "构图", "景别", "视角镜头", "视角构图", "光线", "色调配色", "材质纹理", "氛围情绪", "后期质感", "标签"],
+  image: ["场景背景", "风格", "构图", "景别", "视角镜头", "视角构图", "光线", "色调配色", "材质纹理", "氛围情绪", "后期质感"],
   video: ["场景背景", "广告目标", "风格", "视角构图", "镜头运动", "剪辑节奏", "时序分镜", "字幕卖点", "光线", "色调配色", "材质纹理", "氛围情绪", "转场", "时长建议", "后期质感", "标签"],
 };
 
@@ -42,7 +42,7 @@ export const VIDEO_QUALITIES = [
 ];
 
 export const MAX_VIDEO_DURATION_SECONDS = 15;
-export const MAX_PRODUCT_DETAIL_IMAGES = 5;
+export const MAX_PRODUCT_DETAIL_IMAGES = 10;
 
 export const VIDEO_DURATION_PRESETS = [
   { seconds: 5, label: "5s", hint: "短镜头预览" },

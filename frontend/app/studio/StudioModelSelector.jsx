@@ -152,6 +152,9 @@ export function modelRequirements({ use, creationMode, selected, productAsset, s
     } else {
       requirements.push(["video_generation", "text_to_video", "video"]);
     }
+    if (productAsset) {
+      requirements.push(["reference_image", "multi_reference"]);
+    }
     return requirements;
   }
   return [];

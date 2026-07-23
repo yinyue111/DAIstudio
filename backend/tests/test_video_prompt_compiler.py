@@ -1,3 +1,5 @@
+from app.models import GenTask
+from app.services import generation_video_submit
 from app.services.video_prompt_compiler import (
     build_video_prompt_references,
     compile_video_prompt,
@@ -348,6 +350,50 @@ def test_layered_assembled_prompt_replaces_stale_structured_shots_without_user_i
         "慢速推近 Logo 特写",
     ]
     assert "旧分镜" not in result["prompt"]
+
+
+def test_structured_reverse_final_text_replaces_stale_full_timeline():
+    final_text = (
+        "兰蔻小黑瓶精华液，黑色渐变瓶身和银色玫瑰浮雕瓶盖；"
+        "按原镜头顺序压缩为单段核心版；"
+        "镜头1：黑底品牌标志切到透明滴管特写；"
+        "镜头2：银色瓶盖与带水滴的瓶身特写；"
+        "镜头3：完整产品立于浅蓝色水面并以涟漪收尾"
+    )
+    result = compile_video_prompt(
+        {
+            "图像类型": "产品视频",
+            "主体": "兰蔻小黑瓶精华液，黑色渐变瓶身和银色玫瑰浮雕瓶盖",
+            "时序分镜": (
+                "0-7s 黑底品牌标志；8-10s 银色瓶盖；11-13s 水滴飞溅；"
+                "14-16s 瓶身局部；17-19s 水波空镜；21-23s 完整产品；"
+                "24-25s 纯黑画面"
+            ),
+            "旁白": "未分析",
+            "音效": "未分析",
+            "input_mode": "structured_reverse",
+            "raw_text": final_text,
+            "assembled_text": final_text,
+            "final_text": final_text,
+        },
+        duration=10,
+        model_id="doubao-seedance-1-5-pro-251215",
+        provider="volcengine_ark",
+        references=[{"role": "motion_analysis"}],
+        fit_mode="single_clip",
+    )
+
+    assert result["plan"]["shots"] == [
+        "黑底品牌标志切到透明滴管特写",
+        "银色瓶盖与带水滴的瓶身特写",
+        "完整产品立于浅蓝色水面并以涟漪收尾",
+    ]
+    assert result["metadata"]["source_shot_count"] == 3
+    assert "水波空镜" not in result["prompt"]
+    assert "纯黑画面" not in result["prompt"]
+    assert "主体锁定：全程保持同一产品主体" in result["prompt"]
+    assert result["plan"]["voiceover"] == ""
+    assert result["plan"]["sfx"] == []
 
 
 def test_structured_product_video_without_timeline_keeps_scene_action_and_camera():
@@ -889,10 +935,65 @@ def test_uploaded_video_is_analysis_only_without_native_video_transport():
         }
     ]
     assert "动作参考仅迁移" not in result["prompt"]
-    assert "抽帧反推" in result["prompt"]
-    assert "不进行原视频逐帧动作复刻" in result["prompt"]
+    assert "镜头顺序与节奏以原视频抽帧反推后的当前场景脚本为准" in result["prompt"]
+    assert "不迁移其中的人物、商品、品牌" not in result["prompt"]
     assert result["metadata"]["reference_roles"] == ["motion_analysis"]
     assert result["metadata"]["motion_reference_mode"] == "analysis_only"
+
+
+def test_manual_product_reverse_prompt_keeps_subject_identity_lock():
+    text = (
+        "兰蔻小黑瓶精华液，黑色渐变瓶身和银色玫瑰浮雕瓶盖；"
+        "镜头1：瓶盖微距特写；镜头2：完整产品立于水面。"
+    )
+    result = compile_video_prompt(
+        {
+            "图像类型": "产品视频",
+            "主体": "兰蔻小黑瓶精华液，黑色渐变瓶身和银色玫瑰浮雕瓶盖",
+            "input_mode": "structured_reverse",
+            "assembled_text": text,
+            "final_text": text,
+        },
+        duration=10,
+        model_id="doubao-seedance-1-5-pro-251215",
+    )
+
+    assert "主体锁定：全程保持同一产品主体" in result["prompt"]
+    assert "黑色渐变瓶身" in result["plan"]["subject_lock"]
+    assert "包装结构、比例、主色和材质连续一致" in result["plan"]["subject_lock"]
+
+
+def test_analysis_only_source_video_is_not_submitted_as_first_frame(monkeypatch):
+    task = GenTask(
+        category="video",
+        stage="final",
+        source_type="video",
+        source_asset_url="/api/uploads/reference.mp4",
+        params={
+            "duration": 10,
+            "resolution": "720p",
+            "ratio": "16:9",
+            "_video_reference_roles": [
+                {
+                    "role": "motion_analysis",
+                    "source": "source_asset_url",
+                    "mode": "analysis_only",
+                }
+            ],
+        },
+    )
+    monkeypatch.setattr(
+        generation_video_submit,
+        "gateway_video_first_frame",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("analysis-only source video must not become a first-frame reference")
+        ),
+    )
+
+    params = generation_video_submit.video_submit_params(None, task)
+
+    assert "first_frame_image" not in params
+    assert "reference_image_url" not in params
 
 
 def test_product_detail_references_keep_ordered_numbered_roles():

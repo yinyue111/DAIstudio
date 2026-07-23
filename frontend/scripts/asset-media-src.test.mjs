@@ -14,6 +14,7 @@ const {
   safeAssetMediaSrc,
   shouldRenderVideo,
 } = await import("../components/AssetMedia.jsx");
+const { normalizeLoopbackPlatformMediaUrl } = await import("../lib/platformMedia.js");
 
 assert.equal(
   safeAssetMediaSrc("/media/preview/example.png"),
@@ -40,6 +41,42 @@ assert.equal(
   safeAssetMediaSrc("http://localhost:9000/media/preview/example.png"),
   "",
   "loopback aliases must still match the API port",
+);
+assert.equal(
+  normalizeLoopbackPlatformMediaUrl(
+    "http://localhost:8000/api/uploads/upload_video_preview/example.jpg",
+    {
+      apiBase: "http://127.0.0.1:8000",
+      pageOrigin: "http://127.0.0.1:3002",
+      allowedPrefixes: ["/api/uploads/"],
+    },
+  ),
+  "http://127.0.0.1:8000/api/uploads/upload_video_preview/example.jpg",
+  "authenticated upload previews should normalize equivalent loopback API hosts",
+);
+assert.equal(
+  normalizeLoopbackPlatformMediaUrl(
+    "http://127.0.0.1:8000/api/uploads/upload_video_preview/example.jpg",
+    {
+      apiBase: "http://localhost:8000",
+      pageOrigin: "http://localhost:3002",
+      allowedPrefixes: ["/api/uploads/"],
+    },
+  ),
+  "http://localhost:8000/api/uploads/upload_video_preview/example.jpg",
+  "authenticated upload previews should normalize loopback aliases in both directions",
+);
+assert.equal(
+  normalizeLoopbackPlatformMediaUrl(
+    "http://localhost:8000/media/preview/example.png",
+    {
+      apiBase: "http://127.0.0.1:8000",
+      pageOrigin: "http://127.0.0.1:3002",
+      allowedPrefixes: ["/api/uploads/"],
+    },
+  ),
+  "",
+  "authenticated upload normalization must not broaden to unrelated platform paths",
 );
 assert.equal(
   safeAssetMediaSrc("https://evil.example/media/preview/example.png"),
@@ -96,6 +133,23 @@ assert.equal(
   shouldRenderVideo(uploadedVideo, { interactive: true }),
   true,
   "interactive uploaded-video previews should render a video player",
+);
+
+const studioUploadedVideo = {
+  type: "video",
+  display_url: "blob:http://127.0.0.1:3010/local-video",
+  display_thumb: "/api/uploads/upload_video_preview/local-video.jpg",
+  url: "/api/uploads/upload_video/local-video.mp4",
+};
+assert.equal(
+  assetDisplaySrc(studioUploadedVideo),
+  studioUploadedVideo.display_thumb,
+  "non-interactive Studio video sources must prefer their poster over the MP4 blob",
+);
+assert.equal(
+  shouldRenderVideo(studioUploadedVideo),
+  false,
+  "a Studio upload with a poster must render as an image thumbnail",
 );
 
 const generatedVideo = {

@@ -6,7 +6,7 @@ from app.services import gateway
 from app.services.model_gateway_config import RuntimeGatewayConfig
 
 
-def test_prompt_optimizer_uses_dedicated_model_and_product_context(
+def test_legacy_prompt_optimizer_returns_moved_without_provider_or_credit_changes(
     client, make_user, auth, monkeypatch
 ):
     make_user("13900002991", balance=100)
@@ -38,30 +38,80 @@ def test_prompt_optimizer_uses_dedicated_model_and_product_context(
         headers=headers,
     )
 
-    assert response.status_code == 200, response.text
-    assert response.json()["model_id"] == "gemini-3.5-flash-low"
-    assert "Logo和文字" in response.json()["prompt"]
-    assert seen["prompt"] == "产品放浴室里"
-    assert seen["model_id"] == "gemini-3.5-flash-low"
-    assert seen["category"] == "image"
-    assert seen["product_mode"] is True
-    assert seen["gateway_config"].use == "prompt"
+    assert response.status_code == 410, response.text
+    assert response.json()["detail"] == {
+        "code": "PROMPT_OPTIMIZATION_MOVED",
+        "message": (
+            "旧提示词优化端点已退役，请先创建统一报价，"
+            "再通过 Studio 提示词优化建议流程执行。"
+        ),
+        "quote_endpoint": "/api/quotes",
+        "quote_kind": "prompt_optimization",
+        "proposal_endpoint": "/api/studio/prompt-optimizations",
+    }
+    assert seen == {}
     with SessionLocal() as db:
         user = db.query(User).filter(User.phone == "13900002991").one()
-        assert user.balance_credits == 99
-        charge = (
+        assert user.balance_credits == 100
+        assert user.frozen_credits == 0
+        assert (
             db.query(CreditTransaction)
-            .filter_by(
-                user_id=user.id,
-                type="consume",
-                biz_type="prompt_optimize",
-            )
-            .one()
+            .filter_by(user_id=user.id, biz_type="prompt_optimize")
+            .count()
+            == 0
         )
-        assert charge.change == -1
 
 
-def test_prompt_optimizer_passes_video_generation_context_and_returns_metadata(
+def test_legacy_prompt_optimizer_model_adaptation_points_to_studio_flow(
+    client, make_user, auth, monkeypatch
+):
+    make_user("13900002998", balance=100)
+    headers = auth("13900002998")
+    seen = {}
+
+    def fake_optimize(prompt, model_id, **kwargs):
+        seen.update(prompt=prompt, model_id=model_id, **kwargs)
+        return {
+            "prompt": "商业产品图，ACME SKU-7 包装保持不变，适配目标图片模型。",
+            "usage": None,
+            "latency_ms": 5,
+            "compiler_metadata": {
+                "version": "prompt-optimizer-v2",
+                "output_format": "single_text",
+                "direction": "model_adaptation",
+                "kind": "model_compile",
+            },
+        }
+
+    monkeypatch.setattr("app.services.gateway.optimize_prompt", fake_optimize)
+    response = client.post(
+        "/api/prompt/optimize",
+        json={
+            "prompt": "ACME SKU-7 包装必须保持不变",
+            "category": "image",
+            "product_mode": True,
+            "direction": "model_adaptation",
+        },
+        headers=headers,
+    )
+
+    assert response.status_code == 410, response.text
+    assert response.json()["detail"]["code"] == "PROMPT_OPTIMIZATION_MOVED"
+    assert response.json()["detail"]["quote_kind"] == "prompt_optimization"
+    assert seen == {}
+
+
+def test_prompt_optimizer_rejects_unknown_direction(client, make_user, auth):
+    make_user("13900002999", balance=100)
+    response = client.post(
+        "/api/prompt/optimize",
+        json={"prompt": "产品图", "direction": "magic"},
+        headers=auth("13900002999"),
+    )
+    assert response.status_code == 422
+
+
+def test_legacy_prompt_optimizer_rich_video_request_is_moved(
     client, make_user, auth, monkeypatch
 ):
     make_user("13900002997", balance=100)
@@ -73,7 +123,6 @@ def test_prompt_optimizer_passes_video_generation_context_and_returns_metadata(
         row.display_name = "Gemini 3.5 Flash Low"
         row.cost_credits = 1
         row.enabled = True
-        prompt_model_config_id = row.id
         video_model = db.query(ModelConfig).filter(ModelConfig.use == "video").one()
         video_model.model_id = "doubao-seedance-2-0-mini-260615"
         video_model.provider = "volcengine_ark"
@@ -140,52 +189,12 @@ def test_prompt_optimizer_passes_video_generation_context_and_returns_metadata(
         headers=headers,
     )
 
-    assert response.status_code == 200, response.text
-    assert seen["duration"] == 10
-    assert seen["subject_mode"] == "product"
-    assert seen["reference_type"] == "product_image"
-    assert seen["subject_profile"] == {
-        "identity": "同一 SKU 粉绿色悬挂包装",
-        "texture": "3D 如意云纹",
-    }
-    assert seen["target_model_id"] == "doubao-seedance-2-0-mini-260615"
-    assert seen["target_model_provider"] == "volcengine_ark"
-    assert seen["aspect_ratio"] == "9:16"
-    assert seen["resolution"] == "1080p"
-    assert seen["product_lock_mode"] == "locked"
-    assert seen["product_video_template"] == "slow_push"
-    assert response.json() == {
-        "prompt": (
-            "风格设定：高端日系个护广告，粉绿与米白色调，柔和自然光。\n"
-            "场景脚本：\n"
-            "Shot 1：手从悬挂包装底部抽出一张洗脸巾。\n"
-            "Shot 2：微距展开洗脸巾，展示 3D 如意云纹。\n"
-            "技术约束：总时长 10 秒；画幅 9:16；分辨率 1080p。"
-        ),
-        "model_id": "gemini-3.5-flash-low",
-        "optimizer_model_id": "gemini-3.5-flash-low",
-        "optimizer_model_config_id": prompt_model_config_id,
-        "optimizer_model_name": "Gemini 3.5 Flash Low",
-        "compiler_metadata": {
-            "version": "prompt-optimizer-v3",
-            "output_format": "structured_video_text",
-            "sections": ["风格设定", "场景脚本", "技术约束"],
-        },
-        "context_metadata": {
-            "duration": 10,
-            "subject_mode": "product",
-            "reference_type": "product_image",
-            "target_model_id": "doubao-seedance-2-0-mini-260615",
-            "target_model_provider": "volcengine_ark",
-            "aspect_ratio": "9:16",
-            "resolution": "1080p",
-            "product_lock_mode": "locked",
-            "product_video_template": "slow_push",
-        },
-    }
+    assert response.status_code == 410, response.text
+    assert response.json()["detail"]["code"] == "PROMPT_OPTIMIZATION_MOVED"
+    assert seen == {}
 
 
-def test_video_prompt_optimizer_infers_current_generation_model(
+def test_legacy_prompt_optimizer_does_not_infer_or_invoke_generation_model(
     client, make_user, auth, monkeypatch
 ):
     make_user("13900002998", balance=100)
@@ -219,13 +228,9 @@ def test_video_prompt_optimizer_infers_current_generation_model(
         headers=headers,
     )
 
-    assert response.status_code == 200, response.text
-    assert seen["target_model_id"] == "doubao-seedance-2-0-mini-260615"
-    assert seen["target_model_provider"] == "volcengine_ark"
-    assert seen["target_model_extra"]["prompt_profile"]["max_shots_by_duration"] == {
-        "5": 1,
-        "10": 4,
-    }
+    assert response.status_code == 410, response.text
+    assert response.json()["detail"]["code"] == "PROMPT_OPTIMIZATION_MOVED"
+    assert seen == {}
 
 
 def test_prompt_optimizer_rejects_empty_prompt(client, make_user, auth):
@@ -263,6 +268,7 @@ def test_prompt_optimizer_rejects_whitespace_only_prompt_without_charging(
     with SessionLocal() as db:
         user = db.query(User).filter(User.phone == "13900002996").one()
         assert user.balance_credits == 100
+        assert user.frozen_credits == 0
         assert (
             db.query(CreditTransaction)
             .filter_by(
@@ -274,10 +280,15 @@ def test_prompt_optimizer_rejects_whitespace_only_prompt_without_charging(
         )
 
 
-def test_prompt_optimizer_refunds_charge_when_gateway_fails(client, make_user, auth, monkeypatch):
+def test_legacy_prompt_optimizer_does_not_call_failing_gateway_or_touch_credits(
+    client, make_user, auth, monkeypatch
+):
     make_user("13900002993", balance=10)
+    called = False
 
     def fail_optimize(*_args, **_kwargs):
+        nonlocal called
+        called = True
         raise gateway.GatewayError("upstream unavailable")
 
     monkeypatch.setattr("app.services.gateway.optimize_prompt", fail_optimize)
@@ -287,10 +298,13 @@ def test_prompt_optimizer_refunds_charge_when_gateway_fails(client, make_user, a
         headers=auth("13900002993"),
     )
 
-    assert response.status_code == 502
+    assert response.status_code == 410, response.text
+    assert response.json()["detail"]["code"] == "PROMPT_OPTIMIZATION_MOVED"
+    assert called is False
     with SessionLocal() as db:
         user = db.query(User).filter(User.phone == "13900002993").one()
         assert user.balance_credits == 10
+        assert user.frozen_credits == 0
         rows = (
             db.query(CreditTransaction)
             .filter_by(
@@ -300,7 +314,7 @@ def test_prompt_optimizer_refunds_charge_when_gateway_fails(client, make_user, a
             .order_by(CreditTransaction.id)
             .all()
         )
-        assert [row.type for row in rows] == ["consume", "refund"]
+        assert rows == []
 
 
 def test_prompt_optimizer_body_size_is_limited(client):
@@ -427,6 +441,7 @@ def test_anthropic_prompt_optimizer_uses_messages_protocol(monkeypatch):
         "product_video_template": "slow_push",
         "effective_product_mode": True,
         "product_mode_source": "explicit",
+        "direction": "faithful",
     }
 
 

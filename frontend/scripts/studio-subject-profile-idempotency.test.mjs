@@ -242,11 +242,30 @@ assert.match(
   "generation fallback should retain its successful result in the dedicated result cache ref",
 );
 const cachedReadIndex = submitSource.indexOf("readCachedSubjectProfileResult(");
-const reverseCallIndex = submitSource.indexOf("await api.createReverseOperation(");
+const reverseCallIndex = submitSource.indexOf("await requestQuoteConfirmation(");
 assert.ok(
   cachedReadIndex >= 0 && reverseCallIndex > cachedReadIndex,
-  "generation should consult the successful prefetch cache before creating an async reverse operation",
+  "generation should consult the successful prefetch cache before quoting an async reverse operation",
 );
 assert.doesNotMatch(uploadSource, /profile-prefetch/, "prefetch must not use a phase-specific idempotency scope");
+assert.equal(
+  (uploadSource.match(/window\.setTimeout\(\(\) => \{\s*prefetchProductProfile\(/g) || []).length,
+  2,
+  "upload and asset selection must wait one browser tick before opening a profile quote",
+);
+const prefetchStart = uploadSource.indexOf("async function prefetchProductProfile(");
+const prefetchEnd = uploadSource.indexOf("async function cancelProfileOperation", prefetchStart);
+const prefetchSource = uploadSource.slice(prefetchStart, prefetchEnd);
+const quoteStart = prefetchSource.indexOf("await requestQuoteConfirmation(");
+assert.ok(
+  prefetchSource.indexOf("!ownerRequest.isCurrent()") >= 0
+    && prefetchSource.indexOf("!ownerRequest.isCurrent()") < quoteStart,
+  "a stale owner must be rejected before a quote is opened",
+);
+assert.ok(
+  prefetchSource.indexOf("!isRequestCurrent(productUploadRequestRef, mode, uploadReqId)") >= 0
+    && prefetchSource.indexOf("!isRequestCurrent(productUploadRequestRef, mode, uploadReqId)") < quoteStart,
+  "a replaced upload must be rejected before a quote is opened",
+);
 
 console.log("studio subject-profile idempotency tests passed");

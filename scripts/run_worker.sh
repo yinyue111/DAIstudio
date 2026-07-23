@@ -45,12 +45,17 @@ case "$ROLE" in
     DEFAULT_CONCURRENCY=2
     DEFAULT_POOL="threads"
     ;;
+  workflow)
+    DEFAULT_QUEUES="workflow"
+    DEFAULT_CONCURRENCY=2
+    DEFAULT_POOL="threads"
+    ;;
   all)
-    DEFAULT_QUEUES="default,image,video_submit,video_poll,video_download,parse,reverse,cleanup,payment"
+    DEFAULT_QUEUES="default,image,video_submit,video_poll,video_download,parse,reverse,workflow,cleanup,payment"
     DEFAULT_CONCURRENCY=4
     ;;
   *)
-    echo "unknown WORKER_ROLE=$ROLE; expected critical/image/video/video-submit/video-download/parse/reverse/all" >&2
+    echo "unknown WORKER_ROLE=$ROLE; expected critical/image/video/video-submit/video-download/parse/reverse/workflow/all" >&2
     exit 2
     ;;
 esac

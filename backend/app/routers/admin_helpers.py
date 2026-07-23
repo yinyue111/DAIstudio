@@ -52,6 +52,9 @@ def model_audit_snapshot(row: ModelConfig | None) -> dict:
     return {
         "use": row.use,
         "model_id": row.model_id,
+        "display_name": row.display_name or row.model_id,
+        "is_default": bool(row.is_default),
+        "sort_order": int(row.sort_order or 0),
         "provider": row.provider,
         "base_url": row.base_url,
         "gateway_format": row.gateway_format,

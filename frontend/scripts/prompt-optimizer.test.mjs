@@ -6,11 +6,44 @@ const workspaceSource = fs.readFileSync(new URL("../app/studio/StudioPromptWorks
 const constantsSource = fs.readFileSync(new URL("../app/studio/constants.ts", import.meta.url), "utf8");
 const apiSource = fs.readFileSync(new URL("../lib/api.js", import.meta.url), "utf8");
 const adminHelpers = fs.readFileSync(new URL("../app/admin/components/admin-helpers.js", import.meta.url), "utf8");
+const optimizeDirectStart = pageSource.indexOf("async function optimizeDirectPrompt()");
+const compileShotStart = pageSource.indexOf("async function compileStoryboardShot(", optimizeDirectStart);
+const applyShotStart = pageSource.indexOf("async function applyStoryboardShot(", compileShotStart);
+const optimizeDirectSource = pageSource.slice(optimizeDirectStart, compileShotStart);
+const compileShotSource = pageSource.slice(compileShotStart, applyShotStart);
 
-assert.match(apiSource, /\/api\/prompt\/optimize/);
-assert.match(pageSource, /api\.optimizePrompt\(source, \{[\s\S]{0,1200}duration:[\s\S]{0,1200}subject_mode:[\s\S]{0,1200}reference_type:[\s\S]{0,1200}subject_profile:/);
-assert.match(pageSource, /api\.optimizePrompt\(source, \{[\s\S]{0,1600}aspect_ratio:[\s\S]{0,1600}resolution:[\s\S]{0,1600}product_lock_mode:[\s\S]{0,1600}product_video_template:/);
-assert.match(apiSource, /optimizePrompt:\s*\(prompt, options[\s\S]{0,500}body:\s*\{ prompt, \.\.\.context \}/);
+assert.match(apiSource, /\/api\/studio\/prompt-optimizations/);
+assert.match(
+  pageSource,
+  /function promptOptimizationRequestOptions\([\s\S]{0,2400}reverse_operation_id:[\s\S]{0,300}reverse_revision_id:[\s\S]{0,800}lineage \|\| \{[\s\S]{0,400}prompt:/,
+  "lineage-backed optimization should send only server identities while ordinary prompts send text",
+);
+assert.match(
+  pageSource,
+  /function promptOptimizationRequestOptions\([\s\S]{0,2600}mode: direction,[\s\S]{0,400}target_model_config_id:/,
+  "optimization should explicitly identify its mode and versioned target catalog model",
+);
+assert.match(
+  optimizeDirectSource,
+  /kind: "prompt_optimization"[\s\S]{0,500}clientRequestId: actionRequestId[\s\S]{0,500}api\.createStudioPromptOptimization\(confirmedRequest\)/,
+  "paid Studio rewrites should quote first and execute the confirmed proposal request",
+);
+assert.match(optimizeDirectSource, /idempotency_key: actionRequestId/);
+assert.doesNotMatch(
+  optimizeDirectSource,
+  /client_request_id/,
+  "the extra=forbid prompt proposal body must keep its request id in the quote envelope only",
+);
+assert.doesNotMatch(optimizeDirectSource, /crypto\.randomUUID/);
+assert.match(
+  compileShotSource,
+  /prompt: source[\s\S]{0,500}mode: "target_model_adaptation"[\s\S]{0,300}target_model_config_id:[\s\S]{0,700}api\.createStudioPromptOptimization/,
+  "storyboard shots should use the free Studio model compiler with an ordinary prompt",
+);
+assert.doesNotMatch(compileShotSource, /requestQuoteConfirmation|api\.optimizePrompt/);
+assert.doesNotMatch(apiSource, /\/api\/prompt\/optimize|optimizePrompt:/);
+assert.match(apiSource, /acceptStudioPromptOptimization[\s\S]{0,300}\/accept/);
+assert.match(apiSource, /rejectStudioPromptOptimization[\s\S]{0,300}\/reject/);
 assert.match(pageSource, /Boolean\(prompt\.trim\(\) && promptDirty\)/);
 assert.match(
   pageSource,
@@ -37,7 +70,10 @@ assert.match(
   /onSubjectModeChange=\{changeEditSubjectMode\}/,
   "changing the subject mode should invalidate the in-flight optimization immediately",
 );
-assert.match(workspaceSource, /✦ 优化提示词/);
+assert.match(workspaceSource, /生成优化建议/);
+assert.match(workspaceSource, /编译到当前模型/);
+assert.match(workspaceSource, /PROMPT_OPTIMIZATION_DIRECTIONS/);
+assert.match(workspaceSource, /预计 \{Math\.max\(0, Number\(estimatedCredits/);
 assert.match(workspaceSource, /disabled=\{!canOptimizePrompt \|\| optimizingPrompt\}/);
 assert.match(workspaceSource, /use="prompt"/);
 assert.doesNotMatch(workspaceSource, /提示词库|EDIT_PROMPT_CHIPS|promptChipsForEditMode|onAppendPrompt|onTogglePromptLibrary/);
@@ -45,6 +81,29 @@ assert.doesNotMatch(constantsSource, /EXAMPLES|赛博朋克城市夜景|宇航�
 assert.doesNotMatch(pageSource, /promptLibraryOpen|setPromptLibraryOpen|<PromptLibraryBrowser/);
 assert.match(adminHelpers, /对话 \/ 提示词/);
 assert.match(pageSource, /promptOptimizationRecordsRef/);
+assert.match(
+  pageSource,
+  /function promptOptimizationRequestOptions\(\{[\s\S]{0,160}direction = promptOptimizationSetting\.direction/,
+  "prompt optimization should default to the direction selected for the active workspace",
+);
+assert.match(pageSource, /direction: result\.mode \|\| promptOptimizationSetting\.direction/);
+assert.match(pageSource, /compiler_metadata: result\.compiler_profile/);
+assert.match(
+  pageSource,
+  /applyPromptOptimizationDecision\([\s\S]{0,180}latestWorkspace,[\s\S]{0,180}decision\?\.result,[\s\S]{0,180}decision\?\.accepted_segment_ids/,
+  "accepted decisions should apply the authoritative server payload to the latest workspace",
+);
+assert.match(pageSource, /undoPromptOptimization\(latestWorkspace, undo\)/);
+assert.match(
+  pageSource,
+  /function changeGenerationModelSelection[\s\S]{0,1800}reverse_revision_id[\s\S]{0,500}mode: "target_model_adaptation"/,
+  "switching a generation model should compile the existing revision without launching reverse analysis",
+);
+assert.match(workspaceSource, /约束覆盖证据/);
+assert.match(workspaceSource, /选择要应用的字段/);
+assert.match(workspaceSource, /isSupportedPromptOptimizationSegment\(item\.field_path\)/);
+assert.match(workspaceSource, /supportedChangeSummary\.map\(\(item\) =>/);
+assert.doesNotMatch(workspaceSource, /保留要求和禁止变化/);
 assert.match(pageSource, /raw_text:[\s\S]{0,300}optimized_text:[\s\S]{0,300}optimizer_model_id:/);
 assert.match(pageSource, /promptOptimizationScopeKey/);
 assert.doesNotMatch(

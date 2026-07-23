@@ -34,6 +34,15 @@ assert.doesNotMatch(profileSource, /offset: reset \? 0 : current\.length/, "curs
 assert.match(profileSource, /const hasMore = Boolean\(nextCursor\)/, "profile pagination must stop when the server cursor is exhausted");
 assert.match(profileSource, /assetMeta\(asset\)/, "asset cards must expose available media metadata");
 assert.match(profileSource, /retainedDelta/, "retention metadata changes must update the visible summary immediately");
+assert.match(profileSource, /asset-library-search/, "the asset library must expose text search");
+assert.match(profileSource, /asset-library-tag/, "the asset library must expose tag filtering");
+assert.match(profileSource, /asset-library-folder/, "the asset library must expose folder filtering");
+assert.match(profileSource, /moveSelectedAssets/, "selected assets must be movable between folders");
+assert.match(profileSource, /findMeSimilarAssets/, "the asset library must expose duplicate and similarity analysis");
+assert.match(profileSource, /similarity\.result\.status/, "degraded similarity results must remain visible");
+assert.match(pickerSource, /asset-picker-search/, "the shared asset picker must expose text search");
+assert.match(pickerSource, /asset-picker-tag/, "the shared asset picker must expose tag filtering");
+assert.match(pickerSource, /asset-picker-folder/, "the shared asset picker must expose folder filtering");
 assert.match(pickerSource, /cursor: nextCursor/, "asset picker pagination must continue with the server cursor");
 assert.doesNotMatch(pickerSource, /offset: items\.length/, "asset picker cursor pagination must not skip loaded rows");
 assert.match(

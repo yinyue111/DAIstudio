@@ -13,7 +13,7 @@ from PIL import Image, ImageChops, ImageDraw, ImageFilter
 
 from ..config import settings
 from ..models import GenTask, UploadedAsset
-from . import asset_refs, gateway, locks, storage, video_frames
+from . import asset_refs, gateway, locks, reverse_lineage, storage, video_frames
 from .image_options import IMAGE_SIZES
 from .watermark import make_image_preview
 
@@ -24,7 +24,13 @@ EDIT_MASK_SEND_CONFIDENCE = 0.60
 EDIT_MASK_ANALYSIS_MAX_SIDE = 512
 EDIT_MASK_AUTO_EXPAND_RATIO = 0.010
 EDIT_MASK_AUTO_MAX_EXPAND = 7
-EditMaskMode = Literal["alpha_subject", "auto_subject", "center_box", "none"]
+EditMaskMode = Literal[
+    "alpha_subject",
+    "auto_subject",
+    "center_box",
+    "reviewed_evidence",
+    "none",
+]
 
 
 @dataclass(frozen=True)
@@ -57,8 +63,9 @@ def final_prompt(task: GenTask) -> str:
         return p["final_text"]
     if p.get("instruction"):
         return p["instruction"]
-    # reverse-off mode: instruction + reference hint
-    return "generate a new image in the same style as the reference, high quality"
+    # Reverse-off mode still needs concrete visual constraints when the caller
+    # supplied only a reference image.
+    return "Match the reference subject, composition, lighting, color palette, and materials."
 
 
 def gateway_reference_image(
@@ -71,10 +78,13 @@ def gateway_reference_image(
     prefer_original_upload: bool = False,
     quality: int = 82,
     subsampling: int = 2,
-) -> str | None:
+    return_content_hash: bool = False,
+) -> str | tuple[str, str] | None:
     if not url:
         return None
     if url.startswith("data:image/"):
+        if return_content_hash:
+            return url, reverse_lineage.data_uri_content_hash(url)
         return url
     try:
         return asset_refs.gateway_ref_for_user_asset(
@@ -86,6 +96,7 @@ def gateway_reference_image(
             prefer_original_upload=prefer_original_upload,
             quality=quality,
             subsampling=subsampling,
+            return_content_hash=return_content_hash,
         )
     except asset_refs.AssetRefError as e:
         raise RuntimeError(str(e)) from e
@@ -1017,7 +1028,11 @@ def composite_product_subject_pixels(
     mask is sent. For product mode, the stronger invariant is to reuse the
     original product pixels and let the model contribute the background/style.
     """
-    if not source_url or not source_mask or source_mask.mode not in {"alpha_subject", "auto_subject"}:
+    if (
+        not source_url
+        or not source_mask
+        or source_mask.mode not in {"alpha_subject", "auto_subject", "reviewed_evidence"}
+    ):
         return None
     source_alpha = _mask_alpha_from_data_uri(source_mask.data_uri)
     if source_alpha is None:

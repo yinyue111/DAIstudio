@@ -8,6 +8,7 @@ to seed those rows on first boot.
 from __future__ import annotations
 
 import math
+import re
 from functools import lru_cache
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -40,6 +41,7 @@ class RedisSettings(BaseModel):
 class StorageSettings(BaseModel):
     backend: str
     dir: str
+    mirror_local: bool
     s3_endpoint_url: str
     s3_bucket: str
     s3_region: str
@@ -66,6 +68,9 @@ class GatewaySettings(BaseModel):
     timeout_seconds: int
     max_retries: int
     reverse_timeout_seconds: int
+    reverse_max_retries: int
+    reverse_max_tokens: int
+    reverse_reasoning_effort: str
     image_timeout_seconds: int
     image_download_timeout_seconds: int
     generated_image_max_bytes: int
@@ -154,6 +159,7 @@ class Settings(BaseSettings):
     # --- Core ---
     app_name: str = "AI Material Studio"
     deploy_env: str = "local"  # local | staging | production
+    product_edition: str = "full"  # full | launch_lite
     debug: bool = False
     # Comma separated list of allowed CORS origins for the internal frontend.
     cors_origins: str = "http://localhost:3000,http://127.0.0.1:3000"
@@ -206,10 +212,63 @@ class Settings(BaseSettings):
     anthropic_base_url: str = ""
     anthropic_auth_token: str = ""
     gateway_timeout_seconds: int = 120
+    # A synchronous paid prompt rewrite freezes credits before calling the
+    # provider. This backstop releases reservations left by a crashed API
+    # process; keep it comfortably above the provider request timeout.
+    prompt_optimization_running_timeout_seconds: int = 600
     gateway_max_retries: int = 2
     # Vision reverse-prompt calls can include multiple keyframes and may take
     # longer than normal chat calls, but should remain shorter than rendering.
-    reverse_gateway_timeout_seconds: int = 150
+    reverse_gateway_timeout_seconds: int = 240
+    # A timed-out reverse request may still finish and be billed upstream.
+    # Do not replay it automatically unless the provider offers idempotency.
+    reverse_gateway_max_retries: int = 0
+    reverse_gateway_max_tokens: int = 4096
+    reverse_gateway_reasoning_effort: str = "medium"
+    # Local signal analysis is independent from the optional transcription
+    # gateway so beat/music/transient evidence remains available without ASR.
+    audio_signal_analysis_enabled: bool = True
+    # Optional OpenAI-compatible transcription gateway used by video reverse
+    # analysis. It is deliberately disabled by default so visual reverse keeps
+    # working when no speech-to-text provider is configured.
+    audio_gateway_enabled: bool = False
+    audio_gateway_base_url: str = ""
+    audio_gateway_api_key: str = ""
+    audio_transcription_model: str = "whisper-1"
+    audio_gateway_timeout_seconds: int = 180
+    # Optional bounded readiness probe for the transcription provider. A base
+    # URL and key alone mean configured-but-unverified until a probe or a real
+    # timestamped transcription succeeds.
+    audio_gateway_health_url: str = ""
+    audio_gateway_health_timeout_seconds: int = 3
+    audio_gateway_health_cache_ttl_seconds: int = 15
+    audio_upload_max_bytes: int = 25 * 1024 * 1024
+    # Independent image evidence analyzers. The OCR language list is passed to
+    # Tesseract explicitly; merely having chi_sim installed is not proof that a
+    # recognition call used it.
+    image_evidence_ocr_languages: str = "chi_sim+eng"
+    image_evidence_detector_url: str = ""
+    image_evidence_detector_api_key: str = ""
+    image_evidence_detector_timeout_seconds: int = 30
+    image_evidence_detector_health_url: str = ""
+    image_evidence_detector_health_timeout_seconds: int = 3
+    image_evidence_segmenter_url: str = ""
+    image_evidence_segmenter_api_key: str = ""
+    image_evidence_segmenter_timeout_seconds: int = 30
+    image_evidence_segmenter_health_url: str = ""
+    image_evidence_segmenter_health_timeout_seconds: int = 3
+    # Cache bounded external readiness probes per API/worker process. Analysis
+    # successes invalidate the matching cache entry immediately.
+    image_evidence_health_cache_ttl_seconds: int = 15
+    # Optional independent provider for subject tracks, pose, action and
+    # semantic transitions over sampled video frames. It is disabled by
+    # default; VLM prose is never substituted when this provider is absent.
+    video_evidence_semantic_url: str = ""
+    video_evidence_semantic_api_key: str = ""
+    video_evidence_semantic_timeout_seconds: int = 30
+    video_evidence_semantic_health_url: str = ""
+    video_evidence_semantic_health_timeout_seconds: int = 3
+    video_evidence_semantic_health_cache_ttl_seconds: int = 15
     # Image generation can legitimately take several minutes for large outputs.
     # Keep it separate from normal gateway calls so prompt/reverse endpoints do
     # not wait as long as render endpoints.
@@ -239,9 +298,9 @@ class Settings(BaseSettings):
     video_gateway_api_key: str = ""
     video_gateway_format: str = "ark"  # ark | openai
     video_submit_timeout_seconds: int = 300
-    # Async video render polling (a worker stays busy for up to this long per
-    # render — tune down, or run a dedicated video worker, under high load).
-    video_poll_max_seconds: int = 7200
+    # Total provider render window. Polling is asynchronous; tasks still
+    # running after this deadline fail and release their frozen credits.
+    video_poll_max_seconds: int = 600
     video_poll_interval_seconds: int = 5
     video_resume_batch_size: int = 100
     video_download_max_attempts: int = 3
@@ -268,6 +327,10 @@ class Settings(BaseSettings):
     # --- Storage (local filesystem for the bare-metal MVP) ---
     storage_backend: str = "local"  # local | s3
     storage_dir: str = str(BASE_DIR / "storage")
+    # During an object-storage migration, keep a readable local copy of every
+    # new object. This provides a zero-downtime rollback path while historical
+    # files are copied and verified in the background.
+    storage_mirror_local: bool = False
     storage_s3_endpoint_url: str = ""
     storage_s3_bucket: str = ""
     storage_s3_region: str = "auto"
@@ -293,6 +356,7 @@ class Settings(BaseSettings):
     # --- Misc business rules ---
     parse_cache_minutes: int = 30
     user_gen_rate_per_hour: int = 60  # crude per-user generation rate limit
+    generation_quote_ttl_seconds: int = 600
     user_parse_rate_per_hour: int = 60  # crude per-user parse rate limit
     ws_ticket_rate_per_minute: int = 60
     ws_connect_rate_per_minute: int = 60
@@ -338,6 +402,10 @@ class Settings(BaseSettings):
     # Production SSRF guard for operator-configured egress endpoints. Leave
     # blank unless a gateway really must point at an internal host.
     trusted_egress_hosts: str = ""
+    # Exact hostnames for operator-managed evidence/ASR services on a private
+    # network. This allowlist is consumed only by analyzer calls; it never
+    # relaxes user URL fetching or model-gateway SSRF checks.
+    trusted_analyzer_hosts: str = ""
     # Source/reference video upload limit. Generated video clip duration is
     # capped separately by effective_max_video_generation_seconds.
     max_video_seconds: int = 15 * 60
@@ -445,6 +513,99 @@ class Settings(BaseSettings):
             raise ValueError("reverse_video_frame_payload_max_bytes must be between 1MiB and 64MiB")
         return value
 
+    @field_validator("audio_upload_max_bytes")
+    @classmethod
+    def _validate_audio_upload_budget(cls, value: int) -> int:
+        if value < 1024 * 1024 or value > 100 * 1024 * 1024:
+            raise ValueError("audio_upload_max_bytes must be between 1MiB and 100MiB")
+        return value
+
+    @field_validator("audio_gateway_timeout_seconds")
+    @classmethod
+    def _validate_audio_gateway_timeout(cls, value: int) -> int:
+        if value < 10 or value > 1800:
+            raise ValueError("audio_gateway_timeout_seconds must be between 10 and 1800")
+        return value
+
+    @field_validator("prompt_optimization_running_timeout_seconds")
+    @classmethod
+    def _validate_prompt_optimization_running_timeout(cls, value: int) -> int:
+        if value < 60 or value > 3600:
+            raise ValueError(
+                "prompt_optimization_running_timeout_seconds must be between 60 and 3600"
+            )
+        return value
+
+    @field_validator(
+        "audio_gateway_health_timeout_seconds",
+        "image_evidence_detector_health_timeout_seconds",
+        "image_evidence_segmenter_health_timeout_seconds",
+        "video_evidence_semantic_health_timeout_seconds",
+    )
+    @classmethod
+    def _validate_analyzer_health_timeout(cls, value: int) -> int:
+        if value < 1 or value > 10:
+            raise ValueError("analyzer health timeouts must be between 1 and 10 seconds")
+        return value
+
+    @field_validator(
+        "audio_gateway_health_cache_ttl_seconds",
+        "image_evidence_health_cache_ttl_seconds",
+        "video_evidence_semantic_health_cache_ttl_seconds",
+    )
+    @classmethod
+    def _validate_evidence_health_cache_ttl(cls, value: int) -> int:
+        if value < 1 or value > 60:
+            raise ValueError("evidence health cache TTL must be between 1 and 60 seconds")
+        return value
+
+    @field_validator("audio_transcription_model")
+    @classmethod
+    def _validate_audio_transcription_model(cls, value: str) -> str:
+        model = value.strip()
+        if not model or len(model) > 128 or not model.isprintable():
+            raise ValueError("audio_transcription_model must be 1-128 printable characters")
+        return model
+
+    @field_validator(
+        "image_evidence_detector_timeout_seconds",
+        "image_evidence_segmenter_timeout_seconds",
+        "video_evidence_semantic_timeout_seconds",
+    )
+    @classmethod
+    def _validate_region_analyzer_timeout(cls, value: int) -> int:
+        if value < 1 or value > 120:
+            raise ValueError("evidence analyzer timeouts must be between 1 and 120 seconds")
+        return value
+
+    @field_validator("image_evidence_ocr_languages")
+    @classmethod
+    def _validate_image_evidence_ocr_languages(cls, value: str) -> str:
+        languages = [item.strip() for item in value.replace(",", "+").split("+")]
+        if (
+            not languages
+            or len(languages) > 8
+            or sum(len(item) for item in languages) > 128
+            or any(not re.fullmatch(r"[A-Za-z0-9_-]{1,32}", item, flags=re.ASCII) for item in languages)
+        ):
+            raise ValueError("image_evidence_ocr_languages must be a + separated language list")
+        return "+".join(dict.fromkeys(languages))
+
+    @field_validator("product_edition")
+    @classmethod
+    def _validate_product_edition(cls, value: str) -> str:
+        normalized = str(value or "").strip().lower()
+        if normalized not in {"full", "launch_lite"}:
+            raise ValueError("product_edition must be full or launch_lite")
+        return normalized
+
+    @field_validator("generation_quote_ttl_seconds")
+    @classmethod
+    def _validate_generation_quote_ttl(cls, value: int) -> int:
+        if value < 60 or value > 3600:
+            raise ValueError("generation_quote_ttl_seconds must be between 60 and 3600")
+        return value
+
     @field_validator("upload_processing_acquire_timeout_seconds")
     @classmethod
     def _validate_upload_processing_acquire_timeout(cls, value: float) -> float:
@@ -484,6 +645,14 @@ class Settings(BaseSettings):
         return [o.strip().lower() for o in self.trusted_egress_hosts.split(",") if o.strip()]
 
     @property
+    def trusted_analyzer_host_list(self) -> list[str]:
+        return [
+            o.strip().rstrip(".").lower()
+            for o in self.trusted_analyzer_hosts.split(",")
+            if o.strip()
+        ]
+
+    @property
     def effective_max_video_generation_seconds(self) -> int:
         configured = min(
             int(self.max_video_seconds),
@@ -518,6 +687,7 @@ class Settings(BaseSettings):
         return StorageSettings(
             backend=self.storage_backend,
             dir=self.storage_dir,
+            mirror_local=self.storage_mirror_local,
             s3_endpoint_url=self.storage_s3_endpoint_url,
             s3_bucket=self.storage_s3_bucket,
             s3_region=self.storage_s3_region,
@@ -543,6 +713,9 @@ class Settings(BaseSettings):
             timeout_seconds=self.gateway_timeout_seconds,
             max_retries=self.gateway_max_retries,
             reverse_timeout_seconds=self.reverse_gateway_timeout_seconds,
+            reverse_max_retries=self.reverse_gateway_max_retries,
+            reverse_max_tokens=self.reverse_gateway_max_tokens,
+            reverse_reasoning_effort=self.reverse_gateway_reasoning_effort,
             image_timeout_seconds=self.image_gateway_timeout_seconds,
             image_download_timeout_seconds=self.image_download_timeout_seconds,
             generated_image_max_bytes=self.generated_image_max_bytes,

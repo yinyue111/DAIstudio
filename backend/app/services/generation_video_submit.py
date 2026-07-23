@@ -66,6 +66,7 @@ from .video_prompt_compiler import (
     VIDEO_SUBMIT_CONTRACT_VERSION,
     build_video_prompt_references,
     compile_video_prompt,
+    source_video_is_analysis_only,
     store_video_prompt_compile,
 )
 
@@ -85,6 +86,7 @@ def _compile_legacy_video_prompt(task: GenTask, model, params: dict) -> tuple[st
         source_asset_url=task.source_asset_url,
         source_type=task.source_type,
         params=params,
+        source_video_analysis_only=source_video_is_analysis_only(params),
     )
     extra = getattr(model, "extra", None) if isinstance(getattr(model, "extra", None), dict) else {}
     model_profiles = extra.get("video_prompt_profiles") or extra.get("prompt_profiles")
@@ -370,7 +372,11 @@ def video_submit_params(db, task: GenTask) -> dict:
         first_frame = first_frame or params.get("reference_image_url")
         if task.source_type == "image":
             first_frame = first_frame or task.source_asset_url
-        elif task.source_type == "video" and not first_frame:
+        elif (
+            task.source_type == "video"
+            and not first_frame
+            and not source_video_is_analysis_only(params)
+        ):
             first_frame = gateway_video_first_frame(db, task)
     frame_reference_kwargs = {
         "min_side": VIDEO_FIRST_FRAME_MIN_SIDE,
@@ -714,7 +720,7 @@ def start_video_task(
             model = model_config_for_task(db, task, "video", model_loader)
             if not model or not model.enabled:
                 raise RuntimeError("未配置可用的视频模型")
-            model = model_from_snapshot(task, model)
+            model = model_from_snapshot(task, model, db)
 
             original_params = dict(task.params or {})
             prompt = str(original_params.get("_generation_prompt") or "").strip()
@@ -906,7 +912,7 @@ def poll_video_once(
             )
             return
         try:
-            model = model_from_snapshot(task, model)
+            model = model_from_snapshot(task, model, db)
         except ModelSnapshotMismatchError as e:
             hold_video_poll_for_reconciliation(
                 db,
@@ -922,6 +928,7 @@ def poll_video_once(
         submitted_at = aware(task.external_submitted_at) or aware(task.created_at)
         elapsed = (datetime.now(timezone.utc) - submitted_at).total_seconds() if submitted_at else 0
         if elapsed > poll_budget:
+            timeout_minutes = max(1, (poll_budget + 59) // 60)
             usage.record_call(
                 db,
                 kind="video_poll",
@@ -935,11 +942,15 @@ def poll_video_once(
                     "error": "render timeout",
                 },
             )
-            hold_video_poll_for_reconciliation(
+            fail_and_refund(
                 db,
                 task_id,
-                f"视频渲染超过 {poll_budget} 秒仍未结束; "
+                f"视频生成超过 {poll_budget} 秒仍未完成; "
                 f"external_task_id={polled_external_task_id or 'unknown'}",
+                public_error=(
+                    f"视频生成超过 {timeout_minutes} 分钟，"
+                    "任务已自动失败并退回冻结积分"
+                ),
                 expected_status="running",
                 expected_phase="polling",
                 expected_external_task_id=polled_external_task_id,

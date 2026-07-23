@@ -12,6 +12,7 @@ const pageSource = readFileSync(join(root, "app/page.jsx"), "utf8");
 const mediaUploadSource = readFileSync(join(root, "hooks/useMediaUpload.js"), "utf8");
 const workspaceStateSource = readFileSync(join(root, "hooks/useStudioWorkspaceState.js"), "utf8");
 const promptWorkspaceSource = readFileSync(join(root, "app/studio/StudioPromptWorkspace.jsx"), "utf8");
+const productVideoStrategySource = readFileSync(join(root, "app/studio/StudioProductVideoStrategy.jsx"), "utf8");
 const referencePanelSource = readFileSync(join(root, "app/studio/StudioReferencePanel.jsx"), "utf8");
 const constantsSource = readFileSync(join(root, "app/studio/constants.ts"), "utf8");
 const editPromptSource = readFileSync(join(root, "app/studio/editPrompt.ts"), "utf8");
@@ -24,22 +25,22 @@ const generationControlsSource = readFileSync(join(root, "components/StudioGener
 const studioSource = `${pageSource}\n${workspaceStateSource}\n${promptWorkspaceSource}\n${editPromptSource}\n${generationPayloadSource}\n${referenceParsingSource}\n${viewModelSource}\n${constantsSource}\n${generationControlsSource}`;
 assert.match(
   constantsSource,
-  /MAX_PRODUCT_DETAIL_IMAGES\s*=\s*5/,
-  "the product detail image business limit should be five",
+  /MAX_PRODUCT_DETAIL_IMAGES\s*=\s*10/,
+  "the product detail image business limit should be ten",
 );
 assert.match(
   mediaUploadSource,
   /productDetailAssets\.length \+ files\.length > MAX_PRODUCT_DETAIL_IMAGES/,
-  "product detail uploads should use the shared five-image limit",
+  "product detail uploads should use the shared ten-image limit",
 );
 assert.match(
   pageSource,
   /productDetailAssets:[\s\S]*?\.slice\(0, MAX_PRODUCT_DETAIL_IMAGES\)/,
-  "Studio drafts should retain all five product detail images",
+  "Studio drafts should retain all ten product detail images",
 );
 assert.match(
   referencePanelSource,
-  /最多 \{limit \|\| MAX_PRODUCT_DETAIL_IMAGES\} 张/,
+  /最多 \$\{safeLimit\} 张/,
   "the reference panel should show the effective product detail limit",
 );
 assert.doesNotMatch(
@@ -60,23 +61,28 @@ const clearedWorkspace = clearWorkspaceContent({
   negative: "旧负向词",
   assets: [{ id: 1 }],
   selected: { id: 1 },
+  lastFrameAsset: { id: 5 },
   productAsset: { id: 2 },
   productDetailAssets: [{ id: 3 }, { id: 4 }],
   productProfile: { final_text: "旧主体档案" },
   structured: { 主体: "旧反推主体" },
   reverseVideoAnalysis: { source: { duration_seconds: 10 } },
+  reverseAppliedRevisionId: 99,
   ratio: "3:4",
 });
 assert.equal(clearedWorkspace.prompt, "");
 assert.equal(clearedWorkspace.negative, "");
 assert.deepEqual(clearedWorkspace.assets, []);
 assert.equal(clearedWorkspace.selected, null);
+assert.equal(clearedWorkspace.lastFrameAsset, null);
 assert.equal(clearedWorkspace.productAsset, null);
 assert.deepEqual(clearedWorkspace.productDetailAssets, []);
 assert.equal(clearedWorkspace.productProfile, null);
 assert.deepEqual(clearedWorkspace.structured, {});
 assert.equal(clearedWorkspace.reverseVideoAnalysis, null);
+assert.equal(clearedWorkspace.reverseAppliedRevisionId, null);
 assert.equal(clearedWorkspace.ratio, "3:4", "clear should preserve generation settings");
+assert.match(workspaceStateSource, /reverseAppliedRevisionId:\s*null/);
 
 const clearedWorkspaces = clearAllWorkspaceContent({
   image: {
@@ -255,6 +261,7 @@ for (const field of [
   "url",
   "assets",
   "selected",
+  "lastFrameAsset",
   "productAsset",
   "ratio",
   "imageQuality",
@@ -262,6 +269,7 @@ for (const field of [
   "seed",
   "vDuration",
   "vResolution",
+  "productVideoTemplate",
   "editMaskMode",
   "productPixelLockMode",
   "videoAnalysisPreset",
@@ -329,8 +337,13 @@ assert.match(
 );
 assert.match(
   referenceParsingSource,
-  /setWorkspacePatch\(\(current\) => \{[\s\S]*promptUnchanged[\s\S]*promptSourceSignature:\s*targetSignature/,
-  "reverse output should not overwrite manual prompt edits and should tag the prompt source",
+  /const pendingResult = \{[\s\S]*kind:\s*"pending_reverse_review"[\s\S]*source_signature:\s*targetSignature[\s\S]*final_text:\s*reversePrompt/,
+  "reverse output should preserve source provenance in a pending review result",
+);
+assert.match(
+  referenceParsingSource,
+  /setWorkspacePatch\(\{[\s\S]*pendingReverseResult:\s*pendingResult[\s\S]*reverseResultTab:\s*"draft"[\s\S]*\}, mode\);/,
+  "reverse output should enter review instead of silently replacing the current prompt",
 );
 assert.match(
   referenceParsingSource,
@@ -399,14 +412,19 @@ assert.doesNotMatch(
 );
 assert.match(
   generationPayloadSource,
-  /product_lock_mode:\s*"locked"/,
+  /product_lock_mode:\s*productLockMode/,
   "product video requests should always preserve product identity",
 );
 assert.match(
   generationPayloadSource,
-  /product_video_template:\s*"prompt_driven"/,
-  "product video requests should always preserve user-authored motion",
+  /product_video_template:\s*normalizedProductVideoTemplate/,
+  "product video requests should submit the selected supported strategy",
 );
+assert.match(workspaceStateSource, /productVideoTemplate:\s*"prompt_driven"/);
+assert.match(workspaceStateSource, /setProductVideoTemplate/);
+assert.match(promptWorkspaceSource, /StudioProductVideoStrategy/);
+assert.match(productVideoStrategySource, /aria-pressed=\{selected\}/);
+assert.match(productVideoStrategySource, /sm:grid-cols-2/);
 assert.match(
   generationPayloadSource,
   /edit_mask_mode:\s*editMaskMode \|\| "protect_subject"/,
@@ -528,6 +546,46 @@ assert.match(
   /const directProductVideoMode = creationMode === "video"[\s\S]*\{\(isImageEditMode \|\| directProductVideoMode\) &&/,
   "text-to-video should expose a dedicated product-subject upload panel",
 );
+assert.doesNotMatch(
+  referencePanelSource,
+  /directProductVideoMode && !firstLastFrameEnabled/,
+  "a first/last-frame capable model must not hide the existing product-video entry",
+);
+assert.match(
+  pageSource,
+  /selectedGenerationModel\.capabilities\.first_last_frame === true[\s\S]*subjectMode === "general"[\s\S]*const effectiveLastFrameAsset = firstLastFrameEnabled \? lastFrameAsset : null/,
+  "first/last-frame UI should require an explicit model capability and the general video subject mode",
+);
+assert.match(
+  pageSource,
+  /last_frame_asset:\s*assetSignature\(effectiveLastFrameAsset\)/,
+  "the effective last frame should invalidate stale generation quotes",
+);
+assert.match(
+  pageSource,
+  /lastFrameAsset:\s*sanitizeAssetForDraft\(current\.lastFrameAsset\)/,
+  "studio drafts should retain the optional last-frame image",
+);
+assert.match(
+  pageSource,
+  /async function clearRef\(\)[\s\S]*lastFrameAsset:\s*null/,
+  "clearing the active reference should also clear the last frame",
+);
+assert.match(
+  pageSource,
+  /assetPicker\?\.role === "last_frame"[\s\S]*selectLastFrameAsset\(\{ \.\.\.next, url \}\)/,
+  "the asset library should support selecting a dedicated last-frame image",
+);
+assert.match(
+  generationSubmitSource,
+  /modelOption\.capabilities\.first_last_frame === true[\s\S]*effectiveLastFrameAsset = firstLastFrameEnabled && modelSupportsFirstLastFrame[\s\S]*lastFrameAsset:\s*effectiveLastFrameAsset/,
+  "submission should filter stale last-frame state when the model or mode does not support it",
+);
+assert.match(
+  generationPayloadSource,
+  /subjectMode === "general"[\s\S]*firstLastFrameEnabled[\s\S]*\? lastFrameAsset : null/,
+  "payload assembly should defensively isolate first/last-frame inputs from product video mode",
+);
 assert.match(
   referencePanelSource,
   /作为视频唯一产品主体，不是风格参考/,
@@ -590,12 +648,12 @@ assert.match(
 );
 assert.match(
   pageSource,
-  /disabled=\{missingRequiredSource \|\| structuredDirty \|\| generationSubmitDisabled/,
-  "generation must stay disabled until the required source exists and structured conflicts are resolved",
+  /disabled=\{missingRequiredSource \|\| productVideoStrategyUnsupported \|\| structuredDirty \|\| generationSubmitDisabled/,
+  "generation must stay disabled until source, strategy, and structured constraints are satisfied",
 );
 assert.match(
   pageSource,
-  /missingRequiredSource \? missingRequiredSourceLabel : submitLabel/,
+  /missingRequiredSource[\s\S]*\? missingRequiredSourceLabel[\s\S]*productVideoStrategyUnsupported \? "请切换视频模型" : submitLabel/,
   "the disabled submit button should explain which source image is missing",
 );
 assert.doesNotMatch(

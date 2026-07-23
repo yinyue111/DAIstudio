@@ -15,6 +15,7 @@ from ..models import User
 from ..schemas import PaymentCreateIn, PaymentOrderOut, PaymentPackageOut
 from ..services import audit, payments
 from ..services.config_store import get_bool_setting
+from ..services.product_edition import is_launch_lite
 from ..services.rate_limit import incr_window
 from ..services.request_limits import read_limited_body
 
@@ -67,13 +68,15 @@ def _rate_limit_order(user_id: int, ip: str) -> None:
 
 @router.get("/packages", response_model=list[PaymentPackageOut])
 def packages(db: Session = Depends(get_db), _: User = Depends(get_current_user)):
-    if not get_bool_setting(db, "payment_enabled", False):
+    if is_launch_lite() or not get_bool_setting(db, "payment_enabled", False):
         return []
     return payments.list_packages(db, enabled_only=True)
 
 
 @router.get("/config")
 def payment_config(db: Session = Depends(get_db), _: User = Depends(get_current_user)):
+    if is_launch_lite():
+        return {"enabled": False, "packages": [], "providers": []}
     return payments.public_config(db)
 
 
@@ -82,7 +85,7 @@ def create_order(body: PaymentCreateIn, request: Request,
                  db: Session = Depends(get_db),
                  user: User = Depends(get_current_user)):
     ip = get_client_ip(request)
-    if not get_bool_setting(db, "payment_enabled", False):
+    if is_launch_lite() or not get_bool_setting(db, "payment_enabled", False):
         raise HTTPException(400, "支付充值功能未开启")
     _rate_limit_order(user.id, ip)
     try:

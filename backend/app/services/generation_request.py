@@ -66,13 +66,14 @@ _PRODUCT_VIDEO_TEMPLATES = {
     "stable_showcase",
     "reference_sequence",
     "slow_push",
+    "single_clip_action",
     "handheld_display",
     "background_motion",
     "soft_splash",
 }
 _EDIT_MASK_MODES = {"off", "protect_subject", "center_box"}
 _PRODUCT_PIXEL_LOCK_MODES = {"auto", "strict", "on", "true", "1", "off", "false", "0"}
-_MAX_PRODUCT_DETAIL_IMAGES = 5
+_MAX_PRODUCT_DETAIL_IMAGES = 10
 
 
 def image_max_pixels() -> int:
@@ -411,6 +412,8 @@ def request_fingerprint(
     params: dict,
     parent_task_id: int | None,
     model_config_id: int | None = None,
+    project_id: int | None = None,
+    shot_context: dict | None = None,
 ) -> str:
     payload = {
         "category": category,
@@ -422,6 +425,11 @@ def request_fingerprint(
         "parent_task_id": parent_task_id,
         "model_config_id": model_config_id,
     }
+    # Preserve replay compatibility with tasks created before project scoping.
+    if project_id is not None:
+        payload["project_id"] = int(project_id)
+    if shot_context is not None:
+        payload["shot_context"] = _fingerprint_clean(shot_context)
     raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(raw.encode()).hexdigest()
 

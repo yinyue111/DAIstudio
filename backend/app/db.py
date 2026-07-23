@@ -43,6 +43,30 @@ engine = create_engine(
 )
 
 
+def _enable_sqlite_foreign_keys(dbapi_connection, _connection_record) -> None:
+    original_autocommit = getattr(dbapi_connection, "autocommit", None)
+    if original_autocommit is not None:
+        dbapi_connection.autocommit = True
+    cursor = dbapi_connection.cursor()
+    try:
+        cursor.execute("PRAGMA foreign_keys=ON")
+    finally:
+        cursor.close()
+        if original_autocommit is not None:
+            dbapi_connection.autocommit = original_autocommit
+
+
+def configure_sqlite_foreign_keys(target_engine) -> None:
+    """Match PostgreSQL foreign-key enforcement on every SQLite connection."""
+    if target_engine.dialect.name == "sqlite" and not event.contains(
+        target_engine, "connect", _enable_sqlite_foreign_keys
+    ):
+        event.listen(target_engine, "connect", _enable_sqlite_foreign_keys)
+
+
+configure_sqlite_foreign_keys(engine)
+
+
 @event.listens_for(engine, "before_cursor_execute")
 def _record_query_start(conn, cursor, statement, parameters, context, executemany):  # noqa: ARG001
     context._query_start_time = time.perf_counter()

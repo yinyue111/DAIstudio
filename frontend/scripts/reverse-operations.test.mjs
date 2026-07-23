@@ -18,6 +18,7 @@ import {
   isTerminalReverseOperation,
   normalizeReverseOperation,
   normalizeReverseOperationList,
+  normalizeReverseResultRevisionList,
   reverseOperationRequestSignature,
   reverseOperationResumeCandidates,
   reverseOperationTrackingLost,
@@ -27,9 +28,11 @@ import {
   videoAnalysisEvidenceData,
 } from "../app/studio/StudioReferencePanel.jsx";
 import { buildStudioDerivedViewState } from "../app/studio/viewModel.ts";
+import { cancelStaleReverseOperation } from "../hooks/useReferenceParsing.js";
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const apiSource = readFileSync(join(root, "lib/api.js"), "utf8");
+const apiTypeSource = readFileSync(join(root, "lib/api.d.ts"), "utf8");
 const trackingSource = readFileSync(join(root, "hooks/useReverseOperationTracking.js"), "utf8");
 const parsingSource = readFileSync(join(root, "hooks/useReferenceParsing.js"), "utf8");
 const uploadSource = readFileSync(join(root, "hooks/useMediaUpload.js"), "utf8");
@@ -60,6 +63,13 @@ assert.equal(trackingLost.error_code, "tracking_lost");
 assert.equal(isActiveReverseOperation(trackingLost), true);
 assert.equal(normalizeReverseOperationList({ items: [{ id: 18, status: "canceled" }] }).length, 1);
 assert.equal(isTerminalReverseOperation({ id: 18, status: "canceled" }), true);
+assert.deepEqual(
+  normalizeReverseResultRevisionList([
+    { id: 31, operation_id: 17, version: 3, source: "model_compiled", payload: { final_text: "compiled" } },
+    { id: 32, operation_id: 17, version: 4, source: "generation", payload: { final_text: "generated" } },
+  ]).map((revision) => revision.source),
+  ["model_compiled", "generation"],
+);
 const resumeCandidates = reverseOperationResumeCandidates({
   image: {
     selected: { type: "image", url: "/source.jpg" },
@@ -103,6 +113,11 @@ for (const endpoint of [
   "/confirm-cover",
   "/cancel",
   "/ws-ticket",
+  "/revisions",
+  "/apply",
+  "/feedback",
+  "/retry",
+  "/api/recipes",
 ]) assert.match(apiSource, new RegExp(endpoint.replaceAll("/", "\\/")));
 assert.match(trackingSource, /reverseOperationWsTicket\(tracker\.id\)/);
 assert.match(trackingSource, /new WebSocket\(wsUrl\(/);
@@ -174,10 +189,37 @@ assert.match(
   "recovered profile and prompt operations must seed separate source references",
 );
 assert.match(recoveredBindingSource, /productAsset: current\.productAsset \|\| sourceAsset/);
-assert.match(parsingSource, /promptUnchanged[\s\S]*!current\.promptDirty/);
-assert.match(parsingSource, /preserveRecoveredStructuredEdits[\s\S]*context\.recovered && current\.structuredDirty/);
+const applyReverseResultSource = parsingSource.match(
+  /function applyReverseOperationResult\([\s\S]*?(?=\n  function handleReverseOperationUpdate)/,
+)?.[0] || "";
+assert.match(applyReverseResultSource, /kind: "pending_reverse_review"/);
+assert.match(applyReverseResultSource, /pendingReverseResult: pendingResult/);
+assert.doesNotMatch(
+  applyReverseResultSource,
+  /setWorkspacePatch\(\{[\s\S]{0,500}\bprompt:\s*reversePrompt/,
+  "reverse completion must wait for explicit review instead of overwriting the workspace prompt",
+);
+assert.match(parsingSource, /workspace_snapshot_v3: workspaceSnapshot/);
+assert.match(parsingSource, /const sources = \[/);
+for (const field of [
+  "analysis_focus",
+  "analysis_precision",
+  "output_purpose",
+  "custom_instruction",
+  "source_range",
+  "custom_keyframes",
+  "include_audio",
+]) assert.match(parsingSource, new RegExp(`${field}:`), `v3 reverse request should include ${field}`);
 assert.match(parsingSource, /assetSignature\(selectedByModeRef\.current\[mode\]\) !== targetSignature/);
 assert.match(parsingSource, /cancelTrackedReverseOperation\(trackingKey, savedOperationId\(trackingKey\)\)[\s\S]*stopReverseTracker\(trackingKey\)/);
+const reverseSubmitSource = parsingSource.match(
+  /async function doReverse\(\)[\s\S]*?(?=\n  function savedOperationId)/,
+)?.[0] || "";
+assert.match(
+  reverseSubmitSource,
+  /if \(!isCurrent\(\)\) \{[\s\S]*await cancelStaleReverseOperation\(operation\)/,
+  "input changes after confirmed execution must cancel the newly created reverse operation",
+);
 assert.match(parsingSource, /const profileAssetByModeRef = useRef\(\{\}\)/);
 assert.match(
   parsingSource,
@@ -205,7 +247,12 @@ assert.match(
   /workspace_snapshot_v2:\s*\{[\s\S]*buildReverseOperationRequestSnapshotV2\(\{[\s\S]*productAsset:\s*asset,[\s\S]*source_signature:\s*signature/,
   "profile prefetch must persist the current product asset in its v2 workspace snapshot",
 );
-assert.match(profilePrefetchSource, /normalizeReverseOperation\(await api\.createReverseOperation\(/);
+assert.match(
+  profilePrefetchSource,
+  /requestQuoteConfirmation\(\{[\s\S]*kind: "reverse"[\s\S]*execute: \(\{ request \}\) => api\.createReverseOperation\(request\)/,
+  "profile prefetch must quote before creating the paid reverse operation",
+);
+assert.match(profilePrefetchSource, /normalizeReverseOperation\(profileConfirmation\.result\)/);
 assert.match(profilePrefetchSource, /waitForTrackedProfileOperation\(createdOperation,[\s\S]*trackProfileReverseOperation/);
 assert.doesNotMatch(profilePrefetchSource, /createAndWaitForReverseOperation/);
 assert.match(
@@ -219,7 +266,12 @@ assert.match(
   /workspace_snapshot_v2:\s*\{[\s\S]*buildReverseOperationRequestSnapshotV2\(\{[\s\S]*productAsset,[\s\S]*source_signature:\s*productSignature/,
   "generation-time profile requests must persist the current product asset in their v2 workspace snapshot",
 );
-assert.match(submitSource, /normalizeReverseOperation\(await api\.createReverseOperation\(/);
+assert.match(
+  submitSource,
+  /requestQuoteConfirmation\(\{[\s\S]*kind: "reverse"[\s\S]*execute: \(\{ request \}\) => api\.createReverseOperation\(request\)/,
+  "generation-time profile fallback must quote before creating the paid reverse operation",
+);
+assert.match(submitSource, /normalizeReverseOperation\(profileConfirmation\.result\)/);
 assert.match(submitSource, /waitForTrackedProfileOperation\(createdOperation,[\s\S]*trackProfileReverseOperation/);
 assert.doesNotMatch(submitSource, /createAndWaitForReverseOperation/);
 assert.match(
@@ -232,6 +284,34 @@ assert.equal(
   true,
   "the page must connect both profile creation paths to the shared reverse tracker",
 );
+assert.match(pageSource, /<StudioReverseResultPanel/);
+assert.match(pageSource, /<StudioRecentReversePanel/);
+assert.match(pageSource, /applyReverseResultApplication\(latestWorkspace, pending, mode\)/);
+assert.match(pageSource, /undoReverseResultApplication\(workspace, reverseUndoSnapshot\)/);
+assert.match(pageSource, /api\.createReverseOperationRevision\(operation\.id/);
+assert.match(pageSource, /api\.applyReverseOperationResult\(operation\.id/);
+assert.match(pageSource, /api\.updateReverseOperationFeedback\(operation\.id/);
+assert.match(pageSource, /api\.retryReverseOperation\(operation\.id/);
+assert.match(pageSource, /api\.createCreationRecipe\(/);
+assert.match(pageSource, /api\.createCreationRecipeVersion\(/);
+assert.match(pageSource, /onGenerationSubmitted: handleGenerationSubmitted/);
+assert.match(
+  submitSource,
+  /onGenerationSubmitted\?\.\(\{ task: nextTask, payload: submitted\.payload, stage \}\)/,
+  "generation lineage must bind the normalized request that was actually confirmed and submitted",
+);
+for (const lineageField of ["source_revision_id", "compiled_revision_id", "generation_revision_id"]) {
+  assert.match(pageSource, new RegExp(`submittedTask\\?\\.${lineageField}`));
+}
+assert.match(pageSource, /reverseAppliedRevisionId:\s*sourceRevisionId/);
+assert.doesNotMatch(pageSource, /source:\s*["']generation["']/);
+assert.match(
+  apiTypeSource,
+  /interface ReverseResultRevisionCreate \{\s*source:\s*"user_edit" \| "applied";/,
+  "the browser contract must not allow server-owned revision sources",
+);
+assert.match(apiTypeSource, /interface ReverseResultApplyInput/);
+assert.match(apiTypeSource, /applyReverseOperationResult/);
 const clearProductSource = pageSource.match(
   /async function clearProductAsset\(\)[\s\S]*?(?=\n  async function clearRef)/,
 )?.[0] || "";
@@ -262,11 +342,20 @@ assert.ok(
 const imageVisual = visualStructuredFields({
   "主体": "红色瓶子",
   "妆发五官": "自然妆容",
+  "人像意图": "无",
+  "广告目标": "未见明确卖点",
   "包装文字": "OCR 文字",
   "旁白": "不得进入",
   "final_text": "完整文本",
 }, "image");
 assert.deepEqual(imageVisual, { "主体": "红色瓶子", "妆发五官": "自然妆容" });
+const imageLayoutVisual = visualStructuredFields({
+  "主体": "红色瓶子",
+  "文字版式": "顶部白色无衬线标题，底部小号说明文字",
+  "负向": "乱码与水印",
+}, "image");
+assert.match(composePromptFromStructured(imageLayoutVisual), /顶部白色无衬线标题/);
+assert.doesNotMatch(composePromptFromStructured(imageLayoutVisual), /乱码与水印/);
 const videoVisual = visualStructuredFields({
   "主体": "产品",
   "主体运动设计": "慢速旋转",
@@ -279,6 +368,7 @@ const videoVisual = visualStructuredFields({
   "字幕卖点": "新品上市",
   "音效": "水滴声",
   "观察事实": "分析证据",
+  "源视频规格": "960x540，5.016秒，约24fps",
 }, "video");
 assert.equal(composePromptFromStructured(videoVisual, "", { target: "video" }), "产品");
 assert.doesNotMatch(JSON.stringify(videoVisual), /动作|运镜|剪辑|时序|迁移|字幕|音效|证据/);
@@ -316,8 +406,24 @@ const evidenceTransfer = composeEvidenceBackedVideoTransferPrompt({
     confidence: 0.9,
   }],
 }, "product");
-assert.match(evidenceTransfer, /镜头1 0-2\.5s: 产品居中，缓慢旋转，镜头缓慢推近/);
+assert.match(evidenceTransfer, /镜头1（0\.000-2\.500秒）：产品居中，缓慢旋转，镜头缓慢推近/);
 assert.doesNotMatch(evidenceTransfer, /未证实|新品上市|水滴声|evidence/i);
+assert.ok(evidenceTransfer.length <= 220);
+const compressedLongTransfer = composeEvidenceBackedVideoTransferPrompt({}, {
+  sampled_frames: [
+    { index: 1, timestamp_seconds: 0 },
+    { index: 2, timestamp_seconds: 25.408 },
+  ],
+  shots: [{
+    start_seconds: 0,
+    end_seconds: 25.408,
+    visual: "深蓝玻璃精华瓶依次展示滴管、液滴和瓶身折射",
+    evidence_frame_indices: [1, 2],
+    confidence: 0.9,
+  }],
+}, "");
+assert.match(compressedLongTransfer, /压缩为15秒内核心版/);
+assert.doesNotMatch(compressedLongTransfer, /25\.408秒/);
 const singleFrameTransfer = composeEvidenceBackedVideoTransferPrompt({}, {
   sampled_frames: [
     { index: 1, timestamp_seconds: 1 },
@@ -386,9 +492,17 @@ const snapshot = buildReverseSnapshotV2({
   assets: [{ type: "image", url: "/alternate.jpg", retention_expires_at: future }],
   structured: { "脸型五官": "椭圆脸" },
   finalText: "人物提示词",
+  promptDirty: true,
   videoAnalysisPreset: "quality",
   videoAnalysis: { analysis_mode: "image_motion", source: { audio_analyzed: false } },
   subjectProfile: { structured: { "脸型五官": "椭圆脸" } },
+  appliedVersion: 4,
+  appliedRevisionId: 44,
+  resultRevisions: [
+    { id: 44, operation_id: 12, version: 4, source: "applied", payload: { final_text: "人物提示词" } },
+    { id: 45, operation_id: 12, version: 5, source: "model_compiled", payload: { final_text: "compiled" } },
+    { id: 46, operation_id: 12, version: 6, source: "generation", payload: { final_text: "generated" } },
+  ],
 });
 const requestSnapshot = buildReverseOperationRequestSnapshotV2({
   creationMode: "video_edit",
@@ -407,15 +521,24 @@ assert.equal("structured" in requestSnapshot, false);
 assert.equal("final_text" in requestSnapshot, false);
 assert.equal("video_analysis" in requestSnapshot, false);
 assert.equal(snapshot.selected.retention_expires_at, future);
+assert.equal(snapshot.prompt_dirty, true);
 const rootRestore = workspacePatchFromReverseSnapshot(snapshot);
 assert.equal(rootRestore.subjectMode, "portrait");
 assert.equal(rootRestore.workspace.portraitProfile.structured["脸型五官"], "椭圆脸");
 assert.equal(rootRestore.workspace.productProfile, null);
 assert.equal(rootRestore.workspace.assets[0].url, "/alternate.jpg");
-assert.equal(rootRestore.workspace.videoAnalysisPreset, "quality");
+assert.equal(rootRestore.workspace.videoAnalysisPreset, "standard");
 assert.equal(rootRestore.workspace.reverseVideoAnalysis.analysis_mode, "image_motion");
+assert.equal(snapshot.reverse_applied_revision_id, 44);
+assert.equal(rootRestore.workspace.reverseAppliedRevisionId, 44);
+assert.equal(rootRestore.workspace.productVideoTemplate, "prompt_driven");
+assert.equal(rootRestore.workspace.promptDirty, true);
+assert.deepEqual(
+  rootRestore.workspace.reverseResultRevisions.map((revision) => revision.source),
+  ["applied", "model_compiled", "generation"],
+);
 assert.equal(workspacePatchFromReverseSnapshot({ version: 2, workspace_snapshot_v2: snapshot }).workspace.prompt, "人物提示词");
-assert.equal(reverseSnapshotFromHistory({ params: { reverse_snapshot_v2: snapshot } }).version, 2);
+assert.equal(reverseSnapshotFromHistory({ params: { reverse_snapshot_v2: snapshot } }).version, 3);
 assert.equal(reverseSnapshotFromHistory({ params: { prompt: "v1 only" } }), null);
 const rawProductProfileRestore = workspacePatchFromReverseSnapshot({
   version: 2,
@@ -449,6 +572,34 @@ assert.equal(expiredRestore.workspace.prompt, "人物提示词");
 assert.equal(expiredRestore.expiredAssetsSkipped, true);
 assert.equal(workspacePatchFromReverseSnapshot({ ...snapshot, creation_mode: "invalid", target: "video" }).creationMode, "video");
 assert.equal(workspacePatchFromReverseSnapshot({ ...snapshot, subject_mode: "invalid" }).subjectMode, "general");
+const legacyNoisyImageRestore = workspacePatchFromReverseSnapshot({
+  version: 3,
+  target: "image",
+  structured: {
+    "主体": "直接可见事实：参考1中白色纸盒居中直立。",
+    "场景背景": "视觉估计：半透明蓝色冰块环绕中央冰台。",
+  },
+  final_text: "直接可见事实：参考1中白色纸盒居中直立；未知：地点不确定。",
+});
+assert.match(legacyNoisyImageRestore.workspace.prompt, /白色纸盒居中直立/);
+assert.match(legacyNoisyImageRestore.workspace.prompt, /半透明蓝色冰块环绕中央冰台/);
+assert.doesNotMatch(legacyNoisyImageRestore.workspace.prompt, /直接可见事实|视觉估计|未知|参考1/);
+assert.equal(workspacePatchFromReverseSnapshot({
+  ...snapshot,
+  generation: { product_video_template: "single_clip_action" },
+}).workspace.productVideoTemplate, "single_clip_action");
+assert.equal(workspacePatchFromReverseSnapshot({
+  ...snapshot,
+  generation: { product_video_template: "unknown_strategy" },
+}).workspace.productVideoTemplate, "prompt_driven");
+assert.match(
+  pageSource,
+  /prompt:\s*snapshotRestore\s*\?\s*\(restoredWorkspace\.prompt\s*\|\|\s*parsedDraft\.prompt\s*\|\|\s*""\)/,
+);
+assert.match(
+  pageSource,
+  /promptDirty:\s*snapshotRestore\s*\?\s*Boolean\(restoredWorkspace\.promptDirty\)\s*:\s*true/,
+);
 
 const imageMotionPricing = buildStudioDerivedViewState({
   cfg: {
@@ -484,8 +635,8 @@ const imageMotionPricing = buildStudioDerivedViewState({
 assert.equal(imageMotionPricing.selectedReverseCost, 5);
 assert.equal(imageMotionPricing.reverseImageCost, 5);
 assert.equal(imageMotionPricing.selectedReverseCostLabel, "5积分");
-assert.match(parsingSource, /video_analysis_preset: isVideoTarget \? targetVideoPreset : null/);
-assert.match(referencePanelSource, /单图运动设计成功后结算 \{reverseImageCost\} 积分/);
+assert.match(parsingSource, /video_analysis_preset: targetVideoPreset/);
+assert.match(referencePanelSource, /单图运动设计成功后按图片反推结算 \{reverseImageCost\} 积分/);
 
 assert.equal(analysisModeLabel("keyframes"), "多帧分析");
 assert.equal(analysisModeLabel("cover_fallback"), "封面单帧");
@@ -534,12 +685,12 @@ assert.doesNotMatch(doParseSource.slice(0, doParseSource.indexOf('result.status 
 assert.match(pageSource, /function updateReferenceUrl\(value\)[\s\S]*setWorkspacePatch\(\{ url: value, parsing: false \}/);
 assert.match(
   parsingSource,
-  /const reverseBody = \{[\s\S]*workspace_snapshot_v2: workspaceSnapshot[\s\S]*reverseOperationRequestSignature\(reverseBody\)/,
-  "the pending id signature must cover the exact request body including the v2 workspace snapshot",
+  /const reverseBody = \{[\s\S]*workspace_snapshot_v3: workspaceSnapshot[\s\S]*reverseOperationRequestSignature\(reverseBody\)/,
+  "the pending id signature must cover the exact request body including the v3 workspace snapshot",
 );
 assert.match(
   parsingSource,
-  /buildReverseOperationRequestSnapshotV2\(\{[\s\S]*source_signature: targetSignature/,
+  /buildReverseOperationRequestSnapshotV3\(\{[\s\S]*source_signature: targetSignature/,
   "ordinary image and video reverse requests must persist only the minimal request snapshot",
 );
 assert.doesNotMatch(
@@ -547,12 +698,56 @@ assert.doesNotMatch(
   /buildReverseSnapshotV2\(/,
   "the full result/history snapshot must not be sent with an operation creation request",
 );
-assert.match(
-  parsingSource,
-  /if \(!isCurrent\(\)\) \{[\s\S]*await api\.cancelReverseOperation\(operation\.id\)/,
-  "a task created after its source was replaced must be canceled instead of charging in the background",
-);
 const doReverseSource = parsingSource.match(/async function doReverse\(\)[\s\S]*?(?=\n  function savedOperationId)/)?.[0] || "";
+const staleOperationBranch = doReverseSource.slice(
+  doReverseSource.indexOf("if (!isCurrent())"),
+  doReverseSource.indexOf("setWorkspacePatch({ reverseOperation: operation"),
+);
+assert.match(staleOperationBranch, /await cancelStaleReverseOperation\(operation\)/);
+assert.match(staleOperationBranch, /return;/);
+assert.doesNotMatch(
+  staleOperationBranch,
+  /setWorkspacePatch/,
+  "a stale confirmed operation must never overwrite the current workspace",
+);
+
+const unchangedWorkspace = {
+  selected: { id: 202, url: "/current-source.jpg" },
+  prompt: "current workspace prompt",
+  reverseOperation: null,
+};
+const cancelCalls = [];
+const canceled = await cancelStaleReverseOperation(
+  { id: 901, status: "queued" },
+  async (operationId) => { cancelCalls.push(operationId); },
+  () => assert.fail("successful stale cancellation must not report an error"),
+);
+assert.equal(canceled, true);
+assert.deepEqual(cancelCalls, [901]);
+assert.deepEqual(unchangedWorkspace, {
+  selected: { id: 202, url: "/current-source.jpg" },
+  prompt: "current workspace prompt",
+  reverseOperation: null,
+});
+
+const cancelFailure = new Error("cancel unavailable");
+const reportedCancelErrors = [];
+const canceledAfterFailure = await cancelStaleReverseOperation(
+  { id: 902, status: "running" },
+  async () => { throw cancelFailure; },
+  (error, context) => { reportedCancelErrors.push({ error, context }); },
+);
+assert.equal(canceledAfterFailure, false);
+assert.deepEqual(reportedCancelErrors, [{
+  error: cancelFailure,
+  context: "cancel stale reverse operation after confirmed execution",
+}]);
+assert.deepEqual(unchangedWorkspace, {
+  selected: { id: 202, url: "/current-source.jpg" },
+  prompt: "current workspace prompt",
+  reverseOperation: null,
+});
+
 assert.ok(
   doReverseSource.indexOf('existingOperation?.status === "needs_confirmation"')
     < doReverseSource.indexOf("bumpReverseRequest(mode)"),

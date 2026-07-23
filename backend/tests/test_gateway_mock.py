@@ -61,6 +61,59 @@ def test_antigravity_messages_image_transport_decodes_markdown_data_uri(monkeypa
     assert seen["payload"]["model"] == "gemini-3.1-flash-image"
 
 
+def test_antigravity_messages_image_transport_sends_edit_references(monkeypatch):
+    monkeypatch.setattr(settings, "mock_mode", False)
+    raw = b"\xff\xd8\xff\xe0edited-image"
+    encoded = base64.b64encode(raw).decode()
+    seen = {}
+
+    def fake_post(path, payload, **kwargs):
+        seen.update(path=path, payload=payload, kwargs=kwargs)
+        return {
+            "content": [
+                {"type": "text", "text": f"data:image/jpeg;base64,{encoded}"}
+            ]
+        }
+
+    monkeypatch.setattr(gateway, "_post", fake_post)
+    cfg = RuntimeGatewayConfig(
+        use="image",
+        provider="antigravity",
+        base_url="https://gateway.example.com/antigravity",
+        api_key="secret",
+        gateway_format="anthropic",
+    )
+    refs = [
+        "data:image/png;base64,eA==",
+        "https://cdn.example.com/style.webp",
+    ]
+
+    images = gateway.gen_image(
+        "keep the product and transfer the style",
+        "gemini-3.1-flash-image",
+        n=1,
+        size="1024x1024",
+        reference_image_urls=refs,
+        edit_path="/messages",
+        extra_payload={"image_transport": "anthropic_messages"},
+        gateway_config=cfg,
+    )
+
+    assert images == [raw]
+    assert seen["path"] == "/messages"
+    blocks = seen["payload"]["messages"][0]["content"]
+    assert [block["type"] for block in blocks] == ["image", "image", "text"]
+    assert blocks[0]["source"] == {
+        "type": "base64",
+        "media_type": "image/png",
+        "data": "eA==",
+    }
+    assert blocks[1]["source"] == {
+        "type": "url",
+        "url": "https://cdn.example.com/style.webp",
+    }
+
+
 def test_grok_image_transport_maps_canvas_to_native_fields(monkeypatch):
     monkeypatch.setattr(settings, "mock_mode", False)
     seen = {}
@@ -95,11 +148,74 @@ def test_grok_image_transport_maps_canvas_to_native_fields(monkeypatch):
     assert "size" not in seen["payload"]
 
 
+@pytest.mark.parametrize(
+    ("refs", "source_field"),
+    [
+        (["data:image/png;base64,eA=="], "image"),
+        (
+            [
+                "data:image/png;base64,eA==",
+                "https://cdn.example.com/style.png",
+            ],
+            "images",
+        ),
+    ],
+)
+def test_grok_image_transport_maps_native_edit_payload(
+    monkeypatch,
+    refs,
+    source_field,
+):
+    monkeypatch.setattr(settings, "mock_mode", False)
+    seen = {}
+
+    def fake_submit(path, payload, n, config=None):
+        seen.update(path=path, payload=payload, n=n, config=config)
+        return gateway.ImageBatchResult([b"edited"])
+
+    monkeypatch.setattr(gateway, "_post_single_image_repeated", fake_submit)
+    cfg = RuntimeGatewayConfig(
+        use="image",
+        provider="grok",
+        base_url="https://gateway.example.com/v1",
+        api_key="secret",
+        gateway_format="openai",
+    )
+
+    images = gateway.gen_image(
+        "edit the source image",
+        "grok-imagine-image",
+        n=1,
+        size="1024x1024",
+        reference_image_urls=refs,
+        edit_path="/images/edits",
+        extra_payload={
+            "image_transport": "grok_images",
+            "edit_payload_format": "json",
+            "mask": "data:image/png;base64,bWFzaw==",
+        },
+        gateway_config=cfg,
+    )
+
+    assert images == [b"edited"]
+    assert seen["path"] == "/images/edits"
+    assert source_field in seen["payload"]
+    assert "mask" not in seen["payload"]
+    assert "edit_payload_format" not in seen["payload"]
+    sources = (
+        [seen["payload"][source_field]]
+        if source_field == "image"
+        else seen["payload"][source_field]
+    )
+    assert [source["url"] for source in sources] == refs
+
+
 def test_discovery_marks_only_explicit_media_models_as_importable():
     models = annotate_discovered_models(
         [
             {"id": "gemini-3.1-flash-image"},
             {"id": "grok-imagine-video-1.5"},
+            {"id": "generic-video-model"},
             {"id": "grok-imagine-edit"},
             {"id": "grok-4.5"},
         ],
@@ -109,9 +225,116 @@ def test_discovery_marks_only_explicit_media_models_as_importable():
 
     assert models[0]["recommended_uses"] == ["image"]
     assert models[0]["default_extra"]["image_transport"] == "grok_images"
+    assert models[0]["default_extra"]["capabilities"]["image_to_image"] is False
     assert models[1]["recommended_uses"] == ["video"]
-    assert models[2]["recommended_uses"] == []
-    assert models[3]["recommended_uses"] == ["prompt"]
+    assert models[1]["default_extra"]["capabilities"]["image_to_video"] is True
+    assert models[2]["recommended_uses"] == ["video"]
+    assert models[2]["default_extra"]["capabilities"]["image_to_video"] is False
+    assert models[3]["recommended_uses"] == []
+    assert models[4]["recommended_uses"] == ["prompt"]
+
+
+def test_discovery_marks_verified_grok_and_gemini_image_edit_models():
+    grok = annotate_discovered_models(
+        [{"id": "grok-imagine-image"}],
+        provider="grok",
+        gateway_format="openai",
+    )[0]
+    gemini = annotate_discovered_models(
+        [{"id": "gemini-3.1-flash-image"}],
+        provider="antigravity",
+        gateway_format="anthropic",
+    )[0]
+
+    assert grok["default_extra"]["edit_path"] == "/images/edits"
+    assert grok["default_extra"]["capabilities"]["image_to_image"] is True
+    assert grok["default_extra"]["capabilities"]["max_reference_images"] == 3
+    assert gemini["default_extra"]["edit_path"] == "/messages"
+    assert gemini["default_extra"]["capabilities"]["image_to_image"] is True
+    assert gemini["default_extra"]["capabilities"]["max_reference_images"] == 2
+
+
+def test_discovery_marks_seedance_15_as_first_last_frame_only():
+    seedance = annotate_discovered_models(
+        [{"id": "doubao-seedance-1-5-pro-251215"}],
+        provider="volcengine_ark",
+        gateway_format="ark",
+    )[0]
+
+    capabilities = seedance["default_extra"]["capabilities"]
+    assert capabilities["image_to_video"] is True
+    assert capabilities["first_last_frame"] is True
+    assert capabilities["reference_image"] is False
+    assert capabilities["multi_reference"] is False
+    assert "max_reference_images" not in capabilities
+
+
+def test_discovery_splits_grok_reference_video_from_15_image_to_video():
+    grok_reference, grok_15 = annotate_discovered_models(
+        [
+            {"id": "grok-imagine-video"},
+            {"id": "grok-imagine-video-1.5"},
+        ],
+        provider="grok",
+        gateway_format="openai",
+    )
+
+    assert grok_reference["recommended_uses"] == ["video"]
+    assert grok_reference["default_extra"]["product_images_field"] == "reference_images"
+    assert grok_reference["default_extra"]["product_images_item_field"] == "url"
+    assert grok_reference["default_extra"]["negative_prompt_mode"] == "append_to_prompt"
+    assert grok_reference["default_extra"]["capabilities"] == {
+        "text_to_video": True,
+        "image_to_video": True,
+        "multi_reference": True,
+        "reference_image": True,
+        "max_reference_images": 3,
+    }
+
+    assert grok_15["recommended_uses"] == ["video"]
+    assert grok_15["default_extra"]["first_frame_field"] == "image"
+    assert grok_15["default_extra"]["first_frame_item_field"] == "url"
+    assert "product_images_field" not in grok_15["default_extra"]
+    assert grok_15["default_extra"]["capabilities"] == {
+        "text_to_video": True,
+        "image_to_video": True,
+        "multi_reference": False,
+        "reference_image": False,
+    }
+
+
+@pytest.mark.parametrize(
+    "model_id",
+    [
+        "doubao-seedance-2-0-mini-260615",
+        "doubao-seedance-2-1-pro-270101",
+        "doubao-seedance-3-0-pro-280101",
+    ],
+)
+def test_discovery_marks_ark_seedance_20_plus_as_ten_image_video_model(model_id):
+    seedance = annotate_discovered_models(
+        [{"id": model_id}],
+        provider="volcengine_ark",
+        gateway_format="ark",
+    )[0]
+
+    assert seedance["recommended_uses"] == ["video"]
+    capabilities = seedance["default_extra"]["capabilities"]
+    assert capabilities["text_to_video"] is True
+    assert capabilities["image_to_video"] is True
+    assert capabilities["multi_reference"] is True
+    assert capabilities["max_reference_images"] == 10
+
+
+def test_discovery_does_not_enable_seedance_multi_reference_for_unverified_provider():
+    seedance = annotate_discovered_models(
+        [{"id": "doubao-seedance-2-0-mini-260615"}],
+        provider="custom_openai",
+        gateway_format="openai",
+    )[0]
+
+    assert seedance["recommended_uses"] == ["prompt"]
+    assert seedance["default_extra"] is None
 
 
 def test_mock_video_is_a_playable_mp4(tmp_path):
@@ -218,6 +441,75 @@ def test_video_reverse_labels_frames_with_authoritative_timestamps(monkeypatch):
     assert "shots" not in result["structured"]
     assert result["structured"]["时序分镜"].startswith("0.000-2.200s 液滴入水")
     assert "0.000-2.200s 液滴入水" not in result["final_text"]
+
+
+def test_generation_video_reverse_repairs_missing_sampled_frame_coverage(monkeypatch):
+    monkeypatch.setattr(settings, "mock_mode", False)
+    calls = []
+    responses = iter([
+        {
+            "choices": [{"message": {"content": (
+                '{"主体":"精华瓶","shots":['
+                '{"start_seconds":0,"end_seconds":1,"visual":"瓶盖特写",'
+                '"evidence_frame_indices":[1],"confidence":0.9}],'
+                '"final_text":"瓶盖特写后，完整精华瓶立于水面"}'
+            )}}],
+            "usage": {"total_tokens": 7},
+        },
+        {
+            "choices": [{"message": {"content": (
+                '{"frames":[{"frame_index":2,'
+                '"visual":"完整精华瓶立于水面","lighting":"冷白轮廓光",'
+                '"confidence":0.9}]}'
+            )}}],
+            "usage": {"total_tokens": 3},
+        },
+    ])
+
+    def fake_post(_path, payload, **_kwargs):
+        calls.append(payload)
+        return next(responses)
+
+    monkeypatch.setattr(gateway, "_post", fake_post)
+    cfg = RuntimeGatewayConfig(
+        use="vision",
+        provider="custom_openai",
+        base_url="https://vision-gateway.example.com/v1",
+        api_key="vision-key",
+        gateway_format="openai",
+    )
+    result = gateway.reverse_prompt(
+        ["data:image/jpeg;base64,Zmlyc3Q=", "data:image/jpeg;base64,c2Vjb25k"],
+        "vision-model",
+        target="video",
+        video_analysis={
+            "source": {
+                "duration_seconds": 4.0,
+                "audio_analyzed": False,
+            },
+            "sampled_frames": [
+                {"index": 1, "timestamp_seconds": 0.0},
+                {"index": 2, "timestamp_seconds": 3.9},
+            ],
+        },
+        require_video_frame_coverage=True,
+        gateway_config=cfg,
+    )
+
+    assert len(calls) == 2
+    repair_content = calls[1]["messages"][0]["content"]
+    assert isinstance(repair_content, list)
+    assert [item["type"] for item in repair_content].count("image_url") == 1
+    assert "采样帧 2" in "".join(
+        item.get("text", "") for item in repair_content if item["type"] == "text"
+    )
+    assert result["repair_attempted"] is True
+    assert result["usage"]["total_tokens"] == 10
+    assert {
+        index
+        for shot in result["shots"]
+        for index in shot["evidence_frame_indices"]
+    } == {1, 2}
 
 
 def test_video_shots_are_sorted_before_normalization():
@@ -465,16 +757,17 @@ def test_reversed_invalid_shot_does_not_create_synthetic_split():
 
 
 def test_compose_final_fallback():
-    # when the model omits final_text, we synthesize from all dimensions
+    # Legacy fallback still emits only positive, usable visual dimensions.
     r = gateway._parse_structured('{"主体":"a cat","光线":"soft","负向":"text"}')
     assert "a cat" in r["final_text"] and "soft" in r["final_text"]
-    assert "text" in r["final_text"]  # negative appended
+    assert "text" not in r["final_text"]
+    assert r["structured"]["负向"] == "text"
 
 
 def test_video_reverse_template_keeps_generation_prompt_compact():
     template = gateway._reverse_template("video", n_frames=4)
 
-    assert "220-360 个中文字符" in template
+    assert "120-220 个中文字符" in template
     assert "末尾追加英文视频关键词" not in template
 
 
@@ -497,7 +790,7 @@ def test_video_reverse_missing_final_text_does_not_serialize_raw_shot_objects():
     assert result["shots"][0]["visual"] == "产品入镜"
 
 
-def test_video_reverse_removes_conflicting_provider_duration_from_final_text(monkeypatch):
+def test_video_reverse_keeps_source_spec_structured_and_out_of_visual_prompt(monkeypatch):
     monkeypatch.setattr(settings, "mock_mode", False)
     cfg = RuntimeGatewayConfig(
         use="vision",
@@ -537,7 +830,11 @@ def test_video_reverse_removes_conflicting_provider_duration_from_final_text(mon
         gateway_config=cfg,
     )
 
-    assert "10.000秒" in result["final_text"]
+    assert "10.000秒" in result["structured"]["源视频规格"]
+    assert "720x960" in result["structured"]["源视频规格"]
+    assert "10.000秒" not in result["final_text"]
+    assert "720x960" not in result["final_text"]
+    assert "24" not in result["final_text"]
     assert "8秒" not in result["final_text"]
 
 
@@ -668,7 +965,7 @@ def test_video_reverse_separates_post_production_without_video_metadata(monkeypa
     assert result["structured"]["音效"] == "未分析"
 
 
-def test_compose_final_uses_reverse_dimension_order():
+def test_compose_final_uses_generation_dimension_order_and_drops_analysis_fields():
     r = gateway._parse_structured(
         '{"光线":"soft left key light","主体":"red product bottle",'
         '"图像类型":"产品图","反推重点":"产品优先",'
@@ -676,8 +973,9 @@ def test_compose_final_uses_reverse_dimension_order():
     )
 
     text = r["final_text"]
-    assert text.index("图像类型") < text.index("反推重点") < text.index("主体")
     assert text.index("主体") < text.index("场景背景") < text.index("风格") < text.index("光线")
+    assert "图像类型" not in text
+    assert "反推重点" not in text
 
 
 def test_parse_structured_rejects_fenced_json():
@@ -953,6 +1251,52 @@ def test_download_to_path_rejects_low_speed_stream(monkeypatch, tmp_path):
     assert not out.exists()
 
 
+def test_download_to_path_drops_auth_on_cross_origin_redirect(monkeypatch, tmp_path):
+    responses = [
+        type(
+            "Redirect",
+            (),
+            {
+                "is_redirect": True,
+                "status_code": 302,
+                "headers": {"location": "https://cdn.example.com/final.mp4"},
+            },
+        )(),
+        type(
+            "Video",
+            (),
+            {
+                "is_redirect": False,
+                "status_code": 200,
+                "headers": {"content-type": "video/mp4"},
+                "iter_raw": lambda self: iter((b"video",)),
+            },
+        )(),
+    ]
+    seen_headers = []
+
+    @gateway.contextmanager
+    def fake_guarded_stream(_client, _method, _url, **kwargs):
+        seen_headers.append(dict(kwargs.get("headers") or {}))
+        yield responses.pop(0)
+
+    monkeypatch.setattr(gateway, "assert_safe_url", lambda _url: None)
+    monkeypatch.setattr(gateway, "_guarded_stream", fake_guarded_stream)
+    out = Path(tmp_path) / "redirected.mp4"
+
+    gateway.download_to_path(
+        "https://provider.example.com/content",
+        out,
+        allowed_content_types=("video/",),
+        request_headers={"Authorization": "Bearer secret"},
+    )
+
+    assert out.read_bytes() == b"video"
+    assert seen_headers[0]["Authorization"] == "Bearer secret"
+    assert "Authorization" not in seen_headers[1]
+    assert all(headers["Accept-Encoding"] == "identity" for headers in seen_headers)
+
+
 def test_download_uses_remaining_deadline_for_each_redirect(monkeypatch):
     monkeypatch.setattr(settings, "mock_mode", False)
 
@@ -1154,6 +1498,38 @@ def test_image_edit_can_use_json_payload_format(monkeypatch):
                for _method, _url, payload, _timeout, _retries in calls)
 
 
+def test_image_edit_multipart_sends_all_reference_images(monkeypatch):
+    monkeypatch.setattr(settings, "mock_mode", False)
+    monkeypatch.setattr(settings, "gateway_base_url", "http://gateway.test")
+    monkeypatch.setattr(settings, "gateway_api_key", "test-key")
+    image_raw = gateway._mock_image("x", "256x256", 0)
+    encoded = base64.b64encode(image_raw).decode()
+    refs = [f"data:image/png;base64,{encoded}", f"data:image/png;base64,{encoded}"]
+    calls = []
+
+    def fake_request_multipart_json(method, url, *, headers, data, files, timeout, retries):
+        calls.append((dict(data), list(files)))
+        return {"data": [{"b64_json": encoded}]}
+
+    monkeypatch.setattr(gateway, "_request_multipart_json", fake_request_multipart_json)
+    images = gateway.gen_image(
+        "transfer the second image style",
+        "gpt-image-2",
+        n=1,
+        size="768x1024",
+        reference_image_url=refs[0],
+        reference_image_urls=refs,
+        edit_path="/v1/images/edits",
+    )
+
+    assert len(images) == 1
+    assert len(calls) == 1
+    data, files = calls[0]
+    assert data["size"] == "768x1024"
+    assert [name for name, _file in files] == ["image", "image"]
+    assert [file[0] for _name, file in files] == ["image-1.png", "image-2.png"]
+
+
 def test_text_to_image_repeats_without_n(monkeypatch):
     monkeypatch.setattr(settings, "mock_mode", False)
     monkeypatch.setattr(settings, "gateway_base_url", "http://gateway.test")
@@ -1288,8 +1664,27 @@ def test_reverse_uses_per_model_gateway_config(monkeypatch):
     assert seen["path"] == "/chat/completions"
     assert seen["timeout"] == settings.reverse_gateway_timeout_seconds
     assert seen["config"] is cfg
-    assert seen["retries"] == settings.gateway_max_retries
+    assert seen["retries"] == settings.reverse_gateway_max_retries
     assert seen["payload"]["model"] == "vision-model"
+    assert seen["payload"]["max_tokens"] == settings.reverse_gateway_max_tokens
+    assert "reasoning_effort" not in seen["payload"]
+
+
+def test_reverse_gpt5_completion_controls_bound_output_and_reasoning(monkeypatch):
+    monkeypatch.setattr(settings, "reverse_gateway_max_tokens", 4096)
+    monkeypatch.setattr(settings, "reverse_gateway_reasoning_effort", "medium")
+
+    assert gateway._reverse_completion_controls("gpt-5.6-sol") == {
+        "max_tokens": 4096,
+        "reasoning_effort": "medium",
+    }
+    assert gateway._reverse_completion_controls("openai/gpt-5.5") == {
+        "max_tokens": 4096,
+        "reasoning_effort": "medium",
+    }
+    assert gateway._reverse_completion_controls("vision-model") == {
+        "max_tokens": 4096,
+    }
 
 
 def test_text_to_image_repeated_requests_run_in_parallel(monkeypatch):

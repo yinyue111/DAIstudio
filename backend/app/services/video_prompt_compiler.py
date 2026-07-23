@@ -7,7 +7,7 @@ import re
 from math import ceil
 from typing import Any
 
-COMPILER_VERSION = "video-prompt-v5"
+COMPILER_VERSION = "video-prompt-v6"
 VIDEO_SUBMIT_CONTRACT_VERSION = "video-submit-v3"
 PRODUCT_SUBJECT_LOCK = (
     "上传产品是唯一商品主体；仅锁定同一SKU的包装外形与比例、Logo、"
@@ -87,6 +87,7 @@ _PRODUCT_VIDEO_STRATEGIES = {
         "动作后以产品结构或材质细节清晰可见的近景收束。"
     ),
 }
+PRODUCT_VIDEO_TEMPLATE_KEYS = frozenset(_PRODUCT_VIDEO_STRATEGIES)
 DEFAULT_VIDEO_MODEL_PROFILES: dict[str, dict[str, Any]] = {
     "generic": {
         "family": "generic",
@@ -183,7 +184,7 @@ def _join_voiceovers(*values: str) -> str:
         for part in re.split(r"[\n；;]+", str(value or "")):
             item = part.strip()
             key = re.sub(r"\s+", "", item).lower()
-            if key and key not in seen:
+            if key and key not in seen and not _is_post_placeholder(item):
                 seen.add(key)
                 parts.append(item)
     return "；".join(parts)
@@ -199,6 +200,27 @@ def _unique_items(values: list[str]) -> list[str]:
             seen.add(key)
             unique.append(item)
     return unique
+
+
+_POST_PLACEHOLDER_VALUES = frozenset({
+    "无",
+    "暂无",
+    "不适用",
+    "未知",
+    "未分析",
+    "未提供",
+    "未识别",
+    "未支持",
+    "无法确认",
+})
+
+
+def _is_post_placeholder(value: Any) -> bool:
+    return str(value or "").strip().lower() in _POST_PLACEHOLDER_VALUES
+
+
+def _meaningful_post_items(values: list[str]) -> list[str]:
+    return _unique_items([value for value in values if not _is_post_placeholder(value)])
 
 
 def _has_subject_scene_structure(value: str) -> bool:
@@ -496,9 +518,12 @@ def _layered_authoritative_text(raw_prompt: dict[str, Any]) -> str:
     user_instruction = str(raw_prompt.get("user_instruction") or "").strip()
     if user_instruction:
         return user_instruction
+    input_mode = str(raw_prompt.get("input_mode") or "").strip().lower()
     assembled = str(raw_prompt.get("assembled_text") or "").strip()
     optimized = str(raw_prompt.get("optimized_text") or "").strip()
     raw = str(raw_prompt.get("raw_text") or "").strip()
+    if input_mode == "structured_reverse":
+        return assembled or str(raw_prompt.get("final_text") or "").strip()
     if assembled and (optimized or not raw or assembled != raw):
         return assembled
     return optimized if optimized and not assembled else ""
@@ -757,6 +782,15 @@ def _parse_text_prompt(text: str) -> dict[str, Any]:
 def parse_video_prompt(raw_prompt: str | dict[str, Any]) -> dict[str, Any]:
     """Parse a prompt into the stable public video-plan fields."""
     if isinstance(raw_prompt, dict):
+        subject_lock = str(
+            raw_prompt.get("subject_lock") or raw_prompt.get("一致性约束") or ""
+        ).strip()
+        subject = str(raw_prompt.get("主体") or "").strip()
+        if not subject_lock and "产品" in str(raw_prompt.get("图像类型") or "") and subject:
+            subject_lock = (
+                f"全程保持同一产品主体：{subject[:120]}；"
+                "包装结构、比例、主色和材质连续一致"
+            )
         style = "；".join(
             str(raw_prompt.get(key) or "").strip()
             for key in ("风格", "风格设定", "global_style", "光线")
@@ -829,9 +863,9 @@ def parse_video_prompt(raw_prompt: str | dict[str, Any]) -> dict[str, Any]:
                 shot_voiceovers.append(shot_post["voiceover"])
             shot_sfx.extend(shot_post["sfx"])
         shots = cleaned_shots
-        overlays = _unique_items([*overlays, *shot_overlays])
+        overlays = _meaningful_post_items([*overlays, *shot_overlays])
         raw_prompt_voiceover = _join_voiceovers(raw_prompt_voiceover, *shot_voiceovers)
-        sfx = _unique_items([*sfx, *shot_sfx])
+        sfx = _meaningful_post_items([*sfx, *shot_sfx])
         if style or shots or technical_constraints or overlays or raw_prompt_voiceover or sfx:
             if not shots:
                 fallback = _parse_text_prompt(
@@ -845,7 +879,7 @@ def parse_video_prompt(raw_prompt: str | dict[str, Any]) -> dict[str, Any]:
                 )
             return {
                 "global_style": style,
-                "subject_lock": str(raw_prompt.get("subject_lock") or "").strip(),
+                "subject_lock": subject_lock,
                 "shots": shots,
                 "technical_constraints": technical_constraints,
                 "post_overlays": overlays,
@@ -1004,8 +1038,7 @@ def compile_video_prompt(
         )
     if "motion_analysis" in reference_roles:
         reference_guidance.append(
-            "动作与镜头节奏仅来自原视频的抽帧反推文本；生成阶段只使用关键帧或封面，"
-            "不进行原视频逐帧动作复刻，也不迁移其中的人物、商品、品牌、场景或文字。"
+            "镜头顺序与节奏以原视频抽帧反推后的当前场景脚本为准。"
         )
     has_first_frame = "first_frame" in reference_roles
     has_last_frame = "last_frame" in reference_roles
@@ -1275,6 +1308,7 @@ def build_video_prompt_references(
     source_asset_url: str | None,
     source_type: str | None,
     params: dict[str, Any] | None,
+    source_video_analysis_only: bool = True,
 ) -> list[dict[str, str]]:
     """Assign each supplied asset one stable prompt role."""
     params = params or {}
@@ -1295,12 +1329,15 @@ def build_video_prompt_references(
 
     if source_asset_url:
         if source_type == "video":
-            add(
-                "motion_analysis",
-                "source_asset_url",
-                source_asset_url,
-                mode="analysis_only",
-            )
+            if source_video_analysis_only:
+                add(
+                    "motion_analysis",
+                    "source_asset_url",
+                    source_asset_url,
+                    mode="analysis_only",
+                )
+            else:
+                add("first_frame", "source_asset_url", source_asset_url)
             source_role = ""
         elif subject_mode == "product":
             source_role = "product"
@@ -1336,6 +1373,20 @@ def build_video_prompt_references(
     ):
         add(role, key, params.get(key))
     return references
+
+
+def source_video_is_analysis_only(params: dict[str, Any] | None) -> bool:
+    """Return whether a persisted source video is reverse-analysis provenance only."""
+    roles = params.get("_video_reference_roles") if isinstance(params, dict) else None
+    if not isinstance(roles, list):
+        return False
+    return any(
+        isinstance(item, dict)
+        and item.get("role") == "motion_analysis"
+        and item.get("source") == "source_asset_url"
+        and item.get("mode") == "analysis_only"
+        for item in roles
+    )
 
 
 def store_video_prompt_compile(

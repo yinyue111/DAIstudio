@@ -1,9 +1,22 @@
 """Real-cost accounting (gateway_calls) + video keyframe graceful fallback."""
+import csv
+import io
 from datetime import datetime, timezone
 from types import SimpleNamespace
 
 from app.db import SessionLocal
-from app.models import AuditLog, CreditTransaction, GatewayCall, GenTask, ReverseOperation, User
+from app.models import (
+    AuditLog,
+    CreationRecipe,
+    CreditTransaction,
+    GatewayCall,
+    GenTask,
+    ReverseOperation,
+    ReverseOperationFeedback,
+    ReverseResultRevision,
+    User,
+)
+from app.routers.admin_usage import _evidence_coverage
 from app.services import audit, credits, gateway, usage, video_analysis, video_frames
 
 
@@ -392,6 +405,673 @@ def test_reverse_dashboard_attributes_operation_and_model_cost_to_finished_date(
     }]
 
 
+def test_reverse_dashboard_reports_adoption_edit_generation_feedback_and_recipe(
+    client,
+    make_user,
+    auth,
+):
+    phone = "13900000042"
+    uid = make_user(phone, balance=1000, admin=True)
+    headers = auth(phone)
+    now = datetime(2099, 4, 1, 12, tzinfo=timezone.utc)
+    db = SessionLocal()
+    try:
+        operation = ReverseOperation(
+            user_id=uid,
+            client_request_id="reverse-quality-funnel",
+            request_fingerprint="f" * 64,
+            target="image",
+            analysis_focus="product_ad",
+            asset_url="http://x/product.png",
+            status="succeeded",
+            progress=100,
+            request_context={"source_type": "image"},
+            model_snapshot={"model_id": "vision-quality"},
+            result={"structured": {"subject": "cup"}, "final_text": "red cup"},
+            cost_frozen=0,
+            cost_settled=3,
+            started_at=now,
+            finished_at=now,
+            created_at=now,
+            updated_at=now,
+        )
+        db.add(operation)
+        db.flush()
+        db.add_all([
+            ReverseResultRevision(
+                operation_id=operation.id,
+                user_id=uid,
+                version=1,
+                source="normalized",
+                payload={"final_text": "red cup"},
+            ),
+            ReverseResultRevision(
+                operation_id=operation.id,
+                user_id=uid,
+                version=2,
+                source="user_edit",
+                payload={"final_text": "red ceramic cup"},
+            ),
+            ReverseResultRevision(
+                operation_id=operation.id,
+                user_id=uid,
+                version=3,
+                source="applied",
+                payload={"final_text": "red ceramic cup", "changed_fields": ["prompt"]},
+            ),
+            ReverseResultRevision(
+                operation_id=operation.id,
+                user_id=uid,
+                version=4,
+                source="generation",
+                payload={"final_text": "red ceramic cup", "generation": {"task_id": 99}},
+            ),
+            ReverseOperationFeedback(
+                operation_id=operation.id,
+                user_id=uid,
+                rating="useful",
+                issue_types=["text_error"],
+                note="fixed before generation",
+            ),
+            CreationRecipe(
+                user_id=uid,
+                source_operation_id=operation.id,
+                title="product recipe",
+                category="image",
+                visibility="private",
+                current_version=1,
+            ),
+        ])
+        db.commit()
+    finally:
+        db.close()
+
+    response = client.get(
+        "/api/admin/usage/reverse-operations?start=2099-04-01&end=2099-04-01",
+        headers=headers,
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    quality = body["quality"]
+    assert quality["feedback_count"] == 1
+    assert quality["useful_rate"] == 1
+    assert quality["adopted_operation_count"] == 1
+    assert quality["adoption_rate"] == 1
+    assert quality["edited_operation_count"] == 1
+    assert quality["edit_rate"] == 1
+    assert 0 < quality["avg_edit_ratio"] < 1
+    assert quality["generated_operation_count"] == 1
+    assert quality["generation_conversion_rate"] == 1
+    assert quality["recipe_operation_count"] == 1
+    assert quality["recipe_conversion_rate"] == 1
+    assert quality["issue_types"] == {"text_error": 1}
+    assert body["by_focus"][0]["focus"] == "product_ad"
+    assert body["by_focus"][0]["adoption_rate"] == 1
+    assert body["by_media_type"][0]["media_type"] == "image"
+    assert body["by_model_quality"][0]["model"] == "vision-quality"
+
+
+def test_reverse_quality_report_filters_dimensions_and_reports_economics(
+    client,
+    make_user,
+    auth,
+):
+    phone = "13900000043"
+    uid = make_user(phone, balance=1000, admin=True)
+    headers = auth(phone)
+    now = datetime(2099, 5, 1, 12, tzinfo=timezone.utc)
+    db = SessionLocal()
+    try:
+        image = ReverseOperation(
+            user_id=uid,
+            client_request_id="reverse-quality-image-filter",
+            request_fingerprint="1" * 64,
+            target="image",
+            analysis_focus="product_ad",
+            asset_url="http://x/product.png",
+            status="succeeded",
+            progress=100,
+            request_context={"source_type": "image"},
+            model_snapshot={"model_id": "=vision-image"},
+            result={
+                "final_text": "red cup",
+                "image_evidence_analyzers": {
+                    "ocr": [{"status": "analyzed"}],
+                    "region_proposal": [{"status": "analyzed"}],
+                    "detector": [{"status": "analyzed"}],
+                    "segmenter": [{"status": "unsupported"}],
+                },
+            },
+            cost_frozen=0,
+            cost_settled=10,
+            started_at=now,
+            finished_at=now,
+            created_at=now,
+            updated_at=now,
+        )
+        video = ReverseOperation(
+            user_id=uid,
+            client_request_id="reverse-quality-video-filter",
+            request_fingerprint="2" * 64,
+            target="video",
+            analysis_focus="storyboard",
+            asset_url="http://x/story.mp4",
+            status="failed",
+            progress=100,
+            request_context={"source_type": "video"},
+            model_snapshot={"model_id": "vision-video"},
+            result={
+                "video_analysis": {
+                    "source": {"duration_seconds": 10},
+                    "analysis_gaps": [{"start_seconds": 5, "end_seconds": 10}],
+                },
+            },
+            cost_frozen=0,
+            cost_settled=0,
+            started_at=now,
+            finished_at=now,
+            created_at=now,
+            updated_at=now,
+        )
+        db.add_all([image, video])
+        db.flush()
+        db.add_all([
+            ReverseResultRevision(
+                operation_id=image.id,
+                user_id=uid,
+                version=1,
+                source="normalized",
+                payload={"final_text": "red cup"},
+            ),
+            ReverseResultRevision(
+                operation_id=image.id,
+                user_id=uid,
+                version=2,
+                source="user_edit",
+                payload={"final_text": "red ceramic cup"},
+            ),
+            ReverseResultRevision(
+                operation_id=image.id,
+                user_id=uid,
+                version=3,
+                source="applied",
+                payload={"final_text": "red ceramic cup"},
+            ),
+            ReverseResultRevision(
+                operation_id=image.id,
+                user_id=uid,
+                version=4,
+                source="generation",
+                payload={"final_text": "red ceramic cup"},
+            ),
+            ReverseOperationFeedback(
+                operation_id=image.id,
+                user_id=uid,
+                rating="useful",
+                issue_types=[],
+            ),
+            CreationRecipe(
+                user_id=uid,
+                source_operation_id=image.id,
+                title="filtered recipe",
+                category="image",
+                visibility="private",
+                current_version=1,
+            ),
+            GatewayCall(
+                user_id=uid,
+                kind="reverse",
+                model_id="=vision-image",
+                status="ok",
+                detail={
+                    "operation_id": image.id,
+                    "provider_cost_status": "complete",
+                    "provider_cost_credits": 4,
+                    "cost_credits": 10,
+                },
+                created_at=now,
+            ),
+            GatewayCall(
+                user_id=uid,
+                kind="reverse",
+                model_id="vision-video",
+                status="failed",
+                detail={
+                    "operation_id": video.id,
+                    "provider_cost_status": "complete",
+                    "provider_cost_credits": 2,
+                    "cost_credits": 8,
+                },
+                created_at=now,
+            ),
+        ])
+        db.commit()
+    finally:
+        db.close()
+
+    response = client.get(
+        "/api/admin/usage/reverse-operations",
+        params={
+            "media_type": "image",
+            "model": "=vision-image",
+            "focus": "product_ad",
+        },
+        headers=headers,
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["filters"]["selected"] == {
+        "media_type": "image",
+        "model": "=vision-image",
+        "focus": "product_ad",
+    }
+    assert {"image", "video"}.issubset(body["filters"]["options"]["media_types"])
+    assert {"=vision-image", "vision-video"}.issubset(
+        body["filters"]["options"]["models"]
+    )
+    assert {"product_ad", "storyboard"}.issubset(
+        body["filters"]["options"]["focuses"]
+    )
+    assert body["summary"]["operation_count"] == 1
+    assert body["summary"]["success_rate"] == 1
+    assert body["quality"]["avg_evidence_coverage"] == 0.75
+    assert body["quality"]["adoption_rate"] == 1
+    assert body["quality"]["edit_rate"] == 1
+    assert body["quality"]["generation_conversion_rate"] == 1
+    assert body["quality"]["recipe_conversion_rate"] == 1
+    assert body["economics"] == {
+        "basis": "settled_credits_minus_provider_cost_snapshot",
+        "cost_status": "complete",
+        "revenue_credits": 10,
+        "provider_cost_credits": 4,
+        "attributed_provider_cost_credits": 4,
+        "unattributed_provider_cost_credits": 0,
+        "gross_profit_credits": 6,
+        "gross_margin_rate": 0.6,
+        "gateway_call_count": 1,
+        "gateway_cost_record_count": 1,
+        "gateway_cost_coverage_rate": 1.0,
+        "operation_cost_coverage_rate": 1.0,
+    }
+    image_row = body["by_media_type"][0]
+    assert image_row["media_type"] == "image"
+    assert image_row["avg_evidence_coverage"] == 0.75
+    assert image_row["avg_edit_ratio"] > 0
+    assert image_row["provider_cost_credits"] == 4
+    assert image_row["cost_status"] == "complete"
+    assert image_row["gross_profit_credits"] == 6
+    assert image_row["gross_margin_rate"] == 0.6
+    assert image_row["cost_coverage_rate"] == 1.0
+
+
+def test_reverse_quality_csv_matches_filters_and_escapes_formula_values(
+    client,
+    make_user,
+    auth,
+):
+    phone = "13900000044"
+    uid = make_user(phone, balance=1000, admin=True)
+    headers = auth(phone)
+    now = datetime(2099, 5, 2, 12, tzinfo=timezone.utc)
+    db = SessionLocal()
+    try:
+        operation = ReverseOperation(
+            user_id=uid,
+            client_request_id="reverse-quality-csv",
+            request_fingerprint="3" * 64,
+            target="image",
+            analysis_focus="product_ad",
+            asset_url="http://x/csv.png",
+            status="succeeded",
+            progress=100,
+            request_context={"source_type": "image"},
+            model_snapshot={"model_id": "=csv-formula"},
+            result={"final_text": "csv"},
+            cost_frozen=0,
+            cost_settled=5,
+            started_at=now,
+            finished_at=now,
+            created_at=now,
+            updated_at=now,
+        )
+        db.add(operation)
+        db.flush()
+        db.add(GatewayCall(
+            user_id=uid,
+            kind="reverse",
+            model_id="=csv-formula",
+            status="ok",
+            detail={
+                "operation_id": operation.id,
+                "provider_cost_status": "complete",
+                "provider_cost_credits": 2,
+                "cost_credits": 5,
+            },
+            created_at=now,
+        ))
+        db.commit()
+    finally:
+        db.close()
+
+    response = client.get(
+        "/api/admin/usage/reverse-operations",
+        params={"model": "=csv-formula", "format": "csv"},
+        headers=headers,
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.headers["content-type"].startswith("text/csv")
+    assert "reverse_quality_report.csv" in response.headers["content-disposition"]
+    assert response.content.startswith("\ufeff".encode())
+    text = response.content.decode("utf-8-sig")
+    assert text.splitlines()[0].startswith("dimension,value,operation_count")
+    assert "model,'=csv-formula,1,1,1.0" in text
+    assert "media_type,video" not in text
+    rows = list(csv.DictReader(io.StringIO(text)))
+    model_row = next(row for row in rows if row["dimension"] == "model")
+    assert model_row["cost_status"] == "complete"
+    assert model_row["provider_cost_credits"] == "2"
+    assert model_row["gross_profit_credits"] == "3"
+
+
+def test_video_evidence_coverage_uses_selected_range_union_and_clips_gaps():
+    selected = SimpleNamespace(
+        result={
+            "video_analysis": {
+                "source": {"duration_seconds": 10},
+                "analysis_gaps": [
+                    {"start_seconds": 2, "end_seconds": 5},
+                    {"start_seconds": 4, "end_seconds": 9},
+                ],
+            }
+        },
+        request_context={
+            "source_ranges": [{"start_seconds": 0, "end_seconds": 10}]
+        },
+        source_ranges=[
+            {"start_seconds": 0, "end_seconds": 4},
+            {"start_seconds": 3, "end_seconds": 6},
+            {"start_seconds": 8, "end_seconds": 10},
+        ],
+        source_range=None,
+    )
+    assert _evidence_coverage(selected) == 0.375
+
+    no_selection = SimpleNamespace(
+        result={
+            "video_analysis": {
+                "source": {"duration_seconds": 10},
+                "analysis_gaps": [{"start_seconds": 2, "end_seconds": 4}],
+            }
+        },
+        request_context={},
+        source_ranges=[],
+        source_range=None,
+    )
+    assert _evidence_coverage(no_selection) == 0.8
+
+    invalid_selection = SimpleNamespace(
+        result={
+            "video_analysis": {
+                "source": {"duration_seconds": 10},
+                "analysis_gaps": [],
+            }
+        },
+        request_context={
+            "source_ranges": [{"start_seconds": 0, "end_seconds": 5}]
+        },
+        source_ranges=[
+            {"start_seconds": 11, "end_seconds": 12},
+            {"start_seconds": "invalid", "end_seconds": 5},
+        ],
+        source_range=None,
+    )
+    assert _evidence_coverage(invalid_selection) is None
+
+
+def test_reverse_quality_does_not_treat_user_charge_as_provider_cost(
+    client,
+    make_user,
+    auth,
+):
+    phone = "13900000045"
+    uid = make_user(phone, balance=1000, admin=True)
+    headers = auth(phone)
+    now = datetime(2099, 5, 3, 12, tzinfo=timezone.utc)
+    db = SessionLocal()
+    try:
+        operation = ReverseOperation(
+            user_id=uid,
+            client_request_id="reverse-provider-cost-legacy-only",
+            request_fingerprint="4" * 64,
+            target="image",
+            analysis_focus="provider_cost_legacy",
+            asset_url="http://x/legacy-cost.png",
+            status="succeeded",
+            progress=100,
+            request_context={"source_type": "image"},
+            model_snapshot={"model_id": "provider-cost-legacy-only"},
+            result={"final_text": "legacy"},
+            cost_frozen=9,
+            cost_settled=9,
+            started_at=now,
+            finished_at=now,
+            created_at=now,
+            updated_at=now,
+        )
+        db.add(operation)
+        db.flush()
+        db.add(GatewayCall(
+            user_id=uid,
+            kind="reverse",
+            model_id="provider-cost-legacy-only",
+            status="ok",
+            detail={"operation_id": operation.id, "cost_credits": 4},
+            created_at=now,
+        ))
+        db.commit()
+    finally:
+        db.close()
+
+    response = client.get(
+        "/api/admin/usage/reverse-operations",
+        params={"model": "provider-cost-legacy-only"},
+        headers=headers,
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["economics"]["cost_status"] == "unavailable"
+    assert body["economics"]["provider_cost_credits"] == 0
+    assert body["economics"]["gross_profit_credits"] is None
+    assert body["economics"]["gross_margin_rate"] is None
+    assert body["by_model_quality"][0]["cost_status"] == "unavailable"
+    assert body["by_model_quality"][0]["gross_profit_credits"] is None
+    assert body["model_costs"][0]["cost_credits"] == 4
+
+    csv_response = client.get(
+        "/api/admin/usage/reverse-operations",
+        params={"model": "provider-cost-legacy-only", "format": "csv"},
+        headers=headers,
+    )
+    rows = list(csv.DictReader(io.StringIO(csv_response.content.decode("utf-8-sig"))))
+    all_row = next(row for row in rows if row["dimension"] == "all")
+    assert all_row["cost_status"] == "unavailable"
+    assert all_row["gross_profit_credits"] == ""
+    assert all_row["gross_margin_rate"] == ""
+
+
+def test_reverse_quality_cost_completeness_is_independent_per_dimension(
+    client,
+    make_user,
+    auth,
+):
+    phone = "13900000046"
+    uid = make_user(phone, balance=1000, admin=True)
+    headers = auth(phone)
+    now = datetime(2099, 5, 4, 12, tzinfo=timezone.utc)
+    db = SessionLocal()
+    try:
+        image = ReverseOperation(
+            user_id=uid,
+            client_request_id="reverse-provider-cost-complete",
+            request_fingerprint="5" * 64,
+            target="image",
+            analysis_focus="provider_cost_mix",
+            asset_url="http://x/complete.png",
+            status="succeeded",
+            progress=100,
+            request_context={"source_type": "image"},
+            model_snapshot={"model_id": "provider-cost-complete"},
+            result={"final_text": "complete"},
+            cost_frozen=10,
+            cost_settled=10,
+            started_at=now,
+            finished_at=now,
+            created_at=now,
+            updated_at=now,
+        )
+        video = ReverseOperation(
+            user_id=uid,
+            client_request_id="reverse-provider-cost-partial",
+            request_fingerprint="6" * 64,
+            target="video",
+            analysis_focus="provider_cost_mix",
+            asset_url="http://x/partial.mp4",
+            status="succeeded",
+            progress=100,
+            request_context={"source_type": "video"},
+            model_snapshot={"model_id": "provider-cost-partial"},
+            result={"video_analysis": {"source": {"duration_seconds": 8}}},
+            cost_frozen=12,
+            cost_settled=12,
+            started_at=now,
+            finished_at=now,
+            created_at=now,
+            updated_at=now,
+        )
+        db.add_all([image, video])
+        db.flush()
+        db.add_all([
+            GatewayCall(
+                user_id=uid,
+                kind="reverse",
+                model_id="provider-cost-complete",
+                status="ok",
+                detail={
+                    "operation_id": image.id,
+                    "provider_cost_status": "complete",
+                    "provider_cost_credits": 2,
+                    "cost_credits": 10,
+                },
+                created_at=now,
+            ),
+            GatewayCall(
+                user_id=uid,
+                kind="reverse",
+                model_id="provider-cost-partial",
+                status="ok",
+                detail={
+                    "operation_id": video.id,
+                    "provider_cost_status": "partial",
+                    "provider_cost_known_credits": 1,
+                    "cost_credits": 12,
+                },
+                created_at=now,
+            ),
+        ])
+        db.commit()
+    finally:
+        db.close()
+
+    response = client.get(
+        "/api/admin/usage/reverse-operations",
+        params={"focus": "provider_cost_mix"},
+        headers=headers,
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    economics = body["economics"]
+    assert economics["cost_status"] == "partial"
+    assert economics["provider_cost_credits"] == 3
+    assert economics["gross_profit_credits"] is None
+    assert economics["gateway_cost_coverage_rate"] == 1
+
+    focus_row = body["by_focus"][0]
+    assert focus_row["cost_status"] == "partial"
+    assert focus_row["provider_cost_credits"] == 3
+    assert focus_row["gross_profit_credits"] is None
+
+    media_rows = {row["media_type"]: row for row in body["by_media_type"]}
+    assert media_rows["image"]["cost_status"] == "complete"
+    assert media_rows["image"]["gross_profit_credits"] == 8
+    assert media_rows["video"]["cost_status"] == "partial"
+    assert media_rows["video"]["gross_profit_credits"] is None
+
+
+def test_reverse_quality_explicit_zero_provider_cost_is_complete(
+    client,
+    make_user,
+    auth,
+):
+    phone = "13900000047"
+    uid = make_user(phone, balance=1000, admin=True)
+    headers = auth(phone)
+    now = datetime(2099, 5, 5, 12, tzinfo=timezone.utc)
+    db = SessionLocal()
+    try:
+        operation = ReverseOperation(
+            user_id=uid,
+            client_request_id="reverse-provider-cost-zero",
+            request_fingerprint="7" * 64,
+            target="image",
+            analysis_focus="provider_cost_zero",
+            asset_url="http://x/zero.png",
+            status="succeeded",
+            progress=100,
+            request_context={"source_type": "image"},
+            model_snapshot={"model_id": "provider-cost-zero"},
+            result={"final_text": "zero"},
+            cost_frozen=7,
+            cost_settled=7,
+            started_at=now,
+            finished_at=now,
+            created_at=now,
+            updated_at=now,
+        )
+        db.add(operation)
+        db.flush()
+        db.add(GatewayCall(
+            user_id=uid,
+            kind="reverse",
+            model_id="provider-cost-zero",
+            status="ok",
+            detail={
+                "operation_id": operation.id,
+                "provider_cost_status": "complete",
+                "provider_cost_credits": 0,
+                "cost_credits": 7,
+            },
+            created_at=now,
+        ))
+        db.commit()
+    finally:
+        db.close()
+
+    response = client.get(
+        "/api/admin/usage/reverse-operations",
+        params={"model": "provider-cost-zero"},
+        headers=headers,
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["economics"]["cost_status"] == "complete"
+    assert body["economics"]["provider_cost_credits"] == 0
+    assert body["economics"]["gross_profit_credits"] == 7
+    assert body["economics"]["gross_margin_rate"] == 1
+    assert body["by_model_quality"][0]["cost_status"] == "complete"
+
+
 def test_usage_report_does_not_count_refunds_as_negative_spend(client, make_user, auth):
     phone = "13900009041"
     uid = make_user(phone, balance=1000, admin=True)
@@ -499,10 +1179,10 @@ def test_usage_report_end_date_includes_full_day(client, make_user, auth):
     assert daily["spend_credits"] >= 6
 
 
-def test_image_generation_logs_gateway_call(client, make_user, auth):
+def test_image_generation_logs_gateway_call(client, make_user, auth, quote_and_generate):
     make_user("13900000031", balance=1000)
     h = auth("13900000031")
-    r = client.post("/api/generate", json={
+    r = quote_and_generate({
         "source_asset_url": "http://x/y.png", "source_type": "image",
         "source_asset_meta": {"user_confirmed_rights": True},
         "category": "image", "stage": "preview", "instruction": "x",
@@ -556,7 +1236,9 @@ def test_usage_and_audit_logging_do_not_commit_caller_transaction(client, make_u
         check.close()
 
 
-def test_failed_image_generation_logs_gateway_call(client, make_user, auth, monkeypatch):
+def test_failed_image_generation_logs_gateway_call(
+    client, make_user, auth, monkeypatch, quote_and_generate
+):
     make_user("13900000034", balance=1000)
     h = auth("13900000034")
 
@@ -564,7 +1246,7 @@ def test_failed_image_generation_logs_gateway_call(client, make_user, auth, monk
         raise gateway.GatewayError("bad image request")
 
     monkeypatch.setattr("app.services.gateway.gen_image", fail)
-    r = client.post("/api/generate", json={
+    r = quote_and_generate({
         "source_asset_url": "http://x/y.png", "source_type": "image",
         "source_asset_meta": {"user_confirmed_rights": True},
         "category": "image", "stage": "preview", "instruction": "x",
@@ -714,15 +1396,23 @@ def test_video_reverse_returns_authoritative_source_analysis(client, make_user, 
         "audio_analyzed": False,
     }
     assert analysis["sampled_frames"] == [
-        {"index": 1, "timestamp_seconds": 0.0},
-        {"index": 2, "timestamp_seconds": 4.2},
-        {"index": 3, "timestamp_seconds": 10.004},
+        {"index": 1, "timestamp_seconds": 0.0, "absolute_timestamp_seconds": 0.0},
+        {"index": 2, "timestamp_seconds": 4.2, "absolute_timestamp_seconds": 4.2},
+        {
+            "index": 3,
+            "timestamp_seconds": 10.004,
+            "absolute_timestamp_seconds": 10.004,
+        },
     ]
     assert analysis["shots"][0]["end_seconds"] == 2.2
     assert seen["video_analysis"] == {
         "source": analysis["source"],
         "sampled_frames": analysis["sampled_frames"],
         "analysis_mode": "keyframes",
+        "reference_context": [
+            {"role": "frame", "source_type": "video", **frame}
+            for frame in analysis["sampled_frames"]
+        ],
     }
     assert len(seen["refs"]) == 3
     replay = client.post("/api/prompt/reverse", json=request_body, headers=h)

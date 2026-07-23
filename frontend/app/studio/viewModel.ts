@@ -12,6 +12,7 @@ import {
   videoRatioOptions,
 } from "./helpers";
 import { shouldBlockNewGeneration } from "./taskConcurrency";
+import { studioQuoteRequestFingerprint } from "./generationQuote";
 
 const DEFAULT_REVERSE_VIDEO_PRESET_COSTS = { fast: 5, standard: 5, fine: 5 };
 
@@ -40,6 +41,10 @@ export function modelEnabledForConfig(cfg, kind) {
   if (!cfg) return true;
   const modelUse = kind === "video" || kind === "video_edit" ? "video" : "image";
   return cfg.models?.[modelUse]?.enabled !== false;
+}
+
+export function buildStudioQuoteInputRevision(input: Record<string, unknown>) {
+  return studioQuoteRequestFingerprint(input);
 }
 
 export function buildStudioDerivedViewState({

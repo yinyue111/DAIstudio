@@ -48,6 +48,13 @@ jobs:
       - name: Test (pytest)
         # tests run on sqlite + fakeredis + eager Celery + mock gateway — no services needed
         run: pytest
+      - name: Analyzer provider contract tests
+        working-directory: .
+        run: >-
+          PYTHONPATH=. python -m pytest -q
+          evidence_provider/tests
+          video_semantic_provider/tests
+          audio_provider/tests
       - name: Reverse prompt offline golden evaluation
         run: python scripts/evaluate_reverse_golden.py tests/fixtures/reverse_golden_samples.json
 

@@ -20,6 +20,7 @@ from app.db import SessionLocal
 from app.main import app
 from app.models import AuditLog, GatewayCall, GenAsset, GenTask, ModelConfig, UploadedAsset, User
 from app.services import generation_media, storage
+from app.services.config_store import get_model_config
 from app.services.gateway import _mock_image
 from app.services.watermark import make_model_reference
 
@@ -375,15 +376,23 @@ def test_save_file_partial_write_does_not_publish_target(monkeypatch, tmp_path):
     assert list(destination.iterdir()) == []
 
 
-def _enable_multi_image_edit():
+_MULTI_IMAGE_EDIT_UNSET = object()
+
+
+def _configure_multi_image_edit(value=_MULTI_IMAGE_EDIT_UNSET):
     db = SessionLocal()
     try:
-        model = db.query(ModelConfig).filter(ModelConfig.use == "image").one()
-        model.extra = {
+        model = get_model_config(db, "image")
+        assert model is not None
+        extra = {
             **(model.extra or {}),
             "edit_path": "/v1/images/edits",
-            "multi_image_edit_enabled": True,
         }
+        if value is _MULTI_IMAGE_EDIT_UNSET:
+            extra.pop("multi_image_edit_enabled", None)
+        else:
+            extra["multi_image_edit_enabled"] = value
+        model.extra = extra
         db.commit()
     finally:
         db.close()
@@ -969,7 +978,7 @@ def test_upload_image_rejects_user_storage_quota(client, make_user, auth, monkey
 
 
 def test_uploaded_image_can_drive_reference_edit_generation(
-    client, make_user, auth, monkeypatch
+    client, make_user, auth, monkeypatch, quote_and_generate
 ):
     make_user("13900000102", balance=1000)
     h = auth("13900000102")
@@ -996,7 +1005,7 @@ def test_uploaded_image_can_drive_reference_edit_generation(
 
     monkeypatch.setattr("app.services.gateway.gen_image", fake_gen_image)
 
-    r = client.post("/api/generate", json={
+    r = quote_and_generate({
         "source_asset_url": asset["url"],
         "source_type": "image",
         "category": "image",
@@ -1022,7 +1031,7 @@ def test_uploaded_image_can_drive_reference_edit_generation(
 
 
 def test_structured_portrait_reference_without_instruction_uses_image_edit(
-    client, make_user, auth, monkeypatch
+    client, make_user, auth, monkeypatch, quote_and_generate
 ):
     make_user("13900001970", balance=1000)
     h = auth("13900001970")
@@ -1062,7 +1071,7 @@ def test_structured_portrait_reference_without_instruction_uses_image_edit(
 
     monkeypatch.setattr("app.services.gateway.gen_image", fake_gen_image)
 
-    r = client.post("/api/generate", json={
+    r = quote_and_generate({
         "source_asset_url": source.json()["url"],
         "source_type": "image",
         "category": "image",
@@ -1110,7 +1119,7 @@ def test_structured_portrait_reference_without_instruction_uses_image_edit(
 
 
 def test_character_reference_image_alone_uses_image_edit(
-    client, make_user, auth, monkeypatch
+    client, make_user, auth, monkeypatch, quote_and_generate
 ):
     make_user("13900001976", balance=1000)
     h = auth("13900001976")
@@ -1130,7 +1139,7 @@ def test_character_reference_image_alone_uses_image_edit(
 
     monkeypatch.setattr("app.services.gateway.gen_image", fake_gen_image)
 
-    r = client.post("/api/generate", json={
+    r = quote_and_generate({
         "source_type": "image",
         "category": "image",
         "stage": "preview",
@@ -1153,7 +1162,7 @@ def test_character_reference_image_alone_uses_image_edit(
 
 
 def test_portrait_negative_prompt_ignores_stale_wedding_and_contact_fields(
-    client, make_user, auth, monkeypatch
+    client, make_user, auth, monkeypatch, quote_and_generate
 ):
     make_user("13900001975", balance=1000)
     h = auth("13900001975")
@@ -1177,7 +1186,7 @@ def test_portrait_negative_prompt_ignores_stale_wedding_and_contact_fields(
         "使用冰晶有机雕塑礼服、左上大面积柔光、冷蓝暗部、柔雾与宽泛光晕。"
     )
 
-    r = client.post("/api/generate", json={
+    r = quote_and_generate({
         "source_asset_url": source.json()["url"],
         "source_type": "image",
         "category": "image",
@@ -1204,7 +1213,7 @@ def test_portrait_negative_prompt_ignores_stale_wedding_and_contact_fields(
 
 
 def test_portrait_negative_prompt_uses_effective_lighting_instead_of_guard_text(
-    client, make_user, auth, monkeypatch
+    client, make_user, auth, monkeypatch, quote_and_generate
 ):
     make_user("13900001979", balance=1000)
     h = auth("13900001979")
@@ -1228,7 +1237,7 @@ def test_portrait_negative_prompt_uses_effective_lighting_instead_of_guard_text(
         "无光晕、无高光扩散。"
     )
 
-    r = client.post("/api/generate", json={
+    r = quote_and_generate({
         "source_asset_url": source.json()["url"],
         "source_type": "image",
         "category": "image",
@@ -1253,7 +1262,7 @@ def test_portrait_negative_prompt_uses_effective_lighting_instead_of_guard_text(
 
 
 def test_plain_text_portrait_without_reference_does_not_claim_uploaded_identity(
-    client, make_user, auth, monkeypatch
+    client, make_user, auth, monkeypatch, quote_and_generate
 ):
     make_user("13900001973", balance=1000)
     h = auth("13900001973")
@@ -1269,7 +1278,7 @@ def test_plain_text_portrait_without_reference_does_not_claim_uploaded_identity(
 
     monkeypatch.setattr("app.services.gateway.gen_image", fake_gen_image)
 
-    r = client.post("/api/generate", json={
+    r = quote_and_generate({
         "source_type": "image",
         "category": "image",
         "stage": "preview",
@@ -1292,7 +1301,7 @@ def test_plain_text_portrait_without_reference_does_not_claim_uploaded_identity(
 
 
 def test_image_reference_fails_instead_of_falling_back_without_edit_endpoint(
-    client, make_user, auth, monkeypatch
+    client, make_user, auth, monkeypatch, quote_and_generate
 ):
     make_user("13900001974", balance=1000)
     h = auth("13900001974")
@@ -1311,7 +1320,7 @@ def test_image_reference_fails_instead_of_falling_back_without_edit_endpoint(
     monkeypatch.setattr("app.services.gateway.gen_image", fake_gen_image)
     monkeypatch.setattr("app.services.generation_image_flow.settings.image_edit_path", "")
 
-    r = client.post("/api/generate", json={
+    r = quote_and_generate({
         "source_asset_url": source.json()["url"],
         "source_type": "image",
         "category": "image",
@@ -1345,7 +1354,7 @@ def test_image_reference_url_rejects_non_string_value(
     make_user("13900001971", balance=1000)
     h = auth("13900001971")
 
-    r = client.post("/api/generate", json={
+    r = client.post("/api/quotes", json={
         "source_type": "image",
         "category": "image",
         "stage": "preview",
@@ -1374,7 +1383,7 @@ def test_video_product_reference_rejects_non_string_value(
     make_user("13900001972", balance=1000)
     h = auth("13900001972")
 
-    r = client.post("/api/generate", json={
+    r = client.post("/api/quotes", json={
         "category": "video",
         "stage": "preview",
         "prompt": {"final_text": "让产品在桌面上稳定展示"},
@@ -1392,7 +1401,7 @@ def test_video_product_reference_rejects_non_string_value(
 
 
 def test_uploaded_large_image_edit_uses_high_resolution_original(
-    client, make_user, auth, monkeypatch
+    client, make_user, auth, monkeypatch, quote_and_generate
 ):
     make_user("13900001905", balance=1000)
     h = auth("13900001905")
@@ -1413,7 +1422,7 @@ def test_uploaded_large_image_edit_uses_high_resolution_original(
 
     monkeypatch.setattr("app.services.gateway.gen_image", fake_gen_image)
 
-    r = client.post("/api/generate", json={
+    r = quote_and_generate({
         "source_asset_url": asset["url"],
         "source_type": "image",
         "category": "image",
@@ -1432,7 +1441,7 @@ def test_uploaded_large_image_edit_uses_high_resolution_original(
 
 
 def test_product_image_edit_uses_larger_reference_and_server_fidelity_guard(
-    client, make_user, auth, monkeypatch
+    client, make_user, auth, monkeypatch, quote_and_generate
 ):
     make_user("13900001966", balance=1000)
     h = auth("13900001966")
@@ -1454,7 +1463,7 @@ def test_product_image_edit_uses_larger_reference_and_server_fidelity_guard(
 
     monkeypatch.setattr("app.services.gateway.gen_image", fake_gen_image)
 
-    r = client.post("/api/generate", json={
+    r = quote_and_generate({
         "source_asset_url": asset["url"],
         "source_type": "image",
         "source_asset_meta": {
@@ -1481,7 +1490,7 @@ def test_product_image_edit_uses_larger_reference_and_server_fidelity_guard(
 
 
 def test_product_negative_prompt_wins_when_metadata_also_marks_portrait(
-    client, make_user, auth, monkeypatch
+    client, make_user, auth, monkeypatch, quote_and_generate
 ):
     make_user("13900001972", balance=1000)
     h = auth("13900001972")
@@ -1495,7 +1504,7 @@ def test_product_negative_prompt_wins_when_metadata_also_marks_portrait(
 
     monkeypatch.setattr("app.services.gateway.gen_image", fake_gen_image)
 
-    r = client.post("/api/generate", json={
+    r = quote_and_generate({
         "source_asset_url": "https://example.com/product.png",
         "source_type": "image",
         "source_asset_meta": {
@@ -1530,7 +1539,7 @@ def test_product_negative_prompt_wins_when_metadata_also_marks_portrait(
 
 
 def test_product_image_edit_auto_generates_mask_for_inpaint(
-    client, make_user, auth, monkeypatch
+    client, make_user, auth, monkeypatch, quote_and_generate
 ):
     make_user("13900001968", balance=1000)
     h = auth("13900001968")
@@ -1558,7 +1567,7 @@ def test_product_image_edit_auto_generates_mask_for_inpaint(
     monkeypatch.setattr("app.services.gateway.gen_image", fake_gen_image)
     monkeypatch.setattr(generation_media, "_largest_component_mask", recording_largest_component_mask)
 
-    r = client.post("/api/generate", json={
+    r = quote_and_generate({
         "source_asset_url": asset["url"],
         "source_type": "image",
         "source_asset_meta": {
@@ -1590,7 +1599,7 @@ def test_product_image_edit_auto_generates_mask_for_inpaint(
 
 
 def test_product_image_edit_rgb_mask_protects_detected_subject_not_center_background(
-    client, make_user, auth, monkeypatch
+    client, make_user, auth, monkeypatch, quote_and_generate
 ):
     make_user("13900001970", balance=1000)
     h = auth("13900001970")
@@ -1611,7 +1620,7 @@ def test_product_image_edit_rgb_mask_protects_detected_subject_not_center_backgr
 
     monkeypatch.setattr("app.services.gateway.gen_image", fake_gen_image)
 
-    r = client.post("/api/generate", json={
+    r = quote_and_generate({
         "source_asset_url": asset["url"],
         "source_type": "image",
         "source_asset_meta": {
@@ -1935,7 +1944,7 @@ def test_subject_protection_preview_distinguishes_auto_center_and_off(client, ma
 
 
 def test_product_image_edit_strict_lock_composites_original_subject_pixels(
-    client, make_user, auth, monkeypatch
+    client, make_user, auth, monkeypatch, quote_and_generate
 ):
     uid = make_user("13900001973", balance=1000)
     h = auth("13900001973")
@@ -1954,7 +1963,7 @@ def test_product_image_edit_strict_lock_composites_original_subject_pixels(
 
     monkeypatch.setattr("app.services.gateway.gen_image", fake_gen_image)
 
-    r = client.post("/api/generate", json={
+    r = quote_and_generate({
         "source_asset_url": asset["url"],
         "source_type": "image",
         "source_asset_meta": {
@@ -2003,7 +2012,7 @@ def test_product_image_edit_strict_lock_composites_original_subject_pixels(
 
 
 def test_product_image_edit_rgb_auto_mask_does_not_composite_subject_by_default(
-    client, make_user, auth, monkeypatch
+    client, make_user, auth, monkeypatch, quote_and_generate
 ):
     uid = make_user("13900001974", balance=1000)
     h = auth("13900001974")
@@ -2022,7 +2031,7 @@ def test_product_image_edit_rgb_auto_mask_does_not_composite_subject_by_default(
 
     monkeypatch.setattr("app.services.gateway.gen_image", fake_gen_image)
 
-    r = client.post("/api/generate", json={
+    r = quote_and_generate({
         "source_asset_url": asset["url"],
         "source_type": "image",
         "source_asset_meta": {
@@ -2057,7 +2066,7 @@ def test_product_image_edit_rgb_auto_mask_does_not_composite_subject_by_default(
 
 
 def test_product_pixel_lock_does_not_follow_result_side_false_subject(
-    client, make_user, auth, monkeypatch
+    client, make_user, auth, monkeypatch, quote_and_generate
 ):
     uid = make_user("13900001975", balance=1000)
     h = auth("13900001975")
@@ -2093,7 +2102,7 @@ def test_product_pixel_lock_does_not_follow_result_side_false_subject(
 
     monkeypatch.setattr(generation_media, "_auto_subject_mask", false_result_subject_after_source)
 
-    r = client.post("/api/generate", json={
+    r = quote_and_generate({
         "source_asset_url": asset["url"],
         "source_type": "image",
         "source_asset_meta": {
@@ -2133,7 +2142,7 @@ def test_product_pixel_lock_does_not_follow_result_side_false_subject(
 
 
 def test_product_image_edit_alpha_mask_records_high_confidence_subject_protection(
-    client, make_user, auth, monkeypatch
+    client, make_user, auth, monkeypatch, quote_and_generate
 ):
     uid = make_user("13900001971", balance=1000)
     h = auth("13900001971")
@@ -2154,7 +2163,7 @@ def test_product_image_edit_alpha_mask_records_high_confidence_subject_protectio
 
     monkeypatch.setattr("app.services.gateway.gen_image", fake_gen_image)
 
-    r = client.post("/api/generate", json={
+    r = quote_and_generate({
         "source_asset_url": asset["url"],
         "source_type": "image",
         "source_asset_meta": {
@@ -2190,7 +2199,7 @@ def test_product_image_edit_alpha_mask_records_high_confidence_subject_protectio
 
 
 def test_product_image_edit_auto_mask_failure_does_not_send_center_box_fallback(
-    client, make_user, auth, monkeypatch
+    client, make_user, auth, monkeypatch, quote_and_generate
 ):
     uid = make_user("13900001980", balance=1000)
     h = auth("13900001980")
@@ -2212,7 +2221,7 @@ def test_product_image_edit_auto_mask_failure_does_not_send_center_box_fallback(
 
     monkeypatch.setattr("app.services.gateway.gen_image", fake_gen_image)
 
-    r = client.post("/api/generate", json={
+    r = quote_and_generate({
         "source_asset_url": asset["url"],
         "source_type": "image",
         "source_asset_meta": {
@@ -2252,7 +2261,7 @@ def test_product_image_edit_auto_mask_failure_does_not_send_center_box_fallback(
 
 
 def test_product_image_edit_explicit_center_box_mask_is_sent(
-    client, make_user, auth, monkeypatch
+    client, make_user, auth, monkeypatch, quote_and_generate
 ):
     uid = make_user("13900001972", balance=1000)
     h = auth("13900001972")
@@ -2273,7 +2282,7 @@ def test_product_image_edit_explicit_center_box_mask_is_sent(
 
     monkeypatch.setattr("app.services.gateway.gen_image", fake_gen_image)
 
-    r = client.post("/api/generate", json={
+    r = quote_and_generate({
         "source_asset_url": asset["url"],
         "source_type": "image",
         "source_asset_meta": {
@@ -2312,7 +2321,7 @@ def test_product_image_edit_explicit_center_box_mask_is_sent(
 
 
 def test_product_image_edit_can_disable_auto_mask(
-    client, make_user, auth, monkeypatch
+    client, make_user, auth, monkeypatch, quote_and_generate
 ):
     make_user("13900001969", balance=1000)
     h = auth("13900001969")
@@ -2333,7 +2342,7 @@ def test_product_image_edit_can_disable_auto_mask(
 
     monkeypatch.setattr("app.services.gateway.gen_image", fake_gen_image)
 
-    r = client.post("/api/generate", json={
+    r = quote_and_generate({
         "source_asset_url": asset["url"],
         "source_type": "image",
         "source_asset_meta": {
@@ -2354,7 +2363,7 @@ def test_product_image_edit_can_disable_auto_mask(
 
 
 def test_portrait_image_edit_accepts_character_reference_and_server_fidelity_guard(
-    client, make_user, auth, monkeypatch
+    client, make_user, auth, monkeypatch, quote_and_generate
 ):
     make_user("13900001967", balance=1000)
     h = auth("13900001967")
@@ -2376,7 +2385,7 @@ def test_portrait_image_edit_accepts_character_reference_and_server_fidelity_gua
 
     monkeypatch.setattr("app.services.gateway.gen_image", fake_gen_image)
 
-    r = client.post("/api/generate", json={
+    r = quote_and_generate({
         "source_asset_url": asset["url"],
         "source_type": "image",
         "source_asset_meta": {
@@ -2406,12 +2415,12 @@ def test_portrait_image_edit_accepts_character_reference_and_server_fidelity_gua
     assert seen["reference_image_url"].startswith("data:image/jpeg;base64,")
 
 
-def test_image_edit_can_send_product_and_style_refs_when_enabled(
-    client, make_user, auth, monkeypatch
+def test_image_edit_sends_product_and_style_refs_when_capability_is_unspecified(
+    client, make_user, auth, monkeypatch, quote_and_generate
 ):
     make_user("13900001907", balance=1000, admin=True)
     h = auth("13900001907")
-    _enable_multi_image_edit()
+    _configure_multi_image_edit()
 
     product = client.post(
         "/api/uploads/image",
@@ -2434,7 +2443,7 @@ def test_image_edit_can_send_product_and_style_refs_when_enabled(
 
     monkeypatch.setattr("app.services.gateway.gen_image", fake_gen_image)
 
-    r = client.post("/api/generate", json={
+    r = quote_and_generate({
         "source_asset_url": product["url"],
         "source_type": "image",
         "category": "image",
@@ -2451,18 +2460,27 @@ def test_image_edit_can_send_product_and_style_refs_when_enabled(
     product_ref = Image.open(io.BytesIO(base64.b64decode(seen["reference_image_urls"][0].split(",", 1)[1])))
     style_ref = Image.open(io.BytesIO(base64.b64decode(seen["reference_image_urls"][1].split(",", 1)[1])))
     assert max(product_ref.size) == 1024
-    assert max(style_ref.size) == 384
+    assert max(style_ref.size) == 768
+    db = SessionLocal()
+    try:
+        task = db.get(GenTask, int(r.json()["id"]))
+        assert task.params["_style_reference_requested"] is True
+        assert task.params["_style_reference_sent"] is True
+        assert task.params["_reference_image_count"] == 2
+        assert "_style_reference_skip_reason" not in task.params
+    finally:
+        db.close()
 
 
 def test_image_edit_skips_invalid_optional_style_ref_when_multi_image_enabled(
-    client, make_user, auth, monkeypatch
+    client, make_user, auth, monkeypatch, quote_and_generate
 ):
     make_user("13900001908", balance=1000, admin=True)
     h = auth("13900001908")
     monkeypatch.setattr(settings, "mock_mode", False)
     monkeypatch.setattr(settings, "gateway_base_url", "https://gateway.test")
     monkeypatch.setattr(settings, "gateway_api_key", "sk-test")
-    _enable_multi_image_edit()
+    _configure_multi_image_edit(True)
     product = client.post(
         "/api/uploads/image",
         files={"file": ("product.png", _png_bytes(size=(1600, 900)), "image/png")},
@@ -2482,7 +2500,7 @@ def test_image_edit_skips_invalid_optional_style_ref_when_multi_image_enabled(
         lambda *_a, **_k: b"not-an-image",
     )
 
-    r = client.post("/api/generate", json={
+    r = quote_and_generate({
         "source_asset_url": product["url"],
         "source_type": "image",
         "category": "image",
@@ -2499,6 +2517,69 @@ def test_image_edit_skips_invalid_optional_style_ref_when_multi_image_enabled(
     }, headers=h)
     assert r.status_code == 200, r.text
     assert len(seen["reference_image_urls"]) == 1
+    db = SessionLocal()
+    try:
+        task = db.get(GenTask, int(r.json()["id"]))
+        assert task.params["_style_reference_requested"] is True
+        assert task.params["_style_reference_sent"] is False
+        assert task.params["_reference_image_count"] == 1
+        assert task.params["_style_reference_skip_reason"] == "invalid_or_unavailable"
+    finally:
+        db.close()
+
+
+def test_image_edit_respects_explicit_multi_image_disable(
+    client, make_user, auth, monkeypatch, quote_and_generate
+):
+    make_user("13900001909", balance=1000, admin=True)
+    h = auth("13900001909")
+    _configure_multi_image_edit(False)
+    product = client.post(
+        "/api/uploads/image",
+        files={"file": ("product.png", _png_bytes(size=(900, 900)), "image/png")},
+        headers=h,
+    ).json()
+    style = client.post(
+        "/api/uploads/image",
+        files={"file": ("style.png", _png_bytes(size=(600, 800)), "image/png")},
+        headers=h,
+    ).json()
+    seen = {}
+
+    def fake_gen_image(prompt, image_model_id, n=4, size="1024x1024",
+                       reference_image_url=None, reference_image_urls=None,
+                       edit_path=None, extra_payload=None):
+        seen["reference_image_urls"] = reference_image_urls
+        return [_mock_image(prompt, "256x256", 0)]
+
+    monkeypatch.setattr("app.services.gateway.gen_image", fake_gen_image)
+    r = quote_and_generate({
+        "source_asset_url": product["url"],
+        "source_type": "image",
+        "category": "image",
+        "stage": "preview",
+        "prompt": {
+            "final_text": "keep product identity and transfer style",
+            "instruction": "keep product identity and transfer style",
+        },
+        "params": {
+            "n": 1,
+            "size": "768x1024",
+            "style_reference_image": style["url"],
+        },
+    }, headers=h)
+
+    assert r.status_code == 200, r.text
+    assert len(seen["reference_image_urls"]) == 1
+    db = SessionLocal()
+    try:
+        task = db.get(GenTask, int(r.json()["id"]))
+        assert task.params["_style_reference_requested"] is True
+        assert task.params["_style_reference_sent"] is False
+        assert task.params["_reference_image_count"] == 1
+        assert task.params["_style_reference_skip_reason"] == "model_disabled"
+    finally:
+        db.close()
 
 
 def test_uploaded_image_requires_owner_for_read_and_generation(client, make_user, auth):
@@ -2517,7 +2598,7 @@ def test_uploaded_image_requires_owner_for_read_and_generation(client, make_user
     path = urlparse(asset["url"]).path
 
     assert client.get(path, headers=other_h).status_code == 404
-    r = client.post("/api/generate", json={
+    r = client.post("/api/quotes", json={
         "source_asset_url": asset["url"],
         "source_type": "image",
         "category": "image",
@@ -2551,7 +2632,7 @@ def test_video_product_reference_requires_upload_owner(client, make_user, auth):
     )
     assert up.status_code == 200, up.text
 
-    r = client.post("/api/generate", json={
+    r = client.post("/api/quotes", json={
         "category": "video",
         "stage": "preview",
         "prompt": {"final_text": "展示上传产品"},
@@ -2581,7 +2662,7 @@ def test_video_product_reference_rejects_unsafe_url(client, make_user, auth):
         "admin_password": "pass123456",
     }, headers=h).status_code == 200
 
-    r = client.post("/api/generate", json={
+    r = client.post("/api/quotes", json={
         "category": "video",
         "stage": "preview",
         "prompt": {"final_text": "展示产品"},
@@ -2697,7 +2778,9 @@ def test_external_image_reverse_prompt_uses_high_quality_localized_reference(
     assert 680 <= ref_img.size[1] <= 683
 
 
-def test_uploaded_image_can_drive_video_first_frame(client, make_user, auth, monkeypatch):
+def test_uploaded_image_can_drive_video_first_frame(
+    client, make_user, auth, monkeypatch, quote_and_generate
+):
     make_user("13900000106", balance=1000, admin=True)
     h = auth("13900000106")
     assert client.put("/api/admin/models", json={
@@ -2724,7 +2807,7 @@ def test_uploaded_image_can_drive_video_first_frame(client, make_user, auth, mon
         return "mock-upload-video"
 
     monkeypatch.setattr("app.services.gateway.submit_video", fake_submit)
-    r = client.post("/api/generate", json={
+    r = quote_and_generate({
         "source_asset_url": asset["url"],
         "source_type": "image",
         "category": "video",
@@ -2741,7 +2824,9 @@ def test_uploaded_image_can_drive_video_first_frame(client, make_user, auth, mon
     assert min(ref_img.size) >= 300
 
 
-def test_uploaded_product_video_free_motion_uses_identity_reference_without_frame_lock(client, make_user, auth, monkeypatch):
+def test_uploaded_product_video_free_motion_uses_identity_reference_without_frame_lock(
+    client, make_user, auth, monkeypatch, quote_and_generate
+):
     make_user("13900001970", balance=1000, admin=True)
     h = auth("13900001970")
     assert client.put("/api/admin/models", json={
@@ -2768,7 +2853,7 @@ def test_uploaded_product_video_free_motion_uses_identity_reference_without_fram
         return "mock-upload-video-free"
 
     monkeypatch.setattr("app.services.gateway.submit_video", fake_submit)
-    r = client.post("/api/generate", json={
+    r = quote_and_generate({
         "source_asset_url": asset["url"],
         "source_type": "image",
         "category": "video",
@@ -2790,7 +2875,7 @@ def test_uploaded_product_video_free_motion_uses_identity_reference_without_fram
 
 
 def test_uploaded_product_video_uses_high_fidelity_reference_and_negative_prompt(
-    client, make_user, auth, monkeypatch
+    client, make_user, auth, monkeypatch, quote_and_generate
 ):
     make_user("13900001971", balance=1000, admin=True)
     h = auth("13900001971")
@@ -2822,7 +2907,7 @@ def test_uploaded_product_video_uses_high_fidelity_reference_and_negative_prompt
         return "mock-product-video-fidelity"
 
     monkeypatch.setattr("app.services.gateway.submit_video", fake_submit)
-    r = client.post("/api/generate", json={
+    r = quote_and_generate({
         "source_asset_url": asset["url"],
         "source_type": "image",
         "category": "video",
@@ -2847,7 +2932,7 @@ def test_uploaded_product_video_uses_high_fidelity_reference_and_negative_prompt
 
 
 def test_product_video_localizes_explicit_last_frame_without_inventing_first_frame(
-    client, make_user, auth, monkeypatch
+    client, make_user, auth, monkeypatch, quote_and_generate
 ):
     make_user("13900001972", balance=1000, admin=True)
     headers = auth("13900001972")
@@ -2857,7 +2942,13 @@ def test_product_video_localizes_explicit_last_frame_without_inventing_first_fra
         "cost_credits": 50,
         "unlock_cost": 0,
         "enabled": True,
-        "extra": {"preview_cost": 5},
+        "extra": {
+            "preview_cost": 5,
+            "capabilities": {
+                "image_to_video": True,
+                "first_last_frame": True,
+            },
+        },
         "admin_password": "pass123456",
     }, headers=headers).status_code == 200
     upload = client.post(
@@ -2874,7 +2965,7 @@ def test_product_video_localizes_explicit_last_frame_without_inventing_first_fra
         return "mock-product-last-frame"
 
     monkeypatch.setattr("app.services.gateway.submit_video", fake_submit)
-    response = client.post("/api/generate", json={
+    response = quote_and_generate({
         "source_asset_url": product_url,
         "source_type": "image",
         "category": "video",
@@ -2896,7 +2987,9 @@ def test_product_video_localizes_explicit_last_frame_without_inventing_first_fra
     assert "first_frame_image" not in submitted
 
 
-def test_uploaded_portrait_image_can_drive_video_character_reference(client, make_user, auth, monkeypatch):
+def test_uploaded_portrait_image_can_drive_video_character_reference(
+    client, make_user, auth, monkeypatch, quote_and_generate
+):
     make_user("13900000179", balance=1000, admin=True)
     h = auth("13900000179")
     assert client.put("/api/admin/models", json={
@@ -2923,7 +3016,7 @@ def test_uploaded_portrait_image_can_drive_video_character_reference(client, mak
         return "mock-portrait-video"
 
     monkeypatch.setattr("app.services.gateway.submit_video", fake_submit)
-    r = client.post("/api/generate", json={
+    r = quote_and_generate({
         "source_asset_url": asset["url"],
         "source_type": "image",
         "source_asset_meta": {
@@ -2949,7 +3042,9 @@ def test_uploaded_portrait_image_can_drive_video_character_reference(client, mak
     assert seen["_portrait_locked"] is True
 
 
-def test_uploaded_image_final_video_uses_data_uri_first_frame(client, make_user, auth, monkeypatch):
+def test_uploaded_image_final_video_uses_data_uri_first_frame(
+    client, make_user, auth, monkeypatch, quote_and_generate
+):
     make_user("13900000107", balance=1000, admin=True)
     h = auth("13900000107")
     assert client.put("/api/admin/models", json={
@@ -2977,7 +3072,7 @@ def test_uploaded_image_final_video_uses_data_uri_first_frame(client, make_user,
 
     monkeypatch.setattr("app.services.gateway.submit_video", fake_submit)
 
-    preview = client.post("/api/generate", json={
+    preview = quote_and_generate({
         "source_asset_url": asset["url"],
         "source_type": "image",
         "category": "video",
@@ -2996,7 +3091,7 @@ def test_uploaded_image_final_video_uses_data_uri_first_frame(client, make_user,
     finally:
         db.close()
 
-    final = client.post("/api/generate", json={
+    final = quote_and_generate({
         "category": "video",
         "stage": "final",
         "parent_task_id": preview.json()["id"],
@@ -3023,6 +3118,8 @@ def test_upload_video_returns_reference_asset(client, make_user, auth, tmp_path)
     assert asset["type"] == "video"
     assert asset["width"] == 32
     assert asset["height"] == 48
+    assert isinstance(asset["duration"], float)
+    assert asset["duration"] > 0
     url_key = urlparse(asset["url"]).path.removeprefix("/api/uploads/")
     assert url_key.startswith("upload_video/")
     assert url_key.endswith(".mp4")
@@ -3278,7 +3375,7 @@ def test_uploaded_video_requires_owner_for_read_and_generation(client, make_user
     asset = up.json()
 
     assert client.get(urlparse(asset["url"]).path, headers=other_h).status_code == 404
-    r = client.post("/api/generate", json={
+    r = client.post("/api/quotes", json={
         "source_asset_url": asset["url"],
         "source_type": "video",
         "category": "video",
@@ -3290,7 +3387,9 @@ def test_uploaded_video_requires_owner_for_read_and_generation(client, make_user
     assert "上传素材" in r.text
 
 
-def test_uploaded_video_can_drive_video_first_frame(client, make_user, auth, monkeypatch, tmp_path):
+def test_uploaded_video_can_drive_video_first_frame(
+    client, make_user, auth, monkeypatch, tmp_path, quote_and_generate
+):
     make_user("13900000113", balance=1000, admin=True)
     h = auth("13900000113")
     assert client.put("/api/admin/models", json={
@@ -3317,7 +3416,7 @@ def test_uploaded_video_can_drive_video_first_frame(client, make_user, auth, mon
         return "mock-upload-video"
 
     monkeypatch.setattr("app.services.gateway.submit_video", fake_submit)
-    r = client.post("/api/generate", json={
+    r = quote_and_generate({
         "source_asset_url": asset["url"],
         "source_type": "video",
         "category": "video",

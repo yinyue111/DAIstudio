@@ -33,6 +33,7 @@ def test_release_artifact_checker_rejects_runtime_tree_entries(tmp_path):
         "__MACOSX/._README.md",
         "frontend/node_modules/pkg/index.js",
         "frontend/.next/server/app.js",
+        "frontend/.next-report-build/server/app.js",
         "backend/.venv/bin/python",
         "backend/storage/preview/leak.png",
         "coverage/lcov.info",

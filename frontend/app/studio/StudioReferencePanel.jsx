@@ -3,10 +3,12 @@
 import { useEffect, useState } from "react";
 import { ReferenceAssetPreview } from "./StudioMedia.jsx";
 import StudioModelSelector from "./StudioModelSelector";
+import StudioReverseIntentControls from "./StudioReverseIntentControls";
+import StudioReverseBatchPanel from "./StudioReverseBatchPanel";
+import StudioReverseSourcesEditor from "./StudioReverseSourcesEditor";
+import StudioVideoAnalysisControls from "./StudioVideoAnalysisControls";
+import StudioVideoSourceTimeline from "./StudioVideoSourceTimeline";
 import { assetDims, selectedLabel } from "./helpers";
-import { MAX_PRODUCT_DETAIL_IMAGES } from "./constants";
-
-const REVERSE_VIDEO_PRESET_COSTS = { fast: 5, standard: 5, fine: 5 };
 
 export function analysisModeLabel(mode) {
   return {
@@ -125,15 +127,22 @@ function ProductDetailImages({
   onRemove,
   onMove,
 }) {
-  const canAdd = enabled && assets.length < limit && !busy;
+  const safeLimit = Number.isInteger(limit) && limit > 0 ? limit : 0;
+  const canAdd = enabled && assets.length < safeLimit && !busy;
   return (
     <div className="mt-3 border-t border-aqua/20 pt-3">
       <div className="mb-2 flex items-start justify-between gap-2">
         <div>
           <p className="text-xs font-display font-semibold text-snow">产品细节图</p>
-          <p className="mt-0.5 text-[11px] text-fog">按从左到右顺序提交，最多 {limit || MAX_PRODUCT_DETAIL_IMAGES} 张，同一商品不同角度或局部。</p>
+          <p className="mt-0.5 text-[11px] text-fog">
+            {safeLimit > 0
+              ? `按从左到右顺序提交，最多 ${safeLimit} 张，同一商品不同角度或局部。`
+              : validation?.limit > 0
+                ? "当前素材已占满模型的参考图名额。"
+                : "当前模型不支持产品细节图。"}
+          </p>
         </div>
-        <span className="text-[11px] text-fog">{assets.length}/{Math.max(assets.length, limit || MAX_PRODUCT_DETAIL_IMAGES)}</span>
+        <span className="text-[11px] text-fog">{assets.length}/{Math.max(assets.length, safeLimit)}</span>
       </div>
       {assets.length > 0 && (
         <div className="mb-2 grid grid-cols-3 gap-2">
@@ -163,6 +172,65 @@ function ProductDetailImages({
   );
 }
 
+function LastFrameImage({
+  asset,
+  firstFrameReady,
+  busy,
+  uploadInputRef,
+  onOpenPicker,
+  onClear,
+}) {
+  const canChoose = firstFrameReady && !busy;
+  return (
+    <div className="mt-3 border-t border-iris/25 pt-3">
+      <div className="mb-2 flex items-start justify-between gap-2">
+        <div className="min-w-0">
+          <p className="text-xs font-display font-semibold text-snow">视频尾帧</p>
+          <p className="mt-0.5 text-[11px] text-fog">可选，和上方首帧共同约束视频起止画面。</p>
+        </div>
+        {asset && (
+          <button type="button" onClick={onClear} disabled={busy} className="chip px-2 py-1">
+            清除
+          </button>
+        )}
+      </div>
+      <div className="grid gap-2 sm:grid-cols-[minmax(0,1fr)_minmax(160px,0.9fr)]">
+        <div className={`relative aspect-video min-h-28 overflow-hidden rounded-lg border bg-black/20 ${
+          asset ? "border-iris/60" : "border-dashed border-line2"
+        }`}>
+          {asset ? (
+            <>
+              <ReferenceAssetPreview asset={asset} />
+              <span className="badge absolute left-2 top-2 bg-iris/80 text-white">尾帧</span>
+            </>
+          ) : (
+            <button
+              type="button"
+              onClick={() => uploadInputRef.current?.click()}
+              disabled={!canChoose}
+              className="flex h-full w-full flex-col items-center justify-center gap-2 px-3 text-center transition hover:bg-white/[0.03] disabled:cursor-not-allowed disabled:opacity-45"
+            >
+              <span className="flex h-9 w-9 items-center justify-center rounded-full bg-iris text-base text-white">+</span>
+              <span className="text-xs font-display font-medium text-mist">
+                {firstFrameReady ? "添加尾帧图片" : "请先添加首帧图片"}
+              </span>
+            </button>
+          )}
+        </div>
+        <div className="flex min-w-0 flex-col justify-center gap-2">
+          {asset && <p className="truncate text-[11px] text-fog">{selectedLabel(asset)}</p>}
+          <button type="button" onClick={() => uploadInputRef.current?.click()} disabled={!canChoose} className="btn-secondary btn-sm justify-center">
+            {busy ? "上传中…" : asset ? "替换尾帧" : "上传尾帧"}
+          </button>
+          <button type="button" onClick={() => onOpenPicker?.("last_frame")} disabled={!canChoose} className="btn-secondary btn-sm justify-center">
+            从我的资产选择
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 export default function StudioReferencePanel({
   category,
   creationMode,
@@ -170,6 +238,8 @@ export default function StudioReferencePanel({
   editSubjectMode = "general",
   isEditMode = false,
   selected,
+  lastFrameAsset = null,
+  firstLastFrameEnabled = false,
   productAsset,
   productDetailAssets = [],
   productDetailValidation = { ok: true, message: "" },
@@ -190,10 +260,20 @@ export default function StudioReferencePanel({
   reverseImageCost,
   selectedReverseCost,
   selectedReverseCostLabel,
+  reverseConfig,
+  setReverseConfig,
+  reverseSources = [],
+  setReverseSources,
   videoAnalysisPreset,
   videoAnalysisPresets = [],
   reverseVideoAnalysis = null,
   reverseOperation = null,
+  batchReverseAssets = [],
+  reverseBatch = null,
+  recentReverseBatches = [],
+  reverseBatchBusyAction = "",
+  reverseBatchCapabilities = null,
+  reverseBatchEnabled = true,
   visionModelOptions = [],
   selectedVisionModelConfigId = null,
   onVisionModelChange,
@@ -201,6 +281,7 @@ export default function StudioReferencePanel({
   imageUploadInputRef,
   productUploadInputRef,
   productDetailUploadInputRef,
+  lastFrameUploadInputRef,
   videoUploadInputRef,
   onClear,
   onClearProductAsset,
@@ -208,7 +289,9 @@ export default function StudioReferencePanel({
   onUploadImage,
   onUploadProductImage,
   onUploadProductDetailImages,
+  onUploadLastFrameImage,
   onOpenAssetPicker,
+  onClearLastFrameAsset,
   onRemoveProductDetail,
   onMoveProductDetail,
   onUploadVideo,
@@ -216,6 +299,15 @@ export default function StudioReferencePanel({
   onReverse,
   onConfirmCover,
   onCancelReverse,
+  onToggleBatchAsset,
+  onRemoveBatchAsset,
+  onOpenBatchAssetPicker,
+  onStartReverseBatch,
+  onCancelReverseBatch,
+  onOpenReverseBatch,
+  onOpenReverseBatchItem,
+  onRetryReverseBatchItem,
+  onSaveReverseBatchRecipes,
 }) {
   const isImageEditMode = creationMode === "image_edit";
   const directProductVideoMode = creationMode === "video";
@@ -233,26 +325,38 @@ export default function StudioReferencePanel({
   const imageUploadTargetsProduct = isImageEditMode && productGenerationMode && !productAsset;
   const imageUploadLabel = imageUploadTargetsProduct
     ? "上传产品主体"
+    : firstLastFrameEnabled
+      ? (selected?.type === "image" ? "替换首帧" : "上传首帧")
     : isImageEditMode
       ? "上传风格参考图"
       : directProductVideoMode
       ? "上传图片参考"
       : "上传图片";
-  const modeTitle = isEditMode
+  const modeTitle = firstLastFrameEnabled
+    ? "首尾帧视频"
+    : isEditMode
     ? (creationMode === "video_edit" ? (portraitGenerationMode ? "视频人物重构" : "图生视频重构") : "图片编辑")
     : (category === "video" ? "文生视频" : "链接反推");
-  const styleTitle = isImageEditMode || directProductVideoMode ? "可选风格参考" : (isEditMode ? "风格参考" : "参考素材");
-  const styleDescription = isImageEditMode
+  const styleTitle = firstLastFrameEnabled
+    ? "视频首帧"
+    : isImageEditMode || directProductVideoMode ? "可选风格参考" : (isEditMode ? "风格参考" : "参考素材");
+  const styleDescription = firstLastFrameEnabled
+    ? "上传图片作为视频起始画面；尾帧可在下方单独设置"
+    : isImageEditMode
     ? (portraitGenerationMode ? "可选：反推另一张图/视频的场景、光线、妆造和画面风格" : "可选：反推另一张图的场景、构图、光线和广告质感")
     : directProductVideoMode
     ? "可选：仅用于反推场景、动作、镜头和光影，不会替换上方产品主体"
     : isEditMode
     ? (portraitGenerationMode ? "目标视频/风格参考：只迁移动作、镜头、场景和画面质感，不保证逐帧换脸" : "用于反推场景、构图、光线和广告质感")
     : (category === "video" ? "上传视频或粘贴链接做反推" : "上传图片或粘贴链接做反推");
-  const emptyStyleTitle = isImageEditMode
+  const emptyStyleTitle = firstLastFrameEnabled
+    ? "上传视频首帧"
+    : isImageEditMode
     ? "添加可选风格参考"
     : (portraitGenerationMode ? "上传目标视频 / 风格参考" : category === "video" ? "上传可选视频 / 图片参考" : "上传图片参考");
-  const emptyStyleHint = isImageEditMode
+  const emptyStyleHint = firstLastFrameEnabled
+    ? "支持 JPG、PNG、WebP 或 GIF"
+    : isImageEditMode
     ? "不加也能编辑；需要同款风格时再上传或粘贴链接"
     : directProductVideoMode
     ? "不上传也能生成；这里的素材只提供风格和运动信息"
@@ -276,6 +380,7 @@ export default function StudioReferencePanel({
         ? "上传要生成进目标视频风格的人物照片，参考视频只提供动作、镜头和风格"
         : "上传产品图作为视频中的唯一商品主体，不作为风格参考；保留Logo、包装、颜色、形状和文字标识");
   const [fallbackCoverFile, setFallbackCoverFile] = useState(null);
+  const [batchSelectionMode, setBatchSelectionMode] = useState(false);
   const reverseNeedsConfirmation = reverseOperation?.status === "needs_confirmation";
   const imageMotionSource = category === "video" && selected?.type === "image";
 
@@ -283,13 +388,17 @@ export default function StudioReferencePanel({
     setFallbackCoverFile(null);
   }, [reverseOperation?.id, reverseOperation?.status]);
 
+  useEffect(() => {
+    if (!reverseBatchEnabled) setBatchSelectionMode(false);
+  }, [reverseBatchEnabled]);
+
   return (
-    <aside className="relative min-w-0 overflow-hidden rounded-xl3 border border-iris/35 bg-gradient-to-b from-iris/20 via-base2/80 to-rose/10 p-3 shadow-glow-sm">
+    <aside id="studio-reference-panel" className="relative min-w-0 overflow-hidden rounded-xl3 border border-iris/35 bg-gradient-to-b from-iris/20 via-base2/80 to-rose/10 p-3 shadow-glow-sm">
       <div className="pointer-events-none absolute -right-16 -top-16 h-32 w-32 rounded-full bg-rose/25 blur-3xl" />
       <div className="relative">
         <div className="mb-3 flex min-w-0 items-start justify-between gap-3">
           <div className="min-w-0">
-            <p className="text-xs font-display font-semibold text-iris-400">{directProductVideoMode ? "产品与参考" : "参考素材"}</p>
+            <p className="text-xs font-display font-semibold text-iris-400">{firstLastFrameEnabled ? "首尾帧" : directProductVideoMode ? "产品与参考" : "参考素材"}</p>
             <h3 className="mt-1 text-lg font-display font-semibold text-snow">
               {modeTitle}
             </h3>
@@ -424,13 +533,13 @@ export default function StudioReferencePanel({
                 <>
                   <ReferenceAssetPreview asset={selected} />
                   <span className="badge absolute left-2 top-2 bg-black/70 text-white">
-                    {selected.type === "video" ? "视频参考" : "图片参考"}
+                    {firstLastFrameEnabled ? "首帧" : selected.type === "video" ? "视频参考" : "图片参考"}
                   </span>
                 </>
               ) : (
                 <button
                   type="button"
-                  onClick={() => (category === "video" ? videoUploadInputRef : imageUploadInputRef).current?.click()}
+                  onClick={() => (category === "video" && !firstLastFrameEnabled ? videoUploadInputRef : imageUploadInputRef).current?.click()}
                   className="flex h-full w-full flex-col items-center justify-center gap-3 px-4 text-center transition hover:bg-white/[0.03]"
                 >
                   <span className="flex h-11 w-11 items-center justify-center rounded-full bg-brand text-lg text-white shadow-glow-sm">+</span>
@@ -452,7 +561,9 @@ export default function StudioReferencePanel({
               <div className="truncate text-mist">{selectedLabel(selected)}</div>
               {selected?.type === "image" && selected?.url?.includes("/api/uploads/upload/") && (
                 <div className="mt-1 text-fog">
-                  {isEditMode || directProductVideoMode
+                  {firstLastFrameEnabled
+                    ? "作为视频首帧约束起始画面，可在下方继续添加尾帧。"
+                    : isEditMode || directProductVideoMode
                     ? "仅作为风格参考，不会覆盖产品主体。"
                     : "可直接作为编辑源生成。"}
                 </div>
@@ -461,6 +572,16 @@ export default function StudioReferencePanel({
                 <div className="mt-1 text-fog">会抽取关键帧理解内容，并提取镜头节奏和画面风格。</div>
               )}
             </div>
+          )}
+          {firstLastFrameEnabled && (
+            <LastFrameImage
+              asset={lastFrameAsset}
+              firstFrameReady={selected?.type === "image"}
+              busy={uploading}
+              uploadInputRef={lastFrameUploadInputRef}
+              onOpenPicker={onOpenAssetPicker}
+              onClear={onClearLastFrameAsset}
+            />
           )}
         </div>
 
@@ -598,42 +719,51 @@ export default function StudioReferencePanel({
               {uploading ? "上传中…" : "上传视频"}
             </button>
           </div>
-          {category === "video" && selected && videoAnalysisPresets.length > 0 && (
-            <div className="rounded-xl border border-line bg-black/15 p-2">
-              <div className="mb-2 flex items-center justify-between gap-2 text-xs">
-                <span className="font-display font-medium text-mist">分析精度</span>
-                <span className="text-fog">{imageMotionSource ? `单图成功后结算 ${reverseImageCost} 积分` : "优先镜头切换关键帧"}</span>
-              </div>
-              <div className="grid grid-cols-3 gap-1.5">
-                {videoAnalysisPresets.map((preset) => (
-                  <button
-                    key={preset.key}
-                    type="button"
-                    onClick={() => setVideoAnalysisPreset?.(preset.key)}
-                    className={`rounded-lg border px-2 py-2 text-left transition ${
-                      videoAnalysisPreset === preset.key
-                        ? "border-iris bg-iris/25 text-snow shadow-glow-sm"
-                        : "border-line bg-white/[0.04] text-fog hover:border-line2 hover:text-mist"
-                    }`}
-                  >
-                    <span className="block text-xs font-display font-semibold">{preset.label}</span>
-                    <span className="mt-1 block text-[10px] leading-snug">
-                      {imageMotionSource
-                        ? `冻结 ${Number(preset.max_cost ?? REVERSE_VIDEO_PRESET_COSTS[preset.key] ?? 5)} 积分`
-                        : `${preset.short_range} / ${preset.long_range}`}
-                    </span>
-                  </button>
-                ))}
-              </div>
-              {imageMotionSource && (
-                <p className="mt-2 text-[11px] leading-relaxed text-fog">
-                  当前档位先冻结 {selectedReverseCost} 积分；单图运动设计成功后结算 {reverseImageCost} 积分
-                  {Number(selectedReverseCost || 0) > Number(reverseImageCost || 0)
-                    ? `，并退还 ${Number(selectedReverseCost) - Number(reverseImageCost)} 积分差额。`
-                    : "。"}
-                </p>
-              )}
-            </div>
+          {selected && reverseConfig && (
+            <StudioReverseIntentControls
+              category={category}
+              config={reverseConfig}
+              disabled={reversing || reverseNeedsConfirmation}
+              onChange={setReverseConfig}
+            />
+          )}
+          {selected && (
+            <StudioReverseSourcesEditor
+              selected={selected}
+              assets={assets}
+              sources={reverseSources}
+              disabled={reversing || reverseNeedsConfirmation}
+              onChange={setReverseSources}
+            />
+          )}
+          {category === "video" && selected?.type === "video" && reverseConfig && (
+            <StudioVideoSourceTimeline
+              asset={selected}
+              config={reverseConfig}
+              configuredDuration={selected.duration
+                || reverseVideoAnalysis?.source?.total_duration_seconds
+                || reverseVideoAnalysis?.source?.duration_seconds
+                || null}
+              disabled={reversing || reverseNeedsConfirmation}
+              onChange={setReverseConfig}
+            />
+          )}
+          {category === "video" && selected && reverseConfig && videoAnalysisPresets.length > 0 && (
+            <StudioVideoAnalysisControls
+              config={reverseConfig}
+              presets={videoAnalysisPresets}
+              timelineEnabled={selected.type === "video"}
+              disabled={reversing || reverseNeedsConfirmation}
+              maxDuration={selected.duration || reverseVideoAnalysis?.source?.total_duration_seconds || null}
+              selectedCost={selectedReverseCost}
+              onChange={setReverseConfig}
+            />
+          )}
+          {imageMotionSource && selectedReverseCost > reverseImageCost && (
+            <p className="rounded-lg border border-line bg-black/15 px-2.5 py-2 text-[11px] leading-relaxed text-fog">
+              单图运动设计成功后按图片反推结算 {reverseImageCost} 积分，并退还
+              {Number(selectedReverseCost) - Number(reverseImageCost)} 积分差额。
+            </p>
           )}
           {reverseVideoAnalysis && (
             <div className="rounded-xl border border-line bg-black/15 p-2">
@@ -727,6 +857,15 @@ export default function StudioReferencePanel({
             className="hidden"
             onChange={(e) => onUploadVideo(e.target.files?.[0])}
           />
+          {firstLastFrameEnabled && (
+            <input
+              ref={lastFrameUploadInputRef}
+              type="file"
+              accept="image/jpeg,image/png,image/webp,image/gif"
+              className="hidden"
+              onChange={(e) => onUploadLastFrameImage(e.target.files?.[0])}
+            />
+          )}
           {(isEditMode || directProductVideoMode) && (
             <input
               ref={productUploadInputRef}
@@ -756,29 +895,86 @@ export default function StudioReferencePanel({
 
         {assets.length > 0 && (
           <div className="mt-3">
-            <div className="mb-2 flex items-center justify-between text-xs">
+            <div className="mb-2 flex items-center justify-between gap-2 text-xs">
               <span className="text-fog">已抓取素材</span>
-              <button type="button" onClick={() => setRefOpen((v) => !v)} className="text-mist hover:text-snow">
-                {refOpen ? "收起" : "展开"}
-              </button>
+              <div className="flex items-center gap-2">
+                {reverseBatchEnabled && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setBatchSelectionMode((value) => !value);
+                      setRefOpen(true);
+                    }}
+                    className={batchSelectionMode ? "text-aqua" : "text-mist hover:text-snow"}
+                  >
+                    {batchSelectionMode ? "完成多选" : "批量选择"}
+                  </button>
+                )}
+                <button type="button" onClick={() => setRefOpen((v) => !v)} className="text-mist hover:text-snow">
+                  {refOpen ? "收起" : "展开"}
+                </button>
+              </div>
             </div>
             {refOpen && (
               <div className="grid grid-cols-3 gap-2 sm:grid-cols-4">
-                {assets.map((asset, i) => (
-                  <button
-                    key={i}
-                    onClick={() => onPickAsset(asset)}
-                    className={`relative aspect-square overflow-hidden rounded-lg border transition ${
-                      selected === asset ? "border-iris ring-2 ring-iris/40" : "border-line hover:border-line2"
-                    }`}
-                  >
-                    <ReferenceAssetPreview asset={asset} compact />
-                    <span className="badge absolute left-1 top-1 bg-black/60 text-[10px] text-white">{asset.type}</span>
-                  </button>
-                ))}
+                {assets.map((asset, i) => {
+                  const batchSelected = batchReverseAssets.some((item) => (
+                    (item.asset_ref && asset.asset_ref && item.asset_ref === asset.asset_ref)
+                    || (item.url && asset.url && item.url === asset.url)
+                  ));
+                  const batchCompatible = category === "video" || asset.type === "image";
+                  return (
+                    <button
+                      key={asset.asset_ref || asset.url || i}
+                      type="button"
+                      onClick={() => (batchSelectionMode
+                        ? batchCompatible && onToggleBatchAsset?.(asset)
+                        : onPickAsset(asset))}
+                      aria-pressed={batchSelectionMode ? batchSelected : selected === asset}
+                      disabled={batchSelectionMode && !batchCompatible}
+                      className={`relative aspect-square overflow-hidden rounded-lg border transition disabled:cursor-not-allowed disabled:opacity-40 ${
+                        batchSelected
+                          ? "border-aqua ring-2 ring-aqua/35"
+                          : selected === asset && !batchSelectionMode
+                            ? "border-iris ring-2 ring-iris/40"
+                            : "border-line hover:border-line2"
+                      }`}
+                    >
+                      <ReferenceAssetPreview asset={asset} compact />
+                      <span className="badge absolute left-1 top-1 bg-black/60 text-[10px] text-white">{asset.type}</span>
+                      {batchSelectionMode && (
+                        <span className={`absolute right-1 top-1 flex h-6 w-6 items-center justify-center rounded-full border text-xs font-bold ${
+                          batchSelected ? "border-aqua bg-aqua text-black" : "border-white/30 bg-black/70 text-white"
+                        }`} aria-hidden="true">
+                          {batchSelected ? "✓" : "+"}
+                        </span>
+                      )}
+                    </button>
+                  );
+                })}
               </div>
             )}
           </div>
+        )}
+
+        {reverseBatchEnabled && (
+          <StudioReverseBatchPanel
+            assets={batchReverseAssets}
+            batch={reverseBatch}
+            recentBatches={recentReverseBatches}
+            busyAction={reverseBatchBusyAction}
+            reverseEnabled={reverseEnabled}
+            sharedConfig={reverseConfig}
+            batchCapabilities={reverseBatchCapabilities}
+            onOpenAssetPicker={onOpenBatchAssetPicker}
+            onRemoveAsset={onRemoveBatchAsset}
+            onStart={onStartReverseBatch}
+            onCancel={onCancelReverseBatch}
+            onOpenBatch={onOpenReverseBatch}
+            onOpenItem={onOpenReverseBatchItem}
+            onRetryItem={onRetryReverseBatchItem}
+            onSaveAll={onSaveReverseBatchRecipes}
+          />
         )}
       </div>
     </aside>

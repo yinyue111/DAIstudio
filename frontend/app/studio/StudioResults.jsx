@@ -4,6 +4,8 @@ import { forwardRef } from "react";
 import { classifyGenerationError } from "../../lib/errorHandling";
 import { Lightbox, ResultCard } from "./StudioMedia.jsx";
 import GroupedAssetGallery from "./GroupedAssetGallery.jsx";
+import StudioReproductionAssessment from "./StudioReproductionAssessment.jsx";
+import { reproductionSourceAsset } from "./reproductionAssessment";
 import { isTerminalTaskStatus, statusStyle, statusZh, taskResultTitle } from "./helpers";
 
 const StudioResults = forwardRef(function StudioResults({
@@ -27,10 +29,21 @@ const StudioResults = forwardRef(function StudioResults({
   onUnlock,
   onDownload,
   onVariation,
+  sourceAsset = null,
+  reverseOperationId = null,
+  reverseRevisionId = null,
+  reproductionModelConfigId = null,
+  reproductionVideoComposition = null,
+  requestQuoteConfirmation,
+  onReproductionCorrectionCreated,
+  onReproductionRemediationCreated,
+  onReproductionRemediationExecutionSubmitted,
+  reproductionAssessmentEnabled = true,
 }, ref) {
   const cancelableStatus = task?.status;
   const showCancel = ["queued", "running"].includes(cancelableStatus);
   const visibleBackgroundTasks = (backgroundTasks || []).filter((item) => item?.id && item.id !== task?.id);
+  const assessmentSourceAsset = reproductionSourceAsset(task, sourceAsset);
 
   return (
     <>
@@ -120,19 +133,37 @@ const StudioResults = forwardRef(function StudioResults({
               </div>
             )}
             {task.assets?.length > 0 && (
-              <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
-                {task.assets.map((asset) => (
-                  <ResultCard
-                    key={asset.id}
-                    a={asset}
-                    unlocking={busyAssetIds?.has(asset.id)}
-                    onOpen={() => setLightbox(asset)}
-                    onUnlock={() => onUnlock(asset)}
-                    onDownload={() => onDownload(asset)}
-                    onVariation={onVariation}
+              <>
+                <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+                  {task.assets.map((asset) => (
+                    <ResultCard
+                      key={asset.id}
+                      a={asset}
+                      unlocking={busyAssetIds?.has(asset.id)}
+                      onOpen={() => setLightbox(asset)}
+                      onUnlock={() => onUnlock(asset)}
+                      onDownload={() => onDownload(asset)}
+                      onVariation={onVariation}
+                    />
+                  ))}
+                </div>
+                {reproductionAssessmentEnabled && (
+                  <StudioReproductionAssessment
+                    sourceAsset={assessmentSourceAsset}
+                    generatedAssets={task.assets}
+                    generationTaskId={task.id}
+                    reverseOperationId={task.reverse_operation_id || reverseOperationId}
+                    reverseRevisionId={task.source_revision_id || reverseRevisionId}
+                    modelConfigId={reproductionModelConfigId}
+                    remediationParams={task.params || {}}
+                    videoComposition={reproductionVideoComposition}
+                    requestQuoteConfirmation={requestQuoteConfirmation}
+                    onCorrectionCreated={onReproductionCorrectionCreated}
+                    onRemediationCreated={onReproductionRemediationCreated}
+                    onRemediationExecutionSubmitted={onReproductionRemediationExecutionSubmitted}
                   />
-                ))}
-              </div>
+                )}
+              </>
             )}
           </div>
         </section>

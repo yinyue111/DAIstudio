@@ -31,7 +31,7 @@ def admin_settle_needs_review_image(
     model = model_config_for_task(db, task, "image", get_model_config_fn)
     if not model:
         raise ValueError("未配置图片模型")
-    model = model_from_snapshot(task, model)
+    model = model_from_snapshot(task, model, db)
     params = dict(task.params or {})
     keys = [str(key) for key in (params.get("_image_result_keys") or []) if key]
     saved_n = max(0, int(params.get("_saved_n") or 0))

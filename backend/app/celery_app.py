@@ -69,6 +69,8 @@ celery_app.conf.update(
         Queue("video_download"),
         Queue("parse"),
         Queue("reverse"),
+        Queue("reproduction"),
+        Queue("workflow"),
         Queue("cleanup"),
         Queue("payment"),
     ),
@@ -79,6 +81,8 @@ celery_app.conf.update(
         "download.video": {"queue": "video_download"},
         "parse.*": {"queue": "parse"},
         "reverse.*": {"queue": "reverse"},
+        "reproduction.*": {"queue": "reproduction"},
+        "workflow.*": {"queue": "workflow"},
         "cleanup.*": {"queue": "cleanup"},
         "payments.*": {"queue": "payment"},
     },
@@ -88,10 +92,31 @@ celery_app.conf.update(
             "task": "cleanup.expired_assets",
             "schedule": crontab(hour=3, minute=0),
         },
-        # reap stuck tasks every 10 minutes (last-resort backstop)
+        "archive-inactive-projects-daily": {
+            "task": "cleanup.archive_inactive_projects",
+            "schedule": crontab(hour=3, minute=30),
+        },
+        # Enforce generation deadlines every minute as a last-resort backstop.
         "reap-stuck-tasks": {
             "task": "cleanup.reap_stuck",
-            "schedule": crontab(minute="*/10"),
+            "schedule": crontab(minute="*"),
+        },
+        # Resolve Celery publish acknowledgement loss using the durable outbox.
+        "reconcile-generation-dispatches": {
+            "task": "cleanup.reconcile_generation_dispatches",
+            "schedule": crontab(minute="*"),
+        },
+        "reconcile-workflow-dispatches": {
+            "task": "cleanup.reconcile_workflow_dispatches",
+            "schedule": crontab(minute="*"),
+        },
+        "reconcile-workflow-externals": {
+            "task": "cleanup.reconcile_workflow_externals",
+            "schedule": crontab(minute="*"),
+        },
+        "reconcile-reproduction-remediations": {
+            "task": "cleanup.reconcile_reproduction_remediations",
+            "schedule": crontab(minute="*"),
         },
         # fail parse jobs whose worker message disappeared
         "reap-stuck-parse-records": {
@@ -101,6 +126,10 @@ celery_app.conf.update(
         # expire confirmations, refund stale runs, and republish lost messages
         "reap-stuck-reverse-operations": {
             "task": "cleanup.reap_reverse",
+            "schedule": crontab(minute="*"),
+        },
+        "reap-stale-prompt-optimizations": {
+            "task": "cleanup.reap_prompt_optimizations",
             "schedule": crontab(minute="*"),
         },
         # resume in-flight video renders whose poll chain died (worker crash)

@@ -51,6 +51,42 @@ def _png_bytes(size=(32, 48), color=(20, 120, 200)):
     return buf.getvalue()
 
 
+_MODEL_GATEWAY_FIELDS = (
+    "provider",
+    "base_url",
+    "api_key_encrypted",
+    "gateway_format",
+)
+
+
+@pytest.fixture()
+def preserve_model_gateway_rows():
+    snapshots = {}
+
+    def snapshot(rows):
+        for row in rows:
+            snapshots.setdefault(
+                row.id,
+                {field: getattr(row, field) for field in _MODEL_GATEWAY_FIELDS},
+            )
+
+    yield snapshot
+
+    if not snapshots:
+        return
+    db = SessionLocal()
+    try:
+        for model_id, original in snapshots.items():
+            row = db.get(ModelConfig, model_id)
+            if row is None:
+                continue
+            for field, value in original.items():
+                setattr(row, field, value)
+        db.commit()
+    finally:
+        db.close()
+
+
 # ---------------------------------------------------------------- refund idempotency
 def test_claim_terminal_is_exactly_once(client, make_user):
     uid = make_user("13900000050")
@@ -181,11 +217,13 @@ def test_cancel_and_refund_holds_for_review_when_refund_fails(client, make_user,
 
 
 # ---------------------------------------------------------------- billing
-def test_default_n_image_charges_for_all_images(client, make_user, auth):
+def test_default_n_image_charges_for_all_images(
+    client, make_user, auth, quote_and_generate
+):
     # no n supplied -> freeze AND settle must use the configured default image_n
     make_user("13900000070", balance=1000)
     h = auth("13900000070")
-    r = client.post("/api/generate", json={
+    r = quote_and_generate({
         "category": "image", "stage": "preview",
         "prompt": {"final_text": "x"}, "params": {"size": "256x256"},
     }, headers=h)
@@ -197,10 +235,12 @@ def test_default_n_image_charges_for_all_images(client, make_user, auth):
     assert client.get("/api/me", headers=h).json()["balance_credits"] == 992
 
 
-def test_generate_response_exposes_only_public_params(client, make_user, auth):
+def test_generate_response_exposes_only_public_params(
+    client, make_user, auth, quote_and_generate
+):
     make_user("13900000079", balance=1000)
     h = auth("13900000079")
-    r = client.post("/api/generate", json={
+    r = quote_and_generate({
         "category": "image",
         "stage": "preview",
         "prompt": {"final_text": "public params"},
@@ -212,10 +252,10 @@ def test_generate_response_exposes_only_public_params(client, make_user, auth):
     assert all(not key.startswith("_") for key in params)
 
 
-def test_unlock_is_idempotent(client, make_user, auth):
+def test_unlock_is_idempotent(client, make_user, auth, quote_and_generate):
     make_user("13900000071", balance=1000)
     h = auth("13900000071")
-    r = client.post("/api/generate", json={
+    r = quote_and_generate({
         "category": "image", "stage": "preview", "prompt": {"final_text": "x"},
         "params": {"n": 1, "size": "256x256"}}, headers=h)
     a = client.get(f"/api/tasks/{r.json()['id']}", headers=h).json()["assets"][0]
@@ -229,7 +269,9 @@ def test_unlock_is_idempotent(client, make_user, auth):
     assert client.get("/api/me", headers=h).json()["balance_credits"] == bal1
 
 
-def test_generated_asset_unlock_ignores_model_unlock_cost(client, make_user, auth):
+def test_generated_asset_unlock_ignores_model_unlock_cost(
+    client, make_user, auth, quote_and_generate
+):
     make_user("13900000072", balance=1000, admin=True)
     h = auth("13900000072")
     assert client.put("/api/admin/models", json={
@@ -240,7 +282,7 @@ def test_generated_asset_unlock_ignores_model_unlock_cost(client, make_user, aut
         "enabled": True,
         "admin_password": "pass123456",
     }, headers=h).status_code == 200
-    r = client.post("/api/generate", json={
+    r = quote_and_generate({
         "category": "image",
         "stage": "preview",
         "prompt": {"final_text": "snapshot price"},
@@ -264,7 +306,9 @@ def test_generated_asset_unlock_ignores_model_unlock_cost(client, make_user, aut
     assert before - client.get("/api/me", headers=h).json()["balance_credits"] == 0
 
 
-def test_asset_response_exposes_zero_generated_unlock_cost(client, make_user, auth):
+def test_asset_response_exposes_zero_generated_unlock_cost(
+    client, make_user, auth, quote_and_generate
+):
     make_user("13900000150", balance=1000, admin=True)
     h = auth("13900000150")
     assert client.put("/api/admin/models", json={
@@ -275,7 +319,7 @@ def test_asset_response_exposes_zero_generated_unlock_cost(client, make_user, au
         "enabled": True,
         "admin_password": "pass123456",
     }, headers=h).status_code == 200
-    r = client.post("/api/generate", json={
+    r = quote_and_generate({
         "category": "image",
         "stage": "preview",
         "prompt": {"final_text": "snapshot unlock"},
@@ -300,7 +344,9 @@ def test_asset_response_exposes_zero_generated_unlock_cost(client, make_user, au
 
 
 # ---------------------------------------------------------------- final inheritance
-def test_final_inherits_preview_prompt_not_client(client, make_user, auth):
+def test_final_inherits_preview_prompt_not_client(
+    client, make_user, auth, quote_and_generate
+):
     make_user("13900000052", balance=1000, admin=True)
     h = auth("13900000052")
     client.put("/api/admin/models", json={
@@ -309,7 +355,7 @@ def test_final_inherits_preview_prompt_not_client(client, make_user, auth):
         "admin_password": "pass123456",
     }, headers=h)
 
-    r = client.post("/api/generate", json={
+    r = quote_and_generate({
         "category": "video", "stage": "preview",
         "prompt": {"final_text": "AAA preview prompt"}, "params": {"duration": 2},
     }, headers=h)
@@ -317,7 +363,7 @@ def test_final_inherits_preview_prompt_not_client(client, make_user, auth):
     pid = r.json()["id"]
 
     # final supplies a DIFFERENT prompt — it must be ignored, inheriting parent's
-    r2 = client.post("/api/generate", json={
+    r2 = quote_and_generate({
         "category": "video", "stage": "final", "parent_task_id": pid,
         "prompt": {"final_text": "BBB attacker prompt"},
     }, headers=h)
@@ -332,7 +378,9 @@ def test_final_inherits_preview_prompt_not_client(client, make_user, auth):
         db.close()
 
 
-def test_final_reuses_needs_review_task_for_same_preview(client, make_user, auth):
+def test_final_reuses_needs_review_task_for_same_preview(
+    client, make_user, auth, quote_generation
+):
     uid = make_user("13900000949", balance=1000)
     h = auth("13900000949")
     db = SessionLocal()
@@ -357,6 +405,21 @@ def test_final_reuses_needs_review_task_for_same_preview(client, make_user, auth
                 unlocked=False,
             )
         )
+        db.commit()
+        preview_id = preview.id
+    finally:
+        db.close()
+
+    payload = {
+        "category": "video",
+        "stage": "final",
+        "parent_task_id": preview_id,
+        "prompt": {"final_text": "retry should reuse"},
+    }
+    quote = quote_generation(payload, headers=h)
+
+    db = SessionLocal()
+    try:
         held = GenTask(
             user_id=uid,
             category="video",
@@ -369,17 +432,15 @@ def test_final_reuses_needs_review_task_for_same_preview(client, make_user, auth
         )
         db.add(held)
         db.commit()
-        preview_id = preview.id
         held_id = held.id
     finally:
         db.close()
 
-    r = client.post("/api/generate", json={
-        "category": "video",
-        "stage": "final",
-        "parent_task_id": preview_id,
-        "prompt": {"final_text": "retry should reuse"},
-    }, headers=h)
+    r = client.post(
+        "/api/generate",
+        json={**payload, "quote_id": quote["quote_id"]},
+        headers=h,
+    )
     assert r.status_code == 200, r.text
     assert r.json()["id"] == held_id
 
@@ -398,7 +459,7 @@ def test_reverse_rejects_internal_url(client, make_user, auth):
 def test_generate_rejects_internal_source_url(client, make_user, auth):
     make_user("13900000054", balance=1000)
     h = auth("13900000054")
-    r = client.post("/api/generate", json={
+    r = client.post("/api/quotes", json={
         "category": "image", "stage": "preview", "prompt": {"final_text": "x"},
         "source_asset_url": "http://127.0.0.1/secret.png",
         "params": {"n": 1, "size": "256x256"},
@@ -937,6 +998,50 @@ def test_gateway_request_uses_pinned_client_without_dns_pin_lock(monkeypatch):
     assert events == ["connect", "wait-for-headers"]
 
 
+def test_gateway_request_uses_direct_client_only_for_explicit_analyzer_host(monkeypatch):
+    events: list[str] = []
+
+    class FakeDirectClient:
+        def __init__(self, **kwargs):
+            assert kwargs["follow_redirects"] is False
+            assert kwargs["trust_env"] is False
+            events.append("direct-client")
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def request(self, method, url, headers=None, json=None):  # noqa: ARG002
+            events.append("request")
+            return httpx.Response(
+                200,
+                json={"ok": True},
+                request=httpx.Request(method, url),
+            )
+
+    monkeypatch.setattr(gateway.httpx, "Client", FakeDirectClient)
+    monkeypatch.setattr(
+        gateway,
+        "pinned_client",
+        lambda *_args, **_kwargs: pytest.fail("trusted analyzer must not use public SSRF DNS pinning"),
+    )
+
+    response = gateway._request(
+        "POST",
+        "http://evidence_provider:8090/v1/region/analyze",
+        headers={"Authorization": "Bearer test"},
+        json={},
+        timeout=1,
+        retries=0,
+        trusted_hosts=["evidence_provider"],
+    )
+
+    assert response.json() == {"ok": True}
+    assert events == ["direct-client", "request"]
+
+
 def test_pinned_client_rejects_unresolved_hosts(monkeypatch):
     monkeypatch.setattr(ssrf, "resolve_safe", lambda _host: ["93.184.216.34"])
     client = ssrf.pinned_client("https://gateway.test")
@@ -1170,7 +1275,9 @@ def test_parse_accepts_copied_share_text_with_embedded_url(client, make_user, au
     assert r.json()["url"] == "https://e.tb.cn/h.RsKuM6YesPztUCt?tk=ZTsRgiCip4j"
 
 
-def test_generate_records_source_trace_for_parsed_reference(client, make_user, auth, monkeypatch):
+def test_generate_records_source_trace_for_parsed_reference(
+    client, make_user, auth, monkeypatch, quote_and_generate
+):
     make_user("13900000188", balance=1000)
     h = auth("13900000188")
     monkeypatch.setattr(
@@ -1194,9 +1301,8 @@ def test_generate_records_source_trace_for_parsed_reference(client, make_user, a
     assert parsed.status_code == 200, parsed.text
     asset = parsed.json()["assets"][0]
 
-    generated = client.post(
-        "/api/generate",
-        json={
+    generated = quote_and_generate(
+        {
             "source_asset_url": asset["url"],
             "source_type": "image",
             "source_asset_meta": {
@@ -1228,6 +1334,7 @@ def test_generate_records_source_trace_for_parsed_reference(client, make_user, a
         db.close()
 
     assert trace["source_asset_url"] == asset["url"]
+    assert trace["asset_ref"] == asset["asset_ref"]
     assert trace["selected_url"] == asset["url"]
     assert trace["original_url"] == "https://cdn.example.com/full.jpg"
     assert trace["original_thumb"] == "https://cdn.example.com/thumb.jpg"
@@ -1240,14 +1347,18 @@ def test_generate_records_source_trace_for_parsed_reference(client, make_user, a
     assert "ignored" not in trace
 
 
-def test_generate_allows_external_reference_without_rights_confirmation(client, make_user, auth, monkeypatch):
+def test_generate_allows_external_reference_without_rights_confirmation(
+    client, make_user, auth, monkeypatch, quote_and_generate
+):
     make_user("13900001185", balance=1000)
     h = auth("13900001185")
-    monkeypatch.setattr("app.routers.generate.assert_safe_user_asset_url", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        "app.services.generation_policy.assert_safe_user_asset_url",
+        lambda *_a, **_k: None,
+    )
 
-    r = client.post(
-        "/api/generate",
-        json={
+    r = quote_and_generate(
+        {
             "source_asset_url": "https://cdn.example.com/full.jpg",
             "source_type": "image",
             "source_asset_meta": {
@@ -1266,15 +1377,19 @@ def test_generate_allows_external_reference_without_rights_confirmation(client, 
     assert r.status_code == 200, r.text
 
 
-def test_generate_allows_confirmed_external_reference(client, make_user, auth, monkeypatch):
+def test_generate_allows_confirmed_external_reference(
+    client, make_user, auth, monkeypatch, quote_and_generate
+):
     make_user("13900001184", balance=1000)
     h = auth("13900001184")
-    monkeypatch.setattr("app.routers.generate.assert_safe_user_asset_url", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        "app.services.generation_policy.assert_safe_user_asset_url",
+        lambda *_a, **_k: None,
+    )
     monkeypatch.setattr("app.services.gateway.download_bytes_limited", lambda *_a, **_k: _png_bytes())
 
-    r = client.post(
-        "/api/generate",
-        json={
+    r = quote_and_generate(
+        {
             "source_asset_url": "https://cdn.example.com/full.jpg",
             "source_type": "image",
             "source_asset_meta": {
@@ -1462,7 +1577,9 @@ def test_parse_submit_returns_queued_when_worker_is_async(client, make_user, aut
     assert status.json()["status"] == "queued"
 
 
-def test_parsed_preview_reference_is_owner_bound(client, make_user, auth, monkeypatch):
+def test_parsed_preview_reference_is_owner_bound(
+    client, make_user, auth, monkeypatch, quote_and_generate
+):
     user_a = make_user("13900000092", balance=1000)
     make_user("13900000093", balance=1000)
     h_a = auth("13900000092")
@@ -1485,7 +1602,7 @@ def test_parsed_preview_reference_is_owner_bound(client, make_user, auth, monkey
     finally:
         db.close()
 
-    ok = client.post("/api/generate", json={
+    ok = quote_and_generate({
         "source_asset_url": ref_url,
         "source_type": "image",
         "category": "image",
@@ -1495,7 +1612,7 @@ def test_parsed_preview_reference_is_owner_bound(client, make_user, auth, monkey
     }, headers=h_a)
     assert ok.status_code == 200, ok.text
 
-    blocked = client.post("/api/generate", json={
+    blocked = client.post("/api/quotes", json={
         "source_asset_url": ref_url,
         "source_type": "image",
         "category": "image",
@@ -1563,7 +1680,7 @@ def test_orphaned_parsed_preview_file_cannot_drive_reference_generation(
     finally:
         db.close()
 
-    blocked = client.post("/api/generate", json={
+    blocked = client.post("/api/quotes", json={
         "source_asset_url": ref_url,
         "source_type": "image",
         "category": "image",
@@ -1575,15 +1692,16 @@ def test_orphaned_parsed_preview_file_cannot_drive_reference_generation(
     assert "生成素材不存在" in blocked.text or "上传素材不存在" in blocked.text
 
 
-def test_asset_report_takedown_soft_blocks_reported_asset(client, make_user, auth):
+def test_asset_report_takedown_soft_blocks_reported_asset(
+    client, make_user, auth, quote_and_generate
+):
     make_user("13900000189", balance=1000)
     make_user("13900000190", balance=1000, admin=True)
     user_h = auth("13900000189")
     admin_h = auth("13900000190")
 
-    created = client.post(
-        "/api/generate",
-        json={
+    created = quote_and_generate(
+        {
             "category": "image",
             "stage": "preview",
             "prompt": {"final_text": "reportable asset"},
@@ -1894,8 +2012,18 @@ def test_orphaned_generated_preview_file_cannot_drive_reference_generation(
     url = storage.public_url(key)
     db = SessionLocal()
     try:
+        task = GenTask(
+            user_id=owner_id,
+            category="image",
+            stage="preview",
+            status="succeeded",
+            prompt={},
+            params={},
+        )
+        db.add(task)
+        db.flush()
         asset = GenAsset(
-            task_id=999999,
+            task_id=task.id,
             user_id=owner_id,
             type="image",
             preview_url=url,
@@ -1910,7 +2038,7 @@ def test_orphaned_generated_preview_file_cannot_drive_reference_generation(
         db.close()
 
     for headers in (owner_h, other_h):
-        blocked = client.post("/api/generate", json={
+        blocked = client.post("/api/quotes", json={
             "source_asset_url": url,
             "source_type": "image",
             "category": "image",
@@ -2005,7 +2133,9 @@ def test_s3_public_url_and_key_mapping(monkeypatch):
     monkeypatch.setattr(storage.settings, "storage_backend", "s3")
     monkeypatch.setattr(storage.settings, "storage_s3_public_base_url", "https://media.example.com/ai")
     assert storage.public_url("preview/abc.png") == "https://media.example.com/ai/preview/abc.png"
-    assert storage.upload_api_url("upload/ref.png") == "https://media.example.com/ai/upload/ref.png"
+    assert storage.upload_api_url("upload/ref.png") == (
+        f"{storage.settings.public_base_url.rstrip('/')}/api/uploads/upload/ref.png"
+    )
     assert storage.key_from_url("https://media.example.com/ai/preview/abc.png") == "preview/abc.png"
     assert storage.key_from_url("https://media.example.com/other/preview/abc.png") is None
 
@@ -2031,11 +2161,13 @@ def test_reverse_rejects_hls_playlist(client, make_user, auth):
     assert "m3u8" in r.text
 
 
-def test_audit_failure_does_not_break_generate(client, make_user, auth, monkeypatch):
+def test_audit_failure_does_not_break_generate(
+    client, make_user, auth, monkeypatch, quote_and_generate
+):
     make_user("13900000073", balance=1000)
     h = auth("13900000073")
     monkeypatch.setattr("app.services.audit.log", lambda *_a, **_k: False)
-    r = client.post("/api/generate", json={
+    r = quote_and_generate({
         "category": "image", "stage": "preview",
         "prompt": {"final_text": "x"}, "params": {"n": 1, "size": "256x256"},
     }, headers=h)
@@ -2187,7 +2319,9 @@ def test_admin_config_allows_logged_in_admin_without_second_password(client, mak
         assert restore_ok.status_code == 200, restore_ok.text
 
 
-def test_mock_mode_external_reference_does_not_download(client, make_user, auth, monkeypatch):
+def test_mock_mode_external_reference_does_not_download(
+    client, make_user, auth, monkeypatch, quote_and_generate
+):
     make_user("13900000091", balance=1000)
     h = auth("13900000091")
 
@@ -2195,7 +2329,7 @@ def test_mock_mode_external_reference_does_not_download(client, make_user, auth,
         raise AssertionError("mock generation must not download external references")
 
     monkeypatch.setattr("app.services.gateway.download_bytes_limited", boom)
-    r = client.post("/api/generate", json={
+    r = quote_and_generate({
         "source_asset_url": "https://example.com/mock-ref.png",
         "source_type": "image",
         "source_asset_meta": {},
@@ -2207,7 +2341,9 @@ def test_mock_mode_external_reference_does_not_download(client, make_user, auth,
     assert r.status_code == 200, r.text
 
 
-def test_image_finalize_holds_for_review_when_settle_fails(client, make_user, auth, monkeypatch):
+def test_image_finalize_holds_for_review_when_settle_fails(
+    client, make_user, auth, monkeypatch, quote_and_generate
+):
     make_user("13900000094", balance=1000)
     h = auth("13900000094")
     buf = io.BytesIO()
@@ -2224,7 +2360,7 @@ def test_image_finalize_holds_for_review_when_settle_fails(client, make_user, au
         if p.is_file()
     }
 
-    r = client.post("/api/generate", json={
+    r = quote_and_generate({
         "category": "image",
         "stage": "preview",
         "prompt": {"final_text": "cleanup orphan files"},
@@ -3005,7 +3141,9 @@ def test_admin_routes_still_require_admin_role(client, make_user, auth):
     assert denied.status_code == 403
 
 
-def test_production_requires_real_gateway(client, monkeypatch):
+def test_production_requires_real_gateway(
+    client, monkeypatch, preserve_model_gateway_rows
+):
     monkeypatch.setattr(settings, "debug", False)
     monkeypatch.setattr(settings, "mock_mode", False)
     monkeypatch.setattr(settings, "gateway_base_url", "")
@@ -3021,7 +3159,9 @@ def test_production_requires_real_gateway(client, monkeypatch):
     validate_runtime_config()
     db = SessionLocal()
     try:
-        for row in db.query(ModelConfig).all():
+        rows = db.query(ModelConfig).all()
+        preserve_model_gateway_rows(rows)
+        for row in rows:
             row.base_url = None
             row.api_key_encrypted = None
         db.commit()
@@ -3165,7 +3305,9 @@ def test_runtime_rejects_short_payment_config_secret(monkeypatch):
         validate_runtime_config()
 
 
-def test_production_ark_video_gateway_requires_explicit_credentials(client, monkeypatch):
+def test_production_ark_video_gateway_requires_explicit_credentials(
+    client, monkeypatch, preserve_model_gateway_rows
+):
     monkeypatch.setattr(settings, "debug", False)
     monkeypatch.setattr(settings, "mock_mode", False)
     monkeypatch.setattr(settings, "gateway_base_url", "https://gateway.example.com")
@@ -3184,6 +3326,7 @@ def test_production_ark_video_gateway_requires_explicit_credentials(client, monk
     db = SessionLocal()
     try:
         video = db.query(ModelConfig).filter(ModelConfig.use == "video").one()
+        preserve_model_gateway_rows([video])
         video.base_url = None
         video.api_key_encrypted = None
         db.commit()
@@ -3193,7 +3336,9 @@ def test_production_ark_video_gateway_requires_explicit_credentials(client, monk
         db.close()
 
 
-def test_production_allows_db_model_gateway_credentials(client, monkeypatch):
+def test_production_allows_db_model_gateway_credentials(
+    client, monkeypatch, preserve_model_gateway_rows
+):
     monkeypatch.setattr(settings, "debug", False)
     monkeypatch.setattr(settings, "mock_mode", False)
     monkeypatch.setattr(settings, "gateway_base_url", "")
@@ -3212,7 +3357,9 @@ def test_production_allows_db_model_gateway_credentials(client, monkeypatch):
 
     db = SessionLocal()
     try:
-        for row in db.query(ModelConfig).all():
+        rows = db.query(ModelConfig).all()
+        preserve_model_gateway_rows(rows)
+        for row in rows:
             row.base_url = "https://gateway.example.com/v1"
             row.api_key_encrypted = "sk-test"
         db.commit()
@@ -3221,7 +3368,9 @@ def test_production_allows_db_model_gateway_credentials(client, monkeypatch):
         db.close()
 
 
-def test_production_rejects_partial_db_model_gateway(client, monkeypatch):
+def test_production_rejects_partial_db_model_gateway(
+    client, monkeypatch, preserve_model_gateway_rows
+):
     monkeypatch.setattr(settings, "debug", False)
     monkeypatch.setattr(settings, "mock_mode", False)
     monkeypatch.setattr(settings, "gateway_base_url", "https://gateway.example.com")
@@ -3240,7 +3389,12 @@ def test_production_rejects_partial_db_model_gateway(client, monkeypatch):
 
     db = SessionLocal()
     try:
-        row = db.query(ModelConfig).filter(ModelConfig.use == "image").one()
+        rows = db.query(ModelConfig).order_by(ModelConfig.id).all()
+        preserve_model_gateway_rows(rows)
+        for configured in rows:
+            configured.base_url = "https://configured-gateway.example.com/v1"
+            configured.api_key_encrypted = "sk-test"
+        row = next(configured for configured in rows if configured.use == "image")
         row.base_url = "https://model-gateway.example.com/v1"
         row.api_key_encrypted = None
         db.commit()

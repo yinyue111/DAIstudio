@@ -1,4 +1,5 @@
 import "./globals.css";
+import AppShell from "../components/AppShell";
 import ErrorBoundary from "../components/ErrorBoundary";
 import { ToastProvider } from "../components/ToastProvider";
 
@@ -22,7 +23,7 @@ export default function RootLayout({ children }) {
       <body className="min-h-screen" suppressHydrationWarning>
         <ErrorBoundary>
           <ToastProvider>
-            {children}
+            <AppShell>{children}</AppShell>
           </ToastProvider>
         </ErrorBoundary>
       </body>

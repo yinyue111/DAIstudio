@@ -179,7 +179,7 @@ def _cleanup_storage_keys(*keys: str | None) -> None:
         if not key:
             continue
         try:
-            storage.local_path(key).unlink(missing_ok=True)
+            storage.delete(key)
         except Exception:  # noqa: BLE001
             pass
 
@@ -585,6 +585,7 @@ async def upload_video(
         thumb=storage.upload_api_url(preview_key) if preview_key else None,
         width=width,
         height=height,
+        duration=duration,
     )
 
 
@@ -598,13 +599,14 @@ def get_uploaded_image(
     if kind not in {"upload", "upload_preview", "upload_video", "upload_video_preview"}:
         raise HTTPException(404, "文件不存在")
     key = f"{kind}/{filename}"
-    path = storage.local_path(key)
-    try:
-        path.resolve().relative_to((storage.ROOT / kind).resolve())
-    except (ValueError, OSError):
-        raise HTTPException(404, "文件不存在")
     row = db.get(UploadedAsset, key)
     if not row or row.user_id != user.id:
+        raise HTTPException(404, "文件不存在")
+    try:
+        path = storage.local_path(key)
+    except ValueError:
+        raise HTTPException(404, "文件不存在")
+    if not storage.materialized_path_matches_key(path, key):
         raise HTTPException(404, "文件不存在")
     if not path.exists() or not path.is_file():
         raise HTTPException(404, "文件不存在")

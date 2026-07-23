@@ -9,6 +9,7 @@ from ..config import settings
 from ..db import get_db
 from ..deps import get_current_user
 from ..models import User
+from ..services.catalog import public_model_option
 from ..services.config_store import (
     DEFAULT_SETTINGS,
     get_all_model_configs,
@@ -17,7 +18,9 @@ from ..services.config_store import (
 )
 from ..services.generation_pricing import public_pricing_config
 from ..services.image_options import IMAGE_SIZES
-from ..services.model_gateway_config import PROVIDER_PRESETS, runtime_config_for_model
+from ..services.model_gateway_config import runtime_config_for_model
+from ..services.product_edition import public_feature_flags
+from ..services.reverse_capabilities import BATCH_CAPABILITIES
 from ..services.video_analysis import (
     DEFAULT_VIDEO_ANALYSIS_PRESET,
     max_frame_count,
@@ -26,76 +29,10 @@ from ..services.video_analysis import (
 
 router = APIRouter(prefix="/api", tags=["config"])
 
-_BOOLEAN_CAPABILITIES = {
-    "text_to_image",
-    "image_to_image",
-    "reference_image",
-    "multi_reference",
-    "text_to_video",
-    "image_to_video",
-    "video_to_video",
-    "first_last_frame",
-    "product_profile",
-    "portrait_profile",
-    "prompt_optimization",
-    "image_analysis",
-    "video_analysis",
-}
-_INTEGER_CAPABILITIES = {"max_reference_images", "max_duration_seconds"}
-_LIST_CAPABILITIES = {"aspect_ratios", "resolutions", "durations"}
-
-
-def _public_capabilities(extra: dict | None) -> dict:
-    raw = (extra or {}).get("capabilities")
-    if not isinstance(raw, dict):
-        return {}
-    capabilities: dict = {}
-    for key in _BOOLEAN_CAPABILITIES:
-        if isinstance(raw.get(key), bool):
-            capabilities[key] = raw[key]
-    for key in _INTEGER_CAPABILITIES:
-        value = raw.get(key)
-        if isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= 100000:
-            capabilities[key] = value
-    for key in _LIST_CAPABILITIES:
-        value = raw.get(key)
-        if isinstance(value, list) and len(value) <= 100 and all(
-            isinstance(item, (str, int)) and not isinstance(item, bool) for item in value
-        ):
-            capabilities[key] = value
-    return capabilities
-
-
-def _public_model_option(model) -> dict:
-    extra = model.extra if isinstance(model.extra, dict) else {}
-    preview_cost = (
-        int(extra.get("preview_cost", max(1, int(model.cost_credits or 0) // 10)))
-        if model.use == "video"
-        else None
-    )
-    provider = str(model.provider or "env")
-    provider_label = (PROVIDER_PRESETS.get(provider) or {}).get("label") or provider
-    return {
-        "id": model.id,
-        "use": model.use,
-        "name": model.display_name or model.model_id,
-        "model_id": model.model_id,
-        "provider": provider,
-        "provider_label": provider_label,
-        "is_default": bool(model.is_default),
-        "sort_order": int(model.sort_order or 0),
-        "cost_credits": int(model.cost_credits or 0),
-        "unlock_cost": int(model.unlock_cost or 0),
-        "preview_cost": preview_cost,
-        "final_cost": int(model.cost_credits or 0),
-        "capabilities": _public_capabilities(extra),
-    }
-
-
 @router.get("/config")
 def get_config(db: Session = Depends(get_db), _: User = Depends(get_current_user)):
     defaults = {k: get_setting(db, k) for k in DEFAULT_SETTINGS}
-    all_models = list(get_all_model_configs(db))
+    all_models = get_all_model_configs(db)
     default_models = {}
     for model in all_models:
         if model.use not in default_models or model.is_default:
@@ -114,7 +51,7 @@ def get_config(db: Session = Depends(get_db), _: User = Depends(get_current_user
     model_options = {use: [] for use in ("vision", "image", "video", "prompt")}
     for model in all_models:
         if model.enabled:
-            model_options[model.use].append(_public_model_option(model))
+            model_options[model.use].append(public_model_option(model))
     pricing = public_pricing_config()
     vision_cost = int(models.get("vision", {}).get("cost_credits") or 0)
     gateway_modes = {}
@@ -123,10 +60,15 @@ def get_config(db: Session = Depends(get_db), _: User = Depends(get_current_user
         gateway_modes[m.use] = {"mock_mode": settings.mock_mode or not cfg.configured}
     return {
         "defaults": defaults,
+        "product_edition": settings.product_edition,
         "features": {
             "reverse_prompt_enabled": get_bool_setting(db, "reverse_prompt_enabled", True),
             "sms_auth_enabled": get_bool_setting(db, "sms_auth_enabled", False),
-            "payment_enabled": get_bool_setting(db, "payment_enabled", False),
+            "payment_enabled": (
+                get_bool_setting(db, "payment_enabled", False)
+                and settings.product_edition != "launch_lite"
+            ),
+            **public_feature_flags(),
         },
         "models": models,
         "model_options": model_options,
@@ -143,6 +85,7 @@ def get_config(db: Session = Depends(get_db), _: User = Depends(get_current_user
             "video_frame_count": max_frame_count(DEFAULT_VIDEO_ANALYSIS_PRESET),
             "video_max_cost": pricing["reverse"]["video_preset_costs"].get(DEFAULT_VIDEO_ANALYSIS_PRESET, vision_cost),
             "video_presets": preset_options(vision_cost, pricing["reverse"]["video_preset_costs"]),
+            "batch_capabilities": BATCH_CAPABILITIES,
         },
         "mock_mode": settings.effective_mock_mode,
         "gateways": {

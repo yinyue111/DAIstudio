@@ -18,10 +18,9 @@ def _product_png_bytes() -> bytes:
     return output.getvalue()
 
 
-def _submit_product_edit(client, auth_headers, asset_url):
-    return client.post(
-        "/api/generate",
-        json={
+def _submit_product_edit(quote_and_generate, auth_headers, asset_url):
+    return quote_and_generate(
+        {
             "source_asset_url": asset_url,
             "source_type": "image",
             "source_asset_meta": {
@@ -45,7 +44,9 @@ def _submit_product_edit(client, auth_headers, asset_url):
     )
 
 
-def test_generation_retries_a_busy_product_mask_before_sending(client, make_user, auth, monkeypatch):
+def test_generation_retries_a_busy_product_mask_before_sending(
+    client, make_user, auth, monkeypatch, quote_and_generate
+):
     uid = make_user("13900002994", balance=1000)
     headers = auth("13900002994")
     upload = client.post(
@@ -80,7 +81,7 @@ def test_generation_retries_a_busy_product_mask_before_sending(client, make_user
     monkeypatch.setattr("app.services.generation_image_flow.gateway_image_edit_mask", flaky_mask)
     monkeypatch.setattr("app.services.gateway.gen_image", fake_gen_image)
 
-    response = _submit_product_edit(client, headers, upload.json()["url"])
+    response = _submit_product_edit(quote_and_generate, headers, upload.json()["url"])
     assert response.status_code == 200, response.text
     assert calls == 2
     assert seen["extra_payload"]["mask"].startswith("data:image/png;base64,")
@@ -97,7 +98,9 @@ def test_generation_retries_a_busy_product_mask_before_sending(client, make_user
         assert task.params["_edit_mask_source"] == "test_retry"
 
 
-def test_generation_stops_instead_of_silently_dropping_product_mask(client, make_user, auth, monkeypatch):
+def test_generation_stops_instead_of_silently_dropping_product_mask(
+    client, make_user, auth, monkeypatch, quote_and_generate
+):
     uid = make_user("13900002995", balance=1000)
     headers = auth("13900002995")
     upload = client.post(
@@ -122,7 +125,7 @@ def test_generation_stops_instead_of_silently_dropping_product_mask(client, make
     monkeypatch.setattr("app.services.generation_image_flow.gateway_image_edit_mask", failed_mask)
     monkeypatch.setattr("app.services.gateway.gen_image", fake_gen_image)
 
-    response = _submit_product_edit(client, headers, upload.json()["url"])
+    response = _submit_product_edit(quote_and_generate, headers, upload.json()["url"])
     assert response.status_code == 200, response.text
     assert mask_calls == 2
     assert generated is False

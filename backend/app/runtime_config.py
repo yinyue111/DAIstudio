@@ -57,6 +57,125 @@ def _validate_public_https_url(name: str, url: str) -> None:
         raise RuntimeError(f"{name} 生产部署必须是 HTTPS 公网地址")
 
 
+def _validate_image_evidence_analyzer_config(capability: str) -> None:
+    prefix = f"image_evidence_{capability}"
+    env_prefix = f"IMAGE_EVIDENCE_{capability.upper()}"
+    url = str(getattr(settings, f"{prefix}_url") or "").strip()
+    api_key = str(getattr(settings, f"{prefix}_api_key") or "").strip()
+    health_url = str(getattr(settings, f"{prefix}_health_url") or "").strip()
+    if not url:
+        dangling = []
+        if api_key:
+            dangling.append(f"{env_prefix}_API_KEY")
+        if health_url:
+            dangling.append(f"{env_prefix}_HEALTH_URL")
+        if dangling:
+            raise RuntimeError(
+                f"{env_prefix}_URL 未配置时不能单独配置 " + ",".join(dangling)
+            )
+        return
+    for suffix, configured_url in (("URL", url), ("HEALTH_URL", health_url)):
+        if not configured_url:
+            continue
+        parsed = urlparse(configured_url)
+        if (
+            parsed.scheme not in {"http", "https"}
+            or not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.fragment
+        ):
+            raise RuntimeError(f"{env_prefix}_{suffix} 必须是不含用户信息和 fragment 的 HTTP(S) 地址")
+        if not settings.debug:
+            _validate_analyzer_http_url(f"{env_prefix}_{suffix}", configured_url)
+    analyzer_host = (urlparse(url).hostname or "").rstrip(".").lower()
+    if (
+        not settings.debug
+        and analyzer_host in settings.trusted_analyzer_host_list
+        and not api_key
+    ):
+        raise RuntimeError(
+            f"{env_prefix}_API_KEY 必须为私网分析器配置 Bearer 凭据"
+        )
+
+
+def _validate_analyzer_http_url(name: str, url: str) -> None:
+    parsed = urlparse(url)
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.fragment
+    ):
+        raise RuntimeError(f"{name} 必须是不含用户信息和 fragment 的 HTTP(S) 地址")
+    host = (parsed.hostname or "").rstrip(".").lower()
+    trusted_private = host in settings.trusted_analyzer_host_list
+    if not settings.debug and trusted_private:
+        try:
+            ipaddress.ip_address(host)
+        except ValueError:
+            pass
+        else:
+            raise RuntimeError(
+                f"{name} 的 TRUSTED_ANALYZER_HOSTS 只能使用明确的服务主机名，不能使用 IP"
+            )
+        if host in {"localhost", "metadata", "metadata.google.internal"}:
+            raise RuntimeError(f"{name} 使用了禁止信任的分析器主机名")
+        return
+    if not settings.debug:
+        _validate_configured_egress_url(name, url)
+
+
+def _validate_audio_analyzer_config() -> None:
+    enabled = bool(settings.audio_gateway_enabled)
+    base_url = str(settings.audio_gateway_base_url or "").strip()
+    api_key = str(settings.audio_gateway_api_key or "").strip()
+    model = str(settings.audio_transcription_model or "").strip()
+    health_url = str(settings.audio_gateway_health_url or "").strip()
+    if bool(base_url) != bool(api_key):
+        raise RuntimeError(
+            "AUDIO_GATEWAY_BASE_URL 与 AUDIO_GATEWAY_API_KEY 必须同时配置或同时留空"
+        )
+    if health_url and not base_url:
+        raise RuntimeError(
+            "AUDIO_GATEWAY_BASE_URL 未配置时不能单独配置 AUDIO_GATEWAY_HEALTH_URL"
+        )
+    if enabled and not (base_url and api_key and model):
+        raise RuntimeError(
+            "AUDIO_GATEWAY_ENABLED=true 时必须完整配置 AUDIO_GATEWAY_BASE_URL、"
+            "AUDIO_GATEWAY_API_KEY 和 AUDIO_TRANSCRIPTION_MODEL"
+        )
+    for name, url in (
+        ("AUDIO_GATEWAY_BASE_URL", base_url),
+        ("AUDIO_GATEWAY_HEALTH_URL", health_url),
+    ):
+        if url:
+            _validate_analyzer_http_url(name, url)
+
+
+def _validate_video_semantic_analyzer_config() -> None:
+    url = str(settings.video_evidence_semantic_url or "").strip()
+    api_key = str(settings.video_evidence_semantic_api_key or "").strip()
+    health_url = str(settings.video_evidence_semantic_health_url or "").strip()
+    if bool(url) != bool(api_key):
+        raise RuntimeError(
+            "VIDEO_EVIDENCE_SEMANTIC_URL 与 VIDEO_EVIDENCE_SEMANTIC_API_KEY "
+            "必须同时配置或同时留空"
+        )
+    if health_url and not url:
+        raise RuntimeError(
+            "VIDEO_EVIDENCE_SEMANTIC_URL 未配置时不能单独配置 "
+            "VIDEO_EVIDENCE_SEMANTIC_HEALTH_URL"
+        )
+    for name, configured_url in (
+        ("VIDEO_EVIDENCE_SEMANTIC_URL", url),
+        ("VIDEO_EVIDENCE_SEMANTIC_HEALTH_URL", health_url),
+    ):
+        if configured_url:
+            _validate_analyzer_http_url(name, configured_url)
+
+
 def _validate_production_trusted_proxies() -> None:
     for item in settings.trusted_proxy_ip_list:
         if "/" not in item:
@@ -112,6 +231,10 @@ def validate_runtime_config() -> None:
     # model rows are checked in validate_model_gateway_rows() after startup seed.
     if not settings.debug and settings.mock_mode:
         raise RuntimeError("生产环境(DEBUG=false)必须设置 MOCK_MODE=false")
+    _validate_audio_analyzer_config()
+    _validate_video_semantic_analyzer_config()
+    for capability in ("detector", "segmenter"):
+        _validate_image_evidence_analyzer_config(capability)
     if not settings.debug:
         _validate_configured_egress_url("GATEWAY_BASE_URL", settings.gateway_base_url)
         _validate_configured_egress_url("ANTHROPIC_BASE_URL", settings.anthropic_base_url)
@@ -150,10 +273,24 @@ def validate_runtime_config() -> None:
     if str(storage_settings.backend or "local").lower() not in {"local", "s3"}:
         raise RuntimeError("STORAGE_BACKEND 仅支持 local 或 s3")
     if str(storage_settings.backend or "local").lower() == "s3":
-        raise RuntimeError(
-            "当前版本暂不支持 STORAGE_BACKEND=s3。媒体下载、抽帧、上传复用和高清鉴权仍依赖本地文件路径，"
-            "请使用 STORAGE_BACKEND=local；完整对象存储适配完成后再启用 S3/MinIO。"
-        )
+        if not str(storage_settings.s3_bucket or "").strip():
+            raise RuntimeError("STORAGE_BACKEND=s3 必须配置 STORAGE_S3_BUCKET")
+        if bool(storage_settings.s3_access_key_id) != bool(storage_settings.s3_secret_access_key):
+            raise RuntimeError(
+                "STORAGE_S3_ACCESS_KEY_ID 和 STORAGE_S3_SECRET_ACCESS_KEY 必须同时配置，"
+                "或同时留空使用实例角色"
+            )
+        if storage_settings.s3_endpoint_url:
+            endpoint = urlparse(storage_settings.s3_endpoint_url)
+            if endpoint.scheme not in {"http", "https"} or not endpoint.netloc:
+                raise RuntimeError("STORAGE_S3_ENDPOINT_URL 必须是有效的 HTTP(S) 地址")
+        public_media = urlparse(str(storage_settings.s3_public_base_url or ""))
+        if public_media.scheme not in {"http", "https"} or not public_media.netloc:
+            raise RuntimeError(
+                "STORAGE_BACKEND=s3 必须配置可访问的 STORAGE_S3_PUBLIC_BASE_URL"
+            )
+        if not settings.debug and public_media.scheme != "https":
+            raise RuntimeError("生产环境 STORAGE_S3_PUBLIC_BASE_URL 必须使用 HTTPS")
     if not settings.debug and settings.payment_mock_enabled:
         raise RuntimeError("生产环境(DEBUG=false)必须设置 PAYMENT_MOCK_ENABLED=false")
     if settings.payment_mock_enabled and not mock_payments_allowed():
@@ -173,20 +310,14 @@ def validate_runtime_config() -> None:
 
 
 def validate_model_gateway_rows(db) -> None:
-    """Fail fast on unsupported protocols and unsafe production model config."""
+    """Fail fast on incomplete or unsafe production model configuration."""
     from sqlalchemy import select
 
     from .models import ModelConfig
 
-    rows = list(db.execute(select(ModelConfig)).scalars())
-    for row in rows:
-        if row.use == "vision" and (
-            row.provider == "anthropic" or row.gateway_format == "anthropic"
-        ):
-            raise RuntimeError(
-                "视觉反推不支持 Anthropic 原生协议,"
-                "请将 vision 模型改为 OpenAI-compatible 网关"
-            )
+    rows = list(
+        db.execute(select(ModelConfig).where(ModelConfig.deleted_at.is_(None))).scalars()
+    )
     if settings.debug:
         return
     anthropic_base_configured = bool(str(settings.anthropic_base_url or "").strip())
@@ -197,7 +328,7 @@ def validate_model_gateway_rows(db) -> None:
             "ANTHROPIC_BASE_URL 和 ANTHROPIC_AUTH_TOKEN 必须同时配置,或同时清空后使用后台模型配置。"
         )
     required_uses = {"vision", "image", "video", "prompt"}
-    configured_uses = {str(row.use or "") for row in rows}
+    configured_uses = {str(row.use or "") for row in rows if row.enabled}
     missing_uses = sorted(required_uses - configured_uses)
     if missing_uses:
         raise RuntimeError(

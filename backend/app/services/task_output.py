@@ -4,13 +4,14 @@ from __future__ import annotations
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from ..models import GatewayCall, GenAsset, GenTask
+from ..models import GatewayCall, GenAsset, GenerationDispatch, GenTask
 from ..schemas import TaskOut
 from .asset_output import to_asset_out
 from .error_codes import task_error_type
 from .generation import is_terminal_status
 from .generation_pricing import generation_cost_from_snapshot
 from .progress import get_progress
+from .recipe_usage import attribution_from_snapshot
 from .task_eta import video_eta_for_task
 
 _PUBLIC_PARAM_KEYS = {
@@ -70,6 +71,27 @@ def _decorate_error(out: TaskOut, task: GenTask) -> None:
     out.error_type = task_error_type(task.params, task.error, status=task.status)
 
 
+def _decorate_dispatch(db: Session, out: TaskOut, task: GenTask) -> None:
+    dispatch = db.scalar(
+        select(GenerationDispatch)
+        .where(GenerationDispatch.task_id == task.id)
+        .order_by(GenerationDispatch.attempt.desc())
+        .limit(1)
+    )
+    if dispatch is None:
+        return
+    out.dispatch_attempt = dispatch.attempt
+    out.dispatch_status = dispatch.status
+    out.dispatch_task_id = dispatch.celery_task_id
+    out.dispatch_publish_attempts = int(dispatch.publish_attempts or 0)
+    out.dispatch_reconciliation_required = dispatch.status in {
+        "pending",
+        "publishing",
+        "unknown",
+        "needs_review",
+    }
+
+
 def _decorate_generation_details(
     out: TaskOut,
     task: GenTask,
@@ -108,10 +130,32 @@ def _decorate_generation_details(
         or params.get("_prompt_optimizer_model_id")
         or ""
     ).strip() or None
-    out.prompt_compiler_version = str(params.get("_prompt_compiler_version") or "").strip() or None
-    warnings = params.get("_video_prompt_warnings")
-    out.prompt_warnings = [str(item).strip() for item in warnings if str(item).strip()] \
-        if isinstance(warnings, list) else []
+    compiler_metadata = (
+        prompt_obj.get("compiler_metadata")
+        if isinstance(prompt_obj.get("compiler_metadata"), dict)
+        else {}
+    )
+    out.prompt_compiler_version = str(
+        params.get("_prompt_compiler_version") or compiler_metadata.get("version") or ""
+    ).strip() or None
+    out.prompt_optimization_direction = str(
+        prompt_obj.get("optimization_direction") or compiler_metadata.get("direction") or ""
+    ).strip() or None
+    out.prompt_optimization_kind = str(
+        prompt_obj.get("optimization_kind") or compiler_metadata.get("kind") or ""
+    ).strip() or None
+    warnings: list[str] = []
+    for source_warnings in (
+        params.get("_video_prompt_warnings"),
+        prompt_obj.get("optimization_warnings"),
+    ):
+        if not isinstance(source_warnings, list):
+            continue
+        for item in source_warnings:
+            text = str(item).strip()
+            if text and text not in warnings:
+                warnings.append(text)
+    out.prompt_warnings = warnings
     overlays = params.get("_post_overlays")
     out.post_overlays = [str(item).strip() for item in overlays if str(item).strip()] \
         if isinstance(overlays, list) else []
@@ -120,6 +164,17 @@ def _decorate_generation_details(
     out.sfx = [str(item).strip() for item in sfx if str(item).strip()] \
         if isinstance(sfx, list) else []
     out.sequence_required = bool(params.get("_video_prompt_sequence_required"))
+    quote = params.get("_quote") if isinstance(params.get("_quote"), dict) else {}
+    if quote:
+        out.capability_version_id = quote.get("capability_version_id")
+        out.price_version_id = quote.get("price_version_id")
+        out.quote_estimated_credits = quote.get("estimated_credits")
+    attribution = attribution_from_snapshot(params.get("_recipe_attribution"))
+    if attribution is not None:
+        out.creation_recipe_id = attribution.recipe_id
+        out.creation_recipe_version = attribution.recipe_version
+        out.creation_recipe_source = attribution.source
+        out.creation_recipe_share_id = attribution.share_id
 
 
 def _gateway_model_for_task(db: Session, task_id: int) -> str | None:
@@ -190,6 +245,7 @@ def build_task_out(db: Session, task: GenTask) -> TaskOut:
     out.progress = _progress_for(task)
     _decorate_partial(out, task)
     _decorate_error(out, task)
+    _decorate_dispatch(db, out, task)
     _decorate_generation_details(out, task, gateway_model_id=_gateway_model_for_task(db, task.id))
     _decorate_eta(db, out, task)
     _set_final_cost_estimate(out, task)
@@ -280,6 +336,7 @@ def build_task_outs(db: Session, tasks: list[GenTask]) -> list[TaskOut]:
         out.progress = _progress_for(t)
         _decorate_partial(out, t)
         _decorate_error(out, t)
+        _decorate_dispatch(db, out, t)
         _decorate_generation_details(out, t, gateway_model_id=gateway_model_by_task.get(t.id))
         _decorate_eta(db, out, t)
         _set_final_cost_estimate(out, t)

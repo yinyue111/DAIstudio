@@ -26,6 +26,7 @@ from ..schemas import (
     AssetOut,
     AssetReportIn,
     AssetReportOut,
+    AssetUnlockIn,
 )
 from ..security import decode_access_token
 from ..services import audit, credits, gateway, locks, storage
@@ -330,8 +331,13 @@ def batch_download_assets(
 
 
 @router.post("/{asset_id}/unlock", response_model=AssetOut)
-def unlock(asset_id: int, request: Request, db: Session = Depends(get_db),
-           user: User = Depends(get_current_user)):
+def unlock(
+    asset_id: int,
+    request: Request,
+    body: AssetUnlockIn | None = None,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
     asset = db.get(GenAsset, asset_id)
     if not asset or asset.user_id != user.id:
         raise HTTPException(404, "素材不存在")
@@ -341,6 +347,50 @@ def unlock(asset_id: int, request: Request, db: Session = Depends(get_db),
         return to_asset_out(db, asset)
 
     unlock_cost = unlock_cost_for_asset(db, asset)
+    quote = None
+    if unlock_cost > 0:
+        if body is None:
+            raise HTTPException(
+                422,
+                detail={
+                    "code": "QUOTE_REQUIRED",
+                    "message": "付费高清解锁必须先获取并确认服务端报价",
+                },
+            )
+        from ..services.generation_quotes import (
+            consume_execution_quote,
+            lock_execution_quote,
+            validate_asset_unlock_quote,
+        )
+
+        quote = lock_execution_quote(
+            db,
+            quote_id=body.quote_id,
+            user_id=user.id,
+            kind="asset_unlock",
+            allow_consumed=True,
+        )
+        if quote.status == "consumed":
+            if (
+                quote.consumed_ref_type == "asset_unlock"
+                and int(quote.consumed_ref_id or 0) == int(asset_id)
+            ):
+                db.rollback()
+                db.refresh(asset)
+                if asset.unlocked:
+                    return to_asset_out(db, asset)
+                raise HTTPException(
+                    409,
+                    detail={
+                        "code": "QUOTE_STATE_INVALID",
+                        "message": "解锁报价已消费，但素材状态不一致，请联系管理员处理",
+                    },
+                )
+            raise HTTPException(
+                409,
+                detail={"code": "QUOTE_CONSUMED", "message": "报价已被其他操作使用"},
+            )
+        unlock_cost = validate_asset_unlock_quote(db, quote, asset_id=asset_id)
 
     # Atomic claim: only the request that flips unlocked False->True charges, so
     # a double-click / retry can never double-charge the unlock.
@@ -357,10 +407,34 @@ def unlock(asset_id: int, request: Request, db: Session = Depends(get_db),
 
     if unlock_cost > 0:
         try:
-            credits.unlock(db, user.id, unlock_cost, biz_ref=asset_id, commit=False)
+            credits.freeze(
+                db,
+                user.id,
+                unlock_cost,
+                biz_ref=asset_id,
+                biz_type="unlock",
+                commit=False,
+            )
+            consume_execution_quote(
+                quote,
+                ref_type="asset_unlock",
+                ref_id=asset_id,
+            )
+            credits.settle(
+                db,
+                user.id,
+                unlock_cost,
+                unlock_cost,
+                biz_ref=asset_id,
+                biz_type="unlock",
+                commit=False,
+            )
         except credits.InsufficientCredits as e:
             db.rollback()  # reverts the claim -> stays locked, no charge
             raise HTTPException(400, str(e))
+        except Exception:
+            db.rollback()
+            raise
     db.commit()
     db.refresh(asset)
     audit.log(db, user_id=user.id, action="unlock", biz_type="unlock",

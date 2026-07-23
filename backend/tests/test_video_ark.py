@@ -60,6 +60,22 @@ def test_ark_content_image_to_video_with_last_frame():
     assert c[2]["role"] == "last_frame"
 
 
+def test_seedance_15_ark_payload_assigns_both_frame_roles():
+    payload = gateway._ark_payload(
+        "animate between two frames",
+        "doubao-seedance-1-5-pro-251215",
+        {
+            "first_frame_image": "http://x/first.png",
+            "last_frame_image": "http://x/last.png",
+        },
+    )
+
+    assert [item.get("role") for item in payload["content"][1:]] == [
+        "first_frame",
+        "last_frame",
+    ]
+
+
 def test_ark_content_keeps_same_image_for_distinct_first_and_last_frame_roles():
     c = gateway._ark_content(
         "locked product",
@@ -142,6 +158,24 @@ def test_ark_content_orders_product_theme_then_details_before_other_references()
     ]
     assert "图片2为产品细节参考1" in content[0]["text"]
     assert "图片3为产品细节参考2" in content[0]["text"]
+
+
+def test_ark_content_keeps_seedance_20_theme_plus_nine_details():
+    details = [f"http://x/detail-{index}.png" for index in range(1, 10)]
+    content = gateway._ark_content(
+        "保持产品主题和全部局部细节",
+        {
+            "product_reference_image": "http://x/product.png",
+            "product_detail_images": details,
+        },
+    )
+
+    assert [item["image_url"]["url"] for item in content[1:]] == [
+        "http://x/product.png",
+        *details,
+    ]
+    assert all(item["role"] == "reference_image" for item in content[1:])
+    assert "图片10为产品细节参考9" in content[0]["text"]
 
 
 def test_ark_content_includes_distinct_style_reference():
@@ -293,6 +327,55 @@ def test_generic_video_submit_preserves_first_frame(monkeypatch):
     assert "first_frame_image" not in seen["payload"]
 
 
+def test_grok_video_submit_maps_first_frame_to_native_image_url(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(settings, "mock_mode", False)
+    monkeypatch.setattr(settings, "video_gateway_base_url", "https://video.example.com")
+    monkeypatch.setattr(settings, "video_gateway_api_key", "test-key")
+    monkeypatch.setattr(settings, "video_gateway_format", "openai")
+
+    def fake_post(path, payload, timeout=120):
+        seen["payload"] = payload
+        return {"request_id": "grok-image-to-video"}
+
+    monkeypatch.setattr(gateway, "_video_post", fake_post)
+
+    task_id = gateway.submit_video(
+        "animate",
+        "grok-imagine-video-1.5",
+        {"first_frame_image": "https://example.com/first.png"},
+    )
+
+    assert task_id == "grok-image-to-video"
+    assert seen["payload"]["image"] == {"url": "https://example.com/first.png"}
+    assert "image_url" not in seen["payload"]
+    assert "first_frame_image" not in seen["payload"]
+
+
+def test_grok_video_submit_maps_ratio_to_native_aspect_ratio(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(settings, "mock_mode", False)
+    monkeypatch.setattr(settings, "video_gateway_base_url", "https://video.example.com")
+    monkeypatch.setattr(settings, "video_gateway_api_key", "test-key")
+    monkeypatch.setattr(settings, "video_gateway_format", "openai")
+    monkeypatch.setattr(
+        gateway,
+        "_video_post",
+        lambda _path, payload, timeout=120: seen.update(payload=payload)
+        or {"request_id": "grok-ratio-video"},
+    )
+
+    task_id = gateway.submit_video(
+        "animate",
+        "grok-imagine-video-1.5",
+        {"duration": 5, "resolution": "480p", "ratio": "1:1"},
+    )
+
+    assert task_id == "grok-ratio-video"
+    assert seen["payload"]["aspect_ratio"] == "1:1"
+    assert "ratio" not in seen["payload"]
+
+
 def test_grok_video_submit_maps_product_source_to_native_image_url(monkeypatch):
     seen = {}
     monkeypatch.setattr(settings, "mock_mode", False)
@@ -316,10 +399,59 @@ def test_grok_video_submit_maps_product_source_to_native_image_url(monkeypatch):
     )
 
     assert task_id == "grok-product-video"
-    assert seen["payload"]["image_url"] == "https://example.com/product.png"
+    assert seen["payload"]["reference_images"] == [
+        {"url": "https://example.com/product.png"},
+    ]
+    assert "image" not in seen["payload"]
+    assert "image_url" not in seen["payload"]
     assert "product_reference_image" not in seen["payload"]
     assert "first_frame_image" not in seen["payload"]
     assert "last_frame_image" not in seen["payload"]
+
+
+def test_grok_video_submit_maps_product_theme_and_detail_to_native_reference_schema(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(settings, "mock_mode", False)
+    monkeypatch.setattr(settings, "video_gateway_base_url", "https://video.example.com")
+    monkeypatch.setattr(settings, "video_gateway_api_key", "test-key")
+    monkeypatch.setattr(settings, "video_gateway_format", "openai")
+    monkeypatch.setattr(
+        gateway,
+        "_video_post",
+        lambda _path, payload, timeout=120: seen.update(payload=payload)
+        or {"request_id": "grok-product-details"},
+    )
+
+    task_id = gateway.submit_video(
+        "keep the exact product identity",
+        "grok-imagine-video-1.5",
+        {
+            "product_reference_image": "https://example.com/product.png",
+            "product_detail_images": ["https://example.com/detail.png"],
+            "negative_prompt": "warped logo, unreadable packaging text",
+        },
+        extra={
+            # Tasks 154/155 froze this legacy mapping before migration 0076.
+            "product_images_field": "images",
+            "product_images_item_field": "url",
+        },
+    )
+
+    assert task_id == "grok-product-details"
+    assert seen["payload"]["reference_images"] == [
+        {"url": "https://example.com/product.png"},
+        {"url": "https://example.com/detail.png"},
+    ]
+    assert seen["payload"]["prompt"] == (
+        "keep the exact product identity\n"
+        "Negative constraints: warped logo, unreadable packaging text"
+    )
+    assert "negative_prompt" not in seen["payload"]
+    assert "images" not in seen["payload"]
+    assert "image" not in seen["payload"]
+    assert "image_url" not in seen["payload"]
+    assert "product_reference_image" not in seen["payload"]
+    assert "product_detail_images" not in seen["payload"]
 
 
 def test_generic_video_submit_maps_product_reference_to_configured_field(monkeypatch):
@@ -399,21 +531,33 @@ def test_generic_video_submit_maps_ordered_product_details_to_configured_field(m
     assert "product_detail_images" not in seen["payload"]
 
 
-def test_grok_video_submit_rejects_distinct_product_and_first_frame_on_same_field(monkeypatch):
+def test_grok_video_submit_keeps_product_reference_separate_from_first_frame(monkeypatch):
+    seen = {}
     monkeypatch.setattr(settings, "mock_mode", False)
     monkeypatch.setattr(settings, "video_gateway_base_url", "https://video.example.com")
     monkeypatch.setattr(settings, "video_gateway_api_key", "test-key")
     monkeypatch.setattr(settings, "video_gateway_format", "openai")
+    monkeypatch.setattr(
+        gateway,
+        "_video_post",
+        lambda _path, payload, timeout=120: seen.update(payload=payload)
+        or {"request_id": "grok-frame-and-product"},
+    )
 
-    with pytest.raises(ValueError, match="产品身份参考.*首帧"):
-        gateway.submit_video(
-            "animate product",
-            "grok-imagine-video-1.5",
-            {
-                "product_reference_image": "https://example.com/product.png",
-                "first_frame_image": "https://example.com/opening.png",
-            },
-        )
+    task_id = gateway.submit_video(
+        "animate product",
+        "grok-imagine-video-1.5",
+        {
+            "product_reference_image": "https://example.com/product.png",
+            "first_frame_image": "https://example.com/opening.png",
+        },
+    )
+
+    assert task_id == "grok-frame-and-product"
+    assert seen["payload"]["image"] == {"url": "https://example.com/opening.png"}
+    assert seen["payload"]["reference_images"] == [
+        {"url": "https://example.com/product.png"},
+    ]
 
 
 def test_generic_video_submit_accepts_grok_request_id(monkeypatch):
@@ -666,6 +810,47 @@ def test_generic_video_poll_accepts_top_level_video_urls(monkeypatch):
 
     assert res["status"] == "succeeded"
     assert res["url"] == "https://cdn.example.com/video-url.mp4"
+
+
+def test_generic_video_poll_resolves_relative_result_url_against_runtime_gateway(monkeypatch):
+    monkeypatch.setattr(settings, "mock_mode", False)
+    cfg = RuntimeGatewayConfig(
+        use="video",
+        provider="grok",
+        base_url="https://video.example.com/v1",
+        api_key="test-key",
+        gateway_format="openai",
+    )
+    monkeypatch.setattr(
+        gateway,
+        "_video_get",
+        lambda *_args, **_kwargs: {
+            "status": "succeeded",
+            "url": "/v1/videos/task-1/content",
+        },
+    )
+
+    res = gateway.poll_video("task-1", "video-model", gateway_config=cfg)
+
+    assert res["status"] == "succeeded"
+    assert res["url"] == "https://video.example.com/v1/videos/task-1/content"
+
+
+def test_video_result_download_headers_only_include_auth_for_gateway_origin():
+    cfg = RuntimeGatewayConfig(
+        use="video",
+        provider="grok",
+        base_url="https://video.example.com/v1",
+        api_key="test-key",
+        gateway_format="openai",
+    )
+
+    assert gateway.video_result_download_headers(
+        "https://video.example.com/v1/videos/task-1/content", cfg
+    ) == {"Authorization": "Bearer test-key"}
+    assert gateway.video_result_download_headers(
+        "https://cdn.example.com/video.mp4", cfg
+    ) == {}
 
 
 def test_generic_video_poll_url_encodes_task_id(monkeypatch):

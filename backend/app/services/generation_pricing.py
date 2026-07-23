@@ -19,6 +19,7 @@ REVERSE_VIDEO_PRESET_COSTS = {
     "standard": 5,
     "fine": 5,
 }
+REVERSE_AUDIO_SURCHARGE_COST = 2
 
 IMAGE_PRICE_TABLE = {
     "1k": 8,
@@ -271,9 +272,24 @@ def generation_cost_from_snapshot(
     )
 
 
-def reverse_cost(target: str, *, preset: str | None = None) -> int:
+def reverse_cost(
+    target: str,
+    *,
+    preset: str | None = None,
+    include_audio: bool = False,
+    audio_surcharge: int | None = None,
+) -> int:
     if target == "video":
-        return REVERSE_VIDEO_PRESET_COSTS.get((preset or "standard").strip().lower(), REVERSE_VIDEO_PRESET_COSTS["standard"])
+        visual = REVERSE_VIDEO_PRESET_COSTS.get(
+            (preset or "standard").strip().lower(),
+            REVERSE_VIDEO_PRESET_COSTS["standard"],
+        )
+        surcharge = (
+            REVERSE_AUDIO_SURCHARGE_COST
+            if audio_surcharge is None
+            else max(0, int(audio_surcharge))
+        )
+        return visual + (surcharge if include_audio else 0)
     if target == "product_profile":
         return REVERSE_IMAGE_COST
     return REVERSE_IMAGE_COST
@@ -285,6 +301,7 @@ def public_pricing_config() -> dict:
         "reverse": {
             "image_cost": REVERSE_IMAGE_COST,
             "video_preset_costs": dict(REVERSE_VIDEO_PRESET_COSTS),
+            "audio_surcharge": REVERSE_AUDIO_SURCHARGE_COST,
         },
         "image": {
             "unit_costs": dict(IMAGE_PRICE_TABLE),

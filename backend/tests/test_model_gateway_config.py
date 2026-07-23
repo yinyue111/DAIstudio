@@ -129,7 +129,7 @@ def test_production_rejects_partial_anthropic_env_gateway(
             db.rollback()
 
 
-def test_debug_runtime_rejects_anthropic_vision_row(client, monkeypatch):
+def test_debug_runtime_accepts_anthropic_vision_row(client, monkeypatch):
     monkeypatch.setattr(settings, "debug", True)
 
     with SessionLocal() as db:
@@ -137,8 +137,7 @@ def test_debug_runtime_rejects_anthropic_vision_row(client, monkeypatch):
         vision.provider = "anthropic"
         vision.gateway_format = "anthropic"
         try:
-            with pytest.raises(RuntimeError, match="视觉反推不支持 Anthropic 原生协议"):
-                validate_model_gateway_rows(db)
+            validate_model_gateway_rows(db)
         finally:
             db.rollback()
 

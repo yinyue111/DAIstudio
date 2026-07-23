@@ -110,6 +110,8 @@ def _blocked_reason(name: str) -> str | None:
     for part in parts:
         if part in BLOCKED_DIRS:
             return f"blocked directory {part}"
+        if part.startswith(".next-"):
+            return f"blocked Next.js build directory {part}"
     if path.name in BLOCKED_NAMES:
         return f"blocked file {path.name}"
     if path.name.startswith("celerybeat-schedule"):

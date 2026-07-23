@@ -19,6 +19,7 @@ from ..models import (
     GenTask,
     ParseRecord,
     ReverseOperation,
+    ReverseResultRevision,
     UploadedAsset,
     UserDraft,
 )
@@ -30,6 +31,8 @@ from .generation_video_flow import video_download_alive as _video_download_alive
 from .media_sidecars import collect_unreferenced_asset_keys, unlink_keys
 
 log = logging.getLogger("retention")
+
+REVERSE_RESULT_EXPIRED_CODE = "RESULT_EXPIRED"
 
 
 def _video_waiting_for_download(task: GenTask) -> bool:
@@ -169,7 +172,18 @@ def _purge_table_older_than(db: Session, model, cutoff: datetime, extra=None) ->
 
 
 def _tombstone_named_reverse_operations(db: Session, cutoff: datetime) -> int:
-    """Redact expired caller-keyed rows without changing idempotent replay."""
+    """Redact expired caller-keyed content while retaining ledger identity."""
+    revisions = db.execute(
+        delete(ReverseResultRevision).where(
+            ReverseResultRevision.created_at < cutoff,
+            ReverseResultRevision.operation_id.in_(
+                select(ReverseOperation.id).where(
+                    ReverseOperation.created_at < cutoff,
+                    ReverseOperation.client_request_id.is_not(None),
+                )
+            ),
+        )
+    )
     failed = db.execute(
         update(ReverseOperation)
         .where(
@@ -180,9 +194,23 @@ def _tombstone_named_reverse_operations(db: Session, cutoff: datetime) -> int:
                 ReverseOperation.asset_url != "",
                 ReverseOperation.error.is_not(None),
                 ReverseOperation.result.is_not(None),
+                ReverseOperation.raw_provider_result.is_not(None),
+                ReverseOperation.normalized_result.is_not(None),
+                ReverseOperation.request_context.is_not(None),
+                ReverseOperation.custom_instruction.is_not(None),
             ),
         )
-        .values(asset_url="", error=None, result=null())
+        .values(
+            asset_url="",
+            error=None,
+            result=null(),
+            raw_provider_result=null(),
+            normalized_result=null(),
+            request_context=null(),
+            template_snapshot=null(),
+            custom_instruction=None,
+            error_code=REVERSE_RESULT_EXPIRED_CODE,
+        )
         .execution_options(synchronize_session=False)
     )
     succeeded = db.execute(
@@ -194,14 +222,30 @@ def _tombstone_named_reverse_operations(db: Session, cutoff: datetime) -> int:
             or_(
                 ReverseOperation.asset_url != "",
                 ReverseOperation.error.is_not(None),
+                ReverseOperation.result.is_not(None),
+                ReverseOperation.raw_provider_result.is_not(None),
+                ReverseOperation.normalized_result.is_not(None),
+                ReverseOperation.request_context.is_not(None),
+                ReverseOperation.custom_instruction.is_not(None),
             ),
         )
-        # The successful result is the public idempotent replay payload.
-        .values(asset_url="", error=None)
+        # Keep request fingerprint, status and credit ledger fields for replay
+        # conflict/accounting, while removing raw media-derived content.
+        .values(
+            asset_url="",
+            error=None,
+            result=null(),
+            raw_provider_result=null(),
+            normalized_result=null(),
+            request_context=null(),
+            template_snapshot=null(),
+            custom_instruction=None,
+            error_code=REVERSE_RESULT_EXPIRED_CODE,
+        )
         .execution_options(synchronize_session=False)
     )
     db.commit()
-    return (failed.rowcount or 0) + (succeeded.rowcount or 0)
+    return (failed.rowcount or 0) + (succeeded.rowcount or 0) + (revisions.rowcount or 0)
 
 
 def detach_asset_reports(db: Session, asset_id: int) -> int:
@@ -677,9 +721,23 @@ def reap_stuck_tasks(db: Session, max_minutes: int = 60) -> int:
                 error_message = "视频提交超时且未记录请求号,已自动失败并退回额度"
             else:
                 sub = _aware(row["external_submitted_at"])
-                if _video_poll_alive(task_id, row["external_task_id"]):
+                render_timed_out = bool(
+                    row["phase"] == "polling"
+                    and sub
+                    and (now - sub) >= video_window
+                )
+                if render_timed_out:
+                    timeout_minutes = max(
+                        1,
+                        (int(settings.video_poll_max_seconds) + 59) // 60,
+                    )
+                    error_message = (
+                        f"视频生成超过 {timeout_minutes} 分钟，"
+                        "任务已自动失败并退回冻结积分"
+                    )
+                elif _video_poll_alive(task_id, row["external_task_id"]):
                     continue
-                if row["phase"] == "downloading" and bool(
+                elif row["phase"] == "downloading" and bool(
                     params.get("_video_result_url") or params.get("_video_result_mock")
                 ):
                     if _video_download_alive(task_id, row["external_task_id"]):

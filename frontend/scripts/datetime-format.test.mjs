@@ -75,8 +75,10 @@ assert.deepEqual(datetime.localDateRangeToIsoBounds("2026-02-30", "2026-02-30"),
 });
 
 const historySource = readFileSync(join(root, "app/history/page.jsx"), "utf8");
+const taskCenterSource = readFileSync(join(root, "components/GlobalTaskCenter.jsx"), "utf8");
 const auditSource = readFileSync(join(root, "app/admin/components/reports-audit.jsx"), "utf8");
 
-assert.match(historySource, /formatLocalDateTime\(t\.created_at\)/);
+assert.match(historySource, /UnifiedTaskList/, "history should render timestamps through the shared task list");
+assert.match(taskCenterSource, /formatLocalDateTime\(task\.created_at\)/, "the shared task list should format unified timestamps locally");
 assert.match(auditSource, /formatLocalDateTime\(r\.created_at, \{ includeSeconds: true \}\)/);
 console.log("datetime formatting tests passed");

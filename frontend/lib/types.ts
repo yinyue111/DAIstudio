@@ -5,6 +5,10 @@
  * components, and view-model logic.
  */
 
+import type { ProductVideoStrategy } from "../app/studio/productVideoStrategy";
+
+export type { ProductVideoStrategy } from "../app/studio/productVideoStrategy";
+
 // Re-export API-level types so the rest of the codebase can import from one place.
 export type {
   Asset,
@@ -12,9 +16,20 @@ export type {
   EditMaskMode,
   GeneratePayload,
   ProductPixelLockMode,
+  CreationRecipe,
+  CreationRecipeVersion,
+  ReverseAnalysisFocus,
+  ReverseAnalysisPrecision,
+  ReverseOperationFeedback,
   ReverseTarget,
   ReverseOperation,
   ReverseOperationStatus,
+  ReverseOutputPurpose,
+  ReverseReferenceRole,
+  ReverseResult,
+  ReverseResultRevision,
+  ReverseSourceRange,
+  ReverseSourceReference,
   SubjectProtectionPreview,
   Task,
   TaskStatus,
@@ -80,7 +95,10 @@ export interface ReverseVideoAnalysis {
   fallback_reason?: string | null;
   evidence_coverage?: { start_seconds?: number; end_seconds?: number; ratio?: number } | null;
   analysis_gaps?: Array<string | Record<string, unknown>>;
+  audio_evidence?: Record<string, unknown> | Array<Record<string, unknown>> | null;
 }
+
+export type ReverseUndoSnapshot = import("../app/studio/reverseResultApplication").ReverseResultUndoToken;
 
 export interface WorkspaceState {
   prompt: string;
@@ -93,6 +111,7 @@ export interface WorkspaceState {
   seed: string;
   vDuration: number;
   vResolution: string;
+  productVideoTemplate: ProductVideoStrategy;
   editMaskMode: "protect_subject" | "center_box" | "off";
   productPixelLockMode: ProductPixelLockMode;
   videoAnalysisPreset: string;
@@ -105,6 +124,7 @@ export interface WorkspaceState {
   profileOperation: import("./api").ReverseOperation | null;
   assets: Asset[];
   selected: Asset | null;
+  lastFrameAsset: Asset | null;
   productAsset: Asset | null;
   productDetailAssets: Asset[];
   productProfile: SubjectProfile | null;
@@ -121,6 +141,20 @@ export interface WorkspaceState {
   structuredDirty: boolean;
   structuredSource: string;
   reverseVideoAnalysis: ReverseVideoAnalysis | null;
+  reverseSources: import("./api").ReverseSourceReference[];
+  reverseConfig: import("../app/studio/reverseConfig").ReverseConfig;
+  pendingReverseResult: Record<string, unknown> | null;
+  reverseResultTab: "draft" | "structure" | "storyboard" | "evidence" | "versions";
+  reverseResultSchemaVersion: string;
+  reverseAppliedVersion: number | null;
+  reverseAppliedRevisionId: number | null;
+  reverseUndoSnapshot: ReverseUndoSnapshot | null;
+  reverseResultRevisions: import("./api").ReverseResultRevision[];
+  reverseFeedback: import("./api").ReverseOperationFeedback | null;
+  creationRecipeId: number | null;
+  creationRecipeVersion: number | null;
+  creationRecipeShareSlug: string;
+  creationRecipeSource: "" | "owner" | "public" | "share";
   promptSourceSignature: string;
   negativeTouched: boolean;
   promptDirty: boolean;
@@ -173,11 +207,18 @@ export interface ReverseVideoPreset {
 }
 
 export interface AppConfig {
+  product_edition: "full" | "launch_lite";
   defaults: Record<string, unknown>;
   features: {
     reverse_prompt_enabled: boolean;
     sms_auth_enabled: boolean;
     payment_enabled: boolean;
+    reverse_batch_enabled: boolean;
+    video_composition_enabled: boolean;
+    reproduction_assessment_enabled: boolean;
+    recipes_enabled: boolean;
+    projects_enabled: boolean;
+    tool_workflows_enabled: boolean;
   };
   models: Record<string, ModelInfo>;
   model_options: Record<"vision" | "image" | "video" | "prompt", ModelOption[]>;
@@ -194,6 +235,8 @@ export interface AppConfig {
     video_frame_count: number;
     video_max_cost: number;
     video_presets: ReverseVideoPreset[];
+    batch_capabilities?: Record<string, unknown>;
+    capabilities?: Record<string, unknown>;
   };
   mock_mode: boolean;
   gateways: Record<string, GatewayStatus>;

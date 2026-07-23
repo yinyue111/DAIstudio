@@ -26,5 +26,10 @@ assert.match(
   /setTimeout\(\(\)\s*=>\s*\{[\s\S]*URL\.revokeObjectURL\(u\)[\s\S]*a\.remove\(\)/,
   "downloadBlob should clean up the object URL and temporary anchor after the browser starts the download",
 );
+assert.match(
+  apiSource,
+  /async function fetchBlobWithTimeout[\s\S]*?fetch\(url, \{ cache: "no-store", \.\.\.options, signal \}\)/,
+  "authenticated Blob previews and downloads must bypass the browser cache so repeated cross-origin downloads retain their CORS response",
+);
 
 console.log("download blob navigation test passed");

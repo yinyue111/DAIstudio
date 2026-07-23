@@ -5,6 +5,7 @@ import hashlib
 import io
 import logging
 import time
+import uuid
 from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -18,7 +19,7 @@ from ..deps import get_client_ip, get_current_user
 from ..models import ParseRecord, UploadedAsset, User
 from ..redis_client import redis_client
 from ..schemas import ParseIn, ParseOut
-from ..services import audit, gateway, storage
+from ..services import audit, gateway, project_collection, storage, user_assets
 from ..services.fetcher import extract_first_url, parse_url
 from ..services.rate_limit import incr_window
 from ..services.safe_logging import redact_url_for_log
@@ -36,6 +37,7 @@ class LocalizedMedia(dict):
     url: str
     width: int | None
     height: int | None
+    asset_ref: str | None
 
 
 def _localized_url(local: LocalizedMedia | str) -> str:
@@ -49,6 +51,13 @@ def _localized_int(local: LocalizedMedia | str, key: str) -> int | None:
         return None
     value = local.get(key)
     return int(value) if value else None
+
+
+def _localized_asset_ref(local: LocalizedMedia | str) -> str | None:
+    if isinstance(local, str):
+        return None
+    value = str(local.get("asset_ref") or "").strip()
+    return value or None
 
 
 def _cache_key(url: str, user_id: int) -> str:
@@ -101,6 +110,7 @@ def _localize_media_url(
     user_id: int | None = None,
     *,
     timeout_seconds: int | None = None,
+    register_asset: bool = True,
 ) -> LocalizedMedia | None:
     if not url:
         return None
@@ -122,6 +132,18 @@ def _localize_media_url(
             raise ValueError("图片尺寸非法")
         if width * height > int(settings.parse_localize_image_max_pixels):
             raise ValueError("图片像素过大")
+        normalized_png = b""
+        if register_asset and db is not None and user_id is not None:
+            img.load()
+            if (img.format or "").lower() == "gif" and getattr(img, "is_animated", False):
+                img.seek(0)
+            has_alpha = "A" in img.getbands() or "transparency" in img.info
+            normalized = img.convert("RGBA" if has_alpha else "RGB")
+            if has_alpha and normalized.getchannel("A").getextrema()[0] >= 255:
+                normalized = normalized.convert("RGB")
+            normalized_buf = io.BytesIO()
+            normalized.save(normalized_buf, format="PNG")
+            normalized_png = normalized_buf.getvalue()
         preview_png, preview_w, preview_h = make_image_preview(
             raw,
             max_pixels=int(settings.parse_localize_image_max_pixels),
@@ -134,14 +156,50 @@ def _localize_media_url(
             subsampling=0,
         )
         if db is not None and user_id is not None:
-            ensure_user_media_quota(db, user_id, len(preview_png) + len(model_ref_jpeg))
-        key = storage.save_bytes(preview_png, "preview", "png")
-        model_ref_key = storage.save_bytes_named(
-            model_ref_jpeg,
-            "model_ref",
-            key.split("/", 1)[1].rsplit(".", 1)[0] + ".jpg",
-        )
+            ensure_user_media_quota(
+                db,
+                user_id,
+                len(preview_png) + len(model_ref_jpeg) + len(normalized_png),
+            )
+        stem = uuid.uuid4().hex
+        saved_keys: list[str] = []
+        upload_key = None
+        try:
+            if normalized_png:
+                upload_key = storage.save_bytes_named(
+                    normalized_png,
+                    "upload",
+                    f"{stem}.png",
+                )
+                saved_keys.append(upload_key)
+            key = storage.save_bytes_named(preview_png, "preview", f"{stem}.png")
+            saved_keys.append(key)
+            model_ref_key = storage.save_bytes_named(
+                model_ref_jpeg,
+                "model_ref",
+                f"{stem}.jpg",
+            )
+            saved_keys.append(model_ref_key)
+        except Exception:
+            for saved_key in saved_keys:
+                try:
+                    storage.delete(saved_key)
+                except Exception:  # noqa: BLE001
+                    pass
+            raise
         if db is not None and user_id is not None:
+            if upload_key is not None:
+                db.merge(
+                    UploadedAsset(
+                        key=upload_key,
+                        user_id=user_id,
+                        mime="image/png",
+                        width=width,
+                        height=height,
+                        bytes=len(normalized_png),
+                        original_filename="parsed-image.png",
+                    )
+                )
             db.merge(
                 UploadedAsset(
                     key=key,
@@ -164,7 +222,16 @@ def _localize_media_url(
                     original_filename="parsed-model-ref.jpg",
                 )
             )
-        return LocalizedMedia(url=storage.public_url(key), width=preview_w, height=preview_h)
+        return LocalizedMedia(
+            url=storage.public_url(key),
+            width=preview_w,
+            height=preview_h,
+            asset_ref=(
+                user_assets.uploaded_asset_ref(upload_key)
+                if upload_key is not None
+                else None
+            ),
+        )
     except Exception as e:  # noqa: BLE001
         log.info("parse media localize skipped url=%s error=%s", redact_url_for_log(url), e)
         return None
@@ -219,6 +286,9 @@ def _localize_assets(
                     item["original_thumb"] = item.get("thumb")
                 item["url"] = _localized_url(local)
                 item["thumb"] = _localized_url(local)
+                asset_ref = _localized_asset_ref(local)
+                if asset_ref:
+                    item["asset_ref"] = asset_ref
                 if not item.get("width") and _localized_int(local, "width"):
                     item["width"] = _localized_int(local, "width")
                 if not item.get("height") and _localized_int(local, "height"):
@@ -237,6 +307,7 @@ def _localize_assets(
                 db=db,
                 user_id=user_id,
                 timeout_seconds=remaining_timeout,
+                register_asset=False,
             )
             if local_thumb:
                 localized_count += 1
@@ -285,6 +356,7 @@ def run_parse_record(parse_id: int) -> None:
             rec.cached_until = datetime.now(timezone.utc) + timedelta(
                 minutes=settings.parse_cache_minutes
             )
+            project_collection.collect_parse_outputs(db, int(rec.id), assets)
             db.commit()
             redis_client.setex(_cache_key(rec.url, rec.user_id), settings.parse_cache_minutes * 60, str(rec.id))
             log.info(
@@ -321,15 +393,40 @@ def submit_parse(body: ParseIn, request: Request,
     if not url:
         raise HTTPException(400, "链接不能为空")
 
+    project = None
+    if body.project_id is not None:
+        try:
+            project = project_collection.require_owned_project(db, user.id, body.project_id)
+        except project_collection.ProjectNotFound as exc:
+            raise HTTPException(404, str(exc)) from exc
+
     # short-term cache: reuse THIS user's most recent successful parse of this URL
     cached_id = redis_client.get(_cache_key(url, user.id))
     if cached_id:
         rec = db.get(ParseRecord, int(cached_id))
         if rec and rec.status == "done" and rec.user_id == user.id:
+            if project is not None:
+                project_collection.attach_task(
+                    db,
+                    project=project,
+                    task_kind="parse",
+                    task_id=int(rec.id),
+                )
+                db.flush()
+                project_collection.collect_parse_outputs(db, int(rec.id), rec.assets)
+                db.commit()
             return ParseOut(id=rec.id, status=rec.status, url=rec.url, assets=rec.assets)
 
     active = _existing_active_parse(db, user.id, url)
     if active:
+        if project is not None:
+            project_collection.attach_task(
+                db,
+                project=project,
+                task_kind="parse",
+                task_id=int(active.id),
+            )
+            db.commit()
         return ParseOut(id=active.id, status=active.status, url=active.url, assets=active.assets, error=active.error)
 
     # only count real fetches against the rate limit (cache hits are free)
@@ -338,6 +435,14 @@ def submit_parse(body: ParseIn, request: Request,
 
     rec = ParseRecord(user_id=user.id, url=url, status="queued")
     db.add(rec)
+    db.flush()
+    if project is not None:
+        project_collection.attach_task(
+            db,
+            project=project,
+            task_kind="parse",
+            task_id=int(rec.id),
+        )
     db.commit()
     db.refresh(rec)
 

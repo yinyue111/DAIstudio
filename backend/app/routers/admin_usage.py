@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import csv
 import io
+from difflib import SequenceMatcher
+from typing import Literal
 
 from fastapi import APIRouter, Depends
 from fastapi.responses import StreamingResponse
@@ -11,7 +13,16 @@ from sqlalchemy.orm import Session
 
 from ..db import get_db
 from ..deps import require_admin
-from ..models import CreditTransaction, GatewayCall, GenTask, ReverseOperation, User
+from ..models import (
+    CreationRecipe,
+    CreditTransaction,
+    GatewayCall,
+    GenTask,
+    ReverseOperation,
+    ReverseOperationFeedback,
+    ReverseResultRevision,
+    User,
+)
 from ..services.error_codes import task_error_type
 from .admin_helpers import csv_cell as _csv_cell
 from .admin_helpers import date_key as _date_key
@@ -99,6 +110,37 @@ def _cover_confirmation_flags(operation: ReverseOperation) -> tuple[bool, bool]:
     return required, confirmed
 
 
+def _merge_intervals(intervals: list[tuple[float, float]]) -> list[tuple[float, float]]:
+    merged: list[tuple[float, float]] = []
+    for start, end in sorted(intervals):
+        if not merged or start > merged[-1][1]:
+            merged.append((start, end))
+            continue
+        merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+    return merged
+
+
+def _bounded_intervals(
+    rows: object,
+    *,
+    duration: float,
+) -> list[tuple[float, float]]:
+    intervals: list[tuple[float, float]] = []
+    if not isinstance(rows, list):
+        return intervals
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        try:
+            start = max(0.0, min(duration, float(row.get("start_seconds"))))
+            end = max(0.0, min(duration, float(row.get("end_seconds"))))
+        except (TypeError, ValueError):
+            continue
+        if end > start:
+            intervals.append((start, end))
+    return _merge_intervals(intervals)
+
+
 def _evidence_coverage(operation: ReverseOperation) -> float | None:
     analysis = _reverse_analysis(operation)
     source = analysis.get("source") if isinstance(analysis.get("source"), dict) else {}
@@ -108,34 +150,49 @@ def _evidence_coverage(operation: ReverseOperation) -> float | None:
         return None
     if duration <= 0:
         return None
-    intervals: list[tuple[float, float]] = []
-    for gap in analysis.get("analysis_gaps") or []:
-        if not isinstance(gap, dict):
-            continue
-        try:
-            start = max(0.0, min(duration, float(gap.get("start_seconds"))))
-            end = max(0.0, min(duration, float(gap.get("end_seconds"))))
-        except (TypeError, ValueError):
-            continue
-        if end > start:
-            intervals.append((start, end))
-    uncovered = 0.0
-    merged_end = 0.0
-    for start, end in sorted(intervals):
-        if start >= merged_end:
-            uncovered += end - start
-        elif end > merged_end:
-            uncovered += end - merged_end
-        merged_end = max(merged_end, end)
-    return round(max(0.0, min(1.0, 1 - uncovered / duration)), 4)
+
+    context = _reverse_context(operation)
+    raw_ranges = operation.source_ranges
+    if not isinstance(raw_ranges, list):
+        raw_ranges = context.get("source_ranges")
+    if not isinstance(raw_ranges, list):
+        legacy_range = operation.source_range or context.get("source_range")
+        raw_ranges = [legacy_range] if isinstance(legacy_range, dict) else []
+
+    selected = _bounded_intervals(raw_ranges, duration=duration)
+    if raw_ranges and not selected:
+        return None
+    if not selected:
+        selected = [(0.0, duration)]
+
+    gap_intersections: list[tuple[float, float]] = []
+    for gap_start, gap_end in _bounded_intervals(
+        analysis.get("analysis_gaps") or [],
+        duration=duration,
+    ):
+        for selected_start, selected_end in selected:
+            start = max(gap_start, selected_start)
+            end = min(gap_end, selected_end)
+            if end > start:
+                gap_intersections.append((start, end))
+
+    selected_duration = sum(end - start for start, end in selected)
+    uncovered = sum(
+        end - start
+        for start, end in _merge_intervals(gap_intersections)
+    )
+    return round(max(0.0, min(1.0, 1 - uncovered / selected_duration)), 4)
 
 
 def _detail_cost_credits(detail: dict | None) -> int:
+    return _detail_cost_entry(detail)[1]
+
+
+def _detail_cost_entry(detail: dict | None) -> tuple[bool, int]:
     if not isinstance(detail, dict):
-        return 0
-    # `cost` was written by the original reverse-prompt path. Keep reading it
-    # so historical provider spend remains visible after all new callers move
-    # to the canonical `cost_credits` key.
+        return False, 0
+    # Keep the legacy usage/model-costs contract readable. These fields may be
+    # user settlement prices, so margin reporting must use _provider_cost_entry.
     for key in (
         "cost_credits",
         "cost",
@@ -147,10 +204,39 @@ def _detail_cost_credits(detail: dict | None) -> int:
         if value is None:
             continue
         try:
-            return max(0, int(value))
+            return True, max(0, int(value))
         except (TypeError, ValueError):
             continue
-    return 0
+    return False, 0
+
+
+def _provider_cost_entry(detail: dict | None) -> tuple[str, int, bool]:
+    if not isinstance(detail, dict):
+        return "unavailable", 0, False
+    status = str(detail.get("provider_cost_status") or "unavailable").lower()
+    if status == "complete":
+        keys = ("provider_cost_credits",)
+    elif status == "partial":
+        keys = ("provider_cost_known_credits", "provider_cost_credits")
+    else:
+        return "unavailable", 0, False
+    for key in keys:
+        value = detail.get(key)
+        if value is None or isinstance(value, bool):
+            continue
+        try:
+            return status, max(0, int(value)), True
+        except (TypeError, ValueError):
+            continue
+    return "unavailable", 0, False
+
+
+def _provider_cost_status(entries: list[tuple[str, int, bool]]) -> str:
+    if entries and all(status == "complete" and known for status, _, known in entries):
+        return "complete"
+    if any(known for _, _, known in entries):
+        return "partial"
+    return "unavailable"
 
 
 def _detail_operation_id(detail: dict | None) -> int | None:
@@ -160,6 +246,172 @@ def _detail_operation_id(detail: dict | None) -> int | None:
         return int(detail.get("operation_id"))
     except (TypeError, ValueError):
         return None
+
+
+def _revision_prompt(payload: dict | None) -> str:
+    if not isinstance(payload, dict):
+        return ""
+    for key in ("final_text", "prompt", "optimized_text"):
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+        if isinstance(value, dict):
+            nested = value.get("final_text") or value.get("prompt")
+            if isinstance(nested, str) and nested.strip():
+                return nested.strip()
+    for key in ("result", "reverse_result", "normalized_result"):
+        value = payload.get(key)
+        if isinstance(value, dict):
+            prompt = _revision_prompt(value)
+            if prompt:
+                return prompt
+    return ""
+
+
+def _operation_source_type(operation: ReverseOperation) -> str:
+    context = _reverse_context(operation)
+    value = context.get("source_type")
+    if value in {"image", "video"}:
+        return str(value)
+    sources = context.get("sources")
+    if isinstance(sources, list):
+        for source in sources:
+            if not isinstance(source, dict) or source.get("role") != "primary":
+                continue
+            value = source.get("source_type")
+            if value in {"image", "video"}:
+                return str(value)
+    return "video" if operation.target == "video" else "image"
+
+
+def _operation_model(operation: ReverseOperation) -> str:
+    snapshot = operation.model_snapshot if isinstance(operation.model_snapshot, dict) else {}
+    return str(
+        snapshot.get("model_id")
+        or snapshot.get("model_name")
+        or snapshot.get("display_name")
+        or (f"config:{operation.model_config_id}" if operation.model_config_id else "unknown")
+    )
+
+
+def _image_evidence_coverage(operation: ReverseOperation) -> float | None:
+    result = _reverse_result(operation)
+    analyzers = result.get("image_evidence_analyzers")
+    statuses: list[str] = []
+    if isinstance(analyzers, dict):
+        for value in analyzers.values():
+            rows = value if isinstance(value, list) else [value]
+            for row in rows:
+                if isinstance(row, dict) and row.get("status"):
+                    statuses.append(str(row["status"]).lower())
+    if statuses:
+        ready = sum(status in {"analyzed", "ready", "available"} for status in statuses)
+        return round(ready / len(statuses), 4)
+
+    evidence = result.get("image_evidence")
+    if not isinstance(evidence, list) or not evidence:
+        return None
+    usable = 0
+    considered = 0
+    for row in evidence:
+        if not isinstance(row, dict):
+            continue
+        considered += 1
+        analyzer_status = str(
+            row.get("analyzer_status") or row.get("analysis_status") or "analyzed"
+        ).lower()
+        if (
+            row.get("fact_status") == "visible"
+            and analyzer_status in {"analyzed", "ready", "available"}
+        ):
+            usable += 1
+    return round(usable / considered, 4) if considered else None
+
+
+def _operation_evidence_coverage(operation: ReverseOperation) -> float | None:
+    if _operation_source_type(operation) == "video":
+        return _evidence_coverage(operation)
+    return _image_evidence_coverage(operation)
+
+
+def _rate(numerator: int | float, denominator: int | float) -> float:
+    return round(numerator / denominator, 4) if denominator else 0
+
+
+def _reverse_quality_csv(payload: dict) -> StreamingResponse:
+    summary = payload["summary"]
+    quality = payload["quality"]
+    economics = payload["economics"]
+    all_row = {
+        "operation_count": summary["operation_count"],
+        "succeeded": summary["succeeded"],
+        "success_rate": summary["success_rate"],
+        "adoption_rate": quality["adoption_rate"],
+        "edit_rate": quality["edit_rate"],
+        "avg_edit_ratio": quality["avg_edit_ratio"],
+        "avg_evidence_coverage": quality["avg_evidence_coverage"],
+        "generation_conversion_rate": quality["generation_conversion_rate"],
+        "recipe_conversion_rate": quality["recipe_conversion_rate"],
+        "useful_rate": quality["useful_rate"],
+        "settled_credits": economics["revenue_credits"],
+        "cost_status": economics["cost_status"],
+        "provider_cost_credits": economics["provider_cost_credits"],
+        "gross_profit_credits": economics["gross_profit_credits"],
+        "gross_margin_rate": economics["gross_margin_rate"],
+        "cost_coverage_rate": economics["gateway_cost_coverage_rate"],
+    }
+    dimensions = [
+        ("all", "all", all_row),
+        *(("media_type", row.get("media_type"), row) for row in payload["by_media_type"]),
+        *(("model", row.get("model"), row) for row in payload["by_model_quality"]),
+        *(("focus", row.get("focus"), row) for row in payload["by_focus"]),
+    ]
+    columns = [
+        "dimension",
+        "value",
+        "operation_count",
+        "succeeded",
+        "success_rate",
+        "avg_evidence_coverage",
+        "adoption_rate",
+        "edit_rate",
+        "avg_edit_ratio",
+        "generation_conversion_rate",
+        "recipe_conversion_rate",
+        "useful_rate",
+        "settled_credits",
+        "cost_status",
+        "provider_cost_credits",
+        "gross_profit_credits",
+        "gross_margin_rate",
+        "cost_coverage_rate",
+    ]
+
+    def iter_csv():
+        buffer = io.StringIO()
+        writer = csv.writer(buffer)
+
+        def emit(row):
+            buffer.seek(0)
+            buffer.truncate(0)
+            writer.writerow([_csv_cell(value) for value in row])
+            return buffer.getvalue()
+
+        yield "\ufeff" + emit(columns)
+        for dimension, value, row in dimensions:
+            yield emit([
+                dimension,
+                value,
+                *(row.get(column, "") for column in columns[2:]),
+            ])
+
+    return StreamingResponse(
+        iter_csv(),
+        media_type="text/csv; charset=utf-8",
+        headers={
+            "Content-Disposition": "attachment; filename=reverse_quality_report.csv",
+        },
+    )
 
 
 @router.get("/usage/dashboard")
@@ -275,6 +527,10 @@ def reverse_operation_usage(
     _: User = Depends(require_admin),
     start: str | None = None,
     end: str | None = None,
+    media_type: Literal["image", "video"] | None = None,
+    model: str | None = None,
+    focus: str | None = None,
+    format: Literal["json", "csv"] = "json",
 ):
     start_dt = _parse_date(start)
     end_dt = _parse_date(end, end_of_day=True)
@@ -286,7 +542,20 @@ def reverse_operation_usage(
     )
     query = select(ReverseOperation)
     query = _filter_range(query, reporting_at, start_dt, end_dt)
-    operations = list(db.execute(query).scalars())
+    unfiltered_operations = list(db.execute(query).scalars())
+    filter_options = {
+        "media_types": sorted({_operation_source_type(item) for item in unfiltered_operations}),
+        "models": sorted({_operation_model(item) for item in unfiltered_operations}),
+        "focuses": sorted({str(item.analysis_focus or "unknown") for item in unfiltered_operations}),
+    }
+    operations = [
+        operation
+        for operation in unfiltered_operations
+        if (media_type is None or _operation_source_type(operation) == media_type)
+        and (model is None or _operation_model(operation) == model)
+        and (focus is None or str(operation.analysis_focus or "unknown") == focus)
+    ]
+    dimension_filtered = any(value is not None for value in (media_type, model, focus))
 
     by_status: dict[str, int] = {}
     for operation in operations:
@@ -313,10 +582,12 @@ def reverse_operation_usage(
     }
     cover_required = sum(1 for required, _ in cover_flags.values() if required)
     cover_confirmed = sum(1 for _, confirmed in cover_flags.values() if confirmed)
-    coverage = [
-        value for operation in video_operations
-        if (value := _evidence_coverage(operation)) is not None
-    ]
+    evidence_coverage_by_operation = {
+        int(operation.id): value
+        for operation in operations
+        if (value := _operation_evidence_coverage(operation)) is not None
+    }
+    coverage = list(evidence_coverage_by_operation.values())
     succeeded = by_status.get("succeeded", 0)
     failed = by_status.get("failed", 0)
     canceled = by_status.get("canceled", 0)
@@ -349,20 +620,184 @@ def reverse_operation_usage(
         target_row["settled_credits"] += int(operation.cost_settled or 0)
 
     operation_ids = {int(operation.id) for operation in operations}
+    revisions: list[ReverseResultRevision] = []
+    feedback_rows: list[ReverseOperationFeedback] = []
+    recipe_operation_ids: set[int] = set()
+    if operation_ids:
+        revisions = list(db.execute(
+            select(ReverseResultRevision)
+            .where(ReverseResultRevision.operation_id.in_(operation_ids))
+            .order_by(ReverseResultRevision.operation_id, ReverseResultRevision.version)
+        ).scalars())
+        feedback_rows = list(db.execute(
+            select(ReverseOperationFeedback).where(
+                ReverseOperationFeedback.operation_id.in_(operation_ids)
+            )
+        ).scalars())
+        recipe_operation_ids = {
+            int(value)
+            for value in db.execute(
+                select(CreationRecipe.source_operation_id).where(
+                    CreationRecipe.source_operation_id.in_(operation_ids)
+                )
+            ).scalars()
+            if value is not None
+        }
+
+    revisions_by_operation: dict[int, list[ReverseResultRevision]] = {}
+    for revision in revisions:
+        revisions_by_operation.setdefault(int(revision.operation_id), []).append(revision)
+    adopted_operation_ids = {
+        operation_id
+        for operation_id, rows in revisions_by_operation.items()
+        if any(row.source == "applied" for row in rows)
+    }
+    edited_operation_ids = {
+        operation_id
+        for operation_id, rows in revisions_by_operation.items()
+        if any(row.source == "user_edit" for row in rows)
+    }
+    generated_operation_ids = {
+        operation_id
+        for operation_id, rows in revisions_by_operation.items()
+        if any(row.source == "generation" for row in rows)
+    }
+    edit_ratio_by_operation: dict[int, float] = {}
+    for operation_id, rows in revisions_by_operation.items():
+        normalized = next((row for row in rows if row.source == "normalized"), None)
+        edited = next(
+            (row for row in reversed(rows) if row.source in {"user_edit", "applied"}),
+            None,
+        )
+        before = _revision_prompt(normalized.payload if normalized else None)
+        after = _revision_prompt(edited.payload if edited else None)
+        if before and after:
+            edit_ratio_by_operation[operation_id] = round(
+                1 - SequenceMatcher(None, before, after).ratio(),
+                4,
+            )
+    edit_ratios = list(edit_ratio_by_operation.values())
+
+    feedback_by_operation = {
+        int(row.operation_id): row
+        for row in feedback_rows
+    }
+    useful_operation_ids = {
+        operation_id
+        for operation_id, row in feedback_by_operation.items()
+        if row.rating == "useful"
+    }
+    issue_types: dict[str, int] = {}
+    for feedback in feedback_rows:
+        for issue_type in feedback.issue_types or []:
+            key = str(issue_type)
+            issue_types[key] = issue_types.get(key, 0) + 1
+
+    def quality_dimension(label: str, value_for) -> list[dict]:
+        grouped: dict[str, dict] = {}
+        for operation in operations:
+            value = str(value_for(operation) or "unknown")
+            row = grouped.setdefault(value, {
+                label: value,
+                "operation_count": 0,
+                "succeeded": 0,
+                "settled_credits": 0,
+                "failed": 0,
+                "canceled": 0,
+                "adopted": 0,
+                "edited": 0,
+                "generated": 0,
+                "recipe": 0,
+                "feedback_count": 0,
+                "useful": 0,
+                "evidence_coverage_total": 0.0,
+                "evidence_coverage_samples": 0,
+                "edit_ratio_total": 0.0,
+                "edit_ratio_samples": 0,
+                "provider_cost_credits": 0,
+                "provider_cost_entries": [],
+            })
+            operation_id = int(operation.id)
+            row["operation_count"] += 1
+            row["succeeded"] += int(operation.status == "succeeded")
+            row["failed"] += int(operation.status == "failed")
+            row["canceled"] += int(operation.status == "canceled")
+            row["settled_credits"] += int(operation.cost_settled or 0)
+            row["adopted"] += int(operation_id in adopted_operation_ids)
+            row["edited"] += int(operation_id in edited_operation_ids)
+            row["generated"] += int(operation_id in generated_operation_ids)
+            row["recipe"] += int(operation_id in recipe_operation_ids)
+            row["feedback_count"] += int(operation_id in feedback_by_operation)
+            row["useful"] += int(operation_id in useful_operation_ids)
+            if operation_id in evidence_coverage_by_operation:
+                row["evidence_coverage_total"] += evidence_coverage_by_operation[operation_id]
+                row["evidence_coverage_samples"] += 1
+            if operation_id in edit_ratio_by_operation:
+                row["edit_ratio_total"] += edit_ratio_by_operation[operation_id]
+                row["edit_ratio_samples"] += 1
+            operation_cost_entries = provider_cost_entries_by_operation.get(
+                operation_id,
+                [],
+            )
+            row["provider_cost_entries"].extend(operation_cost_entries)
+            row["provider_cost_credits"] += sum(
+                cost for _, cost, known in operation_cost_entries if known
+            )
+        for row in grouped.values():
+            succeeded_count = int(row["succeeded"])
+            feedback_count = int(row["feedback_count"])
+            terminal = succeeded_count + int(row["failed"]) + int(row["canceled"])
+            revenue = int(row["settled_credits"])
+            provider_cost = int(row["provider_cost_credits"])
+            gross_profit = revenue - provider_cost
+            cost_entries = row.pop("provider_cost_entries")
+            cost_status = _provider_cost_status(cost_entries)
+            row["success_rate"] = _rate(succeeded_count, terminal)
+            row["adoption_rate"] = _rate(int(row["adopted"]), succeeded_count)
+            row["edit_rate"] = _rate(int(row["edited"]), succeeded_count)
+            row["generation_conversion_rate"] = _rate(
+                int(row["generated"]), succeeded_count
+            )
+            row["recipe_conversion_rate"] = _rate(int(row["recipe"]), succeeded_count)
+            row["useful_rate"] = _rate(int(row["useful"]), feedback_count)
+            row["avg_evidence_coverage"] = _rate(
+                row.pop("evidence_coverage_total"),
+                row.pop("evidence_coverage_samples"),
+            )
+            row["avg_edit_ratio"] = _rate(
+                row.pop("edit_ratio_total"),
+                row.pop("edit_ratio_samples"),
+            )
+            row["cost_status"] = cost_status
+            row["gross_profit_credits"] = (
+                gross_profit if cost_status == "complete" else None
+            )
+            row["gross_margin_rate"] = (
+                _rate(gross_profit, revenue)
+                if cost_status == "complete" and revenue
+                else None
+            )
+            row["cost_coverage_rate"] = _rate(
+                sum(known for _, _, known in cost_entries),
+                len(cost_entries),
+            )
+        return [grouped[key] for key in sorted(grouped)]
+
     gateway_query = select(GatewayCall).where(GatewayCall.kind == "reverse")
-    if start_dt or end_dt:
+    if start_dt or end_dt or dimension_filtered:
         # Operation-linked model calls follow the operation's reporting date,
         # even when a call and settlement cross midnight. Calls from the legacy
         # synchronous path have no operation_id and retain their call date.
         candidates: dict[int, GatewayCall] = {}
-        legacy_query = _filter_range(
-            gateway_query,
-            GatewayCall.created_at,
-            start_dt,
-            end_dt,
-        )
-        for call in db.execute(legacy_query).scalars():
-            candidates[int(call.id)] = call
+        if not dimension_filtered:
+            legacy_query = _filter_range(
+                gateway_query,
+                GatewayCall.created_at,
+                start_dt,
+                end_dt,
+            )
+            for call in db.execute(legacy_query).scalars():
+                candidates[int(call.id)] = call
         if operation_ids:
             linked_query = gateway_query.where(
                 GatewayCall.detail["operation_id"].as_integer().in_(operation_ids)
@@ -406,6 +841,31 @@ def reverse_operation_usage(
         if operation_by_id[operation_id].status in {"failed", "canceled"}
     )
 
+    provider_cost_entries: list[tuple[str, int, bool]] = []
+    provider_cost_entries_by_operation: dict[int, list[tuple[str, int, bool]]] = {}
+    cost_recorded_operation_ids: set[int] = set()
+    for call in gateway_calls:
+        entry = _provider_cost_entry(call.detail)
+        provider_cost_entries.append(entry)
+        operation_id = _detail_operation_id(call.detail)
+        if operation_id is None or operation_id not in operation_ids:
+            continue
+        provider_cost_entries_by_operation.setdefault(operation_id, []).append(entry)
+        if entry[2]:
+            cost_recorded_operation_ids.add(operation_id)
+
+    gateway_cost_record_count = sum(known for _, _, known in provider_cost_entries)
+    provider_cost_credits = sum(
+        cost for _, cost, known in provider_cost_entries if known
+    )
+    attributed_provider_cost_credits = sum(
+        cost
+        for entries in provider_cost_entries_by_operation.values()
+        for _, cost, known in entries
+        if known
+    )
+    cost_status = _provider_cost_status(provider_cost_entries)
+
     model_costs: dict[str, dict[str, int | str]] = {}
     for call in gateway_calls:
         model_id = str(call.model_id or "unknown")
@@ -422,19 +882,51 @@ def reverse_operation_usage(
         row["call_count"] += 1
         row["failed_count"] += int(call.status != "ok")
         row["total_tokens"] += int(call.total_tokens or 0)
-        row["cost_credits"] += _detail_cost_credits(call.detail)
+        _, call_cost = _detail_cost_entry(call.detail)
+        row["cost_credits"] += call_cost
 
-    return {
+    revenue_credits = sum(int(operation.cost_settled or 0) for operation in operations)
+    gross_profit_credits = revenue_credits - provider_cost_credits
+    economics = {
+        "basis": "settled_credits_minus_provider_cost_snapshot",
+        "cost_status": cost_status,
+        "revenue_credits": revenue_credits,
+        "provider_cost_credits": provider_cost_credits,
+        "attributed_provider_cost_credits": attributed_provider_cost_credits,
+        "unattributed_provider_cost_credits": (
+            provider_cost_credits - attributed_provider_cost_credits
+        ),
+        "gross_profit_credits": (
+            gross_profit_credits if cost_status == "complete" else None
+        ),
+        "gross_margin_rate": (
+            _rate(gross_profit_credits, revenue_credits)
+            if cost_status == "complete" and revenue_credits
+            else None
+        ),
+        "gateway_call_count": len(gateway_calls),
+        "gateway_cost_record_count": gateway_cost_record_count,
+        "gateway_cost_coverage_rate": _rate(
+            gateway_cost_record_count,
+            len(gateway_calls),
+        ),
+        "operation_cost_coverage_rate": _rate(
+            len(cost_recorded_operation_ids),
+            len(operations),
+        ),
+    }
+
+    payload = {
         "summary": {
             "operation_count": len(operations),
             "succeeded": succeeded,
             "failed": by_status.get("failed", 0),
             "canceled": by_status.get("canceled", 0),
             "needs_confirmation": by_status.get("needs_confirmation", 0),
-            "success_rate": round(succeeded / terminal_count, 4) if terminal_count else 0,
-            "failure_rate": round(failed / terminal_count, 4) if terminal_count else 0,
-            "cancel_rate": round(canceled / terminal_count, 4) if terminal_count else 0,
-            "settled_credits": sum(int(operation.cost_settled or 0) for operation in operations),
+            "success_rate": _rate(succeeded, terminal_count),
+            "failure_rate": _rate(failed, terminal_count),
+            "cancel_rate": _rate(canceled, terminal_count),
+            "settled_credits": revenue_credits,
         },
         "by_status": by_status,
         "latency": {
@@ -446,21 +938,44 @@ def reverse_operation_usage(
         "quality": {
             "video_operation_count": len(video_operations),
             "cover_fallback_count": len(cover_operations),
-            "cover_fallback_rate": round(len(cover_operations) / len(video_operations), 4)
-            if video_operations else 0,
+            "cover_fallback_rate": _rate(len(cover_operations), len(video_operations)),
             "cover_confirmation_required_count": cover_required,
             "cover_confirmed_count": cover_confirmed,
-            "cover_confirmation_rate": round(cover_confirmed / cover_required, 4)
-            if cover_required else 0,
+            "cover_confirmation_rate": _rate(cover_confirmed, cover_required),
             "repair_count": len(repaired_operation_ids),
             "repair_succeeded_count": repair_succeeded,
             "repair_failed_count": repair_failed,
-            "repair_rate": round(len(repaired_operation_ids) / len(operations), 4)
-            if operations else 0,
+            "repair_rate": _rate(len(repaired_operation_ids), len(operations)),
             "avg_evidence_coverage": round(sum(coverage) / len(coverage), 4) if coverage else 0,
+            "feedback_count": len(feedback_rows),
+            "useful_count": len(useful_operation_ids),
+            "not_useful_count": len(feedback_rows) - len(useful_operation_ids),
+            "useful_rate": _rate(len(useful_operation_ids), len(feedback_rows)),
+            "adopted_operation_count": len(adopted_operation_ids),
+            "adoption_rate": _rate(len(adopted_operation_ids), succeeded),
+            "edited_operation_count": len(edited_operation_ids),
+            "edit_rate": _rate(len(edited_operation_ids), succeeded),
+            "avg_edit_ratio": round(sum(edit_ratios) / len(edit_ratios), 4) if edit_ratios else 0,
+            "generated_operation_count": len(generated_operation_ids),
+            "generation_conversion_rate": _rate(len(generated_operation_ids), succeeded),
+            "recipe_operation_count": len(recipe_operation_ids),
+            "recipe_conversion_rate": _rate(len(recipe_operation_ids), succeeded),
+            "issue_types": dict(sorted(issue_types.items())),
+        },
+        "economics": economics,
+        "filters": {
+            "selected": {
+                "media_type": media_type,
+                "model": model,
+                "focus": focus,
+            },
+            "options": filter_options,
         },
         "by_preset": [by_preset[key] for key in sorted(by_preset)],
         "by_target": [by_target[key] for key in sorted(by_target)],
+        "by_focus": quality_dimension("focus", lambda operation: operation.analysis_focus),
+        "by_media_type": quality_dimension("media_type", _operation_source_type),
+        "by_model_quality": quality_dimension("model", _operation_model),
         "model_costs": sorted(
             model_costs.values(),
             key=lambda row: (
@@ -470,6 +985,9 @@ def reverse_operation_usage(
             ),
         ),
     }
+    if format == "csv":
+        return _reverse_quality_csv(payload)
+    return payload
 
 
 @router.get("/usage/report")

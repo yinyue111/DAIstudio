@@ -1,6 +1,7 @@
 import type { Page, Route } from "@playwright/test";
 
 export type ReverseScenario = "image_success" | "video_success" | "cancel" | "refresh" | "cover_confirmation";
+export type SharedRecipeStatus = "active" | "revoked" | "expired";
 
 type JsonRecord = Record<string, any>;
 
@@ -181,6 +182,8 @@ function operationPayload(
   overrides: JsonRecord = {},
 ) {
   const progress = status === "succeeded" || status === "failed" || status === "canceled" ? 100 : status === "queued" ? 0 : 35;
+  const workspaceSnapshotV3 = Number(snapshot?.version) === 3 ? snapshot : null;
+  const workspaceSnapshotV2 = Number(snapshot?.version) === 2 ? snapshot : null;
   return {
     id,
     target,
@@ -194,7 +197,8 @@ function operationPayload(
       workspace_mode: snapshot?.creation_mode || target,
       source_signature: snapshot?.source_signature || "",
     },
-    workspace_snapshot_v2: snapshot,
+    workspace_snapshot_v2: workspaceSnapshotV2,
+    workspace_snapshot_v3: workspaceSnapshotV3,
     reference_count: 1,
     charged_credits: 0,
     cost_frozen: target === "video" ? 18 : 2,
@@ -214,6 +218,29 @@ function operationPayload(
       finished_at: null,
     },
     ...overrides,
+  };
+}
+
+function resultRevision(
+  id: number,
+  version: number,
+  source: "provider_raw" | "normalized" | "user_edit" | "applied",
+  payload: JsonRecord,
+  parentRevisionId: number | null = null,
+) {
+  return {
+    id,
+    operation_id: 6001,
+    version,
+    source,
+    payload,
+    parent_revision_id: parentRevisionId,
+    source_content_hash: "e2e-source-hash",
+    source_fingerprints: [{ kind: "asset", content_hash: "e2e-source-hash" }],
+    payload_hash: `e2e-payload-${version}`,
+    lineage_status: "verified",
+    evidence_review_action: "not_applicable",
+    created_at: NOW,
   };
 }
 
@@ -256,14 +283,206 @@ export function reverseHistoryV2Row() {
   };
 }
 
+export function sharedRecipeFixture(slug = "E2ESharedRecipeSlug_1234") {
+  const payload = {
+    schema_version: "creation-recipe.v1",
+    prompt: "精确生成稿：银色香水瓶居中，镜头缓慢推进",
+    negative: "不要品牌文字漂移",
+    structured: {
+      "主体": "银色香水瓶",
+      "运镜": "slow dolly in",
+    },
+    generation_params: {
+      ratio: "9:16",
+      duration: 8,
+      resolution: "1080p",
+      count: 2,
+      seed: 987654,
+    },
+    reverse_snapshot_v3: {
+      version: 3,
+      target: "video",
+      creation_mode: "video_edit",
+      subject_mode: "general",
+      final_text: "公开快照中的旧生成稿",
+      selected: { type: "video" },
+      assets: [{ type: "image" }],
+      sources: [
+        { source_type: "video", role: "primary" },
+        { source_type: "image", role: "product" },
+      ],
+      analysis_focus: "storyboard",
+      analysis_precision: "fine",
+      output_purpose: "storyboard",
+      custom_instruction: "保留商品文字并重点描述镜头节奏",
+      source_range: null,
+      source_ranges: [{ start_seconds: 2, end_seconds: 6 }],
+      custom_keyframes: [2, 4, 6],
+      include_audio: true,
+      structured: {
+        "主体": "银色香水瓶",
+        "运镜": "slow dolly in",
+      },
+      image_evidence: [{
+        field: "brand_text",
+        text: "CODEX",
+        bbox: [0.1, 0.2, 0.5, 0.35],
+        confidence: 0.98,
+        review_status: "confirmed",
+        mask_mode: "protect",
+      }],
+      video_analysis: {
+        analysis_mode: "multi_segment",
+        selected_ranges: [{ start_seconds: 2, end_seconds: 6 }],
+        shots: [{
+          start_seconds: 2,
+          end_seconds: 4,
+          visual: "香水瓶居中",
+          action: "瓶身缓慢旋转",
+          camera: "slow dolly in",
+          evidence_frame_indices: [4, 7],
+        }],
+        ocr_tracks: [{ text: "CODEX", start_seconds: 2.2, end_seconds: 3.8 }],
+        audio_evidence: [{ kind: "asr", text: "新品上市", start_seconds: 2, end_seconds: 4 }],
+      },
+      reverse_result: {
+        structured: {
+          "主体": "银色香水瓶",
+          "运镜": "slow dolly in",
+        },
+        final_text: "精确生成稿：银色香水瓶居中，镜头缓慢推进",
+        negative: "不要品牌文字漂移",
+        video_analysis: {
+          analysis_mode: "multi_segment",
+          selected_ranges: [{ start_seconds: 2, end_seconds: 6 }],
+          shots: [{
+            start_seconds: 2,
+            end_seconds: 4,
+            visual: "香水瓶居中",
+            action: "瓶身缓慢旋转",
+            camera: "slow dolly in",
+            evidence_frame_indices: [4, 7],
+          }],
+        },
+      },
+      reverse_result_tab: "storyboard",
+      result_schema_version: "reverse-result.v3",
+      reverse_applied_version: 5,
+      result_revisions: [
+        { version: 1, source: "provider_raw" },
+        { version: 2, source: "normalized" },
+        { version: 4, source: "user_edit" },
+        { version: 5, source: "applied" },
+      ],
+      model_selections: { image: 21, video: 31, vision: 11, prompt: 41 },
+      generation: {
+        ratio: "9:16",
+        duration: 8,
+        resolution: "1080p",
+        count: 2,
+        seed: 987654,
+        model_selections: { image: 21, video: 31, vision: 11, prompt: 41 },
+        model_config_id: 31,
+        catalog_versions: {
+          video: { model_config_id: 31, capability_version: 4, price_version: 7 },
+          vision: { model_config_id: 11, capability_version: 3, price_version: 5 },
+        },
+      },
+    },
+    reverse_result: {
+      structured: {
+        "主体": "银色香水瓶",
+        "运镜": "slow dolly in",
+      },
+      final_text: "精确生成稿：银色香水瓶居中，镜头缓慢推进",
+      negative: "不要品牌文字漂移",
+    },
+    generation: {
+      ratio: "9:16",
+      duration: 8,
+      resolution: "1080p",
+      count: 2,
+      seed: 987654,
+      model_selections: { image: 21, video: 31, vision: 11, prompt: 41 },
+      model_config_id: 31,
+      catalog_versions: {
+        video: { model_config_id: 31, capability_version: 4, price_version: 7 },
+        vision: { model_config_id: 11, capability_version: 3, price_version: 5 },
+      },
+    },
+    public_asset_access: {
+      status: "unavailable",
+      reason: "private_source_assets_not_shared",
+      removed_count: 6,
+    },
+  };
+  return {
+    share: {
+      id: 8101,
+      recipe_id: 42,
+      version: 3,
+      slug,
+      status: "active",
+      expires_at: "2099-01-01T00:00:00Z",
+      revoked_at: null,
+      share_url: `/recipes/shared/${slug}`,
+      created_at: NOW,
+    },
+    recipe: {
+      id: 42,
+      source_operation_id: null,
+      title: "E2E 视频广告完整配方",
+      category: "video",
+      visibility: "public",
+      moderation_status: "approved",
+      favorite: false,
+      current_version: 3,
+      approved_version: 3,
+      cover_asset_url: null,
+      submitted_at: NOW,
+      reviewed_at: NOW,
+      review_note: null,
+      version: {
+        id: 4203,
+        recipe_id: 42,
+        version: 3,
+        schema_version: "creation-recipe.v1",
+        payload,
+        created_at: NOW,
+      },
+      created_at: NOW,
+      updated_at: NOW,
+    },
+  };
+}
+
 export async function installReverseApiMock(
   page: Page,
-  { scenario = "image_success", history = [] }: { scenario?: ReverseScenario; history?: JsonRecord[] } = {},
+  {
+    scenario = "image_success",
+    history = [],
+    authenticated = true,
+    sharedRecipe = null,
+    sharedRecipeStatus = "active",
+  }: {
+    scenario?: ReverseScenario;
+    history?: JsonRecord[];
+    authenticated?: boolean;
+    sharedRecipe?: JsonRecord | null;
+    sharedRecipeStatus?: SharedRecipeStatus;
+  } = {},
 ) {
   const state = {
     scenario,
     history,
+    authenticated,
+    sharedRecipe,
+    sharedRecipeStatus,
+    sharedRecipeReads: 0,
+    usageBodies: [] as JsonRecord[],
+    cloneBodies: [] as JsonRecord[],
     operation: null as JsonRecord | null,
+    quoteRequests: [] as JsonRecord[],
     createBodies: [] as JsonRecord[],
     operationReads: 0,
     wsTicketRequests: 0,
@@ -272,9 +491,21 @@ export async function installReverseApiMock(
     draftReads: 0,
     draftWrites: 0,
     draftPayload: null as JsonRecord | null,
+    draftPayloads: [] as JsonRecord[],
+    revisions: [] as JsonRecord[],
+    applyBodies: [] as JsonRecord[],
+    promptOptimizationBodies: [] as JsonRecord[],
     allowCompletion: false,
     confirmed: false,
   };
+
+  function ensureResultRevisions() {
+    if (state.revisions.length || !state.operation?.result) return;
+    state.revisions = [
+      resultRevision(6101, 1, "provider_raw", state.operation.result),
+      resultRevision(6102, 2, "normalized", state.operation.result, 6101),
+    ];
+  }
 
   await page.route("**/api/**", async (route) => {
     const request = route.request();
@@ -283,15 +514,184 @@ export async function installReverseApiMock(
     const method = request.method();
 
     if (path === "/api/me") {
+      if (!state.authenticated) return fulfillJson(route, { detail: "未登录或登录已过期" }, 401);
       return fulfillJson(route, { id: 9001, phone: "13900009001", nickname: "E2E", balance_credits: 200 });
     }
+    if (path === "/api/auth/features") {
+      return fulfillJson(route, { registration_enabled: true, sms_auth_enabled: false });
+    }
     if (path === "/api/config") return fulfillJson(route, configPayload());
+    if (path === "/api/quotes" && method === "POST") {
+      const body = request.postDataJSON() as JsonRecord;
+      const quotedRequest = body.request && typeof body.request === "object" ? body.request : {};
+      const target = quotedRequest.target === "video" ? "video" : "image";
+      const totalCredits = target === "video" ? 18 : 2;
+      const quoteId = 5000 + state.quoteRequests.length + 1;
+      state.quoteRequests.push(body);
+      return fulfillJson(route, {
+        id: quoteId,
+        quote_id: quoteId,
+        kind: body.kind,
+        status: "active",
+        total_credits: totalCredits,
+        breakdown: [{
+          key: "reverse",
+          label: target === "video" ? "视频证据反推" : "图片证据反推",
+          credits: totalCredits,
+        }],
+        balance: { before: 200, after: 200 - totalCredits, sufficient: true },
+        affordable: true,
+        expires_at: "2099-01-01T00:15:00Z",
+      }, 201);
+    }
+    if (path === "/api/navigation") {
+      return fulfillJson(route, {
+        schema_version: 1,
+        default_key: "studio",
+        items: [
+          { key: "studio", label: "创作", href: "/", width: "w-16", enabled: true, visible: true },
+          { key: "catalog", label: "能力", href: "/catalog", width: "w-16", enabled: true, visible: true },
+          { key: "prompts", label: "灵感配方", href: "/prompts", width: "w-24", enabled: true, visible: true },
+          { key: "projects", label: "项目", href: "/projects", width: "w-16", enabled: true, visible: true },
+          { key: "profile", label: "素材", href: "/profile", width: "w-16", enabled: true, visible: true },
+          { key: "recharge", label: "充值", href: "/recharge", width: "w-16", enabled: true, visible: true },
+          { key: "history", label: "历史", href: "/history", width: "w-16", enabled: true, visible: true },
+        ],
+      });
+    }
+    if (path === "/api/events/ws-ticket" && method === "POST") {
+      return fulfillJson(route, { detail: "E2E 使用轮询任务中心" }, 503);
+    }
     if (path === "/api/tasks") return fulfillJson(route, []);
+
+    const sharedRecipeMatch = path.match(/^\/api\/recipes\/shared\/([^/]+)$/);
+    if (sharedRecipeMatch && method === "GET") {
+      state.sharedRecipeReads += 1;
+      if (!state.sharedRecipe || state.sharedRecipeStatus !== "active") {
+        return fulfillJson(route, { detail: "配方分享不存在、已撤销或已过期" }, 404);
+      }
+      return fulfillJson(route, state.sharedRecipe);
+    }
+
+    const recipeActionMatch = path.match(/^\/api\/recipes\/(\d+)\/(usage|clone)$/);
+    if (recipeActionMatch && method === "POST") {
+      if (!state.authenticated) return fulfillJson(route, { detail: "未登录或登录已过期" }, 401);
+      const body = request.postDataJSON() as JsonRecord;
+      if (recipeActionMatch[2] === "usage") {
+        state.usageBodies.push(body);
+        return fulfillJson(route, {
+          id: 8200 + state.usageBodies.length,
+          recipe_id: Number(recipeActionMatch[1]),
+          recipe_version: Number(body.version || state.sharedRecipe?.share?.version || 1),
+          user_id: 9001,
+          event_type: body.event_type,
+          source: body.share_slug ? "share" : "owner",
+          share_id: body.share_slug ? Number(state.sharedRecipe?.share?.id || 8101) : null,
+          generation_task_id: null,
+          client_event_id: body.client_event_id || null,
+          context: body.context || null,
+          created_at: NOW,
+        }, 201);
+      }
+      state.cloneBodies.push(body);
+      const source = state.sharedRecipe?.recipe || {};
+      return fulfillJson(route, {
+        ...source,
+        id: 4300 + state.cloneBodies.length,
+        source_operation_id: null,
+        title: `${source.title || "共享创作配方"} · 我的派生`,
+        visibility: "private",
+        moderation_status: "draft",
+        approved_version: null,
+        version: {
+          ...(source.version || {}),
+          id: 4400 + state.cloneBodies.length,
+          recipe_id: 4300 + state.cloneBodies.length,
+          version: 1,
+        },
+      });
+    }
+
+    if (path === "/api/studio/prompt-optimizations" && method === "POST") {
+      const body = request.postDataJSON() as JsonRecord;
+      state.promptOptimizationBodies.push(body);
+      return fulfillJson(route, {
+        proposal_id: 9101,
+        proposal_version: 1,
+        mode: body.mode || "target_model_adaptation",
+        optimization_kind: "model_compile",
+        original: { final_text: body.prompt || "E2E 原始提示词" },
+        suggestion: { final_text: "E2E 目标模型编译稿" },
+        segments: [{
+          id: "segment-final-text",
+          field_path: "final_text",
+          label: "生成稿",
+          original: body.prompt || "E2E 原始提示词",
+          suggestion: "E2E 目标模型编译稿",
+          changed: true,
+        }],
+        constraint_coverage: [],
+        warnings: [
+          {
+            code: "profile_dropped_field",
+            field: "audio.voiceover",
+            action: "dropped",
+            message: "当前图片模型不接收旁白轨。",
+          },
+          {
+            code: "profile_transformed_field",
+            field: "structured.camera",
+            action: "transformed",
+            message: "运镜约束已合并到生成稿。",
+          },
+          {
+            code: "constraint_unverified",
+            field: "protected.brand_text",
+            action: "unverified",
+            message: "品牌文字需要生成后人工核验。",
+          },
+        ],
+        provenance: {},
+        compiler_profile: {
+          model_config_id: Number(body.target_model_config_id || 21),
+          model_id: "image-a",
+          provider: "openai",
+          capability_version_id: 101,
+          capability_version: 1,
+          schema_version: "e2e.v1",
+          capabilities: { text_to_image: true },
+        },
+        charged_credits: 0,
+      }, 201);
+    }
+    if (path === "/api/studio/prompt-optimizations" && method === "GET") {
+      return fulfillJson(route, { items: [], limit: 8, offset: 0, has_more: false });
+    }
+    if (path === "/api/prompt/reverse-batches" && method === "GET") return fulfillJson(route, []);
+    if (path === "/api/prompt/reverse-analyzers/status" && method === "GET") {
+      const unsupported = (reason: string) => ({
+        status: "unsupported",
+        analyzer_version: "unconfigured",
+        degraded_reason: reason,
+      });
+      return fulfillJson(route, {
+        image: { status: "unsupported" },
+        video: { status: "unsupported" },
+        audio: {
+          asr: unsupported("E2E 未配置 ASR"),
+          speaker: unsupported("E2E 未配置说话人分析"),
+          music: unsupported("E2E 未配置音乐分析"),
+          beat: unsupported("E2E 未配置节拍分析"),
+          sfx: unsupported("E2E 未配置音效分析"),
+        },
+      });
+    }
 
     if (path === "/api/me/drafts/studio") {
       if (method === "PUT") {
         const body = request.postDataJSON() as JsonRecord;
         state.draftPayload = body.payload || null;
+        if (state.draftPayload) state.draftPayloads.push(state.draftPayload);
         state.draftWrites += 1;
       } else if (method === "GET") {
         state.draftReads += 1;
@@ -334,10 +734,38 @@ export async function installReverseApiMock(
       const initialStatus = scenario === "cover_confirmation"
         ? "needs_confirmation"
         : ["image_success", "video_success"].includes(scenario) ? "queued" : "running";
-      state.operation = operationPayload(6001, target, initialStatus, body.workspace_snapshot_v2 || null, {
-        confirmation_expires_at: initialStatus === "needs_confirmation" ? "2099-01-01T00:15:00Z" : null,
-      });
+      state.operation = operationPayload(
+        6001,
+        target,
+        initialStatus,
+        body.workspace_snapshot_v3 || body.workspace_snapshot_v2 || null,
+        {
+          quote_id: body.quote_id || null,
+          confirmation_expires_at: initialStatus === "needs_confirmation" ? "2099-01-01T00:15:00Z" : null,
+        },
+      );
       return fulfillJson(route, state.operation, 202);
+    }
+
+    const reviewMatch = path.match(/^\/api\/prompt\/reverse-operations\/(\d+)\/(revisions|feedback|apply)$/);
+    if (reviewMatch?.[2] === "revisions" && method === "GET") {
+      ensureResultRevisions();
+      return fulfillJson(route, state.revisions);
+    }
+    if (reviewMatch?.[2] === "feedback" && method === "GET") {
+      return fulfillJson(route, null);
+    }
+    if (reviewMatch?.[2] === "apply" && method === "POST") {
+      ensureResultRevisions();
+      const body = request.postDataJSON() as JsonRecord;
+      state.applyBodies.push(body);
+      const parentRevisionId = Number(body.parent_revision_id || state.revisions.at(-1)?.id || 6102);
+      const nextVersion = state.revisions.length + 1;
+      const userEdit = resultRevision(6100 + nextVersion, nextVersion, "user_edit", body.payload, parentRevisionId);
+      const applied = resultRevision(6101 + nextVersion, nextVersion + 1, "applied", body.payload, userEdit.id);
+      state.revisions.push(userEdit, applied);
+      if (state.operation) state.operation = { ...state.operation, applied_result_version: applied.version };
+      return fulfillJson(route, { user_edit: userEdit, applied });
     }
 
     const match = path.match(/^\/api\/prompt\/reverse-operations\/(\d+)(?:\/(ws-ticket|confirm-cover|cancel))?$/);
@@ -347,7 +775,7 @@ export async function installReverseApiMock(
     }
     if (match && match[2] === "cancel") {
       state.cancelRequests += 1;
-      state.operation = operationPayload(6001, state.operation?.target || "image", "canceled", state.operation?.workspace_snapshot_v2 || null, {
+      state.operation = operationPayload(6001, state.operation?.target || "image", "canceled", state.operation?.workspace_snapshot_v3 || state.operation?.workspace_snapshot_v2 || null, {
         cost_frozen: 0,
         cancel_requested: true,
         error: "用户已取消",
@@ -358,7 +786,7 @@ export async function installReverseApiMock(
     if (match && match[2] === "confirm-cover") {
       state.confirmRequests += 1;
       state.confirmed = true;
-      state.operation = operationPayload(6001, "video", "queued", state.operation?.workspace_snapshot_v2 || null);
+      state.operation = operationPayload(6001, "video", "queued", state.operation?.workspace_snapshot_v3 || state.operation?.workspace_snapshot_v2 || null);
       return fulfillJson(route, state.operation);
     }
     if (match && !match[2] && method === "GET") {
@@ -377,7 +805,7 @@ export async function installReverseApiMock(
             ? videoResult()
             : imageResult();
         const settledCost = scenario === "video_success" ? 18 : 2;
-        state.operation = operationPayload(6001, state.operation.target, "succeeded", state.operation.workspace_snapshot_v2 || null, {
+        state.operation = operationPayload(6001, state.operation.target, "succeeded", state.operation.workspace_snapshot_v3 || state.operation.workspace_snapshot_v2 || null, {
           result,
           video_analysis: result.video_analysis || null,
           cost_frozen: 0,

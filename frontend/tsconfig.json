@@ -33,7 +33,13 @@
     "**/*.ts",
     "**/*.tsx",
     ".next/e2e/types/**/*.ts",
-    ".next/e2e/dev/types/**/*.ts"
+    ".next/e2e/dev/types/**/*.ts",
+    ".next-codex-live/types/**/*.ts",
+    ".next-codex-live/dev/types/**/*.ts",
+    ".next-video-timeline/types/**/*.ts",
+    ".next-video-timeline/dev/types/**/*.ts",
+    ".next-wp12/types/**/*.ts",
+    ".next-wp12/dev/types/**/*.ts"
   ],
   "exclude": [
     "node_modules"

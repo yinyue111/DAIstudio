@@ -3,6 +3,11 @@ import { defineConfig } from "@playwright/test";
 const externalBaseUrl = process.env.PLAYWRIGHT_BASE_URL;
 const baseURL = externalBaseUrl || "http://127.0.0.1:3210";
 const localChromeChannel = process.platform === "darwin" ? "chrome" : undefined;
+const requestedChannel = process.env.PLAYWRIGHT_CHANNEL;
+const browserChannel = requestedChannel === "bundled"
+  ? undefined
+  : requestedChannel || localChromeChannel;
+const singleProcessBrowser = process.env.PLAYWRIGHT_SINGLE_PROCESS === "1";
 
 export default defineConfig({
   testDir: "./e2e",
@@ -15,7 +20,10 @@ export default defineConfig({
   outputDir: "test-results/playwright",
   use: {
     baseURL,
-    channel: process.env.PLAYWRIGHT_CHANNEL || localChromeChannel,
+    channel: browserChannel,
+    launchOptions: singleProcessBrowser
+      ? { args: ["--single-process", "--no-zygote"] }
+      : undefined,
     trace: "retain-on-failure",
     screenshot: "only-on-failure",
     video: "retain-on-failure",

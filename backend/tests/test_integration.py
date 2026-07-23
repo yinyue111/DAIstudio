@@ -169,11 +169,11 @@ def test_production_registration_rejects_public_phone_without_sms(client, monkey
     assert "注册暂未开放" in r.text
 
 
-def test_generate_unlock_profile(client, make_user, auth):
+def test_generate_unlock_profile(client, make_user, auth, quote_and_generate):
     make_user("13900000001", balance=1000)
     h = auth("13900000001")
 
-    r = client.post("/api/generate", json={
+    r = quote_and_generate({
         "source_asset_url": "http://example.com/x.png",
         "source_type": "image",
         "source_asset_meta": {"user_confirmed_rights": True},
@@ -228,7 +228,9 @@ def test_generate_unlock_profile(client, make_user, auth):
     assert g[0]["days_left"] is not None
 
 
-def test_generate_client_request_id_replays_existing_task(client, make_user, auth):
+def test_generate_client_request_id_replays_existing_task(
+    client, make_user, auth, quote_generation
+):
     make_user("13900000167", balance=1000)
     h = auth("13900000167")
     payload = {
@@ -242,9 +244,11 @@ def test_generate_client_request_id_replays_existing_task(client, make_user, aut
         "params": {"n": 2, "size": "256x256"},
     }
 
-    first = client.post("/api/generate", json=payload, headers=h)
+    quote = quote_generation(payload, headers=h)
+    quoted_payload = {**payload, "quote_id": quote["quote_id"]}
+    first = client.post("/api/generate", json=quoted_payload, headers=h)
     assert first.status_code == 200, first.text
-    second = client.post("/api/generate", json=payload, headers=h)
+    second = client.post("/api/generate", json=quoted_payload, headers=h)
     assert second.status_code == 200, second.text
     assert second.json()["id"] == first.json()["id"]
 
@@ -259,7 +263,9 @@ def test_generate_client_request_id_replays_existing_task(client, make_user, aut
     assert client.get("/api/me", headers=h).json()["balance_credits"] == 984
 
 
-def test_generate_client_request_id_normalizes_default_image_n_before_fingerprint(client, make_user, auth):
+def test_generate_client_request_id_normalizes_default_image_n_before_fingerprint(
+    client, make_user, auth, quote_generation
+):
     make_user("13900000166", balance=1000)
     h = auth("13900000166")
     payload = {
@@ -273,11 +279,20 @@ def test_generate_client_request_id_normalizes_default_image_n_before_fingerprin
         "params": {"size": "256x256"},
     }
 
-    first = client.post("/api/generate", json=payload, headers=h)
+    quote = quote_generation(payload, headers=h)
+    first = client.post(
+        "/api/generate",
+        json={**payload, "quote_id": quote["quote_id"]},
+        headers=h,
+    )
     assert first.status_code == 200, first.text
     second = client.post(
         "/api/generate",
-        json={**payload, "params": {"n": 1, "size": "256x256"}},
+        json={
+            **payload,
+            "params": {"n": 1, "size": "256x256"},
+            "quote_id": quote["quote_id"],
+        },
         headers=h,
     )
     assert second.status_code == 200, second.text
@@ -295,7 +310,9 @@ def test_generate_client_request_id_normalizes_default_image_n_before_fingerprin
     assert client.get("/api/me", headers=h).json()["balance_credits"] == 992
 
 
-def test_generate_client_request_id_rejects_different_payload(client, make_user, auth):
+def test_generate_client_request_id_rejects_different_payload(
+    client, make_user, auth, quote_generation
+):
     make_user("13900000169", balance=1000)
     h = auth("13900000169")
     payload = {
@@ -309,11 +326,20 @@ def test_generate_client_request_id_rejects_different_payload(client, make_user,
         "params": {"n": 1, "size": "256x256"},
     }
 
-    first = client.post("/api/generate", json=payload, headers=h)
+    quote = quote_generation(payload, headers=h)
+    first = client.post(
+        "/api/generate",
+        json={**payload, "quote_id": quote["quote_id"]},
+        headers=h,
+    )
     assert first.status_code == 200, first.text
     conflict = client.post(
         "/api/generate",
-        json={**payload, "instruction": "different request"},
+        json={
+            **payload,
+            "instruction": "different request",
+            "quote_id": quote["quote_id"],
+        },
         headers=h,
     )
     assert conflict.status_code == 409
@@ -335,8 +361,18 @@ def test_external_asset_download_streams_from_temp_file(client, make_user, auth,
     h = auth("13900000103")
     db = SessionLocal()
     try:
+        task = GenTask(
+            user_id=uid,
+            category="video",
+            stage="final",
+            status="succeeded",
+            prompt={},
+            params={},
+        )
+        db.add(task)
+        db.flush()
         asset = GenAsset(
-            task_id=0,
+            task_id=task.id,
             user_id=uid,
             type="video",
             preview_url="https://cdn.example.com/preview.mp4",
@@ -386,8 +422,18 @@ def test_external_image_download_gets_image_filename(client, make_user, auth, mo
     h = auth("13900000104")
     db = SessionLocal()
     try:
+        task = GenTask(
+            user_id=uid,
+            category="image",
+            stage="final",
+            status="succeeded",
+            prompt={},
+            params={},
+        )
+        db.add(task)
+        db.flush()
         asset = GenAsset(
-            task_id=0,
+            task_id=task.id,
             user_id=uid,
             type="image",
             preview_url="https://cdn.example.com/preview.jpg",
@@ -422,7 +468,9 @@ def test_external_image_download_gets_image_filename(client, make_user, auth, mo
     assert calls["kwargs"]["timeout_seconds"] <= 600
 
 
-def test_video_preview_settles_preview_cost(client, make_user, auth):
+def test_video_preview_settles_preview_cost(
+    client, make_user, auth, quote_and_generate
+):
     make_user("13900000002", balance=1000, admin=True)
     h = auth("13900000002")
 
@@ -437,7 +485,7 @@ def test_video_preview_settles_preview_cost(client, make_user, auth):
     }, headers=h)
     assert r.status_code == 200, r.text
 
-    r = client.post("/api/generate", json={
+    r = quote_and_generate({
         "source_asset_url": "http://example.com/cover.png",
         "source_type": "image",
         "source_asset_meta": {"user_confirmed_rights": True},
@@ -456,7 +504,9 @@ def test_video_preview_settles_preview_cost(client, make_user, auth):
     assert client.get("/api/me", headers=h).json()["balance_credits"] == 950
 
 
-def test_video_final_can_generate_directly_without_preview_parent(client, make_user, auth):
+def test_video_final_can_generate_directly_without_preview_parent(
+    client, make_user, auth, quote_and_generate
+):
     make_user("13900001002", balance=1000, admin=True)
     h = auth("13900001002")
 
@@ -471,7 +521,7 @@ def test_video_final_can_generate_directly_without_preview_parent(client, make_u
     }, headers=h)
     assert r.status_code == 200, r.text
 
-    r = client.post("/api/generate", json={
+    r = quote_and_generate({
         "category": "video",
         "stage": "final",
         "instruction": "direct final clip, product reveal",
@@ -497,7 +547,7 @@ def test_video_final_can_generate_directly_without_preview_parent(client, make_u
 
 
 def test_video_preview_adapts_ratio_and_cover_from_reference(
-    client, make_user, auth, monkeypatch
+    client, make_user, auth, monkeypatch, quote_and_generate
 ):
     make_user("13900000016", balance=1000, admin=True)
     h = auth("13900000016")
@@ -524,7 +574,7 @@ def test_video_preview_adapts_ratio_and_cover_from_reference(
 
     monkeypatch.setattr("app.services.gateway.submit_video", fake_submit)
 
-    r = client.post("/api/generate", json={
+    r = quote_and_generate({
         "source_asset_url": "http://example.com/source-video.mp4",
         "source_type": "video",
         "source_asset_meta": {"user_confirmed_rights": True},
@@ -548,7 +598,7 @@ def test_video_preview_adapts_ratio_and_cover_from_reference(
 
 
 def test_video_final_uses_selected_quality_and_reference_poster(
-    client, make_user, auth, monkeypatch, tiny_mp4
+    client, make_user, auth, monkeypatch, tiny_mp4, quote_and_generate
 ):
     make_user("13900000018", balance=1000, admin=True)
     h = auth("13900000018")
@@ -601,7 +651,7 @@ def test_video_final_uses_selected_quality_and_reference_poster(
 
     monkeypatch.setattr("app.services.gateway.download_to_storage", fake_download_to_storage)
 
-    preview = client.post("/api/generate", json={
+    preview = quote_and_generate({
         "source_asset_url": "http://example.com/source-video.mp4",
         "source_type": "video",
         "source_asset_meta": {"user_confirmed_rights": True},
@@ -620,7 +670,7 @@ def test_video_final_uses_selected_quality_and_reference_poster(
     assert preview.status_code == 200, preview.text
     parent_id = preview.json()["id"]
 
-    r = client.post("/api/generate", json={
+    r = quote_and_generate({
         "source_asset_url": "http://example.com/source-video.mp4",
         "source_type": "video",
         "source_asset_meta": {"user_confirmed_rights": True},
@@ -651,7 +701,15 @@ def test_video_final_uses_selected_quality_and_reference_poster(
     assert task["assets"][0]["hd_url"]
 
 
-def test_video_final_is_idempotent_for_same_preview(client, make_user, auth, monkeypatch, tiny_mp4):
+def test_video_final_is_idempotent_for_same_preview(
+    client,
+    make_user,
+    auth,
+    monkeypatch,
+    tiny_mp4,
+    quote_and_generate,
+    quote_generation,
+):
     make_user("13900000019", balance=1000, admin=True)
     h = auth("13900000019")
 
@@ -666,7 +724,7 @@ def test_video_final_is_idempotent_for_same_preview(client, make_user, auth, mon
     }, headers=h)
     assert r.status_code == 200, r.text
 
-    preview = client.post("/api/generate", json={
+    preview = quote_and_generate({
         "source_asset_url": "http://example.com/source-video.mp4",
         "source_type": "video",
         "source_asset_meta": {"user_confirmed_rights": True},
@@ -710,14 +768,17 @@ def test_video_final_is_idempotent_for_same_preview(client, make_user, auth, mon
     )
 
     payload = {
+        "client_request_id": "video-final-idempotency-001",
         "category": "video",
         "stage": "final",
         "parent_task_id": parent_id,
         "params": {},
     }
-    first = client.post("/api/generate", json=payload, headers=h)
+    quote = quote_generation(payload, headers=h)
+    quoted_payload = {**payload, "quote_id": quote["quote_id"]}
+    first = client.post("/api/generate", json=quoted_payload, headers=h)
     assert first.status_code == 200, first.text
-    second = client.post("/api/generate", json=payload, headers=h)
+    second = client.post("/api/generate", json=quoted_payload, headers=h)
     assert second.status_code == 200, second.text
     assert second.json()["id"] == first.json()["id"]
     assert second.json()["progress"] == 100
@@ -776,7 +837,9 @@ def test_db_rejects_duplicate_active_final_for_same_preview(client, make_user):
         db.close()
 
 
-def test_video_final_integrity_error_replays_active_final(client, make_user, auth, monkeypatch):
+def test_video_final_integrity_error_replays_active_final(
+    client, make_user, auth, monkeypatch, quote_and_generate
+):
     make_user("13900000143", balance=1000, admin=True)
     h = auth("13900000143")
     assert client.put("/api/admin/models", json={
@@ -789,7 +852,7 @@ def test_video_final_integrity_error_replays_active_final(client, make_user, aut
         "extra": {"preview_cost": 5},
     }, headers=h).status_code == 200
 
-    preview = client.post("/api/generate", json={
+    preview = quote_and_generate({
         "source_asset_url": "http://example.com/source-video.mp4",
         "source_type": "video",
         "source_asset_meta": {"user_confirmed_rights": True},
@@ -832,7 +895,13 @@ def test_video_final_integrity_error_replays_active_final(client, make_user, aut
     active_lookup_count = {"value": 0}
 
     def flush_once_then_fail(self, *args, **kwargs):
-        if not tripped["value"]:
+        creating_final = any(
+            isinstance(row, GenTask)
+            and row.stage == "final"
+            and row.parent_task_id == parent_id
+            for row in self.new
+        )
+        if creating_final and not tripped["value"]:
             tripped["value"] = True
             raise IntegrityError("duplicate active final", {}, Exception("unique"))
         return real_flush(self, *args, **kwargs)
@@ -846,7 +915,7 @@ def test_video_final_integrity_error_replays_active_final(client, make_user, aut
     monkeypatch.setattr(Session, "flush", flush_once_then_fail)
     monkeypatch.setattr(generate_router, "_existing_active_final", delayed_existing_active_final)
 
-    r = client.post("/api/generate", json={
+    r = quote_and_generate({
         "category": "video",
         "stage": "final",
         "parent_task_id": parent_id,
@@ -856,7 +925,9 @@ def test_video_final_integrity_error_replays_active_final(client, make_user, aut
     assert r.json()["id"] == final_id
 
 
-def test_video_final_uses_preview_model_snapshot_price(client, make_user, auth, monkeypatch, tiny_mp4):
+def test_video_final_uses_preview_model_snapshot_price(
+    client, make_user, auth, monkeypatch, tiny_mp4, quote_and_generate
+):
     make_user("13900000147", balance=1000, admin=True)
     h = auth("13900000147")
     assert client.put("/api/admin/models", json={
@@ -869,7 +940,7 @@ def test_video_final_uses_preview_model_snapshot_price(client, make_user, auth, 
         "admin_password": "pass123456",
     }, headers=h).status_code == 200
 
-    preview = client.post("/api/generate", json={
+    preview = quote_and_generate({
         "category": "video",
         "stage": "preview",
         "prompt": {"final_text": "snapshot video"},
@@ -907,7 +978,7 @@ def test_video_final_uses_preview_model_snapshot_price(client, make_user, auth, 
         lambda _url, subdir, ext, **_kwargs: storage.save_bytes(tiny_mp4, subdir, ext),
     )
 
-    final = client.post("/api/generate", json={
+    final = quote_and_generate({
         "category": "video",
         "stage": "final",
         "parent_task_id": preview.json()["id"],
@@ -920,7 +991,9 @@ def test_video_final_uses_preview_model_snapshot_price(client, make_user, auth, 
     assert seen["model_id"] == "mock-video-old"
 
 
-def test_video_final_rejects_stale_preview_gateway_key_snapshot(client, make_user, auth):
+def test_video_final_rejects_stale_preview_gateway_key_snapshot(
+    client, make_user, auth, quote_and_generate
+):
     make_user("13900000178", balance=1000, admin=True)
     h = auth("13900000178")
     _clear_active_model_tasks("video")
@@ -939,7 +1012,7 @@ def test_video_final_rejects_stale_preview_gateway_key_snapshot(client, make_use
     first = client.put("/api/admin/models", json={**body, "api_key": "old-key"}, headers=h)
     assert first.status_code == 200, first.text
 
-    preview = client.post("/api/generate", json={
+    preview = quote_and_generate({
         "category": "video",
         "stage": "preview",
         "prompt": {"final_text": "snapshot drift"},
@@ -950,18 +1023,21 @@ def test_video_final_rejects_stale_preview_gateway_key_snapshot(client, make_use
     changed = client.put("/api/admin/models", json={**body, "api_key": "new-key"}, headers=h)
     assert changed.status_code == 200, changed.text
 
-    final = client.post("/api/generate", json={
+    final = client.post("/api/quotes", json={
         "category": "video",
         "stage": "final",
         "parent_task_id": preview.json()["id"],
         "params": {},
     }, headers=h)
     assert final.status_code == 409
-    assert "模型网关配置已变更" in final.text
+    assert final.json()["detail"] == {
+        "code": "MODEL_GATEWAY_SNAPSHOT_STALE",
+        "message": "任务绑定的模型网关配置已失效,请重新报价后提交",
+    }
 
 
 def test_video_final_can_regenerate_after_succeeded_task_loses_asset(
-    client, make_user, auth, monkeypatch, tiny_mp4
+    client, make_user, auth, monkeypatch, tiny_mp4, quote_and_generate
 ):
     make_user("13877777164", balance=1000, admin=True)
     h = auth("13877777164")
@@ -974,7 +1050,7 @@ def test_video_final_can_regenerate_after_succeeded_task_loses_asset(
         "extra": {"preview_cost": 5},
         "admin_password": "pass123456",
     }, headers=h).status_code == 200
-    preview = client.post("/api/generate", json={
+    preview = quote_and_generate({
         "category": "video",
         "stage": "preview",
         "prompt": {"final_text": "rebuild final"},
@@ -995,7 +1071,7 @@ def test_video_final_can_regenerate_after_succeeded_task_loses_asset(
         lambda _url, subdir, ext, **_kwargs: storage.save_bytes(tiny_mp4, subdir, ext),
     )
 
-    first = client.post("/api/generate", json={
+    first = quote_and_generate({
         "category": "video",
         "stage": "final",
         "parent_task_id": preview.json()["id"],
@@ -1006,7 +1082,7 @@ def test_video_final_can_regenerate_after_succeeded_task_loses_asset(
     asset_id = first_task["assets"][0]["id"]
     assert client.delete(f"/api/assets/{asset_id}", headers=h).status_code == 200
 
-    second = client.post("/api/generate", json={
+    second = quote_and_generate({
         "category": "video",
         "stage": "final",
         "parent_task_id": preview.json()["id"],
@@ -1017,7 +1093,9 @@ def test_video_final_can_regenerate_after_succeeded_task_loses_asset(
     assert client.get(f"/api/tasks/{second.json()['id']}", headers=h).json()["assets"]
 
 
-def test_image_hd_extension_matches_jpeg_response(client, make_user, auth, monkeypatch):
+def test_image_hd_extension_matches_jpeg_response(
+    client, make_user, auth, monkeypatch, quote_and_generate
+):
     from io import BytesIO
 
     from PIL import Image
@@ -1029,7 +1107,7 @@ def test_image_hd_extension_matches_jpeg_response(client, make_user, auth, monke
     Image.new("RGB", (32, 32), "white").save(buf, format="JPEG")
     monkeypatch.setattr("app.services.gateway.gen_image",
                         lambda *_a, **_k: [buf.getvalue()])
-    r = client.post("/api/generate", json={
+    r = quote_and_generate({
         "category": "image",
         "stage": "preview",
         "prompt": {"final_text": "jpeg"},
@@ -1041,7 +1119,9 @@ def test_image_hd_extension_matches_jpeg_response(client, make_user, auth, monke
     assert urlparse(unlocked["hd_url"]).path.endswith(".jpg")
 
 
-def test_generated_hd_reference_requires_owner_and_unlock(client, make_user, auth, monkeypatch):
+def test_generated_hd_reference_requires_owner_and_unlock(
+    client, make_user, auth, monkeypatch, quote_and_generate
+):
     make_user("13900000082", balance=1000)
     make_user("13900000083", balance=1000)
     owner_h = auth("13900000082")
@@ -1053,7 +1133,7 @@ def test_generated_hd_reference_requires_owner_and_unlock(client, make_user, aut
         "app.services.gateway.gen_image",
         lambda prompt, _model, n=1, size="256x256", **_k: [_mock_image(prompt, size, 0)],
     )
-    created = client.post("/api/generate", json={
+    created = quote_and_generate({
         "category": "image",
         "stage": "preview",
         "prompt": {"final_text": "private reference"},
@@ -1064,7 +1144,7 @@ def test_generated_hd_reference_requires_owner_and_unlock(client, make_user, aut
     unlocked = client.post(f"/api/assets/{asset['id']}/unlock", headers=owner_h).json()
     hd_url = unlocked["hd_url"]
 
-    other = client.post("/api/generate", json={
+    other = client.post("/api/quotes", json={
         "source_asset_url": hd_url,
         "source_type": "image",
         "category": "image",
@@ -1075,7 +1155,7 @@ def test_generated_hd_reference_requires_owner_and_unlock(client, make_user, aut
     assert other.status_code == 404
     assert "生成素材" in other.text
 
-    owner = client.post("/api/generate", json={
+    owner = quote_and_generate({
         "source_asset_url": hd_url,
         "source_type": "image",
         "category": "image",
@@ -1086,7 +1166,9 @@ def test_generated_hd_reference_requires_owner_and_unlock(client, make_user, aut
     assert owner.status_code == 200, owner.text
 
 
-def test_image_generation_adapts_size_from_reference(client, make_user, auth, monkeypatch):
+def test_image_generation_adapts_size_from_reference(
+    client, make_user, auth, monkeypatch, quote_and_generate
+):
     make_user("13900000017", balance=1000, admin=True)
     h = auth("13900000017")
     client.put("/api/admin/settings", json={"image_size": "1024x1024", "admin_password": "pass123456"}, headers=h)
@@ -1101,7 +1183,7 @@ def test_image_generation_adapts_size_from_reference(client, make_user, auth, mo
 
     monkeypatch.setattr("app.services.gateway.gen_image", fake_gen_image)
 
-    r = client.post("/api/generate", json={
+    r = quote_and_generate({
         "source_asset_url": "http://example.com/reference.jpg",
         "source_type": "image",
         "source_asset_meta": {"user_confirmed_rights": True},
@@ -1115,7 +1197,9 @@ def test_image_generation_adapts_size_from_reference(client, make_user, auth, mo
     assert seen["size"] == "720x1280"
 
 
-def test_image_generation_adapts_size_from_reference_at_2k_default(client, make_user, auth, monkeypatch):
+def test_image_generation_adapts_size_from_reference_at_2k_default(
+    client, make_user, auth, monkeypatch, quote_and_generate
+):
     make_user("13900000079", balance=1000, admin=True)
     h = auth("13900000079")
     client.put("/api/admin/settings", json={"image_size": "2048x2048", "admin_password": "pass123456"}, headers=h)
@@ -1130,7 +1214,7 @@ def test_image_generation_adapts_size_from_reference_at_2k_default(client, make_
 
     monkeypatch.setattr("app.services.gateway.gen_image", fake_gen_image)
 
-    r = client.post("/api/generate", json={
+    r = quote_and_generate({
         "source_asset_url": "http://example.com/reference.jpg",
         "source_type": "image",
         "source_asset_meta": {"user_confirmed_rights": True},
@@ -1144,10 +1228,10 @@ def test_image_generation_adapts_size_from_reference_at_2k_default(client, make_
     assert seen["size"] == "1152x2048"
 
 
-def test_insufficient_credits(client, make_user, auth):
+def test_insufficient_credits(client, make_user, auth, quote_and_generate):
     make_user("13900000003", balance=1)  # below image cost (5)
     h = auth("13900000003")
-    r = client.post("/api/generate", json={
+    r = quote_and_generate({
         "source_asset_url": "http://x/y.png", "source_type": "image",
         "source_asset_meta": {"user_confirmed_rights": True},
         "category": "image", "stage": "preview", "instruction": "x",
@@ -1159,7 +1243,7 @@ def test_insufficient_credits(client, make_user, auth):
 def test_generate_rejects_invalid_stage(client, make_user, auth):
     make_user("13900000005", balance=1000)
     h = auth("13900000005")
-    r = client.post("/api/generate", json={
+    r = client.post("/api/quotes", json={
         "source_asset_url": "http://x/y.png",
         "source_type": "image",
         "category": "image",
@@ -1167,6 +1251,9 @@ def test_generate_rejects_invalid_stage(client, make_user, auth):
         "instruction": "x",
     }, headers=h)
     assert r.status_code == 422
+    location = r.json()["detail"][0]["loc"]
+    assert location[0] == "body"
+    assert location[-1] == "stage"
 
 
 def test_video_final_requires_succeeded_preview_parent(client, make_user, auth):
@@ -1194,7 +1281,7 @@ def test_video_final_requires_succeeded_preview_parent(client, make_user, auth):
     finally:
         db.close()
 
-    r = client.post("/api/generate", json={
+    r = client.post("/api/quotes", json={
         "source_asset_url": "http://example.com/source.mp4",
         "source_type": "video",
         "category": "video",
@@ -1276,8 +1363,8 @@ def test_admin_bulk_grant_updates_balances(client, make_user, auth):
     assert conflict.status_code == 409
 
 
-def _gen(client, h, n=2):
-    r = client.post("/api/generate", json={
+def _gen(quote_and_generate, h, n=2):
+    r = quote_and_generate({
         "source_asset_url": "http://x/y.png", "source_type": "image",
         "source_asset_meta": {"user_confirmed_rights": True},
         "category": "image", "stage": "preview", "instruction": "x",
@@ -1321,10 +1408,10 @@ def test_admin_reset_password(client, make_user, auth):
     assert client.get("/api/me", headers=th).status_code == 200
 
 
-def test_favorite_and_delete(client, make_user, auth):
+def test_favorite_and_delete(client, make_user, auth, quote_and_generate):
     make_user("13900000014", balance=1000)
     h = auth("13900000014")
-    tid = _gen(client, h)
+    tid = _gen(quote_and_generate, h)
     a = client.get(f"/api/tasks/{tid}", headers=h).json()["assets"][0]
     preview_key = storage.key_from_url(a["preview_url"])
     model_ref_path = storage.local_path(preview_key.replace("preview/", "model_ref/", 1).rsplit(".", 1)[0] + ".jpg")
@@ -1342,10 +1429,12 @@ def test_favorite_and_delete(client, make_user, auth):
     assert all(x["id"] != a["id"] for x in after)
 
 
-def test_profile_assets_filters_and_batch_operations(client, make_user, auth):
+def test_profile_assets_filters_and_batch_operations(
+    client, make_user, auth, quote_and_generate
+):
     make_user("13900001007", balance=1000)
     h = auth("13900001007")
-    tid = _gen(client, h, n=2)
+    tid = _gen(quote_and_generate, h, n=2)
     task = client.get(f"/api/tasks/{tid}", headers=h).json()
     asset_ids = [a["id"] for a in task["assets"]]
     for asset_id in asset_ids:
@@ -1547,8 +1636,11 @@ def test_cancel_running_task_marks_cancel_requested(client, make_user, auth):
 
 
 def test_cancel_running_submitted_video_is_rejected(client, make_user, auth):
-    uid = make_user("13900001019", balance=100)
-    h = auth("13900001019")
+    from app.services import credits
+
+    uid = make_user("13900001029", balance=100)
+    h = auth("13900001029")
+    task_id = None
     db = SessionLocal()
     try:
         task = GenTask(
@@ -1565,18 +1657,51 @@ def test_cancel_running_submitted_video_is_rejected(client, make_user, auth):
             cost_settled=0,
         )
         db.add(task)
+        db.flush()
+        credits.freeze(db, uid, 15, biz_ref=task.id, commit=False)
         db.commit()
         task_id = task.id
     finally:
         db.close()
 
-    r = client.post(f"/api/tasks/{task_id}/cancel", headers=h)
+    try:
+        r = client.post(f"/api/tasks/{task_id}/cancel", headers=h)
 
-    assert r.status_code == 409
-    assert "外部网关" in r.text
+        assert r.status_code == 409
+        assert "外部网关" in r.text
+        me = client.get("/api/me", headers=h).json()
+        assert me["balance_credits"] == 85
+        assert me["frozen_credits"] == 15
+        with SessionLocal() as db:
+            saved = db.get(GenTask, task_id)
+            assert saved.status == "running"
+            assert saved.cost_frozen == 15
+            assert saved.cost_settled == 0
+    finally:
+        if task_id is not None:
+            with SessionLocal() as db:
+                task = db.get(GenTask, task_id)
+                if task is not None:
+                    if task.cost_frozen and task.cost_settled == 0:
+                        credits.refund(
+                            db,
+                            uid,
+                            task.cost_frozen,
+                            biz_ref=task.id,
+                            commit=False,
+                        )
+                    db.delete(task)
+                    db.flush()
+                db.query(CreditTransaction).filter(
+                    CreditTransaction.biz_type == "gen_task",
+                    CreditTransaction.biz_ref == task_id,
+                ).delete(synchronize_session=False)
+                db.commit()
 
 
-def test_prompt_history_crud_and_auto_record(client, make_user, auth):
+def test_prompt_history_crud_and_auto_record(
+    client, make_user, auth, quote_and_generate
+):
     make_user("13900001009", balance=1000)
     h = auth("13900001009")
 
@@ -1598,7 +1723,7 @@ def test_prompt_history_crud_and_auto_record(client, make_user, auth):
     assert patched.status_code == 200, patched.text
     assert patched.json()["usage_count"] == 1
 
-    tid = _gen(client, h, n=1)
+    tid = _gen(quote_and_generate, h, n=1)
     assert client.get(f"/api/tasks/{tid}", headers=h).json()["status"] == "succeeded"
     rows = client.get("/api/prompts/history?source=generate", headers=h).json()
     assert any("生成提示词" in row["title"] for row in rows)
@@ -1612,10 +1737,10 @@ def test_prompt_history_crud_and_auto_record(client, make_user, auth):
         db.close()
 
 
-def test_retry_requires_failed(client, make_user, auth):
+def test_retry_requires_failed(client, make_user, auth, quote_and_generate):
     make_user("13900000015", balance=1000)
     h = auth("13900000015")
-    tid = _gen(client, h)  # eager -> succeeded
+    tid = _gen(quote_and_generate, h)  # eager -> succeeded
     r = client.post(f"/api/tasks/{tid}/retry", headers=h)
     assert r.status_code == 400  # only failed tasks can be retried
 
@@ -1754,7 +1879,9 @@ def test_retry_preserves_existing_model_snapshot_price(client, make_user, auth):
                 db.close()
 
 
-def test_retry_rejects_stale_gateway_key_snapshot(client, make_user, auth):
+def test_retry_rejects_stale_gateway_key_snapshot(
+    client, make_user, auth, quote_and_generate
+):
     make_user("13877777179", balance=1000, admin=True)
     h = auth("13877777179")
     _clear_active_model_tasks("image")
@@ -1771,7 +1898,7 @@ def test_retry_rejects_stale_gateway_key_snapshot(client, make_user, auth):
     }
     first = client.put("/api/admin/models", json={**body, "api_key": "old-key"}, headers=h)
     assert first.status_code == 200, first.text
-    task = client.post("/api/generate", json={
+    task = quote_and_generate({
         "category": "image",
         "stage": "preview",
         "prompt": {"final_text": "retry drift"},
@@ -1793,4 +1920,7 @@ def test_retry_rejects_stale_gateway_key_snapshot(client, make_user, auth):
     assert changed.status_code == 200, changed.text
     retry = client.post(f"/api/tasks/{tid}/retry", headers=h)
     assert retry.status_code == 409
-    assert "模型网关配置已变更" in retry.text
+    assert retry.json()["detail"] == {
+        "code": "MODEL_GATEWAY_SNAPSHOT_STALE",
+        "message": "任务绑定的模型网关配置已失效,请重新报价后提交",
+    }

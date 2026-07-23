@@ -50,7 +50,7 @@ assert.match(
   "generation submit hook should own idempotent request ids",
 );
 assert.equal(MAX_VIDEO_DURATION_SECONDS, 15);
-assert.equal(MAX_PRODUCT_DETAIL_IMAGES, 5);
+assert.equal(MAX_PRODUCT_DETAIL_IMAGES, 10);
 assert.deepEqual(
   VIDEO_DURATION_PRESETS.map((item) => item.seconds),
   [5, 8, 10, 15],
@@ -180,6 +180,86 @@ assert.doesNotMatch(
   "audit-only video fields must not cross the final generation boundary",
 );
 
+const firstFrameAsset = {
+  id: 701,
+  type: "image",
+  url: "https://cdn.example.com/first-frame.jpg",
+  width: 1280,
+  height: 720,
+};
+const lastFrameAsset = {
+  id: 702,
+  type: "image",
+  url: "https://cdn.example.com/last-frame.jpg",
+  width: 1280,
+  height: 720,
+};
+const firstLastFrameVideoArgs = {
+  stage: "preview",
+  cfg: { video_duration_max_seconds: 15 },
+  category: "video",
+  creationMode: "video",
+  isEditMode: false,
+  subjectMode: "general",
+  prompt: "镜头从首帧平稳过渡到尾帧",
+  promptDirty: true,
+  selected: firstFrameAsset,
+  lastFrameAsset,
+  firstLastFrameEnabled: true,
+  productAsset: null,
+  structured: {},
+  ratio: "16:9",
+  imageQuality: "1k",
+  n: 1,
+  vDuration: 5,
+  vResolution: "720p",
+};
+const firstLastFrameVideo = buildGenerationPayload(firstLastFrameVideoArgs);
+assert.equal(firstLastFrameVideo.payload.params.first_frame_image, firstFrameAsset.url);
+assert.equal(firstLastFrameVideo.payload.params.last_frame_image, lastFrameAsset.url);
+assert.equal(firstLastFrameVideo.payload.params.reference_image_url, undefined);
+assert.equal(
+  firstLastFrameVideo.payload.source_asset_meta.last_frame.selected_url,
+  lastFrameAsset.url,
+  "the second image should retain source provenance as the video last frame",
+);
+
+const unsupportedFirstLastFrameVideo = buildGenerationPayload({
+  ...firstLastFrameVideoArgs,
+  firstLastFrameEnabled: false,
+});
+assert.equal(unsupportedFirstLastFrameVideo.payload.params.first_frame_image, undefined);
+assert.equal(unsupportedFirstLastFrameVideo.payload.params.last_frame_image, undefined);
+assert.equal(
+  unsupportedFirstLastFrameVideo.payload.params.reference_image_url,
+  firstFrameAsset.url,
+  "models without the declared capability must keep the existing single-reference payload",
+);
+
+const productModeIgnoresLastFrame = buildGenerationPayload({
+  ...firstLastFrameVideoArgs,
+  subjectMode: "product",
+  productAsset: firstFrameAsset,
+});
+assert.equal(productModeIgnoresLastFrame.payload.params.product_reference_image, firstFrameAsset.url);
+assert.equal(productModeIgnoresLastFrame.payload.params.first_frame_image, undefined);
+assert.equal(productModeIgnoresLastFrame.payload.params.last_frame_image, undefined);
+
+assert.throws(
+  () => buildGenerationPayload({
+    ...firstLastFrameVideoArgs,
+    lastFrameAsset: { ...lastFrameAsset, url: firstFrameAsset.url },
+  }),
+  /首帧和尾帧不能使用同一张图片/,
+);
+assert.throws(
+  () => buildGenerationPayload({
+    ...firstLastFrameVideoArgs,
+    lastFrameAsset: { ...lastFrameAsset, type: "video" },
+  }),
+  /尾帧只支持图片素材/,
+);
+
 assert.equal(
   shouldKeepPendingReverseRequest({ status: 409, message: "反推请求仍在处理中,请稍后重试" }),
   true,
@@ -246,8 +326,7 @@ const directProductVideo = buildGenerationPayload({
   seed: "",
   vDuration: 10,
   vResolution: "1080p",
-  videoProductLockMode: "locked",
-  videoProductTemplate: "stable_showcase",
+  productVideoTemplate: "stable_showcase",
 });
 assert.equal(directProductVideo.payload.source_asset_url, productAsset.url);
 assert.equal(directProductVideo.payload.source_type, "image");
@@ -258,19 +337,24 @@ assert.deepEqual(
   productDetails.map((asset) => asset.url),
   "product detail images must preserve the user-defined order",
 );
-const fiveProductDetails = [
+const tenProductDetails = [
   ...productDetails,
   { type: "image", url: "/d3.png" },
   { type: "image", url: "/d4.png" },
   { type: "image", url: "/d5.png" },
+  { type: "image", url: "/d6.png" },
+  { type: "image", url: "/d7.png" },
+  { type: "image", url: "/d8.png" },
+  { type: "image", url: "/d9.png" },
+  { type: "image", url: "/d10.png" },
 ];
-const fiveDetailVideo = buildGenerationPayload({
+const tenDetailVideo = buildGenerationPayload({
   ...directProductVideo,
   category: "video",
   creationMode: "video",
   subjectMode: "product",
   productAsset,
-  productDetailAssets: fiveProductDetails,
+  productDetailAssets: tenProductDetails,
   ratio: "9:16",
   imageQuality: "1k",
   n: 1,
@@ -278,16 +362,16 @@ const fiveDetailVideo = buildGenerationPayload({
   vResolution: "720p",
 });
 assert.deepEqual(
-  fiveDetailVideo.payload.params.product_detail_images,
-  fiveProductDetails.map((asset) => asset.url),
-  "five product details must be accepted and preserve order",
+  tenDetailVideo.payload.params.product_detail_images,
+  tenProductDetails.map((asset) => asset.url),
+  "ten product details must be accepted and preserve order",
 );
 assert.equal(directProductVideo.payload.params.reference_image_url, undefined);
 assert.equal(directProductVideo.payload.params.first_frame_image, undefined);
 assert.equal(directProductVideo.payload.params.last_frame_image, undefined);
 assert.equal(directProductVideo.payload.params.style_reference_image, styleAsset.url);
 assert.equal(directProductVideo.payload.params.product_lock_mode, "locked");
-assert.equal(directProductVideo.payload.params.product_video_template, "prompt_driven");
+assert.equal(directProductVideo.payload.params.product_video_template, "stable_showcase");
 assert.equal(directProductVideo.payload.source_asset_meta.product_generation_mode, true);
 assert.equal(directProductVideo.payload.source_asset_meta.product_subject.selected_url, productAsset.url);
 assert.equal(directProductVideo.payload.source_asset_meta.style_reference.selected_url, styleAsset.url);
@@ -339,7 +423,7 @@ assert.throws(
     creationMode: "video",
     subjectMode: "product",
     productAsset,
-    productDetailAssets: [...fiveProductDetails, { type: "image", url: "/d6.png" }],
+    productDetailAssets: [...tenProductDetails, { type: "image", url: "/d11.png" }],
     prompt: "x",
     ratio: "9:16",
     imageQuality: "1k",
@@ -347,8 +431,8 @@ assert.throws(
     vDuration: 5,
     vResolution: "720p",
   }),
-  /最多 5 张/,
-  "more than five details must fail instead of being truncated",
+  /最多 10 张/,
+  "more than ten details must fail instead of being truncated",
 );
 
 const productEditArgs = {
@@ -393,9 +477,10 @@ assert.equal(productEdit.payload.params.edit_mask_mode, "protect_subject");
 assert.equal(productEdit.payload.params.product_pixel_lock, "auto");
 assert.equal(productEdit.payload.params.n, 4);
 assert.match(productEdit.payload.prompt["产品身份档案"], /DAMAH 黑魔法/);
-assert.match(productEdit.payload.prompt.final_text, /DAMAH 黑魔法/);
-assert.match(productEdit.payload.prompt.final_text, /全棉棉柔巾/);
-assert.match(productEdit.payload.prompt.final_text, /200抽/);
+assert.ok(productEdit.payload.prompt["产品身份档案"].length <= 420);
+assert.doesNotMatch(productEdit.payload.prompt.final_text, /DAMAH 黑魔法/);
+assert.doesNotMatch(productEdit.payload.prompt.final_text, /全棉棉柔巾/);
+assert.doesNotMatch(productEdit.payload.prompt.final_text, /200抽/);
 assert.match(productEdit.payload.prompt.final_text, /唯一产品身份/);
 assert.match(productEdit.payload.prompt.final_text, /Logo和可见文字/);
 assert.ok(productEdit.payload.prompt.final_text.length <= 450);
@@ -458,6 +543,35 @@ assert.equal(structuredPortraitReference.payload.prompt.final_text, canonicalRev
 assert.equal(structuredPortraitReference.payload.prompt.instruction, canonicalReversePrompt);
 assert.equal(structuredPortraitReference.payload.params.reference_image_url, styleAsset.url);
 assert.equal(structuredPortraitReference.payload.params.subject_mode, undefined);
+
+const structuredGeneralReference = buildGenerationPayload({
+  ...staleReversePromptArgs,
+  prompt: canonicalReversePrompt,
+  promptSourceSignature: "image|http://localhost:8000/api/uploads/upload/style.jpg|",
+  selected: styleAsset,
+  structured: {
+    "图像类型": "产品图",
+    "主体": "白色包装居中直立",
+    "场景背景": "半透明蓝色冰块框景",
+    "构图": "竖版3:4中心构图",
+    "光线": "左后方橙金暖光",
+  },
+  structuredSource: "image|http://localhost:8000/api/uploads/upload/style.jpg|",
+  ratio: "3:4",
+});
+assert.equal(structuredGeneralReference.payload.params.reference_image_url, undefined);
+
+const structuredReplicaReference = buildGenerationPayload({
+  ...staleReversePromptArgs,
+  prompt: canonicalReversePrompt,
+  promptSourceSignature: "image|http://localhost:8000/api/uploads/upload/style.jpg|",
+  selected: styleAsset,
+  structured: structuredGeneralReference.effectiveStructured,
+  structuredSource: "image|http://localhost:8000/api/uploads/upload/style.jpg|",
+  analysisFocus: "replica",
+  ratio: "3:4",
+});
+assert.equal(structuredReplicaReference.payload.params.reference_image_url, styleAsset.url);
 
 const portraitReferencePricing = buildStudioDerivedViewState({
   cfg: {
@@ -674,6 +788,8 @@ const finalVideo = buildGenerationPayload({
       target_duration: 30,
       product_reference_image: productAsset.url,
       product_detail_images: productDetails.map((asset) => asset.url),
+      product_lock_mode: "free",
+      product_video_template: "background_motion",
     },
   },
   cfg: { video_duration_max_seconds: 900 },
@@ -693,6 +809,9 @@ assert.equal(finalVideo.payload.parent_task_id, 42);
 assert.equal(finalVideo.payload.params.resolution, "1080p");
 assert.equal(finalVideo.payload.params.duration, 15);
 assert.deepEqual(finalVideo.payload.params.product_detail_images, productDetails.map((asset) => asset.url));
+assert.equal(finalVideo.payload.params.subject_mode, "product");
+assert.equal(finalVideo.payload.params.product_lock_mode, "free");
+assert.equal(finalVideo.payload.params.product_video_template, "background_motion");
 assert.equal(finalVideo.ratioOption.key, "9:16");
 
 const directFinalVideo = buildGenerationPayload({
@@ -750,6 +869,11 @@ const optimizedDirectVideo = buildGenerationPayload({
       + "技术约束：总时长10秒；画幅9:16；分辨率1080p。"
     ),
     optimizer_model_id: "gemini-3.5-flash-low",
+    optimization_direction: "model_adaptation",
+    optimization_kind: "model_compile",
+    compiler_metadata: { version: "prompt-optimizer-v3", direction: "model_adaptation" },
+    change_summary: ["已针对目标模型编译"],
+    warnings: ["检查品牌文字"],
   },
   promptDirty: true,
   selected: null,
@@ -769,6 +893,42 @@ assert.equal(optimizedDirectVideo.payload.prompt.optimizer_model_id, "gemini-3.5
 assert.match(optimizedDirectVideo.payload.prompt.assembled_text, /^风格设定：/);
 assert.match(optimizedDirectVideo.payload.prompt.final_text, /\n技术约束：/);
 assert.equal(optimizedDirectVideo.payload.prompt.input_mode, "optimized");
+assert.equal(optimizedDirectVideo.payload.prompt.optimization_direction, "model_adaptation");
+assert.equal(optimizedDirectVideo.payload.prompt.optimization_kind, "model_compile");
+assert.equal(optimizedDirectVideo.payload.prompt.compiler_metadata.version, "prompt-optimizer-v3");
+assert.deepEqual(optimizedDirectVideo.payload.prompt.optimization_change_summary, ["已针对目标模型编译"]);
+assert.deepEqual(optimizedDirectVideo.payload.prompt.optimization_warnings, ["检查品牌文字"]);
+
+const optimizedDirectImage = buildGenerationPayload({
+  stage: "preview",
+  cfg: { image_size_max_dim: 2048, image_n_max: 8 },
+  category: "image",
+  creationMode: "image",
+  isEditMode: false,
+  prompt: {
+    text: "高端商业产品图，ACME SKU-7 包装保持不变。",
+    raw_text: "ACME SKU-7 产品图，包装不能变。",
+    optimized_text: "高端商业产品图，ACME SKU-7 包装保持不变。",
+    optimizer_model_id: "gemini-3.5-flash-low",
+    optimization_direction: "commercial",
+    optimization_kind: "rewrite",
+    compiler_metadata: { version: "prompt-optimizer-v2", direction: "commercial" },
+  },
+  promptDirty: true,
+  selected: null,
+  structured: {},
+  ratio: "1:1",
+  imageQuality: "1k",
+  n: 1,
+  seed: "",
+  vDuration: 5,
+  vResolution: "720p",
+});
+assert.equal(optimizedDirectImage.payload.prompt.input_mode, "optimized");
+assert.equal(optimizedDirectImage.payload.prompt.raw_text, "ACME SKU-7 产品图，包装不能变。");
+assert.equal(optimizedDirectImage.payload.prompt.optimized_text, "高端商业产品图，ACME SKU-7 包装保持不变。");
+assert.equal(optimizedDirectImage.payload.prompt.optimization_direction, "commercial");
+assert.equal(optimizedDirectImage.payload.prompt.compiler_metadata.version, "prompt-optimizer-v2");
 
 const productVideoEditArgs = {
   stage: "final",
@@ -821,8 +981,7 @@ const productVideoEditArgs = {
   seed: "",
   vDuration: 5,
   vResolution: "720p",
-  videoProductLockMode: "free",
-  videoProductTemplate: "soft_splash",
+  productVideoTemplate: "soft_splash",
 };
 const productVideoEditFree = buildGenerationPayload(productVideoEditArgs);
 
@@ -831,7 +990,7 @@ assert.equal(productVideoEditFree.payload.stage, "final");
 assert.equal(productVideoEditFree.payload.parent_task_id, null);
 assert.equal(productVideoEditFree.payload.params.subject_mode, "product");
 assert.equal(productVideoEditFree.payload.params.product_lock_mode, "locked");
-assert.equal(productVideoEditFree.payload.params.product_video_template, "prompt_driven");
+assert.equal(productVideoEditFree.payload.params.product_video_template, "soft_splash");
 assert.equal(productVideoEditFree.payload.params.product_reference_image, productAsset.url);
 assert.equal(productVideoEditFree.payload.params.reference_image_url, undefined);
 assert.equal(productVideoEditFree.payload.params.first_frame_image, undefined);
@@ -958,21 +1117,34 @@ assert.match(
 
 const productVideoEditLocked = buildGenerationPayload({
   ...productVideoEditArgs,
-  videoProductLockMode: "locked",
-  videoProductTemplate: "slow_push",
+  productVideoTemplate: "slow_push",
 });
 
 assert.equal(productVideoEditLocked.payload.params.product_lock_mode, "locked");
-assert.equal(productVideoEditLocked.payload.params.product_video_template, "prompt_driven");
+assert.equal(productVideoEditLocked.payload.params.product_video_template, "slow_push");
+
+const productVideoSingleClip = buildGenerationPayload({
+  ...productVideoEditArgs,
+  productVideoTemplate: "single_clip_action",
+});
+assert.equal(productVideoSingleClip.payload.params.product_video_template, "single_clip_action");
 
 const productVideoEditDefault = buildGenerationPayload({
   ...productVideoEditArgs,
-  videoProductLockMode: undefined,
-  videoProductTemplate: undefined,
+  productVideoTemplate: undefined,
 });
 
 assert.equal(productVideoEditDefault.payload.params.product_lock_mode, "locked");
 assert.equal(productVideoEditDefault.payload.params.product_video_template, "prompt_driven");
+
+assert.throws(
+  () => buildGenerationPayload({
+    ...productVideoEditArgs,
+    productVideoTemplate: "wild_spin",
+  }),
+  /产品视频策略无效/,
+  "unknown product video strategies must fail before reaching the API",
+);
 
 const fakeStorage = new Map();
 const storage = {

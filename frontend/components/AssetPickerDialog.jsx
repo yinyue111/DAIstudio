@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useRef, useState } from "react";
+import { Search, X } from "lucide-react";
 import { api } from "../lib/api";
 import {
   assetReferenceUrl,
@@ -17,6 +18,11 @@ const ROLE_LABELS = {
   style: "选择风格参考",
   first_frame: "选择视频首帧",
   last_frame: "选择视频尾帧",
+  reverse_batch: "选择批量反推素材",
+  storyboard_shot: "绑定分镜视频素材",
+  storyboard_audio: "选择含音频的视频素材",
+  project_assets: "选择项目素材",
+  folder_assets: "选择文件夹素材",
 };
 
 function isAssetExcluded(asset, excludedRefSet, excludedUrlSet) {
@@ -44,6 +50,12 @@ export default function AssetPickerDialog({
   const dialogRef = useRef(null);
   const [origin, setOrigin] = useState("all");
   const [favoriteOnly, setFavoriteOnly] = useState(false);
+  const [folders, setFolders] = useState([]);
+  const [folder, setFolder] = useState("all");
+  const [searchDraft, setSearchDraft] = useState("");
+  const [tagDraft, setTagDraft] = useState("");
+  const [query, setQuery] = useState("");
+  const [tag, setTag] = useState("");
   const [items, setItems] = useState([]);
   const [nextCursor, setNextCursor] = useState(null);
   const [loading, setLoading] = useState(false);
@@ -59,7 +71,25 @@ export default function AssetPickerDialog({
     setSelection(initial);
     setOrigin("all");
     setFavoriteOnly(false);
+    setFolder("all");
+    setSearchDraft("");
+    setTagDraft("");
+    setQuery("");
+    setTag("");
   }, [open, role]);
+
+  useEffect(() => {
+    if (!open) return undefined;
+    let cancelled = false;
+    api.assetFolders()
+      .then((rows) => {
+        if (!cancelled) setFolders(Array.isArray(rows) ? rows : []);
+      })
+      .catch(() => {
+        if (!cancelled) setFolders([]);
+      });
+    return () => { cancelled = true; };
+  }, [open]);
 
   useEffect(() => {
     if (!open) return;
@@ -71,6 +101,9 @@ export default function AssetPickerDialog({
       type: mediaType,
       favorite: favoriteOnly ? true : "",
       retention: "all",
+      q: query,
+      tag,
+      folder,
       limit: PAGE_SIZE,
       cursor: "",
       offset: 0,
@@ -85,7 +118,7 @@ export default function AssetPickerDialog({
       if (!cancelled) setLoading(false);
     });
     return () => { cancelled = true; };
-  }, [open, origin, favoriteOnly, mediaType, reloadToken]);
+  }, [open, origin, favoriteOnly, mediaType, query, tag, folder, reloadToken]);
 
   useEffect(() => {
     if (!open) return undefined;
@@ -157,6 +190,9 @@ export default function AssetPickerDialog({
         type: mediaType,
         favorite: favoriteOnly ? true : "",
         retention: "all",
+        q: query,
+        tag,
+        folder,
         limit: PAGE_SIZE,
         cursor: nextCursor,
         offset: 0,
@@ -229,8 +265,67 @@ export default function AssetPickerDialog({
             />
             仅收藏
           </label>
+          <form
+            className="flex min-w-full flex-1 flex-wrap items-center gap-2 lg:min-w-0"
+            onSubmit={(event) => {
+              event.preventDefault();
+              setQuery(searchDraft.trim());
+              setTag(tagDraft.trim().replace(/^#+/, ""));
+            }}
+            role="search"
+          >
+            <label className="sr-only" htmlFor="asset-picker-search">搜索素材</label>
+            <input
+              id="asset-picker-search"
+              className="input h-9 min-w-40 flex-1 py-1.5 text-sm"
+              value={searchDraft}
+              onChange={(event) => setSearchDraft(event.target.value)}
+              maxLength={100}
+              placeholder="名称、提示词或标签"
+            />
+            <label className="sr-only" htmlFor="asset-picker-tag">标签筛选</label>
+            <input
+              id="asset-picker-tag"
+              className="input h-9 w-28 py-1.5 text-sm"
+              value={tagDraft}
+              onChange={(event) => setTagDraft(event.target.value)}
+              maxLength={32}
+              placeholder="标签"
+            />
+            <label className="sr-only" htmlFor="asset-picker-folder">文件夹筛选</label>
+            <select
+              id="asset-picker-folder"
+              className="input h-9 min-w-32 py-1.5 text-sm"
+              value={folder}
+              onChange={(event) => setFolder(event.target.value)}
+            >
+              <option value="all">全部文件夹</option>
+              <option value="unfiled">未归档</option>
+              {folders.map((item) => <option key={item.id} value={String(item.id)}>{item.name}</option>)}
+            </select>
+            <button type="submit" className="icon-btn h-9 w-9" title="搜索素材" aria-label="搜索素材">
+              <Search size={15} aria-hidden="true" />
+            </button>
+            {(query || tag || folder !== "all") && (
+              <button
+                type="button"
+                className="icon-btn h-9 w-9"
+                title="清除搜索和归档筛选"
+                aria-label="清除搜索和归档筛选"
+                onClick={() => {
+                  setSearchDraft("");
+                  setTagDraft("");
+                  setQuery("");
+                  setTag("");
+                  setFolder("all");
+                }}
+              >
+                <X size={15} aria-hidden="true" />
+              </button>
+            )}
+          </form>
           {onUploadRequest && (
-            <button type="button" onClick={onUploadRequest} className="btn-secondary btn-sm ml-auto">
+            <button type="button" onClick={onUploadRequest} className="btn-secondary btn-sm lg:ml-auto">
               上传新素材
             </button>
           )}

@@ -2,6 +2,7 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
+import { FolderInput, ScanSearch, Search, Tags, X } from "lucide-react";
 import { api, clearToken, downloadBlob, loginPath } from "../../lib/api";
 import { formatLocalDateTime } from "../../lib/datetime";
 import { redirectOnAuthError, reportBackgroundError } from "../../lib/errorHandling";
@@ -64,12 +65,39 @@ function downloadFilename(asset) {
   return asset?.type === "video" ? `asset-${id}.mp4` : `asset-${id}.png`;
 }
 
+function parseTags(value) {
+  const seen = new Set();
+  const tags = [];
+  for (const raw of String(value || "").split(/[,，]/)) {
+    const tag = raw.trim().replace(/^#+/, "");
+    const key = tag.toLocaleLowerCase();
+    if (!tag || seen.has(key)) continue;
+    seen.add(key);
+    tags.push(tag);
+  }
+  return tags;
+}
+
 export default function ProfilePage() {
   const router = useRouter();
   const notify = useToast();
   const [me, setMe] = useState(null);
   const [profile, setProfile] = useState(null);
-  const [filters, setFilters] = useState({ origin: "all", type: "all", favorite: false, retention: "all" });
+  const [filters, setFilters] = useState({
+    origin: "all",
+    type: "all",
+    favorite: false,
+    retention: "all",
+    q: "",
+    tag: "",
+    folder: "all",
+  });
+  const [searchDraft, setSearchDraft] = useState("");
+  const [tagDraft, setTagDraft] = useState("");
+  const [folders, setFolders] = useState([]);
+  const [moveFolderId, setMoveFolderId] = useState("");
+  const [tagEditor, setTagEditor] = useState(null);
+  const [similarity, setSimilarity] = useState(null);
   const [assets, setAssets] = useState(null);
   const [stats, setStats] = useState(null);
   const [total, setTotal] = useState(0);
@@ -93,11 +121,20 @@ export default function ProfilePage() {
   useEffect(() => {
     api.me().then(setMe).catch((error) => redirectOnAuthError(error, router, setMsg, "profile session probe"));
     api.profile().then(setProfile).catch((error) => reportBackgroundError(error, "load profile summary"));
+    loadFolders();
   }, []);
 
   useEffect(() => {
     loadAssets(true);
-  }, [filters.origin, filters.type, filters.favorite, filters.retention]);
+  }, [
+    filters.origin,
+    filters.type,
+    filters.favorite,
+    filters.retention,
+    filters.q,
+    filters.tag,
+    filters.folder,
+  ]);
 
   useEffect(() => {
     if (!assets) return;
@@ -119,6 +156,9 @@ export default function ProfilePage() {
         type: filters.type,
         favorite: filters.favorite ? true : "",
         retention: filters.retention,
+        q: filters.q,
+        tag: filters.tag,
+        folder: filters.folder,
         limit: PAGE_SIZE,
         cursor: reset ? "" : nextCursor,
         offset: 0,
@@ -149,6 +189,15 @@ export default function ProfilePage() {
         loadingRef.current = false;
         setLoading(false);
       }
+    }
+  }
+
+  async function loadFolders() {
+    try {
+      const rows = await api.assetFolders();
+      setFolders(Array.isArray(rows) ? rows : []);
+    } catch (error) {
+      reportBackgroundError(error, "load asset folders");
     }
   }
 
@@ -226,6 +275,71 @@ export default function ProfilePage() {
     });
   }
 
+  async function saveTags(ref) {
+    const tags = parseTags(tagEditor?.value);
+    if (tags.length > 20 || tags.some((tag) => tag.length > 32)) {
+      notify.warn("最多保存 20 个标签，每个标签不超过 32 个字符");
+      return;
+    }
+    await withBusy([ref], async () => {
+      try {
+        const metadata = await api.updateMeAssetTags(ref, tags);
+        patchAssets([ref], { tags: metadata.tags || [] });
+        setTagEditor(null);
+        if (filters.tag && !tags.some((tag) => tag.toLocaleLowerCase() === filters.tag.toLocaleLowerCase())) {
+          await loadAssets(true);
+        }
+        notify.success("素材标签已保存");
+      } catch (error) {
+        notify.error(error.message || "标签保存失败");
+      }
+    });
+  }
+
+  async function moveSelectedAssets() {
+    const refs = [...selectedRefs];
+    if (!refs.length || !moveFolderId) return;
+    await withBusy(refs, async () => {
+      try {
+        if (moveFolderId === "unfiled") {
+          const byFolder = new Map();
+          for (const asset of selectedAssets) {
+            if (!asset.folder_id) continue;
+            const key = String(asset.folder_id);
+            byFolder.set(key, [...(byFolder.get(key) || []), unifiedAssetKey(asset)]);
+          }
+          await Promise.all(
+            [...byFolder.entries()].map(([folderId, assetRefs]) => (
+              api.removeAssetsFromFolder(folderId, assetRefs)
+            )),
+          );
+        } else {
+          await api.moveAssetsToFolder(moveFolderId, refs);
+        }
+        setSelectedRefs(new Set());
+        setMoveFolderId("");
+        await Promise.all([loadAssets(true), loadFolders()]);
+        notify.success(moveFolderId === "unfiled" ? "素材已移出文件夹" : "素材已移动到文件夹");
+      } catch (error) {
+        notify.error(error.message || "移动素材失败");
+      }
+    });
+  }
+
+  async function findSimilar(asset) {
+    const ref = unifiedAssetKey(asset);
+    await withBusy([ref], async () => {
+      try {
+        const result = await api.findMeSimilarAssets(ref, { maxDistance: 8 });
+        const matches = (result.matches || []).map((item) => item.asset).filter(Boolean);
+        setSimilarity({ query: asset, result, assets: [asset, ...matches] });
+        if (!matches.length) notify.success("未发现重复或感知相似素材");
+      } catch (error) {
+        notify.error(error.message || "查重与相似检测失败");
+      }
+    });
+  }
+
   async function deleteRefs(refs) {
     if (!refs.length || !window.confirm(`确认删除选中的 ${refs.length} 个资产？删除后不可恢复。`)) return;
     await withBusy(refs, async () => {
@@ -289,7 +403,16 @@ export default function ProfilePage() {
       if (type === "image") await api.uploadImage(file);
       else await api.uploadVideo(file);
       notify.success(`${type === "image" ? "图片" : "视频"}已加入我的资产。`);
-      setFilters((current) => ({ ...current, origin: "all", type }));
+      setSearchDraft("");
+      setTagDraft("");
+      setFilters((current) => ({
+        ...current,
+        origin: "all",
+        type,
+        q: "",
+        tag: "",
+        folder: "all",
+      }));
       await loadAssets(true);
     } catch (error) {
       setMsg(error.message || "上传失败");
@@ -328,7 +451,7 @@ export default function ProfilePage() {
     () => (assets || []).filter((asset) => compareSelection.has(unifiedAssetKey(asset))),
     [assets, compareSelection],
   );
-  const compareAssets = selectedAssets.slice(0, 4);
+  const compareAssets = (similarity?.assets || selectedAssets).slice(0, 4);
   const hasMore = Boolean(nextCursor);
 
   function renderAsset(asset) {
@@ -365,15 +488,47 @@ export default function ProfilePage() {
             {asset.bytes ? <span className="shrink-0">{formatBytes(asset.bytes)}</span> : null}
           </div>
           {metadata && <p className="truncate text-[11px] text-fog">{metadata}</p>}
+          {(asset.folder_name || (asset.tags || []).length > 0) && (
+            <div className="flex min-h-5 flex-wrap gap-1" aria-label="素材归档信息">
+              {asset.folder_name && <span className="badge border border-line bg-white/[0.04] text-fog">{asset.folder_name}</span>}
+              {(asset.tags || []).map((tag) => <span key={tag} className="badge border border-aqua/25 bg-aqua/10 text-aqua">#{tag}</span>)}
+            </div>
+          )}
+          {tagEditor?.ref === ref && (
+            <form
+              className="flex gap-1.5"
+              onSubmit={(event) => {
+                event.preventDefault();
+                saveTags(ref);
+              }}
+            >
+              <label className="sr-only" htmlFor={`asset-tags-${ref}`}>素材标签</label>
+              <input
+                id={`asset-tags-${ref}`}
+                className="input h-8 min-w-0 flex-1 py-1 text-xs"
+                value={tagEditor.value}
+                onChange={(event) => setTagEditor({ ref, value: event.target.value })}
+                maxLength={680}
+                placeholder="商品, 主图"
+                autoFocus
+              />
+              <button type="submit" className="btn-primary btn-sm" disabled={busy}>保存</button>
+              <button type="button" className="icon-btn h-8 w-8" onClick={() => setTagEditor(null)} title="取消编辑" aria-label="取消编辑标签">
+                <X size={13} aria-hidden="true" />
+              </button>
+            </form>
+          )}
           <div className="flex items-center justify-between gap-2">
             <div className="flex gap-1">
               <button type="button" onClick={() => updateMetadata([ref], { favorite: !asset.favorite })} disabled={busy} className="btn-ghost btn-sm" aria-label={asset.favorite ? "取消收藏" : "收藏"} title={asset.favorite ? "取消收藏" : "收藏"}>{asset.favorite ? "★" : "☆"}</button>
               <button type="button" onClick={() => updateMetadata([ref], { retained: !asset.retained })} disabled={busy} className="btn-ghost btn-sm" title={asset.retained ? "取消长期保留" : "长期保留"}>{asset.retained ? "取消保留" : "保留"}</button>
-              <button type="button" onClick={() => deleteRefs([ref])} disabled={busy} className="btn-ghost btn-sm text-bad" title="删除">删除</button>
+              <button type="button" onClick={() => setTagEditor({ ref, value: (asset.tags || []).join(", ") })} disabled={busy} className="icon-btn h-8 w-8" title="编辑标签" aria-label="编辑素材标签"><Tags size={14} aria-hidden="true" /></button>
+              <button type="button" onClick={() => findSimilar(asset)} disabled={busy} className="icon-btn h-8 w-8" title="查重与相似检测" aria-label="查重与相似检测"><ScanSearch size={14} aria-hidden="true" /></button>
             </div>
             <div className="flex gap-1">
               {asset.type === "image" && <button type="button" onClick={() => createVariation(asset)} disabled={busy} className="btn-secondary btn-sm">变体</button>}
               <button type="button" onClick={() => download(asset)} disabled={busy || !canDownloadAsset(asset)} className="btn-primary btn-sm">{busy ? "处理中" : "下载"}</button>
+              <button type="button" onClick={() => deleteRefs([ref])} disabled={busy} className="btn-ghost btn-sm text-bad" title="删除">删除</button>
             </div>
           </div>
         </div>
@@ -428,13 +583,95 @@ export default function ProfilePage() {
             <input type="checkbox" checked={filters.favorite} onChange={(event) => setFilters((current) => ({ ...current, favorite: event.target.checked }))} className="h-3.5 w-3.5 accent-brand" />
             仅收藏
           </label>
-          <span className="ml-auto text-xs text-fog">默认资产按平台保留策略过期；收藏不等于长期保留。</span>
+          <form
+            className="flex min-w-full flex-1 flex-wrap items-center gap-2 pt-2 lg:min-w-0 lg:pt-0"
+            role="search"
+            onSubmit={(event) => {
+              event.preventDefault();
+              setFilters((current) => ({
+                ...current,
+                q: searchDraft.trim(),
+                tag: tagDraft.trim().replace(/^#+/, ""),
+              }));
+            }}
+          >
+            <label className="sr-only" htmlFor="asset-library-search">搜索素材</label>
+            <input
+              id="asset-library-search"
+              type="search"
+              className="input h-9 min-w-48 flex-1 py-1.5 text-sm"
+              value={searchDraft}
+              onChange={(event) => setSearchDraft(event.target.value)}
+              maxLength={100}
+              placeholder="名称、提示词、标签或文件夹"
+            />
+            <label className="sr-only" htmlFor="asset-library-tag">按标签筛选</label>
+            <input
+              id="asset-library-tag"
+              className="input h-9 w-32 py-1.5 text-sm"
+              value={tagDraft}
+              onChange={(event) => setTagDraft(event.target.value)}
+              maxLength={32}
+              placeholder="精确标签"
+            />
+            <label className="sr-only" htmlFor="asset-library-folder">按文件夹筛选</label>
+            <select
+              id="asset-library-folder"
+              className="input h-9 min-w-36 py-1.5 text-sm"
+              value={filters.folder}
+              onChange={(event) => setFilters((current) => ({ ...current, folder: event.target.value }))}
+            >
+              <option value="all">全部文件夹</option>
+              <option value="unfiled">未归档</option>
+              {folders.map((folder) => <option key={folder.id} value={String(folder.id)}>{folder.name}</option>)}
+            </select>
+            <button type="submit" className="icon-btn h-9 w-9" title="搜索素材" aria-label="搜索素材">
+              <Search size={15} aria-hidden="true" />
+            </button>
+            {(filters.q || filters.tag || filters.folder !== "all") && (
+              <button
+                type="button"
+                className="icon-btn h-9 w-9"
+                title="清除搜索和归档筛选"
+                aria-label="清除搜索和归档筛选"
+                onClick={() => {
+                  setSearchDraft("");
+                  setTagDraft("");
+                  setFilters((current) => ({ ...current, q: "", tag: "", folder: "all" }));
+                }}
+              >
+                <X size={15} aria-hidden="true" />
+              </button>
+            )}
+          </form>
+          <span className="text-xs text-fog">收藏不等于长期保留。</span>
         </section>
 
         {selectedAssets.length > 0 && (
           <div className="sticky top-[73px] z-20 mb-5 flex flex-wrap items-center justify-between gap-2 border border-brand/30 bg-base2/95 px-3 py-2 shadow-pop backdrop-blur-xl">
             <span className="text-sm text-mist">已选择 {selectedAssets.length} 个资产</span>
             <div className="flex flex-wrap gap-2">
+              <label className="sr-only" htmlFor="asset-batch-folder">目标文件夹</label>
+              <select
+                id="asset-batch-folder"
+                className="input h-9 min-w-36 py-1.5 text-sm"
+                value={moveFolderId}
+                onChange={(event) => setMoveFolderId(event.target.value)}
+              >
+                <option value="">移动到文件夹</option>
+                <option value="unfiled">移出文件夹</option>
+                {folders.map((folder) => <option key={folder.id} value={String(folder.id)}>{folder.name}</option>)}
+              </select>
+              <button
+                type="button"
+                onClick={moveSelectedAssets}
+                disabled={!moveFolderId || selectedAssets.some((asset) => busyRefs.has(unifiedAssetKey(asset)))}
+                className="icon-btn h-9 w-9"
+                title="移动所选素材"
+                aria-label="移动所选素材"
+              >
+                <FolderInput size={15} aria-hidden="true" />
+              </button>
               <button type="button" onClick={() => updateMetadata([...selectedRefs], { retained: true })} className="btn-secondary btn-sm">长期保留</button>
               <button type="button" onClick={() => updateMetadata([...selectedRefs], { favorite: true })} className="btn-secondary btn-sm">收藏</button>
               <button type="button" onClick={() => deleteRefs([...selectedRefs])} className="btn-ghost btn-sm text-bad">删除</button>
@@ -445,7 +682,25 @@ export default function ProfilePage() {
 
         {msg && <div className="mb-5 border border-bad/30 bg-bad/10 px-4 py-3 text-sm text-bad">{msg}</div>}
 
-        <AssetComparePanel assets={compareAssets} onClose={() => setSelectedRefs(new Set())} />
+        {similarity && (
+          <div className={`mb-3 flex items-start justify-between gap-3 border px-3 py-2 text-sm ${similarity.result.status === "degraded" ? "border-warn/30 bg-warn/10 text-warn" : "border-aqua/30 bg-aqua/10 text-mist"}`} role="status">
+            <div>
+              <p className="font-medium text-snow">查重完成：发现 {similarity.result.matches?.length || 0} 个匹配素材</p>
+              <p className="mt-0.5 text-xs">{similarity.result.message || "已完成 SHA-256 精确查重和图片感知相似检测。"}</p>
+            </div>
+            <button type="button" onClick={() => setSimilarity(null)} className="icon-btn h-8 w-8" title="关闭查重结果" aria-label="关闭查重结果">
+              <X size={14} aria-hidden="true" />
+            </button>
+          </div>
+        )}
+
+        <AssetComparePanel
+          assets={compareAssets}
+          onClose={() => {
+            setSimilarity(null);
+            setSelectedRefs(new Set());
+          }}
+        />
 
         {assets === null ? (
           <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-4">
@@ -476,6 +731,8 @@ export default function ProfilePage() {
               <>
                 <button type="button" onClick={() => updateMetadata([ref], { favorite: !asset.favorite })} disabled={busyRefs.has(ref)} className="btn-ghost btn-sm">{asset.favorite ? "★ 已收藏" : "☆ 收藏"}</button>
                 <button type="button" onClick={() => updateMetadata([ref], { retained: !asset.retained })} disabled={busyRefs.has(ref)} className="btn-secondary btn-sm">{asset.retained ? "取消长期保留" : "长期保留"}</button>
+                <button type="button" onClick={() => setTagEditor({ ref, value: (asset.tags || []).join(", ") })} disabled={busyRefs.has(ref)} className="btn-secondary btn-sm">编辑标签</button>
+                <button type="button" onClick={() => findSimilar(asset)} disabled={busyRefs.has(ref)} className="btn-secondary btn-sm">查重</button>
                 {asset.type === "image" && <button type="button" onClick={() => createVariation(asset)} className="btn-secondary btn-sm">生成变体</button>}
                 <button type="button" onClick={() => download(asset)} disabled={busyRefs.has(ref) || !canDownloadAsset(asset)} className="btn-primary btn-sm">下载</button>
                 <button type="button" onClick={() => deleteRefs([ref])} disabled={busyRefs.has(ref)} className="btn-ghost btn-sm text-bad">删除</button>

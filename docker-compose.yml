@@ -36,6 +36,11 @@ x-app-datastores: &app_datastores
 x-backend-env-file: &backend_env_file
   - path: ${BACKEND_ENV_FILE:-./backend/.env.production}
     required: true
+x-backend-build: &backend_build
+  context: ./backend
+  args:
+    DEBIAN_MIRROR: ${DEBIAN_MIRROR:-https://deb.debian.org}
+    PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.org/simple}
 
 services:
   postgres:
@@ -70,7 +75,7 @@ services:
     networks: [backend_internal]
 
   migrate:
-    build: ./backend
+    build: *backend_build
     env_file: *backend_env_file
     environment:
       <<: *app_datastores
@@ -86,7 +91,7 @@ services:
     networks: [backend_internal]
 
   api:
-    build: ./backend
+    build: *backend_build
     restart: unless-stopped
     env_file: *backend_env_file
     environment:
@@ -110,7 +115,7 @@ services:
     networks: [backend_internal, frontend_edge]
 
   worker:
-    build: ./backend
+    build: *backend_build
     restart: unless-stopped
     stop_grace_period: ${WORKER_STOP_GRACE_PERIOD:-15m}
     # Critical short-lived queues only. Keep payment reconciliation, cleanup,
@@ -137,7 +142,7 @@ services:
     networks: [backend_internal, external_access]
 
   worker_image:
-    build: ./backend
+    build: *backend_build
     restart: unless-stopped
     stop_grace_period: ${WORKER_STOP_GRACE_PERIOD:-15m}
     command: celery -A app.celery_app.celery_app worker -l info --pool=${WORKER_IMAGE_POOL:-threads} --concurrency=${WORKER_IMAGE_CONCURRENCY:-4} -Q ${WORKER_IMAGE_QUEUES:-image}
@@ -161,7 +166,7 @@ services:
     networks: [backend_internal, external_access]
 
   worker_video:
-    build: ./backend
+    build: *backend_build
     restart: unless-stopped
     stop_grace_period: ${WORKER_STOP_GRACE_PERIOD:-15m}
     command: celery -A app.celery_app.celery_app worker -l info --pool=${WORKER_VIDEO_SUBMIT_POOL:-solo} --concurrency=${WORKER_VIDEO_SUBMIT_CONCURRENCY:-1} -Q ${WORKER_VIDEO_SUBMIT_QUEUES:-video_submit}
@@ -185,7 +190,7 @@ services:
     networks: [backend_internal, external_access]
 
   worker_video_download:
-    build: ./backend
+    build: *backend_build
     restart: unless-stopped
     stop_grace_period: ${WORKER_STOP_GRACE_PERIOD:-15m}
     command: celery -A app.celery_app.celery_app worker -l info --pool=${WORKER_VIDEO_DOWNLOAD_POOL:-solo} --concurrency=${WORKER_VIDEO_DOWNLOAD_CONCURRENCY:-1} -Q ${WORKER_VIDEO_DOWNLOAD_QUEUES:-video_download}
@@ -209,7 +214,7 @@ services:
     networks: [backend_internal, external_access]
 
   worker_parse:
-    build: ./backend
+    build: *backend_build
     restart: unless-stopped
     stop_grace_period: ${WORKER_STOP_GRACE_PERIOD:-15m}
     command: celery -A app.celery_app.celery_app worker -l info --pool=${WORKER_PARSE_POOL:-solo} --concurrency=${WORKER_PARSE_CONCURRENCY:-1} -Q ${WORKER_PARSE_QUEUES:-parse}
@@ -234,7 +239,7 @@ services:
     networks: [backend_internal, external_access]
 
   worker_reverse:
-    build: ./backend
+    build: *backend_build
     restart: unless-stopped
     stop_grace_period: ${WORKER_STOP_GRACE_PERIOD:-15m}
     # Keep this on threads: reverse tasks use cooperative cancellation and must
@@ -259,8 +264,34 @@ services:
         condition: service_healthy
     networks: [backend_internal, external_access]
 
+  worker_workflow:
+    build: *backend_build
+    restart: unless-stopped
+    stop_grace_period: ${WORKER_STOP_GRACE_PERIOD:-15m}
+    # Workflow nodes can invoke providers and FFmpeg. Keep them isolated from
+    # short control-plane jobs and mount the same media volume as the API.
+    command: celery -A app.celery_app.celery_app worker -l info --pool=${WORKER_WORKFLOW_POOL:-threads} --concurrency=${WORKER_WORKFLOW_CONCURRENCY:-2} -Q ${WORKER_WORKFLOW_QUEUES:-workflow}
+    env_file: *backend_env_file
+    environment:
+      <<: *app_datastores
+      DEPLOY_ENV: ${DEPLOY_ENV:-production}
+    mem_limit: ${WORKER_WORKFLOW_MEM_LIMIT:-2g}
+    volumes:
+      - media:/app/storage
+    healthcheck:
+      test: ["CMD-SHELL", "celery -A app.celery_app.celery_app inspect ping -d celery@$$HOSTNAME || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    networks: [backend_internal, external_access]
+
   beat:
-    build: ./backend
+    build: *backend_build
     restart: unless-stopped
     # Exactly ONE scheduler for the whole stack (retention cleanup, stuck-task
     # reaper, video-resume). Do not scale this service.
@@ -302,6 +333,109 @@ services:
         condition: service_healthy
     networks: [frontend_edge]
 
+  evidence_provider:
+    profiles: [evidence]
+    build: ./evidence_provider
+    restart: unless-stopped
+    environment:
+      EVIDENCE_PROVIDER_API_KEY: ${EVIDENCE_PROVIDER_API_KEY:-}
+      EVIDENCE_PROVIDER_DEVICE: ${EVIDENCE_PROVIDER_DEVICE:-cpu}
+      EVIDENCE_PROVIDER_EAGER_LOAD: "true"
+    ports:
+      - "127.0.0.1:${EVIDENCE_PROVIDER_PORT:-8090}:8090"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - >-
+          import os, urllib.request;
+          key = os.environ.get("EVIDENCE_PROVIDER_API_KEY", "");
+          request = urllib.request.Request(
+              "http://localhost:8090/health",
+              headers={"Authorization": "Bearer " + key} if key else {},
+          );
+          urllib.request.urlopen(request, timeout=5).read()
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 90s
+    mem_limit: ${EVIDENCE_PROVIDER_MEM_LIMIT:-2g}
+    networks: [backend_internal, analyzer_edge]
+
+  video_semantic_provider:
+    profiles: [evidence]
+    build: ./video_semantic_provider
+    restart: unless-stopped
+    environment:
+      VIDEO_SEMANTIC_PROVIDER_API_KEY: ${VIDEO_SEMANTIC_PROVIDER_API_KEY:-}
+      VIDEO_SEMANTIC_MAX_FRAMES: ${VIDEO_SEMANTIC_MAX_FRAMES:-64}
+      VIDEO_SEMANTIC_MAX_FRAME_BYTES: ${VIDEO_SEMANTIC_MAX_FRAME_BYTES:-12582912}
+      VIDEO_SEMANTIC_MAX_FRAME_PIXELS: ${VIDEO_SEMANTIC_MAX_FRAME_PIXELS:-24000000}
+      VIDEO_SEMANTIC_MIN_MOTION_AREA_RATIO: ${VIDEO_SEMANTIC_MIN_MOTION_AREA_RATIO:-0.002}
+      VIDEO_SEMANTIC_MAX_MOTION_AREA_RATIO: ${VIDEO_SEMANTIC_MAX_MOTION_AREA_RATIO:-0.70}
+      VIDEO_SEMANTIC_TRACK_IOU_THRESHOLD: ${VIDEO_SEMANTIC_TRACK_IOU_THRESHOLD:-0.12}
+      VIDEO_SEMANTIC_TRANSITION_THRESHOLD: ${VIDEO_SEMANTIC_TRANSITION_THRESHOLD:-0.46}
+    ports:
+      - "127.0.0.1:${VIDEO_SEMANTIC_PROVIDER_PORT:-8091}:8091"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - >-
+          import os, urllib.request;
+          key = os.environ.get("VIDEO_SEMANTIC_PROVIDER_API_KEY", "");
+          request = urllib.request.Request(
+              "http://localhost:8091/health",
+              headers={"Authorization": "Bearer " + key} if key else {},
+          );
+          urllib.request.urlopen(request, timeout=5).read()
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 15s
+    mem_limit: ${VIDEO_SEMANTIC_PROVIDER_MEM_LIMIT:-1g}
+    networks: [backend_internal, analyzer_edge]
+
+  audio_provider:
+    profiles: [evidence]
+    build:
+      context: ./audio_provider
+      args:
+        ASR_PROVIDER_MODEL: ${ASR_PROVIDER_MODEL:-small}
+    restart: unless-stopped
+    environment:
+      ASR_PROVIDER_API_KEY: ${ASR_PROVIDER_API_KEY:-}
+      ASR_PROVIDER_MODEL: ${ASR_PROVIDER_MODEL:-small}
+      ASR_PROVIDER_DEVICE: ${ASR_PROVIDER_DEVICE:-cpu}
+      ASR_PROVIDER_COMPUTE_TYPE: ${ASR_PROVIDER_COMPUTE_TYPE:-int8}
+      ASR_PROVIDER_EAGER_LOAD: "true"
+      ASR_PROVIDER_MAX_UPLOAD_BYTES: ${ASR_PROVIDER_MAX_UPLOAD_BYTES:-50331648}
+      ASR_PROVIDER_MAX_SEGMENTS: ${ASR_PROVIDER_MAX_SEGMENTS:-1000}
+      ASR_PROVIDER_BEAM_SIZE: ${ASR_PROVIDER_BEAM_SIZE:-5}
+    ports:
+      - "127.0.0.1:${AUDIO_PROVIDER_PORT:-8092}:8092"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - >-
+          import os, urllib.request;
+          key = os.environ.get("ASR_PROVIDER_API_KEY", "");
+          request = urllib.request.Request(
+              "http://localhost:8092/health",
+              headers={"Authorization": "Bearer " + key} if key else {},
+          );
+          urllib.request.urlopen(request, timeout=5).read()
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 180s
+    mem_limit: ${AUDIO_PROVIDER_MEM_LIMIT:-3g}
+    networks: [backend_internal, analyzer_edge]
+
   # Optional object storage (swap services/storage.py to use it):
   # minio:
   #   image: minio/minio
@@ -321,5 +455,6 @@ volumes:
 networks:
   backend_internal:
     internal: true
+  analyzer_edge:
   frontend_edge:
   external_access:

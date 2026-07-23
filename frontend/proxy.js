@@ -15,6 +15,7 @@ function isPublicRequest(pathname) {
   return pathname.startsWith("/api/")
     || pathname.startsWith("/_next/")
     || pathname.startsWith("/prompt-library/")
+    || pathname.startsWith("/recipes/shared/")
     || PUBLIC_PATHS.has(pathname)
     || PUBLIC_FILE_RE.test(pathname);
 }

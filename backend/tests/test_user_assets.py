@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from io import BytesIO
+
+from PIL import Image
 
 from app.config import settings
 from app.db import SessionLocal
-from app.models import AuditLog, GenAsset, GenTask, UploadedAsset
+from app.models import AuditLog, GenAsset, GenTask, UploadedAsset, UserAssetMetadata
 from app.services import storage, user_assets
 
 
@@ -74,6 +77,17 @@ def _upload_group(
             created_at=created_at,
         ))
     return root, preview, model_ref
+
+
+def _png_bytes(*, accent: int = 0) -> bytes:
+    image = Image.new("RGB", (24, 24), "white")
+    for x in range(4, 20):
+        for y in range(5, 19):
+            if x + y + accent > 20:
+                image.putpixel((x, y), (20, 40, 80))
+    output = BytesIO()
+    image.save(output, format="PNG")
+    return output.getvalue()
 
 
 def test_unified_asset_list_filters_roots_retention_and_cursor(client, make_user, auth):
@@ -172,6 +186,169 @@ def test_unified_asset_list_filters_roots_retention_and_cursor(client, make_user
     assert second["total"] == 3
     assert client.get("/api/me/assets?cursor=", headers=headers).status_code == 400
     assert client.get("/api/me/assets?cursor=not-a-cursor", headers=headers).status_code == 400
+
+
+def test_asset_discovery_search_tags_and_folder_ownership(client, make_user, auth):
+    user_id = make_user("13900000511")
+    make_user("13900000512")
+    headers = auth("13900000511")
+    other_headers = auth("13900000512")
+    now = datetime.now(timezone.utc)
+
+    db = SessionLocal()
+    try:
+        upload_key, _, _ = _upload_group(
+            db,
+            user_id,
+            "hero-product",
+            created_at=now,
+        )
+        generated = _generated_asset(
+            db,
+            user_id,
+            created_at=now - timedelta(seconds=1),
+            preview_url="https://cdn.example.com/generated-bottle.png",
+        )
+        db.get(GenTask, generated.task_id).prompt = {
+            "final_text": "cinematic blue bottle campaign",
+        }
+        db.commit()
+        upload_ref = user_assets.uploaded_asset_ref(upload_key)
+        generated_ref = user_assets.generated_asset_ref(generated.id)
+    finally:
+        db.close()
+
+    folder = client.post(
+        "/api/asset-folders",
+        headers=headers,
+        json={"name": "商品主图"},
+    )
+    assert folder.status_code == 201, folder.text
+    folder_id = folder.json()["id"]
+    other_folder = client.post(
+        "/api/asset-folders",
+        headers=other_headers,
+        json={"name": "他人文件夹"},
+    )
+    assert other_folder.status_code == 201, other_folder.text
+
+    tagged = client.put(
+        f"/api/me/assets/{upload_ref}/tags",
+        headers=headers,
+        json={"tags": [" 商品 ", "#主图", "商品"]},
+    )
+    assert tagged.status_code == 200, tagged.text
+    assert tagged.json()["tags"] == ["商品", "主图"]
+    assert client.put(
+        f"/api/me/assets/{upload_ref}/tags",
+        headers=other_headers,
+        json={"tags": ["越权"]},
+    ).status_code == 404
+
+    moved = client.post(
+        f"/api/asset-folders/{folder_id}/assets",
+        headers=headers,
+        json={"asset_refs": [upload_ref]},
+    )
+    assert moved.status_code == 200, moved.text
+
+    by_filename = client.get("/api/me/assets", params={"q": "hero-product"}, headers=headers)
+    assert by_filename.status_code == 200, by_filename.text
+    assert [item["asset_ref"] for item in by_filename.json()["items"]] == [upload_ref]
+
+    by_prompt = client.get("/api/me/assets", params={"q": "cinematic blue"}, headers=headers)
+    assert by_prompt.status_code == 200, by_prompt.text
+    assert [item["asset_ref"] for item in by_prompt.json()["items"]] == [generated_ref]
+
+    by_tag = client.get("/api/me/assets", params={"tag": "商品"}, headers=headers)
+    assert by_tag.status_code == 200, by_tag.text
+    assert by_tag.json()["items"][0]["tags"] == ["商品", "主图"]
+
+    by_folder = client.get("/api/me/assets", params={"folder": folder_id}, headers=headers)
+    assert by_folder.status_code == 200, by_folder.text
+    assert [item["asset_ref"] for item in by_folder.json()["items"]] == [upload_ref]
+    assert by_folder.json()["items"][0]["folder_name"] == "商品主图"
+
+    unfiled = client.get("/api/me/assets", params={"folder": "unfiled"}, headers=headers)
+    assert unfiled.status_code == 200, unfiled.text
+    assert [item["asset_ref"] for item in unfiled.json()["items"]] == [generated_ref]
+    assert client.get(
+        "/api/me/assets",
+        params={"folder": other_folder.json()["id"]},
+        headers=headers,
+    ).status_code == 404
+
+    db = SessionLocal()
+    try:
+        metadata = db.query(UserAssetMetadata).filter_by(
+            user_id=user_id,
+            asset_ref=upload_ref,
+        ).one()
+        assert metadata.tags == ["商品", "主图"]
+        assert db.query(AuditLog).filter(
+            AuditLog.user_id == user_id,
+            AuditLog.action == "update_user_asset_tags",
+        ).count() == 1
+    finally:
+        db.close()
+
+
+def test_full_library_similarity_is_owner_scoped_and_audited(client, make_user, auth):
+    user_id = make_user("13900000513")
+    other_id = make_user("13900000514")
+    headers = auth("13900000513")
+    now = datetime.now(timezone.utc)
+    content = _png_bytes()
+
+    db = SessionLocal()
+    try:
+        keys = [
+            storage.save_bytes_named(content, "upload", "similarity-query.png"),
+            storage.save_bytes_named(content, "upload", "similarity-match.png"),
+            storage.save_bytes_named(content, "upload", "similarity-other.png"),
+        ]
+        for index, (key, owner) in enumerate(
+            [(keys[0], user_id), (keys[1], user_id), (keys[2], other_id)]
+        ):
+            db.add(UploadedAsset(
+                key=key,
+                user_id=owner,
+                mime="image/png",
+                bytes=len(content),
+                original_filename=f"similarity-{index}.png",
+                created_at=now - timedelta(seconds=index),
+            ))
+        db.commit()
+        query_ref = user_assets.uploaded_asset_ref(keys[0])
+        match_ref = user_assets.uploaded_asset_ref(keys[1])
+        other_ref = user_assets.uploaded_asset_ref(keys[2])
+    finally:
+        db.close()
+
+    analyzed = client.post(
+        f"/api/me/assets/{query_ref}/similar",
+        params={"max_distance": 8},
+        headers=headers,
+    )
+    assert analyzed.status_code == 200, analyzed.text
+    payload = analyzed.json()
+    assert payload["status"] == "ready"
+    assert payload["exact_available"] is True
+    assert payload["perceptual_available"] is True
+    assert [row["asset_ref"] for row in payload["matches"]] == [match_ref]
+    assert payload["matches"][0]["match_type"] == "exact"
+    assert payload["matches"][0]["asset"]["asset_ref"] == match_ref
+    assert other_ref not in {row["asset_ref"] for row in payload["matches"]}
+
+    db = SessionLocal()
+    try:
+        assert db.query(UserAssetMetadata).filter_by(user_id=other_id).count() == 0
+        assert db.query(AuditLog).filter(
+            AuditLog.user_id == user_id,
+            AuditLog.action == "analyze_user_asset_similarity",
+        ).count() == 1
+    finally:
+        db.close()
 
 
 def test_asset_metadata_updates_upload_group_and_backfills_generated_bytes(
