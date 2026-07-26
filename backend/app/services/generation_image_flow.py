@@ -12,6 +12,7 @@ from ..db import SessionLocal
 from ..models import GenAsset, GenTask
 from . import credits, gateway, locks, storage, usage
 from .config_store import get_model_config, get_setting
+from .content_safety import assert_generated_media_allowed
 from .generation_common import (
     TaskCanceled,
     TaskLockedError,
@@ -706,6 +707,18 @@ def run_image_task(task_id: int, *, gen_image_fn=None) -> None:
                     if composited:
                         raw, product_composite_meta = composited
                         product_composite_count += 1
+                # 先审后发:生成产出在落存储/落库前机审(开关关闭时零开销直通)。
+                # 拒绝/需复审/审核不可用都走本循环既有的坏图跳过语义(清理已写
+                # key、记入 image_errors);全部被拒时 saved_count=0,任务按生成
+                # 失败结算退款。
+                assert_generated_media_allowed(
+                    db,
+                    task_id=task.id,
+                    user_id=task.user_id,
+                    media_type="image",
+                    data=raw,
+                    mime_type=f"image/{image_ext(raw)}",
+                )
                 preview_png, hd_w, hd_h = make_image_preview(
                     raw,
                     max_pixels=int(settings.generated_image_max_pixels),

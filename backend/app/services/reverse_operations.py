@@ -6,6 +6,7 @@ import inspect
 import json
 import logging
 import math
+import re
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -32,6 +33,7 @@ from . import (
     asset_refs,
     credits,
     gateway,
+    generation_image_evidence,
     generation_quotes,
     image_evidence_analysis,
     project_collection,
@@ -673,6 +675,12 @@ def serialize_operation(op: ReverseOperation) -> dict[str, Any]:
             # Legacy reverse.v2 rows remain readable through the reverse.v3
             # response shape without pretending they contained regional proof.
             result.setdefault("image_evidence", [])
+        # 服务端权威蒙版就绪状态随结果回传，前端不再恒显示"待校验"。
+        result["image_mask_readiness"] = (
+            generation_image_evidence.image_mask_readiness_for_operation(
+                op, supported=op.target in IMAGE_EVIDENCE_TARGETS
+            )
+        )
     context = dict(op.request_context) if isinstance(op.request_context, dict) else {}
     source_ranges = getattr(op, "source_ranges", None)
     if not isinstance(source_ranges, list):
@@ -944,6 +952,8 @@ def serialize_batch(
     include_items: bool,
 ) -> dict[str, Any]:
     sync_batch_state(db, batch)
+    rows = _batch_item_rows(db, int(batch.id))
+    operations = [operation for _, operation in rows]
     items = []
     if include_items:
         items = [
@@ -953,7 +963,7 @@ def serialize_batch(
                 "operation_id": int(operation.id),
                 "operation": serialize_operation(operation),
             }
-            for item, operation in _batch_item_rows(db, int(batch.id))
+            for item, operation in rows
         ]
     return {
         "id": int(batch.id),
@@ -966,6 +976,11 @@ def serialize_batch(
         "status": batch.status,
         "status_counts": dict(batch.status_counts or {}),
         "total_count": int(batch.total_count or 0),
+        # 批级费用 = 各子项 ReverseOperation 费用求和。前端在批次列表
+        # (include_items=false) 无子项可求和，依赖这两个字段展示总费用；
+        # 批级字段一旦下发即优先于前端对 items 的求和值。
+        "cost_frozen": sum(int(operation.cost_frozen or 0) for operation in operations),
+        "cost_settled": sum(int(operation.cost_settled or 0) for operation in operations),
         "cancel_requested": bool(batch.cancel_requested),
         "items": items,
         "created_at": batch.created_at,
@@ -3382,7 +3397,13 @@ def _finalize_evidence_bound_video_result(result: dict[str, Any]) -> None:
     analysis = result.get("video_analysis")
     if not isinstance(analysis, dict) or not isinstance(analysis.get("shots"), list):
         return
-    shots = constrain_video_shots_to_evidence(analysis["shots"])
+    # evidence_analyzers 即 analyze_video_evidence() 的返回值（含
+    # shot_transitions.events），传入后硬切放行的
+    # evidence_gate.transition.score 会带上 lavfi scene_score 数值置信度。
+    shots = constrain_video_shots_to_evidence(
+        analysis["shots"],
+        evidence=analysis.get("evidence_analyzers"),
+    )
     if not shots:
         return
     analysis["shots"] = shots
@@ -3391,6 +3412,11 @@ def _finalize_evidence_bound_video_result(result: dict[str, Any]) -> None:
         structured = {}
         result["structured"] = structured
 
+    # structured / final_text 是交付给生成链路和用户复制的提示词层，模板
+    # 规则明确要求其中不得携带证据说明或置信度话术——「（未验证）」这类
+    # 标注一旦进入 final_text 会被生成模型当成画面内容。因此这里一律使用
+    # canonical shots 原文；已验证/未验证的区分只保留在 shot["evidence_gate"]
+    # 的机器可读置信度里，由前端时间线按 gate 渲染徽标。
     temporal_values = {
         "主体动作": [str(shot.get("action") or "").strip() for shot in shots],
         "镜头运动": [str(shot.get("camera") or "").strip() for shot in shots],
@@ -3408,6 +3434,104 @@ def _finalize_evidence_bound_video_result(result: dict[str, Any]) -> None:
     else:
         structured.pop("时序分镜", None)
     result["final_text"] = compose_visual_final_text(structured, "video", shots)
+
+
+_OCR_CLAIM_QUOTE_PAIRS = (
+    ('"', '"'),
+    ("“", "”"),
+    ("「", "」"),
+    ("『", "』"),
+    ("'", "'"),
+    ("‘", "’"),
+)
+
+
+def _replace_ocr_claim(text: str, claim: str, replacement: str) -> str:
+    """在文字字段里把被拦截/被推翻的 VLM 文字描述替换为 OCR 裁决文本。
+
+    优先匹配带引号的形式（含中英文引号），避免误伤字段里的其他描述；
+    replacement 为空即删除该主张。找不到匹配则原样返回。
+    """
+    if not claim:
+        return text
+    for left, right in _OCR_CLAIM_QUOTE_PAIRS:
+        quoted = f"{left}{claim}{right}"
+        if quoted in text:
+            return text.replace(
+                quoted,
+                f"{left}{replacement}{right}" if replacement else "",
+            )
+    if claim in text:
+        return text.replace(claim, replacement)
+    return text
+
+
+def _tidy_gated_text_field(text: str) -> str:
+    cleaned = re.sub(r"[，,、]{2,}", "，", text)
+    cleaned = re.sub(r"[；;]{2,}", "；", cleaned)
+    return cleaned.strip("，,、；; \t\n")
+
+
+def _apply_image_ocr_gate_to_text(
+    result: dict[str, Any],
+    evidence_rows: list[dict[str, Any]] | None,
+    target: str,
+) -> None:
+    """把 OCR 门控裁决回写到 structured 文字字段与 final_text。
+
+    final_text 在 gateway_prompting 阶段先于独立证据分析生成，被
+    ``ocr_gate`` 判为 rejected/overridden 的文字描述可能已进入
+    ``structured["文字版式"]`` 与 ``final_text``。此处按行内
+    ``ocr_gate.status`` 收口（五态）：
+
+    - ``overridden`` → 用 OCR 文本覆写字段中被推翻的描述；
+    - ``rejected`` → 从字段中清除幻觉描述；若某字段的全部 VLM 文字
+      主张均被拦截，则整字段移除（即使描述在字段里已被截断改写、
+      无法精确定位，也绝不让被拦截文字留在提示词里）；
+    - ``confirmed`` / ``low_confidence`` / ``unavailable`` → 保留不动。
+
+    任一字段被改写后，基于净化的 structured 重新合成 final_text（与
+    validate_reverse_result 的合成路径一致，图片类 target 无 shots）。
+    """
+    structured = result.get("structured")
+    if not isinstance(structured, dict):
+        return
+    verdicts: list[tuple[str, str, str, str]] = []
+    statuses_by_field: dict[str, list[str]] = {}
+    for row in evidence_rows or []:
+        if not isinstance(row, dict):
+            continue
+        gate = row.get("ocr_gate")
+        if not isinstance(gate, dict):
+            continue
+        status = str(gate.get("status") or "")
+        field_key = str(row.get("field_key") or "").strip() or "文字版式"
+        statuses_by_field.setdefault(field_key, []).append(status)
+        claim = str(row.get("vlm_text_description") or "").strip()
+        if status in ("rejected", "overridden") and claim:
+            verdicts.append(
+                (field_key, status, claim, str(gate.get("ocr_text") or "").strip())
+            )
+    changed = False
+    for field_key, status, claim, ocr_text in verdicts:
+        value = structured.get(field_key)
+        if not isinstance(value, str) or not value:
+            continue
+        replacement = ocr_text if status == "overridden" else ""
+        rewritten = _tidy_gated_text_field(_replace_ocr_claim(value, claim, replacement))
+        if rewritten == value:
+            continue
+        changed = True
+        if rewritten:
+            structured[field_key] = rewritten
+        else:
+            structured.pop(field_key, None)
+    for field_key, statuses in statuses_by_field.items():
+        if statuses and all(status == "rejected" for status in statuses):
+            if structured.pop(field_key, None) is not None:
+                changed = True
+    if changed:
+        result["final_text"] = compose_visual_final_text(structured, target)
 
 
 def _audio_analysis_for_request(
@@ -4157,6 +4281,11 @@ def run_operation(operation_id: int) -> None:
             result["image_evidence"] = independent_image["evidence"]
             result["image_evidence_analyzers"] = independent_image["analyzers"]
             result["image_evidence_contract_version"] = independent_image["contract_version"]
+            _apply_image_ocr_gate_to_text(
+                result,
+                independent_image["evidence"],
+                gateway_target,
+            )
         assert_text_allowed(db, result.get("structured"), result.get("final_text"))
         usage.record_call(
             db,

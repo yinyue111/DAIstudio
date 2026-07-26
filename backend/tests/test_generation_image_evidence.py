@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import io
+import uuid
 from types import SimpleNamespace
 
 import pytest
@@ -9,11 +10,12 @@ from PIL import Image
 
 from app.db import SessionLocal
 from app.models import GenTask, ReverseOperation, ReverseResultRevision
-from app.services import gateway, reverse_lineage
+from app.services import gateway, reverse_lineage, reverse_operations, storage
 from app.services.generation_image_evidence import (
     ReviewedEvidenceMaskError,
     ReviewedEvidencePlan,
     ReviewedEvidenceRegion,
+    image_mask_readiness_for_operation,
     rasterize_reviewed_evidence_mask,
     resolve_reviewed_evidence_plan,
 )
@@ -362,3 +364,187 @@ def test_generation_sends_server_rasterized_reviewed_evidence_mask(
         generation_revision = db.get(ReverseResultRevision, task.generation_revision_id)
         assert generation_revision.payload["image_mask"]["source_revision_id"] == revision_id
         assert generation_revision.payload["image_mask"]["mask_hash"] == task.params["_evidence_mask_hash"]
+
+
+# ---------------------------------------------------------------------------
+# 服务端蒙版就绪状态（image_mask_readiness）随 result/operation 回传
+# ---------------------------------------------------------------------------
+
+
+def _readiness_operation(db, user_id: int, asset_url: str, *, target: str = "image"):
+    operation = ReverseOperation(
+        user_id=user_id,
+        request_fingerprint=uuid.uuid4().hex + uuid.uuid4().hex,
+        target=target,
+        asset_url=asset_url,
+        status="succeeded",
+        progress=100,
+        request_context={
+            "source_type": "image",
+            "sources": [{"asset_url": asset_url, "source_type": "image", "role": "primary"}],
+        },
+        result={"final_text": "prompt", "structured": {}},
+        normalized_result={"final_text": "prompt", "structured": {}},
+    )
+    db.add(operation)
+    db.flush()
+    return operation
+
+
+def _reviewed_revision(
+    db,
+    operation,
+    payload: dict,
+    *,
+    fingerprints=None,
+    lineage_status=reverse_lineage.VERIFIED,
+    source: str = "user_edit",
+    version: int = 1,
+):
+    revision = ReverseResultRevision(
+        operation_id=operation.id,
+        user_id=operation.user_id,
+        version=version,
+        source=source,
+        payload=payload,
+        source_content_hash=(
+            reverse_lineage.source_content_hash(fingerprints) if fingerprints else None
+        ),
+        source_fingerprints=fingerprints,
+        payload_hash=reverse_lineage.canonical_payload_hash(payload),
+        lineage_status=lineage_status,
+        evidence_review_action="updated",
+    )
+    db.add(revision)
+    db.flush()
+    return revision
+
+
+def _uploaded_asset(client, headers):
+    upload = client.post(
+        "/api/uploads/image",
+        files={"file": ("readiness.png", _image_bytes((32, 16)), "image/png")},
+        headers=headers,
+    )
+    assert upload.status_code == 200, upload.text
+    asset_url = upload.json()["url"]
+    stored = storage.local_path(storage.key_from_url(asset_url)).read_bytes()
+    return asset_url, stored
+
+
+def _serialized_readiness(operation):
+    serialized = reverse_operations.serialize_operation(operation)
+    readiness = serialized["result"]["image_mask_readiness"]
+    assert readiness == image_mask_readiness_for_operation(
+        operation, supported=operation.target in reverse_operations.IMAGE_EVIDENCE_TARGETS
+    )
+    return readiness
+
+
+def test_mask_readiness_reaches_ready_and_hash_changed_states(client, make_user, auth):
+    user_id = make_user("13972100001", balance=100)
+    headers = auth("13972100001")
+    asset_url, stored = _uploaded_asset(client, headers)
+
+    with SessionLocal() as db:
+        operation = _readiness_operation(db, user_id, asset_url)
+
+        # 尚未保存审阅版本 → 待校验
+        assert _serialized_readiness(operation)["status"] == "pending"
+
+        fingerprint = reverse_lineage.build_source_fingerprint(
+            source_index=1,
+            content_hash=reverse_lineage.bytes_content_hash(stored),
+            locator=asset_url,
+        )
+        revision = _reviewed_revision(
+            db,
+            operation,
+            {
+                "final_text": "prompt",
+                "structured": {},
+                "image_evidence": [_evidence("readiness-bg")],
+            },
+            fingerprints=[fingerprint],
+        )
+
+        # 已确认区域 + 血缘验证 + 指纹匹配 → ready
+        readiness = _serialized_readiness(operation)
+        assert readiness["status"] == "ready", readiness
+        assert readiness["revision_id"] == int(revision.id)
+        assert readiness["revision_version"] == 1
+
+        # 源素材内容被替换 → source_hash_changed
+        path = storage.local_path(storage.key_from_url(asset_url))
+        path.write_bytes(_image_bytes((48, 48), color=(9, 9, 9)))
+        assert _serialized_readiness(operation)["status"] == "source_hash_changed"
+
+        # 源素材文件不可读 → source_expired
+        path.unlink()
+        assert _serialized_readiness(operation)["status"] == "source_expired"
+
+
+def test_mask_readiness_reports_pending_degraded_and_unsupported(client, make_user, auth):
+    user_id = make_user("13972100002", balance=100)
+    headers = auth("13972100002")
+    asset_url, stored = _uploaded_asset(client, headers)
+    fingerprint = reverse_lineage.build_source_fingerprint(
+        source_index=1,
+        content_hash=reverse_lineage.bytes_content_hash(stored),
+        locator=asset_url,
+    )
+
+    with SessionLocal() as db:
+        # 审阅版本存在但未确认任何区域 → 仍是 pending
+        unconfirmed = _readiness_operation(db, user_id, asset_url)
+        _reviewed_revision(
+            db,
+            unconfirmed,
+            {"image_evidence": [_evidence("still-pending", review_status="pending")]},
+            fingerprints=[fingerprint],
+        )
+        assert _serialized_readiness(unconfirmed)["status"] == "pending"
+
+        # 已确认区域但血缘未验证 → degraded
+        legacy = _readiness_operation(db, user_id, asset_url)
+        _reviewed_revision(
+            db,
+            legacy,
+            {"image_evidence": [_evidence("legacy-confirmed")]},
+            fingerprints=None,
+            lineage_status=reverse_lineage.LEGACY_UNVERIFIED,
+        )
+        assert _serialized_readiness(legacy)["status"] == "degraded"
+
+        # 审阅 payload 结构损坏 → degraded（不抛错、不阻塞序列化）
+        broken = _readiness_operation(db, user_id, asset_url)
+        _reviewed_revision(db, broken, {"image_evidence": {"bad": 1}}, fingerprints=None)
+        assert _serialized_readiness(broken)["status"] == "degraded"
+
+        # 不支持证据蒙版的反推目标 → unsupported
+        video = _readiness_operation(db, user_id, asset_url, target="video")
+        assert _serialized_readiness(video)["status"] == "unsupported"
+
+        # 结果已过期 → source_expired
+        expired = _readiness_operation(db, user_id, asset_url)
+        expired.error_code = "RESULT_EXPIRED"
+        assert _serialized_readiness(expired)["status"] == "source_expired"
+
+
+def test_mask_readiness_stays_pending_without_a_session():
+    operation = SimpleNamespace(
+        id=None,
+        user_id=1,
+        target="image",
+        error_code=None,
+        asset_url="http://example.com/a.png",
+        request_context={},
+    )
+    assert image_mask_readiness_for_operation(operation)["status"] == "pending"
+    operation.error_code = "RESULT_EXPIRED"
+    assert image_mask_readiness_for_operation(operation)["status"] == "source_expired"
+    operation.error_code = None
+    assert (
+        image_mask_readiness_for_operation(operation, supported=False)["status"]
+        == "unsupported"
+    )

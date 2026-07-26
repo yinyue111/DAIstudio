@@ -1137,13 +1137,6 @@ def _image_analysis(source_path: Path, generated_path: Path) -> dict[str, Any]:
     }
 
 
-def _shot_rows(row: ReproductionAssessment) -> list[dict[str, Any]]:
-    if row.reverse_revision_id is None:
-        return []
-    # The worker owns the row, but the revision is loaded later in its current DB session.
-    return []
-
-
 def _revision_shots(db: Session, row: ReproductionAssessment) -> list[dict[str, Any]]:
     if row.reverse_revision_id is None:
         return []

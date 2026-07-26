@@ -255,6 +255,32 @@ def _resolved_video_path(db: Session, user_id: int, asset_ref: str) -> Path:
     return _resolved_video_source(db, user_id, asset_ref)[0]
 
 
+def _resolved_audio_track_path(db: Session, user_id: int, asset_ref: str) -> Path:
+    """音轨素材:优先支持 upload_audio/ 音频素材,兼容含音轨的视频素材。"""
+    try:
+        resolved = user_assets.resolve_asset_ref(db, user_id, asset_ref)
+    except (user_assets.AssetNotFound, user_assets.InvalidAssetRef) as exc:
+        raise VideoCompositionError("音轨素材不存在", code="VIDEO_COMPOSITION_ASSET_NOT_FOUND") from exc
+    if resolved.origin == "uploaded":
+        key = str(resolved.row.key)
+        if key.startswith("upload_audio/"):
+            # resolve_asset_ref 已做归属校验;这里只需拿到本地文件路径。
+            try:
+                path = storage.download_to_local_temp(key)
+            except Exception as exc:  # noqa: BLE001 — 存储读取失败统一转业务错误
+                raise VideoCompositionError(
+                    "音频素材文件读取失败",
+                    code="VIDEO_COMPOSITION_ASSET_UNAVAILABLE",
+                ) from exc
+            if not path.is_file():
+                raise VideoCompositionError(
+                    "音频素材文件不存在",
+                    code="VIDEO_COMPOSITION_ASSET_UNAVAILABLE",
+                )
+            return path
+    return _resolved_video_path(db, user_id, asset_ref)
+
+
 def _duration_for_shot(shot: ShotSpec, metadata: dict[str, Any]) -> float:
     source_duration = float(metadata.get("duration_seconds") or metadata.get("duration") or 0)
     source_end = shot.source_end_seconds
@@ -784,7 +810,10 @@ def compose_video(
                     f"镜头 {shot.shot_id} 的生成任务血缘与素材不一致",
                     code="VIDEO_COMPOSITION_LINEAGE_MISMATCH",
                 )
-        audio_paths = [_resolved_video_path(db, user_id, track.asset_ref) for track in spec.audio_tracks]
+        audio_paths = [
+            _resolved_audio_track_path(db, user_id, track.asset_ref)
+            for track in spec.audio_tracks
+        ]
         audio_metadata = [video_frames.probe_media(str(path)) for path in audio_paths]
         if any(not metadata.get("has_audio") for metadata in audio_metadata):
             raise VideoCompositionError(

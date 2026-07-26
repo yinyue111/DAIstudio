@@ -19,6 +19,7 @@ from ..models import (
     ModelRoute,
     ModelRouteHealthEvent,
     ToolDefinition,
+    ToolRun,
     ToolVersion,
     User,
 )
@@ -85,6 +86,7 @@ def _route_for_model(db: Session, model_config_id: int, route_id: int) -> tuple[
         select(ModelRoute).where(
             ModelRoute.id == route_id,
             ModelRoute.model_config_id == model.id,
+            ModelRoute.deleted_at.is_(None),
         )
     )
     if route is None:
@@ -257,7 +259,12 @@ def _admin_tool_detail(
 
 def _lock_tool(db: Session, tool_id: int) -> ToolDefinition:
     tool = db.scalar(
-        select(ToolDefinition).where(ToolDefinition.id == int(tool_id)).with_for_update()
+        select(ToolDefinition)
+        .where(
+            ToolDefinition.id == int(tool_id),
+            ToolDefinition.deleted_at.is_(None),
+        )
+        .with_for_update()
     )
     if tool is None:
         raise HTTPException(404, "工具不存在")
@@ -403,7 +410,10 @@ def model_routes(
     rows = list(
         db.scalars(
             select(ModelRoute)
-            .where(ModelRoute.model_config_id == model.id)
+            .where(
+                ModelRoute.model_config_id == model.id,
+                ModelRoute.deleted_at.is_(None),
+            )
             .order_by(ModelRoute.priority, ModelRoute.id)
         )
     )
@@ -488,7 +498,11 @@ def patch_model_route(
         raise HTTPException(404, "模型配置不存在")
     route = db.scalar(
         select(ModelRoute)
-        .where(ModelRoute.id == route_id, ModelRoute.model_config_id == model.id)
+        .where(
+            ModelRoute.id == route_id,
+            ModelRoute.model_config_id == model.id,
+            ModelRoute.deleted_at.is_(None),
+        )
         .with_for_update()
     )
     if route is None:
@@ -564,6 +578,51 @@ def patch_model_route(
     return route_admin_dict(route, version)
 
 
+@router.delete("/models/{model_config_id}/routes/{route_id}")
+def delete_model_route(
+    model_config_id: int,
+    route_id: int,
+    request: Request,
+    db: Session = Depends(get_db),
+    admin: User = Depends(require_admin),
+):
+    """软删模型路由：保留历史引用，同时释放 route_key 供重建使用。"""
+    model = db.get(ModelConfig, model_config_id)
+    if model is None:
+        raise HTTPException(404, "模型配置不存在")
+    route = db.scalar(
+        select(ModelRoute)
+        .where(
+            ModelRoute.id == route_id,
+            ModelRoute.model_config_id == model.id,
+            ModelRoute.deleted_at.is_(None),
+        )
+        .with_for_update()
+    )
+    if route is None:
+        raise HTTPException(404, "模型路由不存在")
+    if route.route_key == "legacy-default":
+        raise HTTPException(409, "默认兼容路由不能删除,请在模型配置中停用该模型")
+    _assert_no_active_model_config_tasks(db, model)
+    route.enabled = False
+    route.deleted_at = datetime.now(timezone.utc)
+    audit.log_required(
+        db,
+        user_id=admin.id,
+        action="delete_model_route",
+        biz_type="model_route",
+        biz_id=route.id,
+        ip=get_client_ip(request),
+        detail={
+            "model_config_id": model.id,
+            "route_key": route.route_key,
+            "soft_deleted": True,
+        },
+    )
+    _commit(db, "模型路由删除发生并发冲突,请刷新后重试")
+    return {"ok": True}
+
+
 @router.get("/models/{model_config_id}/routes/{route_id}/versions")
 def model_route_versions(
     model_config_id: int,
@@ -595,7 +654,11 @@ def rollback_model_route_catalog_version(
         raise HTTPException(404, "模型配置不存在")
     route = db.scalar(
         select(ModelRoute)
-        .where(ModelRoute.id == route_id, ModelRoute.model_config_id == model.id)
+        .where(
+            ModelRoute.id == route_id,
+            ModelRoute.model_config_id == model.id,
+            ModelRoute.deleted_at.is_(None),
+        )
         .with_for_update()
     )
     if route is None:
@@ -1043,7 +1106,9 @@ def admin_tools(
 ):
     rows = list(
         db.scalars(
-            select(ToolDefinition).order_by(
+            select(ToolDefinition)
+            .where(ToolDefinition.deleted_at.is_(None))
+            .order_by(
                 ToolDefinition.category,
                 ToolDefinition.sort_order,
                 ToolDefinition.id,
@@ -1100,7 +1165,12 @@ def patch_tool(
     admin: User = Depends(require_admin),
 ):
     row = db.scalar(
-        select(ToolDefinition).where(ToolDefinition.id == tool_id).with_for_update()
+        select(ToolDefinition)
+        .where(
+            ToolDefinition.id == tool_id,
+            ToolDefinition.deleted_at.is_(None),
+        )
+        .with_for_update()
     )
     if row is None:
         raise HTTPException(404, "工具不存在")
@@ -1131,6 +1201,46 @@ def patch_tool(
     return _admin_tool_detail(db, row, history=True)
 
 
+@router.delete("/tools/{tool_id}")
+def delete_tool(
+    tool_id: int,
+    request: Request,
+    db: Session = Depends(get_db),
+    admin: User = Depends(require_admin),
+):
+    """软删工具：历史运行记录保留，slug 立即释放供重建使用。"""
+    tool = _lock_tool(db, tool_id)
+    active_run = db.scalar(
+        select(ToolRun.id)
+        .where(
+            ToolRun.tool_definition_id == int(tool.id),
+            ToolRun.status.in_(
+                ("queued", "running", "waiting_review", "compensating")
+            ),
+        )
+        .limit(1)
+    )
+    if active_run is not None:
+        raise HTTPException(409, "该工具还有进行中的任务,请等待任务结束后再删除")
+    versions = _locked_tool_versions(db, tool)
+    now = datetime.now(timezone.utc)
+    _disable_active_tool_version(versions, now=now)
+    tool.enabled = False
+    tool.featured = False
+    tool.deleted_at = now
+    audit.log_required(
+        db,
+        user_id=admin.id,
+        action="delete_tool_definition",
+        biz_type="tool_definition",
+        biz_id=tool.id,
+        ip=get_client_ip(request),
+        detail={"slug": tool.slug, "soft_deleted": True},
+    )
+    _commit(db, "工具删除发生并发冲突,请刷新后重试")
+    return {"ok": True}
+
+
 @router.get("/tools/{tool_id}/versions")
 def tool_versions(
     tool_id: int,
@@ -1138,7 +1248,7 @@ def tool_versions(
     _: User = Depends(require_admin),
 ):
     row = db.get(ToolDefinition, tool_id)
-    if row is None:
+    if row is None or row.deleted_at is not None:
         raise HTTPException(404, "工具不存在")
     return _admin_tool_detail(db, row, history=True)
 

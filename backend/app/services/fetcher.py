@@ -157,10 +157,25 @@ def _is_x_media_host(host: str | None) -> bool:
     return host == "twimg.com" or host.endswith(".twimg.com")
 
 
+# X 帖子媒体的真实路径形态:图片位于 /media/,视频与其封面位于
+# ext_tw_video / amplify_video / tweet_video(GIF 转视频)系列路径。
+# 白名单按前缀放行,继续排除头像(/profile_images/)、横幅(/profile_banners/)
+# 与表情(/emoji/)等非帖子内容。
+_X_POST_MEDIA_PATH_PREFIXES = (
+    "/media/",
+    "/ext_tw_video/",
+    "/ext_tw_video_thumb/",
+    "/amplify_video/",
+    "/amplify_video_thumb/",
+    "/tweet_video/",
+    "/tweet_video_thumb/",
+)
+
+
 def _is_x_post_media_url(url: str | None) -> bool:
     parsed = urlparse(url or "")
     host = (parsed.hostname or "").rstrip(".").lower()
-    return _is_x_media_host(host) and parsed.path.startswith("/media/")
+    return _is_x_media_host(host) and parsed.path.startswith(_X_POST_MEDIA_PATH_PREFIXES)
 
 
 def _normalise_x_media_url(url: str | None) -> str | None:

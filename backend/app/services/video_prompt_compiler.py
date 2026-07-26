@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import re
-from math import ceil
+from math import ceil, isfinite
 from typing import Any
 
 COMPILER_VERSION = "video-prompt-v6"
@@ -147,8 +147,248 @@ _STRUCTURED_CONTEXT_KEYS = (
 )
 
 
+# —— 证据门契约（gateway_prompting.constrain_video_shots_to_evidence 的输出）——
+# 每个 shot 携带 evidence_gate = {"action"/"camera"/"transition": _gate_entry}，
+# _gate_entry: {verified: bool, confidence: "analyzer"|"vlm_only"|None,
+# score: float|None, source: str|None, reason: str|None}。编译器按三态措辞：
+# verified 正常写入；vlm_only 写入但如实标注推断；清空(空文本)不写入。
+# 标签表与 gateway_prompting._CAMERA_LABEL_TEXT_PATTERNS/_CAMERA_LABEL_CLAUSES
+# 保持同步，用于"冲突时以分析器标签为准"的兜底对账（正常情况下证据门已替换）。
+_EVIDENCE_CAMERA_LABEL_PATTERNS: dict[str, re.Pattern] = {
+    "pan": re.compile(
+        r"横摇|左摇|右摇|平移|横移|环绕|摇镜|摇移|甩镜|pan(?:ning)?|orbit",
+        re.IGNORECASE,
+    ),
+    "tilt": re.compile(
+        r"仰摇|俯摇|上摇|下摇|俯仰|上仰|下俯|升降镜头|tilt(?:ing)?|crane|pedestal",
+        re.IGNORECASE,
+    ),
+    "zoom": re.compile(
+        r"推[近进镜]|拉[远镜]|拉近|推拉|变焦|缩放|zoom|dolly",
+        re.IGNORECASE,
+    ),
+    "static": re.compile(
+        r"固定|静止|不动|静态|定镜|static|locked",
+        re.IGNORECASE,
+    ),
+}
+_EVIDENCE_CAMERA_LABEL_CLAUSES: dict[tuple[str, str | None], str] = {
+    ("pan", "left"): "镜头向左横摇",
+    ("pan", "right"): "镜头向右横摇",
+    ("pan", None): "镜头横向摇移",
+    ("tilt", "up"): "镜头向上仰摇",
+    ("tilt", "down"): "镜头向下俯摇",
+    ("tilt", None): "镜头纵向俯仰",
+    ("zoom", "in"): "镜头缓慢推近",
+    ("zoom", "out"): "镜头缓慢拉远",
+    ("zoom", None): "镜头推拉变焦",
+    ("static", None): "固定镜头",
+}
+_EVIDENCE_CAMERA_MIN_CONFIDENCE = 0.4
+_HARD_CUT_TRANSITION_RE = re.compile(r"硬切|直切|跳切|hard\s*cut", re.IGNORECASE)
+# 未经独立分析器验证、由证据门降级保留的描述，写入提示词时的如实措辞后缀。
+UNVERIFIED_EVIDENCE_SUFFIX = "（依据抽样帧推断）"
+# 服务器确认硬切时编译出的剪辑节奏描述（写入技术约束段）。
+HARD_CUT_RHYTHM_CLAUSE = "剪辑节奏：镜头间使用干净硬切衔接，不使用叠化、淡入淡出等软转场"
+_HARD_CUT_SHOT_CLAUSE = "镜头末尾干净硬切进入下一镜"
+
+
 def _clauses(value: str) -> list[str]:
     return [part.strip() for part in re.split(r"[\n。；;]+", str(value or "")) if part.strip()]
+
+
+def _finite_seconds(value: Any) -> float | None:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if isfinite(parsed) else None
+
+
+def _evidence_marker(entry: Any) -> dict[str, Any]:
+    """Normalize one evidence_gate entry into the stable frontend-facing marker."""
+    entry = entry if isinstance(entry, dict) else {}
+    confidence = entry.get("confidence")
+    source = entry.get("source")
+    reason = entry.get("reason")
+    try:
+        score = float(entry.get("score"))
+    except (TypeError, ValueError):
+        score = None
+    if score is not None and not isfinite(score):
+        score = None
+    return {
+        "verified": bool(entry.get("verified")),
+        "confidence": str(confidence) if isinstance(confidence, str) and confidence else None,
+        "score": score,
+        "source": str(source) if isinstance(source, str) and source else None,
+        "reason": str(reason) if isinstance(reason, str) and reason else None,
+    }
+
+
+def _extract_evidence_shots(raw_prompt: dict[str, Any]) -> list[dict]:
+    """Find evidence-gated shot dicts attached by the reverse analysis pipeline."""
+    analysis = raw_prompt.get("video_analysis")
+    if isinstance(analysis, dict):
+        rows = analysis.get("shots")
+        if isinstance(rows, list):
+            gated = [
+                row
+                for row in rows
+                if isinstance(row, dict) and isinstance(row.get("evidence_gate"), dict)
+            ]
+            if gated:
+                return gated
+    timeline = raw_prompt.get("时序分镜") or raw_prompt.get("shots")
+    if isinstance(timeline, list):
+        gated = [
+            row
+            for row in timeline
+            if isinstance(row, dict) and isinstance(row.get("evidence_gate"), dict)
+        ]
+        if gated:
+            return gated
+    return []
+
+
+def _reconcile_camera_with_analyzer(shot: dict, text: str) -> tuple[str, bool]:
+    """Prefer the optical-flow label over conflicting VLM camera wording.
+
+    正常情况下证据门已完成替换，这里是兜底：当上游传入未对账的 shot、
+    且光流分类可用（analyzed、标签已知、置信度达标）而 VLM 文本声称
+    另一种可识别运镜时，以分析器标签编译运镜子句。
+    """
+    summary = shot.get("camera_motion_summary")
+    summary = summary if isinstance(summary, dict) else {}
+    label = str(summary.get("dominant_label") or "").strip().lower()
+    try:
+        score = float(summary.get("confidence"))
+    except (TypeError, ValueError):
+        return text, False
+    if (
+        str(summary.get("status") or "").strip().lower() != "analyzed"
+        or label not in _EVIDENCE_CAMERA_LABEL_PATTERNS
+        or score < _EVIDENCE_CAMERA_MIN_CONFIDENCE
+        or not text
+    ):
+        return text, False
+    text_labels = {
+        key
+        for key, pattern in _EVIDENCE_CAMERA_LABEL_PATTERNS.items()
+        if pattern.search(text)
+    }
+    if not text_labels or label in text_labels:
+        # 无法对账（无可识别关键词）或本就一致：保持证据门的判定，不强行替换。
+        return text, False
+    direction = summary.get("dominant_direction")
+    key = direction if isinstance(direction, str) and direction else None
+    clause = (
+        _EVIDENCE_CAMERA_LABEL_CLAUSES.get((label, key))
+        or _EVIDENCE_CAMERA_LABEL_CLAUSES[(label, None)]
+    )
+    return clause, True
+
+
+def _compile_evidence_shots(shots: list[dict]) -> dict[str, Any]:
+    """Compile evidence-gated shots into prompt lines plus per-field trust markers.
+
+    - verified 字段照常写入提示词；
+    - vlm_only（证据门降级保留）也写入，但追加"依据抽样帧推断"措辞，
+      并在 shot_evidence 里保留 verified=false 供前端展示可信度差异；
+    - 服务器确认的硬切编译为剪辑节奏描述（每镜子句 + 全局 rhythm 子句）；
+    - 三个字段全空的 shot 不产出提示词行，但保留判定记录。
+    """
+    compiled: list[str] = []
+    shot_evidence: list[dict[str, Any]] = []
+    has_hard_cut = False
+    for index, shot in enumerate(shots, start=1):
+        gate = shot.get("evidence_gate")
+        gate = gate if isinstance(gate, dict) else {}
+        action_marker = _evidence_marker(gate.get("action"))
+        camera_marker = _evidence_marker(gate.get("camera"))
+        transition_marker = _evidence_marker(gate.get("transition"))
+        visual = clean_video_prompt_section(shot.get("visual"))
+        lighting = clean_video_prompt_section(shot.get("lighting"))
+        action = clean_video_prompt_section(shot.get("action"))
+        camera = clean_video_prompt_section(shot.get("camera"))
+        transition = clean_video_prompt_section(shot.get("transition"))
+
+        action_prompt = ""
+        if action:
+            action_prompt = (
+                action
+                if action_marker["verified"]
+                else f"{action}{UNVERIFIED_EVIDENCE_SUFFIX}"
+            )
+
+        camera_prompt = ""
+        if camera:
+            camera, replaced = _reconcile_camera_with_analyzer(shot, camera)
+            if replaced:
+                camera_marker = {
+                    **camera_marker,
+                    "verified": True,
+                    "confidence": "analyzer",
+                    "source": "opencv_lk_homography",
+                    "reason": "VLM 运镜描述与光流主导标签冲突，编译时已以分析器结论为准",
+                }
+            camera_prompt = (
+                camera
+                if camera_marker["verified"]
+                else f"{camera}{UNVERIFIED_EVIDENCE_SUFFIX}"
+            )
+
+        transition_prompt = ""
+        if transition:
+            is_hard_cut = bool(
+                _HARD_CUT_TRANSITION_RE.search(transition)
+                or transition_marker["source"] == "ffmpeg_scene"
+            )
+            if transition_marker["verified"] and is_hard_cut:
+                transition_prompt = _HARD_CUT_SHOT_CLAUSE
+                has_hard_cut = True
+            elif transition_marker["verified"]:
+                transition_prompt = transition
+            else:
+                transition_prompt = f"{transition}{UNVERIFIED_EVIDENCE_SUFFIX}"
+
+        details = [
+            part
+            for part in dict.fromkeys(
+                (visual, lighting, action_prompt, camera_prompt, transition_prompt)
+            )
+            if part
+        ]
+        start = _finite_seconds(shot.get("start_seconds"))
+        end = _finite_seconds(shot.get("end_seconds"))
+        line = ""
+        if details:
+            detail = "，".join(details)
+            timing = (
+                f"{start:.3f}-{end:.3f}s "
+                if start is not None and end is not None and end >= start
+                else ""
+            )
+            line = f"{timing}{detail}"
+            compiled.append(line)
+        shot_evidence.append({
+            "index": index,
+            "start_seconds": start,
+            "end_seconds": end,
+            "included": bool(line),
+            "action": {**action_marker, "text": action, "prompt_text": action_prompt},
+            "camera": {**camera_marker, "text": camera, "prompt_text": camera_prompt},
+            "transition": {
+                **transition_marker,
+                "text": transition,
+                "prompt_text": transition_prompt,
+            },
+        })
+    return {
+        "shots": compiled,
+        "shot_evidence": shot_evidence,
+        "rhythm": HARD_CUT_RHYTHM_CLAUSE if has_hard_cut else "",
+    }
 
 
 def _clean_identity_profile(value: Any, *, product: bool) -> str:
@@ -568,6 +808,7 @@ def _direct_passthrough_plan(text: str) -> dict[str, Any]:
         "sfx": post["sfx"],
         "reference_guidance": [],
         "warnings": [],
+        "shot_evidence": [],
     }
 
 
@@ -733,6 +974,7 @@ def _parse_text_prompt(text: str) -> dict[str, Any]:
             "sfx": post["sfx"],
             "reference_guidance": [],
             "warnings": [],
+            "shot_evidence": [],
         }
     numbered = re.split(
         r"(?:^|[\n。；;])\s*(?:Shot|镜头)\s*\d+\s*[:：]\s*",
@@ -776,6 +1018,7 @@ def _parse_text_prompt(text: str) -> dict[str, Any]:
         "sfx": post["sfx"],
         "reference_guidance": [],
         "warnings": [],
+        "shot_evidence": [],
     }
 
 
@@ -809,7 +1052,13 @@ def parse_video_prompt(raw_prompt: str | dict[str, Any]) -> dict[str, Any]:
         style = _join_unique(style, context)
         timeline = raw_prompt.get("时序分镜") or raw_prompt.get("shots") or []
         shots = (
-            [str(item).strip() for item in timeline if str(item).strip()]
+            # 证据门产出的 shot 是 dict（见 _extract_evidence_shots），由证据
+            # 编译路径处理；这里只接收字符串条目，避免 dict 被 str() 成噪声。
+            [
+                str(item).strip()
+                for item in timeline
+                if not isinstance(item, dict) and str(item).strip()
+            ]
             if isinstance(timeline, list)
             else _clauses(str(timeline))
         )
@@ -850,6 +1099,21 @@ def parse_video_prompt(raw_prompt: str | dict[str, Any]) -> dict[str, Any]:
             sfx = manual["sfx"] or sfx
         else:
             raw_prompt_voiceover = structured_voiceover
+        # 证据门产出的三态运动信息：只要上游附带了 evidence_gate 的 shot
+        # 结构、且用户没有手改提示词（user_instruction 为最高优先级），就用
+        # 证据编译结果替换从字符串时间轴/组装文本反解出来的分镜——后者已
+        # 丢失 verified/vlm_only 标注。
+        shot_evidence: list[dict[str, Any]] = []
+        evidence_shots = _extract_evidence_shots(raw_prompt)
+        if evidence_shots and not str(raw_prompt.get("user_instruction") or "").strip():
+            gated = _compile_evidence_shots(evidence_shots)
+            shot_evidence = gated["shot_evidence"]
+            if gated["shots"]:
+                shots = gated["shots"]
+                if gated["rhythm"]:
+                    technical_constraints = _join_unique(
+                        technical_constraints, gated["rhythm"]
+                    )
         cleaned_shots: list[str] = []
         shot_overlays: list[str] = []
         shot_voiceovers: list[str] = []
@@ -866,7 +1130,15 @@ def parse_video_prompt(raw_prompt: str | dict[str, Any]) -> dict[str, Any]:
         overlays = _meaningful_post_items([*overlays, *shot_overlays])
         raw_prompt_voiceover = _join_voiceovers(raw_prompt_voiceover, *shot_voiceovers)
         sfx = _meaningful_post_items([*sfx, *shot_sfx])
-        if style or shots or technical_constraints or overlays or raw_prompt_voiceover or sfx:
+        if (
+            style
+            or shots
+            or technical_constraints
+            or overlays
+            or raw_prompt_voiceover
+            or sfx
+            or shot_evidence
+        ):
             if not shots:
                 fallback = _parse_text_prompt(
                     str(raw_prompt.get("final_text") or raw_prompt.get("instruction") or "")
@@ -887,6 +1159,7 @@ def parse_video_prompt(raw_prompt: str | dict[str, Any]) -> dict[str, Any]:
                 "sfx": sfx,
                 "reference_guidance": [],
                 "warnings": list(raw_prompt.get("warnings") or []),
+                "shot_evidence": shot_evidence,
             }
         text = str(raw_prompt.get("final_text") or raw_prompt.get("instruction") or "")
     else:
@@ -1017,6 +1290,9 @@ def compile_video_prompt(
     plan["shots"] = [str(item).strip() for item in plan["shots"] if str(item).strip()]
     for key in ("post_overlays", "sfx", "warnings"):
         plan[key] = _unique_items(plan[key])
+    plan["shot_evidence"] = [
+        dict(entry) for entry in plan.get("shot_evidence") or [] if isinstance(entry, dict)
+    ]
     reference_roles = {
         str(item.get("role") or "").strip().lower()
         for item in (references or [])
@@ -1133,6 +1409,7 @@ def compile_video_prompt(
                 "voiceover": plan["voiceover"],
                 "sfx": list(plan["sfx"]),
                 "technical_constraints": "",
+                "shot_evidence": [dict(entry) for entry in plan["shot_evidence"]],
             },
         }
     product_strategy = ""
@@ -1299,6 +1576,7 @@ def compile_video_prompt(
             "voiceover": plan["voiceover"],
             "sfx": list(plan["sfx"]),
             "technical_constraints": plan["technical_constraints"],
+            "shot_evidence": [dict(entry) for entry in plan["shot_evidence"]],
         },
     }
 
@@ -1408,4 +1686,7 @@ def store_video_prompt_compile(
     params["_post_overlays"] = list(plan.get("post_overlays") or [])
     params["_voiceover"] = str(plan.get("voiceover") or "").strip()
     params["_sfx"] = list(plan.get("sfx") or [])
+    params["_video_shot_evidence"] = [
+        dict(entry) for entry in plan.get("shot_evidence") or [] if isinstance(entry, dict)
+    ]
     return params

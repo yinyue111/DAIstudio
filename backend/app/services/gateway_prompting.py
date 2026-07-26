@@ -356,15 +356,67 @@ _VISUAL_REFERENCE_LABEL_RE = re.compile(
     r"(?:中(?!央)|为|呈现|采用|的)?\s*",
     re.IGNORECASE,
 )
-_VISUAL_PLATFORM_ATTRIBUTION_RE = re.compile(
-    r"(?:[,，、]\s*)?(?:(?:可|适合)(?:用于|迁移为)?\s*)?"
+_VISUAL_PLATFORM_WORDS = (
     r"(?:小红书|抖音|tiktok|instagram|pinterest|"
     r"社(?:交)?媒体(?:品牌)?(?:广告)?素材|社媒(?:品牌)?(?:广告)?素材|"
     r"品牌网页广告|网页广告|电商(?:详情页|主图|海报|素材|包装视觉升级)|"
     r"发布平台|发布渠道|平台归因)"
-    r"[^；;。.!！?？\n]*",
+)
+_VISUAL_PLATFORM_WORD_RE = re.compile(_VISUAL_PLATFORM_WORDS, re.IGNORECASE)
+# 平台词后紧跟水印/字样/logo 属于画面可见事实（"右下角有小红书水印字样"），
+# 是复刻或去水印决策需要的观察，整句保留，不按归因处理。
+_VISUAL_PLATFORM_VISIBLE_FACT_RE = re.compile(
+    _VISUAL_PLATFORM_WORDS + r"[^,，、；;。.!！?？\n]{0,8}?(?:水印|字样|logo|标识|标志)",
     re.IGNORECASE,
 )
+# 平台词作定语修饰视觉事实时（"电商详情页风格的浅灰渐变"、"电商主图常见的
+# 价格标签排布"），只摘除归因定语、保留事实本体，避免吞掉事实或留残句。
+_VISUAL_PLATFORM_MODIFIER_RE = re.compile(
+    _VISUAL_PLATFORM_WORDS + r"(?:风格|同款|式样?|常见)?的",
+    re.IGNORECASE,
+)
+# 意图归因（"可用于/适合迁移为 小红书…"）：从意图前缀删到子句末。
+_VISUAL_PLATFORM_INTENT_RE = re.compile(
+    r"(?:(?:可|适合)(?:用于|迁移为)?|用于|迁移为)\s*"
+    + _VISUAL_PLATFORM_WORDS
+    + r"[^,，、；;。.!！?？\n]*",
+    re.IGNORECASE,
+)
+# 子句以平台词开头（"小红书爆款构图"）：整段归因，删到子句末。
+_VISUAL_PLATFORM_LEADING_RE = re.compile(
+    r"^\s*" + _VISUAL_PLATFORM_WORDS + r"[^,，、；;。.!！?？\n]*",
+    re.IGNORECASE,
+)
+# 归因处理后若子句以悬垂连接词收尾（"背景是"），说明事实主体已被吞掉，
+# 残句比空句更糟——直接丢弃整个子句。
+_VISUAL_DANGLING_TAIL_RE = re.compile(r"(?:是|有|为|呈|含|显示|采用|的|在)\s*$")
+
+
+def _strip_platform_attribution(text: str) -> str:
+    """按子句粒度删除平台归因，保留可见事实，绝不留下断头残句。
+
+    处理优先级：可见事实(水印/字样)整句放行 > 定语只摘修饰 > 意图归因/
+    句首归因删到子句末 > 仍残留平台词则弃整句 > 悬垂残句兜底丢弃。
+    残留的多余逗号由 _strip_visual_analysis_scaffolding 末尾的标点清理兜底。
+    """
+    if not _VISUAL_PLATFORM_WORD_RE.search(text):
+        return text
+    pieces = re.split(r"([,，、；;。.!！?？\n]+)", text)
+    kept: list[str] = []
+    for index in range(0, len(pieces), 2):
+        clause = pieces[index]
+        delimiter = pieces[index + 1] if index + 1 < len(pieces) else ""
+        if clause.strip() and _VISUAL_PLATFORM_WORD_RE.search(clause):
+            if not _VISUAL_PLATFORM_VISIBLE_FACT_RE.search(clause):
+                clause = _VISUAL_PLATFORM_MODIFIER_RE.sub("", clause)
+                clause = _VISUAL_PLATFORM_INTENT_RE.sub("", clause)
+                clause = _VISUAL_PLATFORM_LEADING_RE.sub("", clause)
+                if _VISUAL_PLATFORM_WORD_RE.search(clause) or _VISUAL_DANGLING_TAIL_RE.search(
+                    clause.strip()
+                ):
+                    clause = ""
+        kept.append(clause + delimiter)
+    return "".join(kept)
 _VISUAL_QUALITY_BOOSTER_RE = re.compile(
     r"(?<![A-Za-z0-9_])(?:masterpiece|best quality|high quality|ultra quality|ultra[- ]?detailed|"
     r"highly detailed|extremely detailed|insanely detailed|ultra[- ]?high resolution|"
@@ -376,8 +428,15 @@ _VISUAL_QUALITY_BOOSTER_RE = re.compile(
     re.IGNORECASE,
 )
 _VISUAL_UNCERTAINTY_RE = re.compile(
+    # 中英对称：中英混排输出里 possibly/maybe 等词与中文"可能"同样把生成
+    # 指令降级为分析备注，须触发同粒度的子句删除。英文词加字母环视边界，
+    # 避免误伤 mighty/unclearly 之外的普通词干组合。中文侧同样需要边界：
+    # 「尽可能/可能性」是一致性约束里的合法措辞（"尽可能保持产品居中"），
+    # 「不猜测/不推测」是模板要求模型复述的禁止性约束（"不猜测色值"），
+    # 都不是不确定表达，不能触发子句删除。
     r"(?:不确定|无法确认|无法判断|证据不足|未见|未识别|看不清|"
-    r"不清晰|疑似|猜测|推测|可能)",
+    r"不清晰|疑似|(?<!不)猜测|(?<!不)推测|(?<!尽)可能(?!性))|"
+    r"(?<![A-Za-z])(?:possibly|maybe|unclear|might)(?![A-Za-z])",
     re.IGNORECASE,
 )
 _VISUAL_HEX_COLOR_RE = re.compile(
@@ -386,7 +445,9 @@ _VISUAL_HEX_COLOR_RE = re.compile(
     re.IGNORECASE,
 )
 _VISUAL_EXACT_PERCENT_RE = re.compile(
-    r"(?:约|大约)?(?:占(?:画面)?\s*)?\d+(?:\.\d+)?\s*%"
+    # 前缀双向兼容："约占画面 55%" 与 "占画面约 55%" 都要整体删除，
+    # 否则会残留"占画面约 "之类的悬垂片段。
+    r"(?:约|大约)?\s*(?:占(?:画面)?\s*)?(?:约|大约)?\s*\d+(?:\.\d+)?\s*%"
     r"(?:\s*(?:-|~|至|到)\s*\d+(?:\.\d+)?\s*%)?",
     re.IGNORECASE,
 )
@@ -413,6 +474,9 @@ def _is_visual_placeholder(value: str) -> bool:
 def _strip_visual_analysis_scaffolding(value: str) -> str:
     """Turn evidence-layer prose into a direct generation clause."""
     text = str(value or "")
+    # 历史版本曾把「（未验证）」展示后缀写进 structured/final_text；旧
+    # revision 重新合成时在这里剥离，确保它永不进入生成提示词。
+    text = re.sub(r"[（(]\s*未验证\s*[）)]", "", text)
     text = re.sub(
         r"(^|[；;。.!！?？,，\n])\s*"
         r"(?:未知|不确定项?|无法确认|无法判断|证据不足)\s*[:：]\s*"
@@ -432,21 +496,34 @@ def _strip_visual_analysis_scaffolding(value: str) -> str:
     # from the image gateway's product/style input order. They are not visual
     # instructions and can actively point the renderer at the wrong image.
     text = _VISUAL_REFERENCE_LABEL_RE.sub("", text)
-    text = _VISUAL_PLATFORM_ATTRIBUTION_RE.sub("", text)
+    text = _strip_platform_attribution(text)
     text = _VISUAL_QUALITY_BOOSTER_RE.sub("", text)
     text = _VISUAL_HEX_COLOR_RE.sub("", text)
     text = _VISUAL_EXACT_PERCENT_RE.sub("", text)
     text = _VISUAL_CONFIDENCE_RE.sub("", text)
     # A qualifier such as "possibly" changes a generation instruction into an
-    # analysis note. Drop the complete sentence instead of leaving fragments
-    # like "the camera" or "the product may" in the executable prompt.
+    # analysis note. Drop the affected clause, but do it at sub-clause
+    # granularity: an uncertainty word in one comma-joined clause must not
+    # delete the valid observations sharing the same sentence (连坐删除).
     chunks = re.split(r"([；;。.!！?？\n]+)", text)
     direct_chunks: list[str] = []
     for index in range(0, len(chunks), 2):
         sentence = chunks[index].strip()
         delimiter = chunks[index + 1] if index + 1 < len(chunks) else ""
-        if not sentence or _VISUAL_UNCERTAINTY_RE.search(sentence):
+        if not sentence:
             continue
+        if _VISUAL_UNCERTAINTY_RE.search(sentence):
+            # 按逗号/顿号切成子句逐段判断：只删含不确定措辞的子句，保留
+            # 同句里的有效观察（如"主体居中，标签文字看不清"保留前半句）。
+            # 整个子句丢弃而非词级挖除，避免留下"镜头"这类残句碎片。
+            kept_clauses = [
+                clause.strip()
+                for clause in re.split(r"[,，、]+", sentence)
+                if clause.strip() and not _VISUAL_UNCERTAINTY_RE.search(clause)
+            ]
+            if not kept_clauses:
+                continue
+            sentence = "，".join(kept_clauses)
         direct_chunks.append(sentence + delimiter)
     text = "".join(direct_chunks)
     text = re.sub(r"([,，;；、])(?:\s*[,，;；、])+", r"\1", text)
@@ -461,15 +538,335 @@ def clean_visual_generation_clause(value: object) -> str:
     return _clean_visual_clause(value)
 
 
-_VIDEO_EVIDENCE_BOUND_FIELDS = {
-    "action": ("action", "action_evidence_refs"),
-    "camera": ("camera_motion", "camera_motion_evidence_refs"),
-    "transition": ("transition", "transition_evidence_refs"),
+# opencv 光流分类标签 ↔ VLM 运镜文本关键词。用于把 camera_motion_summary 的
+# dominant_label 与 VLM 写的运镜描述做标签级对账，而不是仅凭时间窗重叠放行。
+_CAMERA_LABEL_TEXT_PATTERNS: dict[str, re.Pattern] = {
+    "pan": re.compile(
+        r"横摇|左摇|右摇|平移|横移|环绕|摇镜|摇移|甩镜|pan(?:ning)?|orbit",
+        re.IGNORECASE,
+    ),
+    "tilt": re.compile(
+        r"仰摇|俯摇|上摇|下摇|俯仰|上仰|下俯|升降镜头|tilt(?:ing)?|crane|pedestal",
+        re.IGNORECASE,
+    ),
+    "zoom": re.compile(
+        r"推[近进镜]|拉[远镜]|拉近|推拉|变焦|缩放|zoom|dolly",
+        re.IGNORECASE,
+    ),
+    "static": re.compile(
+        r"固定|静止|不动|静态|定镜|static|locked",
+        re.IGNORECASE,
+    ),
 }
 
+# 分析器标签(+方向) → 可执行的运镜生成子句。冲突时"以分析器为准"的替换文本，
+# 方向枚举与 video_evidence_analysis.CAMERA_MOTION_DIRECTIONS 一致。
+_CAMERA_LABEL_CLAUSES: dict[tuple[str, str | None], str] = {
+    ("pan", "left"): "镜头向左横摇",
+    ("pan", "right"): "镜头向右横摇",
+    ("pan", None): "镜头横向摇移",
+    ("tilt", "up"): "镜头向上仰摇",
+    ("tilt", "down"): "镜头向下俯摇",
+    ("tilt", None): "镜头纵向俯仰",
+    ("zoom", "in"): "镜头缓慢推近",
+    ("zoom", "out"): "镜头缓慢拉远",
+    ("zoom", None): "镜头推拉变焦",
+    ("static", None): "固定镜头",
+}
 
-def constrain_video_shots_to_evidence(shots: list[dict] | None) -> list[dict]:
-    """Keep executable temporal claims only when an independent analyzer backs them."""
+# 光流分类置信度低于该值时视为"分类不可判"：既不足以背书、也不足以否决
+# VLM 的运镜描述，只降级保留并如实标注。
+_CAMERA_MOTION_MIN_CONFIDENCE = 0.4
+
+# VLM 声称的软转场（叠化/淡入淡出等）。ffmpeg 场景切点只证明硬切；语义
+# provider 缺席时，软转场声称与服务器确认的硬切冲突，以分析器为准。
+_SOFT_TRANSITION_RE = re.compile(
+    r"叠化|溶解|淡入|淡出|渐隐|渐显|闪白|闪黑|划像|翻页|扫像|模糊过渡|"
+    r"dissolve|cross\s*fade|fade|wipe",
+    re.IGNORECASE,
+)
+
+
+def _gate_entry(
+    verified: bool,
+    *,
+    confidence: str | None = None,
+    score: float | None = None,
+    source: str | None = None,
+    reason: str | None = None,
+) -> dict:
+    """单个时序字段的证据门判定记录（挂在 shot["evidence_gate"] 上）。
+
+    - verified: 是否有独立分析器背书；
+    - confidence: "analyzer"（分析器确认）| "vlm_only"（仅 VLM，降级保留）|
+      None（字段被清空或本就为空）；
+    - score: 分析器数值置信度（有则填，∈[0,1]）；
+    - source: 背书来源（semantic_provider / opencv_lk_homography /
+      ffmpeg_scene / cross_frame_vlm / analyzer_status）；
+    - reason: 冲突或降级的中文原因，供下游与 UI 展示。
+    """
+    return {
+        "verified": bool(verified),
+        "confidence": confidence,
+        "score": score,
+        "source": source,
+        "reason": reason,
+    }
+
+
+def _shot_has_cross_frame_evidence(shot: dict) -> bool:
+    """复用 normalize_video_shots 的跨帧证据契约（本文件下方 :1480 一带）。
+
+    normalize 阶段在帧时间戳可用时已校验"≥2 个不同时间戳帧"，不满足时会把
+    action/camera/transition 清空；能带着非空运动字段走到证据门、且仍有
+    ≥2 个不同证据帧序号的 shot，即视为满足跨帧证据契约。
+    """
+    indices = shot.get("evidence_frame_indices")
+    if not isinstance(indices, list):
+        return False
+    distinct: set[int] = set()
+    for value in indices:
+        if isinstance(value, bool):
+            continue
+        try:
+            distinct.add(int(value))
+        except (TypeError, ValueError):
+            continue
+    return len(distinct) >= 2
+
+
+def _camera_labels_in_text(text: str) -> set[str]:
+    return {
+        label
+        for label, pattern in _CAMERA_LABEL_TEXT_PATTERNS.items()
+        if pattern.search(text)
+    }
+
+
+def _camera_motion_clause(label: str, direction: object) -> str:
+    key = direction if isinstance(direction, str) and direction else None
+    return (
+        _CAMERA_LABEL_CLAUSES.get((label, key))
+        or _CAMERA_LABEL_CLAUSES[(label, None)]
+    )
+
+
+def _field_existence_verified(shot: dict, statuses: dict, capability: str, refs_key: str) -> bool:
+    status = str(statuses.get(capability) or "unsupported").strip().lower()
+    refs = shot.get(refs_key)
+    return status in {"analyzed", "partial"} and isinstance(refs, list) and bool(refs)
+
+
+def _gate_action_field(shot: dict, statuses: dict) -> tuple[str, dict]:
+    """action 三态门：analyzed/partial 放行；unsupported 但满足跨帧证据契约
+    时降置信度保留（vlm_only）；两者都不满足才清空。"""
+    text = _clean_visual_clause(shot.get("action"))
+    if not text:
+        return "", _gate_entry(False)
+    if _field_existence_verified(shot, statuses, "action", "action_evidence_refs"):
+        return text, _gate_entry(True, confidence="analyzer", source="semantic_provider")
+    if _shot_has_cross_frame_evidence(shot):
+        # 语义分析器缺席（如 video_evidence_semantic_url 未配置）时不再
+        # "宁可全删"：VLM 的动作描述已被跨帧证据契约约束，降置信度保留，
+        # 并明确标注未经独立分析器验证，让下游与 UI 能区分。
+        return text, _gate_entry(
+            False,
+            confidence="vlm_only",
+            source="cross_frame_vlm",
+            reason="语义动作分析器不可用，动作描述由多个不同时间戳抽样帧支撑但未经独立验证",
+        )
+    return "", _gate_entry(False, reason="语义动作分析器不可用且缺乏跨帧证据，动作描述已清除")
+
+
+def _gate_camera_field(shot: dict, statuses: dict) -> tuple[str, dict]:
+    """camera 一致性门：从"存在性验证"（纯时间窗重叠）升级为与光流分类
+    结果的标签级对账。一致→保留；冲突→以分析器为准；分类置信度过低→
+    降级保留并标注 vlm_only。"""
+    text = _clean_visual_clause(shot.get("camera"))
+    camera_status = str(
+        statuses.get("camera_motion") or statuses.get("motion") or "unsupported"
+    ).strip().lower()
+    refs = shot.get("camera_motion_evidence_refs")
+    existence_ok = (
+        camera_status in {"analyzed", "partial"}
+        and isinstance(refs, list)
+        and bool(refs)
+    )
+    if not existence_ok:
+        # 时间窗内没有任何光流样本背书：维持原有的清空行为。
+        return "", _gate_entry(
+            False,
+            reason="时间窗内无光流运镜证据，运镜描述已清除" if text else None,
+        )
+    summary = shot.get("camera_motion_summary")
+    summary = summary if isinstance(summary, dict) else {}
+    label = str(summary.get("dominant_label") or "").strip().lower()
+    try:
+        score = float(summary.get("confidence"))
+    except (TypeError, ValueError):
+        score = None
+    summary_usable = (
+        str(summary.get("status") or "").strip().lower() == "analyzed"
+        and label in _CAMERA_LABEL_TEXT_PATTERNS
+        and score is not None
+    )
+    if not summary_usable:
+        # 旧数据没有 camera_motion_summary（或无可用样本）：退回存在性
+        # 验证以保持兼容，但 source 如实标注为仅状态级背书。
+        if not text:
+            return "", _gate_entry(False)
+        return text, _gate_entry(True, confidence="analyzer", source="analyzer_status")
+    if score < _CAMERA_MOTION_MIN_CONFIDENCE:
+        # 光流分类置信度过低：弱分类既不能背书也不能否决 VLM，降级保留。
+        if not text:
+            return "", _gate_entry(False)
+        return text, _gate_entry(
+            False,
+            confidence="vlm_only",
+            score=round(score, 6),
+            source="opencv_lk_homography",
+            reason="光流运镜分类置信度过低，VLM 运镜描述未经对账、降置信度保留",
+        )
+    score = round(score, 6)
+    analyzer_clause = _camera_motion_clause(label, summary.get("dominant_direction"))
+    text_labels = _camera_labels_in_text(text)
+    if label == "static":
+        # 契约约定：static 主导即视为无运镜证据。VLM 声称存在运镜即冲突，
+        # 以分析器为准替换为"固定镜头"。
+        if text and text_labels - {"static"}:
+            return analyzer_clause, _gate_entry(
+                True,
+                confidence="analyzer",
+                score=score,
+                source="opencv_lk_homography",
+                reason="光流分析判定为固定镜头，VLM 声称的运镜与之冲突，已以分析器结论为准",
+            )
+        return (text or analyzer_clause), _gate_entry(
+            True, confidence="analyzer", score=score, source="opencv_lk_homography"
+        )
+    if not text:
+        # VLM 未描述运镜但光流有明确结论：用分析器标签补齐（完全由证据背书）。
+        return analyzer_clause, _gate_entry(
+            True,
+            confidence="analyzer",
+            score=score,
+            source="opencv_lk_homography",
+            reason="VLM 未描述运镜，由光流分析结论补齐",
+        )
+    if label in text_labels:
+        # 一致：VLM 运镜描述与光流主导标签吻合。
+        return text, _gate_entry(
+            True, confidence="analyzer", score=score, source="opencv_lk_homography"
+        )
+    if text_labels:
+        # 冲突：VLM 声称的运动类型与光流主导标签不一致（如光流判定 pan、
+        # VLM 写推近），以分析器为准替换。
+        return analyzer_clause, _gate_entry(
+            True,
+            confidence="analyzer",
+            score=score,
+            source="opencv_lk_homography",
+            reason=f"VLM 运镜描述与光流主导标签 {label} 冲突，已替换为分析器结论",
+        )
+    # VLM 文本无可识别的运镜关键词，无法对账：降级保留并标注。
+    return text, _gate_entry(
+        False,
+        confidence="vlm_only",
+        score=score,
+        source="opencv_lk_homography",
+        reason="VLM 运镜描述无法与光流标签对账，降置信度保留",
+    )
+
+
+def _gate_transition_field(
+    shot: dict,
+    statuses: dict,
+    cut_confidence_by_id: dict[str, float],
+) -> tuple[str, dict]:
+    """transition 门：语义 provider 与 ffmpeg 场景切点均为强证据。服务器
+    确认的硬切（analyzer_status["shot_transitions"]=="analyzed" 且
+    cut_transition_evidence_refs 非空）优先级不低于语义 provider。"""
+    text = _clean_visual_clause(shot.get("transition"))
+    semantic_ok = _field_existence_verified(
+        shot, statuses, "transition", "transition_evidence_refs"
+    )
+    cut_status = str(statuses.get("shot_transitions") or "unsupported").strip().lower()
+    raw_cut_refs = shot.get("cut_transition_evidence_refs")
+    cut_refs = [
+        str(value)
+        for value in (raw_cut_refs if isinstance(raw_cut_refs, list) else [])
+        if str(value or "").strip()
+    ]
+    cut_ok = cut_status == "analyzed" and bool(cut_refs)
+    if semantic_ok and text:
+        return text, _gate_entry(True, confidence="analyzer", source="semantic_provider")
+    if cut_ok:
+        scores = [
+            cut_confidence_by_id[ref]
+            for ref in cut_refs
+            if ref in cut_confidence_by_id
+        ]
+        score = round(max(scores), 6) if scores else None
+        if text and _SOFT_TRANSITION_RE.search(text):
+            # ffmpeg 场景检测只确认硬切；语义 provider 缺席时 VLM 声称的
+            # 软转场与服务器证据冲突，以分析器为准。
+            return "硬切", _gate_entry(
+                True,
+                confidence="analyzer",
+                score=score,
+                source="ffmpeg_scene",
+                reason="ffmpeg 场景检测确认为硬切，VLM 声称的软转场已被替换",
+            )
+        if text:
+            return text, _gate_entry(
+                True, confidence="analyzer", score=score, source="ffmpeg_scene"
+            )
+        return "硬切", _gate_entry(
+            True,
+            confidence="analyzer",
+            score=score,
+            source="ffmpeg_scene",
+            reason="VLM 未描述转场，由服务器确认的场景切点补齐",
+        )
+    return "", _gate_entry(
+        False,
+        reason="转场描述缺乏独立分析器证据，已清除" if text else None,
+    )
+
+
+def constrain_video_shots_to_evidence(
+    shots: list[dict] | None,
+    *,
+    evidence: dict | None = None,
+) -> list[dict]:
+    """Keep executable temporal claims only when independent evidence backs them.
+
+    证据门对称化（该严的严、该放的放，放行必须带置信度标注）：
+    - camera：与光流分类结果（camera_motion_summary）做标签级对账，一致
+      保留、冲突以分析器为准并记录原因；
+    - action：三态——有语义分析器背书放行；unsupported 但满足跨帧证据
+      契约时降置信度保留（confidence="vlm_only", verified=False）；否则清空；
+    - transition：承认 ffmpeg 场景切点为强证据，服务器确认的硬切可放行；
+    - 每个 shot 附带 shot["evidence_gate"]（action/camera/transition →
+      _gate_entry 结构），下游与 UI 依此区分验证等级。
+
+    evidence 传 analyze_video_evidence() 的返回值（含 shot_transitions 块）
+    时，硬切放行会带上 lavfi scene_score 数值置信度；不传则 score 为 None。
+    """
+    cut_confidence_by_id: dict[str, float] = {}
+    if isinstance(evidence, dict):
+        block = evidence.get("shot_transitions")
+        events = block.get("events") if isinstance(block, dict) else None
+        for event in events or []:
+            if not isinstance(event, dict) or not event.get("evidence_id"):
+                continue
+            try:
+                confidence = float(event.get("confidence"))
+            except (TypeError, ValueError):
+                continue
+            cut_confidence_by_id[str(event["evidence_id"])] = max(
+                0.0, min(1.0, confidence)
+            )
     constrained: list[dict] = []
     for raw in shots or []:
         if not isinstance(raw, dict):
@@ -479,11 +876,13 @@ def constrain_video_shots_to_evidence(shots: list[dict] | None) -> list[dict]:
             shot[field] = _clean_visual_clause(shot.get(field))
         statuses = shot.get("analyzer_status")
         statuses = statuses if isinstance(statuses, dict) else {}
-        for field, (capability, refs_key) in _VIDEO_EVIDENCE_BOUND_FIELDS.items():
-            status = str(statuses.get(capability) or "unsupported").strip().lower()
-            refs = shot.get(refs_key)
-            verified = status in {"analyzed", "partial"} and isinstance(refs, list) and bool(refs)
-            shot[field] = _clean_visual_clause(shot.get(field)) if verified else ""
+        gate: dict[str, dict] = {}
+        shot["action"], gate["action"] = _gate_action_field(shot, statuses)
+        shot["camera"], gate["camera"] = _gate_camera_field(shot, statuses)
+        shot["transition"], gate["transition"] = _gate_transition_field(
+            shot, statuses, cut_confidence_by_id
+        )
+        shot["evidence_gate"] = gate
         constrained.append(shot)
     return constrained
 

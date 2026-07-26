@@ -26,8 +26,11 @@ function groupAssetsByTask(assets = []) {
 
 function batchTitle(group) {
   const count = group.assets.length;
-  const type = group.category === "video" ? "视频" : group.assets[0]?.type === "video" ? "视频" : "图片";
-  return `本批次 · ${count} ${type === "视频" ? "条" : "张"}`;
+  const firstType = group.assets[0]?.type;
+  const type = group.category === "video" || firstType === "video"
+    ? "视频"
+    : group.category === "audio" || firstType === "audio" ? "音频" : "图片";
+  return `本批次 · ${count} ${type === "图片" ? "张" : "条"}`;
 }
 
 export default function GroupedAssetGallery({

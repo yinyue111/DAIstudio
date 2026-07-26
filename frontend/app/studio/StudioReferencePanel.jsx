@@ -392,6 +392,15 @@ export default function StudioReferencePanel({
     if (!reverseBatchEnabled) setBatchSelectionMode(false);
   }, [reverseBatchEnabled]);
 
+  // 真正生效的精度状态源是 reverseConfig.analysis_precision（由精度选择器写入）。
+  // 这里把它同步回 workspace.videoAnalysisPreset，让费用/帧数预估读到真实档位，
+  // 避免预估一直停留在默认 standard（如 fine 实际 22 帧却按 14 帧提示）。
+  const reverseAnalysisPrecision = reverseConfig?.analysis_precision || "";
+  useEffect(() => {
+    if (!reverseAnalysisPrecision || reverseAnalysisPrecision === videoAnalysisPreset) return;
+    setVideoAnalysisPreset?.(reverseAnalysisPrecision);
+  }, [reverseAnalysisPrecision, videoAnalysisPreset, setVideoAnalysisPreset]);
+
   return (
     <aside id="studio-reference-panel" className="relative min-w-0 overflow-hidden rounded-xl3 border border-iris/35 bg-gradient-to-b from-iris/20 via-base2/80 to-rose/10 p-3 shadow-glow-sm">
       <div className="pointer-events-none absolute -right-16 -top-16 h-32 w-32 rounded-full bg-rose/25 blur-3xl" />

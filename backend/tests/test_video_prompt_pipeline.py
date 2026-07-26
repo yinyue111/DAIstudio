@@ -12,10 +12,28 @@ def _png_bytes(size=(96, 128), color=(232, 244, 238)) -> bytes:
     return buffer.getvalue()
 
 
+# 与迁移 0078 的目录口径一致：grok-imagine-video-1.5 只做文/图生视频，
+# 参考图直出（product_reference_image 等）属于 R2V 模型 grok-imagine-video。
+_I2V_CAPABILITIES = {
+    "text_to_video": True,
+    "image_to_video": True,
+    "reference_image": False,
+    "multi_reference": False,
+}
+_R2V_CAPABILITIES = {
+    "text_to_video": True,
+    "image_to_video": True,
+    "reference_image": True,
+    "multi_reference": True,
+    "max_reference_images": 3,
+}
+
+
 def _configure_video_model(
     model_id: str = "grok-imagine-video-1.5",
     *,
     prompt_profile: dict | None = None,
+    capabilities: dict | None = None,
 ) -> None:
     with SessionLocal() as db:
         model = db.query(ModelConfig).filter(ModelConfig.use == "video").one()
@@ -29,6 +47,9 @@ def _configure_video_model(
                 "max_prompt_chars": 900,
                 "max_shots_by_duration": {"5": 2, "10": 3, "15": 4},
             },
+            # 显式覆盖 capabilities：共享测试库里其他用例会改同一行模型，
+            # 不覆盖的话本文件的用例会依赖执行顺序。
+            "capabilities": dict(capabilities or _I2V_CAPABILITIES),
         }
         db.commit()
 
@@ -264,7 +285,7 @@ def test_direct_product_video_submits_visual_copy_and_keeps_post_metadata(
 ):
     make_user("13900003103", balance=1000)
     headers = auth("13900003103")
-    _configure_video_model()
+    _configure_video_model("grok-imagine-video", capabilities=_R2V_CAPABILITIES)
     upload = client.post(
         "/api/uploads/image",
         files={"file": ("tissue.png", _png_bytes(), "image/png")},
@@ -330,7 +351,7 @@ def test_direct_product_video_submits_visual_copy_and_keeps_post_metadata(
     assert task["post_overlays"] == ["干湿两用"]
     assert task["voiceover"] == "让洗脸这件事，成为一天温柔的开始。"
     assert task["prompt_compiler_version"]
-    assert task["model_id"] == "grok-imagine-video-1.5"
+    assert task["model_id"] == "grok-imagine-video"
     with SessionLocal() as db:
         persisted = db.get(GenTask, response.json()["id"])
         assert persisted.params["_video_prompt_metadata"]["prompt_mode"] == "direct_passthrough"

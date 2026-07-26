@@ -1,23 +1,29 @@
 """Recharge credits via QR-code payments."""
 from __future__ import annotations
 
+import csv
+import io
 import json
+from datetime import datetime, timezone
 from urllib.parse import parse_qsl
 
-from fastapi import APIRouter, Depends, HTTPException, Request
-from fastapi.responses import PlainTextResponse
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi.responses import PlainTextResponse, StreamingResponse
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from ..config import settings
 from ..db import get_db
 from ..deps import get_client_ip, get_current_user
-from ..models import User
+from ..models import CreditTransaction, User
 from ..schemas import PaymentCreateIn, PaymentOrderOut, PaymentPackageOut
+from ..schemas.billing import PaymentInvoiceOrderOut, PaymentInvoiceRequestIn
 from ..services import audit, payments
 from ..services.config_store import get_bool_setting
 from ..services.product_edition import is_launch_lite
 from ..services.rate_limit import incr_window
 from ..services.request_limits import read_limited_body
+from .admin_helpers import csv_cell as _csv_cell
 
 router = APIRouter(prefix="/api/payments", tags=["payments"])
 _ORDER_RATE_WINDOW_SECONDS = 3600
@@ -100,9 +106,105 @@ def create_order(body: PaymentCreateIn, request: Request,
 
 
 @router.get("/orders", response_model=list[PaymentOrderOut])
-def my_orders(limit: int = 20, db: Session = Depends(get_db),
+def my_orders(limit: int = Query(default=20, ge=1, le=100),
+              offset: int = Query(default=0, ge=0),
+              cursor: int | None = Query(default=None, ge=1),
+              db: Session = Depends(get_db),
               user: User = Depends(get_current_user)):
-    return payments.list_user_orders(db, user.id, limit=limit)
+    """充值订单列表,新单在前。
+
+    分页与积分账单同思路:`cursor` 传上一页最后一条订单的 id(只取更早的订单,
+    翻页期间新订单不会造成错位);`offset` 供无游标场景兜底。
+    """
+    return payments.list_user_orders(db, user.id, limit=limit, offset=offset, before_id=cursor)
+
+
+@router.get("/billing/export")
+def export_my_billing_csv(db: Session = Depends(get_db),
+                          user: User = Depends(get_current_user)):
+    """导出当前用户积分账单 CSV(充值、冻结、结算、退款等全部流水)。"""
+    rows = list(
+        db.execute(
+            select(CreditTransaction)
+            .where(CreditTransaction.user_id == user.id)
+            .order_by(CreditTransaction.id.desc())
+            .limit(10000)
+        ).scalars()
+    )
+
+    def iter_csv():
+        buffer = io.StringIO()
+        writer = csv.writer(buffer)
+        writer.writerow([
+            "时间", "类型", "余额变动", "冻结变动", "变动后余额", "变动后冻结",
+            "业务类型", "业务编号", "备注",
+        ])
+        for tx in rows:
+            created = tx.created_at
+            if created is not None and created.tzinfo is None:
+                created = created.replace(tzinfo=timezone.utc)
+            writer.writerow([
+                _csv_cell(created.isoformat() if created else ""),
+                _csv_cell(tx.type),
+                _csv_cell(int(tx.balance_delta if tx.balance_delta is not None else tx.change or 0)),
+                _csv_cell(int(tx.frozen_delta or 0)),
+                _csv_cell(int(tx.balance_after or 0)),
+                _csv_cell(int(tx.frozen_after) if tx.frozen_after is not None else ""),
+                _csv_cell(tx.biz_type or ""),
+                _csv_cell(int(tx.biz_ref) if tx.biz_ref is not None else ""),
+                _csv_cell(tx.note or ""),
+            ])
+            yield buffer.getvalue()
+            buffer.seek(0)
+            buffer.truncate(0)
+
+    date_tag = datetime.now(timezone.utc).strftime("%Y%m%d")
+    return StreamingResponse(
+        iter_csv(),
+        media_type="text/csv; charset=utf-8",
+        headers={
+            "Content-Disposition": f"attachment; filename=credit_bill_{date_tag}.csv",
+        },
+    )
+
+
+@router.get("/invoices", response_model=list[PaymentInvoiceOrderOut])
+def my_invoices(db: Session = Depends(get_db),
+                user: User = Depends(get_current_user)):
+    """当前用户的开票申请记录(按订单维度)。"""
+    return payments.list_user_invoice_orders(db, user.id)
+
+
+@router.post("/orders/{order_no}/invoice", response_model=PaymentInvoiceOrderOut)
+def request_invoice(order_no: str, body: PaymentInvoiceRequestIn, request: Request,
+                    db: Session = Depends(get_db),
+                    user: User = Depends(get_current_user)):
+    """对已支付订单发起开票申请。"""
+    order = payments.user_order(db, order_no, user.id)
+    if not order:
+        raise HTTPException(404, "订单不存在")
+    if order.status != payments.PAID or not order.paid_at:
+        raise HTTPException(400, "仅已支付订单可以申请开票")
+    if int(order.refunded_amount_cents or 0) > 0:
+        raise HTTPException(400, "订单存在退款,暂不支持开票,请联系客服")
+    if order.invoice_status in ("requested", "issued"):
+        raise HTTPException(400, "该订单已申请开票,请勿重复提交")
+    if body.invoice_type == "company" and not body.tax_no:
+        raise HTTPException(400, "企业抬头必须填写税号")
+    order.invoice_status = "requested"
+    order.invoice_type = body.invoice_type
+    order.invoice_title = body.title
+    order.invoice_tax_no = body.tax_no
+    order.invoice_email = (body.email or "").strip() or None
+    order.invoice_note = (body.note or "").strip() or None
+    order.invoice_requested_at = datetime.now(timezone.utc)
+    db.commit()
+    db.refresh(order)
+    audit.log(db, user_id=user.id, action="request_payment_invoice",
+              biz_type="payment", biz_id=order.id, ip=get_client_ip(request),
+              detail={"order_no": order.order_no, "invoice_type": body.invoice_type,
+                      "title": body.title})
+    return order
 
 
 @router.get("/orders/{order_no}", response_model=PaymentOrderOut)

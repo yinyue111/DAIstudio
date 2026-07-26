@@ -63,7 +63,7 @@ class UserAssetMetadata(Base):
     __tablename__ = "user_asset_metadata"
     __table_args__ = (
         CheckConstraint(
-            "media_type in ('image', 'video')",
+            "media_type in ('image', 'video', 'audio')",
             name="ck_user_asset_metadata_media_type_valid",
         ),
         CheckConstraint(

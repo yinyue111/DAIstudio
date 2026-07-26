@@ -1,5 +1,6 @@
 """Platform settings round-trip + video cost-estimate logic."""
 import os
+import socket
 import subprocess
 import sys
 import tempfile
@@ -42,6 +43,55 @@ from app.services.generation_prompts import (
 )
 from app.services.generation_request import estimate_generation_cost, validate_generation_params
 from app.services.model_pricing import estimate_credits_from_usage
+
+
+_PUBLIC_DNS_RESULT = [
+    (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 0)),
+]
+
+
+def _is_placeholder_test_host(host: str) -> bool:
+    """RFC 2606 reserved names used as stand-ins throughout this module."""
+    host = str(host).lower().rstrip(".")
+    return (
+        host == "example.com"
+        or host.endswith(".example.com")
+        or host == "test"
+        or host.endswith(".test")
+    )
+
+
+@pytest.fixture(autouse=True)
+def _isolate_host_environment(monkeypatch):
+    """Keep host-machine state out of runtime-config validation results.
+
+    Two leaks make these tests flap depending on the developer's machine:
+
+    1. The `settings` singleton reads ANTHROPIC_BASE_URL / ANTHROPIC_AUTH_TOKEN
+       from the process environment at import time. A shell that exports them
+       (e.g. a local Claude proxy on a private address) makes
+       validate_runtime_config() fail on the egress-URL check before the checks
+       these tests actually target. Pin both to empty — on the singleton and in
+       os.environ (for any Settings(...) constructed inside a test).
+    2. Proxy/VPN "fake IP" DNS modes (e.g. 198.18.0.0/15 answers for every
+       name) defeat the conftest gaierror fallback and make the SSRF guard
+       reject RFC 2606 placeholder hosts like gateway.example.com as reserved
+       addresses. Pin placeholder domains to a public IP so the guard's happy
+       path never depends on host DNS.
+    """
+    for var in ("ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setattr(settings, "anthropic_base_url", "")
+    monkeypatch.setattr(settings, "anthropic_auth_token", "")
+
+    current_getaddrinfo = socket.getaddrinfo  # conftest DNS shim
+
+    def _pinned_getaddrinfo(host, *args, **kwargs):
+        if _is_placeholder_test_host(host):
+            return _PUBLIC_DNS_RESULT
+        return current_getaddrinfo(host, *args, **kwargs)
+
+    monkeypatch.setattr(socket, "getaddrinfo", _pinned_getaddrinfo)
 
 
 def make_session():

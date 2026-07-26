@@ -875,6 +875,164 @@ def _drop_unverified_video_timeline(result: dict) -> None:
         result["unverified_temporal_fields"] = removed
 
 
+# 文本修复中受保护的 shot 事实字段:文本类逐字比对,时间类按数值比对。
+_REPAIR_SHOT_FACT_TEXT_FIELDS = (
+    "visual",
+    "action",
+    "camera",
+    "transition",
+    "lighting",
+    "ocr",
+    "audio_cue",
+)
+_REPAIR_SHOT_FACT_TIME_FIELDS = ("start_seconds", "end_seconds")
+
+
+def _repair_shot_fact_key(shot: dict) -> tuple[int, tuple[int, ...]]:
+    """Identity of a shot for the repair diff: source segment + evidence frames."""
+    evidence = tuple(sorted({
+        int(index)
+        for index in shot.get("evidence_frame_indices") or []
+        if isinstance(index, int) and not isinstance(index, bool) and index > 0
+    }))
+    try:
+        segment = int(shot.get("source_segment_index") or 1)
+    except (TypeError, ValueError):
+        segment = 1
+    return (segment, evidence)
+
+
+def _repair_shot_sort_key(shot: dict) -> tuple[int, float]:
+    try:
+        segment = int(shot.get("source_segment_index") or 1)
+    except (TypeError, ValueError):
+        segment = 1
+    try:
+        start = float(shot.get("start_seconds") or 0)
+    except (TypeError, ValueError):
+        start = 0.0
+    return (segment, start)
+
+
+def _enforce_repair_shot_facts(
+    original_content: str,
+    repaired_payload: dict,
+) -> tuple[dict, list[dict]]:
+    """文本修复只允许修 JSON 结构:已有 shot 的事实差分校验。
+
+    修复请求的指令是"不得增加、删除或改写事实",但模型返回的是整份文档,
+    此前直接整体替换原始结果,没有人比对未要求修改的部分。这里以原始输出
+    为基线逐 shot 比对:
+
+    - 单个 shot 的事实字段被改写 -> 丢弃改写、回滚原值并记录告警,
+      不整体失败(那会把一次成功的结构修复浪费掉);
+    - shot 被删除 -> 恢复原 shot;凭空新增的 shot -> 丢弃
+      (本路径只在采样帧已全覆盖时走到,结构修复没有新增镜头的正当理由);
+    - 违规 shot 达到 2 个以上且超过原有 shot 总数的一半 -> 抛错整体失败。
+      单个违规回滚后结果仍完全可信;而过半改写说明模型整体没有遵守
+      "只修结构不改事实"的指令,按启发式键拼回的结果不再可信,
+      此时如实报错比悄悄计费交付一份缝合结果更符合证据契约。
+
+    原始输出连 JSON 都解不开时没有可信基线,结构修复本身就是全量重建,
+    此时跳过差分(该局限已在调用处注明)。字段类型无效的原值不参与比对,
+    允许结构修复纠正类型。
+    """
+    try:
+        original_payload = _decode_reverse_json_object(original_content)
+    except ReverseResultValidationError:
+        return repaired_payload, []
+    if not isinstance(original_payload, dict):
+        return repaired_payload, []
+    original_shots = [
+        shot for shot in original_payload.get("shots") or [] if isinstance(shot, dict)
+    ]
+    if not original_shots:
+        return repaired_payload, []
+    pending: dict[tuple[int, tuple[int, ...]], list[dict]] = {}
+    for shot in original_shots:
+        pending.setdefault(_repair_shot_fact_key(shot), []).append(shot)
+    repaired_shots = [
+        shot for shot in repaired_payload.get("shots") or [] if isinstance(shot, dict)
+    ]
+    kept: list[dict] = []
+    warnings: list[dict] = []
+    violation_count = 0
+    for shot in repaired_shots:
+        key = _repair_shot_fact_key(shot)
+        bucket = pending.get(key)
+        if not bucket:
+            violation_count += 1
+            warnings.append({
+                "reason": "shot_added",
+                "source_segment_index": key[0],
+                "evidence_frame_indices": list(key[1]),
+            })
+            continue
+        original = bucket.pop(0)
+        rolled_back: list[str] = []
+        for field in _REPAIR_SHOT_FACT_TEXT_FIELDS:
+            original_value = original.get(field)
+            if not isinstance(original_value, str):
+                continue
+            repaired_value = shot.get(field)
+            if (
+                not isinstance(repaired_value, str)
+                or repaired_value.strip() != original_value.strip()
+            ):
+                shot[field] = original_value
+                rolled_back.append(field)
+        for field in _REPAIR_SHOT_FACT_TIME_FIELDS:
+            original_value = original.get(field)
+            if isinstance(original_value, bool) or not isinstance(
+                original_value, (int, float)
+            ):
+                continue
+            repaired_value = shot.get(field)
+            if (
+                isinstance(repaired_value, bool)
+                or not isinstance(repaired_value, (int, float))
+                or abs(float(repaired_value) - float(original_value)) > 0.0005
+            ):
+                shot[field] = original_value
+                rolled_back.append(field)
+        if rolled_back:
+            violation_count += 1
+            warnings.append({
+                "reason": "fields_rewritten",
+                "source_segment_index": key[0],
+                "evidence_frame_indices": list(key[1]),
+                "fields": rolled_back,
+            })
+        kept.append(shot)
+    for key, bucket in pending.items():
+        for original in bucket:
+            violation_count += 1
+            warnings.append({
+                "reason": "shot_deleted",
+                "source_segment_index": key[0],
+                "evidence_frame_indices": list(key[1]),
+            })
+            kept.append(dict(original))
+    if violation_count:
+        log.warning(
+            "反推文本修复在只修结构的指令下改动了 %d 处已有 shot 事实(基线 %d 个 shot),"
+            "已按原值回滚: %s",
+            violation_count,
+            len(original_shots),
+            warnings,
+        )
+    if violation_count >= 2 and violation_count * 2 > len(original_shots):
+        raise GatewayError(
+            f"文本修复在只修结构的指令下改写了 {violation_count} 处已有 shot 事实"
+            f"(原有 {len(original_shots)} 个 shot),判定模型未遵守指令,结果不可信",
+            error_code="INVALID_REVERSE_RESULT",
+            phase="repairing",
+        )
+    repaired_payload = dict(repaired_payload)
+    repaired_payload["shots"] = sorted(kept, key=_repair_shot_sort_key)
+    return repaired_payload, warnings
+
+
 def _repair_reverse_result_once(
     content: str,
     error: ReverseResultValidationError,
@@ -913,9 +1071,22 @@ def _repair_reverse_result_once(
         retries=0,
     )
     repaired_content = _reverse_response_content(repair_data)
+    # 差分校验:模型返回的是整份文档,不能默认它遵守了"只修结构不改事实"。
+    # 原始输出解不开 JSON 时没有可信基线,保持原样交给严格校验兜底。
+    fact_rollbacks: list[dict] = []
+    repaired_payload: dict | str = repaired_content
+    try:
+        decoded_repair = _decode_reverse_json_object(repaired_content)
+    except ReverseResultValidationError:
+        decoded_repair = None
+    if isinstance(decoded_repair, dict):
+        repaired_payload, fact_rollbacks = _enforce_repair_shot_facts(
+            content,
+            decoded_repair,
+        )
     try:
         result = _validate_reverse_result(
-            repaired_content,
+            repaired_payload,
             target,
             source_count=source_count,
             video_segment_count=video_segment_count,
@@ -929,6 +1100,9 @@ def _repair_reverse_result_once(
             error_code="INVALID_REVERSE_RESULT",
             phase="repairing",
         ) from repair_error
+    if fact_rollbacks:
+        # 单个 shot 被偷改已按原值回滚;把告警随结果带出,供上层审计展示。
+        result["repair_fact_rollbacks"] = fact_rollbacks
     return result, _reverse_usage(repair_data)
 
 
@@ -1028,6 +1202,10 @@ def _repair_missing_video_frames_once(
             repaired_content,
             missing_frame_indices,
         )
+        # 合并在本地完成:模型只允许返回缺失帧的 frames 列表(上面已校验
+        # 帧号集合严格等于缺失集合),已有 shot 全部取自原始输出,模型在
+        # "只补不改"指令下没有任何改写既有事实的通道。文本修复路径
+        # (_repair_reverse_result_once)由 _enforce_repair_shot_facts 差分兜底。
         merged_payload = _decode_reverse_json_object(content)
         merged_shots = list(merged_payload.get("shots") or [])
         for description in descriptions:

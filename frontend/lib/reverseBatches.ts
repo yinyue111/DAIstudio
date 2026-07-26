@@ -1,10 +1,14 @@
+import {
+  isReverseAnalysisPrecision,
+  type ReverseAnalysisPrecision,
+} from "../app/studio/reverseConfig";
 import { normalizeReverseOperation } from "./reverseOperations";
 
 export const MAX_REVERSE_BATCH_ITEMS = 20;
 
 export type ReverseBatchItemOverride = {
   target?: "image" | "video";
-  analysis_precision?: "fast" | "standard" | "deep";
+  analysis_precision?: ReverseAnalysisPrecision;
   source_ranges?: Array<{ start_seconds: number; end_seconds: number }>;
   custom_keyframes?: number[];
   include_audio?: boolean;
@@ -89,7 +93,7 @@ export function normalizeReverseBatchItemOverride(value: unknown): ReverseBatchI
     : [];
   return {
     ...(target === "image" || target === "video" ? { target } : {}),
-    ...(precision === "fast" || precision === "standard" || precision === "deep" ? { analysis_precision: precision } : {}),
+    ...(isReverseAnalysisPrecision(precision) ? { analysis_precision: precision } : {}),
     ...(raw.source_ranges !== undefined ? { source_ranges: finiteRanges(raw.source_ranges) } : {}),
     ...(raw.custom_keyframes !== undefined ? { custom_keyframes: keyframes } : {}),
     ...(typeof raw.include_audio === "boolean" ? { include_audio: raw.include_audio } : {}),
@@ -206,7 +210,10 @@ function countsForItems(items: ReturnType<typeof normalizeBatchItem>[]) {
 
 function derivedBatchStatus(counts: ReturnType<typeof countsForItems>) {
   if (counts.running > 0) return "running";
-  if (counts.queued > 0 || counts.needs_confirmation > 0) return "queued";
+  // 待确认必须暴露为独立状态：折叠成"等待中"会让用户错过 15 分钟确认 TTL，
+  // 超时后任务直接取消退款（后端 reap_operations 的 CONFIRMATION_EXPIRED）。
+  if (counts.needs_confirmation > 0) return "needs_confirmation";
+  if (counts.queued > 0) return "queued";
   if (counts.total > 0 && counts.succeeded === counts.total) return "succeeded";
   if (counts.succeeded > 0) return "partial";
   if (counts.total > 0 && counts.canceled === counts.total) return "canceled";
@@ -239,6 +246,19 @@ export function normalizeReverseBatch(value: unknown) {
   const id = Number(raw.id);
   if (!Number.isInteger(id) || id <= 0) throw new Error("服务端未返回有效的批量反推任务");
   const status = String(raw.status || derivedBatchStatus(counts));
+  // 批次响应没有批级费用字段（serialize_batch 只回子项 operation 的
+  // cost_frozen/cost_settled），批级总费用由子项求和得出；若服务端将来
+  // 下发批级字段则以服务端为准。
+  const rawFrozen = raw.cost_frozen ?? raw.frozen_credits;
+  const rawSettled = raw.cost_settled ?? raw.charged_credits;
+  const summedFrozen = items.reduce(
+    (total, item) => total + Math.max(0, Number(item.operation?.cost_frozen) || 0),
+    0,
+  );
+  const summedSettled = items.reduce(
+    (total, item) => total + Math.max(0, Number(item.operation?.cost_settled) || 0),
+    0,
+  );
   return {
     id,
     client_request_id: String(raw.client_request_id || ""),
@@ -253,8 +273,8 @@ export function normalizeReverseBatch(value: unknown) {
     item_override_capability: reverseBatchOverrideCapability(raw),
     counts,
     items,
-    cost_frozen: Math.max(0, Number(raw.cost_frozen ?? raw.frozen_credits) || 0),
-    cost_settled: Math.max(0, Number(raw.cost_settled ?? raw.charged_credits) || 0),
+    cost_frozen: rawFrozen != null ? Math.max(0, Number(rawFrozen) || 0) : summedFrozen,
+    cost_settled: rawSettled != null ? Math.max(0, Number(rawSettled) || 0) : summedSettled,
     created_at: raw.created_at ? String(raw.created_at) : null,
     updated_at: raw.updated_at ? String(raw.updated_at) : null,
     finished_at: raw.finished_at ? String(raw.finished_at) : null,
@@ -280,4 +300,20 @@ export function reverseBatchSucceededOperations(batch: ReturnType<typeof normali
   return (batch?.items || [])
     .map((item) => item.operation)
     .filter((operation) => operation?.status === "succeeded" && operation?.result);
+}
+
+// 待确认子项汇总：数量 + 最早的确认截止时间（用于 UI 倒计时）。
+// 超时未确认后端会自动取消并退款（CONFIRMATION_EXPIRED），所以必须醒目提示。
+export function reverseBatchConfirmationState(batch: ReturnType<typeof normalizeReverseBatch> | null) {
+  const operations = (batch?.items || [])
+    .map((item) => item.operation)
+    .filter((operation) => operation?.status === "needs_confirmation");
+  const expiries = operations
+    .map((operation) => Date.parse(String(operation?.confirmation_expires_at || "")))
+    .filter((value) => Number.isFinite(value));
+  return {
+    count: operations.length,
+    operations,
+    expires_at: expiries.length ? new Date(Math.min(...expiries)).toISOString() : null,
+  };
 }

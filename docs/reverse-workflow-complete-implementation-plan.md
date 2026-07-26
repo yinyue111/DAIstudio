@@ -19,19 +19,19 @@
 | WP5 结果审阅与应用 | 生成稿、结构、分镜、证据、版本、差异、字段级应用和撤销 | 部分完成 | 已有替换/追加/仅结构/仅参数/撤销；缺字段多选和版本内容差异 |
 | WP6 提示词优化与模型编译 | 忠实、精简、商业增强、目标模型适配、约束检查 | 部分完成 | 已有建议对比/接受/拒绝和视频编译器；缺显式优化方向和图片模型适配预览 |
 | WP7 历史、版本和创作配方 | 原始/标准化/编辑/应用/生成血缘，配方版本与恢复 | 已完成 | 服务端版本、重试血缘、最近反推和创作配方页已接通 |
-| WP8 批量反推 | 网页素材多选、共享配置、独立任务、结果比较/批量保存 | 未完成 | 当前仅支持一个主素材的单次反推 |
+| WP8 批量反推 | 网页素材多选、共享配置、独立任务、结果比较/批量保存 | 已完成 | `ReverseBatch` 后端接口与批量任务已落地（`backend/tests/test_reverse_batches.py`、前端 `e2e/reverse-batches.spec.ts`、`api.createReverseBatch/reverseBatches`） |
 | WP9 质量评估与运营 | 黄金集、用户反馈、采用/生成转化、模型/目标/费用对比 | 部分完成 | 已有黄金样本、反馈和后端证据/成本报表；缺采用率、编辑幅度和管理端可视化 |
 | WP10 保留与安全 | 结果保留、敏感内容清理、所有权校验、系统契约强制 | 已完成 | 过期内容脱敏、`RESULT_EXPIRED`、owner gate、SSRF 和强制系统模板 |
-| WP11 复刻度评估与修正 | 图片分维度热力图/区域 finding、视频镜头对齐/差异时间线、修正 revision、局部或逐镜重生成 | 未完成 | 当前没有生成后 source-versus-generated assessment 持久记录、用户可选 findings 或 canonical correction chain |
+| WP11 复刻度评估与修正 | 图片分维度热力图/区域 finding、视频镜头对齐/差异时间线、修正 revision、局部或逐镜重生成 | 已完成 | 复刻评估与修正闭环已落地（`backend/app/services/reproduction_assessment.py`、`backend/tests/test_reproduction_assessments.py` / `test_reproduction_remediations.py`、前端 `e2e/reproduction-remediation.spec.ts`）；仅剩历史列表接口 `api.reproductionAssessments` 尚未接前端入口 |
 
 ## 3. 实施顺序
 
 1. WP5 字段级应用与版本差异：先保证反推结果可控地进入工作区。
 2. WP3 图片区域证据：补齐图片与视频的“证据化”差距。
 3. WP6 优化方向和图片模型编译预览。
-4. WP8 批量反推与多片段视频分析。
+4. ~~WP8 批量反推与多片段视频分析。~~（批量反推已完成，多片段批量分析缺口见 WP4）
 5. WP9 采用率、生成转化、编辑幅度与管理报表。
-6. WP11 复刻度评估、修正版本和局部/逐镜重生成闭环。
+6. ~~WP11 复刻度评估、修正版本和局部/逐镜重生成闭环。~~（已完成，剩余复刻评估历史列表前端入口）
 
 ## 4. 全局验收条件
 

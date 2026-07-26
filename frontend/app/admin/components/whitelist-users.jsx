@@ -94,14 +94,23 @@ export function Users() {
   const [msg, setMsg] = useState("");
   const [granting, setGranting] = useState(null);
   const [loadingUsers, setLoadingUsers] = useState(false);
+  const [me, setMe] = useState(null);
+  const [activeAdminCount, setActiveAdminCount] = useState(null);
+  const [roleUpdating, setRoleUpdating] = useState(null);
   const loadSeqRef = useRef(0);
   const PAGE = 50;
+  // 前端护栏需要知道全局活跃管理员数量（列表可能被搜索 / 分页过滤）。
+  const refreshActiveAdminCount = () => api
+    .adminUsers({ is_admin: "true", status: "active", limit: 200 })
+    .then((rows) => setActiveAdminCount(rows.length))
+    .catch(() => setActiveAdminCount(null));
   const load = (nextOffset = 0, overrides = {}) => {
     const seq = ++loadSeqRef.current;
     const query = overrides.q ?? q;
     const rowStatus = overrides.status ?? status;
     const adminFilter = overrides.onlyAdmin ?? onlyAdmin;
     setLoadingUsers(true);
+    refreshActiveAdminCount();
     return api.adminUsers({
     q: query,
     status: rowStatus,
@@ -122,6 +131,7 @@ export function Users() {
   });
   };
   useEffect(() => { load(0); }, []);
+  useEffect(() => { api.me().then(setMe).catch(() => {}); }, []);
 
   async function grant(uid) {
     if (granting === uid) return;
@@ -186,9 +196,25 @@ export function Users() {
     setMsg("");
     try {
       await api.adminSetUserStatus(user.id, { status });
-      load();
+      load(offset);
     } catch (e) {
       setMsg(e.message);
+    }
+  }
+
+  async function setRole(user, isAdmin) {
+    if (roleUpdating) return;
+    const action = isAdmin ? "提升为管理员" : "取消管理员权限";
+    if (!window.confirm(`确认将用户 ${user.phone} ${action}？该操作会使其已登录令牌失效，并记录审计日志。`)) return;
+    setMsg("");
+    setRoleUpdating(user.id);
+    try {
+      await api.adminSetUserRole(user.id, { is_admin: isAdmin });
+      await load(offset);
+    } catch (e) {
+      setMsg(e.message);
+    } finally {
+      setRoleUpdating(null);
     }
   }
 
@@ -290,7 +316,27 @@ export function Users() {
               <Th>选择</Th><Th>ID</Th><Th>手机号</Th><Th>部门</Th><Th>状态</Th><Th>余额</Th><Th>发放</Th><Th>账号</Th>
           </tr></thead>
           <tbody>
-            {list.map((u) => (
+            {list.map((u) => {
+              // 与后端护栏一一对应：自己、最后一个活跃管理员在 UI 上直接禁用并说明原因。
+              const isSelf = me ? u.id === me.id : null;
+              const isLastActiveAdmin = u.is_admin && u.status === "active"
+                && activeAdminCount !== null && activeAdminCount <= 1;
+              const demoteGuard = !u.is_admin ? "" : !me
+                ? "正在加载当前管理员信息"
+                : isSelf
+                  ? "不能给当前管理员账号降权"
+                  : isLastActiveAdmin
+                    ? "至少需要保留一个可用管理员账号"
+                    : "";
+              const disableGuard = !u.is_admin ? "" : !me
+                ? "正在加载当前管理员信息"
+                : isSelf
+                  ? "不能禁用当前管理员账号"
+                  : isLastActiveAdmin
+                    ? "至少需要保留一个可用管理员账号"
+                    : "";
+              const promoteGuard = u.status !== "active" ? "只能给启用状态的用户提权" : "";
+              return (
               <tr key={u.id} className="border-b border-line/60 text-mist transition-colors hover:bg-white/5">
                 <td className="py-2 pr-3">
                   <input
@@ -345,18 +391,43 @@ export function Users() {
                   <button onClick={() => resetPw(u.id)} className="btn-ghost btn-sm ml-1">重置密码</button>
                 </td>
                 <td className="py-1">
-                  {u.status === "disabled" ? (
-                    <button onClick={() => setStatus(u, "active")} className="btn-secondary btn-sm">启用</button>
-                  ) : u.is_admin ? (
-                    <button disabled title="管理员账号需要至少保留一个可用入口" className="btn-ghost btn-sm opacity-50">
-                      管理员
-                    </button>
-                  ) : (
-                    <button onClick={() => setStatus(u, "disabled")} className="btn-ghost btn-sm">禁用</button>
-                  )}
+                  <div className="flex flex-wrap items-center gap-1">
+                    {u.status === "disabled" ? (
+                      <button onClick={() => setStatus(u, "active")} className="btn-secondary btn-sm">启用</button>
+                    ) : (
+                      <button
+                        onClick={() => setStatus(u, "disabled")}
+                        disabled={Boolean(disableGuard)}
+                        title={disableGuard}
+                        className="btn-ghost btn-sm disabled:cursor-not-allowed disabled:opacity-50"
+                      >
+                        禁用
+                      </button>
+                    )}
+                    {u.is_admin ? (
+                      <button
+                        onClick={() => setRole(u, false)}
+                        disabled={Boolean(demoteGuard) || roleUpdating === u.id}
+                        title={demoteGuard}
+                        className="btn-ghost btn-sm disabled:cursor-not-allowed disabled:opacity-50"
+                      >
+                        {roleUpdating === u.id ? "处理中" : "取消管理员"}
+                      </button>
+                    ) : (
+                      <button
+                        onClick={() => setRole(u, true)}
+                        disabled={Boolean(promoteGuard) || roleUpdating === u.id}
+                        title={promoteGuard}
+                        className="btn-secondary btn-sm disabled:cursor-not-allowed disabled:opacity-50"
+                      >
+                        {roleUpdating === u.id ? "处理中" : "设为管理员"}
+                      </button>
+                    )}
+                  </div>
                 </td>
               </tr>
-            ))}
+              );
+            })}
           </tbody>
         </table>
       </div>

@@ -12,6 +12,8 @@ const FILTERS = [
 export default function CreationRecipeBrowser({
   recipes = [],
   loading = false,
+  loadingMore = false,
+  hasMore = false,
   error = "",
   scope = "mine",
   filter = "all",
@@ -21,6 +23,7 @@ export default function CreationRecipeBrowser({
   onQueryChange,
   onSearch,
   onRefresh,
+  onLoadMore,
   onRestore,
   onFavorite,
   onDelete,
@@ -83,23 +86,29 @@ export default function CreationRecipeBrowser({
             </button>
           ))}
         </div>
-        {!mine && (
-          <div className="flex min-w-0 flex-1 items-center justify-end gap-2 sm:max-w-sm" role="search">
-            <label htmlFor="public-recipe-search" className="sr-only">搜索公开创作配方</label>
-            <input
-              id="public-recipe-search"
-              type="search"
-              className="input min-w-0 flex-1 px-3 py-2 text-xs"
-              placeholder="搜索公开配方"
-              value={query}
-              onChange={(event) => onQueryChange?.(event.target.value)}
-              onKeyDown={(event) => { if (event.key === "Enter") onSearch?.(); }}
-            />
-            <button type="button" className="icon-btn h-10 w-10" aria-label="搜索公开配方" onClick={onSearch} disabled={loading}>
-              <Search size={16} aria-hidden="true" />
-            </button>
-          </div>
-        )}
+        <div className="flex min-w-0 flex-1 items-center justify-end gap-2 sm:max-w-sm" role="search">
+          <label htmlFor="creation-recipe-search" className="sr-only">
+            {mine ? "搜索我的创作配方" : "搜索公开创作配方"}
+          </label>
+          <input
+            id="creation-recipe-search"
+            type="search"
+            className="input min-w-0 flex-1 px-3 py-2 text-xs"
+            placeholder={mine ? "搜索我的配方" : "搜索公开配方"}
+            value={query}
+            onChange={(event) => onQueryChange?.(event.target.value)}
+            onKeyDown={(event) => { if (event.key === "Enter") onSearch?.(); }}
+          />
+          <button
+            type="button"
+            className="icon-btn h-10 w-10"
+            aria-label={mine ? "搜索我的配方" : "搜索公开配方"}
+            onClick={onSearch}
+            disabled={loading}
+          >
+            <Search size={16} aria-hidden="true" />
+          </button>
+        </div>
       </div>
 
       {error && (
@@ -125,23 +134,40 @@ export default function CreationRecipeBrowser({
       )}
 
       {recipes.length > 0 && (
-        <div className="grid items-start gap-3 sm:grid-cols-2 lg:grid-cols-3">
-          {recipes.map((recipe) => (
-            <CreationRecipeCard
-              key={`${scope}-${recipe.id}`}
-              recipe={recipe}
-              scope={scope}
-              onRestore={onRestore}
-              onFavorite={onFavorite}
-              onDelete={onDelete}
-              onRename={onRename}
-              onToggleVisibility={onToggleVisibility}
-              onClone={onClone}
-              onLoadVersions={onLoadVersions}
-              onActivate={onActivate}
-            />
-          ))}
-        </div>
+        <>
+          <div className="grid items-start gap-3 sm:grid-cols-2 lg:grid-cols-3">
+            {recipes.map((recipe) => (
+              <CreationRecipeCard
+                key={`${scope}-${recipe.id}`}
+                recipe={recipe}
+                scope={scope}
+                onRestore={onRestore}
+                onFavorite={onFavorite}
+                onDelete={onDelete}
+                onRename={onRename}
+                onToggleVisibility={onToggleVisibility}
+                onClone={onClone}
+                onLoadVersions={onLoadVersions}
+                onActivate={onActivate}
+              />
+            ))}
+          </div>
+          <div className="mt-4 flex items-center justify-center gap-3 text-xs text-fog">
+            <span>已显示 {recipes.length} 个配方</span>
+            {hasMore ? (
+              <button
+                type="button"
+                onClick={onLoadMore}
+                disabled={loading || loadingMore}
+                className="btn-secondary btn-sm"
+              >
+                {loadingMore ? "加载中…" : "加载更多"}
+              </button>
+            ) : (
+              <span>已全部加载</span>
+            )}
+          </div>
+        </>
       )}
     </section>
   );

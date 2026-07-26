@@ -42,6 +42,8 @@ def test_release_artifact_checker_rejects_runtime_tree_entries(tmp_path):
         ".coverage",
         "backend/celerybeat-schedule.db",
         "backend/certs/payment.key.example",
+        "backend/app/models.py.bak",
+        "backend/app/schemas.py.bak",
     ]):
         root = tmp_path / f"src-{index}"
         root.mkdir()
@@ -50,6 +52,17 @@ def test_release_artifact_checker_rejects_runtime_tree_entries(tmp_path):
         path.write_text("blocked\n", encoding="utf-8")
 
         assert check_release_artifact.main(["check_release_artifact.py", str(root)]) == 1
+
+
+def test_release_artifact_checker_rejects_bak_suffix(tmp_path):
+    # 拆包重构遗留的 .bak 源码副本不允许进入发布包
+    assert ".bak" in check_release_artifact.BLOCKED_SUFFIXES
+    root = tmp_path / "src"
+    root.mkdir()
+    (root / "README.md").write_text("ok\n", encoding="utf-8")
+    (root / "models.py.bak").write_text("stale\n", encoding="utf-8")
+
+    assert check_release_artifact.main(["check_release_artifact.py", str(root)]) == 1
 
 
 def test_release_artifact_checker_rejects_tree_symlinks(tmp_path):

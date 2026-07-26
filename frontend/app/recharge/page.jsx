@@ -5,7 +5,7 @@ import { useRouter } from "next/navigation";
 import QRCode from "qrcode";
 import Nav from "../../components/Nav";
 import { useToast } from "../../components/ToastProvider";
-import { api, loginPath, wsUrl } from "../../lib/api";
+import { api, downloadBlob, loginPath, wsUrl } from "../../lib/api";
 import { reportBackgroundError } from "../../lib/errorHandling";
 import AccountTabs, { ACCOUNT_TABS } from "./AccountTabs";
 import CreditLedger from "./CreditLedger";
@@ -22,6 +22,13 @@ const PROVIDERS = [
   ["alipay", "支付宝"],
   ["wechat", "微信"],
 ];
+
+const ORDER_PAGE_SIZE = 20;
+const INVOICE_STATUS_TEXT = {
+  requested: "已申请，等待处理",
+  issued: "已开票",
+  rejected: "已驳回，请联系客服",
+};
 
 export default function RechargePage() {
   const router = useRouter();
@@ -40,7 +47,15 @@ export default function RechargePage() {
   const [initialLoading, setInitialLoading] = useState(true);
   const [ordersLoading, setOrdersLoading] = useState(true);
   const [ordersError, setOrdersError] = useState("");
-  const [orderLimit, setOrderLimit] = useState(20);
+  const [ordersHasMore, setOrdersHasMore] = useState(false);
+  const [invoiceOpen, setInvoiceOpen] = useState(false);
+  const [invoiceForm, setInvoiceForm] = useState({
+    invoice_type: "company",
+    title: "",
+    tax_no: "",
+    email: "",
+  });
+  const [invoiceSubmitting, setInvoiceSubmitting] = useState(false);
   const [activeTab, setActiveTab] = useState("packages");
   const [billingRefreshKey, setBillingRefreshKey] = useState(0);
   const [msg, setMsg] = useState("");
@@ -59,7 +74,7 @@ export default function RechargePage() {
         setMe(u);
         const paymentCfg = await api.paymentConfig();
         const enabled = paymentCfg.enabled !== false;
-        const rows = enabled ? await api.paymentOrders(20) : [];
+        const rows = enabled ? await api.paymentOrders(ORDER_PAGE_SIZE) : [];
         const pkgs = paymentCfg.packages || [];
         const readyProviders = (paymentCfg.providers || [])
           .filter((p) => p.enabled && p.ready)
@@ -70,6 +85,7 @@ export default function RechargePage() {
         setPackages(pkgs);
         setProviders(readyProviders);
         replaceOrdersMonotonically(rows);
+        setOrdersHasMore(rows.length >= ORDER_PAGE_SIZE);
         const pending = rows.find((o) => o.status === "pending" && o.code_url);
         if (pending) {
           const seq = createOrderSeqRef.current;
@@ -296,7 +312,7 @@ export default function RechargePage() {
       const current = rows.find((row) => row.order_no === next.order_no);
       const selected = selectMonotonicPaymentOrder(current, next);
       if (selected === current) return rows;
-      return [selected, ...rows.filter((row) => row.order_no !== next.order_no)].slice(0, 100);
+      return [selected, ...rows.filter((row) => row.order_no !== next.order_no)].slice(0, 500);
     });
   }
 
@@ -318,16 +334,18 @@ export default function RechargePage() {
     setActiveOrder(null);
   }
 
-  async function refreshOrders(limit = orderLimit, { visible = false } = {}) {
+  async function refreshOrders(limit, { visible = false } = {}) {
     const seq = createOrderSeqRef.current;
     const currentOrderNo = activeOrderRef.current?.order_no;
+    const effectiveLimit = Math.min(100, Math.max(limit || orders.length || ORDER_PAGE_SIZE, ORDER_PAGE_SIZE));
     if (visible) {
       setOrdersLoading(true);
       setOrdersError("");
     }
     try {
-      const rows = await api.paymentOrders(limit);
+      const rows = await api.paymentOrders(effectiveLimit);
       replaceOrdersMonotonically(rows);
+      setOrdersHasMore(rows.length >= effectiveLimit);
       if (currentOrderNo && seq === createOrderSeqRef.current && activeOrderRef.current?.order_no === currentOrderNo) {
         const current = rows.find((o) => o.order_no === currentOrderNo);
         if (current) updateActiveOrder(current);
@@ -342,9 +360,63 @@ export default function RechargePage() {
   }
 
   async function loadMoreOrders() {
-    const nextLimit = Math.min(100, orderLimit + 20);
-    await refreshOrders(nextLimit, { visible: true });
-    setOrderLimit(nextLimit);
+    // 游标翻页:取当前已加载订单里最早的一条 id,只拉更早的订单,
+    // 翻页期间新产生的订单不会造成错位或重复。
+    setOrdersLoading(true);
+    setOrdersError("");
+    try {
+      const cursor = orders.length ? Math.min(...orders.map((o) => o.id)) : null;
+      const rows = await api.paymentOrders(ORDER_PAGE_SIZE, { cursor });
+      setOrders((cur) => {
+        const known = new Set(cur.map((o) => o.order_no));
+        return [...cur, ...rows.filter((row) => !known.has(row.order_no))];
+      });
+      setOrdersHasMore(rows.length >= ORDER_PAGE_SIZE);
+    } catch (error) {
+      setOrdersError(error.message || "充值订单加载失败");
+      throw error;
+    } finally {
+      setOrdersLoading(false);
+    }
+  }
+
+  async function exportBillingCsv() {
+    try {
+      await downloadBlob("/api/payments/billing/export", "credit_bill.csv");
+      notify.success("账单 CSV 已开始下载。");
+    } catch (e) {
+      notify.error(e.message || "账单导出失败");
+    }
+  }
+
+  async function submitInvoice() {
+    if (!activeOrder || invoiceSubmitting) return;
+    const title = invoiceForm.title.trim();
+    if (!title) {
+      notify.error("请填写发票抬头");
+      return;
+    }
+    if (invoiceForm.invoice_type === "company" && !invoiceForm.tax_no.trim()) {
+      notify.error("企业抬头必须填写税号");
+      return;
+    }
+    setInvoiceSubmitting(true);
+    try {
+      const next = await api.requestPaymentInvoice(activeOrder.order_no, {
+        invoice_type: invoiceForm.invoice_type,
+        title,
+        tax_no: invoiceForm.tax_no.trim() || null,
+        email: invoiceForm.email.trim() || null,
+      });
+      patchOrder(next);
+      updateActiveOrder(next);
+      setInvoiceOpen(false);
+      notify.success("开票申请已提交，请等待管理员处理。");
+    } catch (e) {
+      notify.error(e.message || "开票申请失败");
+    } finally {
+      setInvoiceSubmitting(false);
+    }
   }
 
   function selectAccountTab(tab) {
@@ -359,6 +431,7 @@ export default function RechargePage() {
     createOrderSeqRef.current += 1;
     clearActiveOrder();
     setQrImage("");
+    setInvoiceOpen(false);
   }
 
   async function createOrder() {
@@ -449,6 +522,7 @@ export default function RechargePage() {
 
   async function viewOrder(orderNo) {
     const seq = ++createOrderSeqRef.current;
+    setInvoiceOpen(false);
     const row = orders.find((order) => order.order_no === orderNo);
     if (row) {
       setPackageId(row.package_id);
@@ -633,6 +707,55 @@ export default function RechargePage() {
                     {canMockPay && <button type="button" onClick={mockPay} disabled={loading} className="btn-secondary mt-3 w-full">本地模拟支付成功</button>}
                     {activeOrder.status === "pending" && <button type="button" onClick={refreshActiveOrder} disabled={loading} className="btn-secondary mt-2 w-full">刷新订单状态</button>}
                     {activeOrder.status === "paid" && <div className="mt-3 rounded-xl border border-ok/30 bg-ok/10 px-3 py-2 text-sm text-ok">已入账 {activeOrder.credits} 积分</div>}
+                    {activeOrder.status === "paid" && (
+                      activeOrder.invoice_status && activeOrder.invoice_status !== "none" ? (
+                        <div className="mt-2 rounded-xl border border-line bg-white/5 px-3 py-2 text-xs text-mist">
+                          开票状态：{INVOICE_STATUS_TEXT[activeOrder.invoice_status] || activeOrder.invoice_status}
+                        </div>
+                      ) : !invoiceOpen ? (
+                        <button type="button" onClick={() => setInvoiceOpen(true)} className="btn-secondary mt-2 w-full">申请开票</button>
+                      ) : (
+                        <div className="mt-3 space-y-2 rounded-xl border border-line bg-base2/50 p-3">
+                          <select
+                            className="select w-full"
+                            value={invoiceForm.invoice_type}
+                            onChange={(e) => setInvoiceForm({ ...invoiceForm, invoice_type: e.target.value })}
+                          >
+                            <option value="company">企业抬头</option>
+                            <option value="personal">个人抬头</option>
+                          </select>
+                          <input
+                            className="input w-full"
+                            placeholder="发票抬头"
+                            maxLength={128}
+                            value={invoiceForm.title}
+                            onChange={(e) => setInvoiceForm({ ...invoiceForm, title: e.target.value })}
+                          />
+                          {invoiceForm.invoice_type === "company" && (
+                            <input
+                              className="input w-full"
+                              placeholder="税号"
+                              maxLength={32}
+                              value={invoiceForm.tax_no}
+                              onChange={(e) => setInvoiceForm({ ...invoiceForm, tax_no: e.target.value })}
+                            />
+                          )}
+                          <input
+                            className="input w-full"
+                            placeholder="接收邮箱（选填）"
+                            maxLength={128}
+                            value={invoiceForm.email}
+                            onChange={(e) => setInvoiceForm({ ...invoiceForm, email: e.target.value })}
+                          />
+                          <div className="flex gap-2">
+                            <button type="button" onClick={submitInvoice} disabled={invoiceSubmitting} className="btn-primary flex-1">
+                              {invoiceSubmitting ? "提交中" : "提交申请"}
+                            </button>
+                            <button type="button" onClick={() => setInvoiceOpen(false)} disabled={invoiceSubmitting} className="btn-ghost">取消</button>
+                          </div>
+                        </div>
+                      )
+                    )}
                     {orderExpired && <p className="mt-2 rounded-xl border border-warn/30 bg-warn/10 px-3 py-2 text-xs text-warn">本地已到订单有效期，可刷新确认状态或重新生成二维码。</p>}
                     {orderClosed && activeOrder.status !== "paid" && (
                       <button type="button" onClick={createOrder} disabled={loading || !paymentEnabled || !selectedPackage || !providers.includes(provider)} className="btn-primary mt-3 w-full">
@@ -651,14 +774,23 @@ export default function RechargePage() {
               loading={ordersLoading}
               actionLoading={loading}
               error={ordersError}
-              hasMore={orders.length >= orderLimit && orderLimit < 100}
-              onRefresh={() => refreshOrders(orderLimit, { visible: true }).catch((error) => notify.error(error.message || "订单列表刷新失败"))}
+              hasMore={ordersHasMore}
+              onRefresh={() => refreshOrders(undefined, { visible: true }).catch((error) => notify.error(error.message || "订单列表刷新失败"))}
               onLoadMore={() => loadMoreOrders().catch((error) => notify.error(error.message || "订单列表加载失败"))}
               onOpen={viewOrder}
             />
           )}
 
-          {activeTab === "billing" && <CreditLedger refreshKey={billingRefreshKey} />}
+          {activeTab === "billing" && (
+            <div>
+              <div className="mb-3 flex justify-end">
+                <button type="button" onClick={exportBillingCsv} className="btn-secondary btn-sm">
+                  导出账单 CSV
+                </button>
+              </div>
+              <CreditLedger refreshKey={billingRefreshKey} />
+            </div>
+          )}
         </div>
       </main>
     </div>

@@ -22,6 +22,17 @@ from . import gateway, image_evidence_analysis
 
 CONTRACT_VERSION = "video-evidence.v1"
 SEMANTIC_CONTRACT_VERSION = "video-semantic-evidence.v1"
+# 光流运镜分类的封闭标签集：下游证据门用它和 VLM 的运镜文本做标签级对账。
+CAMERA_MOTION_LABELS = ("pan", "tilt", "zoom", "static")
+# 每个标签允许的方向取值（static 无方向）。
+CAMERA_MOTION_DIRECTIONS = {
+    "pan": ("left", "right"),
+    "tilt": ("up", "down"),
+    "zoom": ("in", "out"),
+    "static": (),
+}
+# ffmpeg 硬切没有 lavfi 分值时的保守默认置信度。
+DEFAULT_CUT_TRANSITION_CONFIDENCE = 0.5
 SEMANTIC_CAPABILITIES = ("subject_tracking", "pose", "action", "transition")
 _SEMANTIC_EVIDENCE_KEYS = {
     "subject_tracking": "tracks",
@@ -1080,19 +1091,34 @@ def cv2_motion_analysis(images: list[Image.Image], frames: list[dict[str, Any]])
     except ImportError:
         return {
             "status": "unsupported", "analyzer": "opencv_lk_homography",
-            "analyzer_version": "unavailable", "samples": [],
+            "analyzer_version": "unavailable",
+            "camera_labels": list(CAMERA_MOTION_LABELS), "samples": [],
+            "excluded_cross_cut_pairs": 0,
             "degraded_reason": "服务器未安装 OpenCV/NumPy，无法形成光流运镜证据",
         }
     if len(images) < 2:
         return {
             "status": "degraded", "analyzer": "opencv_lk_homography",
-            "analyzer_version": str(cv2.__version__), "samples": [],
+            "analyzer_version": str(cv2.__version__),
+            "camera_labels": list(CAMERA_MOTION_LABELS), "samples": [],
+            "excluded_cross_cut_pairs": 0,
             "degraded_reason": "至少需要两帧才能分析运动",
         }
     samples: list[dict[str, Any]] = []
+    excluded_cross_cut_pairs = 0
     for index in range(1, len(images)):
         previous_meta, current_meta = frames[index - 1], frames[index]
         if previous_meta["source_segment_index"] != current_meta["source_segment_index"]:
+            continue
+        previous_shot = previous_meta.get("detected_shot_index")
+        current_shot = current_meta.get("detected_shot_index")
+        if (
+            isinstance(previous_shot, int)
+            and isinstance(current_shot, int)
+            and previous_shot != current_shot
+        ):
+            # 跨 ffmpeg 切点的帧对测到的是剪辑跳变而不是运镜，会产生伪运镜样本。
+            excluded_cross_cut_pairs += 1
             continue
         previous = cv2.cvtColor(np.array(images[index - 1]), cv2.COLOR_RGB2GRAY)
         current = cv2.cvtColor(np.array(images[index]), cv2.COLOR_RGB2GRAY)
@@ -1130,6 +1156,16 @@ def cv2_motion_analysis(images: list[Image.Image], frames: list[dict[str, Any]])
         static = max(0.0, 1.0 - max(pan, tilt, zoom))
         labels = {"pan": pan, "tilt": tilt, "zoom": zoom, "static": static}
         camera = max(labels, key=labels.get)
+        # 方向约定：仿射把前一帧坐标映射到当前帧。画面内容右移(dx>0)说明相机
+        # 左摇；内容下移(dy>0)说明相机上仰；scale>1 说明推近。
+        if camera == "pan":
+            camera_direction = "left" if dx > 0 else "right"
+        elif camera == "tilt":
+            camera_direction = "up" if dy > 0 else "down"
+        elif camera == "zoom":
+            camera_direction = "in" if scale >= 1 else "out"
+        else:
+            camera_direction = None
         inlier_ratio = float(inliers.mean()) if inliers is not None else 0.0
         sample = {
             "start_seconds": previous_meta["timestamp_seconds"],
@@ -1137,6 +1173,7 @@ def cv2_motion_analysis(images: list[Image.Image], frames: list[dict[str, Any]])
             "source_segment_index": current_meta["source_segment_index"],
             "frame_indices": [previous_meta["frame_index"], current_meta["frame_index"]],
             "camera": camera,
+            "camera_direction": camera_direction,
             "camera_confidence": round(labels[camera], 6),
             "camera_scores": {key: round(value, 6) for key, value in labels.items()},
             "background_motion_confidence": round(inlier_ratio, 6),
@@ -1144,12 +1181,110 @@ def cv2_motion_analysis(images: list[Image.Image], frames: list[dict[str, Any]])
         }
         sample["evidence_id"] = _stable_id("motion-", sample)
         samples.append(sample)
+    if samples:
+        degraded_reason = None
+    elif excluded_cross_cut_pairs:
+        degraded_reason = "抽样帧对全部跨越镜头切点，无法形成同镜头光流证据"
+    else:
+        degraded_reason = "抽样帧缺少足够可跟踪特征"
     return {
         "status": "analyzed" if samples else "degraded",
         "analyzer": "opencv_lk_homography",
         "analyzer_version": str(cv2.__version__),
+        "camera_labels": list(CAMERA_MOTION_LABELS),
         "samples": samples,
-        "degraded_reason": None if samples else "抽样帧缺少足够可跟踪特征",
+        "excluded_cross_cut_pairs": excluded_cross_cut_pairs,
+        "degraded_reason": degraded_reason,
+    }
+
+
+def build_cut_transition_evidence(frame_meta: list[dict[str, Any]]) -> dict[str, Any]:
+    """把 ffmpeg 场景切点整理成帧对可验证的 transition 证据。
+
+    抽样帧带有 detected_shot_* 元数据（来自 video_frames 的镜头切分）。相邻两个
+    抽样帧落在不同检测镜头时，两帧之间必然发生了硬切——切点时刻、前后帧指纹与
+    lavfi 场景分值一起构成独立于 VLM 的转场证据，供下游证据门放行 transition。
+    """
+    analyzer_fields = {
+        "analyzer": "ffmpeg_scene",
+        "analyzer_version": "scene-threshold-v1",
+    }
+    rows = sorted(
+        (meta for meta in frame_meta if isinstance(meta, dict)),
+        key=lambda meta: (
+            int(meta.get("source_segment_index") or 1),
+            float(meta.get("timestamp_seconds") or 0),
+        ),
+    )
+    if not any(isinstance(meta.get("detected_shot_index"), int) for meta in rows):
+        return {
+            "status": "unsupported",
+            **analyzer_fields,
+            "events": [],
+            "evidence_count": 0,
+            "degraded_reason": "抽样帧缺少镜头切点元数据，无法形成切点转场证据",
+        }
+    events: list[dict[str, Any]] = []
+    for previous, current in zip(rows, rows[1:]):
+        previous_segment = int(previous.get("source_segment_index") or 1)
+        current_segment = int(current.get("source_segment_index") or 1)
+        if previous_segment != current_segment:
+            continue
+        previous_shot = previous.get("detected_shot_index")
+        current_shot = current.get("detected_shot_index")
+        if (
+            not isinstance(previous_shot, int)
+            or not isinstance(current_shot, int)
+            or current_shot <= previous_shot
+        ):
+            continue
+        cut_timestamp = current.get("detected_shot_start_seconds")
+        if isinstance(cut_timestamp, bool) or not isinstance(cut_timestamp, (int, float)):
+            continue
+        previous_ts = float(previous.get("timestamp_seconds") or 0)
+        current_ts = float(current.get("timestamp_seconds") or 0)
+        cut_ts = float(cut_timestamp)
+        if not previous_ts - 0.001 <= cut_ts <= current_ts + 0.001:
+            continue
+        score = current.get("detected_shot_cut_score")
+        has_score = (
+            not isinstance(score, bool)
+            and isinstance(score, (int, float))
+            and 0.0 <= float(score) <= 1.0
+        )
+        canonical = {
+            "label": "hard_cut",
+            "source_segment_index": current_segment,
+            "timestamp_seconds": round(min(max(cut_ts, previous_ts), current_ts), 3),
+            "before_frame_index": int(previous.get("frame_index") or 0),
+            "after_frame_index": int(current.get("frame_index") or 0),
+            "before_timestamp_seconds": round(previous_ts, 3),
+            "after_timestamp_seconds": round(current_ts, 3),
+            # 两帧之间跨越的切点数下界（>1 说明中间还有未采样到的快剪镜头）。
+            "cut_count": current_shot - previous_shot,
+            "confidence": (
+                round(float(score), 6) if has_score
+                else DEFAULT_CUT_TRANSITION_CONFIDENCE
+            ),
+            "confidence_source": (
+                "ffmpeg_scene_score" if has_score else "default_hard_cut"
+            ),
+        }
+        events.append({
+            **canonical,
+            **analyzer_fields,
+            "evidence_id": _stable_id("cut-transition-", canonical),
+            "source_content_hashes": [
+                str(previous.get("source_content_hash") or ""),
+                str(current.get("source_content_hash") or ""),
+            ],
+        })
+    return {
+        "status": "analyzed",
+        **analyzer_fields,
+        "events": events,
+        "evidence_count": len(events),
+        "degraded_reason": None,
     }
 
 
@@ -1181,6 +1316,33 @@ def analyze_video_evidence(
             "timestamp_seconds": round(timestamp, 3),
             "source_segment_index": segment_index,
         }
+        # 帧的镜头归属元数据（video_frames 的 ffmpeg 切分结果）：光流分析用它
+        # 排除跨切点帧对，切点转场证据用它定位帧对之间的硬切。
+        shot_ordinal = raw_meta.get("detected_shot_index")
+        if (
+            not isinstance(shot_ordinal, bool)
+            and isinstance(shot_ordinal, int)
+            and shot_ordinal >= 1
+        ):
+            meta["detected_shot_index"] = shot_ordinal
+            shot_id = str(raw_meta.get("detected_shot_id") or "").strip()
+            if shot_id:
+                meta["detected_shot_id"] = shot_id
+            shot_start = raw_meta.get("detected_shot_start_seconds")
+            if (
+                not isinstance(shot_start, bool)
+                and isinstance(shot_start, (int, float))
+                and math.isfinite(float(shot_start))
+                and float(shot_start) >= 0
+            ):
+                meta["detected_shot_start_seconds"] = round(float(shot_start), 3)
+            cut_score = raw_meta.get("detected_shot_cut_score")
+            if (
+                not isinstance(cut_score, bool)
+                and isinstance(cut_score, (int, float))
+                and 0.0 <= float(cut_score) <= 1.0
+            ):
+                meta["detected_shot_cut_score"] = round(float(cut_score), 6)
         try:
             image = _decode(ref)
             content_hash = _content_hash(ref)
@@ -1267,6 +1429,8 @@ def analyze_video_evidence(
         "motion": motion,
         # Explicit name for new clients; motion remains as a compatibility key.
         "camera_motion": motion,
+        # ffmpeg 场景切点整理出的硬切转场证据，独立于 http 语义 provider。
+        "shot_transitions": build_cut_transition_evidence(frame_meta),
         **{
             capability: semantic.get(capability)
             or _semantic_capability_status(
@@ -1281,12 +1445,75 @@ def analyze_video_evidence(
     }
 
 
+def _summarize_camera_motion(
+    samples: list[dict[str, Any]],
+    *,
+    analyzer_block: dict[str, Any],
+    evidence_refs: list[str],
+) -> dict[str, Any]:
+    """把镜头时间窗内的光流样本聚合成可直接对账的运镜摘要。
+
+    下游证据门拿 dominant_label / label_scores 与 VLM 的运镜文本做标签级比对，
+    不再只看时间窗重叠。
+    """
+    usable = [
+        sample for sample in samples
+        if isinstance(sample.get("camera_scores"), dict)
+    ]
+    base = {
+        "analyzer": analyzer_block.get("analyzer"),
+        "analyzer_version": analyzer_block.get("analyzer_version"),
+        "camera_labels": list(CAMERA_MOTION_LABELS),
+        "sample_count": len(usable),
+        "evidence_refs": list(evidence_refs),
+    }
+    if not usable:
+        return {
+            **base,
+            "status": "no_evidence",
+            "dominant_label": None,
+            "dominant_direction": None,
+            "label_scores": None,
+            "confidence": None,
+        }
+    label_scores: dict[str, float] = {}
+    for label in CAMERA_MOTION_LABELS:
+        values = [
+            float(sample["camera_scores"].get(label) or 0.0)
+            for sample in usable
+        ]
+        label_scores[label] = round(sum(values) / len(values), 6)
+    dominant = max(CAMERA_MOTION_LABELS, key=lambda label: label_scores[label])
+    direction_counts: dict[str, int] = {}
+    for sample in usable:
+        direction = sample.get("camera_direction")
+        if sample.get("camera") == dominant and isinstance(direction, str) and direction:
+            direction_counts[direction] = direction_counts.get(direction, 0) + 1
+    dominant_direction = None
+    if direction_counts:
+        dominant_direction = sorted(
+            direction_counts.items(), key=lambda item: (-item[1], item[0])
+        )[0][0]
+    return {
+        **base,
+        "status": "analyzed",
+        "dominant_label": dominant,
+        "dominant_direction": dominant_direction,
+        "label_scores": label_scores,
+        "confidence": label_scores[dominant],
+    }
+
+
 def attach_evidence_to_shots(shots: list[dict[str, Any]], evidence: dict[str, Any]) -> list[dict[str, Any]]:
     tracks = evidence.get("frame_ocr", {}).get("tracks", [])
     camera_motion = evidence.get("camera_motion")
     if not isinstance(camera_motion, dict):
         camera_motion = evidence.get("motion", {})
     motion_samples = camera_motion.get("samples", [])
+    shot_transitions = evidence.get("shot_transitions")
+    if not isinstance(shot_transitions, dict):
+        shot_transitions = {}
+    cut_transition_events = shot_transitions.get("events") or []
     subject_tracks = evidence.get("subject_tracking", {}).get("tracks", [])
     pose_observations = evidence.get("pose", {}).get("observations", [])
     action_events = evidence.get("action", {}).get("events", [])
@@ -1334,6 +1561,12 @@ def attach_evidence_to_shots(shots: list[dict[str, Any]], evidence: dict[str, An
             if int(event.get("source_segment_index") or 1) == segment
             and start <= float(event.get("timestamp_seconds") or 0) <= end
         ]
+        matching_cut_transitions = [
+            event for event in cut_transition_events
+            if isinstance(event, dict)
+            and int(event.get("source_segment_index") or 1) == segment
+            and start <= float(event.get("timestamp_seconds") or 0) <= end
+        ]
         vlm_description = str(shot.get("ocr") or "").strip()
         shot["vlm_text_description"] = vlm_description or None
         shot["ocr_track_refs"] = [track["track_id"] for track in matching_tracks]
@@ -1343,6 +1576,16 @@ def attach_evidence_to_shots(shots: list[dict[str, Any]], evidence: dict[str, An
             for sample in matching_motion
         ]
         shot["camera_motion_evidence_refs"] = list(shot["motion_evidence_refs"])
+        shot["camera_motion_summary"] = _summarize_camera_motion(
+            matching_motion,
+            analyzer_block=camera_motion,
+            evidence_refs=shot["motion_evidence_refs"],
+        )
+        shot["cut_transition_evidence_refs"] = [
+            str(event["evidence_id"])
+            for event in matching_cut_transitions
+            if event.get("evidence_id")
+        ]
         shot["subject_track_refs"] = [
             str(track["evidence_id"])
             for track in matching_subjects
@@ -1368,6 +1611,7 @@ def attach_evidence_to_shots(shots: list[dict[str, Any]], evidence: dict[str, An
             "ocr": evidence.get("frame_ocr", {}).get("status", "unsupported"),
             "motion": camera_motion.get("status", "unsupported"),
             "camera_motion": camera_motion.get("status", "unsupported"),
+            "shot_transitions": shot_transitions.get("status", "unsupported"),
             **{
                 capability: evidence.get(capability, {}).get("status", "unsupported")
                 for capability in SEMANTIC_CAPABILITIES

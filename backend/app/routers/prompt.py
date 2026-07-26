@@ -64,7 +64,7 @@ from ..services.generation_image_evidence import (
     ReviewedEvidenceMaskError,
     validate_saved_reviewed_image_evidence,
 )
-from ..services.product_edition import is_launch_lite
+from ..services.product_edition import feature_enabled
 from ..services.rate_limit import incr_window
 from ..services.ssrf import SsrfError, assert_safe_user_asset_url
 
@@ -613,7 +613,13 @@ def _validate_reverse_asset_request(
     if _is_video_source(pseudo) and target != "video":
         raise HTTPException(400, "视频素材仅支持视频反推")
     if _is_unsupported_video_url(asset_url):
-        raise HTTPException(400, "暂不支持 HLS/m3u8 视频反推,请使用 mp4/webm/mov 或封面图")
+        # 抽帧组件仅支持整文件下载(且 ffmpeg 以 file,pipe 协议白名单运行),
+        # 无法拉取 HLS 分段流,这里明确拒绝而不是等运行时抽帧失败。
+        raise HTTPException(
+            400,
+            "该视频是 HLS/m3u8 流媒体,抽帧组件暂不支持拉取分段流,"
+            "请改用 mp4/webm/mov 视频文件,或选择封面图做单帧反推",
+        )
 
 
 def _legacy_cover_confirmation_required(operation: ReverseOperation) -> HTTPException:
@@ -781,7 +787,7 @@ def create_reverse_operation(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    if is_launch_lite() and body.project_id is not None:
+    if body.project_id is not None and not feature_enabled("projects_enabled"):
         raise HTTPException(404, "not found")
     lock_key, lock_token = _acquire_reverse_quote_lock(user.id, body.quote_id)
     try:
@@ -1327,7 +1333,7 @@ def create_reverse_operation_ws_ticket(
 @_deprecated_reverse_endpoint
 def reverse(body: ReverseIn, db: Session = Depends(get_db),
             user: User = Depends(get_current_user), response: Response = None):
-    if is_launch_lite() and body.project_id is not None:
+    if body.project_id is not None and not feature_enabled("projects_enabled"):
         raise HTTPException(404, "not found")
     if body.project_id is not None:
         try:

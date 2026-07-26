@@ -16,8 +16,16 @@ claim capabilities that it does not implement.
 - `transition`: identifies abrupt visual discontinuities from adjacent sampled
   frame colour histograms. It does not distinguish editorial cuts from every
   possible lighting change.
-- `pose` and `action`: always `unsupported`. No pose or action model is
-  bundled, so this service never fabricates keypoints or action names.
+- `pose`: opt-in. By default it reports `unsupported`. When
+  `VIDEO_SEMANTIC_POSE_ENABLED=true` and the optional MediaPipe stack from
+  `requirements-pose.txt` is installed, single-person pose keypoints are
+  attached to validated subject tracks (a majority of confident keypoints must
+  fall inside the track's observation bbox). If the dependency is missing or
+  inference fails, pose reports `degraded` with empty evidence — keypoints are
+  never fabricated. `VIDEO_SEMANTIC_POSE_MIN_CONFIDENCE` (default `0.25`)
+  filters low-visibility keypoints.
+- `action`: always `unsupported`. No action recognition model is bundled, so
+  this service never fabricates action names.
 
 No sustained moving region or abrupt discontinuity produces `partial` with a
 clear reason and empty evidence, as required by the caller contract.

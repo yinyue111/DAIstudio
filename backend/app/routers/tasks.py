@@ -390,7 +390,11 @@ def cancel_task(
         return build_task_out(db, task)
     if task.status == "running":
         if task.category == "video" and task.external_task_id:
-            raise HTTPException(409, "视频任务已提交到外部网关，暂不支持中途取消")
+            raise HTTPException(
+                409,
+                "视频任务已提交到外部网关，网关不支持中途取消；"
+                "请等待任务完成，若长时间无结果，系统会在超时后自动结束并退回冻结积分",
+            )
         params = dict(task.params or {})
         if params.get("_cancel_requested"):
             return build_task_out(db, task)

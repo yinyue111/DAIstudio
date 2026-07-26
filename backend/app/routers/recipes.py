@@ -688,14 +688,57 @@ def _serialize_version(
     }
 
 
+def _empty_usage_stats() -> dict[str, Any]:
+    return {"total": 0, "unique_users": 0, "by_event": {}, "last_used_at": None}
+
+
+def _usage_stats_map(db: Session, recipe_ids: list[int]) -> dict[int, dict[str, Any]]:
+    """批量聚合配方使用埋点，列表页一次两条分组查询，避免逐行 N+1。"""
+    stats: dict[int, dict[str, Any]] = {int(rid): _empty_usage_stats() for rid in recipe_ids}
+    if not stats:
+        return stats
+    ids = list(stats)
+    totals = db.execute(
+        select(
+            CreationRecipeUsageEvent.recipe_id,
+            func.count(CreationRecipeUsageEvent.id),
+            func.count(func.distinct(CreationRecipeUsageEvent.user_id)),
+            func.max(CreationRecipeUsageEvent.created_at),
+        )
+        .where(CreationRecipeUsageEvent.recipe_id.in_(ids))
+        .group_by(CreationRecipeUsageEvent.recipe_id)
+    ).all()
+    for recipe_id, total, unique_users, last_used_at in totals:
+        stats[int(recipe_id)].update(
+            total=int(total or 0),
+            unique_users=int(unique_users or 0),
+            last_used_at=last_used_at,
+        )
+    grouped = db.execute(
+        select(
+            CreationRecipeUsageEvent.recipe_id,
+            CreationRecipeUsageEvent.event_type,
+            func.count(CreationRecipeUsageEvent.id),
+        )
+        .where(CreationRecipeUsageEvent.recipe_id.in_(ids))
+        .group_by(CreationRecipeUsageEvent.recipe_id, CreationRecipeUsageEvent.event_type)
+    ).all()
+    for recipe_id, event_type, count in grouped:
+        stats[int(recipe_id)]["by_event"][str(event_type)] = int(count)
+    return stats
+
+
 def _serialize(
     db: Session,
     row: CreationRecipe,
     *,
     public: bool = False,
     version: CreationRecipeVersion | None = None,
+    usage: dict[str, Any] | None = None,
 ) -> dict:
     version = version or _current_version(db, row)
+    if usage is None:
+        usage = _usage_stats_map(db, [int(row.id)])[int(row.id)]
     return {
         "id": int(row.id),
         "source_operation_id": None if public else row.source_operation_id,
@@ -711,6 +754,7 @@ def _serialize(
         "reviewed_at": row.reviewed_at,
         "review_note": None if public else row.review_note,
         "version": _serialize_version(version, public=public),
+        "usage": usage,
         "created_at": row.created_at,
         "updated_at": row.updated_at,
     }
@@ -790,6 +834,7 @@ def _record_usage(
 def list_recipes(
     category: str | None = None,
     favorite: bool | None = None,
+    q: str = Query(default="", max_length=128),
     limit: int = 30,
     offset: int = 0,
     db: Session = Depends(get_db),
@@ -803,12 +848,20 @@ def list_recipes(
         query = query.where(CreationRecipe.category == category)
     if favorite is not None:
         query = query.where(CreationRecipe.favorite.is_(bool(favorite)))
+    search = q.strip()
+    if search:
+        query = query.where(CreationRecipe.title.ilike(f"%{search}%"))
     rows = list(db.execute(
-        query.order_by(CreationRecipe.favorite.desc(), CreationRecipe.updated_at.desc())
-        .limit(min(max(int(limit), 1), 100))
+        query.order_by(
+            CreationRecipe.favorite.desc(),
+            CreationRecipe.updated_at.desc(),
+            CreationRecipe.id.desc(),
+        )
+        .limit(min(max(int(limit), 1), 200))
         .offset(max(int(offset), 0))
     ).scalars())
-    return [_serialize(db, row) for row in rows]
+    usage_stats = _usage_stats_map(db, [int(row.id) for row in rows])
+    return [_serialize(db, row, usage=usage_stats[int(row.id)]) for row in rows]
 
 
 @router.post("", response_model=CreationRecipeOut)
@@ -886,10 +939,14 @@ def list_public_recipes(
         query = query.where(CreationRecipe.title.ilike(f"%{search}%"))
     rows = list(db.execute(
         query.order_by(CreationRecipe.updated_at.desc(), CreationRecipe.id.desc())
-        .limit(min(max(int(limit), 1), 100))
+        .limit(min(max(int(limit), 1), 200))
         .offset(max(int(offset), 0))
     ).scalars())
-    return [_serialize(db, row, public=True) for row in rows]
+    usage_stats = _usage_stats_map(db, [int(row.id) for row in rows])
+    return [
+        _serialize(db, row, public=True, usage=usage_stats[int(row.id)])
+        for row in rows
+    ]
 
 
 @router.get("/public/{recipe_id}", response_model=CreationRecipeOut)

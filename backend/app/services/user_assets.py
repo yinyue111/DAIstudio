@@ -7,6 +7,7 @@ import json
 import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from io import BytesIO
 from pathlib import Path
 
 from PIL import Image, UnidentifiedImageError
@@ -22,7 +23,7 @@ from ..models import (
     UploadedAsset,
     UserAssetMetadata,
 )
-from . import retention, storage, upload_quota
+from . import retention, storage, upload_quota, video_frames
 from .asset_output import to_asset_out
 from .media_sidecars import (
     direct_keys_for_asset_urls,
@@ -32,8 +33,12 @@ from .media_sidecars import (
     unlink_keys,
 )
 
-_UPLOAD_ROOT_PREFIXES = ("upload/", "upload_video/")
+_UPLOAD_ROOT_PREFIXES = ("upload/", "upload_video/", "upload_audio/")
 _B64_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+# 视频感知指纹:抽固定数量关键帧,逐帧 dhash64 后拼接。帧数固定使同算法
+# 指纹等长,可按 64bit 分段求平均汉明距离,沿用图片的 0-64 阈值语义。
+_VIDEO_FINGERPRINT_FRAMES = 4
+_VIDEO_HASH_ALGORITHM = f"video-dhash64x{_VIDEO_FINGERPRINT_FRAMES}"
 _CURSOR_VERSION = 1
 _UTC_EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
@@ -210,12 +215,20 @@ def resolve_asset_ref(db: Session, user_id: int, asset_ref: str) -> ResolvedAsse
     return resolve_asset_refs(db, user_id, [asset_ref])[0]
 
 
+def _uploaded_media_type(key: str) -> str:
+    if key.startswith("upload_video/"):
+        return "video"
+    if key.startswith("upload_audio/"):
+        return "audio"
+    return "image"
+
+
 def _media_type(resolved: ResolvedAsset) -> str:
     if resolved.origin == "generated":
         assert isinstance(resolved.row, GenAsset)
         return resolved.row.type
     assert isinstance(resolved.row, UploadedAsset)
-    return "video" if resolved.row.key.startswith("upload_video/") else "image"
+    return _uploaded_media_type(resolved.row.key)
 
 
 def _metadata_row(
@@ -323,9 +336,10 @@ def _storage_key(resolved: ResolvedAsset) -> str | None:
     return None
 
 
-def _dhash64(path: Path) -> str:
+def _dhash64_from_source(source) -> str:
+    """dhash64 of an image file path or in-memory JPEG/PNG bytes buffer."""
     try:
-        with Image.open(path) as image:
+        with Image.open(source) as image:
             width, height = image.size
             if width <= 0 or height <= 0:
                 raise ValueError("图片尺寸无效")
@@ -345,6 +359,28 @@ def _dhash64(path: Path) -> str:
     return f"{digest:016x}"
 
 
+def _dhash64(path: Path) -> str:
+    return _dhash64_from_source(path)
+
+
+def _video_fingerprint(path: Path) -> str:
+    """帧级 dhash 聚合的视频感知指纹。
+
+    复用 video_frames 的抽帧能力(内部含并发闸门与超时),只抽固定的
+    ``_VIDEO_FINGERPRINT_FRAMES`` 帧,不做全量解码存储;指纹按素材缓存在
+    UserAssetMetadata 中,每个视频只计算一次,不阻塞上传链路。
+    """
+    sample = video_frames.sample_video_from_path(str(path), _VIDEO_FINGERPRINT_FRAMES)
+    if sample is None or not sample.frames:
+        raise ValueError("视频关键帧抽取失败,无法计算感知指纹")
+    frames = list(sample.frames)[:_VIDEO_FINGERPRINT_FRAMES]
+    hashes = [_dhash64_from_source(BytesIO(frame.jpeg)) for frame in frames]
+    if len(hashes) < _VIDEO_FINGERPRINT_FRAMES:
+        # 极短视频可能抽不满,重复末帧补齐,保证同算法指纹等长可比。
+        hashes.extend([hashes[-1]] * (_VIDEO_FINGERPRINT_FRAMES - len(hashes)))
+    return "".join(hashes)
+
+
 def analyze_asset(
     db: Session,
     user_id: int,
@@ -359,7 +395,8 @@ def analyze_asset(
         not force
         and row.content_sha256
         and row.analysis_status == "ready"
-        and (row.media_type == "video" or row.perceptual_hash)
+        # 音频只做精确重复检测;图片/视频要求感知 hash 已就绪才可复用。
+        and (row.media_type == "audio" or row.perceptual_hash)
     ):
         return row
 
@@ -384,6 +421,12 @@ def analyze_asset(
                     raise FileNotFoundError("图片原文件不存在")
                 row.perceptual_hash = _dhash64(path)
                 row.perceptual_hash_algorithm = "dhash64"
+            elif row.media_type == "video":
+                path = storage.local_path(key)
+                if not path.exists() or not path.is_file():
+                    raise FileNotFoundError("视频原文件不存在")
+                row.perceptual_hash = _video_fingerprint(path)
+                row.perceptual_hash_algorithm = _VIDEO_HASH_ALGORITHM
             row.analysis_status = "ready"
         except Exception as error:  # noqa: BLE001
             row.analysis_status = "degraded"
@@ -398,6 +441,19 @@ def analyze_asset(
 
 def _hamming_distance(left: str, right: str) -> int:
     return (int(left, 16) ^ int(right, 16)).bit_count()
+
+
+def _perceptual_distance(query: UserAssetMetadata, candidate: UserAssetMetadata) -> int | None:
+    """同算法、等长感知 hash 间的归一化距离(按 64bit 段取平均,0-64)。"""
+    if not query.perceptual_hash or not candidate.perceptual_hash:
+        return None
+    if query.perceptual_hash_algorithm != candidate.perceptual_hash_algorithm:
+        return None
+    if len(query.perceptual_hash) != len(candidate.perceptual_hash):
+        return None
+    segments = max(1, len(query.perceptual_hash) // 16)
+    total = _hamming_distance(query.perceptual_hash, candidate.perceptual_hash)
+    return round(total / segments)
 
 
 def find_similar_assets(
@@ -431,7 +487,7 @@ def find_similar_assets(
         db.refresh(candidate)
 
     exact_available = bool(query.content_sha256)
-    perceptual_available = bool(query.media_type == "image" and query.perceptual_hash)
+    perceptual_available = bool(query.perceptual_hash)
     matches: list[dict] = []
     matched_refs: list[str] = []
     for candidate in candidates:
@@ -446,9 +502,9 @@ def find_similar_assets(
             })
             matched_refs.append(candidate.asset_ref)
             continue
-        if not perceptual_available or not candidate.perceptual_hash:
+        distance = _perceptual_distance(query, candidate)
+        if distance is None:
             continue
-        distance = _hamming_distance(query.perceptual_hash, candidate.perceptual_hash)
         if distance <= max(0, min(64, int(max_distance))):
             matches.append({
                 "asset_ref": candidate.asset_ref,
@@ -464,9 +520,11 @@ def find_similar_assets(
     messages: list[str] = []
     if query.analysis_status == "degraded":
         messages.append(query.analysis_error or "查询素材无法完整分析")
-    if query.media_type == "video":
-        messages.append("视频已执行 SHA-256 精确重复检测，暂不支持感知相似分析")
-    elif not perceptual_available:
+    if query.media_type == "audio":
+        messages.append("音频素材仅支持 SHA-256 精确重复检测")
+    elif query.media_type == "video" and not perceptual_available:
+        messages.append("视频感知指纹不可用，当前仅能执行 SHA-256 精确重复检测")
+    elif query.media_type == "image" and not perceptual_available:
         messages.append("图片感知 hash 不可用，当前仅能执行精确重复检测")
     if degraded_refs:
         messages.append(f"{len(degraded_refs)} 个候选素材无法真实分析")
@@ -653,7 +711,7 @@ def list_user_assets(
             created = _aware(row.created_at)
             if not retained_value and created is not None and created < cutoff:
                 continue
-            row_type = "video" if row.key.startswith("upload_video/") else "image"
+            row_type = _uploaded_media_type(row.key)
             row_origin = _uploaded_asset_origin(row)
             if not _matches_filters(
                 origin=row_origin,
@@ -787,6 +845,7 @@ def list_user_assets(
         "fetched": sum(entry.item["origin"] == "fetched" for entry in entries),
         "images": sum(entry.item["type"] == "image" for entry in entries),
         "videos": sum(entry.item["type"] == "video" for entry in entries),
+        "audios": sum(entry.item["type"] == "audio" for entry in entries),
         "favorites": sum(bool(entry.item["favorite"]) for entry in entries),
         "retained": sum(bool(entry.item["retained"]) for entry in entries),
     }
@@ -1007,7 +1066,7 @@ def asset_items_for_refs(
         items[item.asset_ref] = _apply_metadata({
             "asset_ref": item.asset_ref,
             "origin": _uploaded_asset_origin(row),
-            "type": "video" if row.key.startswith("upload_video/") else "image",
+            "type": _uploaded_media_type(row.key),
             "url": url,
             "preview_url": preview_url,
             "thumb": preview_url,

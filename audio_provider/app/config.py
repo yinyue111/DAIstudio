@@ -36,6 +36,13 @@ class ProviderSettings:
     max_upload_bytes: int = 48 * 1024 * 1024
     max_segments: int = 1000
     beam_size: int = 5
+    # Speaker diarization is opt-in: without the pyannote dependency and its
+    # gated model weights the provider keeps reporting speaker: unsupported.
+    diarization_enabled: bool = False
+    diarization_model: str = "pyannote/speaker-diarization-3.1"
+    diarization_auth_token: str = ""
+    diarization_device: str = "cpu"
+    diarization_max_speakers: int = 8
 
     @classmethod
     def from_env(cls) -> "ProviderSettings":
@@ -45,6 +52,18 @@ class ProviderSettings:
         model = os.getenv("ASR_PROVIDER_MODEL", "small").strip()
         if not model or len(model) > 128:
             raise ValueError("ASR_PROVIDER_MODEL must be between 1 and 128 characters")
+        diarization_model = os.getenv(
+            "ASR_PROVIDER_DIARIZATION_MODEL", "pyannote/speaker-diarization-3.1"
+        ).strip()
+        if not diarization_model or len(diarization_model) > 128:
+            raise ValueError(
+                "ASR_PROVIDER_DIARIZATION_MODEL must be between 1 and 128 characters"
+            )
+        diarization_device = os.getenv(
+            "ASR_PROVIDER_DIARIZATION_DEVICE", "cpu"
+        ).strip().lower()
+        if diarization_device not in {"cpu", "cuda"}:
+            raise ValueError("ASR_PROVIDER_DIARIZATION_DEVICE must be cpu or cuda")
         compute_type = os.getenv("ASR_PROVIDER_COMPUTE_TYPE", "int8").strip().lower()
         if compute_type not in {
             "int8",
@@ -71,4 +90,13 @@ class ProviderSettings:
                 "ASR_PROVIDER_MAX_SEGMENTS", 1000, minimum=1, maximum=10_000
             ),
             beam_size=_bounded_int("ASR_PROVIDER_BEAM_SIZE", 5, minimum=1, maximum=10),
+            diarization_enabled=_boolean("ASR_PROVIDER_DIARIZATION_ENABLED", False),
+            diarization_model=diarization_model,
+            diarization_auth_token=os.getenv(
+                "ASR_PROVIDER_DIARIZATION_AUTH_TOKEN", ""
+            ).strip(),
+            diarization_device=diarization_device,
+            diarization_max_speakers=_bounded_int(
+                "ASR_PROVIDER_DIARIZATION_MAX_SPEAKERS", 8, minimum=1, maximum=32
+            ),
         )

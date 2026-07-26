@@ -6,6 +6,11 @@ Codes live in Redis only (never the DB):
   sms:hourly:{phone} -> rolling hourly send count (TTL = 3600)
   sms:fail:{phone}   -> wrong-attempt counter
 Anti brute-force: cooldown between sends, hourly cap, max wrong attempts.
+
+Codes are purpose-scoped so a register code can never be replayed for password
+reset (and vice versa). The default purpose "register" keeps the legacy key
+layout above; other purposes (e.g. "reset") get their own namespace:
+  sms:{purpose}:code/cooldown/hourly/fail:{phone}
 """
 from __future__ import annotations
 
@@ -48,20 +53,25 @@ def readiness_issues(*, allow_mock: bool | None = None) -> list[str]:
     return issues
 
 
-def _k(prefix: str, phone: str) -> str:
-    return f"sms:{prefix}:{phone}"
+DEFAULT_PURPOSE = "register"
 
 
-def can_send(phone: str) -> tuple[bool, int]:
-    ttl = redis_client.ttl(_k("cooldown", phone))
+def _k(prefix: str, phone: str, purpose: str = DEFAULT_PURPOSE) -> str:
+    if purpose == DEFAULT_PURPOSE:
+        return f"sms:{prefix}:{phone}"  # legacy layout, keeps existing codes valid
+    return f"sms:{purpose}:{prefix}:{phone}"
+
+
+def can_send(phone: str, purpose: str = DEFAULT_PURPOSE) -> tuple[bool, int]:
+    ttl = redis_client.ttl(_k("cooldown", phone, purpose))
     if ttl and ttl > 0:
         return False, ttl
     return True, 0
 
 
-def _reserve_send_slot(phone: str) -> int:
+def _reserve_send_slot(phone: str, purpose: str = DEFAULT_PURPOSE) -> int:
     """Atomically reserve cooldown + hourly quota before contacting provider."""
-    cooldown_key = _k("cooldown", phone)
+    cooldown_key = _k("cooldown", phone, purpose)
     reserved = redis_client.set(
         cooldown_key,
         "1",
@@ -72,7 +82,7 @@ def _reserve_send_slot(phone: str) -> int:
         ttl = redis_client.ttl(cooldown_key)
         raise SmsError(f"请稍后再试({max(0, int(ttl or 0))}s 后可重新发送)")
 
-    hourly_key = _k("hourly", phone)
+    hourly_key = _k("hourly", phone, purpose)
     sent = incr_window(hourly_key, 3600)
     if sent > settings.sms_send_hourly_limit:
         redis_client.delete(cooldown_key)
@@ -81,29 +91,29 @@ def _reserve_send_slot(phone: str) -> int:
     return sent
 
 
-def _rollback_send_slot(phone: str, sent: int) -> None:
-    redis_client.delete(_k("code", phone))
-    redis_client.delete(_k("cooldown", phone))
-    redis_client.delete(_k("fail", phone))
-    hourly_key = _k("hourly", phone)
+def _rollback_send_slot(phone: str, sent: int, purpose: str = DEFAULT_PURPOSE) -> None:
+    redis_client.delete(_k("code", phone, purpose))
+    redis_client.delete(_k("cooldown", phone, purpose))
+    redis_client.delete(_k("fail", phone, purpose))
+    hourly_key = _k("hourly", phone, purpose)
     if sent <= 1:
         redis_client.delete(hourly_key)
     else:
         redis_client.decr(hourly_key)
 
 
-def send_code(phone: str) -> str:
-    sent = _reserve_send_slot(phone)
+def send_code(phone: str, purpose: str = DEFAULT_PURPOSE) -> str:
+    sent = _reserve_send_slot(phone, purpose)
     code = f"{secrets.randbelow(1_000_000):06d}"
-    redis_client.setex(_k("code", phone), settings.sms_code_ttl_seconds, code)
-    redis_client.delete(_k("fail", phone))
+    redis_client.setex(_k("code", phone, purpose), settings.sms_code_ttl_seconds, code)
+    redis_client.delete(_k("fail", phone, purpose))
 
     try:
         _dispatch(phone, code)
     except Exception:
         # Provider failed before delivery. Roll back Redis-side quota/cooldown so
         # the user can retry after the operator fixes the SMS channel.
-        _rollback_send_slot(phone, sent)
+        _rollback_send_slot(phone, sent, purpose)
         raise
     return code
 
@@ -140,15 +150,15 @@ def _send_http(phone: str, code: str) -> None:
         raise SmsError(f"短信网关返回 {res.status_code}")
 
 
-def verify_code(phone: str, code: str) -> bool:
-    real = redis_client.get(_k("code", phone))
+def verify_code(phone: str, code: str, purpose: str = DEFAULT_PURPOSE) -> bool:
+    real = redis_client.get(_k("code", phone, purpose))
     if not real:
         raise SmsError("验证码不存在或已过期")
 
-    fail_key = _k("fail", phone)
+    fail_key = _k("fail", phone, purpose)
     fails = int(redis_client.get(fail_key) or 0)
     if fails >= settings.sms_verify_max_attempts:
-        redis_client.delete(_k("code", phone))
+        redis_client.delete(_k("code", phone, purpose))
         raise SmsError("尝试次数过多,请重新获取验证码")
 
     if code != real:
@@ -156,7 +166,7 @@ def verify_code(phone: str, code: str) -> bool:
         raise SmsError("验证码错误")
 
     # success -> burn the code
-    redis_client.delete(_k("code", phone))
+    redis_client.delete(_k("code", phone, purpose))
     redis_client.delete(fail_key)
     return True
 

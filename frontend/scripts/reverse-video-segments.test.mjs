@@ -58,6 +58,25 @@ assert.deepEqual(reverseConfigForSourceChange({
   source_ranges: [],
   custom_keyframes: [],
 });
+// 精度契约：后端 Literal 为 fast/standard/fine/ultra，"超精细"(ultra) 不能再被前端白名单拦下；
+// 非法值（如历史上误用的 deep）仍要报"分析精度无效"并在归一化时回退 standard。
+const ultraPrecision = validateReverseConfig(
+  { ...config, analysis_precision: "ultra" },
+  { category: "video", selectedType: "video", duration: 40 },
+);
+assert.equal(ultraPrecision.valid, true);
+assert.equal(ultraPrecision.value.analysis_precision, "ultra");
+const invalidPrecision = validateReverseConfig(
+  { ...config, analysis_precision: "deep" },
+  { category: "video", selectedType: "video", duration: 40 },
+);
+assert.equal(invalidPrecision.valid, false);
+assert.match(invalidPrecision.errors[0].message, /分析精度无效/);
+assert.equal(
+  normalizeReverseConfig({ analysis_precision: "deep" }, { category: "video" }).analysis_precision,
+  "standard",
+);
+
 const parsingHook = fs.readFileSync(new URL("../hooks/useReferenceParsing.js", import.meta.url), "utf8");
 assert.match(
   parsingHook,
@@ -146,6 +165,24 @@ assert.match(
   "the inline control should report duration overflow before segment membership",
 );
 assert.doesNotMatch(controls, /不包含说话人、音乐、节拍和音效分析/);
+// 预估打通：精度选择器写入 reverseConfig.analysis_precision，参考面板必须把它同步回
+// workspace.videoAnalysisPreset，viewModel 才能按真实档位显示费用/帧数；同时 viewModel
+// 要把 /api/config 下发的档位登记为精度白名单，避免与后端枚举漂移。
+const referencePanelSource = fs.readFileSync(
+  new URL("../app/studio/StudioReferencePanel.jsx", import.meta.url),
+  "utf8",
+);
+assert.match(
+  referencePanelSource,
+  /setVideoAnalysisPreset\?\.\(reverseAnalysisPrecision\)/,
+  "reference panel must sync reverseConfig.analysis_precision into workspace.videoAnalysisPreset",
+);
+const viewModelSource = fs.readFileSync(new URL("../app/studio/viewModel.ts", import.meta.url), "utf8");
+assert.match(
+  viewModelSource,
+  /registerReversePrecisionOptions\(reverseVideoPresets\)/,
+  "view model must register server precision tiers as the frontend whitelist",
+);
 const intentControls = fs.readFileSync(
   new URL("../app/studio/StudioReverseIntentControls.jsx", import.meta.url),
   "utf8",

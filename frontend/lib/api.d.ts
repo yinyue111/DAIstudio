@@ -1992,9 +1992,10 @@ export const api: {
   }): Promise<BillingEntryPage>;
   paymentPackages(): Promise<unknown>;
   paymentConfig(): Promise<unknown>;
-  paymentOrders(limit?: number): Promise<unknown>;
+  paymentOrders(limit?: number, options?: { cursor?: string | number | null }): Promise<unknown>;
   createPaymentOrder(body: Record<string, unknown>): Promise<unknown>;
   paymentOrder(orderNo: string): Promise<unknown>;
+  requestPaymentInvoice(orderNo: string, body: Record<string, unknown>): Promise<unknown>;
   mockPayOrder(orderNo: string): Promise<unknown>;
   changePassword(old_password: string, new_password: string): Promise<unknown>;
   logout(): Promise<unknown>;
@@ -2164,6 +2165,13 @@ export const api: {
   adminBulkGrant(body: Record<string, unknown>): Promise<unknown>;
   adminSetUserStatus(userId: number | string, body: Record<string, unknown>): Promise<unknown>;
   adminResetPassword(userId: number | string, body: Record<string, unknown>): Promise<unknown>;
+  adminSetUserRole(userId: number | string, body: Record<string, unknown>): Promise<unknown>;
+  adminWorkflowSummary(): Promise<unknown>;
+  adminCompleteWorkflowNode(
+    runId: number | string,
+    nodeKey: string,
+    body: Record<string, unknown>,
+  ): Promise<unknown>;
   adminModels(): Promise<unknown>;
   adminCreateModel(body: Record<string, unknown>): Promise<unknown>;
   adminUpdateModel(id: number | string, body: Record<string, unknown>): Promise<unknown>;
@@ -2221,4 +2229,9 @@ export const api: {
   adminDisablePaymentPackage(id: number | string, body?: Record<string, unknown>): Promise<unknown>;
   adminPaymentProviders(): Promise<unknown>;
   adminSavePaymentProvider(provider: string, body: Record<string, unknown>): Promise<unknown>;
+  adminPaymentOrders(params?: Record<string, string | number>): Promise<unknown>;
+  adminSyncPaymentOrder(orderNo: string): Promise<unknown>;
+  adminRefundPaymentOrder(orderNo: string, body: Record<string, unknown>): Promise<unknown>;
+  adminPaymentInvoices(query?: { status?: string; limit?: number; offset?: number }): Promise<unknown>;
+  adminProcessPaymentInvoice(orderNo: string, body: Record<string, unknown>): Promise<unknown>;
 };

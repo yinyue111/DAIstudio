@@ -720,14 +720,35 @@ export function Models() {
   );
 }
 
+const REVIEW_QUEUE_PAGE_SIZE = 50;
+
 export function ReviewTasks() {
   const [rows, setRows] = useState([]);
   const [msg, setMsg] = useState("");
   const [busyId, setBusyId] = useState(null);
+  const [hasMore, setHasMore] = useState(false);
+  const [loadingMore, setLoadingMore] = useState(false);
+  const loadSeqRef = useRef(0);
 
-  const load = () => {
+  const load = (options = {}) => {
+    const append = options?.append === true;
+    const seq = ++loadSeqRef.current;
     setMsg("");
-    api.adminReviewTasks().then(setRows).catch((e) => setMsg(e.message));
+    if (append) setLoadingMore(true);
+    api.adminReviewTasks(REVIEW_QUEUE_PAGE_SIZE, append ? rows.length : 0)
+      .then((nextRows) => {
+        if (seq !== loadSeqRef.current) return;
+        setRows((prev) => (append
+          ? [...prev, ...nextRows.filter((row) => !prev.some((item) => item.id === row.id))]
+          : nextRows));
+        setHasMore(nextRows.length === REVIEW_QUEUE_PAGE_SIZE);
+      })
+      .catch((e) => {
+        if (seq === loadSeqRef.current) setMsg(e.message);
+      })
+      .finally(() => {
+        if (seq === loadSeqRef.current) setLoadingMore(false);
+      });
   };
   useEffect(() => { load(); }, []);
 
@@ -834,26 +855,60 @@ export function ReviewTasks() {
           </tbody>
         </table>
       </div>
+      {rows.length > 0 && (
+        <div className="mt-4 flex items-center justify-center gap-3 text-xs text-fog">
+          <span>已显示 {rows.length} 条待对账任务</span>
+          {hasMore ? (
+            <button
+              type="button"
+              onClick={() => load({ append: true })}
+              disabled={loadingMore}
+              className="btn-secondary btn-sm"
+            >
+              {loadingMore ? "加载中…" : "加载更多"}
+            </button>
+          ) : (
+            <span>已全部加载</span>
+          )}
+        </div>
+      )}
     </Card>
   );
 }
+
+const ASSET_REPORT_PAGE_SIZE = 50;
 
 export function AssetReports() {
   const [rows, setRows] = useState([]);
   const [status, setStatus] = useState("open");
   const [msg, setMsg] = useState("");
   const [busyId, setBusyId] = useState(null);
+  const [hasMore, setHasMore] = useState(false);
+  const [loadingMore, setLoadingMore] = useState(false);
   const loadSeqRef = useRef(0);
 
-  const load = () => {
+  const load = (options = {}) => {
+    const append = options?.append === true;
     const seq = ++loadSeqRef.current;
     setMsg("");
-    api.adminAssetReports({ status })
+    if (append) setLoadingMore(true);
+    api.adminAssetReports({
+      status,
+      limit: ASSET_REPORT_PAGE_SIZE,
+      offset: append ? rows.length : 0,
+    })
       .then((nextRows) => {
-        if (seq === loadSeqRef.current) setRows(nextRows);
+        if (seq !== loadSeqRef.current) return;
+        setRows((prev) => (append
+          ? [...prev, ...nextRows.filter((row) => !prev.some((item) => item.id === row.id))]
+          : nextRows));
+        setHasMore(nextRows.length === ASSET_REPORT_PAGE_SIZE);
       })
       .catch((e) => {
         if (seq === loadSeqRef.current) setMsg(e.message);
+      })
+      .finally(() => {
+        if (seq === loadSeqRef.current) setLoadingMore(false);
       });
   };
   useEffect(() => { load(); }, [status]);
@@ -932,6 +987,23 @@ export function AssetReports() {
           </tbody>
         </table>
       </div>
+      {rows.length > 0 && (
+        <div className="mt-4 flex items-center justify-center gap-3 text-xs text-fog">
+          <span>已显示 {rows.length} 条举报</span>
+          {hasMore ? (
+            <button
+              type="button"
+              onClick={() => load({ append: true })}
+              disabled={loadingMore}
+              className="btn-secondary btn-sm"
+            >
+              {loadingMore ? "加载中…" : "加载更多"}
+            </button>
+          ) : (
+            <span>已全部加载</span>
+          )}
+        </div>
+      )}
     </Card>
   );
 }

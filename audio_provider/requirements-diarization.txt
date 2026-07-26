@@ -1,0 +1,9 @@
+# Optional speaker diarization stack. Install alongside requirements.txt only
+# when ASR_PROVIDER_DIARIZATION_ENABLED=true. The pyannote pipeline weights
+# (e.g. pyannote/speaker-diarization-3.1) are gated on Hugging Face: accepting
+# the model license and supplying ASR_PROVIDER_DIARIZATION_AUTH_TOKEN is
+# required before the provider can report speaker: available.
+-r requirements.txt
+pyannote.audio==3.3.2
+torch==2.5.1
+torchaudio==2.5.1

@@ -144,3 +144,35 @@ export function emptyStructuredListItem(
 export function structuredValuesEqual(left: unknown, right: unknown) {
   return JSON.stringify(structuredFieldValue(left)) === JSON.stringify(structuredFieldValue(right));
 }
+
+/**
+ * 容错还原历史退化数据：早期编辑器把对象/数组 JSON.stringify 后原样写回，
+ * 嵌套维度会退化成字符串。这里只在字符串确实能解析回对象/数组时还原，
+ * 普通文案（包括解析失败的残缺 JSON）原样保留，绝不抛错。
+ */
+export function reviveStructuredValue(value: unknown): unknown {
+  if (isStructuredFieldEnvelope(value)) {
+    const envelope = value as Record<string, unknown>;
+    const revived = reviveStructuredValue(envelope.value);
+    return revived === envelope.value ? value : { ...envelope, value: revived };
+  }
+  if (typeof value !== "string") return value;
+  const text = value.trim();
+  const looksStructured = (text.startsWith("{") && text.endsWith("}"))
+    || (text.startsWith("[") && text.endsWith("]"));
+  if (!looksStructured) return value;
+  try {
+    const parsed: unknown = JSON.parse(text);
+    return parsed !== null && typeof parsed === "object" ? parsed : value;
+  } catch {
+    return value;
+  }
+}
+
+/** 把数字输入框的文本解析回 number；空串或非法输入保留原值，避免维度类型被编辑退化。 */
+export function parseStructuredNumberInput(text: unknown, fallback: unknown = 0): unknown {
+  const trimmed = String(text ?? "").trim();
+  if (!trimmed) return fallback;
+  const parsed = Number(trimmed);
+  return Number.isFinite(parsed) ? parsed : fallback;
+}

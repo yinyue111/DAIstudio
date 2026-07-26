@@ -148,7 +148,7 @@ def test_sms_send_returns_disabled_when_switch_is_off(client):
     assert r.json() == {"ok": False, "disabled": True}
 
 
-def test_production_registration_rejects_public_phone_without_sms(client, monkeypatch):
+def test_production_registration_is_enabled_by_default_without_sms(client, monkeypatch):
     monkeypatch.setattr("app.routers.auth.settings.debug", False)
     db = SessionLocal()
     try:
@@ -159,11 +159,25 @@ def test_production_registration_rejects_public_phone_without_sms(client, monkey
 
     features = client.get("/api/auth/features")
     assert features.status_code == 200, features.text
-    assert features.json()["registration_enabled"] is False
+    assert features.json()["registration_enabled"] is True
 
     r = client.post(
         "/api/auth/register",
         json={"phone": "13700000005", "password": "secret1234"},
+    )
+    assert r.status_code == 200, r.text
+
+
+def test_registration_can_be_explicitly_disabled(client, monkeypatch):
+    monkeypatch.setattr("app.routers.auth.settings.registration_enabled", False)
+
+    features = client.get("/api/auth/features")
+    assert features.status_code == 200, features.text
+    assert features.json()["registration_enabled"] is False
+
+    r = client.post(
+        "/api/auth/register",
+        json={"phone": "13700000015", "password": "secret1234"},
     )
     assert r.status_code == 400, r.text
     assert "注册暂未开放" in r.text

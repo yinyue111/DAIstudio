@@ -82,12 +82,16 @@ from ..services.generation_request import (
     request_fingerprint as build_request_fingerprint,
 )
 from ..services.generation_submit import submit_generation_task, validate_generation_lineage
+from ..services.generation_video_submit import (
+    lineage_video_analysis_for_compile,
+    merge_lineage_video_analysis,
+)
 from ..services.model_routes import (
     ModelRouteUnavailable,
     attach_route_snapshot,
     select_model_route,
 )
-from ..services.product_edition import is_launch_lite
+from ..services.product_edition import feature_enabled
 from ..services.rate_limit import incr_window
 from ..services.task_output import build_task_out
 from ..services.video_prompt_compiler import (
@@ -439,10 +443,16 @@ def _prepare_generation(
     avoid_route_ids: set[int] | None = None,
     trusted_recipe_attribution: recipe_usage.RecipeAttribution | None = None,
 ) -> PreparedGeneration:
-    if is_launch_lite() and (
-        body.project_id is not None
-        or body.creation_recipe_id is not None
-        or body.reproduction_remediation_id is not None
+    if (
+        (body.project_id is not None and not feature_enabled("projects_enabled"))
+        or (
+            body.creation_recipe_id is not None
+            and not feature_enabled("recipes_enabled")
+        )
+        or (
+            body.reproduction_remediation_id is not None
+            and not feature_enabled("reproduction_assessment_enabled")
+        )
     ):
         raise HTTPException(404, "not found")
     validate_dispatch_request(body.category)
@@ -517,7 +527,7 @@ def _prepare_generation(
         parent=parent,
         existing_client_task=existing_client_task,
     )
-    lineage_operation, _lineage_revision = validate_generation_lineage(
+    lineage_operation, lineage_revision = validate_generation_lineage(
         db,
         user_id=user.id,
         reverse_operation_id=reverse_operation_id,
@@ -781,8 +791,17 @@ def _prepare_generation(
         )
         if not isinstance(model_profiles, dict):
             model_profiles = None
+        # 反推链路的证据门分镜（verified/vlm_only 三态运动信息）存放在已应用
+        # 的反推结果版本里，而不是客户端提交的 prompt 里。这里只在编译输入上
+        # 合并：存库的 task.prompt 与请求指纹保持不变，没有血缘或没有证据门
+        # 的任务行为与旧版完全一致。
         compiled = compile_video_prompt(
-            prompt,
+            merge_lineage_video_analysis(
+                prompt,
+                lineage_video_analysis_for_compile(
+                    getattr(lineage_revision, "payload", None)
+                ),
+            ),
             duration=video_render_duration(task_params, body.stage),
             model_id=str(snapshot.get("model_id") or ""),
             provider=str(snapshot.get("provider") or ""),
@@ -1011,10 +1030,9 @@ def quote_generation(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    if (
-        is_launch_lite()
-        and isinstance(body, ExecutionQuoteIn)
-        and body.kind in {"reverse_batch", "workflow"}
+    if isinstance(body, ExecutionQuoteIn) and (
+        (body.kind == "reverse_batch" and not feature_enabled("reverse_batch_enabled"))
+        or (body.kind == "workflow" and not feature_enabled("tool_workflows_enabled"))
     ):
         raise HTTPException(404, "not found")
     if isinstance(body, GenerationQuoteIn):

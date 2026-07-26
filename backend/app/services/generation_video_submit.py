@@ -3,15 +3,17 @@ from __future__ import annotations
 
 import logging
 import time
+from copy import deepcopy
 from datetime import datetime, timezone
+from typing import Any
 from uuid import uuid4
 
 from billiard.exceptions import SoftTimeLimitExceeded
-from sqlalchemy import update
+from sqlalchemy import or_, update
 
 from ..db import SessionLocal
-from ..models import GenTask
-from . import credits, gateway, locks, usage
+from ..models import GenAsset, GenTask, ReverseResultRevision, UploadedAsset
+from . import credits, gateway, locks, storage, usage
 from .config_store import get_model_config
 from .generation_common import (
     TaskCanceled,
@@ -74,13 +76,84 @@ log = logging.getLogger("generation")
 VIDEO_FIRST_FRAME_MIN_SIDE = 300
 VIDEO_FIRST_FRAME_MAX_SIDE = 768
 PRODUCT_VIDEO_REFERENCE_MAX_SIDE = 2048
+# 源视频参考地址的有效期：上游在提交后短时间内拉取源视频，1 小时留足余量。
+VIDEO_SOURCE_URL_TTL_SECONDS = 3600
 
 
 class VideoSubmitVersionMismatch(RuntimeError):
     """The API-created task cannot be safely submitted by this Worker build."""
 
 
-def _compile_legacy_video_prompt(task: GenTask, model, params: dict) -> tuple[str, dict]:
+class SourceVideoUrlUnavailable(RuntimeError):
+    """本部署无法为源视频生成上游可访问地址（例如本地存储 + 上传原片）。
+
+    与其他失败不同，这一类是"部署能力不足"而非"请求非法"：调用方可以
+    退回首帧生成，但必须显式标注降级，绝不允许静默丢失运动信息。
+    """
+
+
+def lineage_video_analysis_for_compile(payload: Any) -> dict[str, Any] | None:
+    """Return the reverse-lineage video_analysis if it carries evidence-gated shots.
+
+    仅当分镜带有证据门判定（shot["evidence_gate"]）时才返回——没有证据门
+    的旧分析对编译器没有增量信息，返回 None 让编译走与旧版完全一致的路径。
+    """
+    if not isinstance(payload, dict):
+        return None
+    analysis = payload.get("video_analysis")
+    if not isinstance(analysis, dict):
+        return None
+    shots = analysis.get("shots")
+    if not isinstance(shots, list):
+        return None
+    if any(
+        isinstance(row, dict) and isinstance(row.get("evidence_gate"), dict)
+        for row in shots
+    ):
+        return analysis
+    return None
+
+
+def merge_lineage_video_analysis(
+    raw_prompt: Any,
+    analysis: dict[str, Any] | None,
+) -> Any:
+    """Attach evidence-gated reverse analysis to the compiler input.
+
+    向后兼容约束：
+    - 字符串提示词（旧任务/direct 输入）原样返回；
+    - 提示词已自带 video_analysis 时不覆盖（客户端显式传入优先）；
+    - 没有可用证据分析时原样返回；
+    - 永不修改传入的 prompt dict（返回浅拷贝），存库的 prompt 与请求指纹不变。
+    """
+    if not isinstance(analysis, dict) or not isinstance(raw_prompt, dict):
+        return raw_prompt
+    if isinstance(raw_prompt.get("video_analysis"), dict):
+        return raw_prompt
+    return {**raw_prompt, "video_analysis": deepcopy(analysis)}
+
+
+def _task_lineage_video_analysis(db, task) -> dict[str, Any] | None:
+    """Load the applied reverse revision bound to a task and extract gated analysis."""
+    operation_id = getattr(task, "reverse_operation_id", None)
+    revision_id = getattr(task, "source_revision_id", None)
+    if db is None or operation_id is None or revision_id is None:
+        return None
+    revision = db.get(ReverseResultRevision, int(revision_id))
+    if (
+        revision is None
+        or int(revision.operation_id) != int(operation_id)
+        or int(revision.user_id) != int(getattr(task, "user_id", 0) or 0)
+    ):
+        return None
+    return lineage_video_analysis_for_compile(
+        revision.payload if isinstance(revision.payload, dict) else None
+    )
+
+
+def _compile_legacy_video_prompt(
+    task: GenTask, model, params: dict, db=None
+) -> tuple[str, dict]:
     """Compile retry/legacy tasks that predate request-time video compilation."""
     references = build_video_prompt_references(
         source_asset_url=task.source_asset_url,
@@ -93,7 +166,10 @@ def _compile_legacy_video_prompt(task: GenTask, model, params: dict) -> tuple[st
     if not isinstance(model_profiles, dict):
         model_profiles = None
     compiled = compile_video_prompt(
-        task.prompt or final_prompt(task),
+        merge_lineage_video_analysis(
+            task.prompt or final_prompt(task),
+            _task_lineage_video_analysis(db, task),
+        ),
         duration=video_render_duration(params, task.stage),
         model_id=str(getattr(model, "model_id", "") or ""),
         provider=str(getattr(model, "provider", "") or ""),
@@ -307,6 +383,53 @@ def hold_video_poll_for_reconciliation(
     )
 
 
+def gateway_source_video_url(db, task: GenTask) -> str:
+    """Resolve the task's source video into a URL the video gateway can fetch.
+
+    真·视频参考通道的入口。请求非法（缺素材、外部链接、未解锁等）一律显式
+    报错并中止提交。唯一例外是"本部署拿不到上游可访问地址"——那会抛
+    ``SourceVideoUrlUnavailable``，调用方可退回首帧，但必须标注降级，
+    绝不允许静默丢失运动信息。
+    """
+    raw = str(task.source_asset_url or "").strip()
+    if not raw:
+        raise RuntimeError("视频参考生成缺少源视频素材，无法提交")
+    key = storage.key_from_url(raw)
+    if not key:
+        raise RuntimeError("视频参考生成的源视频必须是本站素材，无法提交外部视频链接")
+    if key.startswith("upload_video/"):
+        row = db.get(UploadedAsset, key)
+        if not row or row.user_id != task.user_id:
+            raise RuntimeError("上传视频不存在")
+    elif key.startswith(("video_preview/", "video_hd/")):
+        # 与 asset_refs.generated_video_reference_path 相同的归属校验，
+        # 但不落盘取文件——这里只需要一个上游可访问的地址。
+        asset = db.query(GenAsset).filter(
+            or_(
+                GenAsset.preview_url == storage.public_url(key),
+                GenAsset.hd_url == storage.public_url(key),
+            )
+        ).first()
+        if not asset or asset.user_id != task.user_id:
+            raise RuntimeError("生成视频不存在")
+        if key.startswith("video_hd/") and not asset.unlocked:
+            raise RuntimeError("请先解锁该视频后再作为参考")
+    else:
+        raise RuntimeError("视频参考生成的源视频类型不受支持")
+    if storage.is_object_storage_enabled():
+        url = storage.presigned_download_url(key, expires=VIDEO_SOURCE_URL_TTL_SECONDS)
+    elif key.startswith("video_preview/"):
+        # 本地存储只公开预览目录；上传原片与高清片没有上游可访问地址。
+        url = storage.public_url(key)
+    else:
+        raise SourceVideoUrlUnavailable(
+            "当前部署未启用对象存储，无法为上传原片生成上游可访问地址"
+        )
+    if not url:
+        raise SourceVideoUrlUnavailable("无法为源视频生成上游可访问地址")
+    return url
+
+
 def video_submit_params(db, task: GenTask) -> dict:
     """Stage-aware effective gateway params for a video render."""
     params = dict(task.params or {})
@@ -363,6 +486,33 @@ def video_submit_params(db, task: GenTask) -> dict:
             )
             for detail_url in product_details
         ]
+
+    # 真·视频参考通道：非"仅反推分析"的视频源任务，把源视频 URL 显式带进
+    # 提交参数（payload 构建方会把它写入上游允许的视频字段），而不是只抽首帧。
+    if (
+        task.source_type == "video"
+        and task.source_asset_url
+        and not source_video_is_analysis_only(params)
+    ):
+        try:
+            params["source_video_url"] = gateway_source_video_url(db, task)
+            params.pop("source_video_degraded", None)
+            params.pop("source_video_degraded_reason", None)
+        except SourceVideoUrlUnavailable as exc:
+            # 部署能力不足（本地存储 + 上传原片）：退回首帧，但显式标注降级。
+            # 这里刻意不抛错——否则本地存储部署的视频参考生成会整体不可用；
+            # 也刻意不静默——运动信息丢失必须让用户看得到。
+            params["source_video_degraded"] = "first_frame_only"
+            params["source_video_degraded_reason"] = (
+                f"{exc}。本次仅使用首帧，未传递运动信息；"
+                "如需完整视频参考，请启用对象存储。"
+            )
+            params.pop("source_video_url", None)
+            log.warning(
+                "video source degraded to first frame: task=%s reason=%s",
+                task.id,
+                exc,
+            )
 
     # Every client-supplied frame URL must be resolved by this backend before
     # it reaches the model gateway. Product identity references stay separate
@@ -731,7 +881,9 @@ def start_video_task(
                 original_params.get("_video_submit_contract_version") or ""
             ).strip()
             if not prompt or not stored_compiler_version or not stored_contract_version:
-                prompt, original_params = _compile_legacy_video_prompt(task, model, original_params)
+                prompt, original_params = _compile_legacy_video_prompt(
+                    task, model, original_params, db=db
+                )
             elif stored_contract_version != VIDEO_SUBMIT_CONTRACT_VERSION:
                 raise VideoSubmitVersionMismatch(
                     "视频提交契约版本不一致，已停止提交；请重启 API 与 Worker 后重试"

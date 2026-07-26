@@ -1987,3 +1987,90 @@ def test_public_recipe_sanitizer_resource_limits_fail_closed():
     assert "cdn.example.com" not in serialized
     assert len(projected["node_heavy"]) < len(node_heavy)
     assert projected["public_asset_access"]["status"] == "unavailable"
+
+
+def _bulk_insert_recipes(user_id: int, count: int, *, public: bool = False) -> list[int]:
+    """直接批量写入配方与首个版本，避免 200+ 次 API 往返拖慢测试。"""
+    now = datetime.now(timezone.utc)
+    db = SessionLocal()
+    try:
+        rows = []
+        for index in range(count):
+            rows.append(CreationRecipe(
+                user_id=user_id,
+                title=f"批量配方 {index:03d}",
+                category="image",
+                visibility="public" if public else "private",
+                moderation_status="approved" if public else "draft",
+                favorite=False,
+                current_version=1,
+                approved_version=1 if public else None,
+                created_at=now - timedelta(seconds=index),
+                updated_at=now - timedelta(seconds=index),
+            ))
+        db.add_all(rows)
+        db.flush()
+        for row in rows:
+            db.add(CreationRecipeVersion(
+                recipe_id=row.id,
+                version=1,
+                schema_version="creation-recipe.v1",
+                payload=_payload(f"批量配方提示词 {row.title}"),
+                metadata_snapshot={},
+            ))
+        db.commit()
+        return [int(row.id) for row in rows]
+    finally:
+        db.close()
+
+
+def test_list_recipes_offset_pagination_and_title_search(client, make_user, auth):
+    user_id = make_user("13710000871", balance=100)
+    headers = auth("13710000871")
+    _bulk_insert_recipes(user_id, 5)
+
+    first_page = client.get("/api/recipes?limit=2&offset=0", headers=headers)
+    assert first_page.status_code == 200, first_page.text
+    second_page = client.get("/api/recipes?limit=2&offset=2", headers=headers)
+    assert second_page.status_code == 200, second_page.text
+    all_rows = client.get("/api/recipes?limit=10&offset=0", headers=headers)
+    assert all_rows.status_code == 200, all_rows.text
+    first_ids = [row["id"] for row in first_page.json()]
+    second_ids = [row["id"] for row in second_page.json()]
+    assert len(first_ids) == 2 and len(second_ids) == 2
+    # offset 生效:两页互不重叠，且与整体排序逐段一致
+    assert not set(first_ids) & set(second_ids)
+    assert first_ids + second_ids == [row["id"] for row in all_rows.json()][:4]
+    # 越过末尾的 offset 返回空列表而不是报错
+    tail = client.get("/api/recipes?limit=10&offset=5", headers=headers)
+    assert tail.status_code == 200 and tail.json() == []
+
+    # q 过滤:命中标题子串，且不区分他人配方
+    searched = client.get("/api/recipes?q=%E9%85%8D%E6%96%B9%20003", headers=headers)
+    assert searched.status_code == 200, searched.text
+    assert [row["title"] for row in searched.json()] == ["批量配方 003"]
+    missed = client.get("/api/recipes?q=%E4%B8%8D%E5%AD%98%E5%9C%A8%E7%9A%84%E6%A0%87%E9%A2%98", headers=headers)
+    assert missed.status_code == 200 and missed.json() == []
+
+
+def test_list_recipes_limit_clamped_to_200(client, make_user, auth):
+    user_id = make_user("13710000872", balance=100)
+    headers = auth("13710000872")
+    _bulk_insert_recipes(user_id, 205, public=True)
+
+    # 我的配方列表:limit 超上限被夹到 200
+    mine = client.get("/api/recipes?limit=999", headers=headers)
+    assert mine.status_code == 200, mine.text
+    assert len(mine.json()) == 200
+    # 第二页可以取到剩余的 5 条，历史数据不会永远够不到
+    mine_tail = client.get("/api/recipes?limit=999&offset=200", headers=headers)
+    assert mine_tail.status_code == 200 and len(mine_tail.json()) == 5
+
+    # 公开发现列表同样夹到 200，翻页可达剩余数据（用 q 隔离其他用例的公开配方）
+    public = client.get("/api/recipes/public?limit=999&q=%E6%89%B9%E9%87%8F%E9%85%8D%E6%96%B9")
+    assert public.status_code == 200, public.text
+    assert len(public.json()) == 200
+    public_tail = client.get(
+        "/api/recipes/public?limit=999&offset=200&q=%E6%89%B9%E9%87%8F%E9%85%8D%E6%96%B9"
+    )
+    assert public_tail.status_code == 200 and len(public_tail.json()) == 5

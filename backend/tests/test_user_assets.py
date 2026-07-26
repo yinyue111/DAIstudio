@@ -152,6 +152,7 @@ def test_unified_asset_list_filters_roots_retention_and_cursor(client, make_user
         "fetched": 0,
         "images": 2,
         "videos": 1,
+        "audios": 0,
         "favorites": 2,
         "retained": 1,
     }
@@ -689,3 +690,234 @@ def test_unified_download_enforces_owner_and_existing_generated_rules(client, ma
     )
     assert generated.status_code == 200, generated.text
     assert generated.content == b"generated-original"
+
+
+def _lavfi_video_bytes(tmp_path, name, *, source="testsrc2=size=64x64:rate=12:duration=0.6", scale=None):
+    import shutil
+    import subprocess
+    import tempfile
+    from pathlib import Path
+
+    workdir = Path(tempfile.mkdtemp(prefix="phash-video-", dir=str(tmp_path)))
+    out = workdir / name
+    cmd = [
+        str(shutil.which("ffmpeg")), "-hide_banner", "-loglevel", "error", "-y",
+        "-f", "lavfi", "-i", source,
+    ]
+    if scale:
+        cmd.extend(["-vf", f"scale={scale}"])
+    cmd.extend(["-pix_fmt", "yuv420p", "-c:v", "libx264", str(out)])
+    subprocess.run(cmd, check=True, capture_output=True, timeout=30)
+    return out.read_bytes()
+
+
+def _uploaded_video_asset(db, user_id, payload, stem):
+    key = storage.save_bytes_named(payload, "upload_video", f"{stem}.mp4")
+    db.add(UploadedAsset(
+        key=key,
+        user_id=user_id,
+        mime="video/mp4",
+        bytes=len(payload),
+        original_filename=f"{stem}.mp4",
+        created_at=datetime.now(timezone.utc),
+    ))
+    db.commit()
+    return user_assets.uploaded_asset_ref(key)
+
+
+def test_video_similarity_uses_frame_level_perceptual_fingerprint(
+    client, make_user, auth, tmp_path
+):
+    import shutil
+
+    if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
+        import pytest
+
+        pytest.skip("ffmpeg/ffprobe required")
+
+    user_id = make_user("13900000521")
+    db = SessionLocal()
+    try:
+        # 同源:同一画面内容,不同分辨率/码率的转码副本(sha256 不同)
+        query_ref = _uploaded_video_asset(
+            db, user_id, _lavfi_video_bytes(tmp_path, "query.mp4"), "phash-query"
+        )
+        transcoded_ref = _uploaded_video_asset(
+            db,
+            user_id,
+            _lavfi_video_bytes(tmp_path, "transcoded.mp4", scale="48:48"),
+            "phash-transcoded",
+        )
+        # 非同源:纯色画面,dhash 梯度全 0,与 testsrc2 距离远
+        unrelated_ref = _uploaded_video_asset(
+            db,
+            user_id,
+            _lavfi_video_bytes(
+                tmp_path, "unrelated.mp4", source="color=c=blue:size=64x64:rate=12:duration=0.6"
+            ),
+            "phash-unrelated",
+        )
+
+        result = user_assets.find_similar_assets(
+            db,
+            user_id,
+            query_ref,
+            [transcoded_ref, unrelated_ref],
+            max_distance=10,
+        )
+        assert result["exact_available"] is True
+        assert result["perceptual_available"] is True, result
+        assert result["query"]["perceptual_hash_algorithm"] == "video-dhash64x4"
+        assert len(result["query"]["perceptual_hash"]) == 64
+        matched = {row["asset_ref"]: row for row in result["matches"]}
+        assert transcoded_ref in matched, result
+        assert matched[transcoded_ref]["match_type"] == "similar"
+        assert 0 <= matched[transcoded_ref]["hamming_distance"] <= 10
+        assert unrelated_ref not in matched
+        # 感知指纹按素材缓存,重复查询不再重新抽帧
+        db2 = SessionLocal()
+        try:
+            row = db2.query(UserAssetMetadata).filter_by(
+                user_id=user_id, asset_ref=query_ref
+            ).one()
+            assert row.analysis_status == "ready"
+            assert row.perceptual_hash
+        finally:
+            db2.close()
+    finally:
+        db.close()
+
+
+def test_video_similarity_degrades_to_exact_when_fingerprint_unavailable(
+    client, make_user, auth, monkeypatch
+):
+    user_id = make_user("13900000522")
+    payload = b"fake-video-bytes-identical"
+    db = SessionLocal()
+    try:
+        query_ref = _uploaded_video_asset(db, user_id, payload, "degraded-query")
+        exact_ref = _uploaded_video_asset(db, user_id, payload, "degraded-copy")
+        # 指纹计算失败(如 ffmpeg 不可用/文件损坏)时保留 sha256 精确匹配
+        result = user_assets.find_similar_assets(db, user_id, query_ref, [exact_ref])
+        assert result["exact_available"] is True
+        assert result["perceptual_available"] is False
+        assert result["status"] == "degraded"
+        assert "视频感知指纹不可用" in (result["message"] or "")
+        matched = {row["asset_ref"]: row for row in result["matches"]}
+        assert exact_ref in matched
+        assert matched[exact_ref]["match_type"] == "exact"
+    finally:
+        db.close()
+
+
+def _uploaded_audio_asset(db, user_id, payload, stem):
+    key = storage.save_bytes_named(payload, "upload_audio", f"{stem}.m4a")
+    db.add(UploadedAsset(
+        key=key,
+        user_id=user_id,
+        mime="audio/mp4",
+        bytes=len(payload),
+        original_filename=f"{stem}.m4a",
+        created_at=datetime.now(timezone.utc),
+    ))
+    db.commit()
+    return user_assets.uploaded_asset_ref(key)
+
+
+def test_uploaded_audio_asset_enters_unified_library(client, make_user):
+    user_id = make_user("13900000523")
+    db = SessionLocal()
+    try:
+        ref = _uploaded_audio_asset(db, user_id, b"fake-m4a", "bgm-meta")
+        resolved = user_assets.resolve_asset_ref(db, user_id, ref)
+        assert resolved.origin == "uploaded"
+        assert user_assets._media_type(resolved) == "audio"
+        # 音频进入统一素材列表,type=audio
+        listing = user_assets.list_user_assets(
+            db,
+            user_id,
+            origin="all",
+            asset_type="all",
+            favorite=None,
+            retention_filter="all",
+            limit=100,
+            offset=0,
+            cursor=None,
+        )
+        listed = {item["asset_ref"]: item for item in listing["items"]}
+        assert ref in listed
+        assert listed[ref]["type"] == "audio"
+        assert listed[ref]["origin"] == "uploaded"
+        assert listing["stats"]["audios"] == 1
+        # 批量视图同样产出音频条目
+        views = user_assets.asset_items_for_refs(db, user_id, [ref])
+        assert ref in views
+        assert views[ref]["type"] == "audio"
+    finally:
+        db.close()
+
+
+def test_audio_tags_and_exact_similarity_supported(client, make_user):
+    user_id = make_user("13900000524")
+    payload = b"fake-m4a-identical-bytes"
+    db = SessionLocal()
+    try:
+        query_ref = _uploaded_audio_asset(db, user_id, payload, "bgm-query")
+        exact_ref = _uploaded_audio_asset(db, user_id, payload, "bgm-copy")
+        other_ref = _uploaded_audio_asset(db, user_id, b"different-audio-bytes", "bgm-other")
+        # 标签写入不再被业务错误拦截(CHECK 约束已放开 audio)
+        metadata_row = user_assets.update_asset_tags(db, user_id, query_ref, ["bgm", "轻快"])
+        assert set(metadata_row.tags) == {"bgm", "轻快"}
+        assert metadata_row.media_type == "audio"
+        # 相似分析:音频只支持 SHA-256 精确匹配,感知指纹不可用
+        result = user_assets.find_similar_assets(
+            db, user_id, query_ref, [exact_ref, other_ref]
+        )
+        assert result["exact_available"] is True
+        assert result["perceptual_available"] is False
+        assert result["status"] == "degraded"
+        assert "音频素材仅支持 SHA-256 精确重复检测" in (result["message"] or "")
+        matched = {row["asset_ref"]: row for row in result["matches"]}
+        assert exact_ref in matched
+        assert matched[exact_ref]["match_type"] == "exact"
+        assert other_ref not in matched
+        assert result["query"]["media_type"] == "audio"
+        assert result["query"]["analysis_status"] == "ready"
+    finally:
+        db.close()
+
+
+def test_me_assets_endpoint_filters_by_audio_type(client, make_user, auth):
+    """/me/assets 的 type 查询参数必须放行 audio（此前 pattern 只允许
+    all|image|video，音频虽已进入统一素材库却无法单独筛选）。"""
+    user_id = make_user("13900000525")
+    headers = auth("13900000525")
+    now = datetime.now(timezone.utc)
+    db = SessionLocal()
+    try:
+        audio_ref = _uploaded_audio_asset(db, user_id, b"fake-m4a-endpoint", "bgm-endpoint")
+        image_root, _, _ = _upload_group(db, user_id, "pic-endpoint", created_at=now)
+        db.commit()
+        image_ref = user_assets.uploaded_asset_ref(image_root)
+    finally:
+        db.close()
+
+    audio_only = client.get("/api/me/assets?type=audio", headers=headers)
+    assert audio_only.status_code == 200, audio_only.text
+    audio_items = audio_only.json()["items"]
+    assert [item["asset_ref"] for item in audio_items] == [audio_ref]
+    assert audio_items[0]["type"] == "audio"
+
+    image_only = client.get("/api/me/assets?type=image", headers=headers)
+    assert image_only.status_code == 200, image_only.text
+    image_refs = [item["asset_ref"] for item in image_only.json()["items"]]
+    assert image_ref in image_refs
+    assert audio_ref not in image_refs
+
+    unfiltered = client.get("/api/me/assets?type=all", headers=headers)
+    assert unfiltered.status_code == 200
+    all_refs = [item["asset_ref"] for item in unfiltered.json()["items"]]
+    assert audio_ref in all_refs and image_ref in all_refs
+
+    # 仍拒绝未知类型
+    assert client.get("/api/me/assets?type=bogus", headers=headers).status_code == 422

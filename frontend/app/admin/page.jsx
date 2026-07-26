@@ -12,6 +12,7 @@ import { CatalogVersions } from "./components/catalog-versions";
 import { RecipeReviews } from "./components/recipe-reviews";
 import { VersionUpgrade } from "./components/version-upgrade";
 import { Users, Whitelist } from "./components/whitelist-users";
+import { WorkflowOps } from "./components/workflow-ops";
 
 const TABS = [
   ["dashboard", "运营概览"],
@@ -19,6 +20,7 @@ const TABS = [
   ["users", "用户 / 额度"],
   ["models", "模型配置"],
   ["catalog", "能力 / 工具"],
+  ["workflows", "工作流"],
   ["review", "待对账"],
   ["moderation", "举报处理"],
   ["recipes", "配方审核"],
@@ -35,6 +37,7 @@ const TAB_COMPONENTS = {
   users: Users,
   models: Models,
   catalog: CatalogVersions,
+  workflows: WorkflowOps,
   review: ReviewTasks,
   moderation: AssetReports,
   recipes: RecipeReviews,

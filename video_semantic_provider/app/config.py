@@ -28,6 +28,18 @@ def _bounded_float(
     return value
 
 
+def _boolean(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    value = raw.strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"{name} must be a boolean")
+
+
 @dataclass(frozen=True, slots=True)
 class ProviderSettings:
     api_key: str = ""
@@ -38,6 +50,10 @@ class ProviderSettings:
     max_motion_area_ratio: float = 0.70
     track_iou_threshold: float = 0.12
     transition_threshold: float = 0.46
+    # Pose estimation is opt-in: without the optional model dependency the
+    # provider keeps reporting pose: unsupported instead of guessing.
+    pose_enabled: bool = False
+    pose_min_confidence: float = 0.25
 
     @classmethod
     def from_env(cls) -> "ProviderSettings":
@@ -75,5 +91,9 @@ class ProviderSettings:
             ),
             transition_threshold=_bounded_float(
                 "VIDEO_SEMANTIC_TRANSITION_THRESHOLD", 0.46, minimum=0.05, maximum=0.99
+            ),
+            pose_enabled=_boolean("VIDEO_SEMANTIC_POSE_ENABLED", False),
+            pose_min_confidence=_bounded_float(
+                "VIDEO_SEMANTIC_POSE_MIN_CONFIDENCE", 0.25, minimum=0.01, maximum=0.99
             ),
         )

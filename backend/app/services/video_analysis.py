@@ -23,10 +23,13 @@ class VideoAnalysisPreset:
 
 
 VIDEO_ANALYSIS_PRESETS: dict[str, VideoAnalysisPreset] = {
+    # 档位描述只描述帧预算与速度，不承诺价格差异：四档默认同价
+    # （generation_pricing.REVERSE_VIDEO_PRESET_COSTS），实际价格随
+    # preset_options 的 max_cost 下发，管理员可在模型目录按档位覆盖。
     "fast": VideoAnalysisPreset(
         key="fast",
         label="快速",
-        description="便宜、粗略",
+        description="帧数最少，出结果最快",
         min_frames=4,
         max_frames=8,
     ),

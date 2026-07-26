@@ -29,8 +29,13 @@ from ..schemas import (
     UserDraftOut,
     UserOut,
 )
-from ..security import hash_password, verify_password
-from ..services import audit, billing, storage, user_assets
+from ..schemas.user import (
+    AccountDeletionIn,
+    AccountDeletionOut,
+    AccountDeletionPreflightOut,
+)
+from ..security import dummy_password_hash, hash_password, verify_password
+from ..services import account_deletion, audit, billing, storage, user_assets
 from ..services.rate_limit import incr_window
 
 router = APIRouter(prefix="/api", tags=["me"])
@@ -120,7 +125,7 @@ def _asset_error(error: Exception) -> HTTPException:
 @router.get("/me/assets", response_model=UserAssetListOut)
 def list_me_assets(
     origin: str = Query(default="all", pattern="^(all|generated|uploaded|fetched)$"),
-    type: str = Query(default="all", pattern="^(all|image|video)$"),
+    type: str = Query(default="all", pattern="^(all|image|video|audio)$"),
     favorite: str | None = None,
     retention: str = Query(default="all", pattern="^(all|retained|expiring)$"),
     q: str | None = Query(default=None, max_length=100),
@@ -472,6 +477,70 @@ def change_password(body: ChangePasswordIn, request: Request, db: Session = Depe
     redis_client.delete(fail_key)
     audit.log(db, user_id=user.id, action="change_password", ip=get_client_ip(request))
     return {"ok": True, "relogin": True}
+
+
+@router.get("/me/account-deletion/preflight", response_model=AccountDeletionPreflightOut)
+def account_deletion_preflight(
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """注销预检:返回阻断项与需要放弃的积分,供前端展示确认页。"""
+    return account_deletion.preflight(db, user)
+
+
+@router.post("/me/account-deletion", response_model=AccountDeletionOut)
+def delete_my_account(
+    body: AccountDeletionIn,
+    request: Request,
+    response: Response,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """自助注销（两阶段软注销,不可撤销）。
+
+    立即:停用账号、脱敏手机号（原手机号即刻可重新注册）、清空昵称/头像、
+    吊销全部登录态。保留:财务与审计记录按法定期限留存,但已与自然人解绑。
+    剩余积分不退款,需在请求里显式确认放弃;有未结算任务/待支付订单时拒绝注销。
+    """
+    if user.is_admin:
+        raise HTTPException(400, "管理员账号不能自助注销,请先移交管理员权限")
+    # 复用改密码的防爆破窗口,防止拿到登录态后暴力试密码触发注销。
+    fail_key = f"password:fail:{user.id}"
+    ip_key = f"password:failip:{get_client_ip(request)}"
+    if int(redis_client.get(fail_key) or 0) >= PASSWORD_FAIL_LIMIT:
+        raise HTTPException(429, "密码错误次数过多,请稍后再试")
+    if int(redis_client.get(ip_key) or 0) >= PASSWORD_FAIL_LIMIT * 3:
+        raise HTTPException(429, "密码错误次数过多,请稍后再试")
+    if not verify_password(body.password, user.password_hash or dummy_password_hash()):
+        for key in (fail_key, ip_key):
+            incr_window(key, PASSWORD_FAIL_WINDOW)
+        audit.log(db, user_id=user.id, action="account_deletion_denied",
+                  ip=get_client_ip(request), detail={"reason": "wrong_password"})
+        raise HTTPException(400, "密码不正确,无法注销账号")
+    try:
+        result = account_deletion.delete_account(
+            db,
+            user.id,
+            confirm_forfeit_credits=body.confirm_forfeit_credits,
+            ip=get_client_ip(request),
+        )
+    except account_deletion.CreditsForfeitConfirmationRequired as exc:
+        raise HTTPException(409, {
+            "code": "confirm_forfeit_credits_required",
+            "message": str(exc),
+            "balance_credits": exc.balance_credits,
+        }) from exc
+    except account_deletion.AccountDeletionBlocked as exc:
+        raise HTTPException(409, {
+            "code": "account_deletion_blocked",
+            "message": "当前无法注销账号:" + "; ".join(
+                blocker["message"] for blocker in exc.blockers
+            ),
+            "blockers": exc.blockers,
+        }) from exc
+    redis_client.delete(fail_key)
+    response.delete_cookie(settings.auth_cookie_name, path="/", samesite="lax")
+    return result
 
 
 @router.post("/me/logout")

@@ -14,6 +14,11 @@ from typing import Any
 _SIZE_RE = re.compile(r"^(\d{2,5})x(\d{2,5})$")
 
 REVERSE_IMAGE_COST = 5
+# 视频反推四档默认同价：按次计费，与档位帧预算解耦（帧数见 video_analysis.py）。
+# 管理员可在模型目录 pricing["reverse"]["video_preset_costs"] 按档位覆盖，
+# 报价与结算都会读取覆盖值（reverse_operations._reverse_cost_for_model）。
+# 注意：档位文案不得暗示价格差异，除非此表或目录覆盖真的分级
+# （/api/config 会把各档 max_cost 与描述并排下发给用户）。
 REVERSE_VIDEO_PRESET_COSTS = {
     "fast": 5,
     "standard": 5,

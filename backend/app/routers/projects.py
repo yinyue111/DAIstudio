@@ -494,13 +494,33 @@ def _folder_out(db: Session, folder: AssetFolder, *, detail: bool) -> dict:
         .where(AssetFolderItem.folder_id == folder.id)
         .order_by(AssetFolderItem.created_at, AssetFolderItem.id)
     ))
+    item_rows: list[dict] = []
+    if detail and items:
+        # 一次性批量取素材视图补充可读字段，避免逐条查询
+        asset_views = user_assets.asset_items_for_refs(
+            db,
+            int(folder.user_id),
+            [item.asset_ref for item in items],
+        )
+        for item in items:
+            view = asset_views.get(item.asset_ref) or {}
+            item_rows.append({
+                "asset_ref": item.asset_ref,
+                "type": view.get("type"),
+                "url": view.get("url"),
+                "preview_url": view.get("preview_url"),
+                "thumb": view.get("thumb"),
+                "filename": view.get("filename"),
+                "available": bool(view.get("available")),
+                "created_at": item.created_at,
+            })
     return {
         "id": folder.id,
         "name": folder.name,
         "parent_id": folder.parent_id,
         "sort_order": folder.sort_order,
         "item_count": len(items),
-        "items": items if detail else [],
+        "items": item_rows,
         "created_at": folder.created_at,
         "updated_at": folder.updated_at,
     }

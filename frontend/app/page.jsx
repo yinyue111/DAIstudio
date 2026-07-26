@@ -142,6 +142,36 @@ import {
 } from "./studio/studioDraft";
 import { clearAllWorkspaceContent, clearWorkspaceContent } from "./studio/workspaceReset";
 
+// 反推应用冲突详情：workspace 字段 → 用户可读名称（仅用于冲突详情面板渲染）。
+const REVERSE_APPLY_CONFLICT_FIELD_LABELS = {
+  prompt: "提示词",
+  negative: "负向提示词",
+  structured: "结构化维度",
+  structuredBaseline: "结构化维度基线",
+  ratio: "画面比例",
+  vDuration: "视频时长",
+  vResolution: "视频分辨率",
+  reverseVideoAnalysis: "视频分析",
+  image_evidence: "图片区域证据",
+};
+const REVERSE_APPLY_CONFLICT_INTERNAL_FIELDS = new Set([
+  "promptSourceSignature",
+  "structuredSource",
+  "promptDirty",
+  "negativeTouched",
+  "structuredDirty",
+  "structuredBaseline",
+]);
+
+function reverseApplyConflictFieldChips(fields) {
+  const rows = [...new Set(Array.isArray(fields) ? fields : [])];
+  const visible = rows.filter((field) => !REVERSE_APPLY_CONFLICT_INTERNAL_FIELDS.has(field));
+  return (visible.length ? visible : rows).map((field) => ({
+    field,
+    label: REVERSE_APPLY_CONFLICT_FIELD_LABELS[field] || field,
+  }));
+}
+
 function positivePromptDraftInteger(value) {
   const parsed = Number(value);
   return Number.isInteger(parsed) && parsed > 0 ? parsed : null;
@@ -539,6 +569,7 @@ export default function Home() {
     reverseAppliedVersion,
     reverseAppliedRevisionId,
     reverseUndoSnapshot,
+    reverseApplyConflict = null,
     reverseResultRevisions,
     reverseFeedback,
     batchReverseAssets = [],
@@ -556,9 +587,12 @@ export default function Home() {
     targetLanguage: "en",
   };
   const reverseBatchEnabled = cfg?.features?.reverse_batch_enabled !== false;
-  const videoCompositionEnabled = cfg?.features?.video_composition_enabled !== false;
+  // Fail closed: when the flag is missing or the config payload is broken the
+  // composition panel must stay hidden, so a flag-only rollback works.
+  const videoCompositionEnabled = cfg?.features?.video_composition_enabled === true;
   const reproductionAssessmentEnabled = cfg?.features?.reproduction_assessment_enabled !== false;
   const recipesEnabled = cfg?.features?.recipes_enabled !== false;
+  const toolWorkflowsEnabled = cfg?.features?.tool_workflows_enabled === true;
   const {
     operations: recentReverseOperations,
     loading: recentReverseLoading,
@@ -1244,6 +1278,17 @@ export default function Home() {
     if (!me?.id || !cloudDraftLoadedRef.current || typeof window === "undefined") return;
     const slug = studioWorkflowSlug(window.location.search);
     if (!slug) return;
+    if (!cfg) return; // wait for runtime config before deciding on the flag
+    if (!toolWorkflowsEnabled) {
+      // tool_workflows_enabled off: never apply a workflow preset to the draft.
+      if (workflowBootstrapRef.current !== `disabled:${slug}`) {
+        workflowBootstrapRef.current = `disabled:${slug}`;
+        const message = `工作流功能未开放，已忽略「${slug}」预设，当前草稿未改变。`;
+        setMsg(message);
+        notify.warn(message);
+      }
+      return;
+    }
     const loadingKey = `loading:${slug}`;
     if (
       workflowBootstrapRef.current === loadingKey
@@ -1304,7 +1349,7 @@ export default function Home() {
       active = false;
       if (workflowBootstrapRef.current === loadingKey) workflowBootstrapRef.current = "";
     };
-  }, [me?.id, workspaces, setWorkspacePatch]);
+  }, [me?.id, workspaces, setWorkspacePatch, cfg, toolWorkflowsEnabled]);
 
   useEffect(() => {
     if (!me?.id || !cfg || typeof window === "undefined") return;
@@ -4313,6 +4358,39 @@ export default function Home() {
               videoCompositionEnabled={videoCompositionEnabled}
               recipesEnabled={recipesEnabled}
             />
+
+            {reverseApplyConflict && (
+              <section
+                className="mt-3 rounded-xl2 border border-warn/35 bg-warn/10 p-3 animate-fadeup"
+                role="alert"
+                aria-label="反推结果应用冲突详情"
+              >
+                <div className="flex flex-wrap items-start justify-between gap-2">
+                  <div className="min-w-0 flex-1">
+                    <p className="text-xs font-display font-medium text-warn">
+                      反推结果应用冲突
+                      {reverseApplyConflict.revision_id != null && (
+                        <span className="ml-1 text-fog">· 服务端已记录版本 #{reverseApplyConflict.revision_id}</span>
+                      )}
+                    </p>
+                    <p className="mt-1 text-xs text-mist">以下字段在应用期间被本地修改，已保留当前编辑，未被服务端版本覆盖：</p>
+                    <div className="mt-1.5 flex flex-wrap gap-1">
+                      {reverseApplyConflictFieldChips(reverseApplyConflict.fields).map(({ field, label }) => (
+                        <span key={field} className="chip">{label}</span>
+                      ))}
+                    </div>
+                    <p className="mt-1.5 text-[11px] text-fog">请对照上方反推结果重新审阅这些字段后再次应用，或保持当前编辑。</p>
+                  </div>
+                  <button
+                    type="button"
+                    className="btn-secondary btn-sm px-2.5 py-1 text-xs"
+                    onClick={() => setWorkspacePatch({ reverseApplyConflict: null })}
+                  >
+                    知道了
+                  </button>
+                </div>
+              </section>
+            )}
 
             <StudioRecentReversePanel
               operations={recentReverseOperations.filter((item) => ["image", "video"].includes(item.target))}

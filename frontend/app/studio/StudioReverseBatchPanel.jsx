@@ -13,11 +13,13 @@ import {
   Square,
 } from "lucide-react";
 import { ReferenceAssetPreview } from "./StudioMedia";
+import { reversePrecisionOptions } from "./reverseConfig";
 import { assetReferenceUrl, unifiedAssetKey } from "../../lib/unifiedAssets";
 import {
   normalizeReverseBatchItemOverride,
   parseReverseBatchKeyframes,
   parseReverseBatchRanges,
+  reverseBatchConfirmationState,
   reverseBatchOverrideCapability,
   reverseBatchOverrideCount,
   reverseBatchSucceededOperations,
@@ -26,7 +28,7 @@ import {
 const STATUS_LABELS = {
   queued: "等待中",
   running: "分析中",
-  needs_confirmation: "待确认",
+  needs_confirmation: "需要你确认",
   succeeded: "已完成",
   partial: "部分完成",
   failed: "失败",
@@ -35,6 +37,25 @@ const STATUS_LABELS = {
 
 function statusLabel(value) {
   return STATUS_LABELS[value] || value || "等待中";
+}
+
+// 确认截止倒计时：待确认状态有 15 分钟 TTL，超时后端自动取消并退款，
+// 所以剩余时间必须实时可见，而不是显示成静态的"等待中"。
+function useConfirmationCountdown(expiresAt) {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    if (!expiresAt) return undefined;
+    setNow(Date.now());
+    const timer = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(timer);
+  }, [expiresAt]);
+  if (!expiresAt) return null;
+  const deadline = Date.parse(expiresAt);
+  if (!Number.isFinite(deadline)) return null;
+  const remaining = Math.max(0, Math.floor((deadline - now) / 1000));
+  const minutes = String(Math.floor(remaining / 60)).padStart(2, "0");
+  const seconds = String(remaining % 60).padStart(2, "0");
+  return { expired: remaining <= 0, text: `${minutes}:${seconds}` };
 }
 
 function assetKey(asset) {
@@ -52,6 +73,11 @@ function formatKeyframes(values) {
 function BatchItemOverrideEditor({ asset, value, inherited, capability, disabled, onChange }) {
   const override = normalizeReverseBatchItemOverride(value);
   const count = reverseBatchOverrideCount(override);
+  // 精度档位跟随 /api/config 下发的服务端枚举，避免下拉值与后端契约漂移。
+  const precisionOptions = reversePrecisionOptions();
+  const inheritedPrecision = inherited.analysis_precision || "standard";
+  const inheritedPrecisionLabel = precisionOptions.find((option) => option.key === inheritedPrecision)?.label
+    || inheritedPrecision;
   const effectiveTarget = override.target || inherited.target || asset.type;
   const video = asset.type === "video" && effectiveTarget === "video";
   const supports = (field) => capability.fields.includes(field);
@@ -76,10 +102,10 @@ function BatchItemOverrideEditor({ asset, value, inherited, capability, disabled
         <label className="text-[10px] text-fog">
           <span className="mb-1 block">精度</span>
           <select className="select min-h-10 px-2 text-xs" disabled={disabled || !supports("analysis_precision")} value={override.analysis_precision || ""} onChange={(event) => patch({ analysis_precision: event.target.value || undefined })}>
-            <option value="">继承 {inherited.analysis_precision || "standard"}</option>
-            <option value="fast">快速</option>
-            <option value="standard">标准</option>
-            <option value="deep">精细</option>
+            <option value="">继承 {inheritedPrecisionLabel}</option>
+            {precisionOptions.map((option) => (
+              <option key={option.key} value={option.key}>{option.label}</option>
+            ))}
           </select>
         </label>
         <label className="text-[10px] text-fog">
@@ -136,7 +162,7 @@ function BatchItem({ item, busy, onOpen, onRetry }) {
       <div className="min-w-0">
         <div className="flex min-w-0 items-center gap-2 text-xs">
           <span className="font-display font-medium text-mist">素材 {item.index + 1}</span>
-          <span className={status === "failed" ? "text-bad" : status === "succeeded" ? "text-aqua" : "text-fog"}>
+          <span className={status === "failed" ? "text-bad" : status === "succeeded" ? "text-aqua" : status === "needs_confirmation" ? "font-medium text-warn" : "text-fog"}>
             {statusLabel(status)}
           </span>
           {operation && <span className="text-fog">{Math.round(Number(operation.progress || 0))}%</span>}
@@ -146,6 +172,11 @@ function BatchItem({ item, busy, onOpen, onRetry }) {
         </p>
       </div>
       <div className="flex items-center gap-1">
+        {operation?.status === "needs_confirmation" && (
+          <button type="button" className="btn-primary btn-sm shrink-0" onClick={() => onOpen?.(operation)} disabled={busy} title="查看降级原因并确认" aria-label="去确认">
+            去确认
+          </button>
+        )}
         {operation?.status === "succeeded" && (
           <button type="button" className="icon-btn h-9 w-9" onClick={() => onOpen?.(operation)} title="查看并应用" aria-label="查看并应用">
             <Eye size={15} aria-hidden="true" />
@@ -192,6 +223,8 @@ export default function StudioReverseBatchPanel({
   const successful = reverseBatchSucceededOperations(batch);
   const creating = busyAction === "create";
   const totalCost = Number(batch?.cost_settled || batch?.cost_frozen || 0);
+  const confirmation = reverseBatchConfirmationState(batch);
+  const countdown = useConfirmationCountdown(confirmation.expires_at);
   return (
     <section className="mt-3 border-t border-line pt-3" aria-labelledby="reverse-batch-title">
       <div className="flex min-w-0 items-start justify-between gap-2">
@@ -266,6 +299,15 @@ export default function StudioReverseBatchPanel({
               </button>
             )}
           </div>
+          {confirmation.count > 0 && (
+            <div className="mt-2 rounded-lg border border-warn/60 bg-warn/10 p-2 text-[11px] text-warn" role="alert">
+              <p className="font-medium">
+                {confirmation.count} 项需要你确认后才能继续
+                {countdown ? (countdown.expired ? "（确认已超时，正在取消并退款）" : `（剩余 ${countdown.text}）`) : ""}
+              </p>
+              <p className="mt-0.5">视频帧提取失败，请点击"去确认"选择是否降级为封面分析；超时未确认将自动取消并全额退回积分。</p>
+            </div>
+          )}
           <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-black/30">
             <div
               className="h-full bg-aqua transition-[width]"

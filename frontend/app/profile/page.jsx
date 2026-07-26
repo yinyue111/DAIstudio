@@ -2,7 +2,7 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
-import { FolderInput, ScanSearch, Search, Tags, X } from "lucide-react";
+import { Flag, FolderArchive, FolderInput, ScanSearch, Search, Tags, X } from "lucide-react";
 import { api, clearToken, downloadBlob, loginPath } from "../../lib/api";
 import { formatLocalDateTime } from "../../lib/datetime";
 import { redirectOnAuthError, reportBackgroundError } from "../../lib/errorHandling";
@@ -25,6 +25,15 @@ import { assetVariationSourceUrl } from "../studio/assetActions";
 import { STUDIO_VARIATION_DRAFT_KEY } from "../studio/constants";
 
 const PAGE_SIZE = 36;
+const BATCH_DOWNLOAD_LIMIT = 100;
+
+const REPORT_REASONS = [
+  ["copyright", "涉嫌侵权或盗用他人素材"],
+  ["sensitive", "包含敏感内容"],
+  ["illegal", "违法违规信息"],
+  ["privacy", "泄露个人隐私"],
+  ["other", "其他问题"],
+];
 
 function generatedAssetId(asset) {
   if (asset?.origin !== "generated") return null;
@@ -107,6 +116,11 @@ export default function ProfilePage() {
   const [msg, setMsg] = useState("");
   const [busyRefs, setBusyRefs] = useState(() => new Set());
   const [selectedRefs, setSelectedRefs] = useState(() => new Set());
+  const [reportTarget, setReportTarget] = useState(null);
+  const [reportReason, setReportReason] = useState("copyright");
+  const [reportNote, setReportNote] = useState("");
+  const [reportBusy, setReportBusy] = useState(false);
+  const [batchDownloading, setBatchDownloading] = useState(false);
   const [uploading, setUploading] = useState("");
   const [pwOpen, setPwOpen] = useState(false);
   const [oldPw, setOldPw] = useState("");
@@ -378,6 +392,75 @@ export default function ProfilePage() {
     });
   }
 
+  function openReport(asset) {
+    if (!generatedAssetId(asset)) {
+      notify.warn("仅平台生成的素材支持举报。");
+      return;
+    }
+    setReportReason("copyright");
+    setReportNote("");
+    setReportTarget(asset);
+  }
+
+  function closeReport() {
+    if (reportBusy) return;
+    setReportTarget(null);
+    setReportNote("");
+  }
+
+  async function submitReport() {
+    const assetId = generatedAssetId(reportTarget);
+    if (!assetId || reportBusy) return;
+    const note = reportNote.trim();
+    if (note.length > 500) {
+      notify.warn("补充说明最多 500 字");
+      return;
+    }
+    setReportBusy(true);
+    try {
+      const report = await api.reportAsset(assetId, { reason: reportReason, note: note || null });
+      const createdAt = report?.created_at ? Date.parse(report.created_at) : NaN;
+      const duplicated = Number.isFinite(createdAt) && Date.now() - createdAt > 15000;
+      if (duplicated) {
+        notify.warn("你已举报过该素材，平台正在核实中，请勿重复提交。");
+      } else {
+        notify.success("举报已受理，平台会尽快核实处理。");
+      }
+      setReportTarget(null);
+      setReportNote("");
+    } catch (error) {
+      notify.error(error.message || "举报提交失败，请稍后再试");
+    } finally {
+      setReportBusy(false);
+    }
+  }
+
+  async function batchDownloadSelected() {
+    if (batchDownloading) return;
+    const ids = selectedDownloadableIds;
+    if (!ids.length) {
+      notify.warn("所选素材中没有可打包的生成素材（需已解锁）。");
+      return;
+    }
+    if (ids.length > BATCH_DOWNLOAD_LIMIT) {
+      notify.warn(`单次最多打包下载 ${BATCH_DOWNLOAD_LIMIT} 个素材，请减少选择。`);
+      return;
+    }
+    const skippedCount = selectedAssets.length - ids.length;
+    setBatchDownloading(true);
+    try {
+      const filename = await api.batchDownloadAssets(ids);
+      notify.success(skippedCount > 0
+        ? `已开始下载 ${filename}，${skippedCount} 个非生成或未解锁素材未打包。`
+        : `已开始下载 ${filename}`);
+    } catch (error) {
+      setMsg(error.message || "打包下载失败");
+      notify.error(error.message || "打包下载失败，请稍后再试");
+    } finally {
+      setBatchDownloading(false);
+    }
+  }
+
   function createVariation(asset) {
     const sourceUrl = assetVariationSourceUrl(asset);
     if (!sourceUrl) {
@@ -451,6 +534,12 @@ export default function ProfilePage() {
     () => (assets || []).filter((asset) => compareSelection.has(unifiedAssetKey(asset))),
     [assets, compareSelection],
   );
+  const selectedDownloadableIds = useMemo(() => (
+    selectedAssets
+      .filter((asset) => asset.origin === "generated" && canDownloadAsset(asset))
+      .map((asset) => generatedAssetId(asset))
+      .filter(Boolean)
+  ), [selectedAssets]);
   const compareAssets = (similarity?.assets || selectedAssets).slice(0, 4);
   const hasMore = Boolean(nextCursor);
 
@@ -524,6 +613,9 @@ export default function ProfilePage() {
               <button type="button" onClick={() => updateMetadata([ref], { retained: !asset.retained })} disabled={busy} className="btn-ghost btn-sm" title={asset.retained ? "取消长期保留" : "长期保留"}>{asset.retained ? "取消保留" : "保留"}</button>
               <button type="button" onClick={() => setTagEditor({ ref, value: (asset.tags || []).join(", ") })} disabled={busy} className="icon-btn h-8 w-8" title="编辑标签" aria-label="编辑素材标签"><Tags size={14} aria-hidden="true" /></button>
               <button type="button" onClick={() => findSimilar(asset)} disabled={busy} className="icon-btn h-8 w-8" title="查重与相似检测" aria-label="查重与相似检测"><ScanSearch size={14} aria-hidden="true" /></button>
+              {asset.origin === "generated" && (
+                <button type="button" onClick={() => openReport(asset)} disabled={busy} className="icon-btn h-8 w-8" title="举报素材" aria-label="举报素材"><Flag size={14} aria-hidden="true" /></button>
+              )}
             </div>
             <div className="flex gap-1">
               {asset.type === "image" && <button type="button" onClick={() => createVariation(asset)} disabled={busy} className="btn-secondary btn-sm">变体</button>}
@@ -674,6 +766,19 @@ export default function ProfilePage() {
               </button>
               <button type="button" onClick={() => updateMetadata([...selectedRefs], { retained: true })} className="btn-secondary btn-sm">长期保留</button>
               <button type="button" onClick={() => updateMetadata([...selectedRefs], { favorite: true })} className="btn-secondary btn-sm">收藏</button>
+              <button
+                type="button"
+                onClick={batchDownloadSelected}
+                disabled={batchDownloading || !selectedDownloadableIds.length}
+                className="btn-secondary btn-sm inline-flex items-center gap-1.5"
+                title={selectedDownloadableIds.length
+                  ? `将 ${selectedDownloadableIds.length} 个已解锁生成素材打包为 ZIP 下载`
+                  : "所选素材中没有可打包的生成素材（需已解锁）"}
+                aria-label="打包下载所选素材"
+              >
+                <FolderArchive size={14} aria-hidden="true" />
+                {batchDownloading ? "打包中…" : `打包下载${selectedDownloadableIds.length ? ` ${selectedDownloadableIds.length}` : ""}`}
+              </button>
               <button type="button" onClick={() => deleteRefs([...selectedRefs])} className="btn-ghost btn-sm text-bad">删除</button>
               <button type="button" onClick={() => setSelectedRefs(new Set())} className="btn-ghost btn-sm">取消选择</button>
             </div>
@@ -734,12 +839,64 @@ export default function ProfilePage() {
                 <button type="button" onClick={() => setTagEditor({ ref, value: (asset.tags || []).join(", ") })} disabled={busyRefs.has(ref)} className="btn-secondary btn-sm">编辑标签</button>
                 <button type="button" onClick={() => findSimilar(asset)} disabled={busyRefs.has(ref)} className="btn-secondary btn-sm">查重</button>
                 {asset.type === "image" && <button type="button" onClick={() => createVariation(asset)} className="btn-secondary btn-sm">生成变体</button>}
+                {asset.origin === "generated" && <button type="button" onClick={() => openReport(asset)} disabled={busyRefs.has(ref)} className="btn-ghost btn-sm">举报</button>}
                 <button type="button" onClick={() => download(asset)} disabled={busyRefs.has(ref) || !canDownloadAsset(asset)} className="btn-primary btn-sm">下载</button>
                 <button type="button" onClick={() => deleteRefs([ref])} disabled={busyRefs.has(ref)} className="btn-ghost btn-sm text-bad">删除</button>
               </>
             );
           }}
         </AssetPreviewDialog>
+      )}
+
+      {reportTarget && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4" role="dialog" aria-modal="true" aria-label="举报素材">
+          <div className="w-full max-w-md rounded-xl2 border border-line bg-base2 p-5 shadow-pop">
+            <div className="flex items-start justify-between gap-3">
+              <div>
+                <h2 className="text-base font-display font-semibold text-snow">举报素材</h2>
+                <p className="mt-1 text-xs text-fog">举报后平台会人工核实，确认违规的素材将被下架。</p>
+              </div>
+              <button type="button" className="icon-btn h-8 w-8" onClick={closeReport} disabled={reportBusy} title="关闭" aria-label="关闭举报弹窗">
+                <X size={14} aria-hidden="true" />
+              </button>
+            </div>
+            <div className="mt-4 space-y-2" role="radiogroup" aria-label="举报理由">
+              {REPORT_REASONS.map(([value, label]) => (
+                <label
+                  key={value}
+                  className={`flex cursor-pointer items-center gap-2 rounded-lg border px-3 py-2 text-sm transition ${
+                    reportReason === value ? "border-brand/60 bg-brand/10 text-snow" : "border-line text-mist hover:border-line2"
+                  }`}
+                >
+                  <input
+                    type="radio"
+                    name="asset-report-reason"
+                    value={value}
+                    checked={reportReason === value}
+                    onChange={() => setReportReason(value)}
+                    className="h-3.5 w-3.5 accent-brand"
+                  />
+                  {label}
+                </label>
+              ))}
+            </div>
+            <label className="sr-only" htmlFor="asset-report-note">补充说明</label>
+            <textarea
+              id="asset-report-note"
+              className="input mt-3 h-24 w-full resize-none py-2 text-sm"
+              value={reportNote}
+              onChange={(event) => setReportNote(event.target.value)}
+              maxLength={500}
+              placeholder="选填：补充具体情况，如侵权来源链接（最多 500 字）"
+            />
+            <div className="mt-4 flex justify-end gap-2">
+              <button type="button" className="btn-ghost btn-sm" onClick={closeReport} disabled={reportBusy}>取消</button>
+              <button type="button" className="btn-primary btn-sm" onClick={submitReport} disabled={reportBusy}>
+                {reportBusy ? "提交中…" : "提交举报"}
+              </button>
+            </div>
+          </div>
+        </div>
       )}
     </div>
   );

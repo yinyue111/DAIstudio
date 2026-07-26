@@ -3426,3 +3426,283 @@ def test_uploaded_video_can_drive_video_first_frame(
     }, headers=h)
     assert r.status_code == 200, r.text
     assert seen["first_frame_image"].startswith("data:image/jpeg;base64,")
+
+
+def _m4a_bytes(tmp_path, seconds=0.4):
+    out = tmp_path / "bgm.m4a"
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            f"sine=frequency=440:duration={seconds}:sample_rate=44100",
+            "-c:a",
+            "aac",
+            str(out),
+        ],
+        check=True,
+        capture_output=True,
+        timeout=15,
+    )
+    return out.read_bytes()
+
+
+@pytest.mark.skipif(
+    subprocess.run(["which", "ffmpeg"], capture_output=True).returncode != 0
+    or subprocess.run(["which", "ffprobe"], capture_output=True).returncode != 0,
+    reason="ffmpeg/ffprobe required",
+)
+def test_upload_audio_returns_audio_asset_with_asset_ref(client, make_user, auth, tmp_path):
+    uid = make_user("13900000150", balance=1000)
+    h = auth("13900000150")
+
+    r = client.post(
+        "/api/uploads/audio",
+        files={"file": ("bgm.m4a", _m4a_bytes(tmp_path), "audio/mp4")},
+        headers=h,
+    )
+    assert r.status_code == 200, r.text
+    asset = r.json()
+    assert asset["type"] == "audio"
+    assert asset["asset_ref"].startswith("u.")
+    url_key = urlparse(asset["url"]).path.removeprefix("/api/uploads/")
+    assert url_key.startswith("upload_audio/")
+    assert url_key.endswith(".m4a")
+
+    db = SessionLocal()
+    try:
+        row = db.get(UploadedAsset, url_key)
+        assert row is not None
+        assert row.user_id == uid
+        assert row.mime == "audio/mp4"
+        assert row.bytes and row.bytes > 0
+        log = db.query(AuditLog).filter(
+            AuditLog.user_id == uid,
+            AuditLog.action == "upload_audio",
+        ).order_by(AuditLog.id.desc()).first()
+        assert log is not None
+        assert log.detail["sanitized"] is True
+    finally:
+        db.close()
+
+    # 归属校验:匿名 401,他人 404,本人 200
+    anon = TestClient(app)
+    assert anon.get(urlparse(asset["url"]).path).status_code == 401
+    assert client.get(urlparse(asset["url"]).path, headers=h).status_code == 200
+    make_user("13900000151")
+    other = auth("13900000151")
+    assert client.get(urlparse(asset["url"]).path, headers=other).status_code == 404
+
+    # 音频进入统一素材列表,type=audio
+    listing = client.get("/api/me/assets", headers=h)
+    assert listing.status_code == 200, listing.text
+    listed = {item["asset_ref"]: item for item in listing.json()["items"]}
+    assert asset["asset_ref"] in listed
+    assert listed[asset["asset_ref"]]["type"] == "audio"
+    assert listed[asset["asset_ref"]]["origin"] == "uploaded"
+    assert listing.json()["stats"]["audios"] >= 1
+
+
+@pytest.mark.skipif(
+    subprocess.run(["which", "ffmpeg"], capture_output=True).returncode != 0
+    or subprocess.run(["which", "ffprobe"], capture_output=True).returncode != 0,
+    reason="ffmpeg/ffprobe required",
+)
+def test_upload_audio_with_moderation_enabled_is_not_blocked(
+    client, make_user, auth, monkeypatch, tmp_path
+):
+    """启用审核后音频不送 provider(其协议只定义 image/video),显式降级放行并落审计。
+
+    回归目标:HTTP 审核骨架对未识别类型归 review,若把 audio 直接送审,
+    启用审核后音频上传会被全量卡死。
+    """
+    from app.services import content_safety as cs
+    from app.services import content_safety_providers as csp
+    from app.services.config_store import set_setting
+
+    uid = make_user("13900000156", balance=1000)
+    h = auth("13900000156")
+
+    class _ReviewEverythingProvider(csp.MediaModerationProvider):
+        name = "review-everything"
+
+        def moderate(self, request):  # noqa: ARG002
+            return csp.MediaModerationResult(
+                decision=csp.DECISION_REVIEW, reason="unknown media", provider=self.name
+            )
+
+    monkeypatch.setattr(
+        cs, "get_media_moderation_provider", lambda name=None: _ReviewEverythingProvider()
+    )
+    db = SessionLocal()
+    try:
+        set_setting(db, "media_moderation_enabled", True)
+        r = client.post(
+            "/api/uploads/audio",
+            files={"file": ("bgm.m4a", _m4a_bytes(tmp_path), "audio/mp4")},
+            headers=h,
+        )
+        assert r.status_code == 200, r.text
+        assert r.json()["type"] == "audio"
+        log = db.query(AuditLog).filter(
+            AuditLog.user_id == uid,
+            AuditLog.action == "media_moderation",
+        ).order_by(AuditLog.id.desc()).first()
+        assert log is not None
+        assert log.detail["media_type"] == "audio"
+        assert log.detail["decision"] == "allow"
+        assert log.detail["provider"] == "audio_unsupported"
+    finally:
+        set_setting(db, "media_moderation_enabled", False)
+        db.close()
+
+
+def test_upload_audio_rejects_non_audio_payload(client, make_user, auth):
+    make_user("13900000152", balance=1000)
+    h = auth("13900000152")
+    r = client.post(
+        "/api/uploads/audio",
+        files={"file": ("fake.mp3", _png_bytes(), "audio/mpeg")},
+        headers=h,
+    )
+    assert r.status_code == 400, r.text
+    assert "音频" in r.json()["detail"]
+
+
+def test_upload_audio_rejects_unsupported_content_type(client, make_user, auth):
+    make_user("13900000153", balance=1000)
+    h = auth("13900000153")
+    r = client.post(
+        "/api/uploads/audio",
+        files={"file": ("doc.txt", b"hello", "text/plain")},
+        headers=h,
+    )
+    assert r.status_code == 400, r.text
+    assert "音频" in r.json()["detail"]
+
+
+def test_upload_image_calls_content_moderation_and_rejection_blocks_storage(
+    client, make_user, auth, monkeypatch
+):
+    from app.routers import uploads as uploads_router
+    from app.services.content_safety import MediaModerationRejected
+
+    make_user("13900000154", balance=1000)
+    h = auth("13900000154")
+    calls = {}
+
+    def fake_moderation(db, **kwargs):
+        calls.update(kwargs)
+        raise MediaModerationRejected(
+            400, "上传内容未通过安全审核", decision="reject", reason="test"
+        )
+
+    monkeypatch.setattr(uploads_router, "assert_upload_media_allowed", fake_moderation)
+    before = len(list(Path(storage.ROOT).glob("upload/*"))) if (Path(storage.ROOT) / "upload").exists() else 0
+    r = client.post(
+        "/api/uploads/image",
+        files={"file": ("ref.png", _png_bytes(), "image/png")},
+        headers=h,
+    )
+    assert r.status_code == 400, r.text
+    assert "安全审核" in r.json()["detail"]
+    assert calls["media_type"] == "image"
+    assert calls["mime_type"] == "image/png"
+    assert calls["data"]
+    after = len(list(Path(storage.ROOT).glob("upload/*"))) if (Path(storage.ROOT) / "upload").exists() else 0
+    assert after == before  # 拒绝发生在落存储之前
+
+
+@pytest.mark.skipif(
+    subprocess.run(["which", "ffmpeg"], capture_output=True).returncode != 0
+    or subprocess.run(["which", "ffprobe"], capture_output=True).returncode != 0,
+    reason="ffmpeg/ffprobe required",
+)
+def test_upload_video_moderation_rejection_cleans_stored_file(
+    client, make_user, auth, monkeypatch, tmp_path
+):
+    from app.routers import uploads as uploads_router
+    from app.services.content_safety import MediaModerationRejected
+
+    make_user("13900000155", balance=1000)
+    h = auth("13900000155")
+    calls = {}
+
+    def fake_moderation(db, **kwargs):
+        calls.update(kwargs)
+        raise MediaModerationRejected(
+            400, "上传内容未通过安全审核", decision="reject", reason="test"
+        )
+
+    monkeypatch.setattr(uploads_router, "assert_upload_media_allowed", fake_moderation)
+    video_dir = Path(storage.ROOT) / "upload_video"
+    keys_before = {p.name for p in video_dir.glob("*.mp4")} if video_dir.exists() else set()
+    r = client.post(
+        "/api/uploads/video",
+        files={"file": ("moderated-ref.mp4", _mp4_bytes(tmp_path), "video/mp4")},
+        headers=h,
+    )
+    assert r.status_code == 400, r.text
+    assert calls["media_type"] == "video"
+    assert calls["mime_type"] == "video/mp4"
+    assert calls["data"]  # 小文件内联送审
+    db = SessionLocal()
+    try:
+        assert (
+            db.query(UploadedAsset)
+            .filter(UploadedAsset.key.like("upload_video/%"))
+            .filter(UploadedAsset.original_filename == "moderated-ref.mp4")
+            .count()
+            == 0
+        )
+    finally:
+        db.close()
+    # 拒绝后本次已落的存储文件被清理,不新增任何 upload_video 文件
+    keys_after = {p.name for p in video_dir.glob("*.mp4")} if video_dir.exists() else set()
+    assert keys_after == keys_before
+
+
+@pytest.mark.skipif(
+    subprocess.run(["which", "ffmpeg"], capture_output=True).returncode != 0
+    or subprocess.run(["which", "ffprobe"], capture_output=True).returncode != 0,
+    reason="ffmpeg/ffprobe required",
+)
+def test_upload_video_over_inline_cap_never_sends_dead_media_url(
+    client, make_user, auth, monkeypatch, tmp_path
+):
+    """本地存储 + 超内联上限:送审绝不携带未挂载的 /media/upload_* 死链.
+
+    data 与 url 都应为 None,由 content_safety 的 fail-open/closed 策略决定
+    拒/放;S3 后端才会给 presigned URL(此处不覆盖)。
+    """
+    from app.routers import uploads as uploads_router
+    from app.config import settings as app_settings
+
+    make_user("13900000156", balance=1000)
+    h = auth("13900000156")
+    calls = {}
+
+    def fake_moderation(db, **kwargs):
+        calls.update(kwargs)
+
+    monkeypatch.setattr(uploads_router, "assert_upload_media_allowed", fake_moderation)
+    monkeypatch.setattr(app_settings, "media_moderation_http_max_inline_bytes", 1)
+    r = client.post(
+        "/api/uploads/video",
+        files={"file": ("big-ref.mp4", _mp4_bytes(tmp_path), "video/mp4")},
+        headers=h,
+    )
+    assert r.status_code == 200, r.text
+    assert calls["media_type"] == "video"
+    assert calls["data"] is None  # 超上限不内联
+    assert calls["url"] is None   # 本地后端没有匿名可取地址,绝不送死链
+
+
+def test_moderation_inline_cap_follows_provider_setting(monkeypatch):
+    from app.config import settings as app_settings
+    from app.routers import uploads as uploads_router
+
+    monkeypatch.setattr(app_settings, "media_moderation_http_max_inline_bytes", 12345)
+    assert uploads_router._moderation_inline_cap() == 12345

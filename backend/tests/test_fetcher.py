@@ -1179,3 +1179,58 @@ def test_douyin_render_prefers_target_keyed_only_by_group_id(monkeypatch):
         f"https://www.douyin.com/video/{target_id}"
     )
     assert assets[0]["url"] == "https://example.com/target.jpg"
+
+
+def test_x_post_media_url_filter_allows_video_paths_and_blocks_profile_chrome():
+    # 真实形状的 X 视频/封面 URL:视频在 video.twimg.com 的 ext_tw_video /
+    # amplify_video / tweet_video 路径,封面在 pbs.twimg.com 的 *_thumb 路径。
+    allowed = [
+        "https://video.twimg.com/ext_tw_video/1815696123456789012/pu/vid/avc1/720x1280/AbCdEf12345.mp4?tag=12",
+        "https://video.twimg.com/amplify_video/1815696123456789012/vid/avc1/1280x720/XyZw9876.mp4?tag=14",
+        "https://video.twimg.com/tweet_video/GhIjKlMnOpQ.mp4",
+        "https://pbs.twimg.com/ext_tw_video_thumb/1815696123456789012/pu/img/AbCdEf12345.jpg",
+        "https://pbs.twimg.com/amplify_video_thumb/1815696123456789012/img/XyZw9876.jpg",
+        "https://pbs.twimg.com/tweet_video_thumb/GhIjKlMnOpQ.jpg",
+        "https://pbs.twimg.com/media/GrJQ-demo?format=jpg&name=large",
+    ]
+    blocked = [
+        "https://pbs.twimg.com/profile_images/123/avatar_400x400.jpg",
+        "https://pbs.twimg.com/profile_banners/123/1700000000/1500x500",
+        "https://abs.twimg.com/emoji/v2/svg/1f600.svg",
+        "https://evil.example.com/ext_tw_video/1/pu/vid/avc1/720x1280/a.mp4",
+        "https://eviltwimg.com/media/spoof.jpg",
+    ]
+    for url in allowed:
+        assert fetcher._is_x_post_media_url(url), url
+    for url in blocked:
+        assert not fetcher._is_x_post_media_url(url), url
+
+
+def test_x_status_extracts_video_post_media(monkeypatch):
+    # 视频帖:og:video 指向 ext_tw_video mp4,封面是 ext_tw_video_thumb。
+    # 修复前视频资源被 /media/ 前缀过滤为空,并触发误导性的登录态文案。
+    html = """
+    <html><head>
+      <meta property="og:video"
+            content="https://video.twimg.com/ext_tw_video/1815696123456789012/pu/vid/avc1/720x1280/AbCdEf12345.mp4?tag=12">
+      <meta name="twitter:image"
+            content="https://pbs.twimg.com/ext_tw_video_thumb/1815696123456789012/pu/img/AbCdEf12345.jpg">
+    </head><body>
+      <img src="https://pbs.twimg.com/profile_images/123/avatar_400x400.jpg">
+    </body></html>
+    """
+
+    monkeypatch.setattr(fetcher, "assert_safe_url", lambda url: url)
+    monkeypatch.setattr(fetcher, "_render_with_httpx", lambda _url, **_kwargs: html)
+    monkeypatch.setattr(fetcher, "_render_with_playwright", lambda _url: None)
+
+    assets = fetcher.parse_url("https://x.com/i/status/2069410454028296307")
+
+    urls = {asset["url"] for asset in assets}
+    assert (
+        "https://video.twimg.com/ext_tw_video/1815696123456789012/pu/vid/avc1/720x1280/AbCdEf12345.mp4?tag=12"
+        in urls
+    )
+    video_assets = [asset for asset in assets if asset["type"] == "video"]
+    assert video_assets, assets
+    assert all("profile_images" not in asset["url"] for asset in assets)

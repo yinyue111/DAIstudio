@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException, Request
+from pydantic import BaseModel
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
@@ -15,6 +16,27 @@ from ..services import audit
 from .admin_helpers import page as _page
 
 router = APIRouter()
+
+
+class UserRoleIn(BaseModel):
+    """管理员提权 / 降权请求体。"""
+
+    is_admin: bool
+
+
+def _ensure_remaining_active_admin(db: Session, target: User) -> None:
+    """降权与停用共用的不变式：目标之外必须仍有至少一个可用管理员。"""
+    active_admin_count = db.execute(
+        select(func.count())
+        .select_from(User)
+        .where(
+            User.is_admin.is_(True),
+            User.status == "active",
+            User.id != target.id,
+        )
+    ).scalar_one()
+    if int(active_admin_count or 0) < 1:
+        raise HTTPException(400, "至少需要保留一个可用管理员账号")
 
 
 @router.get("/users", response_model=list[UserOut])
@@ -58,17 +80,7 @@ def set_user_status(
     if body.status == "disabled" and user.is_admin:
         if user.id == admin.id:
             raise HTTPException(400, "不能禁用当前管理员账号")
-        active_admin_count = db.execute(
-            select(func.count())
-            .select_from(User)
-            .where(
-                User.is_admin.is_(True),
-                User.status == "active",
-                User.id != user.id,
-            )
-        ).scalar_one()
-        if int(active_admin_count or 0) < 1:
-            raise HTTPException(400, "至少需要保留一个可用管理员账号")
+        _ensure_remaining_active_admin(db, user)
     if user.status != body.status:
         user.status = body.status
         user.token_version += 1
@@ -81,6 +93,46 @@ def set_user_status(
         biz_id=user_id,
         ip=get_client_ip(request) if request else None,
         detail={"status": body.status},
+    )
+    return {"ok": True}
+
+
+@router.patch("/users/{user_id}/role")
+def set_user_role(
+    user_id: int,
+    body: UserRoleIn,
+    db: Session = Depends(get_db),
+    admin: User = Depends(require_admin),
+    request: Request = None,
+):
+    """管理员提权 / 降权，护栏与停用逻辑保持一致。"""
+    user = db.get(User, user_id)
+    if not user:
+        raise HTTPException(404, "用户不存在")
+    was_admin = bool(user.is_admin)
+    wants_admin = bool(body.is_admin)
+    if was_admin and not wants_admin:
+        if user.id == admin.id:
+            raise HTTPException(400, "不能给当前管理员账号降权")
+        _ensure_remaining_active_admin(db, user)
+    if not was_admin and wants_admin and user.status != "active":
+        raise HTTPException(400, "只能给启用状态的用户提权")
+    if was_admin != wants_admin:
+        user.is_admin = wants_admin
+        user.token_version += 1  # 角色变化后强制重新登录，避免旧会话沿用旧角色
+    db.commit()
+    audit.log(
+        db,
+        user_id=admin.id,
+        action="set_user_role",
+        biz_type="admin",
+        biz_id=user_id,
+        ip=get_client_ip(request) if request else None,
+        detail={
+            "target_user_id": user_id,
+            "is_admin_before": was_admin,
+            "is_admin_after": wants_admin,
+        },
     )
     return {"ok": True}
 

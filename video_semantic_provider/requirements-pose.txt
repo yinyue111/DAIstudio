@@ -1,0 +1,15 @@
+# Optional pose estimation stack. Install INSTEAD OF requirements.txt when
+# VIDEO_SEMANTIC_POSE_ENABLED=true — do not combine the two files:
+# - mediapipe requires numpy<2 while the base stack pins numpy 2.x, so this
+#   file re-pins the whole set on a numpy 1.x baseline.
+# - mediapipe hard-depends on opencv-contrib-python (non-headless), which
+#   ships the same cv2 module; pinning opencv-python-headless alongside it
+#   would clobber files nondeterministically, so this file omits headless and
+#   the deployment image must provide libGL (e.g. apt-get install libgl1).
+# MediaPipe bundles its pose model weights in the pip package, so no external
+# model download is required.
+fastapi==0.137.1
+uvicorn[standard]==0.30.1
+Pillow==12.3.0
+numpy==1.26.4
+mediapipe==0.10.21

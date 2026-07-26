@@ -17,6 +17,7 @@ import shutil
 import subprocess
 import threading
 import time
+import unicodedata
 from collections.abc import Callable
 from copy import deepcopy
 from datetime import datetime, timezone
@@ -43,6 +44,13 @@ _REGION_PROVIDER_STATUSES = frozenset({"analyzed", "degraded", "unsupported"})
 _TESSERACT_LANGUAGE_RE = re.compile(r"^[A-Za-z0-9_-]{1,32}$", flags=re.ASCII)
 _MAX_TESSERACT_LANGUAGES = 8
 _MAX_TESSERACT_LANGUAGE_CHARS = 128
+# 与视频路径 (_MIN_VIDEO_OCR_CONFIDENCE=0.70) 对齐的图片 OCR 门控阈值。
+# 图片只有一帧、没有跨帧交叉验证，因此短碎片阈值 (视频为 0.85 且要求 ≥2 帧复现)
+# 在单帧场景收紧到 0.92，作为缺失跨帧佐证的补偿。
+_MIN_IMAGE_OCR_CONFIDENCE = 0.70
+_MIN_SHORT_IMAGE_OCR_CONFIDENCE = 0.92
+_VLM_ANALYZER_SOURCE = "vision_language_model"
+_VISIBLE_TEXT_RE = re.compile(r"[A-Za-z0-9\u3400-\u9fff]")
 
 
 def _status(
@@ -809,6 +817,216 @@ def merge_region_evidence(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return merged
 
 
+def _visible_characters(value: Any) -> str:
+    return "".join(_VISIBLE_TEXT_RE.findall(str(value or "")))
+
+
+def _normalized_match_text(value: Any) -> str:
+    """去掉空白、折叠变音符并 casefold，用于 OCR 与视觉模型文字声明的比对。
+
+    Tesseract 常把带变音符的拉丁文输出成纯 ASCII (Lumière → LUMIERE)，
+    比对时不应因此误判为冲突。
+    """
+    text = re.sub(r"\s+", "", str(value or ""))
+    decomposed = unicodedata.normalize("NFKD", text)
+    return "".join(
+        character for character in decomposed if not unicodedata.combining(character)
+    ).casefold()
+
+
+def _texts_match(left: Any, right: Any) -> bool:
+    normalized_left = _normalized_match_text(left)
+    normalized_right = _normalized_match_text(right)
+    if not normalized_left or not normalized_right:
+        return False
+    return (
+        normalized_left == normalized_right
+        or normalized_left in normalized_right
+        or normalized_right in normalized_left
+    )
+
+
+def _credible_image_ocr_row(row: dict[str, Any]) -> bool:
+    """单帧版的 ``_credible_video_ocr_track``：图片没有跨帧复现可依赖。
+
+    视频路径允许短碎片在 ``≥2`` 帧复现且置信度达标时放行；单图无法复现，
+    因此孤立单字符直接拒绝，短碎片必须达到更高的置信度阈值。
+    """
+    visible = _visible_characters(row.get("evidence_text"))
+    if not visible:
+        return False
+    try:
+        confidence = float(row.get("confidence") or 0)
+    except (TypeError, ValueError):
+        return False
+    if confidence < _MIN_IMAGE_OCR_CONFIDENCE:
+        return False
+    if len(visible) == 1:
+        return False
+    if re.fullmatch(r"[A-Za-z]{2}", visible) or re.fullmatch(r"[a-z]{3}", visible):
+        return confidence >= _MIN_SHORT_IMAGE_OCR_CONFIDENCE
+    return True
+
+
+def _bbox_overlap_ratio(left: dict[str, Any] | None, right: dict[str, Any] | None) -> float:
+    """交叠面积占较小区域的比例；OCR 词框通常远小于视觉模型的区域框。"""
+    if not isinstance(left, dict) or not isinstance(right, dict):
+        return 0.0
+    lx1, ly1 = float(left["x"]), float(left["y"])
+    rx1, ry1 = float(right["x"]), float(right["y"])
+    lx2, ly2 = lx1 + float(left["width"]), ly1 + float(left["height"])
+    rx2, ry2 = rx1 + float(right["width"]), ry1 + float(right["height"])
+    intersection = max(0.0, min(lx2, rx2) - max(lx1, rx1)) * max(
+        0.0, min(ly2, ry2) - max(ly1, ry1)
+    )
+    smaller = min((lx2 - lx1) * (ly2 - ly1), (rx2 - rx1) * (ry2 - ry1))
+    return intersection / smaller if smaller > 0 else 0.0
+
+
+def _ocr_candidates_for_claim(
+    claim: dict[str, Any],
+    ocr_rows: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    claim_bbox = _region_bbox(claim)
+    if claim_bbox is None:
+        return list(ocr_rows)
+    matched = [
+        row for row in ocr_rows
+        if _bbox_overlap_ratio(_region_bbox(row), claim_bbox) >= 0.3
+    ]
+    # 视觉模型的区域框可能画偏；有独立 OCR 检出时不因为框不准而误判成"无文字"。
+    return matched or list(ocr_rows)
+
+
+def _joined_ocr_text(rows: list[dict[str, Any]]) -> str:
+    def order(row: dict[str, Any]) -> tuple[float, float]:
+        bbox = _region_bbox(row) or {}
+        return float(bbox.get("y") or 0), float(bbox.get("x") or 0)
+
+    return " ".join(dict.fromkeys(
+        str(row.get("evidence_text") or "").strip()
+        for row in sorted(rows, key=order)
+        if str(row.get("evidence_text") or "").strip()
+    ))
+
+
+def apply_ocr_text_gate(
+    rows: list[dict[str, Any]],
+    ocr_statuses: list[dict[str, Any]] | None,
+) -> list[dict[str, Any]]:
+    """把视频路径的 OCR 强门控对齐到图片路径。
+
+    视频路径 (``video_evidence_analysis.attach_evidence_to_shots``) 会把视觉
+    模型的文字描述挪到 ``vlm_text_description``，并用独立 OCR 轨迹覆写
+    ``shot["ocr"]``。图片路径此前只在 ``merge_region_evidence`` 里标注冲突、
+    不拦截，导致视觉模型编造的"文字版式"直接进入最终结果。
+
+    对每条视觉模型的 ``evidence_type == "ocr"`` 证据：
+    - OCR 已分析且有可信检出、与描述一致 → ``confirmed``；
+    - OCR 已分析且有可信检出、与描述冲突 → 以 OCR 文本覆写 ``evidence_text``
+      (``overridden``)，原描述保留在 ``vlm_text_description``；
+    - OCR 已分析但只有低置信检出 → 保留描述并标注 ``low_confidence``，交人工复核；
+    - OCR 已分析且区域内完全无检出 → ``rejected``，``review_status`` 置为
+      ``rejected``，不再作为可见文字证据使用；
+    - OCR 不可用 (unsupported/degraded) → 保留描述并标注 ``unavailable``，
+      不因分析器缺席而清空内容 (避免复刻视频路径 action/transition 被
+      误杀的旧问题)。
+
+    所有分支都会在 ``ocr_gate`` 结构化字段里写明状态与中文原因，绝不静默替换。
+    """
+    status_by_source: dict[int, dict[str, Any]] = {}
+    for position, status_row in enumerate(ocr_statuses or [], start=1):
+        if isinstance(status_row, dict):
+            try:
+                source_index = int(status_row.get("source_index") or position)
+            except (TypeError, ValueError):
+                source_index = position
+            status_by_source[source_index] = status_row
+    gated = [dict(row) for row in rows]
+    ocr_rows_by_source: dict[int, list[dict[str, Any]]] = {}
+    for row in gated:
+        if (
+            row.get("evidence_type") == "ocr"
+            and row.get("analyzer_source") != _VLM_ANALYZER_SOURCE
+        ):
+            try:
+                source_index = int(row.get("source_index") or 1)
+            except (TypeError, ValueError):
+                continue
+            ocr_rows_by_source.setdefault(source_index, []).append(row)
+    for row in gated:
+        if (
+            row.get("analyzer_source") != _VLM_ANALYZER_SOURCE
+            or row.get("evidence_type") != "ocr"
+        ):
+            continue
+        try:
+            source_index = int(row.get("source_index") or 1)
+        except (TypeError, ValueError):
+            source_index = 1
+        claimed_text = str(row.get("evidence_text") or "").strip()
+        row["vlm_text_description"] = claimed_text or None
+        status_row = status_by_source.get(source_index) or {}
+        ocr_status = str(status_row.get("status") or "unsupported")
+        gate: dict[str, Any] = {
+            "analyzer": status_row.get("analyzer"),
+            "ocr_status": ocr_status,
+            "matched_evidence_ids": [],
+            "ocr_text": None,
+        }
+        if ocr_status != "analyzed":
+            degraded_reason = str(status_row.get("degraded_reason") or "分析器不可用")
+            gate["status"] = "unavailable"
+            gate["reason"] = (
+                f"OCR 不可用({degraded_reason})，无法交叉验证该文字描述，请人工复核"
+            )
+            row["ocr_gate"] = gate
+            continue
+        candidates = _ocr_candidates_for_claim(row, ocr_rows_by_source.get(source_index, []))
+        credible = [item for item in candidates if _credible_image_ocr_row(item)]
+        if credible:
+            matched = [
+                item for item in credible
+                if _texts_match(claimed_text, item.get("evidence_text"))
+            ]
+            if matched:
+                gate["status"] = "confirmed"
+                gate["reason"] = "OCR 已验证该文字描述与像素证据一致"
+                gate["matched_evidence_ids"] = sorted(
+                    str(item.get("evidence_id")) for item in matched
+                )
+                gate["ocr_text"] = _joined_ocr_text(matched)
+            else:
+                gate["status"] = "overridden"
+                gate["reason"] = "该描述与 OCR 结果冲突，已以 OCR 为准"
+                gate["matched_evidence_ids"] = sorted(
+                    str(item.get("evidence_id")) for item in credible
+                )
+                gate["ocr_text"] = _joined_ocr_text(credible)
+                row["evidence_text"] = gate["ocr_text"]
+        elif candidates:
+            weak_match = any(
+                _texts_match(claimed_text, item.get("evidence_text"))
+                for item in candidates
+            )
+            gate["status"] = "low_confidence"
+            gate["reason"] = (
+                "OCR 低置信检出与该描述一致，仅作弱验证，请人工复核"
+                if weak_match
+                else "OCR 仅有低置信检出且与该描述不一致，无法裁决，请人工复核"
+            )
+            gate["ocr_text"] = _joined_ocr_text(candidates) or None
+        else:
+            gate["status"] = "rejected"
+            gate["reason"] = (
+                "OCR 已分析该图片但未检出该文字，疑似视觉模型幻觉，已拦截，"
+                "不会作为可见文字证据使用"
+            )
+            row["review_status"] = "rejected"
+        row["ocr_gate"] = gate
+    return gated
+
+
 def analyze_image_sources(
     refs: list[str],
     *,
@@ -898,7 +1116,12 @@ def analyze_image_sources(
     return {
         "contract_version": CONTRACT_VERSION,
         "analyzers": analyzers,
-        "evidence": merge_region_evidence(evidence),
+        # 先做冲突标注(保留"曾与谁冲突"的审计记录)，再做 OCR 强门控，
+        # 与视频路径 attach_evidence_to_shots 的 OCR 覆写保持同等强度。
+        "evidence": apply_ocr_text_gate(
+            merge_region_evidence(evidence),
+            analyzers["ocr"],
+        ),
     }
 
 

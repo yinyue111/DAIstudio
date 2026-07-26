@@ -7,6 +7,7 @@ import {
   Copy,
   Eye,
   EyeOff,
+  Flame,
   GitBranch,
   ImageIcon,
   Pencil,
@@ -38,6 +39,18 @@ function previewText(recipe) {
     || recipe?.version?.payload?.reverse_result?.final_text
     || "",
   );
+}
+
+// 配方热度：后端 _serialize 聚合的 usage 统计（apply/clone/generation_* 埋点总数）。
+function usageSummary(recipe) {
+  const usage = recipe?.usage;
+  if (!usage || typeof usage.total !== "number") return null;
+  const derived = Number(usage.by_event?.clone || 0);
+  return {
+    total: Number(usage.total || 0),
+    uniqueUsers: Number(usage.unique_users || 0),
+    derived,
+  };
 }
 
 function visibilityLabel(recipe) {
@@ -130,6 +143,7 @@ export default function CreationRecipeCard({
   }
 
   const asset = recipeAsset(recipe);
+  const usage = usageSummary(recipe);
   const selected = versions.find((row) => row.version === selectedVersion)
     || (selectedVersion === recipe.current_version ? recipe.version : null);
 
@@ -218,6 +232,15 @@ export default function CreationRecipeCard({
         <div className="mt-2 flex flex-wrap items-center gap-x-2 gap-y-1 text-[11px] text-fog">
           <span>v{recipe.current_version}</span>
           {recipe.updated_at && <span>{formatLocalDateTime(recipe.updated_at)}</span>}
+          {usage && (
+            <span
+              className={`inline-flex items-center gap-1 ${usage.total > 0 ? "text-warn" : ""}`}
+              title={`累计使用 ${usage.total} 次 · ${usage.uniqueUsers} 人使用过${usage.derived ? ` · 被派生 ${usage.derived} 次` : ""}`}
+            >
+              <Flame size={11} aria-hidden="true" />
+              热度 {usage.total}
+            </span>
+          )}
           {recipe.version?.payload?.derived_from_recipe_id && (
             <span className="inline-flex items-center gap-1">
               <GitBranch size={11} aria-hidden="true" />

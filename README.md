@@ -30,7 +30,7 @@
 
 ## 业务流程
 
-1. 用户使用手机号和密码登录；注册需要手机号在白名单内。
+1. 用户使用手机号和密码注册、登录；自助注册默认开放。
 2. 用户粘贴参考链接或上传参考图片/视频。
 3. 平台抓取或保存素材，并生成可预览的参考资源。
 4. 用户选择参考素材，可执行提示词反推，也可以直接输入创作要求。
@@ -416,14 +416,16 @@ Docker Compose 部署时，在线升级配置同样写在 `backend/.env.producti
 3. 宿主机 oneshot/supervisor 再执行 `docker compose up -d --build migrate api worker worker_image worker_video worker_video_download worker_parse worker_reverse worker_workflow beat frontend`。
 4. 重启完成后先用 `https://dream.aiwuq.cn/api/live` 确认进程存活，再用 `https://dream.aiwuq.cn/api/ready` 确认 DB/Redis 就绪，最后检查容器状态和后台版本页。
 
-提示词反推异步化版本必须按以下顺序发布，不能把 API 或前端先于数据库迁移上线：
-
-1. 先运行 `migrate`，确认 Alembic 已到 `0035_async_reverse_operations`，旧同步接口仍可读写已有记录。
-2. 再发布 `api`，检查 `/api/live`、`/api/ready` 和 `/api/health` 均正常；此时旧前端仍可使用兼容接口。
-3. 然后发布独立的 `worker_reverse` 和 `beat`，确认 `reverse` 队列可消费、每分钟清理任务已注册，且 worker 使用线程池并发 2。
-4. 最后发布 `frontend`，完成图片反推、视频反推、封面确认、取消和刷新恢复的 mock 冒烟检查。
-
-若任一阶段失败，停止后续阶段；不要用强杀 worker 的方式回滚。已冻结但未完成的反推任务由补投和超时清理流程继续处理或退款。
+> **历史记录（已完成的一次性发布，勿再照此执行）**：以下是当年“提示词反推异步化”版本（Alembic `0035_async_reverse_operations`）的分阶段发布顺序，仅留档供类似的分阶段升级参考。当前迁移链头远在其后，正常部署直接 `alembic upgrade head` 全量发布即可。
+>
+> 提示词反推异步化版本当时必须按以下顺序发布，不能把 API 或前端先于数据库迁移上线：
+>
+> 1. 先运行 `migrate`，确认 Alembic 已到 `0035_async_reverse_operations`，旧同步接口仍可读写已有记录。
+> 2. 再发布 `api`，检查 `/api/live`、`/api/ready` 和 `/api/health` 均正常；此时旧前端仍可使用兼容接口。
+> 3. 然后发布独立的 `worker_reverse` 和 `beat`，确认 `reverse` 队列可消费、每分钟清理任务已注册，且 worker 使用线程池并发 2。
+> 4. 最后发布 `frontend`，完成图片反推、视频反推、封面确认、取消和刷新恢复的 mock 冒烟检查。
+>
+> 若任一阶段失败，停止后续阶段；不要用强杀 worker 的方式回滚。已冻结但未完成的反推任务由补投和超时清理流程继续处理或退款。
 
 如果暂时没有宿主机执行器，建议把 `ONLINE_UPDATE_APPLY_COMMAND` 留空：后台只允许查看远端版本和升级预检；检测到新版本时会拒绝直接合并代码，之后由运维在宿主机手动执行拉取、迁移和 Compose 生效。
 
@@ -468,7 +470,7 @@ git ls-remote --heads git@github.com:yinyue111/DAIstudio.git main
 
 ## 短信配置
 
-短信验证码默认关闭。管理员可在后台开启注册短信验证。
+自助注册默认开放，可通过 `REGISTRATION_ENABLED=false` 临时关闭。短信验证码默认关闭，管理员可在后台开启注册短信验证。
 
 当前实现支持：
 
@@ -508,6 +510,7 @@ SMS_TEMPLATE_CODE=<your-template-code>
 | `REDIS_MAX_CONNECTIONS` | API/Worker/Celery Redis 最大连接数 |
 | `REDIS_SOCKET_CONNECT_TIMEOUT_SECONDS` / `REDIS_SOCKET_TIMEOUT_SECONDS` | Redis 连接和读写超时 |
 | `JWT_SECRET` | 登录态签名密钥，生产必须强随机 |
+| `REGISTRATION_ENABLED` | 自助注册开关，默认 `true` |
 | `PUBLIC_BASE_URL` | 后端公开访问地址，用于媒体 URL |
 | `STORAGE_BACKEND` | 媒体存储后端：`local` 或 S3/MinIO 兼容的 `s3` |
 | `STORAGE_MIRROR_LOCAL` | S3 灰度期同时保留新对象的本地镜像，便于回滚 |

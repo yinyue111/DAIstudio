@@ -63,7 +63,11 @@ class BodyTooLargeError(Exception):
 
 
 class ProductEditionMiddleware:
-    """Return 404 for advanced public APIs excluded from launch_lite."""
+    """Return 404 for public API prefixes whose owning feature switch is off.
+
+    Resolution lives in services.product_edition: explicit FEATURE_*_ENABLED
+    settings win, otherwise PRODUCT_EDITION supplies the default.
+    """
 
     def __init__(self, app: ASGIApp):
         self.app = app

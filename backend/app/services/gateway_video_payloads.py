@@ -43,6 +43,7 @@ def generic_video_payload_params(params: dict, extra: dict, model_id: str = "") 
             "product_detail_images",
             "character_reference_image",
             "style_reference_image",
+            "source_video_url",
         }
         and not str(k).startswith("_")
         and v not in (None, "")
@@ -151,6 +152,24 @@ def generic_video_payload_params(params: dict, extra: dict, model_id: str = "") 
     style_field = extra.get("style_image_field", "style_reference_image")
     if style and style_field:
         payload_params[str(style_field)] = style
+    # 真·视频参考通道：管理员已声明 video_to_video 能力时，源视频 URL 必须
+    # 进入上游 payload。这里宁可显式报错，也不允许静默退化成"仅首帧"。
+    source_video = (params or {}).get("source_video_url")
+    if source_video:
+        video_field = extra.get("video_url_field", "video_url")
+        if not video_field:
+            raise ValueError(
+                "当前视频模型未配置源视频上游字段，无法提交视频参考生成；"
+                "请在模型 extra 中配置 video_url_field，或关闭该模型的视频参考能力"
+            )
+        video_field = str(video_field)
+        if video_field in payload_params:
+            raise ValueError("源视频与其他参考素材映射到了同一上游字段")
+        video_item_field = str(extra.get("video_url_item_field") or "").strip()
+        payload_params[video_field] = _reference_payload_value(
+            source_video,
+            video_item_field,
+        )
     return payload_params
 
 
@@ -293,6 +312,21 @@ def ark_content(prompt: str, params: dict) -> list:
         role_notes.append(f"图片{character_number}为人物身份参考，仅锁定同一人物身份")
     if role_notes:
         content[0]["text"] = f"{content[0]['text']}  图片角色：{'；'.join(role_notes)}。"
+    # 真·视频参考通道：源视频作为独立的 video_url 内容项发给 Ark。若上游不
+    # 支持该内容类型会显式返回错误，绝不允许静默退化成"仅首帧+提示词"。
+    source_video = params.get("source_video_url")
+    if source_video:
+        content.append(
+            {
+                "type": "video_url",
+                "video_url": {"url": source_video},
+                "role": "reference_video",
+            }
+        )
+        content[0]["text"] = (
+            f"{content[0]['text']}  参考视频：已附带源视频，"
+            "生成时须参考其运动轨迹、节奏与镜头运动。"
+        )
     return content
 
 

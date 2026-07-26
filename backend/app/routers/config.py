@@ -19,7 +19,7 @@ from ..services.config_store import (
 from ..services.generation_pricing import public_pricing_config
 from ..services.image_options import IMAGE_SIZES
 from ..services.model_gateway_config import runtime_config_for_model
-from ..services.product_edition import public_feature_flags
+from ..services.product_edition import is_launch_lite, public_feature_flags
 from ..services.reverse_capabilities import BATCH_CAPABILITIES
 from ..services.video_analysis import (
     DEFAULT_VIDEO_ANALYSIS_PRESET,
@@ -66,7 +66,7 @@ def get_config(db: Session = Depends(get_db), _: User = Depends(get_current_user
             "sms_auth_enabled": get_bool_setting(db, "sms_auth_enabled", False),
             "payment_enabled": (
                 get_bool_setting(db, "payment_enabled", False)
-                and settings.product_edition != "launch_lite"
+                and not is_launch_lite()
             ),
             **public_feature_flags(),
         },

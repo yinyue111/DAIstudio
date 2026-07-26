@@ -174,6 +174,16 @@ class Settings(BaseSettings):
     # private deployments where the whole proxy subnet is owned by the operator.
     allow_broad_trusted_proxy_cidr: bool = False
 
+    # --- Feature flags ---
+    # None = follow the PRODUCT_EDITION default policy for that feature;
+    # explicit true/false overrides the edition default per feature.
+    feature_projects_enabled: bool | None = None
+    feature_recipes_enabled: bool | None = None
+    feature_reverse_batch_enabled: bool | None = None
+    feature_video_composition_enabled: bool | None = None
+    feature_reproduction_assessment_enabled: bool | None = None
+    feature_tool_workflows_enabled: bool | None = None
+
     # --- Datastores ---
     database_url: str = "postgresql+psycopg2://postgres:postgres@localhost:5432/ai_studio"
     redis_url: str = "redis://localhost:6379/0"
@@ -195,6 +205,9 @@ class Settings(BaseSettings):
     jwt_algorithm: str = "HS256"
     jwt_expire_minutes: int = 60 * 24 * 7  # 7 days
     auth_cookie_name: str = "ai_studio_token"
+    # Self-service registration is open by default. Set false only when the
+    # operator needs to temporarily stop creating new accounts.
+    registration_enabled: bool = True
     # Browser auth uses the HttpOnly cookie. Keep bearer tokens out of login
     # responses in production unless an API-client deployment explicitly opts in.
     auth_bearer_response_enabled: bool = False
@@ -353,6 +366,25 @@ class Settings(BaseSettings):
     sms_http_api_key: str = ""
     sms_http_timeout_seconds: int = 10
 
+    # --- Media moderation (noop by default: no review is performed) ---
+    # noop | http. "http" is a generic moderation gateway skeleton: the media
+    # bytes are POSTed inline (bounded below) and the JSON response is mapped
+    # to allow/reject/review through the field paths and value lists below.
+    media_moderation_provider: str = "noop"
+    media_moderation_http_url: str = ""
+    media_moderation_http_api_key: str = ""
+    media_moderation_http_timeout_seconds: int = 10
+    # Media larger than this is not inlined to the moderation gateway.
+    media_moderation_http_max_inline_bytes: int = 10 * 1024 * 1024
+    # Dot-separated paths into the provider JSON response.
+    media_moderation_http_decision_field: str = "decision"
+    media_moderation_http_reason_field: str = "reason"
+    media_moderation_http_confidence_field: str = "confidence"
+    # Comma separated decision values mapped to each verdict.
+    media_moderation_http_allow_values: str = "allow,pass,ok"
+    media_moderation_http_reject_values: str = "reject,block,deny"
+    media_moderation_http_review_values: str = "review,suspect,manual"
+
     # --- Misc business rules ---
     parse_cache_minutes: int = 30
     user_gen_rate_per_hour: int = 60  # crude per-user generation rate limit
@@ -395,6 +427,10 @@ class Settings(BaseSettings):
     upload_processing_acquire_timeout_seconds: float = 10.0
     subject_protection_parallelism: int = 2
     max_upload_video_bytes: int = 512 * 1024 * 1024
+    # User-uploaded audio limits (distinct from audio_upload_max_bytes, which
+    # bounds what is sent to the transcription gateway).
+    max_upload_audio_bytes: int = 30 * 1024 * 1024
+    max_audio_seconds: int = 600
     user_upload_storage_quota_bytes: int = 2 * 1024 * 1024 * 1024
     payment_notify_max_body_bytes: int = 64 * 1024
     payment_order_rate_limit_per_hour: int = 20
@@ -436,6 +472,9 @@ class Settings(BaseSettings):
     payment_reconcile_interval_minutes: int = 10
     payment_reconcile_lookback_hours: int = 24
     payment_reconcile_max_orders: int = 50
+    # Channel refunds have never been verified against real merchant accounts.
+    # Keep this disabled until Alipay/WeChat refund flows pass live testing.
+    payment_refund_enabled: bool = False
     payment_frontend_base_url: str = "http://localhost:3000"
     payment_subject_prefix: str = "造梦 Studio 积分充值"
     # Used to encrypt payment merchant secrets stored from the admin UI. In
@@ -598,6 +637,21 @@ class Settings(BaseSettings):
         if normalized not in {"full", "launch_lite"}:
             raise ValueError("product_edition must be full or launch_lite")
         return normalized
+
+    @field_validator("media_moderation_provider")
+    @classmethod
+    def _validate_media_moderation_provider(cls, value: str) -> str:
+        normalized = str(value or "").strip().lower()
+        if normalized not in {"noop", "http"}:
+            raise ValueError("media_moderation_provider must be noop or http")
+        return normalized
+
+    @field_validator("media_moderation_http_timeout_seconds")
+    @classmethod
+    def _validate_media_moderation_http_timeout(cls, value: int) -> int:
+        if value < 1 or value > 120:
+            raise ValueError("media_moderation_http_timeout_seconds must be between 1 and 120")
+        return value
 
     @field_validator("generation_quote_ttl_seconds")
     @classmethod

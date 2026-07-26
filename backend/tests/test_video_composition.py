@@ -377,3 +377,124 @@ def test_video_composition_applies_crossfade_and_mixes_audio(client, make_user):
         assert result["manifest"]["audio_tracks"][0]["volume"] == 0.2
     finally:
         db.close()
+
+
+def _uploaded_audio(db, *, user_id: int, filename: str) -> str:
+    with tempfile.TemporaryDirectory() as temp_dir:
+        output = Path(temp_dir) / "bgm.m4a"
+        subprocess.run(
+            [
+                str(shutil.which("ffmpeg")),
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:duration=0.6:sample_rate=48000",
+                "-c:a",
+                "aac",
+                str(output),
+            ],
+            check=True,
+            capture_output=True,
+        )
+        payload = output.read_bytes()
+    key = storage.save_bytes(payload, "upload_audio", "m4a")
+    db.add(
+        UploadedAsset(
+            key=key,
+            user_id=user_id,
+            mime="audio/mp4",
+            duration=1,
+            bytes=len(payload),
+            original_filename=filename,
+        )
+    )
+    db.commit()
+    return user_assets.uploaded_asset_ref(key)
+
+
+@pytest.mark.skipif(not shutil.which("ffmpeg") or not shutil.which("ffprobe"), reason="ffmpeg required")
+def test_video_composition_accepts_uploaded_audio_asset_as_track(client, make_user, tiny_mp4):
+    """upload_audio/ 音频素材可直接作为混音音轨,无需借用含音轨的视频。"""
+    user_id = make_user("13900004005")
+    db = SessionLocal()
+    try:
+        shot_source = _uploaded_video(
+            db,
+            user_id=user_id,
+            payload=tiny_mp4,
+            filename="silent-shot.mp4",
+        )
+        audio_ref = _uploaded_audio(db, user_id=user_id, filename="bgm.m4a")
+        result = video_composition.compose_video(
+            db,
+            user_id=user_id,
+            payload={
+                "schema_version": "video-composition.v1",
+                "title": "audio-asset-track",
+                "canvas": {"width": 64, "height": 64, "fps": 24},
+                "shots": [
+                    {
+                        "shot_id": "shot-a",
+                        "asset_ref": shot_source,
+                        "duration_seconds": 0.4,
+                    }
+                ],
+                "audio_tracks": [
+                    {
+                        "asset_ref": audio_ref,
+                        "start_seconds": 0,
+                        "volume": 0.8,
+                        "loop": True,
+                    }
+                ],
+            },
+            client_request_id="video-composition-audio-asset-001",
+        )
+        asset = db.get(GenAsset, result["asset_id"])
+        output_key = storage.key_from_url(asset.hd_url)
+        metadata = video_frames.probe_media(str(storage.local_path(output_key)))
+        assert metadata["has_audio"] is True
+        assert result["manifest"]["audio_tracks"][0]["volume"] == 0.8
+    finally:
+        db.close()
+
+
+@pytest.mark.skipif(not shutil.which("ffmpeg") or not shutil.which("ffprobe"), reason="ffmpeg required")
+def test_video_composition_rejects_cross_owner_audio_track(client, make_user, tiny_mp4):
+    owner_id = make_user("13900004006")
+    intruder_id = make_user("13900004007")
+    db = SessionLocal()
+    try:
+        audio_ref = _uploaded_audio(db, user_id=owner_id, filename="private-bgm.m4a")
+        shot_source = _uploaded_video(
+            db,
+            user_id=intruder_id,
+            payload=tiny_mp4,
+            filename="intruder-shot.mp4",
+        )
+        with pytest.raises(video_composition.VideoCompositionError) as exc_info:
+            video_composition.compose_video(
+                db,
+                user_id=intruder_id,
+                payload={
+                    "schema_version": "video-composition.v1",
+                    "title": "cross-owner-audio",
+                    "canvas": {"width": 64, "height": 64, "fps": 24},
+                    "shots": [
+                        {
+                            "shot_id": "shot-a",
+                            "asset_ref": shot_source,
+                            "duration_seconds": 0.3,
+                        }
+                    ],
+                    "audio_tracks": [{"asset_ref": audio_ref}],
+                },
+                client_request_id="video-composition-cross-owner-audio-001",
+            )
+        assert exc_info.value.code == "VIDEO_COMPOSITION_ASSET_NOT_FOUND"
+    finally:
+        db.close()

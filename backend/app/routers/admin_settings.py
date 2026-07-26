@@ -10,7 +10,7 @@ from ..db import get_db
 from ..deps import get_client_ip, require_admin
 from ..models import AuditLog, User
 from ..schemas import AuditOut, SettingsIn
-from ..services import audit, payment_config, payments, sms
+from ..services import audit, content_safety_providers, payment_config, payments, sms
 from ..services.config_store import DEFAULT_SETTINGS, get_setting, set_settings
 from .admin_helpers import IMAGE_SIZE_RE as _IMAGE_SIZE_RE
 from .admin_helpers import page as _page
@@ -65,6 +65,10 @@ def put_settings(
         sms_issues = sms.readiness_issues()
         if sms_issues:
             raise HTTPException(400, "短信验证码注册未就绪: " + "; ".join(sms_issues))
+    if changed.get("media_moderation_enabled") is True:
+        moderation_issues = content_safety_providers.readiness_issues()
+        if moderation_issues:
+            raise HTTPException(400, "媒体机器审核未就绪: " + "; ".join(moderation_issues))
     if changed.get("payment_enabled") is True:
         payment_status = payment_config.export_public_status(db)
         ready = any(

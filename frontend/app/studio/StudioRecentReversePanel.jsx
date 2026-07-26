@@ -1,16 +1,41 @@
 "use client";
 
 import { Eye, History, RefreshCw, RotateCw, Save } from "lucide-react";
+import { useEffect, useState } from "react";
 import AssetMedia from "../../components/AssetMedia";
 
 const STATUS_LABELS = {
   queued: "排队中",
   running: "分析中",
-  needs_confirmation: "待确认",
+  needs_confirmation: "需要你确认",
   succeeded: "已完成",
   failed: "失败",
   canceled: "已取消",
 };
+
+// 与批量反推面板一致:待确认状态有 15 分钟 TTL,超时后端自动取消并退款,
+// 所以剩余时间必须实时可见,而不是一条静态状态文案。
+function useNowWhileConfirming(active) {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    if (!active) return undefined;
+    setNow(Date.now());
+    const timer = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(timer);
+  }, [active]);
+  return now;
+}
+
+function confirmationCountdownText(expiresAt, now) {
+  if (!expiresAt) return "";
+  const deadline = Date.parse(expiresAt);
+  if (!Number.isFinite(deadline)) return "";
+  const remaining = Math.max(0, Math.floor((deadline - now) / 1000));
+  if (remaining <= 0) return "已超时";
+  const minutes = String(Math.floor(remaining / 60)).padStart(2, "0");
+  const seconds = String(remaining % 60).padStart(2, "0");
+  return `剩余 ${minutes}:${seconds}`;
+}
 
 function operationAsset(operation) {
   const context = operation?.request_context || {};
@@ -40,6 +65,10 @@ export default function StudioRecentReversePanel({
   onSaveRecipe,
   recipesEnabled = true,
 }) {
+  const confirming = operations.some(
+    (operation) => operation?.status === "needs_confirmation" && operation?.confirmation_expires_at,
+  );
+  const now = useNowWhileConfirming(confirming);
   return (
     <section className="mt-3 border-t border-line pt-3" aria-labelledby="recent-reverse-title">
       <div className="flex items-center justify-between gap-3">
@@ -70,6 +99,9 @@ export default function StudioRecentReversePanel({
             const asset = operationAsset(operation);
             const busy = String(busyOperationId || "") === String(operation.id);
             const expired = Boolean(operation.expired || operation.error_code === "RESULT_EXPIRED");
+            const countdown = operation.status === "needs_confirmation"
+              ? confirmationCountdownText(operation.confirmation_expires_at, now)
+              : "";
             return (
               <li key={operation.id} className="flex min-w-0 items-center gap-2 py-2">
                 <div className="h-12 w-12 flex-none overflow-hidden rounded-lg border border-line bg-black/25">
@@ -81,6 +113,7 @@ export default function StudioRecentReversePanel({
                   </p>
                   <p className="mt-0.5 truncate text-[10px] text-fog">
                     {expired ? "结果已过期" : (STATUS_LABELS[operation.status] || operation.status)}
+                    {!expired && countdown ? ` · ${countdown}` : ""}
                     {operation.model_name ? ` · ${operation.model_name}` : ""}
                     {operation.cost_settled ? ` · ${operation.cost_settled} 积分` : ""}
                   </p>

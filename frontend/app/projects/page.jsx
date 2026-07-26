@@ -13,6 +13,7 @@ import { redirectOnAuthError, reportBackgroundError } from "../../lib/errorHandl
 import { saveStudioUserDraft } from "../../lib/studioSession";
 import { normalizeUnifiedAssetPage, unifiedAssetKey } from "../../lib/unifiedAssets";
 import AssetFolderPanel from "./AssetFolderPanel";
+import ProjectLinkPickerDialog from "./ProjectLinkPickerDialog";
 import ProjectList from "./ProjectList";
 import ProjectWorkspace from "./ProjectWorkspace";
 
@@ -46,6 +47,7 @@ function ProjectsPageContent() {
   const [assetRole, setAssetRole] = useState("source");
   const [folderName, setFolderName] = useState("");
   const [picker, setPicker] = useState("");
+  const [linkPicker, setLinkPicker] = useState("");
   const [draftText, setDraftText] = useState("");
   const [draftDirty, setDraftDirty] = useState(false);
   const [draftStatus, setDraftStatus] = useState("saved");
@@ -326,6 +328,35 @@ function ProjectsPageContent() {
     }
   }
 
+  async function confirmProjectLinks(selectedItems) {
+    if (!project || busy || !selectedItems.length) return;
+    setBusy("link-project-items");
+    try {
+      if (linkPicker === "tasks") {
+        // 后端按 task_kind 分组归集，选中多种任务时逐类提交（project_id 走路径参数）
+        const idsByKind = new Map();
+        for (const task of selectedItems) {
+          if (!idsByKind.has(task.kind)) idsByKind.set(task.kind, []);
+          idsByKind.get(task.kind).push(task.id);
+        }
+        let updated = null;
+        for (const [taskKind, taskIds] of idsByKind) {
+          updated = await api.addProjectTasks(project.id, taskKind, taskIds);
+        }
+        if (updated) publishProject(updated);
+        notify.success(`已加入 ${selectedItems.length} 个任务`);
+      } else if (linkPicker === "recipes") {
+        publishProject(await api.addProjectRecipes(project.id, selectedItems.map((item) => item.id)));
+        notify.success(`已加入 ${selectedItems.length} 个配方`);
+      }
+      setLinkPicker("");
+    } catch (linkError) {
+      notify.error(linkError.message || "加入项目失败");
+    } finally {
+      setBusy("");
+    }
+  }
+
   function changeDraft(value) {
     setDraftText(value);
     setDraftDirty(true);
@@ -370,6 +401,65 @@ function ProjectsPageContent() {
       notify.success("文件夹已删除，素材仍保留");
     } catch (deleteError) {
       notify.error(deleteError.message || "删除文件夹失败");
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function renameFolder(nextName) {
+    const trimmed = String(nextName || "").trim();
+    if (!folder || !trimmed || trimmed === folder.name || busy) return;
+    setBusy("rename-folder");
+    try {
+      const updated = await api.updateAssetFolder(folder.id, { name: trimmed });
+      setFolder(updated);
+      setFolders((current) => replaceById(current, updated));
+      notify.success("文件夹已重命名");
+    } catch (renameError) {
+      notify.error(renameError.message || "重命名文件夹失败");
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function moveFolderParent(parentId) {
+    if (!folder || busy || (folder.parent_id || null) === (parentId || null)) return;
+    setBusy("move-folder");
+    try {
+      const updated = await api.updateAssetFolder(
+        folder.id,
+        parentId ? { parent_id: parentId } : { move_to_root: true },
+      );
+      setFolder(updated);
+      setFolders(await api.assetFolders());
+      notify.success(parentId ? "文件夹已移动" : "文件夹已移到根目录");
+    } catch (moveError) {
+      notify.error(moveError.message || "移动文件夹失败");
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function reorderFolder(direction) {
+    if (!folder || busy) return;
+    const siblings = folders.filter((item) => (item.parent_id || null) === (folder.parent_id || null));
+    const index = siblings.findIndex((item) => item.id === folder.id);
+    const targetIndex = index + (direction === "up" ? -1 : 1);
+    if (index < 0 || targetIndex < 0 || targetIndex >= siblings.length) return;
+    const ordered = [...siblings];
+    [ordered[index], ordered[targetIndex]] = [ordered[targetIndex], ordered[index]];
+    setBusy("reorder-folder");
+    try {
+      // 按新顺序补齐同级 sort_order，只提交发生变化的文件夹
+      for (let position = 0; position < ordered.length; position += 1) {
+        if ((ordered[position].sort_order ?? 0) !== position) {
+          await api.updateAssetFolder(ordered[position].id, { sort_order: position });
+        }
+      }
+      setFolders(await api.assetFolders());
+      notify.success("文件夹顺序已更新");
+    } catch (reorderError) {
+      notify.error(reorderError.message || "调整文件夹顺序失败");
     } finally {
       setBusy("");
     }
@@ -459,6 +549,8 @@ function ProjectsPageContent() {
             onDraftChange={changeDraft}
             onAssetRoleChange={setAssetRole}
             onAddAssets={() => setPicker("project")}
+            onAddTasks={() => setLinkPicker("tasks")}
+            onAddRecipes={() => setLinkPicker("recipes")}
             onRemoveAsset={removeProjectAsset}
             onRemoveTask={removeProjectTask}
             onRemoveRecipe={removeProjectRecipe}
@@ -485,11 +577,24 @@ function ProjectsPageContent() {
               onSelect={selectFolder}
               onAddAssets={() => setPicker("folder")}
               onRemoveAsset={removeFolderAsset}
+              onRename={renameFolder}
+              onMoveParent={moveFolderParent}
+              onReorder={reorderFolder}
               onDelete={deleteFolder}
             />
           </div>
         </div>
       </main>
+      <ProjectLinkPickerDialog
+        open={Boolean(linkPicker)}
+        mode={linkPicker || "tasks"}
+        busy={Boolean(busy)}
+        excludedKeys={linkPicker === "tasks"
+          ? (project?.tasks || []).map((task) => `${task.task_kind}:${task.task_id}`)
+          : (project?.recipes || []).map((recipe) => `recipe:${recipe.recipe_id}`)}
+        onClose={() => setLinkPicker("")}
+        onConfirm={confirmProjectLinks}
+      />
       <AssetPickerDialog
         open={Boolean(picker)}
         role={picker === "project" ? "project_assets" : "folder_assets"}

@@ -14,6 +14,8 @@ DEFAULT_SETTINGS = {
     "navigation_states": {},
     "content_safety_enabled": False,
     "content_safety_banned_terms": "",
+    "media_moderation_enabled": False,
+    "media_moderation_fail_open": False,
     "image_n": 1,
     "image_size": "1024x1024",
     "asset_retention_days": 30,
