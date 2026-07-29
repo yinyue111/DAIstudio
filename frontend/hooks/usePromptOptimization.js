@@ -26,7 +26,6 @@ export default function usePromptOptimization({
   subjectMode,
   productGenerationMode,
   prompt,
-  promptDirty,
   vDuration,
   ratio,
   vResolution,
@@ -65,7 +64,7 @@ export default function usePromptOptimization({
   const setting = settings[creationMode] || DEFAULT_SETTING;
   const proposal = proposals[creationMode] || null;
   const optimizing = optimizingPromptMode === creationMode;
-  const ready = Boolean(String(prompt || "").trim() && promptDirty);
+  const ready = Boolean(String(prompt || "").trim());
   const context = {
     creationMode,
     category,
@@ -123,25 +122,17 @@ export default function usePromptOptimization({
   function requestOptions({
     direction = setting.direction,
     duration = category === "video" ? Number(vDuration) : undefined,
+    promptText = String(prompt || "").trim(),
   } = {}) {
-    const operation = reverseOperationForPendingResult();
-    const lineage = operation?.id && reverseAppliedRevisionId
-      ? {
-          reverse_operation_id: Number(operation.id),
-          reverse_revision_id: Number(reverseAppliedRevisionId),
-        }
-      : null;
     return {
-      ...(lineage || {
-        prompt: String(prompt || "").trim(),
-        category,
-        product_mode: productGenerationMode,
-        duration: category === "video"
-          ? Math.max(1, Math.round(Number(duration) || Number(vDuration) || 1))
-          : undefined,
-        aspect_ratio: category === "video" ? ratio : undefined,
-        resolution: category === "video" ? vResolution : undefined,
-      }),
+      prompt: String(promptText || "").trim(),
+      category,
+      product_mode: productGenerationMode,
+      duration: category === "video"
+        ? Math.max(1, Math.round(Number(duration) || Number(vDuration) || 1))
+        : undefined,
+      aspect_ratio: category === "video" ? ratio : undefined,
+      resolution: category === "video" ? vResolution : undefined,
       mode: direction,
       target_language: setting.targetLanguage,
       optimizer_model_config_id: selectedPromptModelConfigId || undefined,
@@ -151,52 +142,66 @@ export default function usePromptOptimization({
 
   async function optimize() {
     const source = String(prompt || "").trim();
-    if (!source || !promptDirty || optimizing) return;
+    if (!source || optimizing) return;
     const mode = creationMode;
     const requestId = (requestRef.current[mode] || 0) + 1;
     requestRef.current[mode] = requestId;
     const request = { id: requestId, contextKey: currentContextKey };
     setOptimizingPromptMode(mode);
     try {
-      const optimizationRequest = requestOptions();
-      const actionRequestId = pendingStudioActionRequestId(
-        studioActionPendingRequestRef,
-        `prompt-optimization:${me?.id || "unknown"}:${mode}`,
-        optimizationRequest,
-      );
-      const executableRequest = {
-        ...optimizationRequest,
-        idempotency_key: actionRequestId,
-      };
+      const optimizationRequest = requestOptions({ promptText: source });
       const compileOnly = ["model_adaptation", "target_model_adaptation"]
         .includes(String(optimizationRequest.mode || ""));
       const requiresQuote = !compileOnly && (
         selectedPromptModel == null || Number(selectedPromptModel.cost_credits || 0) > 0
       );
       let result;
-      if (requiresQuote) {
-        const confirmation = await requestQuoteConfirmation({
-          kind: "prompt_optimization",
-          request: executableRequest,
-          clientRequestId: actionRequestId,
-          execute: ({ request: confirmedRequest }) => (
-            api.createStudioPromptOptimization(confirmedRequest)
-          ),
-        });
-        if (confirmation.status !== "executed") {
-          if (["quote_failed", "execution_failed"].includes(confirmation.status)) {
-            throw confirmation.error || new Error("提示词优化执行失败。");
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        const actionRequestId = pendingStudioActionRequestId(
+          studioActionPendingRequestRef,
+          `prompt-optimization:${me?.id || "unknown"}:${mode}`,
+          optimizationRequest,
+        );
+        const executableRequest = {
+          ...optimizationRequest,
+          idempotency_key: actionRequestId,
+        };
+        try {
+          if (requiresQuote) {
+            const confirmation = await requestQuoteConfirmation({
+              kind: "prompt_optimization",
+              request: executableRequest,
+              clientRequestId: actionRequestId,
+              execute: ({ request: confirmedRequest }) => (
+                api.createStudioPromptOptimization(confirmedRequest)
+              ),
+            });
+            if (confirmation.status !== "executed") {
+              if (["quote_failed", "execution_failed"].includes(confirmation.status)) {
+                throw confirmation.error || new Error("提示词优化执行失败。");
+              }
+              clearPendingStudioActionRequest(studioActionPendingRequestRef, actionRequestId);
+              if (confirmation.status === "invalidated") {
+                setMsg(confirmation.reason || "参数已变化，请重新执行提示词优化。");
+              }
+              return;
+            }
+            result = confirmation.result;
+          } else {
+            result = await api.createStudioPromptOptimization(executableRequest);
           }
-          if (confirmation.status === "invalidated") {
-            setMsg(confirmation.reason || "参数已变化，请重新执行提示词优化。");
+          clearPendingStudioActionRequest(studioActionPendingRequestRef, actionRequestId);
+          break;
+        } catch (error) {
+          const failedAndRefunded = Number(error?.status) === 409
+            && errorMessage(error, "").includes("已失败并退款");
+          if (failedAndRefunded || Number.isFinite(Number(error?.status))) {
+            clearPendingStudioActionRequest(studioActionPendingRequestRef, actionRequestId);
           }
-          return;
+          if (failedAndRefunded && attempt === 0) continue;
+          throw error;
         }
-        result = confirmation.result;
-      } else {
-        result = await api.createStudioPromptOptimization(executableRequest);
       }
-      clearPendingStudioActionRequest(studioActionPendingRequestRef, actionRequestId);
       if (!isPromptOptimizationResultCurrent(
         request,
         requestRef.current[mode],
