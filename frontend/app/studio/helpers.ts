@@ -67,7 +67,7 @@ function stripUncertainVisualSentences(value) {
     const delimiter = String(chunks[index + 1] || "");
     if (
       sentence
-      && !/(?:不确定|无法确认|无法判断|证据不足|未见|未识别|看不清|不清晰|疑似|猜测|推测|可能)/i.test(sentence)
+      && !/(?:不确定|无法确认|无法判断|证据不足|未见|未识别|看不清|不清晰|疑似|(?<!不)猜测|(?<!不)推测|(?<!尽)可能(?!性)|possibly|maybe|unclear|might)/i.test(sentence)
     ) {
       direct.push(`${sentence}${delimiter}`);
     }
@@ -274,7 +274,235 @@ export function visualStructuredFields(structured, target = "image") {
   );
 }
 
-const VIDEO_EVIDENCE_SHOT_FIELDS = ["visual", "action", "camera", "lighting", "transition"];
+const VIDEO_EVIDENCE_SHOT_FIELDS = [
+  "visual", "subject_tracking", "pose", "action", "camera", "lighting", "transition", "ocr", "audio_cue",
+];
+const VIDEO_DRAFT_SHOT_LABELS = {
+  visual: "画面",
+  subject_tracking: "主体追踪",
+  pose: "姿态",
+  action: "动作",
+  camera: "运镜",
+  lighting: "光线",
+  transition: "转场",
+  ocr: "画面文字",
+  audio_cue: "声音",
+};
+
+const VIDEO_GENERATION_OUTPUT_SPEC_RE = /(?:输出规格|视频规格|生成规格|源视频规格)\s*[:：]\s*[^\n；;。]*/gi;
+const VIDEO_GENERATION_RESOLUTION_RE = /(^|\D)\d{3,4}\s*[x×]\s*\d{3,4}(?!\d)/gi;
+const VIDEO_GENERATION_RATIO_RE = /(^|\D)\d{1,2}\s*:\s*\d{1,2}(?!\d)\s*(?:画幅|比例|竖版|横版)?/gi;
+const VIDEO_GENERATION_TIMESTAMP_LIST_RE = /(?:在|于)\s*(?:约\s*)?\d+(?:\.\d+)?\s*(?:秒|s)(?:\s*[、,，]\s*\d+(?:\.\d+)?\s*(?:秒|s))*\s*(?:等)?\s*/gi;
+const VIDEO_GENERATION_TIME_RANGE_RE = /(^|\D)\d+(?:\.\d+)?\s*(?:-|–|—|~|至|到)\s*\d+(?:\.\d+)?\s*(?:秒|s)(?![A-Za-z])/gi;
+const VIDEO_GENERATION_RUNTIME_RE = /(?:总时长|视频时长|成片时长|全片时长|片长|建议生成)\s*(?:为|约|建议)?\s*\d+(?:\.\d+)?\s*(?:秒钟?|seconds?|secs?|s)(?![A-Za-z])|\d+(?:\.\d+)?\s*秒钟?\s*(?=(?:视频|广告|短片|成片))/gi;
+const VIDEO_GENERATION_RELATIVE_SECONDS_RE = /前\s*\d+(?:\.\d+)?\s*秒(?:内)?|\d+(?:\.\d+)?\s*秒(?:钟)?后|(?:持续|停留)\s*(?:约\s*)?\d+(?:\.\d+)?\s*秒(?:钟)?/gi;
+const VIDEO_GENERATION_EXACT_BPM_RE = /(?:节拍(?:约|为)?\s*)?\d+(?:\.\d+)?\s*BPM/gi;
+const VIDEO_GENERATION_UNCLASSIFIED_TRANSIENT_RE = /(?:检测到\s*)?\d+\s*个?\s*未分类瞬态声|未分类瞬态声/gi;
+const VIDEO_GENERATION_RAW_AUDIO_SIGNAL_RE = /检测到节拍点|节拍点秒数\s*=\s*[^；;。\n]+|持续音乐可能性不确定|未检测到明显持续音乐/gi;
+const LEGACY_VIDEO_GENERATION_PARAMETER_RE = /(?:输出规格|视频规格|生成规格|源视频规格)\s*[:：]|\d{3,4}\s*[x×]\s*\d{3,4}|\d{1,2}\s*:\s*\d{1,2}|\d+(?:\.\d+)?\s*(?:秒钟?|seconds?|secs?)|镜头\d+\s*[（(][^）)]*[）)]|\d+(?:\.\d+)?\s*BPM|未分类瞬态声/i;
+
+export function normalizeLegacyVideoGenerationPrompt(value) {
+  let text = String(value || "")
+    .replace(
+      /^\s*(?:输出规格|视频规格|生成规格|源视频规格)\s*[:：][^\n]*(?:\n|$)/gim,
+      "",
+    )
+    .replace(
+      /(镜头\d+)\s*[（(]\s*\d+(?:\.\d+)?\s*(?:-|–|—|~|至|到)\s*\d+(?:\.\d+)?\s*(?:秒|s)\s*[）)]\s*[:：]?/gi,
+      "$1：",
+    )
+    .replace(VIDEO_GENERATION_TIMESTAMP_LIST_RE, "");
+  text = stripNonExecutableAudioSignals(text)
+    .replace(VIDEO_GENERATION_OUTPUT_SPEC_RE, "")
+    .replace(VIDEO_GENERATION_RESOLUTION_RE, "$1")
+    .replace(VIDEO_GENERATION_RATIO_RE, "$1")
+    .replace(VIDEO_GENERATION_TIME_RANGE_RE, "$1")
+    .replace(VIDEO_GENERATION_RUNTIME_RE, "")
+    .replace(VIDEO_GENERATION_RELATIVE_SECONDS_RE, (token) => {
+      if (token.trimStart().startsWith("前")) return "开场";
+      if (/后\s*$/.test(token)) return "随后";
+      return "";
+    });
+  return text
+    .replace(/([,，;；、])(?:\s*[,，;；、])+/g, "$1")
+    .replace(/[ \t]+\n/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .replace(/^[ \t,，;；、。]+|[ \t,，;；、。]+$/g, "")
+    .trim();
+}
+
+function cleanVideoGenerationValue(value) {
+  let text = cleanVisualStructuredValue(value);
+  text = text.replace(VIDEO_GENERATION_OUTPUT_SPEC_RE, "");
+  text = text.replace(VIDEO_GENERATION_RESOLUTION_RE, "$1");
+  text = text.replace(VIDEO_GENERATION_RATIO_RE, "$1");
+  text = text.replace(VIDEO_GENERATION_TIMESTAMP_LIST_RE, "");
+  text = text.replace(VIDEO_GENERATION_TIME_RANGE_RE, "$1");
+  text = text.replace(VIDEO_GENERATION_RUNTIME_RE, "");
+  text = text.replace(VIDEO_GENERATION_RELATIVE_SECONDS_RE, (token) => {
+    if (token.trimStart().startsWith("前")) return "开场";
+    if (/后\s*$/.test(token)) return "随后";
+    return "";
+  });
+  return text
+    .replace(/([,，;；、])(?:\s*[,，;；、])+/g, "$1")
+    .replace(/\s+/g, " ")
+    .replace(/^[\s,，;；。、]+|[\s,，;；。、]+$/g, "");
+}
+
+function stripNonExecutableAudioSignals(value) {
+  return String(value || "")
+    .replace(/检测到持续音乐可能性较高/gi, "持续背景音乐")
+    .replace(VIDEO_GENERATION_EXACT_BPM_RE, "")
+    .replace(VIDEO_GENERATION_UNCLASSIFIED_TRANSIENT_RE, "")
+    .replace(VIDEO_GENERATION_RAW_AUDIO_SIGNAL_RE, "")
+    .replace(/([,，;；、])(?:\s*[,，;；、])+/g, "$1")
+    .replace(/(^|[；;\n])\s*(?:声音|音效)\s*[:：][ \t,，;；。、]*(?=[；;\n]|$)/g, "$1")
+    .replace(/^[\s,，;；。、]+|[\s,，;；。、]+$/g, "");
+}
+
+function cleanVideoGenerationAudioValue(value) {
+  return stripNonExecutableAudioSignals(cleanVideoGenerationValue(value));
+}
+const VIDEO_DRAFT_FIELD_LABELS = {
+  主体: "主体",
+  人像意图: "人物",
+  人物比例: "人物比例",
+  身材体态: "体态",
+  体态线条: "体态线条",
+  服装结构: "服装",
+  服装覆盖: "服装覆盖",
+  妆发五官: "妆发",
+  商品服装: "产品/服装",
+  细节特征: "关键细节",
+  场景背景: "场景",
+  广告目标: "叙事目标",
+  风格: "风格",
+  视角构图: "构图",
+  光线: "光线",
+  色调配色: "配色",
+  材质纹理: "材质",
+  氛围情绪: "氛围",
+  一致性约束: "连续性约束",
+  字幕卖点: "画面字幕",
+  旁白: "旁白/对白",
+  音效: "声音",
+};
+
+function composeCanonicalVideoDraft(
+  initialParts,
+  structured,
+  videoAnalysis,
+  { excludeReferenceIdentity = false, includePostProduction = true } = {},
+) {
+  const parts = [...initialParts].filter(Boolean);
+  const source = videoAnalysis?.source && typeof videoAnalysis.source === "object"
+    ? videoAnalysis.source
+    : {};
+  const shots = Array.isArray(videoAnalysis?.shots) ? videoAnalysis.shots : [];
+  const sourceDuration = Math.max(
+    Number(source.duration_seconds) || 0,
+    ...shots.map((shot) => Number(shot?.end_seconds) || 0),
+  );
+  if (shots.length > 3) {
+    parts.push(
+      `复刻执行：参考片含 ${shots.length} 个高密度剪辑镜头；建议逐镜独立生成，单镜含多步动作或内部硬切时再按一段一个主动作/可见结果拆分，最后按原镜头顺序剪辑。`,
+    );
+  } else if (sourceDuration > MAX_VIDEO_DURATION_SECONDS) {
+    parts.push("复刻执行：参考片时间线较长，建议逐镜分别生成后按顺序合成，不压缩、不省略原镜头。");
+  }
+  const frameTimes = new Map(
+    (Array.isArray(videoAnalysis?.sampled_frames) ? videoAnalysis.sampled_frames : [])
+      .map((frame) => [Number(frame?.index), Number(frame?.timestamp_seconds)])
+      .filter(([index, timestamp]) => Number.isInteger(index) && Number.isFinite(timestamp)),
+  );
+  for (let index = 0; index < shots.length; index += 1) {
+    const shot = shots[index];
+    if (!shot || typeof shot !== "object") continue;
+    const confidence = Number(shot.confidence);
+    const evidenceIndices = Array.isArray(shot.evidence_frame_indices)
+      ? [...new Set(shot.evidence_frame_indices.map(Number))].filter((value) => frameTimes.has(value))
+      : [];
+    if (!evidenceIndices.length || !Number.isFinite(confidence) || confidence <= 0) continue;
+    const hasCrossFrameEvidence = new Set(evidenceIndices.map((value) => frameTimes.get(value))).size >= 2;
+    const allowedFields = (
+      hasCrossFrameEvidence
+        ? VIDEO_EVIDENCE_SHOT_FIELDS
+        : ["visual", "lighting", "ocr", "audio_cue"]
+    ).filter((key) => includePostProduction || !["ocr", "audio_cue"].includes(key));
+    const details = allowedFields
+      .map((key) => {
+        const value = key === "audio_cue"
+          ? cleanVideoGenerationAudioValue(shot[key])
+          : cleanVideoGenerationValue(shot[key]);
+        if (!value || (excludeReferenceIdentity && hasReferenceIdentityLeak(value, structured))) return "";
+        return `${VIDEO_DRAFT_SHOT_LABELS[key]}：${value}`;
+      })
+      .filter(Boolean);
+    if (!details.length) continue;
+    const segmentIndex = Number(shot.source_segment_index);
+    const segment = Number.isInteger(segmentIndex) && segmentIndex > 0 ? `片段${segmentIndex} ` : "";
+    parts.push(`${segment}镜头${index + 1}：${[...new Set(details)].join("；")}`);
+  }
+  return [...new Set(parts)].join("\n").trim();
+}
+
+export function composeEvidenceBackedVideoGenerationDraft(
+  structured,
+  videoAnalysis = null,
+  providerFinalText = "",
+) {
+  const visual = visualStructuredFields(structured, "video");
+  const parts = visualStructuredFieldOrder("video")
+    .map((key) => {
+      const value = cleanVideoGenerationValue(visual[key]);
+      return value ? `${VIDEO_DRAFT_FIELD_LABELS[key] || key}：${value}` : "";
+    })
+    .filter(Boolean);
+  for (const key of ["字幕卖点", "旁白", "音效"]) {
+    const value = key === "音效"
+      ? cleanVideoGenerationAudioValue(structured?.[key])
+      : cleanVideoGenerationValue(structured?.[key]);
+    if (value) parts.push(`${VIDEO_DRAFT_FIELD_LABELS[key]}：${value}`);
+  }
+  const draft = composeCanonicalVideoDraft(parts, structured, videoAnalysis);
+  if (draft.includes("镜头")) return draft;
+  const providerNarrative = cleanVideoGenerationAudioValue(providerFinalText);
+  return [...new Set([draft, providerNarrative].filter(Boolean))].join("\n").trim();
+}
+
+export function withEvidenceBackedVideoGenerationDraft(result, target = "video") {
+  if (target !== "video" || !result || typeof result !== "object") return result;
+  const structured = result.structured && typeof result.structured === "object"
+    ? result.structured
+    : {};
+  const storedAnalysis = result.video_analysis && typeof result.video_analysis === "object"
+    ? result.video_analysis
+    : {};
+  const videoAnalysis = Array.isArray(storedAnalysis.shots)
+    ? storedAnalysis
+    : { ...storedAnalysis, shots: Array.isArray(result.shots) ? result.shots : [] };
+  const draft = composeEvidenceBackedVideoGenerationDraft(
+    structured,
+    videoAnalysis,
+    result.provider_final_text,
+  );
+  const storedFinalText = String(result.final_text || "").trim();
+  const normalizedStoredFinalText = normalizeLegacyVideoGenerationPrompt(storedFinalText);
+  const hasLegacyParameters = LEGACY_VIDEO_GENERATION_PARAMETER_RE.test(storedFinalText);
+  const hasRebuiltShots = /(?:^|\n)(?:片段\d+\s*)?镜头\d+：/.test(draft);
+  const useDraft = Boolean(
+    draft
+    && (
+      draft.length > normalizedStoredFinalText.length
+      || (hasLegacyParameters && hasRebuiltShots)
+    )
+  );
+  const finalText = useDraft ? draft : normalizedStoredFinalText;
+  return finalText && finalText !== storedFinalText
+    ? { ...result, final_text: finalText }
+    : result;
+}
 
 function videoSubjectTransferRules(subject = "") {
   if (subject === "product") {
@@ -309,50 +537,10 @@ export function composeEvidenceBackedVideoTransferPrompt(
       .map((key) => cleanVisualStructuredValue(staticStructured[key]))
       .filter(Boolean),
   ].filter(Boolean);
-  const shots = Array.isArray(videoAnalysis?.shots) ? videoAnalysis.shots : [];
-  const compressLongVideo = shots.some((shot) => (
-    Number.isFinite(Number(shot?.end_seconds))
-    && Number(shot?.end_seconds) > MAX_VIDEO_DURATION_SECONDS
-  ));
-  const frameTimes = new Map(
-    (Array.isArray(videoAnalysis?.sampled_frames) ? videoAnalysis.sampled_frames : [])
-      .map((frame) => [Number(frame?.index), Number(frame?.timestamp_seconds)])
-      .filter(([index, timestamp]) => Number.isInteger(index) && Number.isFinite(timestamp)),
-  );
-  for (let index = 0; index < shots.length; index += 1) {
-    const shot = shots[index];
-    if (!shot || typeof shot !== "object") continue;
-    const confidence = Number(shot.confidence);
-    const evidenceIndices = Array.isArray(shot.evidence_frame_indices)
-      ? [...new Set(shot.evidence_frame_indices.map(Number))].filter((value) => frameTimes.has(value))
-      : [];
-    if (!evidenceIndices.length || !Number.isFinite(confidence) || confidence <= 0) continue;
-    const hasCrossFrameEvidence = new Set(
-      evidenceIndices.map((value) => frameTimes.get(value)),
-    ).size >= 2;
-    const allowedShotFields = hasCrossFrameEvidence
-      ? VIDEO_EVIDENCE_SHOT_FIELDS
-      : ["visual", "lighting"];
-    const details = allowedShotFields
-      .map((key) => cleanVisualStructuredValue(shot[key]))
-      .filter((value) => value && !hasReferenceIdentityLeak(value, structured));
-    const uniqueDetails = [...new Set(details)];
-    if (!uniqueDetails.length) continue;
-    const start = Number(shot.start_seconds);
-    const end = Number(shot.end_seconds);
-    const range = !compressLongVideo && Number.isFinite(start) && Number.isFinite(end) && end >= start
-      ? `（${start.toFixed(3)}-${end.toFixed(3)}秒）`
-      : "";
-    const segmentIndex = Number(shot.source_segment_index);
-    const segment = Number.isInteger(segmentIndex) && segmentIndex > 0
-      ? `片段${segmentIndex} `
-      : "";
-    parts.push(`${segment}镜头${index + 1}${range}：${uniqueDetails.join("，")}`);
-  }
-  if (compressLongVideo && parts.length) {
-    parts.splice(videoSubjectTransferRules(subject).length, 0, "按原镜头顺序压缩为15秒内核心版");
-  }
-  return compactVisualPrompt([...new Set(parts)], "video");
+  return composeCanonicalVideoDraft(parts, structured, videoAnalysis, {
+    excludeReferenceIdentity: true,
+    includePostProduction: false,
+  });
 }
 
 export function isStructuredPortrait(structured) {

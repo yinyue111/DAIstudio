@@ -1544,6 +1544,42 @@ def test_keyframe_sampling_preset_uses_downloaded_duration(monkeypatch):
     assert len(stamps) == 14
 
 
+def test_fine_sampling_gives_each_detected_short_shot_three_frames(monkeypatch, tmp_path):
+    monkeypatch.setattr(video_frames, "probe_media", lambda *_args: {
+        "width": 608,
+        "height": 1080,
+        "duration_seconds": 10.054,
+        "fps": 24.0,
+        "has_audio": True,
+    })
+    monkeypatch.setattr(
+        video_frames,
+        "_scene_change_timestamps",
+        lambda *_args: [1.25, 2.75, 5.583, 6.375, 7.542, 8.375],
+    )
+
+    def fake_grab(_src, timestamp, destination):
+        with open(destination, "wb") as output:
+            output.write(f"frame-{timestamp}".encode())
+        return timestamp
+
+    monkeypatch.setattr(video_frames, "_grab_frame_with_backoff", fake_grab)
+    source = tmp_path / "washcloth.mp4"
+    source.write_bytes(b"video")
+
+    sample = video_frames._sample_video_from_file(
+        str(source),
+        n=36,
+        preset="fine",
+    )
+
+    counts: dict[int, int] = {}
+    for frame in sample.frames:
+        counts[frame.detected_shot_index] = counts.get(frame.detected_shot_index, 0) + 1
+    assert len(sample.frames) == 21
+    assert counts == {index: 3 for index in range(1, 8)}
+
+
 def test_keyframe_sampling_backs_off_when_container_tail_has_no_decodable_frame(monkeypatch):
     monkeypatch.setattr(video_frames, "FFMPEG", "/usr/bin/ffmpeg")
     monkeypatch.setattr(video_frames, "probe_media", lambda _path: {})

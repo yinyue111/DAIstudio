@@ -69,9 +69,11 @@ def _shot(**overrides):
 
 def _gate(shot_out, field):
     gate = shot_out["evidence_gate"]
-    assert set(gate) == {"action", "camera", "transition"}
+    assert set(gate) == {"subject_tracking", "pose", "action", "camera", "transition"}
     entry = gate[field]
-    assert set(entry) == {"verified", "confidence", "score", "source", "reason"}
+    assert set(entry) == {
+        "verified", "claim_type", "level", "confidence", "score", "source", "reason",
+    }
     return entry
 
 
@@ -141,6 +143,36 @@ class TestCameraLabelReconciliation:
         assert entry["verified"] is False
         assert entry["confidence"] == "vlm_only"
         assert "置信度过低" in entry["reason"]
+
+    def test_subject_motion_does_not_override_locked_camera(self):
+        summary = _camera_summary("pan", confidence=0.95, direction="left")
+        summary["background_motion_confidence"] = 0.18
+        summary["subject_motion_confidence"] = 0.82
+        shot = self._camera_shot("固定机位", summary)
+
+        out = constrain_video_shots_to_evidence([shot])[0]
+
+        assert out["camera"] == "固定机位"
+        entry = _gate(out, "camera")
+        assert entry["verified"] is False
+        assert entry["confidence"] == "vlm_only"
+        assert entry["source"] == "cross_frame_vlm"
+        assert "主体运动" in entry["reason"]
+
+    def test_ambiguous_pan_zoom_does_not_override_locked_camera(self):
+        summary = _camera_summary("pan", confidence=0.725171, direction="left")
+        summary["label_scores"]["zoom"] = 0.673504
+        summary["background_motion_confidence"] = 0.758916
+        shot = self._camera_shot("固定特写", summary)
+
+        out = constrain_video_shots_to_evidence([shot])[0]
+
+        assert out["camera"] == "固定特写"
+        entry = _gate(out, "camera")
+        assert entry["verified"] is False
+        assert entry["confidence"] == "vlm_only"
+        assert entry["source"] == "cross_frame_vlm"
+        assert "类型区分度不足" in entry["reason"]
 
     def test_unclassifiable_vlm_text_kept_but_downgraded(self):
         shot = self._camera_shot(

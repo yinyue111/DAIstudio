@@ -30,7 +30,7 @@ from PIL import Image
 from ..config import settings
 from .safe_logging import redact_url_for_log
 from .ssrf import MAX_REDIRECTS, assert_safe_url, pinned_client
-from .video_analysis import frame_count_for_duration
+from .video_analysis import frame_count_for_duration, max_frame_count
 
 log = logging.getLogger("video_frames")
 
@@ -375,7 +375,7 @@ class _SceneCut(float):
 
     scene_score: float | None
 
-    def __new__(cls, value: float, scene_score: float | None = None) -> "_SceneCut":
+    def __new__(cls, value: float, scene_score: float | None = None) -> _SceneCut:
         cut = super().__new__(cls, value)
         cut.scene_score = scene_score
         return cut
@@ -596,6 +596,169 @@ def _target_frame_count(n: int, dur: float | None, preset: str | None = None) ->
             target = min(target, n)
         return max(1, target)
     return max(1, frame_count_for_duration(dur, None) if n < 1 else n)
+
+
+def _adaptive_frame_target_for_detected_shots(
+    target: int,
+    *,
+    requested_max: int,
+    preset: str | None,
+    shot_detection: dict,
+) -> int:
+    """Use spare preset capacity for cross-frame and mid-shot observations."""
+    if preset not in {"standard", "fine", "ultra"}:
+        return target
+    shot_count = len([
+        shot for shot in shot_detection.get("shots") or []
+        if isinstance(shot, dict)
+    ])
+    if shot_count < 1:
+        return target
+    preset_cap = max_frame_count(preset)
+    if requested_max > 0:
+        preset_cap = min(preset_cap, requested_max)
+    observations_per_shot = _detected_shot_observations_for_preset(preset)
+    return min(preset_cap, max(target, shot_count * observations_per_shot))
+
+
+def _detected_shot_observations_for_preset(preset: str | None) -> int:
+    return 3 if preset in {"fine", "ultra"} else 2
+
+
+def _allocate_detected_shot_frame_budget(
+    total: int,
+    durations: list[float | None],
+    shot_detection: dict,
+) -> list[int]:
+    """Allocate enough segment budget to cover each detected shot before density."""
+    shot_counts = [0] * len(durations)
+    for shot in shot_detection.get("shots") or []:
+        if not isinstance(shot, dict):
+            continue
+        try:
+            segment_index = int(shot.get("source_segment_index") or 0)
+        except (TypeError, ValueError):
+            continue
+        if 1 <= segment_index <= len(shot_counts):
+            shot_counts[segment_index - 1] += 1
+    total_shots = sum(shot_counts)
+    if total_shots < 1 or total < total_shots:
+        return _allocate_frame_budget(total, durations)
+
+    counts = list(shot_counts)
+    remaining = total - total_shots
+    while remaining > 0 and any(
+        counts[index] < shot_counts[index] * 2
+        for index in range(len(counts))
+    ):
+        candidates = [
+            index for index in range(len(counts))
+            if counts[index] < shot_counts[index] * 2
+        ]
+        index = max(
+            candidates,
+            key=lambda value: (
+                (shot_counts[value] * 2 - counts[value]) / shot_counts[value],
+                float(durations[value] or 0),
+            ),
+        )
+        counts[index] += 1
+        remaining -= 1
+    while remaining > 0:
+        index = max(
+            range(len(counts)),
+            key=lambda value: float(durations[value] or 0) / (counts[value] + 1),
+        )
+        counts[index] += 1
+        remaining -= 1
+    return counts
+
+
+def _shot_aware_timestamps(
+    base: list[float],
+    *,
+    shot_detection: dict,
+    segment_index: int,
+    segment_start: float,
+    segment_duration: float | None,
+    target: int,
+    requested: list[float],
+    observations_per_shot: int = 2,
+) -> list[float]:
+    """Rebalance timestamps so short shots also receive cross-frame evidence."""
+    if target < 1 or not segment_duration or segment_duration <= 0:
+        return base
+    max_ts = max(0.0, float(segment_duration) - 0.05)
+    shots: list[tuple[float, float]] = []
+    for shot in shot_detection.get("shots") or []:
+        if not isinstance(shot, dict):
+            continue
+        try:
+            shot_segment = int(shot.get("source_segment_index") or 0)
+            start = max(0.0, float(shot["start_seconds"]) - segment_start)
+            end = min(float(segment_duration), float(shot["end_seconds"]) - segment_start)
+        except (KeyError, TypeError, ValueError):
+            continue
+        if shot_segment == segment_index and end > start:
+            shots.append((start, end))
+    if not shots or target < len(shots):
+        return base
+
+    selected: list[float] = []
+
+    def add(timestamp: float) -> None:
+        clean = round(max(0.0, min(float(timestamp), max_ts)), 3)
+        if len(selected) < target and all(abs(clean - seen) > 0.001 for seen in selected):
+            selected.append(clean)
+
+    def belongs(timestamp: float, shot_index: int) -> bool:
+        start, end = shots[shot_index]
+        return start <= timestamp < end or (
+            shot_index == len(shots) - 1 and start <= timestamp <= end
+        )
+
+    for timestamp in requested:
+        add(timestamp)
+
+    # First observation sits just inside the detected boundary so decoder seek
+    # backoff cannot accidentally assign it to the preceding shot.
+    for shot_index, (start, end) in enumerate(shots):
+        if any(belongs(timestamp, shot_index) for timestamp in selected):
+            continue
+        inset = min(0.05, max(0.001, (end - start) * 0.1))
+        add(0.0 if shot_index == 0 and start <= 0.001 else start + inset)
+
+    # Spend the next pass on end-state observations. Short shots come first
+    # when the preset cannot afford two frames for every detected shot.
+    for shot_index in sorted(
+        range(len(shots)),
+        key=lambda value: shots[value][1] - shots[value][0],
+    ):
+        if len(selected) >= target:
+            break
+        count = sum(belongs(timestamp, shot_index) for timestamp in selected)
+        if count >= 2:
+            continue
+        start, end = shots[shot_index]
+        inset = min(0.05, max(0.001, (end - start) * 0.1))
+        add(end - inset)
+
+    # Fine analysis needs the action's intermediate state as well as its start
+    # and end. This is where short-lived overlays and product interactions tend
+    # to appear, so allocate the midpoint before generic uniform fill.
+    if observations_per_shot >= 3:
+        for shot_index, (start, end) in enumerate(shots):
+            if len(selected) >= target:
+                break
+            count = sum(belongs(timestamp, shot_index) for timestamp in selected)
+            if count < 3:
+                add((start + end) / 2)
+
+    for timestamp in base:
+        add(timestamp)
+    for timestamp in _uniform_timestamps(segment_duration, target):
+        add(timestamp)
+    return sorted(selected)
 
 
 def _allocate_frame_budget(total: int, durations: list[float | None]) -> list[int]:
@@ -999,9 +1162,23 @@ def _sample_video_from_file(
         source_ranges=metadata_ranges,
     )
     target = _target_frame_count(n, selected_duration, preset)
-    allocations = _allocate_frame_budget(target, durations)
     absolute_scenes = _scene_change_timestamps(src, max(256, target * 3))
     shot_detection = _shot_detection_contract(ranges, absolute_scenes)
+    shot_aware_sampling = preset in {"standard", "fine", "ultra"}
+    if shot_aware_sampling:
+        target = _adaptive_frame_target_for_detected_shots(
+            target,
+            requested_max=n,
+            preset=preset,
+            shot_detection=shot_detection,
+        )
+        allocations = _allocate_detected_shot_frame_budget(
+            target,
+            durations,
+            shot_detection,
+        )
+    else:
+        allocations = _allocate_frame_budget(target, durations)
     locate_shot = _detected_shot_locator(shot_detection)
 
     with tempfile.TemporaryDirectory() as td:
@@ -1025,6 +1202,17 @@ def _sample_video_from_file(
                 segment_dur,
                 requested=requested,
             )
+            if shot_aware_sampling:
+                relative_stamps = _shot_aware_timestamps(
+                    relative_stamps,
+                    shot_detection=shot_detection,
+                    segment_index=segment_index,
+                    segment_start=start,
+                    segment_duration=segment_dur,
+                    target=segment_target,
+                    requested=requested,
+                    observations_per_shot=_detected_shot_observations_for_preset(preset),
+                )
             for local_index, relative_ts in enumerate(relative_stamps):
                 timestamp = start + relative_ts
                 dst = os.path.join(td, f"f_{frame_number:03d}.jpg")

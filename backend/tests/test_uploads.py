@@ -3677,8 +3677,8 @@ def test_upload_video_over_inline_cap_never_sends_dead_media_url(
     data 与 url 都应为 None,由 content_safety 的 fail-open/closed 策略决定
     拒/放;S3 后端才会给 presigned URL(此处不覆盖)。
     """
-    from app.routers import uploads as uploads_router
     from app.config import settings as app_settings
+    from app.routers import uploads as uploads_router
 
     make_user("13900000156", balance=1000)
     h = auth("13900000156")

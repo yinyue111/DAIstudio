@@ -121,7 +121,7 @@ export const DEFAULT_REVERSE_CONFIG: Readonly<ReverseConfig> = Object.freeze({
   source_range: null,
   source_ranges: [],
   custom_keyframes: [],
-  include_audio: false,
+  include_audio: true,
 });
 
 export function reverseConfigForSourceChange(value: unknown): Record<string, unknown> | null {
@@ -237,7 +237,9 @@ export function normalizeReverseConfig(
     source_range: sourceRanges.length === 1 ? sourceRanges[0] : null,
     source_ranges: sourceRanges,
     custom_keyframes: videoSource ? normalizeKeyframes(raw.custom_keyframes ?? raw.keyframes, duration) : [],
-    include_audio: videoSource && Boolean(raw.include_audio),
+    include_audio: videoSource && (
+      raw.include_audio === undefined ? true : Boolean(raw.include_audio)
+    ),
   };
 }
 
@@ -269,9 +271,6 @@ export function validateReverseConfig(
   const instruction = String(raw.custom_instruction ?? "").trim();
   if (instruction.length > MAX_REVERSE_CUSTOM_INSTRUCTION_LENGTH) {
     errors.push({ field: "custom_instruction", message: `补充要求不能超过 ${MAX_REVERSE_CUSTOM_INSTRUCTION_LENGTH} 字。` });
-  }
-  if (category === "image" && raw.include_audio) {
-    errors.push({ field: "include_audio", message: "图片反推不支持音频分析。" });
   }
   const rawRanges = requestedRanges(raw);
   const maxDuration = finiteNumber(duration);

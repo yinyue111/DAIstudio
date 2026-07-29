@@ -38,6 +38,12 @@ assert.deepEqual(config.source_ranges, [
   { start_seconds: 20, end_seconds: 25 },
 ]);
 assert.equal(config.source_range, null);
+assert.equal(config.include_audio, true, "video reverse must analyze audio by default");
+assert.equal(
+  normalizeReverseConfig({}, { category: "image", selectedType: "image" }).include_audio,
+  false,
+  "image reverse must ignore the video-only audio default",
+);
 
 assert.deepEqual(reverseConfigForSourceChange({
   analysis_focus: "camera_motion",
@@ -153,12 +159,10 @@ assert.equal(restored.workspace.selected.duration, 40);
 const controls = fs.readFileSync(new URL("../app/studio/StudioVideoAnalysisControls.jsx", import.meta.url), "utf8");
 assert.match(controls, /source_ranges/);
 assert.match(controls, /添加片段/);
-assert.match(controls, /api\.reverseAnalyzerStatus\(\)/);
-assert.match(controls, /loadReverseAnalyzerHealth/);
-assert.match(controls, /summarizeVideoAnalyzerHealth/);
-assert.match(controls, /视觉证据能力/);
-assert.match(controls, /音频证据分析/);
-assert.match(controls, /audioHealth\.explicitlyUnavailable/);
+assert.doesNotMatch(controls, /reverseAnalyzerStatus/);
+assert.doesNotMatch(controls, /视觉证据能力/);
+assert.doesNotMatch(controls, /音频证据分析/);
+assert.doesNotMatch(controls, /include_audio/);
 assert.match(
   controls,
   /关键帧时间必须位于素材时长范围内。[\s\S]*关键帧必须位于某个已选分析片段内。/,
@@ -171,6 +175,11 @@ assert.doesNotMatch(controls, /不包含说话人、音乐、节拍和音效分�
 const referencePanelSource = fs.readFileSync(
   new URL("../app/studio/StudioReferencePanel.jsx", import.meta.url),
   "utf8",
+);
+assert.doesNotMatch(
+  referencePanelSource,
+  /StudioVideoSourceTimeline/,
+  "the advanced source timeline must stay out of the primary reverse workflow",
 );
 assert.match(
   referencePanelSource,
@@ -187,10 +196,20 @@ const intentControls = fs.readFileSync(
   new URL("../app/studio/StudioReverseIntentControls.jsx", import.meta.url),
   "utf8",
 );
-assert.match(intentControls, /loadReverseAnalyzerHealth/);
-assert.match(intentControls, /summarizeImageAnalyzerHealth/);
-assert.match(intentControls, /图片证据能力/);
+assert.doesNotMatch(intentControls, /loadReverseAnalyzerHealth/);
+assert.doesNotMatch(intentControls, /summarizeImageAnalyzerHealth/);
+assert.doesNotMatch(intentControls, /图片证据能力/);
 assert.match(intentControls, /category === "image"/);
+assert.match(intentControls, /反推设置/);
+assert.match(intentControls, /type="checkbox"/);
+assert.match(intentControls, /include_audio/);
+assert.match(intentControls, /分析音频/);
+assert.match(intentControls, /focus === "audio_script"[\s\S]*include_audio: true/);
+assert.doesNotMatch(intentControls, /反推方案/);
+assert.doesNotMatch(intentControls, /VIDEO_REVERSE_QUICK_PRESETS/);
+assert.doesNotMatch(intentControls, /videoReverseConfigSummary/);
+assert.doesNotMatch(intentControls, /自定义设置/);
+assert.doesNotMatch(intentControls, /customSettingsOpen/);
 const apiClient = fs.readFileSync(new URL("../lib/api.js", import.meta.url), "utf8");
 assert.match(apiClient, /reverseAnalyzerStatus:[\s\S]*\/api\/prompt\/reverse-analyzers\/status/);
 

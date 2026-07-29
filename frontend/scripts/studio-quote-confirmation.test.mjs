@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
+import { readStudioSourceFromUrl } from "./studio-source.mjs";
 
 import {
   beginQuoteConfirmationExecution,
@@ -13,7 +14,9 @@ import {
 
 const hookSource = readFileSync(new URL("../hooks/useStudioQuoteConfirmation.js", import.meta.url), "utf8");
 const compositionSource = readFileSync(new URL("../app/studio/StudioVideoComposition.jsx", import.meta.url), "utf8");
-const pageSource = readFileSync(new URL("../app/page.jsx", import.meta.url), "utf8");
+const pageSource = readStudioSourceFromUrl(import.meta.url);
+const promptOptimizationSource = readFileSync(new URL("../hooks/usePromptOptimization.js", import.meta.url), "utf8");
+const assetActionsSource = readFileSync(new URL("../hooks/useAssetActions.js", import.meta.url), "utf8");
 const apiSource = readFileSync(new URL("../lib/api.js", import.meta.url), "utf8");
 
 const settlements = [];
@@ -115,12 +118,12 @@ assert.doesNotMatch(
   "retrying an already quoted workflow node must not create a second top-level workflow charge",
 );
 
-const optimizeStart = pageSource.indexOf("async function optimizeDirectPrompt()");
-const compileStart = pageSource.indexOf("async function compileStoryboardShot(", optimizeStart);
-const unlockStart = pageSource.indexOf("async function unlock(asset)");
-const downloadStart = pageSource.indexOf("async function download(asset)", unlockStart);
-const optimizeSource = pageSource.slice(optimizeStart, compileStart);
-const unlockSource = pageSource.slice(unlockStart, downloadStart);
+const optimizeStart = promptOptimizationSource.indexOf("async function optimize()");
+const optimizeEnd = promptOptimizationSource.indexOf("async function accept(", optimizeStart);
+const unlockStart = assetActionsSource.indexOf("async function unlock(asset)");
+const downloadStart = assetActionsSource.indexOf("async function download(asset)", unlockStart);
+const optimizeSource = promptOptimizationSource.slice(optimizeStart, optimizeEnd);
+const unlockSource = assetActionsSource.slice(unlockStart, downloadStart);
 
 assert.match(
   optimizeSource,

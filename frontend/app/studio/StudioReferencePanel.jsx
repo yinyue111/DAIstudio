@@ -7,7 +7,6 @@ import StudioReverseIntentControls from "./StudioReverseIntentControls";
 import StudioReverseBatchPanel from "./StudioReverseBatchPanel";
 import StudioReverseSourcesEditor from "./StudioReverseSourcesEditor";
 import StudioVideoAnalysisControls from "./StudioVideoAnalysisControls";
-import StudioVideoSourceTimeline from "./StudioVideoSourceTimeline";
 import { assetDims, selectedLabel } from "./helpers";
 
 export function analysisModeLabel(mode) {
@@ -728,6 +727,14 @@ export default function StudioReferencePanel({
               {uploading ? "上传中…" : "上传视频"}
             </button>
           </div>
+          <button
+            type="button"
+            onClick={() => onOpenAssetPicker?.("reverse_source")}
+            disabled={uploading || reversing || reverseNeedsConfirmation}
+            className="btn-secondary btn-sm w-full justify-center border-line2 bg-white/[0.08]"
+          >
+            从我的素材库选择
+          </button>
           {selected && reverseConfig && (
             <StudioReverseIntentControls
               category={category}
@@ -743,18 +750,6 @@ export default function StudioReferencePanel({
               sources={reverseSources}
               disabled={reversing || reverseNeedsConfirmation}
               onChange={setReverseSources}
-            />
-          )}
-          {category === "video" && selected?.type === "video" && reverseConfig && (
-            <StudioVideoSourceTimeline
-              asset={selected}
-              config={reverseConfig}
-              configuredDuration={selected.duration
-                || reverseVideoAnalysis?.source?.total_duration_seconds
-                || reverseVideoAnalysis?.source?.duration_seconds
-                || null}
-              disabled={reversing || reverseNeedsConfirmation}
-              onChange={setReverseConfig}
             />
           )}
           {category === "video" && selected && reverseConfig && videoAnalysisPresets.length > 0 && (

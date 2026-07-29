@@ -76,6 +76,61 @@ def test_direct_product_video_passthrough_separates_post_production_from_visual_
     assert result["metadata"]["shot_count"] == 1
 
 
+def test_timed_direct_prompt_counts_shots_and_embeds_seedance_15_audio_visual_requirements():
+    raw_text = (
+        "10秒高端个护广告。\n"
+        "Shot 1（0.00-2.00s）：人物伸懒腰后硬切。\n"
+        "Shot 2（2.00-6.00s）：洗脸巾浸水，画面依次浮现“干湿两用”“厚实吸水”。\n"
+        "Shot 3（6.00-10.00s）：擦拭脸颊，画面文字“亲肤”；"
+        "画面文字仅出现上述三组卖点；音效：水滴声和纸巾摩擦声。"
+    )
+    prompt = {
+        "input_mode": "direct_input",
+        "user_instruction": raw_text,
+        "raw_text": raw_text,
+        "assembled_text": raw_text,
+        "final_text": raw_text,
+    }
+
+    result = compile_video_prompt(
+        prompt,
+        duration=10,
+        model_id="doubao-seedance-1-5-pro-251215",
+        provider="volcengine_ark",
+        fit_mode="single_clip",
+    )
+
+    assert result["metadata"]["shot_count"] == 3
+    assert result["metadata"]["source_shot_count"] == 3
+    assert result["metadata"]["embedded_av_requirements"] is True
+    assert result["prompt"].count("Shot ") == 3
+    assert result["plan"]["post_overlays"] == ["干湿两用", "厚实吸水", "亲肤"]
+    assert "仅出现上述三组卖点" not in result["plan"]["post_overlays"]
+    assert result["plan"]["sfx"] == ["水滴声和纸巾摩擦声"]
+    assert "音画生成要求" in result["prompt"]
+    assert "干湿两用" in result["prompt"]
+    assert "水滴声和纸巾摩擦声" in result["prompt"]
+    assert any("3 个镜头" in warning for warning in result["plan"]["warnings"])
+
+
+def test_structured_video_sections_accept_timed_shot_labels():
+    result = compile_video_prompt(
+        "风格设定：真实家庭浴室。\n"
+        "场景脚本：\n"
+        "Shot 1（0.00-2.00s）：从包装底部抽出洗脸巾。\n"
+        "Shot 2（2.00-5.00s）：微距展示压纹。\n"
+        "技术约束：稳定镜头。",
+        duration=5,
+        model_id="seedance-2.0",
+    )
+
+    assert result["metadata"]["shot_count"] == 2
+    assert result["plan"]["shots"] == [
+        "从包装底部抽出洗脸巾",
+        "微距展示压纹",
+    ]
+
+
 def test_structured_reverse_input_mode_does_not_use_direct_passthrough():
     text = "高端浴室广告。Shot 1：抽出洗脸巾。文字“干湿两用”浮现。"
     result = compile_video_prompt(

@@ -14,9 +14,11 @@ from pathlib import Path
 import pytest
 
 from app.services import gateway_prompting as gp
+from app.services.gateway_prompt_validation import VIDEO_REVERSE_TEMPLATE
 from app.services.gateway_prompting import (
     ReverseResultValidationError,
     clean_visual_generation_clause,
+    compose_video_generation_draft,
     compose_visual_final_text,
     constrain_video_shots_to_evidence,
     normalize_video_shots,
@@ -46,6 +48,11 @@ def test_clean_visual_clause_non_string_inputs_become_empty():
     """非字符串输入一律清空，不抛异常。"""
     for value in (None, 123, 1.5, True, [], {}, object()):
         assert clean_visual_generation_clause(value) == ""
+
+
+def test_video_reverse_template_requires_cross_shot_ocr_reconciliation():
+    assert "综合全部清晰帧交叉核对品牌、数字、单位和字母" in VIDEO_REVERSE_TEMPLATE
+    assert "不得猜测或输出冲突版本" in VIDEO_REVERSE_TEMPLATE
 
 
 class TestUncertaintyCollateralDeletion:
@@ -283,9 +290,9 @@ class TestValidateReverseResultGolden:
             required_video_frame_indices=[1, 2],
             video_frame_timestamps={1: 0.0, 2: 2.0},
         )
-        # 旁白不进白名单；shot 细节按 visual/action/lighting 顺序拼接并带时间戳
+        # 旁白不进白名单；shot 细节按 visual/action/lighting 顺序拼接。
         assert out["final_text"] == (
-            "红色圆瓶，居中；镜头1（0.000-2.000秒）：红色圆瓶特写，瓶身缓慢旋转，柔和顶光"
+            "红色圆瓶，居中；镜头1：红色圆瓶特写，瓶身缓慢旋转，柔和顶光"
         )
         # provider 抄了 schema 占位 confidence=0：有帧证据的 visual 不作废，回填中性 0.5
         assert out["shots"][0]["confidence"] == 0.5
@@ -346,14 +353,14 @@ class TestComposeVisualFinalTextWhitelist:
         with pytest.raises(ReverseResultValidationError, match="视觉白名单字段"):
             compose_visual_final_text({"旁白": "只有旁白"}, "video")
 
-    def test_shot_line_includes_segment_and_timing(self):
+    def test_shot_line_keeps_segment_and_omits_source_timing(self):
         structured = {"图像类型": "产品视频", "主体": "红瓶"}
         shots = [{
             "start_seconds": 0.0, "end_seconds": 2.0, "visual": "红瓶特写",
             "action": "旋转", "lighting": "顶光", "source_segment_index": 2,
         }]
         assert compose_visual_final_text(structured, "video", shots) == (
-            "红瓶；片段2 镜头1（0.000-2.000秒）：红瓶特写，旋转，顶光"
+            "红瓶；片段2 镜头1：红瓶特写，旋转，顶光"
         )
 
     def test_long_product_video_compressed_and_black_frames_dropped(self):
@@ -375,6 +382,120 @@ class TestComposeVisualFinalTextWhitelist:
         final_text = compose_visual_final_text(structured, "image")
         # 主体的图片档位上限是 48 字
         assert final_text.split("；")[0] == "红" * 48
+
+    def test_canonical_video_draft_keeps_complete_timeline_and_temporal_fields(self):
+        structured = {
+            "图像类型": "产品视频",
+            "主体": "蓝色纸巾盒",
+            "场景背景": "蓝天云层",
+            "一致性约束": "全程保持同一纸巾盒",
+            "字幕卖点": "干湿两用",
+            "旁白": "未分析",
+            "音效": (
+                "检测到持续音乐可能性较高；节拍约 170.5 BPM；"
+                "在 5.92秒、6.24秒等 检测到 11 个未分类瞬态声"
+            ),
+            "源视频规格": "720x1280，9:16，36.000秒",
+        }
+        shots = [
+            {
+                "start_seconds": index * 6,
+                "end_seconds": (index + 1) * 6,
+                "visual": f"第{index + 1}镜画面",
+                "subject_tracking": f"第{index + 1}镜主体连续",
+                "pose": f"第{index + 1}镜姿态",
+                "action": f"第{index + 1}镜动作",
+                "camera": f"第{index + 1}镜运镜",
+                "lighting": f"第{index + 1}镜光线",
+                "transition": "硬切" if index < 5 else "定帧收尾",
+                "ocr": "厚实吸水" if index == 2 else "",
+                "audio_cue": "水滴入水声" if index == 2 else "未分析",
+            }
+            for index in range(6)
+        ]
+
+        draft = compose_video_generation_draft(structured, shots)
+
+        assert "输出规格" not in draft
+        assert "720x1280" not in draft
+        assert "9:16" not in draft
+        assert "36.000秒" not in draft
+        assert "参考片含 6 个高密度剪辑镜头" in draft
+        assert "镜头1：" in draft
+        assert "镜头6：" in draft
+        assert "镜头1（" not in draft
+        assert "主体追踪：第6镜主体连续" in draft
+        assert "姿态：第6镜姿态" in draft
+        assert "运镜：第6镜运镜" in draft
+        assert "画面字幕：干湿两用" in draft
+        assert "画面文字：厚实吸水" in draft
+        assert "声音：持续背景音乐" in draft
+        assert "声音：水滴入水声" in draft
+        assert "BPM" not in draft
+        assert "未分类瞬态声" not in draft
+        assert "5.92秒" not in draft
+        assert "6.24秒" not in draft
+        assert "未分析" not in draft
+        assert len(draft) > 220
+
+    def test_canonical_video_draft_uses_vlm_text_when_ocr_is_missing_or_watermark(self):
+        structured = {"图像类型": "产品视频", "主体": "白色洗脸巾"}
+        shots = [
+            {
+                "start_seconds": 0,
+                "end_seconds": 1,
+                "visual": "洗脸巾浸入水中",
+                "ocr": "生成",
+                "vlm_text_description": "干湿两用 豆包AI生成",
+            },
+            {
+                "start_seconds": 1,
+                "end_seconds": 2,
+                "visual": "洗脸巾轻擦脸颊",
+                "ocr": "",
+                "vlm_text_description": "亲肤",
+            },
+            {
+                "start_seconds": 2,
+                "end_seconds": 3,
+                "visual": "产品包装定帧",
+                "ocr": "DAMAH 166PCS",
+                "vlm_text_description": "可能错误的包装文字",
+            },
+        ]
+
+        draft = compose_video_generation_draft(structured, shots)
+
+        assert "画面文字：干湿两用" in draft
+        assert "画面文字：亲肤" in draft
+        assert "画面文字：DAMAH 166PCS" in draft
+        assert "画面文字：生成" not in draft
+        assert "可能错误的包装文字" not in draft
+
+    def test_canonical_video_draft_marks_dense_short_timeline_for_shotwise_generation(self):
+        structured = {
+            "图像类型": "人物+产品混合视频",
+            "主体": "女性与白色洗脸巾包装",
+        }
+        shots = [
+            {
+                "start_seconds": index * (10 / 7),
+                "end_seconds": (index + 1) * (10 / 7),
+                "visual": f"第{index + 1}镜画面",
+                "action": f"第{index + 1}镜主动作",
+                "camera": "固定机位",
+            }
+            for index in range(7)
+        ]
+
+        draft = compose_video_generation_draft(structured, shots)
+
+        assert "参考片含 7 个高密度剪辑镜头" in draft
+        assert "逐镜独立生成" in draft
+        assert "单镜含多步动作或内部硬切" in draft
+        assert "一段一个主动作/可见结果" in draft
+        assert "最后按原镜头顺序剪辑" in draft
+        assert "不要将全部镜头压入一次生成" in draft
 
 
 class TestAudioEvidenceSanitization:
@@ -402,6 +523,62 @@ class TestAudioEvidenceSanitization:
         assert shots[0]["audio_cue"] == "对白/旁白：全新上市"
         # music/beat/sfx 未声明状态 → 未支持
         assert structured["音效"] == "未支持"
+
+    def test_local_music_beat_and_transients_enter_summary_and_shot_cues(self):
+        structured = {"旁白": "模型虚构旁白", "音效": "模型虚构水滴声"}
+        shots = [
+            {
+                "start_seconds": 0,
+                "end_seconds": 2,
+                "audio_cue": "洗脸巾入水时出现清晰水滴声",
+            },
+            {
+                "start_seconds": 2,
+                "end_seconds": 4,
+                "audio_cue": "疑似包装摩擦声",
+            },
+        ]
+        evidence = {
+            "status": "partial",
+            "features": {
+                "asr": {"status": "unsupported"},
+                "music": {
+                    "status": "analyzed",
+                    "assessment": "likely",
+                    "evidence": [{
+                        "start_seconds": 0,
+                        "end_seconds": 4,
+                        "assessment": "likely",
+                    }],
+                },
+                "beat": {
+                    "status": "analyzed",
+                    "bpm": 120,
+                    "evidence": [{"start_seconds": 0.5, "end_seconds": 0.58}],
+                },
+                "sfx": {
+                    "status": "analyzed",
+                    "evidence": [{
+                        "start_seconds": 1.25,
+                        "end_seconds": 1.37,
+                        "label": "unclassified_transient",
+                    }],
+                },
+            },
+        }
+
+        sanitize_video_audio_evidence(structured, shots, audio_evidence=evidence)
+
+        assert structured["旁白"] == "未支持"
+        assert "检测到持续音乐可能性较高" in structured["音效"]
+        assert "节拍约 120.0 BPM" in structured["音效"]
+        assert "1 个未分类瞬态声" in structured["音效"]
+        assert "水滴" not in structured["音效"]
+        assert "洗脸巾入水时出现清晰水滴声" in shots[0]["audio_cue"]
+        assert "持续背景音乐" in shots[0]["audio_cue"]
+        assert "BPM" not in shots[0]["audio_cue"]
+        assert "未分类瞬态声" not in shots[0]["audio_cue"]
+        assert shots[1]["audio_cue"] == "持续背景音乐"
 
 
 class TestComposeFinalFallback:

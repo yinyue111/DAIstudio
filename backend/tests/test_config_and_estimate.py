@@ -44,7 +44,6 @@ from app.services.generation_prompts import (
 from app.services.generation_request import estimate_generation_cost, validate_generation_params
 from app.services.model_pricing import estimate_credits_from_usage
 
-
 _PUBLIC_DNS_RESULT = [
     (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 0)),
 ]
@@ -235,6 +234,7 @@ def test_public_config_exposes_video_reverse_presets(client, make_user, auth):
     assert presets[2]["max_cost"] == 5
     assert presets[3]["max_frames"] == 36
     assert presets[3]["max_cost"] == 5
+    assert data["reverse"]["audio_surcharge"] == 2
     assert data["pricing"]["reverse"]["image_cost"] == 5
     assert data["pricing"]["image"]["unit_costs"] == {"1k": 8, "2k": 8, "4k": 8}
     assert data["pricing"]["image"]["edit_unit_costs"] == {"1k": 8, "2k": 8, "4k": 8}

@@ -9,6 +9,7 @@ type AnalyzerCapabilityDefinition<Key extends string = string> = {
   unsupportedLabel: "未配置" | "不可用";
   falseFlag?: string;
   falseFlagReason?: string;
+  modelFallback?: boolean;
 };
 
 export const IMAGE_ANALYZER_CAPABILITIES = [
@@ -25,10 +26,10 @@ export const IMAGE_ANALYZER_CAPABILITIES = [
 ] as const satisfies readonly AnalyzerCapabilityDefinition[];
 
 export const VIDEO_ANALYZER_CAPABILITIES = [
-  { key: "subject_tracking", label: "主体追踪", unsupportedLabel: "未配置" },
-  { key: "pose", label: "姿态", unsupportedLabel: "未配置" },
-  { key: "action", label: "动作", unsupportedLabel: "未配置" },
-  { key: "transition", label: "转场", unsupportedLabel: "未配置" },
+  { key: "subject_tracking", label: "主体追踪", unsupportedLabel: "未配置", modelFallback: true },
+  { key: "pose", label: "姿态", unsupportedLabel: "未配置", modelFallback: true },
+  { key: "action", label: "动作", unsupportedLabel: "未配置", modelFallback: true },
+  { key: "transition", label: "转场", unsupportedLabel: "未配置", modelFallback: true },
   { key: "camera_motion", label: "运镜", unsupportedLabel: "不可用" },
 ] as const satisfies readonly AnalyzerCapabilityDefinition[];
 
@@ -65,6 +66,7 @@ export type AnalyzerCapabilityView<Key extends string = string> = {
   statusLabel: string;
   reason: string | null;
   configured: boolean | null;
+  fallbackLabel: string | null;
 };
 
 export type AnalyzerCapabilitySummary<Key extends string = string> = {
@@ -135,6 +137,9 @@ function capabilityView<Key extends string>(
     statusLabel: capabilityStatusLabel(status, configured, definition.unsupportedLabel),
     reason: explicitReason || truthfulReason,
     configured,
+    fallbackLabel: definition.modelFallback && status !== "available"
+      ? "主模型跨帧推断"
+      : null,
   };
 }
 
@@ -174,12 +179,16 @@ function capabilitySummary<Key extends string>(
     .filter(({ status, statusLabel }) => status === "unsupported" && statusLabel === "不可用")
     .map(({ label }) => label);
   const unknown = capabilities.filter(({ status }) => status === "unknown").map(({ label }) => label);
+  const modelFallback = capabilities
+    .filter(({ fallbackLabel }) => Boolean(fallbackLabel))
+    .map(({ label }) => label);
   const parts = [
     available.length ? `可用：${available.join("、")}` : "",
     limited.length ? `降级：${limited.join("、")}` : "",
     unconfigured.length ? `未配置：${unconfigured.join("、")}` : "",
     unavailable.length ? `不可用：${unavailable.join("、")}` : "",
     unknown.length ? `待确认：${unknown.join("、")}` : "",
+    modelFallback.length ? `主模型跨帧推断：${modelFallback.join("、")}` : "",
   ].filter(Boolean);
   return {
     explicitlyUnavailable,
@@ -207,7 +216,7 @@ export function summarizeVideoAnalyzerHealth(
     payload,
     "video",
     VIDEO_ANALYZER_CAPABILITIES,
-    "当前视频视觉分析器不可用，本次不会产生独立时序证据。",
+    "独立时序分析器未配置；主体追踪、姿态、动作和转场由主视觉模型基于多帧提供跨帧推断，运镜仍以后端光流证据为准。",
   );
 }
 

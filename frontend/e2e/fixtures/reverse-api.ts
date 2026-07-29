@@ -563,6 +563,15 @@ export async function installReverseApiMock(
     if (path === "/api/events/ws-ticket" && method === "POST") {
       return fulfillJson(route, { detail: "E2E 使用轮询任务中心" }, 503);
     }
+    if (path === "/api/task-center" && method === "GET") {
+      return fulfillJson(route, {
+        items: [],
+        next_cursor: null,
+        has_more: false,
+        total: 0,
+        counts: { active: 0, succeeded: 0, failed: 0, canceled: 0, needs_attention: 0, all: 0 },
+      });
+    }
     if (path === "/api/tasks") return fulfillJson(route, []);
 
     const sharedRecipeMatch = path.match(/^\/api\/recipes\/shared\/([^/]+)$/);

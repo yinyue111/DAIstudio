@@ -2,12 +2,13 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { readStudioSource } from "./studio-source.mjs";
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const previewSource = readFileSync(join(root, "app/studio/StudioMedia.jsx"), "utf8");
 
 assert.doesNotMatch(
-  readFileSync(join(root, "app/page.jsx"), "utf8"),
+  readStudioSource(root),
   /rightsConfirmed|合法使用权/,
   "reference rights confirmation UI and generation blocker should be removed",
 );

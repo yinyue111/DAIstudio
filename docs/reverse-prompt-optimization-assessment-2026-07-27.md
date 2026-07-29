@@ -336,36 +336,36 @@
 - [quality] [高/小时级] 清洗不确定词正则误杀「尽可能/可能性」等常用措辞 ✅已修
 - [quality] [高/小时级] 平台归因清洗吞掉视觉事实并留下悬垂残句进入 final_text ✅已修
 - [quality] [高/小时级] 「（未验证）」展示后缀泄漏进生成用 final_text 与 structured 字段 ✅已修
-- [quality] [高/天级] 视频 final_text 220 字硬预算成段丢弃尾部镜头与光线/配色/一致性约束 
-- [quality] [中/天级] 模板重金约束的 provider final_text 必被丢弃重建,指令预算错配 
-- [performance-cost] [中/小时级] tesseract_ocr 每帧额外 spawn 两个探测子进程且逐帧串行 
-- [performance-cost] [高/天级] 场景切点检测永远全片解码，单镜头重分析尤其浪费 
-- [performance-cost] [中/天级] 远程视频在同一次反推里被完整下载两次（抽帧一次、音频一次） 
-- [performance-cost] [高/天级] 单镜头重分析按全片档位一口价计费，报价与真实成本偏差最大 
-- [performance-cost] [高/一周以上] 同素材同参数重复反推零复用，内容指纹已算好却只用于血缘 
-- [performance-cost] [中/小时级] 语义 provider 请求把 JPEG 帧重编码成 PNG base64，payload 膨胀数倍 
-- [performance-cost] [高/天级] 批量反推并发超过抽帧信号量时，付费视频反推被静默降级为封面确认 
-- [ux] [高/小时级] 反推进度直出英文机器键，且 45%-90% 长时间静止 
-- [ux] [高/小时级] 反推失败没有驻留状态卡，重试入口对失败任务基本不可达 
-- [ux] [高/天级] 结果面板"结构参数"页仍是裸 textarea + JSON 手编，typed 编辑器未接入首次审阅路径 
-- [ux] [高/天级] 单镜头重分析是断头流程：提交后无跟踪、结果不回流分镜 
-- [ux] [中/天级] 版本对比刻意排除 shots，分镜编辑产生的版本在 diff 里显示"完全一致" 
-- [ux] [中/天级] 批量反推"结果对比"只有截断文本卡片，无法真正对比 
-- [ux] [低/小时级] 最近反推面板直出 analysis_focus 机器键，失败项无原因可看 
-- [coverage] [高/天级] 外链视频 80MB/30s 硬上限与上传通道 512MB/15min 形成能力断崖,且失败原因不区分 
-- [coverage] [中/天级] 同一操作内远程视频被完整下载两次(抽帧一次、音频一次) 
-- [coverage] [中/小时级] 抽帧/音频下载不带 Referer,防盗链 CDN 的链接视频必失败 
-- [coverage] [中/天级] 动图 GIF 被静默压成首帧,动效参考完全丢失且无任何提示 
-- [coverage] [高/小时级] HEIC 直接拒收、fetcher 允诺的 .avif 素材下游无法处理 
-- [coverage] [中/小时级] HDR(HLG/PQ)视频抽帧无 tonemap,VLM 看到的是发灰低对比帧 
-- [coverage] [高/天级] beat/BPM/music 分析器已产出带时间戳证据,却被提示词编译层整体丢弃 
-- [reliability] [高/天级] 反推 WS 进度通道是全链路死代码,实际进度靠 1.2s REST 轮询 
-- [reliability] [高/小时级] reaper 重投递不更新 updated_at,worker 积压时每分钟对同一批 queued 行重复投递 
-- [reliability] [中/天级] revision 血缘每次保存 O(N) 全链重验 + 全量 payload 快照存储,高频编辑下 O(N²) 膨胀 
-- [reliability] [高/天级] gateway 瞬态失败(429/连接失败)直接终态退款,attempt_count 存在但从未用于自动重试 
-- [reliability] [中/天级] 错误码无中心枚举,gateway 后 4xx 一律标 CONTENT_SAFETY_BLOCKED、gateway 前非 404 一律 REQUEST_REJECTED 
-- [reliability] [中/天级] focus/purpose 枚举与限额双端手工镜像,capabilities 下发只覆盖 precision 和批量 
-- [reliability] [中/一周以上] reverse_operations.py 4624 行、约 120 个顶层函数、至少 7 类职责,拆分已是其他优化的前置 
+- [quality] [高/天级] 视频 final_text 220 字硬预算成段丢弃尾部镜头与光线/配色/一致性约束
+- [quality] [中/天级] 模板重金约束的 provider final_text 必被丢弃重建,指令预算错配
+- [performance-cost] [中/小时级] tesseract_ocr 每帧额外 spawn 两个探测子进程且逐帧串行
+- [performance-cost] [高/天级] 场景切点检测永远全片解码，单镜头重分析尤其浪费
+- [performance-cost] [中/天级] 远程视频在同一次反推里被完整下载两次（抽帧一次、音频一次）
+- [performance-cost] [高/天级] 单镜头重分析按全片档位一口价计费，报价与真实成本偏差最大
+- [performance-cost] [高/一周以上] 同素材同参数重复反推零复用，内容指纹已算好却只用于血缘
+- [performance-cost] [中/小时级] 语义 provider 请求把 JPEG 帧重编码成 PNG base64，payload 膨胀数倍
+- [performance-cost] [高/天级] 批量反推并发超过抽帧信号量时，付费视频反推被静默降级为封面确认
+- [ux] [高/小时级] 反推进度直出英文机器键，且 45%-90% 长时间静止
+- [ux] [高/小时级] 反推失败没有驻留状态卡，重试入口对失败任务基本不可达
+- [ux] [高/天级] 结果面板"结构参数"页仍是裸 textarea + JSON 手编，typed 编辑器未接入首次审阅路径
+- [ux] [高/天级] 单镜头重分析是断头流程：提交后无跟踪、结果不回流分镜
+- [ux] [中/天级] 版本对比刻意排除 shots，分镜编辑产生的版本在 diff 里显示"完全一致"
+- [ux] [中/天级] 批量反推"结果对比"只有截断文本卡片，无法真正对比
+- [ux] [低/小时级] 最近反推面板直出 analysis_focus 机器键，失败项无原因可看
+- [coverage] [高/天级] 外链视频 80MB/30s 硬上限与上传通道 512MB/15min 形成能力断崖,且失败原因不区分
+- [coverage] [中/天级] 同一操作内远程视频被完整下载两次(抽帧一次、音频一次)
+- [coverage] [中/小时级] 抽帧/音频下载不带 Referer,防盗链 CDN 的链接视频必失败
+- [coverage] [中/天级] 动图 GIF 被静默压成首帧,动效参考完全丢失且无任何提示
+- [coverage] [高/小时级] HEIC 直接拒收、fetcher 允诺的 .avif 素材下游无法处理
+- [coverage] [中/小时级] HDR(HLG/PQ)视频抽帧无 tonemap,VLM 看到的是发灰低对比帧
+- [coverage] [高/天级] beat/BPM/music 分析器已产出带时间戳证据,却被提示词编译层整体丢弃
+- [reliability] [高/天级] 反推 WS 进度通道是全链路死代码,实际进度靠 1.2s REST 轮询
+- [reliability] [高/小时级] reaper 重投递不更新 updated_at,worker 积压时每分钟对同一批 queued 行重复投递
+- [reliability] [中/天级] revision 血缘每次保存 O(N) 全链重验 + 全量 payload 快照存储,高频编辑下 O(N²) 膨胀
+- [reliability] [高/天级] gateway 瞬态失败(429/连接失败)直接终态退款,attempt_count 存在但从未用于自动重试
+- [reliability] [中/天级] 错误码无中心枚举,gateway 后 4xx 一律标 CONTENT_SAFETY_BLOCKED、gateway 前非 404 一律 REQUEST_REJECTED
+- [reliability] [中/天级] focus/purpose 枚举与限额双端手工镜像,capabilities 下发只覆盖 precision 和批量
+- [reliability] [中/一周以上] reverse_operations.py 4624 行、约 120 个顶层函数、至少 7 类职责,拆分已是其他优化的前置
 
 ## 附录 B：评估方法说明
 

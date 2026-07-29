@@ -409,13 +409,13 @@ def test_non_xiaohongshu_parse_does_not_use_playwright(monkeypatch):
     calls = {"playwright": 0}
     html = '<html><body><img src="/public.jpg"></body></html>'
 
-    monkeypatch.setattr(fetcher, "_render_with_httpx", lambda _url, **_kwargs: html)
+    monkeypatch.setattr(fetcher._fetch, "_render_with_httpx", lambda _url, **_kwargs: html)
 
     def fake_playwright(_url):
         calls["playwright"] += 1
         return html
 
-    monkeypatch.setattr(fetcher, "_render_with_playwright", fake_playwright)
+    monkeypatch.setattr(fetcher._fetch, "_render_with_playwright", fake_playwright)
 
     assets = fetcher.parse_url("https://example.com/page")
 
@@ -435,8 +435,8 @@ def test_xiaohongshu_host_matching_does_not_accept_suffix_spoof(monkeypatch):
         calls["playwright"] += 1
         return html
 
-    monkeypatch.setattr(fetcher, "_render_with_httpx", fake_httpx)
-    monkeypatch.setattr(fetcher, "_render_with_playwright", fake_playwright)
+    monkeypatch.setattr(fetcher._fetch, "_render_with_httpx", fake_httpx)
+    monkeypatch.setattr(fetcher._fetch, "_render_with_playwright", fake_playwright)
 
     assets = fetcher.parse_url("https://evilxiaohongshu.com/page")
 
@@ -468,11 +468,11 @@ def test_xiaohongshu_httpx_timeout_falls_back_to_render(monkeypatch):
     """
 
     monkeypatch.setattr(
-        fetcher,
+        fetcher._fetch,
         "_render_with_httpx",
         lambda _url, **_kwargs: (_ for _ in ()).throw(httpx.TimeoutException("slow")),
     )
-    monkeypatch.setattr(fetcher, "_render_with_playwright", lambda _url: html)
+    monkeypatch.setattr(fetcher._fetch, "_render_with_playwright", lambda _url: html)
 
     assets = fetcher.parse_url("https://www.xiaohongshu.com/explore/abc")
 
@@ -495,8 +495,8 @@ def test_xiaohongshu_httpx_ignores_platform_images_and_uses_render(monkeypatch):
     </body></html>
     """
 
-    monkeypatch.setattr(fetcher, "_render_with_httpx", lambda _url, **_kwargs: partial)
-    monkeypatch.setattr(fetcher, "_render_with_playwright", lambda _url: rendered)
+    monkeypatch.setattr(fetcher._fetch, "_render_with_httpx", lambda _url, **_kwargs: partial)
+    monkeypatch.setattr(fetcher._fetch, "_render_with_playwright", lambda _url: rendered)
 
     assets = fetcher.parse_url("https://www.xiaohongshu.com/explore/abc")
 
@@ -513,8 +513,8 @@ def test_xiaohongshu_timeout_checks_canonical_security_redirect(monkeypatch):
             raise httpx.TimeoutException("slow")
         raise ValueError("小红书返回安全校验:当前笔记暂时无法浏览")
 
-    monkeypatch.setattr(fetcher, "_render_with_httpx", fake_httpx)
-    monkeypatch.setattr(fetcher, "_render_with_playwright", lambda _url: None)
+    monkeypatch.setattr(fetcher._fetch, "_render_with_httpx", fake_httpx)
+    monkeypatch.setattr(fetcher._fetch, "_render_with_playwright", lambda _url: None)
 
     try:
         fetcher.parse_url("https://www.xiaohongshu.com/explore/abc?xsec_token=deadbeef")
@@ -546,8 +546,8 @@ def test_xiaohongshu_security_check_falls_back_to_render(monkeypatch):
         calls.append(url)
         raise ValueError("小红书返回安全校验:当前笔记暂时无法浏览(error_code=300031)")
 
-    monkeypatch.setattr(fetcher, "_render_with_httpx", fake_httpx)
-    monkeypatch.setattr(fetcher, "_render_with_playwright", lambda _url: rendered)
+    monkeypatch.setattr(fetcher._fetch, "_render_with_httpx", fake_httpx)
+    monkeypatch.setattr(fetcher._fetch, "_render_with_playwright", lambda _url: rendered)
 
     assets = fetcher.parse_url("https://www.xiaohongshu.com/explore/abc?xsec_token=deadbeef")
 
@@ -576,8 +576,8 @@ def test_xiaohongshu_timeout_canonical_http_error_still_uses_render(monkeypatch)
             raise httpx.TimeoutException("slow")
         raise httpx.RemoteProtocolError("server disconnected")
 
-    monkeypatch.setattr(fetcher, "_render_with_httpx", fake_httpx)
-    monkeypatch.setattr(fetcher, "_render_with_playwright", lambda _url: html)
+    monkeypatch.setattr(fetcher._fetch, "_render_with_httpx", fake_httpx)
+    monkeypatch.setattr(fetcher._fetch, "_render_with_playwright", lambda _url: html)
 
     assets = fetcher.parse_url("https://www.xiaohongshu.com/explore/abc?xsec_token=deadbeef")
 
@@ -588,8 +588,8 @@ def test_xiaohongshu_timeout_render_failure_returns_xhs_hint(monkeypatch):
     def fake_httpx(_url, **_kwargs):
         raise httpx.TimeoutException("slow")
 
-    monkeypatch.setattr(fetcher, "_render_with_httpx", fake_httpx)
-    monkeypatch.setattr(fetcher, "_render_with_playwright", lambda _url: None)
+    monkeypatch.setattr(fetcher._fetch, "_render_with_httpx", fake_httpx)
+    monkeypatch.setattr(fetcher._fetch, "_render_with_playwright", lambda _url: None)
 
     try:
         fetcher.parse_url("https://www.xiaohongshu.com/explore/abc?xsec_token=deadbeef")
@@ -600,8 +600,8 @@ def test_xiaohongshu_timeout_render_failure_returns_xhs_hint(monkeypatch):
 
 
 def test_xiaohongshu_empty_render_returns_xhs_specific_hint(monkeypatch):
-    monkeypatch.setattr(fetcher, "_render_with_httpx", lambda _url, **_kwargs: "<html></html>")
-    monkeypatch.setattr(fetcher, "_render_with_playwright", lambda _url: "<html></html>")
+    monkeypatch.setattr(fetcher._fetch, "_render_with_httpx", lambda _url, **_kwargs: "<html></html>")
+    monkeypatch.setattr(fetcher._fetch, "_render_with_playwright", lambda _url: "<html></html>")
 
     try:
         fetcher.parse_url("https://www.xiaohongshu.com/explore/abc")
@@ -618,8 +618,8 @@ def test_xiaohongshu_playwright_none_does_not_do_slow_httpx_fallback(monkeypatch
         calls.append(_url)
         return "<html></html>"
 
-    monkeypatch.setattr(fetcher, "_render_with_httpx", fake_httpx)
-    monkeypatch.setattr(fetcher, "_render_with_playwright", lambda _url: None)
+    monkeypatch.setattr(fetcher._fetch, "_render_with_httpx", fake_httpx)
+    monkeypatch.setattr(fetcher._fetch, "_render_with_playwright", lambda _url: None)
 
     try:
         fetcher.parse_url("https://www.xiaohongshu.com/explore/abc")
@@ -665,9 +665,9 @@ def test_douyin_detail_extracts_image_album(monkeypatch):
     }
     """
     calls = {"playwright": 0}
-    monkeypatch.setattr(fetcher, "_render_with_httpx", lambda _url, **_kwargs: raw)
+    monkeypatch.setattr(fetcher._fetch, "_render_with_httpx", lambda _url, **_kwargs: raw)
     monkeypatch.setattr(
-        fetcher,
+        fetcher._fetch,
         "_render_with_playwright",
         lambda _url: calls.__setitem__("playwright", calls["playwright"] + 1),
     )
@@ -715,7 +715,7 @@ def test_douyin_detail_extracts_video_and_prefers_no_watermark(monkeypatch):
       }
     }
     """
-    monkeypatch.setattr(fetcher, "_render_with_httpx", lambda _url, **_kwargs: raw)
+    monkeypatch.setattr(fetcher._fetch, "_render_with_httpx", lambda _url, **_kwargs: raw)
 
     assets = fetcher.parse_url(
         "https://www.douyin.com/jingxuan/acg/search/foo?modal_id=7636700980432347259"
@@ -768,8 +768,8 @@ def test_douyin_detail_business_error_falls_back_to_rendered_state(monkeypatch):
         calls["playwright"] += 1
         return rendered
 
-    monkeypatch.setattr(fetcher, "_render_with_httpx", fake_httpx)
-    monkeypatch.setattr(fetcher, "_render_with_playwright", fake_playwright)
+    monkeypatch.setattr(fetcher._fetch, "_render_with_httpx", fake_httpx)
+    monkeypatch.setattr(fetcher._fetch, "_render_with_playwright", fake_playwright)
 
     assets = fetcher.parse_url(
         f"https://www.douyin.com/jingxuan/acg/search/foo?modal_id={target_id}"
@@ -847,7 +847,7 @@ def test_jd_extractor_reads_main_video(monkeypatch):
             "height": 720,
         }
 
-    monkeypatch.setattr(fetcher, "_fetch_jd_video_asset", fake_video)
+    monkeypatch.setattr(fetcher.jd, "_fetch_jd_video_asset", fake_video)
     html = """
     <html><body>
       <script>var pageConfig = {
@@ -872,7 +872,7 @@ def test_jd_extractor_reads_main_video(monkeypatch):
 
 def test_jd_video_api_jsonp_parsed(monkeypatch):
     monkeypatch.setattr(
-        fetcher,
+        fetcher._fetch,
         "_render_with_httpx",
         lambda *_args, **_kwargs: (
             'jdVideo({"duration":10,"code":0,'
@@ -907,7 +907,7 @@ def test_jd_fallback_keeps_sku_from_original_url(monkeypatch):
             final_url=url,
         )
 
-    monkeypatch.setattr(fetcher, "_render_page_with_httpx", fake_page)
+    monkeypatch.setattr(fetcher._fetch, "_render_page_with_httpx", fake_page)
 
     assets = fetcher.parse_url("https://item.jd.com/100108209840.html?from=card")
 
@@ -933,7 +933,7 @@ def test_jd_short_link_falls_back_to_pc_product_page(monkeypatch):
             final_url="https://item.jd.com/10210432712118.html",
         )
 
-    monkeypatch.setattr(fetcher, "_render_page_with_httpx", fake_page)
+    monkeypatch.setattr(fetcher._fetch, "_render_page_with_httpx", fake_page)
 
     assets = fetcher.parse_url("https://3.cn/2Tswk-cG?jkl=@S6Pp90buMlXo@")
 
@@ -967,7 +967,7 @@ def test_taobao_short_link_uses_embedded_target_url(monkeypatch):
             final_url="https://item.taobao.com/item.htm?id=954144213943",
         )
 
-    monkeypatch.setattr(fetcher, "_render_page_with_httpx", fake_page)
+    monkeypatch.setattr(fetcher._fetch, "_render_page_with_httpx", fake_page)
 
     assets = fetcher.parse_url("https://e.tb.cn/h.RsKuM6YesPztUCt?tk=ZTsRgiCip4j")
 
@@ -985,9 +985,9 @@ def test_taobao_h5_detail_fallback_extracts_product_images(monkeypatch):
             final_url=url,
         )
 
-    monkeypatch.setattr(fetcher, "_render_page_with_httpx", fake_page)
+    monkeypatch.setattr(fetcher._fetch, "_render_page_with_httpx", fake_page)
     monkeypatch.setattr(
-        fetcher,
+        fetcher._fetch,
         "_render_with_httpx",
         lambda *_args, **_kwargs: (
             'mtopjsonp1({"api":"mtop.taobao.detail.data.get","v":"1.0",'
@@ -1023,8 +1023,8 @@ def test_taobao_h5_fallback_keeps_item_id_from_original_url(monkeypatch):
             "height": None,
         }]
 
-    monkeypatch.setattr(fetcher, "_render_page_with_httpx", fake_page)
-    monkeypatch.setattr(fetcher, "_fetch_taobao_h5_detail_assets", fake_h5)
+    monkeypatch.setattr(fetcher._fetch, "_render_page_with_httpx", fake_page)
+    monkeypatch.setattr(fetcher.taobao, "_fetch_taobao_h5_detail_assets", fake_h5)
 
     assets = fetcher.parse_url("https://detail.tmall.com/item.htm?id=991767518632")
 
@@ -1033,7 +1033,7 @@ def test_taobao_h5_fallback_keeps_item_id_from_original_url(monkeypatch):
 
 def test_taobao_security_page_returns_clear_error(monkeypatch):
     monkeypatch.setattr(
-        fetcher,
+        fetcher._fetch,
         "_render_page_with_httpx",
         lambda url, **_kwargs: fetcher.RenderedPage(
             html='<a href="https://bixi.alicdn.com/punish/foo"></a><script>x5secdata=""</script>',
@@ -1041,7 +1041,7 @@ def test_taobao_security_page_returns_clear_error(monkeypatch):
         ),
     )
     monkeypatch.setattr(
-        fetcher,
+        fetcher._fetch,
         "_render_with_httpx",
         lambda *_args, **_kwargs: 'mtopjsonp1({"ret":["RGV587_ERROR::SM::login"],"data":{}})',
     )
@@ -1063,7 +1063,8 @@ def test_x_status_falls_back_to_rendered_twitter_image_meta(monkeypatch):
     </head><body></body></html>
     """
 
-    monkeypatch.setattr(fetcher, "assert_safe_url", lambda url: url)
+    monkeypatch.setattr(fetcher._urls, "assert_safe_url", lambda url: url)
+    monkeypatch.setattr(fetcher.registry, "assert_safe_url", lambda url: url)
 
     def fake_httpx(_url, **_kwargs):
         calls["httpx"] += 1
@@ -1073,8 +1074,8 @@ def test_x_status_falls_back_to_rendered_twitter_image_meta(monkeypatch):
         calls["playwright"] += 1
         return rendered
 
-    monkeypatch.setattr(fetcher, "_render_with_httpx", fake_httpx)
-    monkeypatch.setattr(fetcher, "_render_with_playwright", fake_playwright)
+    monkeypatch.setattr(fetcher._fetch, "_render_with_httpx", fake_httpx)
+    monkeypatch.setattr(fetcher._fetch, "_render_with_playwright", fake_playwright)
 
     assets = fetcher.parse_url("https://x.com/i/status/2069410454028296307")
 
@@ -1094,9 +1095,10 @@ def test_x_status_filters_profile_images_and_prioritizes_post_media(monkeypatch)
     </body></html>
     """
 
-    monkeypatch.setattr(fetcher, "assert_safe_url", lambda url: url)
-    monkeypatch.setattr(fetcher, "_render_with_httpx", lambda _url, **_kwargs: html)
-    monkeypatch.setattr(fetcher, "_render_with_playwright", lambda _url: None)
+    monkeypatch.setattr(fetcher._urls, "assert_safe_url", lambda url: url)
+    monkeypatch.setattr(fetcher.registry, "assert_safe_url", lambda url: url)
+    monkeypatch.setattr(fetcher._fetch, "_render_with_httpx", lambda _url, **_kwargs: html)
+    monkeypatch.setattr(fetcher._fetch, "_render_with_playwright", lambda _url: None)
 
     assets = fetcher.parse_url("https://twitter.com/example/status/2069410454028296307")
 
@@ -1115,9 +1117,10 @@ def test_x_status_dedupes_colon_large_media_variant(monkeypatch):
     </body></html>
     """
 
-    monkeypatch.setattr(fetcher, "assert_safe_url", lambda url: url)
-    monkeypatch.setattr(fetcher, "_render_with_httpx", lambda _url, **_kwargs: html)
-    monkeypatch.setattr(fetcher, "_render_with_playwright", lambda _url: None)
+    monkeypatch.setattr(fetcher._urls, "assert_safe_url", lambda url: url)
+    monkeypatch.setattr(fetcher.registry, "assert_safe_url", lambda url: url)
+    monkeypatch.setattr(fetcher._fetch, "_render_with_httpx", lambda _url, **_kwargs: html)
+    monkeypatch.setattr(fetcher._fetch, "_render_with_playwright", lambda _url: None)
 
     assets = fetcher.parse_url("https://x.com/i/status/2070441131263893801")
 
@@ -1138,9 +1141,9 @@ def test_weixin_extracts_data_src_and_upgrades_resolution(monkeypatch):
     </body></html>
     """
     calls = {"playwright": 0}
-    monkeypatch.setattr(fetcher, "_render_with_httpx", lambda _url, **_kwargs: html)
+    monkeypatch.setattr(fetcher._fetch, "_render_with_httpx", lambda _url, **_kwargs: html)
     monkeypatch.setattr(
-        fetcher, "_render_with_playwright",
+        fetcher._fetch, "_render_with_playwright",
         lambda _url: calls.__setitem__("playwright", calls["playwright"] + 1),
     )
 
@@ -1171,9 +1174,9 @@ def test_douyin_render_prefers_target_keyed_only_by_group_id(monkeypatch):
       </script>
     </body></html>
     """
-    monkeypatch.setattr(fetcher, "_render_with_httpx", lambda _url, **_kwargs:
+    monkeypatch.setattr(fetcher._fetch, "_render_with_httpx", lambda _url, **_kwargs:
                         (_ for _ in ()).throw(ValueError("need verify")))
-    monkeypatch.setattr(fetcher, "_render_with_playwright", lambda _url: rendered)
+    monkeypatch.setattr(fetcher._fetch, "_render_with_playwright", lambda _url: rendered)
 
     assets = fetcher.parse_url(
         f"https://www.douyin.com/video/{target_id}"
@@ -1220,9 +1223,10 @@ def test_x_status_extracts_video_post_media(monkeypatch):
     </body></html>
     """
 
-    monkeypatch.setattr(fetcher, "assert_safe_url", lambda url: url)
-    monkeypatch.setattr(fetcher, "_render_with_httpx", lambda _url, **_kwargs: html)
-    monkeypatch.setattr(fetcher, "_render_with_playwright", lambda _url: None)
+    monkeypatch.setattr(fetcher._urls, "assert_safe_url", lambda url: url)
+    monkeypatch.setattr(fetcher.registry, "assert_safe_url", lambda url: url)
+    monkeypatch.setattr(fetcher._fetch, "_render_with_httpx", lambda _url, **_kwargs: html)
+    monkeypatch.setattr(fetcher._fetch, "_render_with_playwright", lambda _url: None)
 
     assets = fetcher.parse_url("https://x.com/i/status/2069410454028296307")
 

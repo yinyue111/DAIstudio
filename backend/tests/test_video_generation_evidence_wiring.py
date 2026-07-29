@@ -5,8 +5,8 @@
 prompt 通常只带 final_text。本文件验证：
 
 - /api/generate 视频请求携带反推血缘时，编译器输入被合并进证据分镜，
-  最终提交给网关的提示词包含 verified 动作原文与 vlm_only 动作的
-  "依据抽样帧推断"如实措辞，task.params 里留下 shot_evidence 标记；
+  最终提交给网关的提示词包含 verified 与 vlm_only 动作原文，
+  但不包含源时间戳或证据注释，task.params 里单独留下 shot_evidence 标记；
 - 存库的 task.prompt 不被改写（请求指纹与旧版一致）；
 - 不带血缘的请求走旧路径，编译结果与改动前完全一致；
 - Worker 的 legacy 重编译路径（_compile_legacy_video_prompt）对带血缘的
@@ -204,10 +204,13 @@ def test_generate_with_reverse_lineage_submits_evidence_gated_motion(
     )
 
     assert response.status_code == 200, response.text
-    # verified 动作按原文写入，不带推断措辞；vlm_only 动作保留但如实标注。
+    # 两类动作都以可执行原文写入，证据状态只存元数据。
     assert VERIFIED_ACTION in submitted["prompt"]
     assert f"{VERIFIED_ACTION}{UNVERIFIED_EVIDENCE_SUFFIX}" not in submitted["prompt"]
-    assert f"{VLM_ONLY_ACTION}{UNVERIFIED_EVIDENCE_SUFFIX}" in submitted["prompt"]
+    assert VLM_ONLY_ACTION in submitted["prompt"]
+    assert UNVERIFIED_EVIDENCE_SUFFIX not in submitted["prompt"]
+    assert "0.000-2.000s" not in submitted["prompt"]
+    assert "2.000-4.000s" not in submitted["prompt"]
 
     with SessionLocal() as db:
         task = db.get(GenTask, response.json()["id"])
@@ -317,7 +320,9 @@ def test_legacy_worker_recompile_walks_evidence_path_for_lineage_tasks(
             task, model, {"duration": 10}, db=db
         )
     assert VERIFIED_ACTION in prompt
-    assert f"{VLM_ONLY_ACTION}{UNVERIFIED_EVIDENCE_SUFFIX}" in prompt
+    assert VLM_ONLY_ACTION in prompt
+    assert UNVERIFIED_EVIDENCE_SUFFIX not in prompt
+    assert "0.000-2.000s" not in prompt
     assert persisted["_video_shot_evidence"][0]["action"]["verified"] is True
     # 编译输入合并不回写 task.prompt。
     assert "video_analysis" not in task.prompt

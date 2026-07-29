@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { readStudioSource } from "./studio-source.mjs";
 
 import {
   clearPendingReverseRequest,
@@ -10,7 +11,7 @@ import {
 
 const profileIdentity = await import("../lib/studioSubjectProfile.js").catch(() => ({}));
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
-const pageSource = readFileSync(join(root, "app/page.jsx"), "utf8");
+const pageSource = readStudioSource(root);
 const uploadSource = readFileSync(join(root, "hooks/useMediaUpload.js"), "utf8");
 const submitSource = readFileSync(join(root, "hooks/useGenerationSubmit.js"), "utf8");
 
@@ -174,8 +175,8 @@ assert.notEqual(
   "different subject-profile requests must not share a signature",
 );
 
-assert.match(pageSource, /const subjectProfilePendingRequestRef = useRef\(null\)/);
-assert.match(pageSource, /const subjectProfileResultCacheRef = useRef\(null\)/);
+assert.match(pageSource, /subjectProfilePendingRequestRef:\s*useRef\(null\)/);
+assert.match(pageSource, /subjectProfileResultCacheRef:\s*useRef\(null\)/);
 assert.equal(
   (pageSource.match(/subjectProfilePendingRequestRef,/g) || []).length >= 2,
   true,

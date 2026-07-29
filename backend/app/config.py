@@ -236,7 +236,7 @@ class Settings(BaseSettings):
     # A timed-out reverse request may still finish and be billed upstream.
     # Do not replay it automatically unless the provider offers idempotency.
     reverse_gateway_max_retries: int = 0
-    reverse_gateway_max_tokens: int = 4096
+    reverse_gateway_max_tokens: int = 8192
     reverse_gateway_reasoning_effort: str = "medium"
     # Local signal analysis is independent from the optional transcription
     # gateway so beat/music/transient evidence remains available without ASR.

@@ -1,0 +1,3 @@
+/ws/events	user_events
+/ws/prompt/reverse-operations/{operation_id}	reverse_operation_progress
+/ws/tasks/{task_id}	task_progress

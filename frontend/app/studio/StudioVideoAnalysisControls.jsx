@@ -1,24 +1,12 @@
 "use client";
 
 import { Plus, Trash2 } from "lucide-react";
-import { useEffect, useMemo, useState } from "react";
-import { api } from "../../lib/api";
+import { useState } from "react";
 import { MAX_REVERSE_SOURCE_RANGES } from "./reverseConfig";
-import {
-  loadReverseAnalyzerHealth,
-  summarizeAudioAnalyzerHealth,
-  summarizeVideoAnalyzerHealth,
-} from "./reverseAnalyzerHealth";
 
 function finiteNumber(value, fallback = 0) {
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : fallback;
-}
-
-function capabilityClassName(status) {
-  if (status === "available") return "border-good/35 text-good";
-  if (["partial", "degraded"].includes(status)) return "border-warn/35 text-warn";
-  return "border-line text-fog";
 }
 
 export default function StudioVideoAnalysisControls({
@@ -32,54 +20,10 @@ export default function StudioVideoAnalysisControls({
 }) {
   const [keyframeInput, setKeyframeInput] = useState("");
   const [keyframeError, setKeyframeError] = useState("");
-  const [analyzerStatus, setAnalyzerStatus] = useState(null);
-  const [analyzerStatusLoading, setAnalyzerStatusLoading] = useState(true);
-  const [analyzerStatusError, setAnalyzerStatusError] = useState("");
   const ranges = Array.isArray(config.source_ranges) && config.source_ranges.length
     ? config.source_ranges
     : config.source_range ? [config.source_range] : [];
   const keyframes = Array.isArray(config.custom_keyframes) ? config.custom_keyframes : [];
-  const audioHealth = useMemo(
-    () => summarizeAudioAnalyzerHealth(analyzerStatus),
-    [analyzerStatus],
-  );
-  const videoHealth = useMemo(
-    () => summarizeVideoAnalyzerHealth(analyzerStatus),
-    [analyzerStatus],
-  );
-
-  useEffect(() => {
-    let cancelled = false;
-    setAnalyzerStatusLoading(true);
-    loadReverseAnalyzerHealth(() => api.reverseAnalyzerStatus())
-      .then((result) => {
-        if (cancelled) return;
-        setAnalyzerStatus(result);
-        setAnalyzerStatusError("");
-      })
-      .catch(() => {
-        if (cancelled) return;
-        setAnalyzerStatus(null);
-        setAnalyzerStatusError("分析能力状态读取失败，提交后以后端实际分析结果为准。");
-      })
-      .finally(() => {
-        if (!cancelled) setAnalyzerStatusLoading(false);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, []);
-
-  useEffect(() => {
-    if (
-      !analyzerStatusLoading
-      && analyzerStatus
-      && audioHealth.explicitlyUnavailable
-      && config.include_audio
-    ) {
-      onChange?.({ ...config, include_audio: false });
-    }
-  }, [analyzerStatusLoading, analyzerStatus, audioHealth.explicitlyUnavailable, config, onChange]);
 
   function patch(next) {
     onChange?.({ ...config, ...next });
@@ -162,41 +106,6 @@ export default function StudioVideoAnalysisControls({
             </button>
           );
         })}
-      </div>
-
-      <div className="mt-2 border-t border-line pt-2" aria-live="polite">
-        <div className="flex items-center justify-between gap-2">
-          <span className="text-[11px] font-display font-medium text-mist">视觉证据能力</span>
-          <span className="text-[10px] text-fog">按当前服务环境</span>
-        </div>
-        {analyzerStatusLoading ? (
-          <p className="mt-1 text-[10px] text-fog">正在读取视频分析能力…</p>
-        ) : analyzerStatusError ? (
-          <p className="mt-1 text-[10px] leading-relaxed text-warn" role="alert">
-            {analyzerStatusError}
-          </p>
-        ) : (
-          <>
-            <p className="mt-1 text-[10px] leading-relaxed text-fog">{videoHealth.summary}</p>
-            <div className="mt-1 flex flex-wrap gap-1" aria-label="视频视觉分析器能力状态">
-              {videoHealth.capabilities.map((capability) => (
-                <span
-                  key={capability.key}
-                  className={`border px-1.5 py-0.5 text-[10px] ${capabilityClassName(capability.status)}`}
-                  title={capability.reason || undefined}
-                  aria-label={`${capability.label}：${capability.statusLabel}${
-                    capability.reason ? `，${capability.reason}` : ""
-                  }`}
-                >
-                  {capability.label} · {capability.statusLabel}
-                </span>
-              ))}
-            </div>
-            {videoHealth.issues && (
-              <p className="mt-1 text-[10px] leading-relaxed text-warn">{videoHealth.issues}</p>
-            )}
-          </>
-        )}
       </div>
 
       <label className="mt-2 flex min-h-11 items-center justify-between gap-3 rounded-lg border border-line bg-white/[0.035] px-2.5 py-2">
@@ -319,51 +228,6 @@ export default function StudioVideoAnalysisControls({
         )}
       </div>
 
-      <label className="mt-2 flex min-h-11 items-center justify-between gap-3 rounded-lg border border-line bg-white/[0.035] px-2.5 py-2">
-        <span>
-          <span className="block text-xs font-display font-medium text-mist">音频证据分析</span>
-          <span className="block text-[10px] text-fog">按当前环境提取对白、说话人、音乐倾向、节拍和瞬态声学事件</span>
-        </span>
-        <input
-          type="checkbox"
-          className="h-4 w-4 accent-brand"
-          checked={Boolean(config.include_audio)}
-          disabled={disabled || !timelineEnabled || (
-            !analyzerStatusLoading
-            && Boolean(analyzerStatus)
-            && audioHealth.explicitlyUnavailable
-          )}
-          onChange={(event) => patch({ include_audio: event.target.checked })}
-        />
-      </label>
-      <div className="mt-1.5 text-[10px] leading-relaxed text-fog" aria-live="polite">
-        {analyzerStatusLoading ? (
-          <p>正在读取音频分析能力…</p>
-        ) : analyzerStatusError ? (
-          <p className="text-warn">{analyzerStatusError}</p>
-        ) : (
-          <>
-            <p className={audioHealth.explicitlyUnavailable ? "text-warn" : ""}>{audioHealth.summary}</p>
-            <div className="mt-1 flex flex-wrap gap-1" aria-label="音频分析器能力状态">
-              {audioHealth.capabilities.map((capability) => (
-                <span
-                  key={capability.key}
-                  className={`border px-1.5 py-0.5 ${capabilityClassName(capability.status)}`}
-                  title={capability.reason || undefined}
-                  aria-label={`${capability.label}：${capability.statusLabel}${
-                    capability.reason ? `，${capability.reason}` : ""
-                  }`}
-                >
-                  {capability.label} · {capability.statusLabel}
-                </span>
-              ))}
-            </div>
-            {audioHealth.issues && (
-              <p className="mt-1 text-warn">{audioHealth.issues}</p>
-            )}
-          </>
-        )}
-      </div>
     </section>
   );
 }

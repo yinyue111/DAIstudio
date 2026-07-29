@@ -17,7 +17,14 @@ from app.models import (
     UserPrompt,
 )
 from app.routers import prompt
-from app.services import credits, gateway, reverse_lineage, reverse_operations
+from app.services import (
+    credits,
+    gateway,
+    reverse_lineage,
+    reverse_operations,
+    reverse_runner,
+    reverse_source_resolution,
+)
 from tests.reverse_helpers import post_reverse, post_reverse_retry
 
 
@@ -39,6 +46,19 @@ def _stub_reverse_dependencies(monkeypatch, *, result=None):
     monkeypatch.setattr(
         prompt, "_gateway_ref", lambda *_args, **_kwargs: "data:image/jpeg;base64,YQ=="
     )
+    monkeypatch.setattr(
+        reverse_source_resolution,
+        "gateway_ref",
+        lambda *_args, **_kwargs: "data:image/jpeg;base64,YQ==",
+    )
+    monkeypatch.setattr(
+        reverse_source_resolution,
+        "gateway_ref_with_content_hash",
+        lambda *_args, **_kwargs: (
+            "data:image/jpeg;base64,YQ==",
+            "ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb",
+        ),
+    )
     monkeypatch.setattr(reverse_operations, "assert_text_allowed", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(reverse_operations.usage, "record_call", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(reverse_operations, "_remember_history", lambda *_args, **_kwargs: None)
@@ -56,6 +76,29 @@ def _stub_quoted_provider_cost(monkeypatch, policy: dict) -> None:
     monkeypatch.setattr(reverse_operations, "reverse_pricing_snapshot", with_provider_cost)
 
 
+def test_video_ref_collection_passes_preset_capacity_for_shot_aware_sampling(monkeypatch):
+    captured = {}
+
+    def fake_collect_refs(*_args, **kwargs):
+        captured.update(kwargs)
+        return ["data:image/jpeg;base64,YQ=="], {"analysis_mode": "keyframes"}, []
+
+    monkeypatch.setattr(reverse_source_resolution, "collect_refs", fake_collect_refs)
+    state = reverse_runner._OperationRunState(
+        operation_id=1,
+        db=SimpleNamespace(),
+        user=SimpleNamespace(id=1),
+        body=SimpleNamespace(target="video"),
+        runtime=SimpleNamespace(source="db"),
+        preset="fine",
+        is_video_source=True,
+    )
+
+    assert reverse_runner._collect_operation_refs(state) is True
+    assert captured["frame_budget"] == 22
+    assert captured["video_preset"] == "fine"
+
+
 def test_workspace_snapshot_preserves_video_duration():
     snapshot = reverse_operations.sanitize_workspace_snapshot(
         {
@@ -69,6 +112,25 @@ def test_workspace_snapshot_preserves_video_duration():
     )
 
     assert snapshot["selected"]["duration"] == 6.016
+
+
+def test_video_analysis_report_requires_model_frame_coverage():
+    state = SimpleNamespace(
+        operation=SimpleNamespace(template_snapshot={}),
+        body=SimpleNamespace(output_purpose="analysis_report", target="video"),
+        gateway_target="video",
+        is_video_source=True,
+        runtime=None,
+        video_analysis={"sampled_frames": [{"index": 1}]},
+        preset="fine",
+        real_cost=5,
+        audio_result=None,
+        operation_id=1,
+    )
+
+    kwargs = reverse_runner._operation_gateway_kwargs(state)
+
+    assert kwargs["require_video_frame_coverage"] is True
 
 
 def test_provider_cost_detail_uses_actual_visual_path_and_audio_evidence():
@@ -850,7 +912,7 @@ def test_settlement_boundary_rebuilds_visual_prompt_and_preserves_provider_text(
     )
 
     assert result["provider_final_text"] == provider_text
-    assert result["final_text"] == "红色产品；柔和侧光；镜头1（0.000-1.000秒）：产品居中"
+    assert result["final_text"] == "红色产品；柔和侧光；镜头1：产品居中"
     assert result["structured"]["未知审计字段"] == "证据帧中有BUY NOW"
     for forbidden in ("欢迎回来", "限时优惠", "BUY NOW", "OCR", "证据帧"):
         assert forbidden not in result["final_text"]
@@ -1499,8 +1561,8 @@ def test_video_cover_confirmation_settles_reverse_price(
     _stub_reverse_dependencies(monkeypatch)
     seen_targets = []
     monkeypatch.setattr(
-        prompt,
-        "_collect_refs",
+        reverse_source_resolution,
+        "collect_refs",
         lambda *_args, **_kwargs: (
             ["data:image/jpeg;base64,YQ=="],
             {
@@ -1699,8 +1761,8 @@ def test_cover_confirmation_broker_error_after_worker_claim_keeps_worker_result(
     _stub_reverse_dependencies(monkeypatch)
     gateway_calls = []
     monkeypatch.setattr(
-        prompt,
-        "_collect_refs",
+        reverse_source_resolution,
+        "collect_refs",
         lambda *_args, **_kwargs: (
             ["data:image/jpeg;base64,YQ=="],
             {
@@ -1994,8 +2056,8 @@ def test_legacy_reverse_returns_deprecated_409_for_cover_confirmation(
     _stub_reverse_dependencies(monkeypatch)
     monkeypatch.setattr(prompt.settings, "mock_mode", False)
     monkeypatch.setattr(
-        prompt,
-        "_collect_refs",
+        reverse_source_resolution,
+        "collect_refs",
         lambda *_args, **_kwargs: (
             ["data:image/jpeg;base64,YQ=="],
             {

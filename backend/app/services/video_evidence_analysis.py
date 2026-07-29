@@ -8,65 +8,56 @@ import io
 import json
 import math
 import re
-import threading
-import time
 from collections.abc import Callable
-from copy import deepcopy
-from datetime import datetime, timezone
 from typing import Any
 
 from PIL import Image
 
-from ..config import settings
-from . import gateway, image_evidence_analysis
+from . import image_evidence_analysis
+from . import video_evidence_motion as _video_evidence_motion
+from . import video_evidence_semantic as _video_evidence_semantic
+from .compat_facade import install_assignment_forwarding as _install_assignment_forwarding
 
 CONTRACT_VERSION = "video-evidence.v1"
-SEMANTIC_CONTRACT_VERSION = "video-semantic-evidence.v1"
-# 光流运镜分类的封闭标签集：下游证据门用它和 VLM 的运镜文本做标签级对账。
-CAMERA_MOTION_LABELS = ("pan", "tilt", "zoom", "static")
-# 每个标签允许的方向取值（static 无方向）。
-CAMERA_MOTION_DIRECTIONS = {
-    "pan": ("left", "right"),
-    "tilt": ("up", "down"),
-    "zoom": ("in", "out"),
-    "static": (),
-}
+SEMANTIC_CONTRACT_VERSION = _video_evidence_semantic.SEMANTIC_CONTRACT_VERSION
+SEMANTIC_CAPABILITIES = _video_evidence_semantic.SEMANTIC_CAPABILITIES
+_SEMANTIC_EVIDENCE_KEYS = _video_evidence_semantic._SEMANTIC_EVIDENCE_KEYS
+_SEMANTIC_EVIDENCE_PREFIXES = _video_evidence_semantic._SEMANTIC_EVIDENCE_PREFIXES
+_PROVIDER_LAST_SUCCESS = _video_evidence_semantic._PROVIDER_LAST_SUCCESS
+_PROVIDER_HEALTH_CACHE = _video_evidence_semantic._PROVIDER_HEALTH_CACHE
+_PROVIDER_STATE_LOCK = _video_evidence_semantic._PROVIDER_STATE_LOCK
+_PROVIDER_HEALTH_PROBE_LOCK = _video_evidence_semantic._PROVIDER_HEALTH_PROBE_LOCK
+_MAX_SEMANTIC_FRAMES = _video_evidence_semantic._MAX_SEMANTIC_FRAMES
+_semantic_runtime_config = _video_evidence_semantic._semantic_runtime_config
+_semantic_capability_status = _video_evidence_semantic._semantic_capability_status
+_semantic_failure = _video_evidence_semantic._semantic_failure
+_normalize_semantic_provider_response = (
+    _video_evidence_semantic._normalize_semantic_provider_response
+)
+_record_semantic_provider_success = (
+    _video_evidence_semantic._record_semantic_provider_success
+)
+http_semantic_provider = _video_evidence_semantic.http_semantic_provider
+_semantic_provider_health = _video_evidence_semantic._semantic_provider_health
+settings = _video_evidence_semantic.settings
+gateway = _video_evidence_semantic.gateway
+time = _video_evidence_semantic.time
+
+CAMERA_MOTION_LABELS = _video_evidence_motion.CAMERA_MOTION_LABELS
+CAMERA_MOTION_DIRECTIONS = _video_evidence_motion.CAMERA_MOTION_DIRECTIONS
+cv2_motion_analysis = _video_evidence_motion.cv2_motion_analysis
 # ffmpeg 硬切没有 lavfi 分值时的保守默认置信度。
 DEFAULT_CUT_TRANSITION_CONFIDENCE = 0.5
-SEMANTIC_CAPABILITIES = ("subject_tracking", "pose", "action", "transition")
-_SEMANTIC_EVIDENCE_KEYS = {
-    "subject_tracking": "tracks",
-    "pose": "observations",
-    "action": "events",
-    "transition": "events",
-}
-_SEMANTIC_EVIDENCE_PREFIXES = {
-    "subject_tracking": "subject-track-",
-    "pose": "pose-",
-    "action": "action-",
-    "transition": "transition-",
-}
 _PROVIDER_EVIDENCE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$", re.ASCII)
-_PROVIDER_LAST_SUCCESS: dict[str, Any] = {}
-_PROVIDER_HEALTH_CACHE: dict[str, tuple[str, float, dict[str, Any]]] = {}
-_PROVIDER_STATE_LOCK = threading.RLock()
-_PROVIDER_HEALTH_PROBE_LOCK = threading.Lock()
 _MAX_PROVIDER_ROWS = 512
 _MAX_TRACK_OBSERVATIONS = 256
 _MAX_POSE_KEYPOINTS = 128
-_MAX_SEMANTIC_FRAMES = 64
 _MIN_VIDEO_OCR_CONFIDENCE = 0.70
 _MIN_SHORT_VIDEO_OCR_CONFIDENCE = 0.85
-
-
-def _semantic_runtime_config() -> dict[str, Any]:
-    return {
-        "url": str(settings.video_evidence_semantic_url or "").strip(),
-        "api_key": str(settings.video_evidence_semantic_api_key or "").strip(),
-        "timeout_seconds": settings.video_evidence_semantic_timeout_seconds,
-        "health_url": str(settings.video_evidence_semantic_health_url or "").strip(),
-        "health_timeout_seconds": settings.video_evidence_semantic_health_timeout_seconds,
-    }
+_VIDEO_GENERATION_WATERMARK_RE = re.compile(
+    r"^(?:(?:豆包|即梦|可灵)\s*)?(?:AI\s*)?生成$",
+    re.IGNORECASE,
+)
 
 
 def _aggregate_analyzer_status(statuses: list[dict[str, Any]]) -> str:
@@ -252,43 +243,6 @@ def _known_frame(
     if not math.isclose(timestamp, expected, abs_tol=0.001):
         raise ValueError(f"{path}.absolute_timestamp_seconds does not match the sampled frame")
     return frame_index, round(expected, 3), frame
-
-
-def _semantic_capability_status(
-    capability: str,
-    status: str,
-    *,
-    analyzer: str,
-    analyzer_version: str,
-    evidence: list[dict[str, Any]] | None = None,
-    reason: str | None = None,
-) -> dict[str, Any]:
-    rows = evidence or []
-    return {
-        "status": status,
-        "analyzer": analyzer,
-        "analyzer_version": analyzer_version,
-        "evidence_count": len(rows),
-        "degraded_reason": reason,
-        _SEMANTIC_EVIDENCE_KEYS[capability]: rows,
-    }
-
-
-def _semantic_failure(status: str, reason: str) -> dict[str, Any]:
-    analyzer = "http_video_semantic_provider"
-    return {
-        "contract_version": SEMANTIC_CONTRACT_VERSION,
-        **{
-            capability: _semantic_capability_status(
-                capability,
-                status,
-                analyzer=analyzer,
-                analyzer_version="unconfigured" if status == "unsupported" else "unknown",
-                reason=reason,
-            )
-            for capability in SEMANTIC_CAPABILITIES
-        },
-    }
 
 
 def _validate_subject_tracks(
@@ -642,376 +596,6 @@ def _validate_transition_events(
     return rows, provider_ids
 
 
-def _normalize_semantic_provider_response(
-    payload: Any,
-    *,
-    frames: list[dict[str, Any]],
-) -> dict[str, Any]:
-    if not isinstance(payload, dict):
-        raise ValueError("semantic provider response must be an object")
-    if payload.get("contract_version") != SEMANTIC_CONTRACT_VERSION:
-        raise ValueError(f"semantic provider must return {SEMANTIC_CONTRACT_VERSION}")
-    analyzer = _provider_label(
-        payload.get("analyzer"), path="semantic provider response.analyzer"
-    )
-    analyzer_version = _provider_label(
-        payload.get("analyzer_version"), path="semantic provider response.analyzer_version"
-    )
-    capabilities = payload.get("capabilities")
-    if not isinstance(capabilities, dict):
-        raise ValueError("semantic provider response.capabilities must be an object")
-    if set(capabilities) != set(SEMANTIC_CAPABILITIES):
-        raise ValueError(
-            "semantic provider response.capabilities must contain exactly "
-            + ", ".join(SEMANTIC_CAPABILITIES)
-        )
-    lookup = _frame_lookup(frames)
-    if not lookup:
-        raise ValueError("semantic analysis requires at least one decoded sampled frame")
-    bounds = _segment_bounds(lookup)
-    normalized: dict[str, Any] = {"contract_version": SEMANTIC_CONTRACT_VERSION}
-    subjects: dict[str, dict[str, Any]] = {}
-    used_provider_ids: set[str] = set()
-
-    for capability in SEMANTIC_CAPABILITIES:
-        raw = capabilities.get(capability)
-        try:
-            if not isinstance(raw, dict):
-                raise ValueError(f"capabilities.{capability} must be an object")
-            status = raw.get("status")
-            if status not in {"analyzed", "partial", "unsupported", "degraded"}:
-                raise ValueError(f"capabilities.{capability}.status is invalid")
-            evidence = raw.get("evidence")
-            reason = _provider_reason(
-                raw.get("degraded_reason"),
-                path=f"capabilities.{capability}.degraded_reason",
-                required=status in {"partial", "unsupported", "degraded"},
-            )
-            if status in {"unsupported", "degraded"}:
-                if evidence != []:
-                    raise ValueError(
-                        f"capabilities.{capability} cannot return evidence with status={status}"
-                    )
-                normalized[capability] = _semantic_capability_status(
-                    capability,
-                    str(status),
-                    analyzer=analyzer,
-                    analyzer_version=analyzer_version,
-                    reason=reason,
-                )
-                continue
-            if status == "analyzed" and reason:
-                raise ValueError(
-                    f"capabilities.{capability} analyzed response cannot include degraded_reason"
-                )
-            if capability == "subject_tracking":
-                rows, validated_subjects, provider_ids = _validate_subject_tracks(
-                    evidence,
-                    lookup=lookup,
-                    bounds=bounds,
-                )
-                subjects = validated_subjects
-            elif capability == "pose":
-                rows, provider_ids = _validate_pose_observations(
-                    evidence,
-                    lookup=lookup,
-                    bounds=bounds,
-                    subjects=subjects,
-                )
-            elif capability == "action":
-                rows, provider_ids = _validate_action_events(
-                    evidence,
-                    lookup=lookup,
-                    bounds=bounds,
-                    subjects=subjects,
-                )
-            else:
-                rows, provider_ids = _validate_transition_events(
-                    evidence,
-                    lookup=lookup,
-                    bounds=bounds,
-                )
-            duplicate_ids = used_provider_ids & provider_ids
-            if duplicate_ids:
-                raise ValueError(
-                    f"capabilities.{capability} reused provider evidence ids: "
-                    + ", ".join(sorted(duplicate_ids)[:3])
-                )
-            used_provider_ids.update(provider_ids)
-            effective_status = str(status)
-            if not rows:
-                effective_status = "partial"
-                reason = reason or "provider 未返回可验证的独立证据"
-            normalized[capability] = _semantic_capability_status(
-                capability,
-                effective_status,
-                analyzer=analyzer,
-                analyzer_version=analyzer_version,
-                evidence=rows,
-                reason=reason,
-            )
-        except Exception as exc:  # noqa: BLE001
-            if capability == "subject_tracking":
-                subjects = {}
-            normalized[capability] = _semantic_capability_status(
-                capability,
-                "degraded",
-                analyzer=analyzer,
-                analyzer_version=analyzer_version,
-                reason=str(exc)[:200],
-            )
-    return normalized
-
-
-def _record_semantic_provider_success(result: dict[str, Any], *, source: str) -> None:
-    analyzer = "http_video_semantic_provider"
-    analyzer_version = "unknown"
-    capability_statuses: dict[str, str] = {}
-    for capability in SEMANTIC_CAPABILITIES:
-        status = result.get(capability)
-        if not isinstance(status, dict):
-            continue
-        analyzer = str(status.get("analyzer") or analyzer)
-        analyzer_version = str(status.get("analyzer_version") or analyzer_version)
-        capability_statuses[capability] = str(status.get("status") or "degraded")
-    record = {
-        "last_success_at": datetime.now(timezone.utc).isoformat(),
-        "last_success_source": source,
-        "last_analyzer": analyzer,
-        "last_analyzer_version": analyzer_version,
-        "last_capability_statuses": capability_statuses,
-    }
-    with _PROVIDER_STATE_LOCK:
-        _PROVIDER_LAST_SUCCESS.clear()
-        _PROVIDER_LAST_SUCCESS.update(record)
-        _PROVIDER_HEALTH_CACHE.clear()
-
-
-def http_semantic_provider(
-    images: list[Image.Image],
-    frames: list[dict[str, Any]],
-) -> dict[str, Any]:
-    """Call the configured video semantic analyzer with a bounded strict contract."""
-    config = _semantic_runtime_config()
-    url = config["url"]
-    api_key = config["api_key"]
-    if not url:
-        return _semantic_failure("unsupported", "video semantic provider 未配置")
-    if not images or len(images) != len(frames):
-        return _semantic_failure("degraded", "video semantic provider 缺少对应的抽样帧")
-    if len(images) > _MAX_SEMANTIC_FRAMES:
-        return _semantic_failure("degraded", "video semantic provider 单次最多接收 64 个抽样帧")
-    try:
-        timeout = min(
-            120,
-            max(1, int(config["timeout_seconds"])),
-        )
-    except (TypeError, ValueError):
-        return _semantic_failure("degraded", "video semantic provider timeout 配置无效")
-    request_frames: list[dict[str, Any]] = []
-    try:
-        for image, frame in zip(images, frames, strict=True):
-            buffer = io.BytesIO()
-            image.save(buffer, format="PNG")
-            frame_index = _positive_index(
-                frame.get("frame_index"), path="sampled_frames[].frame_index"
-            )
-            segment = _positive_index(
-                frame.get("source_segment_index"),
-                path="sampled_frames[].source_segment_index",
-            )
-            timestamp = _finite_number(
-                frame.get("timestamp_seconds"),
-                path="sampled_frames[].absolute_timestamp_seconds",
-                minimum=0,
-            )
-            request_frames.append({
-                "frame_index": frame_index,
-                "absolute_timestamp_seconds": round(timestamp, 3),
-                "source_segment_index": segment,
-                "source_content_hash": str(frame.get("source_content_hash") or ""),
-                "width": image.width,
-                "height": image.height,
-                "image_media_type": "image/png",
-                "image_base64": base64.b64encode(buffer.getvalue()).decode("ascii"),
-            })
-        payload = gateway._request_json(
-            "POST",
-            url,
-            headers={"Authorization": f"Bearer {api_key}"} if api_key else {},
-            payload={
-                "contract_version": SEMANTIC_CONTRACT_VERSION,
-                "capabilities": list(SEMANTIC_CAPABILITIES),
-                "frames": request_frames,
-            },
-            timeout=timeout,
-            retries=0,
-            trusted_hosts=settings.trusted_analyzer_host_list,
-        )
-        result = _normalize_semantic_provider_response(payload, frames=frames)
-        if any(
-            result[capability].get("status") in {"analyzed", "partial"}
-            and int(result[capability].get("evidence_count") or 0) > 0
-            for capability in SEMANTIC_CAPABILITIES
-        ):
-            _record_semantic_provider_success(result, source="analysis")
-        return result
-    except Exception as exc:  # noqa: BLE001
-        return _semantic_failure("degraded", str(exc)[:200])
-
-
-def _semantic_provider_health() -> dict[str, Any]:
-    config = _semantic_runtime_config()
-    url = config["url"]
-    health_url = config["health_url"]
-    api_key = config["api_key"]
-    analyzer = "http_video_semantic_provider"
-    if not url:
-        return {
-            "status": "unsupported",
-            "analyzer": analyzer,
-            "configured": False,
-            "verification_status": "unconfigured",
-            "health_url_configured": False,
-            "degraded_reason": "video semantic provider 未配置",
-        }
-    with _PROVIDER_STATE_LOCK:
-        last_success = deepcopy(_PROVIDER_LAST_SUCCESS)
-    if not health_url:
-        if last_success:
-            return {
-                "status": "available",
-                "analyzer": analyzer,
-                "configured": True,
-                "verification_status": "last_success",
-                "health_url_configured": False,
-                "degraded_reason": None,
-                **last_success,
-            }
-        return {
-            "status": "degraded",
-            "analyzer": analyzer,
-            "configured": True,
-            "verification_status": "configured_unverified",
-            "health_url_configured": False,
-            "degraded_reason": "provider 已配置，但尚无 health probe 或成功分析记录",
-        }
-    cache_key = hashlib.sha256(json.dumps(
-        {
-            "url": url,
-            "health_url": health_url,
-            "api_key_sha256": hashlib.sha256(api_key.encode()).hexdigest(),
-            "timeout": config["health_timeout_seconds"],
-        },
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode()).hexdigest()
-
-    def cached_result() -> dict[str, Any] | None:
-        now = time.monotonic()
-        with _PROVIDER_STATE_LOCK:
-            cached = _PROVIDER_HEALTH_CACHE.get("semantic")
-            if cached and cached[0] == cache_key and cached[1] > now:
-                return deepcopy(cached[2])
-            if cached:
-                _PROVIDER_HEALTH_CACHE.pop("semantic", None)
-        return None
-
-    cached = cached_result()
-    if cached is not None:
-        return cached
-
-    with _PROVIDER_HEALTH_PROBE_LOCK:
-        cached = cached_result()
-        if cached is not None:
-            return cached
-        with _PROVIDER_STATE_LOCK:
-            last_success = deepcopy(_PROVIDER_LAST_SUCCESS)
-        try:
-            timeout = min(10, max(1, int(config["health_timeout_seconds"])))
-            payload = gateway._request_json(
-                "GET",
-                health_url,
-                headers={"Authorization": f"Bearer {api_key}"} if api_key else {},
-                payload=None,
-                timeout=timeout,
-                retries=0,
-                trusted_hosts=settings.trusted_analyzer_host_list,
-            )
-            if not isinstance(payload, dict):
-                raise ValueError("health response must be an object")
-            if payload.get("contract_version") != SEMANTIC_CONTRACT_VERSION:
-                raise ValueError(
-                    f"health response.contract_version must be {SEMANTIC_CONTRACT_VERSION}"
-                )
-            health_status = str(payload.get("status") or "").strip().lower()
-            if payload.get("ok") is not True and health_status not in {
-                "ok", "healthy", "available", "ready",
-            }:
-                raise ValueError("health response did not report ready")
-            provider_analyzer = _provider_label(
-                payload.get("analyzer"), path="health response.analyzer"
-            )
-            version = _provider_label(
-                payload.get("analyzer_version"),
-                path="health response.analyzer_version",
-            )
-            capability_statuses = payload.get("capability_statuses")
-            if not isinstance(capability_statuses, dict):
-                raise ValueError("health response.capability_statuses must be an object")
-            if set(capability_statuses) != set(SEMANTIC_CAPABILITIES) or any(
-                value not in {"available", "degraded", "unsupported"}
-                for value in capability_statuses.values()
-            ):
-                raise ValueError(
-                    "health response.capability_statuses must report every semantic capability"
-                )
-            success = {
-                "last_success_at": datetime.now(timezone.utc).isoformat(),
-                "last_success_source": "health_probe",
-                "last_analyzer": provider_analyzer,
-                "last_analyzer_version": version,
-                "last_capability_statuses": dict(capability_statuses),
-            }
-            with _PROVIDER_STATE_LOCK:
-                _PROVIDER_LAST_SUCCESS.clear()
-                _PROVIDER_LAST_SUCCESS.update(deepcopy(success))
-            result = {
-                "status": "available",
-                "analyzer": provider_analyzer,
-                "analyzer_version": version,
-                "configured": True,
-                "verification_status": "health_probe",
-                "health_url_configured": True,
-                "degraded_reason": None,
-                **success,
-            }
-        except Exception as exc:  # noqa: BLE001
-            result = {
-                "status": "degraded",
-                "analyzer": analyzer,
-                "configured": True,
-                "verification_status": "health_probe_failed",
-                "health_url_configured": True,
-                "degraded_reason": str(exc)[:200],
-                **last_success,
-            }
-        try:
-            ttl = min(
-                60,
-                max(1, int(settings.video_evidence_semantic_health_cache_ttl_seconds)),
-            )
-        except (TypeError, ValueError):
-            ttl = 15
-        with _PROVIDER_STATE_LOCK:
-            _PROVIDER_HEALTH_CACHE["semantic"] = (
-                cache_key,
-                time.monotonic() + ttl,
-                deepcopy(result),
-            )
-        return result
-
-
 def _iou(left: dict[str, Any], right: dict[str, Any]) -> float:
     lx, ly, lw, lh = (float(left[key]) for key in ("x", "y", "width", "height"))
     rx, ry, rw, rh = (float(right[key]) for key in ("x", "y", "width", "height"))
@@ -1064,6 +648,8 @@ def build_ocr_tracks(frame_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
 def _credible_video_ocr_track(track: dict[str, Any]) -> bool:
     """Reject isolated OCR fragments while keeping stable labels and copy."""
     text = re.sub(r"\s+", " ", str(track.get("text") or "")).strip()
+    if _VIDEO_GENERATION_WATERMARK_RE.fullmatch(text):
+        return False
     visible = "".join(re.findall(r"[A-Za-z0-9\u3400-\u9fff]", text))
     if not visible:
         return False
@@ -1081,121 +667,9 @@ def _credible_video_ocr_track(track: dict[str, Any]) -> bool:
         return observation_count >= 2 and confidence >= _MIN_SHORT_VIDEO_OCR_CONFIDENCE
     if re.fullmatch(r"[a-z]{3}", visible):
         return observation_count >= 2 and confidence >= _MIN_SHORT_VIDEO_OCR_CONFIDENCE
+    if re.fullmatch(r"[A-Za-z]{4}", visible):
+        return observation_count >= 2 or confidence >= 0.92
     return True
-
-
-def cv2_motion_analysis(images: list[Image.Image], frames: list[dict[str, Any]]) -> dict[str, Any]:
-    try:
-        import cv2  # type: ignore[import-not-found]
-        import numpy as np  # type: ignore[import-not-found]
-    except ImportError:
-        return {
-            "status": "unsupported", "analyzer": "opencv_lk_homography",
-            "analyzer_version": "unavailable",
-            "camera_labels": list(CAMERA_MOTION_LABELS), "samples": [],
-            "excluded_cross_cut_pairs": 0,
-            "degraded_reason": "服务器未安装 OpenCV/NumPy，无法形成光流运镜证据",
-        }
-    if len(images) < 2:
-        return {
-            "status": "degraded", "analyzer": "opencv_lk_homography",
-            "analyzer_version": str(cv2.__version__),
-            "camera_labels": list(CAMERA_MOTION_LABELS), "samples": [],
-            "excluded_cross_cut_pairs": 0,
-            "degraded_reason": "至少需要两帧才能分析运动",
-        }
-    samples: list[dict[str, Any]] = []
-    excluded_cross_cut_pairs = 0
-    for index in range(1, len(images)):
-        previous_meta, current_meta = frames[index - 1], frames[index]
-        if previous_meta["source_segment_index"] != current_meta["source_segment_index"]:
-            continue
-        previous_shot = previous_meta.get("detected_shot_index")
-        current_shot = current_meta.get("detected_shot_index")
-        if (
-            isinstance(previous_shot, int)
-            and isinstance(current_shot, int)
-            and previous_shot != current_shot
-        ):
-            # 跨 ffmpeg 切点的帧对测到的是剪辑跳变而不是运镜，会产生伪运镜样本。
-            excluded_cross_cut_pairs += 1
-            continue
-        previous = cv2.cvtColor(np.array(images[index - 1]), cv2.COLOR_RGB2GRAY)
-        current = cv2.cvtColor(np.array(images[index]), cv2.COLOR_RGB2GRAY)
-        points = cv2.goodFeaturesToTrack(previous, maxCorners=200, qualityLevel=0.01, minDistance=7)
-        if points is None or len(points) < 4:
-            continue
-        moved, status, _error = cv2.calcOpticalFlowPyrLK(previous, current, points, None)
-        if moved is None or status is None:
-            continue
-        source_points = points[status.reshape(-1) == 1]
-        target_points = moved[status.reshape(-1) == 1]
-        if len(source_points) < 4:
-            continue
-        matrix, inliers = cv2.estimateAffinePartial2D(
-            source_points, target_points, method=cv2.RANSAC, ransacReprojThreshold=3.0
-        )
-        if matrix is None:
-            continue
-        width, height = previous.shape[1], previous.shape[0]
-        center_x, center_y = width / 2, height / 2
-        moved_center_x = (
-            float(matrix[0, 0]) * center_x
-            + float(matrix[0, 1]) * center_y
-            + float(matrix[0, 2])
-        )
-        moved_center_y = (
-            float(matrix[1, 0]) * center_x
-            + float(matrix[1, 1]) * center_y
-            + float(matrix[1, 2])
-        )
-        dx = (moved_center_x - center_x) / width
-        dy = (moved_center_y - center_y) / height
-        scale = (float(matrix[0, 0]) ** 2 + float(matrix[0, 1]) ** 2) ** 0.5
-        pan, tilt, zoom = min(1.0, abs(dx) * 20), min(1.0, abs(dy) * 20), min(1.0, abs(scale - 1) * 20)
-        static = max(0.0, 1.0 - max(pan, tilt, zoom))
-        labels = {"pan": pan, "tilt": tilt, "zoom": zoom, "static": static}
-        camera = max(labels, key=labels.get)
-        # 方向约定：仿射把前一帧坐标映射到当前帧。画面内容右移(dx>0)说明相机
-        # 左摇；内容下移(dy>0)说明相机上仰；scale>1 说明推近。
-        if camera == "pan":
-            camera_direction = "left" if dx > 0 else "right"
-        elif camera == "tilt":
-            camera_direction = "up" if dy > 0 else "down"
-        elif camera == "zoom":
-            camera_direction = "in" if scale >= 1 else "out"
-        else:
-            camera_direction = None
-        inlier_ratio = float(inliers.mean()) if inliers is not None else 0.0
-        sample = {
-            "start_seconds": previous_meta["timestamp_seconds"],
-            "end_seconds": current_meta["timestamp_seconds"],
-            "source_segment_index": current_meta["source_segment_index"],
-            "frame_indices": [previous_meta["frame_index"], current_meta["frame_index"]],
-            "camera": camera,
-            "camera_direction": camera_direction,
-            "camera_confidence": round(labels[camera], 6),
-            "camera_scores": {key: round(value, 6) for key, value in labels.items()},
-            "background_motion_confidence": round(inlier_ratio, 6),
-            "subject_motion_confidence": round(max(0.0, 1.0 - inlier_ratio), 6),
-        }
-        sample["evidence_id"] = _stable_id("motion-", sample)
-        samples.append(sample)
-    if samples:
-        degraded_reason = None
-    elif excluded_cross_cut_pairs:
-        degraded_reason = "抽样帧对全部跨越镜头切点，无法形成同镜头光流证据"
-    else:
-        degraded_reason = "抽样帧缺少足够可跟踪特征"
-    return {
-        "status": "analyzed" if samples else "degraded",
-        "analyzer": "opencv_lk_homography",
-        "analyzer_version": str(cv2.__version__),
-        "camera_labels": list(CAMERA_MOTION_LABELS),
-        "samples": samples,
-        "excluded_cross_cut_pairs": excluded_cross_cut_pairs,
-        "degraded_reason": degraded_reason,
-    }
 
 
 def build_cut_transition_evidence(frame_meta: list[dict[str, Any]]) -> dict[str, Any]:
@@ -1225,7 +699,7 @@ def build_cut_transition_evidence(frame_meta: list[dict[str, Any]]) -> dict[str,
             "degraded_reason": "抽样帧缺少镜头切点元数据，无法形成切点转场证据",
         }
     events: list[dict[str, Any]] = []
-    for previous, current in zip(rows, rows[1:]):
+    for previous, current in zip(rows, rows[1:], strict=False):
         previous_segment = int(previous.get("source_segment_index") or 1)
         current_segment = int(current.get("source_segment_index") or 1)
         if previous_segment != current_segment:
@@ -1483,6 +957,14 @@ def _summarize_camera_motion(
             for sample in usable
         ]
         label_scores[label] = round(sum(values) / len(values), 6)
+    background_values = [
+        max(0.0, min(1.0, float(sample.get("background_motion_confidence") or 0.0)))
+        for sample in usable
+    ]
+    subject_values = [
+        max(0.0, min(1.0, float(sample.get("subject_motion_confidence") or 0.0)))
+        for sample in usable
+    ]
     dominant = max(CAMERA_MOTION_LABELS, key=lambda label: label_scores[label])
     direction_counts: dict[str, int] = {}
     for sample in usable:
@@ -1501,6 +983,12 @@ def _summarize_camera_motion(
         "dominant_direction": dominant_direction,
         "label_scores": label_scores,
         "confidence": label_scores[dominant],
+        "background_motion_confidence": round(
+            sum(background_values) / len(background_values), 6
+        ),
+        "subject_motion_confidence": round(
+            sum(subject_values) / len(subject_values), 6
+        ),
     }
 
 
@@ -1707,3 +1195,22 @@ def analyzer_health() -> dict[str, Any]:
             "provider_status": semantic_provider.get("status"),
         }
     return health
+
+
+_video_evidence_semantic._bind_contract_helpers(
+    finite_number=_finite_number,
+    positive_index=_positive_index,
+    provider_label=_provider_label,
+    provider_reason=_provider_reason,
+    frame_lookup=_frame_lookup,
+    segment_bounds=_segment_bounds,
+    validate_subject_tracks=_validate_subject_tracks,
+    validate_pose_observations=_validate_pose_observations,
+    validate_action_events=_validate_action_events,
+    validate_transition_events=_validate_transition_events,
+)
+
+_install_assignment_forwarding(
+    __name__,
+    (_video_evidence_semantic, _video_evidence_motion),
+)

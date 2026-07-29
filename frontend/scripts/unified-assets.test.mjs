@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { readStudioSource } from "./studio-source.mjs";
 
 import {
   isStoredUserAsset,
@@ -36,6 +37,7 @@ assert.deepEqual(page.items.map(unifiedAssetKey), [
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const profileSource = readFileSync(join(root, "app/profile/page.jsx"), "utf8");
 const pickerSource = readFileSync(join(root, "components/AssetPickerDialog.jsx"), "utf8");
+const referencePanelSource = readFileSync(join(root, "app/studio/StudioReferencePanel.jsx"), "utf8");
 assert.match(profileSource, /selectedRefs/, "asset selection must use opaque asset refs");
 assert.match(profileSource, /batchDeleteMeAssets\(refs\)/, "unified deletion must use asset refs");
 assert.match(profileSource, /download_url/, "asset downloads must use the owner-gated unified endpoint");
@@ -74,21 +76,41 @@ assert.match(
   "product detail selection must explain why the theme image is unavailable",
 );
 
-const studioSource = readFileSync(join(root, "app/page.jsx"), "utf8");
+const studioSource = readStudioSource(root);
 assert.match(
   studioSource,
-  /excludedRefs=\{assetPicker\?\.role === "product_detail"/,
+  /excludedRefs=\{role === "product_detail"/,
   "Studio must exclude the current theme asset ref from detail selection",
 );
 assert.match(
   studioSource,
-  /excludedUrls=\{assetPicker\?\.role === "product_detail"/,
+  /excludedUrls=\{role === "product_detail"/,
   "Studio must also exclude an equivalent theme URL from detail selection",
 );
 assert.match(
   studioSource,
-  /productDetailUploadInputRef\.current\?\.click\(\)/,
+  /uploadInputRefs\.productDetail\?\.current\?\.click\(\)/,
   "the detail picker must offer a direct upload continuation",
+);
+assert.match(
+  studioSource,
+  /if \(next\.length > productDetailLimit\) return \{\};/,
+  "detail selection must honor the effective model and business limit",
+);
+assert.match(
+  referencePanelSource,
+  /onOpenAssetPicker\?\.\("reverse_source"\)[\s\S]*从我的素材库选择/,
+  "image and video reverse flows must expose the user's asset library",
+);
+assert.match(
+  studioSource,
+  /role === "reverse_source"[\s\S]*selectReferenceAsset\(\{ \.\.\.next, url \}\)/,
+  "a library asset selected for reverse analysis must become the main reference source",
+);
+assert.match(
+  studioSource,
+  /role === "reverse_source"[\s\S]*mediaType: category === "video" \? "video" : "image"/,
+  "the reverse source picker must filter assets to the active media mode",
 );
 
 console.log("unified asset tests passed");

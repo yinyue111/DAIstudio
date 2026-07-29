@@ -314,6 +314,8 @@ def test_shot_attachment_carries_cut_transition_refs_and_camera_summary():
     assert summary["dominant_direction"] == "left"
     assert summary["label_scores"] == {"pan": 0.7, "tilt": 0.15, "zoom": 0.1, "static": 0.05}
     assert summary["confidence"] == 0.7
+    assert summary["background_motion_confidence"] == 0.9
+    assert summary["subject_motion_confidence"] == 0.1
     assert summary["sample_count"] == 2
     assert summary["evidence_refs"] == ["motion-fixture-a", "motion-fixture-b"]
     assert summary["evidence_refs"] == covering["camera_motion_evidence_refs"]
@@ -358,7 +360,7 @@ def test_merge_timestamps_keeps_long_shot_coverage_when_cuts_cluster_early():
     # 至少吃进两个切点（旧算法只有一个桶能吸附到）
     assert len(set(merged) & set(cuts)) >= 2
     # 尾部长镜头仍有均匀回填，空窗不失控
-    assert max(right - left for left, right in zip(merged, merged[1:])) <= 70
+    assert max(right - left for left, right in zip(merged, merged[1:], strict=False)) <= 70
 
 
 def test_merge_timestamps_keeps_user_requested_keyframes_first():

@@ -1,9 +1,14 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
+import { readStudioSourceFromUrl } from "./studio-source.mjs";
 
 const catalog = readFileSync(new URL("../app/catalog/page.jsx", import.meta.url), "utf8");
-const studio = readFileSync(new URL("../app/page.jsx", import.meta.url), "utf8");
+const studio = readStudioSourceFromUrl(import.meta.url);
+const deepLinkBootstrap = readFileSync(
+  new URL("../hooks/useStudioDeepLinkBootstrap.js", import.meta.url),
+  "utf8",
+);
 
 test("model catalog compares up to three models and deep-links exact selections", () => {
   assert.match(catalog, /function ModelComparison/);
@@ -22,19 +27,20 @@ test("model catalog compares up to three models and deep-links exact selections"
 });
 
 test("studio resolves server tool versions before mutating workflow state", () => {
-  assert.match(studio, /api\.toolCatalogDetail\(slug\)/);
-  assert.match(studio, /resolveStudioWorkflowPreset\(window\.location\.search, tool\)/);
-  assert.match(studio, /resolution\.status !== "ready"/);
-  assert.match(studio, /当前草稿未改变/);
+  assert.match(studio, /useStudioDeepLinkBootstrap\(\{/);
+  assert.match(deepLinkBootstrap, /api\.toolCatalogDetail\(slug\)/);
+  assert.match(deepLinkBootstrap, /resolveStudioWorkflowPreset\(window\.location\.search, tool\)/);
+  assert.match(deepLinkBootstrap, /resolution\.status !== "ready"/);
+  assert.match(deepLinkBootstrap, /当前草稿未改变/);
 });
 
 test("studio validates catalog model capability and compatible mode before exact selection", () => {
   assert.match(studio, /catalogModelBootstrapRef/);
-  assert.match(studio, /MODEL_SELECTION_USES\.includes\(modelUse\)/);
-  assert.match(studio, /allModelOptions\[modelUse\]\?\.find/);
-  assert.match(studio, /resolveCatalogModelIntent\(option, requestedMode\)/);
-  assert.match(studio, /resolution\.creationMode && creationMode !== resolution\.creationMode/);
-  assert.match(studio, /modelOptionsForSelection\[modelUse\]\?\.find/);
-  assert.match(studio, /changeModelSelection\(modelUse, modelConfigId\)/);
-  assert.ok(!studio.includes("setModelSelections({ [modelUse]: modelConfigId })"));
+  assert.match(deepLinkBootstrap, /MODEL_SELECTION_USES\.includes\(modelUse\)/);
+  assert.match(deepLinkBootstrap, /allModelOptions\[modelUse\]\?\.find/);
+  assert.match(deepLinkBootstrap, /resolveCatalogModelIntent\(option, requestedMode\)/);
+  assert.match(deepLinkBootstrap, /resolution\.creationMode && creationMode !== resolution\.creationMode/);
+  assert.match(deepLinkBootstrap, /modelOptionsForSelection\[modelUse\]/);
+  assert.match(deepLinkBootstrap, /changeModelSelection\(modelUse, modelConfigId\)/);
+  assert.ok(!deepLinkBootstrap.includes("setModelSelections({ [modelUse]: modelConfigId })"));
 });

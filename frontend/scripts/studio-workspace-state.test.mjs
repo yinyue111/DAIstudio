@@ -2,14 +2,18 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { readStudioSource } from "./studio-source.mjs";
 import {
   clearAllWorkspaceContent,
   clearWorkspaceContent,
 } from "../app/studio/workspaceReset.ts";
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
-const pageSource = readFileSync(join(root, "app/page.jsx"), "utf8");
+const pageSource = readStudioSource(root);
+const draftSessionSource = readFileSync(join(root, "app/studio/studioDraftSession.js"), "utf8");
 const mediaUploadSource = readFileSync(join(root, "hooks/useMediaUpload.js"), "utf8");
+const variationActionsSource = readFileSync(join(root, "hooks/useStudioVariationActions.js"), "utf8");
+const workspaceActionsSource = readFileSync(join(root, "hooks/useStudioWorkspaceActions.js"), "utf8");
 const workspaceStateSource = readFileSync(join(root, "hooks/useStudioWorkspaceState.js"), "utf8");
 const promptWorkspaceSource = readFileSync(join(root, "app/studio/StudioPromptWorkspace.jsx"), "utf8");
 const productVideoStrategySource = readFileSync(join(root, "app/studio/StudioProductVideoStrategy.jsx"), "utf8");
@@ -17,12 +21,16 @@ const referencePanelSource = readFileSync(join(root, "app/studio/StudioReference
 const constantsSource = readFileSync(join(root, "app/studio/constants.ts"), "utf8");
 const editPromptSource = readFileSync(join(root, "app/studio/editPrompt.ts"), "utf8");
 const generationPayloadSource = readFileSync(join(root, "app/studio/generationPayload.ts"), "utf8");
-const generationSubmitSource = readFileSync(join(root, "hooks/useGenerationSubmit.js"), "utf8");
+const generationSubmitSource = [
+  readFileSync(join(root, "hooks/useGenerationSubmit.js"), "utf8"),
+  readFileSync(join(root, "hooks/generationSubmitWorkflow.js"), "utf8"),
+].join("\n");
 const referenceParsingSource = readFileSync(join(root, "hooks/useReferenceParsing.js"), "utf8");
 const viewModelSource = readFileSync(join(root, "app/studio/viewModel.ts"), "utf8");
 const structuredEditorSource = readFileSync(join(root, "app/studio/StudioStructuredEditor.jsx"), "utf8");
+const submitBarSource = readFileSync(join(root, "app/studio/StudioSubmitBar.jsx"), "utf8");
 const generationControlsSource = readFileSync(join(root, "components/StudioGenerationControls.jsx"), "utf8");
-const studioSource = `${pageSource}\n${workspaceStateSource}\n${promptWorkspaceSource}\n${editPromptSource}\n${generationPayloadSource}\n${referenceParsingSource}\n${viewModelSource}\n${constantsSource}\n${generationControlsSource}`;
+const studioSource = `${pageSource}\n${workspaceStateSource}\n${workspaceActionsSource}\n${variationActionsSource}\n${promptWorkspaceSource}\n${editPromptSource}\n${generationPayloadSource}\n${referenceParsingSource}\n${viewModelSource}\n${constantsSource}\n${generationControlsSource}`;
 assert.match(
   constantsSource,
   /MAX_PRODUCT_DETAIL_IMAGES\s*=\s*10/,
@@ -34,7 +42,7 @@ assert.match(
   "product detail uploads should use the shared ten-image limit",
 );
 assert.match(
-  pageSource,
+  draftSessionSource,
   /productDetailAssets:[\s\S]*?\.slice\(0, MAX_PRODUCT_DETAIL_IMAGES\)/,
   "Studio drafts should retain all ten product detail images",
 );
@@ -108,11 +116,11 @@ assert.equal(clearedWorkspaces.video_edit.productAsset, null);
 assert.equal(clearedWorkspaces.video_edit.productProfile, null);
 assert.deepEqual(clearedWorkspaces.video_edit.structured, {});
 assert.equal(clearedWorkspaces.video_edit.vDuration, 10, "clear all should preserve video settings");
-const clearCurrentWorkspaceSource = pageSource.match(
+const clearCurrentWorkspaceSource = workspaceActionsSource.match(
   /async function clearCurrentWorkspace\(\)[\s\S]*?(?=\n  async function clearAllWorkspaces)/,
 )?.[0] || "";
-const clearAllWorkspacesSource = pageSource.match(
-  /async function clearAllWorkspaces\(\)[\s\S]*?(?=\n  async function saveReversePromptToLibrary)/,
+const clearAllWorkspacesSource = workspaceActionsSource.match(
+  /async function clearAllWorkspaces\(\)[\s\S]*?(?=\n\n  return \{)/,
 )?.[0] || "";
 assert.match(clearCurrentWorkspaceSource, /cancelReverseOperationForMode\(mode\)/);
 assert.match(clearCurrentWorkspaceSource, /clearWorkspaceContent\(current\)/);
@@ -302,8 +310,8 @@ assert.match(
 );
 assert.match(
   pageSource,
-  /useStudioWorkspaceState\(\{\s*creationMode,\s*modes: CREATION_MODES\s*\}\)/,
-  "main page should delegate per-mode workspace state to the workspace hook",
+  /useStudioWorkspaceState\(\{\s*creationMode,\s*modes: CREATION_MODES,?\s*\}\)/,
+  "Studio foundation should delegate per-mode workspace state to the workspace hook",
 );
 assert.match(
   referenceParsingSource,
@@ -332,7 +340,7 @@ assert.match(
 );
 assert.match(
   referenceParsingSource,
-  /const validatedFinalText = String\(result\.final_text[\s\S]*const evidenceTransferPrompt = composeEvidenceBackedVideoTransferPrompt\([\s\S]*const reversePrompt = targetIsEditMode[\s\S]*evidenceTransferPrompt[\s\S]*: validatedFinalText \|\| composePromptFromStructured/,
+  /const validatedFinalText = String\(result\.final_text[\s\S]*const evidenceTransferPrompt = composeEvidenceBackedVideoTransferPrompt\([\s\S]*const evidenceGenerationDraft = isVideo[\s\S]*const reversePrompt = targetIsEditMode[\s\S]*evidenceTransferPrompt[\s\S]*: evidenceGenerationDraft \|\| validatedFinalText \|\| composePromptFromStructured/,
   "video reverse should use evidence-backed transfer prompts while preserving validated direct final text",
 );
 assert.match(
@@ -342,7 +350,7 @@ assert.match(
 );
 assert.match(
   referenceParsingSource,
-  /setWorkspacePatch\(\{[\s\S]*pendingReverseResult:\s*pendingResult[\s\S]*reverseResultTab:\s*"draft"[\s\S]*\}, mode\);/,
+  /setWorkspacePatch\(\{[\s\S]*pendingReverseResult:\s*pendingResult[\s\S]*reverseResultTab:\s*isVideo \? "report" : "draft"[\s\S]*\}, mode\);/,
   "reverse output should enter review instead of silently replacing the current prompt",
 );
 assert.match(
@@ -486,7 +494,7 @@ assert.match(
   "product image editing should default to automatic pixel lock",
 );
 assert.match(
-  pageSource,
+  draftSessionSource,
   /productPixelLockMode:\s*current\.productPixelLockMode \|\| "auto"/,
   "restored workspaces without a product pixel lock mode should use automatic pixel lock",
 );
@@ -558,22 +566,22 @@ assert.match(
 );
 assert.match(
   pageSource,
-  /last_frame_asset:\s*assetSignature\(effectiveLastFrameAsset\)/,
+  /last_frame_asset:\s*assetSignature\((?:model\.)?effectiveLastFrameAsset\)/,
   "the effective last frame should invalidate stale generation quotes",
 );
 assert.match(
-  pageSource,
+  draftSessionSource,
   /lastFrameAsset:\s*sanitizeAssetForDraft\(current\.lastFrameAsset\)/,
   "studio drafts should retain the optional last-frame image",
 );
 assert.match(
-  pageSource,
+  workspaceActionsSource,
   /async function clearRef\(\)[\s\S]*lastFrameAsset:\s*null/,
   "clearing the active reference should also clear the last frame",
 );
 assert.match(
   pageSource,
-  /assetPicker\?\.role === "last_frame"[\s\S]*selectLastFrameAsset\(\{ \.\.\.next, url \}\)/,
+  /role === "last_frame"[\s\S]*selectLastFrameAsset\(\{ \.\.\.next, url \}\)/,
   "the asset library should support selecting a dedicated last-frame image",
 );
 assert.match(
@@ -643,16 +651,16 @@ assert.doesNotMatch(
 );
 assert.match(
   pageSource,
-  /const missingRequiredSource = isEditMode && !productAsset/,
+  /const missingRequiredSource = (?:foundation\.)?isEditMode && !(?:foundation\.)?productAsset/,
   "edit generation should treat its source image as a required input",
 );
 assert.match(
-  pageSource,
+  submitBarSource,
   /disabled=\{missingRequiredSource \|\| productVideoStrategyUnsupported \|\| structuredDirty \|\| generationSubmitDisabled/,
   "generation must stay disabled until source, strategy, and structured constraints are satisfied",
 );
 assert.match(
-  pageSource,
+  submitBarSource,
   /missingRequiredSource[\s\S]*\? missingRequiredSourceLabel[\s\S]*productVideoStrategyUnsupported \? "请切换视频模型" : submitLabel/,
   "the disabled submit button should explain which source image is missing",
 );
@@ -702,7 +710,7 @@ assert.match(
   "late product upload responses should be ignored after clear or replace",
 );
 assert.match(
-  pageSource,
+  workspaceActionsSource,
   /bumpProductUploadRequest\(creationMode\)/,
   "clearing a product source should invalidate in-flight product uploads",
 );
@@ -732,17 +740,17 @@ assert.doesNotMatch(
   "video reconstruction mode should not be labeled as direct video editing",
 );
 assert.match(
-  pageSource,
+  variationActionsSource,
   /createImageVariation/,
   "studio should expose an image variation workflow from generated results",
 );
 assert.match(
-  pageSource,
+  variationActionsSource,
   /setCreationMode\("image_edit"\)/,
   "image variation workflow should reuse image editing instead of bypassing the normal generate path",
 );
 assert.match(
-  pageSource,
+  variationActionsSource,
   /基于这张图生成同主体、同风格的近似变体/,
   "image variation workflow should prefill a same-style variation prompt",
 );

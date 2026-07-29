@@ -81,6 +81,7 @@ def get_config(db: Session = Depends(get_db), _: User = Depends(get_current_user
         "video_duration_max_seconds": settings.effective_max_video_generation_seconds,
         "reverse": {
             "image_cost": pricing["reverse"]["image_cost"],
+            "audio_surcharge": pricing["reverse"]["audio_surcharge"],
             "video_default_preset": DEFAULT_VIDEO_ANALYSIS_PRESET,
             "video_frame_count": max_frame_count(DEFAULT_VIDEO_ANALYSIS_PRESET),
             "video_max_cost": pricing["reverse"]["video_preset_costs"].get(DEFAULT_VIDEO_ANALYSIS_PRESET, vision_cost),

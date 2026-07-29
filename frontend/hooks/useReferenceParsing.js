@@ -17,6 +17,7 @@ import {
 import {
   assetDims,
   assetSignature,
+  composeEvidenceBackedVideoGenerationDraft,
   composeEvidenceBackedVideoTransferPrompt,
   composePromptFromStructured,
   composeStyleTransferPrompt,
@@ -241,7 +242,24 @@ export default function useReferenceParsing({
   function applyReverseOperationResult(operation, mode, runtimeContext = null) {
     const result = reverseOperationResult(operation);
     if (!result) {
-      setWorkspacePatch({ reversing: false, reverseOperation: operation }, mode);
+      setWorkspacePatch((current) => {
+        if (
+          current.reverseOperation?.id
+          && String(current.reverseOperation.id) !== String(operation.id)
+        ) return {};
+        return {
+          reversing: false,
+          reverseOperation: operation,
+          pendingReverseResult: null,
+          reverseResultRevisions: [],
+          reverseAppliedVersion: null,
+          reverseAppliedRevisionId: null,
+          reverseFeedback: null,
+          reverseResultSchemaVersion: "",
+          reverseUndoSnapshot: null,
+          reverseApplyConflict: null,
+        };
+      }, mode);
       if (isModeVisible(mode)) setMsg("反推任务完成但未返回可用结果");
       clearReverseRuntimeContext(mode, runtimeContext || reverseContextsRef.current[mode] || null);
       return;
@@ -318,6 +336,13 @@ export default function useReferenceParsing({
       videoAnalysis,
       targetSubjectMode,
     );
+    const evidenceGenerationDraft = isVideo
+      ? composeEvidenceBackedVideoGenerationDraft(
+          structured,
+          videoAnalysis,
+          result.provider_final_text,
+        )
+      : "";
     const reversePrompt = targetIsEditMode
       ? (
           isVideo
@@ -331,7 +356,7 @@ export default function useReferenceParsing({
                 subject: targetSubjectMode,
               })
         )
-      : validatedFinalText || composePromptFromStructured(visualStructured, "", {
+      : evidenceGenerationDraft || validatedFinalText || composePromptFromStructured(visualStructured, "", {
           target: operationTarget || targetCategory,
         });
     lastReversePromptRef.current[mode] = {
@@ -373,7 +398,7 @@ export default function useReferenceParsing({
       reversing: false,
       reverseOperation: operation,
       pendingReverseResult: pendingResult,
-      reverseResultTab: "draft",
+      reverseResultTab: isVideo ? "report" : "draft",
     }, mode);
     if (isModeVisible(mode)) {
       const cost = Number(operation.cost_settled ?? result.charged_credits ?? 0);
@@ -428,9 +453,28 @@ export default function useReferenceParsing({
       applyReverseOperationResult(operation, mode, context);
       return;
     }
-    setWorkspacePatch(isProfileOperation
-      ? { productProfiling: false, profileOperation: null }
-      : { reverseOperation: operation, reversing: false }, mode);
+    if (isProfileOperation) {
+      setWorkspacePatch({ productProfiling: false, profileOperation: null }, mode);
+    } else {
+      setWorkspacePatch((current) => {
+        if (
+          current.reverseOperation?.id
+          && String(current.reverseOperation.id) !== String(operation.id)
+        ) return {};
+        return {
+          reverseOperation: operation,
+          reversing: false,
+          pendingReverseResult: null,
+          reverseResultRevisions: [],
+          reverseAppliedVersion: null,
+          reverseAppliedRevisionId: null,
+          reverseFeedback: null,
+          reverseResultSchemaVersion: "",
+          reverseUndoSnapshot: null,
+          reverseApplyConflict: null,
+        };
+      }, mode);
+    }
     if (operation.status === "needs_confirmation") {
       if (isModeVisible(mode)) setMsg("视频抽帧失败，需要确认是否改用封面单帧分析。");
       return;
@@ -795,7 +839,16 @@ export default function useReferenceParsing({
         if (reverseContextsRef.current[mode] === context) delete reverseContextsRef.current[mode];
         return;
       }
-      setWorkspacePatch({ reverseOperation: operation, reversing: true }, mode);
+      setWorkspacePatch({ reverseOperation: operation, reversing: true,
+        pendingReverseResult: null,
+        reverseResultRevisions: [],
+        reverseAppliedVersion: null,
+        reverseAppliedRevisionId: null,
+        reverseFeedback: null,
+        reverseResultSchemaVersion: "",
+        reverseUndoSnapshot: null,
+        reverseApplyConflict: null,
+      }, mode);
       await startReverseTracking(operation, { mode, context });
     } catch (e) {
       if (

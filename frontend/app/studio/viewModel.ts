@@ -69,6 +69,7 @@ export function buildStudioDerivedViewState({
   vDuration,
   vResolution,
   videoAnalysisPreset,
+  reverseConfig,
 }) {
   const blockingGeneration = shouldBlockNewGeneration(task, category);
   const running = blockingGeneration;
@@ -85,7 +86,14 @@ export function buildStudioDerivedViewState({
     ?? DEFAULT_REVERSE_VIDEO_PRESET_COSTS[videoAnalysisPreset]
     ?? DEFAULT_REVERSE_VIDEO_PRESET_COSTS.standard;
   const reverseTargetsVideo = category === "video";
-  const selectedReverseCost = reverseTargetsVideo ? reverseVideoMaxCost : reverseImageCost;
+  const reverseAudioSurcharge = reverseTargetsVideo
+    && selected?.type === "video"
+    && Boolean(reverseConfig?.include_audio)
+    ? Number(cfg?.reverse?.audio_surcharge || 0)
+    : 0;
+  const selectedReverseCost = reverseTargetsVideo
+    ? Number(reverseVideoMaxCost) + reverseAudioSurcharge
+    : reverseImageCost;
   const selectedReverseCostLabel = reverseTargetsVideo && selected?.type === "image"
     ? selectedReverseCost === reverseImageCost
       ? `${reverseImageCost}积分`

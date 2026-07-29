@@ -16,6 +16,7 @@ from app.services import (
     gateway_prompting,
     retention,
     reverse_operations,
+    reverse_source_resolution,
     video_frames,
 )
 
@@ -370,8 +371,8 @@ def test_reverse_source_type_video_uses_video_template_without_suffix(client, ma
     monkeypatch.setattr(prompt, "get_setting", lambda db, key, default=None: True)
     monkeypatch.setattr(prompt, "_assert_text_allowed", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(
-        prompt,
-        "_collect_refs",
+        reverse_source_resolution,
+        "collect_refs",
         lambda *_args, **_kwargs: (
             [
                 _data_image_ref(b"frame-1", "image/png"),
@@ -425,8 +426,8 @@ def test_reverse_product_profile_uses_single_image_ref(client, make_user, monkey
     monkeypatch.setattr(prompt, "get_setting", lambda db, key, default=None: True)
     monkeypatch.setattr(prompt, "_assert_text_allowed", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(
-        prompt,
-        "_gateway_ref_with_content_hash",
+        reverse_source_resolution,
+        "gateway_ref_with_content_hash",
         lambda db, user, url: _data_image_ref_with_hash(b"product", "image/png"),
     )
     monkeypatch.setattr(reverse_operations.usage, "record_call", lambda *_args, **_kwargs: None)
@@ -485,7 +486,7 @@ def test_reverse_video_usage_cost_is_not_multiplied_by_frame_count(client, make_
     monkeypatch.setattr(prompt, "get_setting", lambda db, key, default=None: True)
     monkeypatch.setattr(prompt, "_assert_text_allowed", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(prompt, "assert_safe_user_asset_url", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(prompt, "_collect_refs", lambda *_args, **_kwargs: [
+    monkeypatch.setattr(reverse_source_resolution, "collect_refs", lambda *_args, **_kwargs: [
         _data_image_ref(b"frame-a"),
         _data_image_ref(b"frame-b"),
         _data_image_ref(b"frame-c"),
@@ -525,8 +526,8 @@ def test_reverse_blocks_unsafe_gateway_output_before_history(client, make_user, 
     uid = make_user("13800000004", balance=100)
     monkeypatch.setattr(prompt, "assert_safe_user_asset_url", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(
-        prompt,
-        "_collect_refs",
+        reverse_source_resolution,
+        "collect_refs",
         lambda *_args, **_kwargs: [_data_image_ref(b"unsafe-output-source")],
     )
     monkeypatch.setattr(
@@ -598,8 +599,8 @@ def test_reverse_usage_metadata_does_not_override_fixed_image_price(client, make
     monkeypatch.setattr(prompt, "_assert_text_allowed", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(prompt, "assert_safe_user_asset_url", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(
-        prompt,
-        "_collect_refs",
+        reverse_source_resolution,
+        "collect_refs",
         lambda *_args, **_kwargs: [_data_image_ref(b"fixed-price-source")],
     )
     monkeypatch.setattr(
@@ -634,8 +635,8 @@ def test_reverse_client_request_id_replays_without_double_charge(client, make_us
     monkeypatch.setattr(prompt, "assert_safe_user_asset_url", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(prompt, "_assert_text_allowed", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(
-        prompt,
-        "_collect_refs",
+        reverse_source_resolution,
+        "collect_refs",
         lambda *_args, **_kwargs: [_data_image_ref(b"replay-source")],
     )
 
@@ -734,8 +735,8 @@ def test_reverse_empty_structured_result_fails_and_refunds_without_settlement(
     monkeypatch.setattr(prompt, "assert_safe_user_asset_url", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(prompt, "_assert_text_allowed", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(
-        prompt,
-        "_collect_refs",
+        reverse_source_resolution,
+        "collect_refs",
         lambda *_args, **_kwargs: [_data_image_ref(b"empty-result-source")],
     )
 
@@ -798,8 +799,8 @@ def test_reverse_without_client_request_id_persists_operation_and_uses_it_for_bi
     monkeypatch.setattr(prompt, "assert_safe_user_asset_url", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(prompt, "_assert_text_allowed", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(
-        prompt,
-        "_collect_refs",
+        reverse_source_resolution,
+        "collect_refs",
         lambda *_args, **_kwargs: [_data_image_ref(b"no-request-id-source")],
     )
     monkeypatch.setattr(
@@ -850,8 +851,8 @@ def test_reverse_client_request_id_rejects_different_payload(client, make_user, 
     monkeypatch.setattr(prompt, "assert_safe_user_asset_url", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(prompt, "_assert_text_allowed", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(
-        prompt,
-        "_collect_refs",
+        reverse_source_resolution,
+        "collect_refs",
         lambda *_args, **_kwargs: [_data_image_ref(b"conflict-source")],
     )
     monkeypatch.setattr(
@@ -886,8 +887,8 @@ def test_reverse_http_exception_refunds_and_marks_operation_failed(client, make_
     monkeypatch.setattr(prompt, "assert_safe_user_asset_url", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(prompt, "_assert_text_allowed", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(
-        prompt,
-        "_collect_refs",
+        reverse_source_resolution,
+        "collect_refs",
         lambda *_args, **_kwargs: [_data_image_ref(b"provider-error-source")],
     )
     monkeypatch.setattr(
@@ -928,8 +929,8 @@ def test_reverse_completion_cannot_overwrite_stale_refund(client, make_user, aut
     monkeypatch.setattr(prompt, "assert_safe_user_asset_url", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(prompt, "_assert_text_allowed", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(
-        prompt,
-        "_collect_refs",
+        reverse_source_resolution,
+        "collect_refs",
         lambda *_args, **_kwargs: [_data_image_ref(b"race-refund-source")],
     )
     monkeypatch.setattr(reverse_operations.usage, "record_call", lambda *_args, **_kwargs: None)

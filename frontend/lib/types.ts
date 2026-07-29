@@ -144,7 +144,7 @@ export interface WorkspaceState {
   reverseSources: import("./api").ReverseSourceReference[];
   reverseConfig: import("../app/studio/reverseConfig").ReverseConfig;
   pendingReverseResult: Record<string, unknown> | null;
-  reverseResultTab: "draft" | "structure" | "storyboard" | "evidence" | "versions";
+  reverseResultTab: "report" | "draft" | "structure" | "storyboard" | "evidence" | "versions";
   reverseResultSchemaVersion: string;
   reverseAppliedVersion: number | null;
   reverseAppliedRevisionId: number | null;

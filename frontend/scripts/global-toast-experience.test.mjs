@@ -2,13 +2,15 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { readStudioSource } from "./studio-source.mjs";
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const layoutSource = readFileSync(join(root, "app/layout.jsx"), "utf8");
 const apiSource = readFileSync(join(root, "lib/api.js"), "utf8");
 const errorSource = readFileSync(join(root, "lib/errorHandling.js"), "utf8");
 const taskTrackingSource = readFileSync(join(root, "hooks/useTaskTracking.js"), "utf8");
-const pageSource = readFileSync(join(root, "app/page.jsx"), "utf8");
+const ownerSessionSource = readFileSync(join(root, "hooks/useStudioOwnerSession.js"), "utf8");
+const pageSource = readStudioSource(root);
 const historySource = readFileSync(join(root, "app/history/page.jsx"), "utf8");
 const profileSource = readFileSync(join(root, "app/profile/page.jsx"), "utf8");
 const promptsSource = readFileSync(join(root, "app/prompts/page.jsx"), "utf8");
@@ -38,7 +40,11 @@ assert.match(apiSource, /adminUsageDashboard:/, "API client should expose admin 
 assert.match(apiSource, /adminModelCosts:/, "API client should expose model cost dashboard");
 assert.match(errorSource, /error_type/, "generation error classifier should prefer backend error_type codes");
 assert.match(taskTrackingSource, /eta_remaining_seconds|eta_total_seconds/, "video task tracking should use backend historical ETA fields");
-assert.match(pageSource, /saveDraft|loadDraft|getDraft/, "studio should sync recoverable drafts to the backend");
+assert.match(
+  ownerSessionSource,
+  /saveDraft|getDraft/,
+  "studio owner session should sync recoverable drafts to the backend",
+);
 assert.match(pageSource, /promptSaveTitle|promptSaveFavorite|promptSaveCategory/, "reverse prompt saving should support title, favorite, and category");
 assert.match(historySource, /UnifiedTaskList|useUnifiedTaskCenter/, "history page should use the unified task-center surface");
 assert.match(profileSource, /compareSelection|Compare/, "profile page should offer a comparison mode");

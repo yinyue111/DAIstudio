@@ -75,6 +75,8 @@ export function storyboardShotIdentity(shot: StoryboardShot): string {
     finite(shot.start_seconds),
     finite(shot.end_seconds),
     cleanText(shot.visual),
+    cleanText(shot.subject_tracking),
+    cleanText(shot.pose),
     cleanText(shot.action),
     cleanText(shot.camera),
     cleanText(shot.transition),
@@ -454,6 +456,8 @@ export function composeStoryboardShotPrompt(
   ].filter(Boolean).join(" · ");
   const rows = [
     ["画面", shot.visual],
+    ["主体追踪", shot.subject_tracking],
+    ["姿态", shot.pose],
     ["动作", shot.action],
     ["镜头", shot.camera],
     ["转场", shot.transition],
@@ -538,6 +542,8 @@ export function mergeStoryboardShots(shots: StoryboardShot[], index: number): St
     start_seconds: Math.min(finite(left.start_seconds), finite(right.start_seconds)),
     end_seconds: Math.max(finite(left.end_seconds), finite(right.end_seconds)),
     visual: joinedText(left.visual, right.visual),
+    subject_tracking: joinedText(left.subject_tracking, right.subject_tracking),
+    pose: joinedText(left.pose, right.pose),
     action: joinedText(left.action, right.action),
     camera: joinedText(left.camera, right.camera),
     transition: cleanText(right.transition) || cleanText(left.transition),

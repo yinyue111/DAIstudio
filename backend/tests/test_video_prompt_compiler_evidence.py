@@ -3,8 +3,8 @@
 上游 gateway_prompting.constrain_video_shots_to_evidence 在每个 shot 上写：
 - evidence_gate: {action/camera/transition: {verified, confidence, score, source, reason}}
 - camera_motion_summary / cut_transition_evidence_refs / analyzer_status
-编译器必须：verified 正常写入；vlm_only 写入但如实标注推断并保留
-verified=false 结构化标记；ffmpeg 硬切编译成剪辑节奏描述；camera 冲突
+编译器必须：verified 与 vlm_only 都以可执行原文写入，可信度只保留在
+verified=false 结构化标记中；ffmpeg 硬切编译成剪辑节奏描述；camera 冲突
 以分析器标签为准；全空时降级到 final_text 而不是崩溃。
 """
 from app.services.video_prompt_compiler import (
@@ -77,7 +77,7 @@ def test_verified_action_compiles_without_hedging_and_marks_verified_true():
     assert entry["source"] == "semantic_provider"
 
 
-def test_vlm_only_action_stays_in_prompt_with_hedged_wording_and_verified_false():
+def test_vlm_only_action_stays_executable_while_metadata_marks_verified_false():
     result = _compile([
         _shot(
             action="手指捏住洗脸巾边缘缓慢展开",
@@ -94,13 +94,13 @@ def test_vlm_only_action_stays_in_prompt_with_hedged_wording_and_verified_false(
         )
     ])
 
-    # 恢复产品价值：降级保留的动作必须仍进提示词，但措辞如实标注推断。
-    assert f"手指捏住洗脸巾边缘缓慢展开{UNVERIFIED_EVIDENCE_SUFFIX}" in result["prompt"]
+    assert "手指捏住洗脸巾边缘缓慢展开" in result["prompt"]
+    assert UNVERIFIED_EVIDENCE_SUFFIX not in result["prompt"]
     entry = result["metadata"]["shot_evidence"][0]["action"]
     assert entry["verified"] is False
     assert entry["confidence"] == "vlm_only"
     assert entry["reason"]
-    assert entry["prompt_text"].endswith(UNVERIFIED_EVIDENCE_SUFFIX)
+    assert entry["prompt_text"] == "手指捏住洗脸巾边缘缓慢展开"
     # plan 与 metadata 一致，前端可从任一侧读取可信度差异。
     assert result["plan"]["shot_evidence"] == result["metadata"]["shot_evidence"]
 
@@ -222,7 +222,7 @@ def test_camera_agreeing_with_analyzer_keeps_vlm_wording():
     assert "镜头缓慢推近产品" in result["prompt"]
 
 
-def test_vlm_only_camera_is_hedged_in_prompt():
+def test_vlm_only_camera_stays_executable_without_evidence_annotation():
     result = _compile([
         _shot(
             camera="镜头带一点呼吸感的轻微晃动",
@@ -240,10 +240,31 @@ def test_vlm_only_camera_is_hedged_in_prompt():
         )
     ])
 
-    assert f"镜头带一点呼吸感的轻微晃动{UNVERIFIED_EVIDENCE_SUFFIX}" in result["prompt"]
+    assert "镜头带一点呼吸感的轻微晃动" in result["prompt"]
+    assert UNVERIFIED_EVIDENCE_SUFFIX not in result["prompt"]
     entry = result["metadata"]["shot_evidence"][0]["camera"]
     assert entry["verified"] is False
     assert entry["confidence"] == "vlm_only"
+
+
+def test_source_shot_timestamps_stay_in_metadata_not_executable_prompt():
+    result = _compile([
+        _shot(
+            start_seconds=12.25,
+            end_seconds=14.75,
+            action="从包装下方抽出洗脸巾",
+            evidence_gate={
+                "action": _gate_entry(True, confidence="analyzer"),
+                "camera": _gate_entry(False),
+                "transition": _gate_entry(False),
+            },
+        )
+    ])
+
+    assert "12.250-14.750s" not in result["prompt"]
+    evidence = result["metadata"]["shot_evidence"][0]
+    assert evidence["start_seconds"] == 12.25
+    assert evidence["end_seconds"] == 14.75
 
 
 def test_all_cleared_shots_degrade_to_final_text_without_crashing():

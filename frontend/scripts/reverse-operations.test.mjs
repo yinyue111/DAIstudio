@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { readStudioSource } from "./studio-source.mjs";
 import {
   composeEvidenceBackedVideoTransferPrompt,
   composePromptFromStructured,
@@ -29,6 +30,8 @@ import {
 } from "../app/studio/StudioReferencePanel.jsx";
 import { buildStudioDerivedViewState } from "../app/studio/viewModel.ts";
 import { cancelStaleReverseOperation } from "../hooks/useReferenceParsing.js";
+import { buildReverseHistoryWorkspacePatch } from "../hooks/useReverseHistoryActions.js";
+import { resolvePendingReverseOperation } from "../hooks/studio/useStudioReverseDomain.js";
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const apiSource = readFileSync(join(root, "lib/api.js"), "utf8");
@@ -36,10 +39,23 @@ const apiTypeSource = readFileSync(join(root, "lib/api.d.ts"), "utf8");
 const trackingSource = readFileSync(join(root, "hooks/useReverseOperationTracking.js"), "utf8");
 const parsingSource = readFileSync(join(root, "hooks/useReferenceParsing.js"), "utf8");
 const uploadSource = readFileSync(join(root, "hooks/useMediaUpload.js"), "utf8");
-const pageSource = readFileSync(join(root, "app/page.jsx"), "utf8");
+const reverseHistoryActionsSource = readFileSync(join(root, "hooks/useReverseHistoryActions.js"), "utf8");
+const deepLinkBootstrapSource = readFileSync(join(root, "hooks/useStudioDeepLinkBootstrap.js"), "utf8");
+const reverseResultActionsSource = readFileSync(join(root, "hooks/useReverseResultActions.js"), "utf8");
+const shotGenerationSource = readFileSync(join(root, "hooks/useShotGeneration.js"), "utf8");
+const ownerSessionSource = [
+  readFileSync(join(root, "hooks/useStudioOwnerSession.js"), "utf8"),
+  readFileSync(join(root, "hooks/studioOwnerRestore.js"), "utf8"),
+].join("\n");
+const recipeActionsSource = readFileSync(join(root, "hooks/useStudioRecipeActions.js"), "utf8");
+const workspaceActionsSource = readFileSync(join(root, "hooks/useStudioWorkspaceActions.js"), "utf8");
+const pageSource = readStudioSource(root);
 const editorSource = readFileSync(join(root, "app/studio/StudioStructuredEditor.jsx"), "utf8");
 const referencePanelSource = readFileSync(join(root, "app/studio/StudioReferencePanel.jsx"), "utf8");
-const submitSource = readFileSync(join(root, "hooks/useGenerationSubmit.js"), "utf8");
+const submitSource = [
+  readFileSync(join(root, "hooks/useGenerationSubmit.js"), "utf8"),
+  readFileSync(join(root, "hooks/generationSubmitWorkflow.js"), "utf8"),
+].join("\n");
 
 const normalized = normalizeReverseOperation({
   operation: {
@@ -90,6 +106,24 @@ assert.deepEqual(resumeCandidates.map(({ mode, trackingKey, operation }) => (
   ["video_edit", "video_edit::profile", 22],
 ]);
 assert.equal(
+  resolvePendingReverseOperation({
+    pendingReverseResult: { operation_id: 78 },
+    trackedOperation: { id: 81, status: "failed" },
+    workspaceOperation: { id: 81, status: "failed" },
+  }),
+  null,
+  "a stale result must never be rendered with a newer operation's status or settlement",
+);
+assert.equal(
+  resolvePendingReverseOperation({
+    pendingReverseResult: { operation_id: 80 },
+    trackedOperation: { id: 80, status: "succeeded" },
+    workspaceOperation: { id: 81, status: "failed" },
+  })?.id,
+  80,
+  "a pending result should resolve only to its own operation",
+);
+assert.equal(
   reverseOperationRequestSignature({
     target: "image",
     asset_url: "/source.jpg",
@@ -107,6 +141,53 @@ assert.notEqual(
   reverseOperationRequestSignature({ asset_url: "/source.jpg", workspace_snapshot_v2: { final_text: "B" } }),
   "every effective workspace input must participate in the pending request signature",
 );
+
+const explicitlyOpenedResult = {
+  structured: { "主体": "历史任务主体" },
+  final_text: "历史压缩稿",
+  video_analysis: {
+    sampled_frames: Array.from({ length: 12 }, (_, index) => ({
+      index: index + 1,
+      timestamp_seconds: index,
+    })),
+    shots: Array.from({ length: 6 }, (_, index) => ({
+      id: index + 1,
+      start_seconds: index * 2,
+      end_seconds: index * 2 + 2,
+      visual: `历史镜头${index + 1}`,
+      action: `历史动作${index + 1}`,
+      evidence_frame_indices: [index * 2 + 1, index * 2 + 2],
+      confidence: 0.9,
+    })),
+  },
+};
+const explicitlyOpenedOperation = {
+  id: 76,
+  target: "video",
+  result_schema_version: "v3",
+  applied_result_version: 4,
+};
+const explicitRestorePatch = buildReverseHistoryWorkspacePatch({
+  operation: explicitlyOpenedOperation,
+  result: explicitlyOpenedResult,
+  restored: {
+    subjectMode: "general",
+    workspace: {
+      pendingReverseResult: { operation_id: 74, result: { video_analysis: { shots: [] } } },
+      reverseOperation: { id: 74, target: "video" },
+    },
+  },
+  revisions: [{ id: 145, operation_id: 76 }],
+  feedback: null,
+  appliedRevision: null,
+});
+assert.equal(explicitRestorePatch.pendingReverseResult.operation_id, 76);
+assert.equal(explicitRestorePatch.pendingReverseResult.result.video_analysis.shots.length, 6);
+assert.match(explicitRestorePatch.pendingReverseResult.result.final_text, /镜头6/);
+assert.doesNotMatch(explicitRestorePatch.pendingReverseResult.result.final_text, /历史压缩稿/);
+assert.equal(explicitRestorePatch.reverseOperation.id, 76);
+assert.match(deepLinkBootstrapSource, /cloudDraftLoadedRef\.current[\s\S]*?parseUnifiedTaskKey[\s\S]*?task\.kind !== "reverse"/);
+assert.match(deepLinkBootstrapSource, /openRecentReverseOperation\(\{ id: task\.id \}\)/);
 
 for (const endpoint of [
   "/api/prompt/reverse-operations",
@@ -162,11 +243,11 @@ assert.match(
   /for \(const operation of normalizeReverseOperationList\(payload\)\)[\s\S]*if \(!isActiveReverseOperation\(operation\)\) continue/,
   "the list fallback must never replay unrelated successful history",
 );
-assert.match(pageSource, /reverseOperationResumeCandidates\(restoredWorkspaces\)/);
-assert.match(pageSource, /reverseResumeOperationsRef\.current = \[\]/);
-assert.match(pageSource, /const ACTIVE_REVERSE_STATUSES = new Set\(\["queued", "running", "needs_confirmation"\]\)/);
+assert.match(ownerSessionSource, /reverseOperationResumeCandidates\(restoredWorkspaces\)/);
+assert.match(ownerSessionSource, /reverseResumeOperationsRef\.current = \[\]/);
+assert.match(ownerSessionSource, /const ACTIVE_REVERSE_STATUSES = new Set\(\["queued", "running", "needs_confirmation"\]\)/);
 assert.match(
-  pageSource,
+  ownerSessionSource,
   /hasActiveReverseOperations\(workspaces\)[\s\S]*saveStudioSessionDraft\(active \? "reverse_operation_active" : "reverse_operation_settled", \{[\s\S]*persistCloud: false/,
   "active reverse operations must be persisted locally immediately instead of waiting for the cloud debounce",
 );
@@ -290,31 +371,36 @@ assert.match(
   "generation-time profile tracking loss must remain refresh-recoverable",
 );
 assert.equal(
-  (pageSource.match(/trackProfileReverseOperation,/g) || []).length >= 3,
-  true,
-  "the page must connect both profile creation paths to the shared reverse tracker",
+  (pageSource.match(/trackProfileReverseOperation:\s*reverse\.trackProfileReverseOperation/g) || []).length,
+  2,
+  "the reference and generation domains must connect both profile creation paths to the shared reverse tracker",
 );
 assert.match(pageSource, /<StudioReverseResultPanel/);
 assert.match(pageSource, /<StudioRecentReversePanel/);
-assert.match(pageSource, /applyReverseResultApplication\(latestWorkspace, pending, mode\)/);
-assert.match(pageSource, /undoReverseResultApplication\(workspace, reverseUndoSnapshot\)/);
-assert.match(pageSource, /api\.createReverseOperationRevision\(operation\.id/);
-assert.match(pageSource, /api\.applyReverseOperationResult\(operation\.id/);
-assert.match(pageSource, /api\.updateReverseOperationFeedback\(operation\.id/);
-assert.match(pageSource, /api\.retryReverseOperation\(operation\.id/);
-assert.match(pageSource, /api\.createCreationRecipe\(/);
-assert.match(pageSource, /api\.createCreationRecipeVersion\(/);
-assert.match(pageSource, /onGenerationSubmitted: handleGenerationSubmitted/);
+assert.match(
+  pageSource,
+  /const pendingReverseOperation = reverseOperationForPendingResult\(\)[\s\S]*pending=\{pendingReverseResult\}[\s\S]*operation=\{pendingReverseOperation\}/,
+  "the result panel must restore persisted portable results even when no online operation is available",
+);
+assert.match(reverseResultActionsSource, /applyReverseResultApplication\(latestWorkspace, pending, mode\)/);
+assert.match(reverseResultActionsSource, /undoReverseResultApplication\(workspace, reverseUndoSnapshot\)/);
+assert.match(reverseResultActionsSource, /api\.createReverseOperationRevision\(operation\.id/);
+assert.match(reverseResultActionsSource, /api\.applyReverseOperationResult\(operation\.id/);
+assert.match(reverseResultActionsSource, /api\.updateReverseOperationFeedback\(operation\.id/);
+assert.match(reverseHistoryActionsSource, /api\.retryReverseOperation\(operation\.id/);
+assert.match(recipeActionsSource, /api\.createCreationRecipe\(/);
+assert.match(recipeActionsSource, /api\.createCreationRecipeVersion\(/);
+assert.match(pageSource, /onGenerationSubmitted: (?:task\.)?handleGenerationSubmitted/);
 assert.match(
   submitSource,
-  /onGenerationSubmitted\?\.\(\{ task: nextTask, payload: submitted\.payload, stage \}\)/,
+  /onGenerationSubmitted\?\.\(\{ task: nextTask, payload: confirmation\.request, stage \}\)/,
   "generation lineage must bind the normalized request that was actually confirmed and submitted",
 );
 for (const lineageField of ["source_revision_id", "compiled_revision_id", "generation_revision_id"]) {
-  assert.match(pageSource, new RegExp(`submittedTask\\?\\.${lineageField}`));
+  assert.match(shotGenerationSource, new RegExp(`submittedTask\\?\\.${lineageField}`));
 }
-assert.match(pageSource, /reverseAppliedRevisionId:\s*sourceRevisionId/);
-assert.doesNotMatch(pageSource, /source:\s*["']generation["']/);
+assert.match(shotGenerationSource, /reverseAppliedRevisionId:\s*sourceRevisionId/);
+assert.doesNotMatch(shotGenerationSource, /source:\s*["']generation["']/);
 assert.match(
   apiTypeSource,
   /interface ReverseResultRevisionCreate \{\s*source:\s*"user_edit" \| "applied";/,
@@ -322,7 +408,7 @@ assert.match(
 );
 assert.match(apiTypeSource, /interface ReverseResultApplyInput/);
 assert.match(apiTypeSource, /applyReverseOperationResult/);
-const clearProductSource = pageSource.match(
+const clearProductSource = workspaceActionsSource.match(
   /async function clearProductAsset\(\)[\s\S]*?(?=\n  async function clearRef)/,
 )?.[0] || "";
 assert.match(clearProductSource, /cancelRecoveredProfileOperationForMode\(creationMode\)/);
@@ -416,9 +502,9 @@ const evidenceTransfer = composeEvidenceBackedVideoTransferPrompt({
     confidence: 0.9,
   }],
 }, "product");
-assert.match(evidenceTransfer, /镜头1（0\.000-2\.500秒）：产品居中，缓慢旋转，镜头缓慢推近/);
+assert.match(evidenceTransfer, /镜头1：画面：产品居中；动作：缓慢旋转；运镜：镜头缓慢推近/);
 assert.doesNotMatch(evidenceTransfer, /未证实|新品上市|水滴声|evidence/i);
-assert.ok(evidenceTransfer.length <= 220);
+assert.ok(evidenceTransfer.length > 0);
 const compressedLongTransfer = composeEvidenceBackedVideoTransferPrompt({}, {
   sampled_frames: [
     { index: 1, timestamp_seconds: 0 },
@@ -432,8 +518,10 @@ const compressedLongTransfer = composeEvidenceBackedVideoTransferPrompt({}, {
     confidence: 0.9,
   }],
 }, "");
-assert.match(compressedLongTransfer, /压缩为15秒内核心版/);
-assert.doesNotMatch(compressedLongTransfer, /25\.408秒/);
+assert.match(compressedLongTransfer, /参考片时间线较长/);
+assert.match(compressedLongTransfer, /逐镜分别生成后按顺序合成/);
+assert.match(compressedLongTransfer, /镜头1：/);
+assert.doesNotMatch(compressedLongTransfer, /25\.41 秒|镜头1（/);
 const singleFrameTransfer = composeEvidenceBackedVideoTransferPrompt({}, {
   sampled_frames: [
     { index: 1, timestamp_seconds: 1 },
@@ -451,7 +539,7 @@ const singleFrameTransfer = composeEvidenceBackedVideoTransferPrompt({}, {
     confidence: 0.95,
   }],
 }, "portrait");
-assert.match(singleFrameTransfer, /产品居中，柔和侧光/);
+assert.match(singleFrameTransfer, /画面：产品居中；光线：柔和侧光/);
 assert.doesNotMatch(singleFrameTransfer, /幻觉旋转|幻觉环绕|幻觉闪白/);
 const missingEvidenceTransfer = composeEvidenceBackedVideoTransferPrompt({}, {
   sampled_frames: [{ index: 1, timestamp_seconds: 0 }],
@@ -603,11 +691,11 @@ assert.equal(workspacePatchFromReverseSnapshot({
   generation: { product_video_template: "unknown_strategy" },
 }).workspace.productVideoTemplate, "prompt_driven");
 assert.match(
-  pageSource,
+  ownerSessionSource,
   /prompt:\s*snapshotRestore\s*\?\s*\(restoredWorkspace\.prompt\s*\|\|\s*parsedDraft\.prompt\s*\|\|\s*""\)/,
 );
 assert.match(
-  pageSource,
+  ownerSessionSource,
   /promptDirty:\s*snapshotRestore\s*\?\s*Boolean\(restoredWorkspace\.promptDirty\)\s*:\s*true/,
 );
 
@@ -645,6 +733,40 @@ const imageMotionPricing = buildStudioDerivedViewState({
 assert.equal(imageMotionPricing.selectedReverseCost, 5);
 assert.equal(imageMotionPricing.reverseImageCost, 5);
 assert.equal(imageMotionPricing.selectedReverseCostLabel, "5积分");
+
+const videoAudioPricing = buildStudioDerivedViewState({
+  ...{
+    cfg: {
+      reverse: {
+        image_cost: 5,
+        audio_surcharge: 2,
+        video_presets: [{ key: "fine", max_cost: 5, max_frames: 22 }],
+      },
+    },
+    creationMode: "video",
+    category: "video",
+    isEditMode: false,
+    isImageEditMode: false,
+    subjectMode: "general",
+    productGenerationMode: false,
+    portraitGenerationMode: false,
+    task: null,
+    submitting: false,
+    selected: { type: "video", url: "/reference.mp4" },
+    productAsset: null,
+    structured: {},
+    prompt: "",
+    ratio: "9:16",
+    imageQuality: "standard",
+    n: 1,
+    vDuration: 10,
+    vResolution: "720p",
+    videoAnalysisPreset: "fine",
+    reverseConfig: { include_audio: true },
+  },
+});
+assert.equal(videoAudioPricing.selectedReverseCost, 7);
+assert.equal(videoAudioPricing.selectedReverseCostLabel, "冻结7积分(最多22帧)");
 assert.match(parsingSource, /video_analysis_preset: targetVideoPreset/);
 assert.match(referencePanelSource, /单图运动设计成功后按图片反推结算 \{reverseImageCost\} 积分/);
 
@@ -692,7 +814,7 @@ assert.ok(
   "a successful fetch with no usable assets must preserve the existing workspace and operation",
 );
 assert.doesNotMatch(doParseSource.slice(0, doParseSource.indexOf('result.status !== "done"')), /assets:\s*\[\]|selected:\s*null/);
-assert.match(pageSource, /function updateReferenceUrl\(value\)[\s\S]*setWorkspacePatch\(\{ url: value, parsing: false \}/);
+assert.match(workspaceActionsSource, /function updateReferenceUrl\(value\)[\s\S]*setWorkspacePatch\(\{ url: value, parsing: false \}/);
 assert.match(
   parsingSource,
   /const reverseBody = \{[\s\S]*workspace_snapshot_v3: workspaceSnapshot[\s\S]*reverseOperationRequestSignature\(reverseBody\)/,
@@ -709,6 +831,24 @@ assert.doesNotMatch(
   "the full result/history snapshot must not be sent with an operation creation request",
 );
 const doReverseSource = parsingSource.match(/async function doReverse\(\)[\s\S]*?(?=\n  function savedOperationId)/)?.[0] || "";
+assert.match(
+  doReverseSource,
+  /setWorkspacePatch\(\{[\s\S]*reverseOperation: operation,[\s\S]*pendingReverseResult: null,[\s\S]*reverseResultRevisions: \[\],[\s\S]*reverseAppliedVersion: null,[\s\S]*reverseAppliedRevisionId: null,[\s\S]*reverseFeedback: null/,
+  "starting a confirmed reverse operation must clear the previous result and its review metadata",
+);
+const settledReverseSource = parsingSource.match(
+  /function handleReverseOperationSettled\([\s\S]*?(?=\n  const \{)/,
+)?.[0] || "";
+assert.match(
+  settledReverseSource,
+  /String\(current\.reverseOperation\.id\) !== String\(operation\.id\)/,
+  "a stale terminal update must not replace the current reverse operation",
+);
+assert.match(
+  settledReverseSource,
+  /pendingReverseResult: null[\s\S]*reverseResultRevisions: \[\][\s\S]*reverseAppliedVersion: null[\s\S]*reverseAppliedRevisionId: null[\s\S]*reverseFeedback: null/,
+  "a failed reverse operation must not retain an older result or its review metadata",
+);
 const staleOperationBranch = doReverseSource.slice(
   doReverseSource.indexOf("if (!isCurrent())"),
   doReverseSource.indexOf("setWorkspacePatch({ reverseOperation: operation"),
@@ -774,17 +914,17 @@ assert.match(confirmCoverSource, /confirmTrackedReverseCover\([\s\S]*fallbackIma
 assert.match(referencePanelSource, /onConfirmCover\?\.\(fallbackCoverFile\)/);
 
 assert.match(pageSource, /if \(promptDirty\)[\s\S]*structuredDirty: true[\s\S]*composePromptFromStructured/);
-assert.match(pageSource, /function recompose\(\)[\s\S]*structuredDirty: false/);
-assert.match(pageSource, /function undoStructuredChanges\(\)[\s\S]*structuredBaseline[\s\S]*structuredDirty: false/);
+assert.match(workspaceActionsSource, /function recompose\(\)[\s\S]*structuredDirty: false/);
+assert.match(workspaceActionsSource, /function undoStructuredChanges\(\)[\s\S]*structuredBaseline[\s\S]*structuredDirty: false/);
 assert.match(editorSource, />\s*应用结构修改\s*</);
 assert.match(editorSource, />\s*撤销结构修改\s*</);
 assert.match(submitSource, /if \(structuredDirty\)[\s\S]*请先应用结构修改或撤销结构修改/);
 
-const clearCurrentSource = pageSource.match(
+const clearCurrentSource = workspaceActionsSource.match(
   /async function clearCurrentWorkspace\(\)[\s\S]*?(?=\n  async function clearAllWorkspaces)/,
 )?.[0] || "";
-const clearAllSource = pageSource.match(
-  /async function clearAllWorkspaces\(\)[\s\S]*?(?=\n  async function saveReversePromptToLibrary)/,
+const clearAllSource = workspaceActionsSource.match(
+  /async function clearAllWorkspaces\(\)[\s\S]*?(?=\n\n  return \{)/,
 )?.[0] || "";
 assert.match(clearCurrentSource, /clearWorkspaceContent\(current\)/);
 assert.doesNotMatch(clearCurrentSource, /clearAllWorkspaceContent/);

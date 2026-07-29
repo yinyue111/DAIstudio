@@ -16,8 +16,14 @@ from app.services import gateway, video_frames
 from app.services.gateway_prompting import (
     ReverseResultValidationError,
     constrain_video_shots_to_evidence,
+    normalize_video_shots,
     reverse_template,
     validate_reverse_result,
+    video_analysis_gaps,
+)
+from app.services.gateway_reverse_context import (
+    _video_analysis_context_text,
+    _video_generation_duration_suggestion,
 )
 from app.services.model_gateway_config import RuntimeGatewayConfig
 
@@ -48,6 +54,146 @@ def test_target_contracts_require_typed_core_fields(target, payload):
     invalid = {**payload, core_key: {"invalid": True}}
     with pytest.raises(ReverseResultValidationError):
         validate_reverse_result(invalid, target)
+
+
+def test_video_template_requires_main_model_subject_tracking_and_pose_per_multiframe_shot():
+    template = reverse_template("video", n_frames=4)
+    assert "主视觉模型的跨帧推断" in template
+    assert "subject_tracking 和 pose" in template
+    assert "主体位置不变也要写" in template
+    assert "姿态不变也要写稳定状态" in template
+    assert "不要把 subject_tracking、pose、action 合并到 visual" in template
+    assert "全片视觉基线和 shots 是主要交付" in template
+    assert "初态→过程→终态" in template
+    assert "不得缩写" in template
+    assert "如何接触" in template
+    assert "每镜都填" in template
+    assert "几何结构" in template
+    assert "内部硬切" in template
+    for field in (
+        "场景背景", "风格", "视角构图", "光线", "色调配色", "材质纹理",
+        "氛围情绪", "一致性约束",
+    ):
+        assert field in template
+
+
+def test_dense_short_video_duration_suggestion_requires_shotwise_generation():
+    assert _video_generation_duration_suggestion(10.053, shot_count=7) == (
+        "源片含 7 个高密度镜头，建议逐镜生成；"
+        "单镜含多步动作时再按主动作拆分，按原时间码剪辑成片"
+    )
+    assert _video_generation_duration_suggestion(10.053, shot_count=3) == (
+        "建议生成约 10.1 秒单段视频"
+    )
+
+
+def test_video_context_passes_local_audio_signals_to_main_model_without_semantic_guessing():
+    context = _video_analysis_context_text({
+        "source": {
+            "duration_seconds": 4,
+            "has_audio": True,
+            "audio_analyzed": False,
+        },
+        "audio": {
+            "status": "partial",
+            "degraded_reason": "音频转写未启用，仅完成本地信号分析",
+            "features": {
+                "asr": {"status": "unsupported"},
+                "music": {
+                    "status": "analyzed",
+                    "assessment": "likely",
+                    "evidence": [{
+                        "start_seconds": 0,
+                        "end_seconds": 4,
+                        "assessment": "likely",
+                    }],
+                },
+                "beat": {
+                    "status": "analyzed",
+                    "bpm": 120,
+                    "evidence": [{"start_seconds": 0.5, "end_seconds": 0.58}],
+                },
+                "sfx": {
+                    "status": "analyzed",
+                    "evidence": [{
+                        "start_seconds": 1.25,
+                        "end_seconds": 1.37,
+                        "label": "unclassified_transient",
+                    }],
+                },
+            },
+        },
+    })
+
+    assert "持续音乐可能性=likely" in context
+    assert "节拍估计 BPM=120.000" in context
+    assert "未分类瞬态声秒数=1.250" in context
+    assert "只有声源清晰时才转写为‘动作发生时的具体声音’" in context
+    assert "不得输出精确 BPM" in context
+    assert "不得猜测曲目、乐器或音乐风格" in context
+    assert "音频转写未启用" in context
+
+
+def test_video_shots_use_authoritative_detected_boundaries_without_false_gaps():
+    sampled_frames = [
+        {
+            "index": 1,
+            "timestamp_seconds": 0.0,
+            "detected_shot_id": "shot-1",
+            "detected_shot_start_seconds": 0.0,
+            "detected_shot_end_seconds": 1.25,
+        },
+        {
+            "index": 2,
+            "timestamp_seconds": 0.9,
+            "detected_shot_id": "shot-1",
+            "detected_shot_start_seconds": 0.0,
+            "detected_shot_end_seconds": 1.25,
+        },
+        {
+            "index": 3,
+            "timestamp_seconds": 1.3,
+            "detected_shot_id": "shot-2",
+            "detected_shot_start_seconds": 1.25,
+            "detected_shot_end_seconds": 2.75,
+        },
+        {
+            "index": 4,
+            "timestamp_seconds": 2.7,
+            "detected_shot_id": "shot-2",
+            "detected_shot_start_seconds": 1.25,
+            "detected_shot_end_seconds": 2.75,
+        },
+    ]
+    normalized = normalize_video_shots(
+        [
+            {
+                "start_seconds": 0.0,
+                "end_seconds": 1.1,
+                "visual": "人物伸懒腰",
+                "action": "双臂上举后放松",
+                "evidence_frame_indices": [1, 2],
+                "confidence": 0.9,
+            },
+            {
+                "start_seconds": 1.3,
+                "end_seconds": 2.6,
+                "visual": "手从包装下方抽出洗脸巾",
+                "action": "手指抓住边缘并向下抽出",
+                "evidence_frame_indices": [3, 4],
+                "confidence": 0.9,
+            },
+        ],
+        duration_seconds=2.75,
+        frame_count=4,
+        sampled_frames=sampled_frames,
+    )
+
+    assert [
+        (shot["start_seconds"], shot["end_seconds"])
+        for shot in normalized
+    ] == [(0.0, 1.25), (1.25, 2.75)]
+    assert video_analysis_gaps(normalized, duration_seconds=2.75) == []
 
 
 def test_profile_visual_prompts_keep_identity_prefix_and_separate_negative_constraints():
@@ -234,6 +380,64 @@ def test_video_temporal_fields_require_independent_evidence_refs():
     assert constrained[0]["transition"] == ""
 
 
+def test_main_vlm_semantics_survive_as_cross_frame_inference_without_provider():
+    constrained = constrain_video_shots_to_evidence([{
+        "visual": "蓝色纸巾盒居中",
+        "subject_tracking": "同一纸巾盒持续居中，纸巾向右上方延展",
+        "pose": "纸巾由折叠状态逐步展开",
+        "action": "纸巾缓慢飘动并展开",
+        "camera": "",
+        "transition": "云层叠化到产品特写",
+        "evidence_frame_indices": [2, 5],
+        "subject_track_refs": [],
+        "pose_evidence_refs": [],
+        "action_evidence_refs": [],
+        "transition_evidence_refs": [],
+        "analyzer_status": {
+            "subject_tracking": "unsupported",
+            "pose": "unsupported",
+            "action": "unsupported",
+            "transition": "unsupported",
+        },
+    }])[0]
+
+    assert constrained["subject_tracking"] == "同一纸巾盒持续居中，纸巾向右上方延展"
+    assert constrained["pose"] == "纸巾由折叠状态逐步展开"
+    assert constrained["action"] == "纸巾缓慢飘动并展开"
+    assert constrained["transition"] == "云层叠化到产品特写"
+    for field in ("subject_tracking", "pose", "action", "transition"):
+        assert constrained["evidence_gate"][field]["verified"] is False
+        assert constrained["evidence_gate"][field]["claim_type"] == "cross_frame_inference"
+        assert constrained["evidence_gate"][field]["level"] == "inferred"
+        assert constrained["evidence_gate"][field]["source"] == "cross_frame_vlm"
+
+
+def test_independent_semantic_refs_remain_verified():
+    constrained = constrain_video_shots_to_evidence([{
+        "visual": "人物居中",
+        "subject_tracking": "同一人物从画面左侧走向中央",
+        "pose": "人物由侧身转为正面站立",
+        "action": "人物抬起产品",
+        "transition": "硬切",
+        "evidence_frame_indices": [1, 2],
+        "subject_track_refs": ["track-1"],
+        "pose_evidence_refs": ["pose-1", "pose-2"],
+        "action_evidence_refs": ["action-1"],
+        "transition_evidence_refs": ["transition-1"],
+        "analyzer_status": {
+            "subject_tracking": "analyzed",
+            "pose": "analyzed",
+            "action": "analyzed",
+            "transition": "analyzed",
+        },
+    }])[0]
+
+    for field in ("subject_tracking", "pose", "action", "transition"):
+        assert constrained["evidence_gate"][field]["verified"] is True
+        assert constrained["evidence_gate"][field]["level"] == "verified"
+        assert constrained["evidence_gate"][field]["source"] == "semantic_provider"
+
+
 def test_single_source_video_uses_authoritative_segment_index():
     result = validate_reverse_result(
         {
@@ -275,7 +479,7 @@ def test_multi_source_video_rejects_out_of_range_segment_index():
         )
 
 
-def test_generation_video_contract_requires_every_sampled_frame():
+def test_generation_video_contract_accepts_partial_sampled_frame_coverage():
     payload = {
         "主体": "产品",
         "shots": [{
@@ -288,14 +492,15 @@ def test_generation_video_contract_requires_every_sampled_frame():
         "final_text": "产品瓶身特写",
     }
 
-    with pytest.raises(ReverseResultValidationError, match="缺少采样帧: 3"):
-        validate_reverse_result(
-            payload,
-            "video",
-            required_video_frame_indices=[1, 2, 3],
-        )
+    result = validate_reverse_result(
+        payload,
+        "video",
+        required_video_frame_indices=[1, 2, 3],
+    )
+    assert result["shots"][0]["evidence_frame_indices"] == [1, 2]
+    assert result["final_text"]
 
-    # Analysis/report callers keep the existing partial-coverage contract.
+    # Validation without server-side sampled-frame evidence remains compatible.
     assert validate_reverse_result(payload, "video")["shots"][0]["visual"] == "产品瓶身特写"
 
 
@@ -361,8 +566,11 @@ def test_generation_video_contract_keeps_visible_frame_when_confidence_is_placeh
     assert result["shots"][0]["confidence"] == 0.5
 
 
-def test_generation_video_contract_rejects_empty_visual_frame_coverage():
-    with pytest.raises(ReverseResultValidationError, match="缺少采样帧: 1"):
+def test_generation_video_contract_rejects_zero_usable_shots():
+    with pytest.raises(
+        ReverseResultValidationError,
+        match="未返回任何带采样帧证据的有效 shots",
+    ):
         validate_reverse_result(
             {
                 "主体": "产品",
@@ -486,6 +694,108 @@ def test_reverse_result_gets_at_most_one_text_only_repair(monkeypatch):
     assert "image_url" not in calls[1]["messages"][0]["content"]
     assert result["repair_attempted"] is True
     assert result["repair_succeeded"] is True
+    assert result["usage"]["total_tokens"] == 10
+
+
+def test_reverse_result_repairs_json_syntax_locally_before_model_repair(monkeypatch):
+    monkeypatch.setattr(settings, "mock_mode", False)
+    calls = []
+
+    def fake_post(_path, payload, **_kwargs):
+        calls.append(payload)
+        return {
+            "choices": [{"message": {"content": (
+                '{"主体":"猫","final_text":"猫的肖像",}'
+            )}}],
+            "usage": {"total_tokens": 7},
+        }
+
+    monkeypatch.setattr(gateway, "_post", fake_post)
+    result = gateway.reverse_prompt(
+        "data:image/jpeg;base64,eA==",
+        "vision",
+        gateway_config=_vision_config(),
+    )
+
+    assert len(calls) == 1
+    assert result["structured"]["主体"] == "猫"
+    assert result["repair_attempted"] is True
+    assert result["repair_succeeded"] is True
+    assert result["usage"]["total_tokens"] == 7
+
+
+def test_video_reverse_repairs_partial_coverage_and_groups_detected_shot(monkeypatch):
+    monkeypatch.setattr(settings, "mock_mode", False)
+    calls = []
+    responses = iter([
+        {
+            "choices": [{"message": {"content": json.dumps({
+                "主体": "白色洗脸巾",
+                "shots": [{
+                    "start_seconds": 0.0,
+                    "end_seconds": 2.0,
+                    "visual": "洗脸巾在水中展开",
+                    "lighting": "柔和侧光",
+                    "ocr": "干湿两用",
+                    "evidence_frame_indices": [1],
+                    "confidence": 0.9,
+                }],
+                "final_text": "白色洗脸巾在水中展开",
+            }, ensure_ascii=False)}}],
+            "usage": {"total_tokens": 7},
+        },
+        {
+            "choices": [{"message": {"content": json.dumps({
+                "frames": [{
+                    "frame_index": 2,
+                    "visual": "双手拧干吸满水的洗脸巾",
+                    "lighting": "柔和侧光",
+                    "ocr": "厚实吸水",
+                    "confidence": 0.85,
+                }],
+            }, ensure_ascii=False)}}],
+            "usage": {"total_tokens": 3},
+        },
+    ])
+
+    def fake_post(_path, payload, **_kwargs):
+        calls.append(payload)
+        return next(responses)
+
+    monkeypatch.setattr(gateway, "_post", fake_post)
+    sampled_frames = [
+        {
+            "index": index,
+            "timestamp_seconds": timestamp,
+            "relative_timestamp_seconds": timestamp,
+            "detected_shot_id": "shot-1",
+            "detected_shot_index": 1,
+            "detected_shot_start_seconds": 0.0,
+            "detected_shot_end_seconds": 2.0,
+        }
+        for index, timestamp in ((1, 0.25), (2, 1.75))
+    ]
+
+    result = gateway.reverse_prompt(
+        ["data:image/jpeg;base64,eA==", "data:image/jpeg;base64,eA=="],
+        "vision",
+        target="video",
+        gateway_config=_vision_config(),
+        video_analysis={
+            "source": {"duration_seconds": 2.0, "audio_analyzed": False},
+            "sampled_frames": sampled_frames,
+        },
+        require_video_frame_coverage=True,
+    )
+
+    assert len(calls) == 2
+    assert result["repair_attempted"] is True
+    assert result["repair_succeeded"] is True
+    assert result["analysis_gaps"] == []
+    assert len(result["shots"]) == 1
+    assert result["shots"][0]["evidence_frame_indices"] == [1, 2]
+    assert "双手拧干吸满水" in result["shots"][0]["visual"]
+    assert result["shots"][0]["ocr"] == "干湿两用；厚实吸水"
     assert result["usage"]["total_tokens"] == 10
 
 
@@ -722,7 +1032,7 @@ def test_provider_prose_and_unknown_evidence_never_enter_visual_prompt(monkeypat
     assert result["structured"]["未知审计字段"] == "证据帧中有BUY NOW"
     assert result["shots"][0]["ocr"] == "BUY NOW"
     assert result["shots"][0]["audio_cue"] == "未分析"
-    assert result["final_text"] == "红色产品；柔和侧光；镜头1（0.000-1.000秒）：产品居中"
+    assert result["final_text"] == "红色产品；柔和侧光；镜头1：产品居中"
     for forbidden in ("欢迎回来", "限时优惠", "BUY NOW", "OCR", "证据帧"):
         assert forbidden not in result["final_text"]
 
@@ -731,6 +1041,8 @@ def test_single_frame_evidence_cannot_authorize_motion_camera_or_transition(monk
     monkeypatch.setattr(settings, "mock_mode", False)
     payload = {
         "主体": "红色产品",
+        "主体追踪": "同一产品从中央移向右侧",
+        "姿态变化": "产品由直立转为倾斜",
         "主体动作": "产品快速旋转",
         "镜头运动": "镜头环绕一周",
         "转场": "闪白转场",
@@ -738,6 +1050,8 @@ def test_single_frame_evidence_cannot_authorize_motion_camera_or_transition(monk
             "start_seconds": 0,
             "end_seconds": 1,
             "visual": "产品居中",
+            "subject_tracking": "同一产品从中央移向右侧",
+            "pose": "产品由直立转为倾斜",
             "action": "产品快速旋转",
             "camera": "镜头环绕一周",
             "lighting": "柔和侧光",
@@ -773,13 +1087,15 @@ def test_single_frame_evidence_cannot_authorize_motion_camera_or_transition(monk
     assert len(result["shots"]) == 1
     assert result["shots"][0]["visual"] == "产品居中"
     assert result["shots"][0]["lighting"] == "柔和侧光"
+    assert result["shots"][0]["subject_tracking"] == ""
+    assert result["shots"][0]["pose"] == ""
     assert result["shots"][0]["action"] == ""
     assert result["shots"][0]["camera"] == ""
     assert result["shots"][0]["transition"] == ""
     assert set(result["unverified_temporal_fields"]) == {
-        "主体动作", "镜头运动", "转场",
+        "主体追踪", "姿态变化", "主体动作", "镜头运动", "转场",
     }
-    for forbidden in ("快速旋转", "环绕一周", "闪白转场"):
+    for forbidden in ("移向右侧", "转为倾斜", "快速旋转", "环绕一周", "闪白转场"):
         assert forbidden not in result["final_text"]
     assert "产品居中" in result["final_text"]
     assert "柔和侧光" in result["final_text"]
@@ -965,7 +1281,7 @@ def test_vision_anthropic_messages_supports_multiple_images_and_usage(monkeypatc
     assert path == "/messages"
     assert kwargs["retries"] == 0
     assert payload["model"] == "gemini-3.1-pro-high"
-    assert payload["max_tokens"] == 4096
+    assert payload["max_tokens"] == 8192
     assert "reasoning_effort" not in payload
     blocks = payload["messages"][0]["content"]
     assert [block["type"] for block in blocks] == ["image", "image", "text"]

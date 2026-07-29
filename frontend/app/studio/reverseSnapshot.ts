@@ -21,7 +21,7 @@ export const REVERSE_SNAPSHOT_VERSION = 3;
 export const REVERSE_SNAPSHOT_COMPATIBLE_VERSIONS = new Set([2, 3]);
 const CREATION_MODES = new Set(["image", "video", "image_edit", "video_edit"]);
 const SUBJECT_MODES = new Set(["general", "product", "portrait"]);
-const RESULT_TABS = new Set(["draft", "structure", "storyboard", "evidence", "versions"]);
+const RESULT_TABS = new Set(["report", "draft", "structure", "storyboard", "evidence", "versions"]);
 const UNDO_FIELDS = new Set([
   "prompt", "negative", "structured", "structuredBaseline", "ratio", "vDuration",
   "vResolution", "promptSourceSignature", "structuredSource", "promptDirty",

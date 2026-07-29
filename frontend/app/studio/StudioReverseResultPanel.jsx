@@ -11,6 +11,7 @@ import {
 } from "./StudioReverseResultViews";
 import { normalizeImageEvidence } from "./imageEvidence";
 import { normalizePendingReverseResult } from "./reverseResultApplication";
+import StudioReverseProfessionalReport from "./StudioReverseProfessionalReport";
 
 const BASE_TABS = [
   ["draft", "生成稿"],
@@ -150,7 +151,7 @@ export default function StudioReverseResultPanel({
   }, [enabledFieldIdentity]);
   if (!result) return null;
   const tabs = isVideo
-    ? [BASE_TABS[0], BASE_TABS[1], ["storyboard", "分镜"], BASE_TABS[2], BASE_TABS[3]]
+    ? [["report", "专业报告"], BASE_TABS[0], BASE_TABS[1], ["storyboard", "分镜"], BASE_TABS[2], BASE_TABS[3]]
     : BASE_TABS;
 
   function changeResult(nextResult) {
@@ -252,6 +253,7 @@ export default function StudioReverseResultPanel({
       </div>
 
       <div className="max-h-[32rem] overflow-y-auto p-3" role="tabpanel">
+        {activeTab === "report" && isVideo && <StudioReverseProfessionalReport result={result} />}
         {activeTab === "draft" && <ReverseDraftView result={result} onChange={changeResult} />}
         {activeTab === "structure" && (
           <ReverseStructureView

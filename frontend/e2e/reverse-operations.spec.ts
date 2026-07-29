@@ -32,6 +32,9 @@ test.beforeEach(async ({ context, baseURL }) => {
 async function openStudio(page) {
   await page.goto("/");
   await expect(page.getByRole("heading", { name: "一句话，生成你的画面" })).toBeVisible();
+  await expect(page.getByLabel("反推模型", { exact: true }).locator("option")).toHaveCount(2);
+  await expect(page.getByLabel("图片模型", { exact: true }).locator("option")).toHaveCount(2);
+  await expect(page.getByLabel("优化模型", { exact: true }).locator("option")).toHaveCount(2);
 }
 
 async function expectPromptOptimizerOnly(page) {
@@ -200,7 +203,9 @@ test("正常多帧视频反推展示采样、证据覆盖和分析缺口", async
   const mock = await installReverseApiMock(page, { scenario: "video_success" });
   await openStudio(page);
   await page.getByRole("button", { name: /文生视频/ }).click();
+  await expect(page.getByLabel("视频模型", { exact: true }).locator("option")).toHaveCount(2);
   await page.locator('input[type="file"][accept*="video/mp4"]').setInputFiles(VIDEO_FILE);
+  await expect(page.getByRole("button", { name: /video$/ })).toBeVisible();
   const analysisPrecision = page.getByRole("radiogroup", { name: "分析精度" });
   await expect(analysisPrecision.getByRole("radio")).toHaveCount(4);
   for (const range of ["4-8帧", "8-14帧", "14-22帧", "22-36帧"]) {

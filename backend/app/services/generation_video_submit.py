@@ -1,4 +1,5 @@
 """Video submit and polling orchestration."""
+
 from __future__ import annotations
 
 import logging
@@ -8,7 +9,7 @@ from datetime import datetime, timezone
 from typing import Any
 from uuid import uuid4
 
-from billiard.exceptions import SoftTimeLimitExceeded
+from billiard.exceptions import SoftTimeLimitExceeded  # noqa: F401 - legacy facade export
 from sqlalchemy import or_, update
 
 from ..db import SessionLocal
@@ -35,7 +36,7 @@ from .generation_media import (
     video_target_duration,
     video_target_resolution,
 )
-from .generation_model_runtime import (
+from .generation_model_runtime import (  # noqa: F401 - polling facade dependencies
     ModelSnapshotMismatchError,
     find_video_by_request_id_with_model_config,
     model_config_for_task,
@@ -49,7 +50,7 @@ from .generation_prompts import (
 from .generation_state import TERMINAL_STATUSES as TERMINAL
 from .generation_state import cancel_requested, claim_terminal
 from .generation_video_download import hold_video_download_for_reconciliation
-from .generation_video_flow import (
+from .generation_video_flow import (  # noqa: F401 - polling facade dependencies
     POLL_MAX_CONSEC_ERRORS,
     VIDEO_POLL_MAX_SECONDS,
     aware,
@@ -61,7 +62,7 @@ from .generation_video_flow import (
     reset_poll_errors,
     video_task_action,
 )
-from .model_pricing import usage_from_response
+from .model_pricing import usage_from_response  # noqa: F401 - polling facade dependency
 from .progress import set_progress
 from .video_prompt_compiler import (
     COMPILER_VERSION,
@@ -106,10 +107,7 @@ def lineage_video_analysis_for_compile(payload: Any) -> dict[str, Any] | None:
     shots = analysis.get("shots")
     if not isinstance(shots, list):
         return None
-    if any(
-        isinstance(row, dict) and isinstance(row.get("evidence_gate"), dict)
-        for row in shots
-    ):
+    if any(isinstance(row, dict) and isinstance(row.get("evidence_gate"), dict) for row in shots):
         return analysis
     return None
 
@@ -151,9 +149,7 @@ def _task_lineage_video_analysis(db, task) -> dict[str, Any] | None:
     )
 
 
-def _compile_legacy_video_prompt(
-    task: GenTask, model, params: dict, db=None
-) -> tuple[str, dict]:
+def _compile_legacy_video_prompt(task: GenTask, model, params: dict, db=None) -> tuple[str, dict]:
     """Compile retry/legacy tasks that predate request-time video compilation."""
     references = build_video_prompt_references(
         source_asset_url=task.source_asset_url,
@@ -190,13 +186,6 @@ def _compile_legacy_video_prompt(
     return persisted["_generation_prompt"], persisted
 
 
-def _enqueue_poll_safely(task_id: int, external_task_id: str | None = None) -> None:
-    try:
-        enqueue_poll(task_id, external_task_id)
-    except Exception:
-        log.exception("video poll enqueue failed for task %s", task_id)
-
-
 def _enqueue_video_download_safely(
     db,
     task_id: int,
@@ -218,89 +207,6 @@ def _enqueue_video_download_safely(
             expected_status="running",
             expected_phase="downloading",
             expected_external_task_id=external_task_id,
-        )
-
-
-def _reload_polled_video_task(db, task_id: int, external_task_id: str):
-    db.rollback()
-    current = db.get(GenTask, task_id, populate_existing=True)
-    if not current or current.external_task_id != external_task_id:
-        return current, None
-    return current, video_task_action(current)
-
-
-def _handoff_video_download_best_effort(
-    db,
-    task_id: int,
-    external_task_id: str,
-    enqueue_download_fn=None,
-) -> None:
-    try:
-        if enqueue_download_fn is None:
-            enqueue_video_download(task_id, external_task_id=external_task_id)
-        else:
-            # Handoffs must not let an injected enqueue wrapper mutate task state
-            # through its failure path. Successful wrappers do not use the DB.
-            enqueue_download_fn(
-                None,
-                task_id,
-                external_task_id=external_task_id,
-            )
-    except Exception:  # noqa: BLE001
-        log.warning(
-            "redundant video download handoff enqueue failed for task %s; recovery will retry",
-            task_id,
-            exc_info=True,
-        )
-
-
-def _hold_owned_video_download_for_reconciliation(
-    db,
-    task_id: int,
-    external_task_id: str,
-    error: str,
-) -> None:
-    db.rollback()
-    task = db.get(GenTask, task_id, populate_existing=True)
-    if not task or task.external_task_id != external_task_id:
-        return
-    params = dict(task.params or {})
-    mark_needs_review(
-        db,
-        task_id,
-        (
-            "视频已由上游生成,但结果下载落盘失败,需要系统恢复或管理员确认。"
-            f"external_task_id={external_task_id}; "
-            f"result_url={'present' if params.get('_video_result_url') else 'missing'}; "
-            f"error={error[:500]}"
-        ),
-        expected_status="running",
-        expected_phase="downloading",
-        expected_external_task_id=external_task_id,
-    )
-
-
-def _enqueue_owned_video_download(
-    db,
-    task_id: int,
-    external_task_id: str,
-    enqueue_download_fn=None,
-) -> None:
-    try:
-        if enqueue_download_fn is None:
-            enqueue_video_download(task_id, external_task_id=external_task_id)
-        else:
-            enqueue_download_fn(
-                db,
-                task_id,
-                external_task_id=external_task_id,
-            )
-    except Exception as e:  # noqa: BLE001
-        _hold_owned_video_download_for_reconciliation(
-            db,
-            task_id,
-            external_task_id,
-            str(e),
         )
 
 
@@ -350,39 +256,6 @@ def hold_video_submit_unknown_for_reconciliation(
     )
 
 
-def hold_video_poll_for_reconciliation(
-    db,
-    task_id: int,
-    error: str,
-    *,
-    expected_status: str | None = None,
-    expected_phase: str | None = None,
-    expected_external_task_id: str | None = None,
-) -> None:
-    """Hold submitted video tasks when provider status cannot be trusted locally."""
-    db.rollback()
-    task = db.get(GenTask, task_id, populate_existing=True)
-    if not task:
-        return
-    if expected_external_task_id is not None and task.external_task_id != expected_external_task_id:
-        return
-    mark_needs_review(
-        db,
-        task_id,
-        (
-            "视频上游任务状态未知,冻结积分暂不退回。"
-            "请继续查询外部任务结果补结果结算,或确认上游未生成后人工退款。"
-            f"external_task_id={expected_external_task_id or task.external_task_id or 'unknown'}; "
-            f"error={error[:500]}"
-        ),
-        params_update={"_video_poll_state_unknown": True},
-        rollback=False,
-        expected_status=expected_status,
-        expected_phase=expected_phase,
-        expected_external_task_id=expected_external_task_id,
-    )
-
-
 def gateway_source_video_url(db, task: GenTask) -> str:
     """Resolve the task's source video into a URL the video gateway can fetch.
 
@@ -404,12 +277,16 @@ def gateway_source_video_url(db, task: GenTask) -> str:
     elif key.startswith(("video_preview/", "video_hd/")):
         # 与 asset_refs.generated_video_reference_path 相同的归属校验，
         # 但不落盘取文件——这里只需要一个上游可访问的地址。
-        asset = db.query(GenAsset).filter(
-            or_(
-                GenAsset.preview_url == storage.public_url(key),
-                GenAsset.hd_url == storage.public_url(key),
+        asset = (
+            db.query(GenAsset)
+            .filter(
+                or_(
+                    GenAsset.preview_url == storage.public_url(key),
+                    GenAsset.hd_url == storage.public_url(key),
+                )
             )
-        ).first()
+            .first()
+        )
         if not asset or asset.user_id != task.user_id:
             raise RuntimeError("生成视频不存在")
         if key.startswith("video_hd/") and not asset.unlocked:
@@ -422,9 +299,7 @@ def gateway_source_video_url(db, task: GenTask) -> str:
         # 本地存储只公开预览目录；上传原片与高清片没有上游可访问地址。
         url = storage.public_url(key)
     else:
-        raise SourceVideoUrlUnavailable(
-            "当前部署未启用对象存储，无法为上传原片生成上游可访问地址"
-        )
+        raise SourceVideoUrlUnavailable("当前部署未启用对象存储，无法为上传原片生成上游可访问地址")
     if not url:
         raise SourceVideoUrlUnavailable("无法为源视频生成上游可访问地址")
     return url
@@ -504,8 +379,7 @@ def video_submit_params(db, task: GenTask) -> dict:
             # 也刻意不静默——运动信息丢失必须让用户看得到。
             params["source_video_degraded"] = "first_frame_only"
             params["source_video_degraded_reason"] = (
-                f"{exc}。本次仅使用首帧，未传递运动信息；"
-                "如需完整视频参考，请启用对象存储。"
+                f"{exc}。本次仅使用首帧，未传递运动信息；" "如需完整视频参考，请启用对象存储。"
             )
             params.pop("source_video_url", None)
             log.warning(
@@ -814,6 +688,35 @@ def submit_state_unknown(exc: Exception) -> bool:
     return True
 
 
+def _prepare_video_submission(db, task: GenTask, model) -> tuple[dict, str, dict]:
+    original_params = dict(task.params or {})
+    prompt = str(original_params.get("_generation_prompt") or "").strip()
+    stored_compiler_version = str(original_params.get("_prompt_compiler_version") or "").strip()
+    stored_contract_version = str(
+        original_params.get("_video_submit_contract_version") or ""
+    ).strip()
+    if not prompt or not stored_compiler_version or not stored_contract_version:
+        prompt, original_params = _compile_legacy_video_prompt(task, model, original_params, db=db)
+    elif stored_contract_version != VIDEO_SUBMIT_CONTRACT_VERSION:
+        raise VideoSubmitVersionMismatch(
+            "视频提交契约版本不一致，已停止提交；请重启 API 与 Worker 后重试"
+        )
+    elif stored_compiler_version != COMPILER_VERSION:
+        raise VideoSubmitVersionMismatch(
+            "视频提示词编译器版本不一致，已停止提交；请重启 API 与 Worker 后重试"
+        )
+    if not prompt:
+        raise RuntimeError("视频提示词为空，无法提交生成")
+    if not original_params.get("_video_request_id"):
+        original_params["_video_request_id"] = f"video-{task.id}-{uuid4().hex}"
+    task.params = original_params
+    db.commit()
+    params = video_submit_params(db, task)
+    params.setdefault("request_id", original_params["_video_request_id"])
+    raise_if_cancel_requested(db, db.get(GenTask, task.id))
+    return original_params, prompt, params
+
+
 def start_video_task(
     task_id: int,
     *,
@@ -872,35 +775,7 @@ def start_video_task(
                 raise RuntimeError("未配置可用的视频模型")
             model = model_from_snapshot(task, model, db)
 
-            original_params = dict(task.params or {})
-            prompt = str(original_params.get("_generation_prompt") or "").strip()
-            stored_compiler_version = str(
-                original_params.get("_prompt_compiler_version") or ""
-            ).strip()
-            stored_contract_version = str(
-                original_params.get("_video_submit_contract_version") or ""
-            ).strip()
-            if not prompt or not stored_compiler_version or not stored_contract_version:
-                prompt, original_params = _compile_legacy_video_prompt(
-                    task, model, original_params, db=db
-                )
-            elif stored_contract_version != VIDEO_SUBMIT_CONTRACT_VERSION:
-                raise VideoSubmitVersionMismatch(
-                    "视频提交契约版本不一致，已停止提交；请重启 API 与 Worker 后重试"
-                )
-            elif stored_compiler_version != COMPILER_VERSION:
-                raise VideoSubmitVersionMismatch(
-                    "视频提示词编译器版本不一致，已停止提交；请重启 API 与 Worker 后重试"
-                )
-            if not prompt:
-                raise RuntimeError("视频提示词为空，无法提交生成")
-            if not original_params.get("_video_request_id"):
-                original_params["_video_request_id"] = f"video-{task.id}-{uuid4().hex}"
-            task.params = original_params
-            db.commit()
-            params = video_submit_params(db, task)
-            params.setdefault("request_id", original_params["_video_request_id"])
-            raise_if_cancel_requested(db, db.get(GenTask, task_id))
+            original_params, prompt, params = _prepare_video_submission(db, task, model)
 
             submit_t0 = time.time()
             try:
@@ -928,7 +803,9 @@ def start_video_task(
                     },
                 )
                 if unknown:
-                    recovered = recover_unknown_submit_by_request_id(db, task, model, original_params, params)
+                    recovered = recover_unknown_submit_by_request_id(
+                        db, task, model, original_params, params
+                    )
                     if recovered:
                         action = video_task_action(task)
                         if action == "download":
@@ -1021,374 +898,30 @@ def start_video_task(
         enqueue_poll_fn(task_id, submitted_external_task_id)
 
 
-def poll_video_once(
-    task_id: int,
-    *,
-    get_model_config_fn=None,
-    poll_video_fn=None,
-    try_enqueue_poll_fn=None,
-    try_enqueue_video_download_fn=None,
-    poll_max_seconds: int | None = None,
-) -> None:
-    """One poll tick that re-enqueues itself until the render is terminal."""
-    model_loader = get_model_config_fn or get_model_config
-    poller = poll_video_fn or poll_video_with_model_config
-    enqueue_poll_fn = try_enqueue_poll_fn or _enqueue_poll_safely
-    polled_external_task_id: str | None = None
-    db = SessionLocal()
-    try:
-        task = db.get(GenTask, task_id)
-        if not task or task.status in TERMINAL:
-            return
-        action = video_task_action(task)
-        if action == "download":
-            _handoff_video_download_best_effort(
-                db,
-                task_id,
-                task.external_task_id,
-                try_enqueue_video_download_fn,
-            )
-            return
-        if action != "poll":
-            return
-        polled_external_task_id = task.external_task_id
-        model = model_config_for_task(db, task, "video", model_loader)
-        if not model:
-            hold_video_poll_for_reconciliation(
-                db,
-                task_id,
-                "视频模型配置缺失",
-                expected_status="running",
-                expected_phase="polling",
-                expected_external_task_id=polled_external_task_id,
-            )
-            return
-        try:
-            model = model_from_snapshot(task, model, db)
-        except ModelSnapshotMismatchError as e:
-            hold_video_poll_for_reconciliation(
-                db,
-                task_id,
-                str(e),
-                expected_status="running",
-                expected_phase="polling",
-                expected_external_task_id=polled_external_task_id,
-            )
-            return
+# Polling remains import-compatible through this service module.
+from . import generation_video_polling as _generation_video_polling_module  # noqa: E402
+from .compat_facade import (  # noqa: E402
+    install_assignment_forwarding as _install_assignment_forwarding,
+)
+from .generation_video_polling import (  # noqa: E402, F401
+    _continue_pending_poll,
+    _enqueue_owned_video_download,
+    _enqueue_poll_safely,
+    _expire_video_poll,
+    _handle_failed_poll_result,
+    _handle_poll_provider_error,
+    _handle_succeeded_poll_result,
+    _handoff_video_download_best_effort,
+    _hold_owned_video_download_for_reconciliation,
+    _load_pollable_video_task,
+    _poll_owner_state,
+    _poll_runtime_model,
+    _poll_timing,
+    _reconcile_poll_exception,
+    _reconcile_poll_soft_timeout,
+    _reload_polled_video_task,
+    hold_video_poll_for_reconciliation,
+    poll_video_once,
+)
 
-        poll_budget = int(poll_max_seconds or VIDEO_POLL_MAX_SECONDS)
-        submitted_at = aware(task.external_submitted_at) or aware(task.created_at)
-        elapsed = (datetime.now(timezone.utc) - submitted_at).total_seconds() if submitted_at else 0
-        if elapsed > poll_budget:
-            timeout_minutes = max(1, (poll_budget + 59) // 60)
-            usage.record_call(
-                db,
-                kind="video_poll",
-                model_id=model.model_id,
-                user_id=task.user_id,
-                task_id=task.id,
-                status="failed",
-                detail={
-                    "stage": task.stage,
-                    "external_task_id": task.external_task_id,
-                    "error": "render timeout",
-                },
-            )
-            fail_and_refund(
-                db,
-                task_id,
-                f"视频生成超过 {poll_budget} 秒仍未完成; "
-                f"external_task_id={polled_external_task_id or 'unknown'}",
-                public_error=(
-                    f"视频生成超过 {timeout_minutes} 分钟，"
-                    "任务已自动失败并退回冻结积分"
-                ),
-                expected_status="running",
-                expected_phase="polling",
-                expected_external_task_id=polled_external_task_id,
-            )
-            return
-
-        current, current_action = _reload_polled_video_task(
-            db,
-            task_id,
-            polled_external_task_id,
-        )
-        if current_action == "download":
-            _handoff_video_download_best_effort(
-                db,
-                task_id,
-                current.external_task_id,
-                try_enqueue_video_download_fn,
-            )
-            return
-        if current_action != "poll":
-            return
-        task = current
-        mark_poll_alive(task_id, polled_external_task_id)
-        try:
-            res = poller(model, polled_external_task_id)
-        except SoftTimeLimitExceeded:
-            log.warning("poll_video_once soft time limit for task %s; holding for review", task_id)
-            current, current_action = _reload_polled_video_task(
-                db,
-                task_id,
-                polled_external_task_id,
-            )
-            if current_action == "download":
-                _handoff_video_download_best_effort(
-                    db,
-                    task_id,
-                    current.external_task_id,
-                    try_enqueue_video_download_fn,
-                )
-            elif current_action == "poll":
-                hold_video_poll_for_reconciliation(
-                    db,
-                    task_id,
-                    "视频状态查询执行超时",
-                    expected_status="running",
-                    expected_phase="polling",
-                    expected_external_task_id=polled_external_task_id,
-                )
-            return
-        except Exception as e:  # noqa: BLE001
-            is_transient_poll_error = isinstance(e, gateway.GatewayError) and getattr(e, "transient", False)
-            if is_transient_poll_error:
-                usage.record_call(
-                    db,
-                    kind="video_poll",
-                    model_id=model.model_id,
-                    user_id=task.user_id,
-                    task_id=task.id,
-                    status="failed",
-                    detail={
-                        "stage": task.stage,
-                        "external_task_id": polled_external_task_id,
-                        "transient": True,
-                        "error": str(e)[:300],
-                    },
-                )
-            current, current_action = _reload_polled_video_task(
-                db,
-                task_id,
-                polled_external_task_id,
-            )
-            if current_action == "download":
-                _handoff_video_download_best_effort(
-                    db,
-                    task_id,
-                    current.external_task_id,
-                    try_enqueue_video_download_fn,
-                )
-                return
-            if current_action != "poll":
-                return
-            fails = bump_poll_errors(task_id, polled_external_task_id)
-            log.warning("poll error %s/%s for task %s: %s", fails, POLL_MAX_CONSEC_ERRORS, task_id, e)
-            if fails >= POLL_MAX_CONSEC_ERRORS:
-                hold_video_poll_for_reconciliation(
-                    db,
-                    task_id,
-                    f"视频轮询连续失败: {e}",
-                    expected_status="running",
-                    expected_phase="polling",
-                    expected_external_task_id=polled_external_task_id,
-                )
-            else:
-                mark_poll_alive(task_id, polled_external_task_id)
-                current, current_action = _reload_polled_video_task(
-                    db,
-                    task_id,
-                    polled_external_task_id,
-                )
-                if current_action == "download":
-                    _handoff_video_download_best_effort(
-                        db,
-                        task_id,
-                        current.external_task_id,
-                        try_enqueue_video_download_fn,
-                    )
-                elif current_action == "poll":
-                    enqueue_poll_fn(task_id, polled_external_task_id)
-            return
-
-        current, current_action = _reload_polled_video_task(
-            db,
-            task_id,
-            polled_external_task_id,
-        )
-        if current_action == "download":
-            _handoff_video_download_best_effort(
-                db,
-                task_id,
-                current.external_task_id,
-                try_enqueue_video_download_fn,
-            )
-            return
-        if current_action != "poll":
-            return
-        reset_poll_errors(task_id, polled_external_task_id)
-
-        status = res.get("status")
-        if status == "failed":
-            usage.record_call(
-                db,
-                kind="video_poll",
-                model_id=model.model_id,
-                user_id=current.user_id,
-                task_id=current.id,
-                status="failed",
-                detail={
-                    "stage": current.stage,
-                    "external_task_id": polled_external_task_id,
-                    "error": str(res.get("error"))[:300],
-                },
-            )
-            fail_and_refund(
-                db,
-                task_id,
-                res.get("error") or "视频网关返回失败",
-                public_error="视频生成失败，已退回冻结积分，请稍后重试",
-                expected_status="running",
-                expected_phase="polling",
-                expected_external_task_id=polled_external_task_id,
-            )
-            return
-        if status == "succeeded":
-            provider_usage = usage_from_response(res)
-            try:
-                usage.record_call(
-                    db,
-                    kind="video_poll",
-                    model_id=model.model_id,
-                    user_id=current.user_id,
-                    task_id=current.id,
-                    status="ok",
-                    usage=provider_usage,
-                    detail={
-                        "stage": current.stage,
-                        "external_task_id": polled_external_task_id,
-                    },
-                )
-            except Exception:  # noqa: BLE001
-                log.exception("video poll usage record failed for task %s", task_id)
-                db.rollback()
-            try:
-                won_download = persist_video_download_result(db, current, res)
-            except Exception as e:  # noqa: BLE001
-                log.exception("video success persistence failed for task %s", task_id)
-                latest, latest_action = _reload_polled_video_task(
-                    db,
-                    task_id,
-                    polled_external_task_id,
-                )
-                if latest_action == "download":
-                    _handoff_video_download_best_effort(
-                        db,
-                        task_id,
-                        latest.external_task_id,
-                        try_enqueue_video_download_fn,
-                    )
-                elif latest_action == "poll":
-                    hold_video_poll_for_reconciliation(
-                        db,
-                        task_id,
-                        str(e),
-                        expected_status="running",
-                        expected_phase="polling",
-                        expected_external_task_id=polled_external_task_id,
-                    )
-                return
-            if won_download:
-                _enqueue_owned_video_download(
-                    db,
-                    task_id,
-                    polled_external_task_id,
-                    try_enqueue_video_download_fn,
-                )
-                return
-            latest, latest_action = _reload_polled_video_task(
-                db,
-                task_id,
-                polled_external_task_id,
-            )
-            if latest_action == "download":
-                _handoff_video_download_best_effort(
-                    db,
-                    task_id,
-                    latest.external_task_id,
-                    try_enqueue_video_download_fn,
-                )
-            return
-
-        mark_poll_alive(task_id, polled_external_task_id)
-        current, current_action = _reload_polled_video_task(
-            db,
-            task_id,
-            polled_external_task_id,
-        )
-        if current_action == "download":
-            _handoff_video_download_best_effort(
-                db,
-                task_id,
-                current.external_task_id,
-                try_enqueue_video_download_fn,
-            )
-            return
-        if current_action != "poll":
-            return
-        pct = min(85, 30 + int(elapsed) * 55 // max(1, poll_budget))
-        set_progress(task_id, pct, "running")
-        enqueue_poll_fn(task_id, polled_external_task_id)
-    except SoftTimeLimitExceeded:
-        log.warning("poll_video_once soft time limit for task %s; holding for review", task_id)
-        if polled_external_task_id is not None:
-            current, current_action = _reload_polled_video_task(
-                db,
-                task_id,
-                polled_external_task_id,
-            )
-            if current_action == "download":
-                _handoff_video_download_best_effort(
-                    db,
-                    task_id,
-                    current.external_task_id,
-                    try_enqueue_video_download_fn,
-                )
-            elif current_action == "poll":
-                hold_video_poll_for_reconciliation(
-                    db,
-                    task_id,
-                    "视频状态查询执行超时",
-                    expected_status="running",
-                    expected_phase="polling",
-                    expected_external_task_id=polled_external_task_id,
-                )
-    except Exception as e:  # noqa: BLE001
-        log.exception("poll_video_once %s failed", task_id)
-        if polled_external_task_id is None:
-            return
-        current, current_action = _reload_polled_video_task(
-            db,
-            task_id,
-            polled_external_task_id,
-        )
-        if current_action == "download":
-            _handoff_video_download_best_effort(
-                db,
-                task_id,
-                current.external_task_id,
-                try_enqueue_video_download_fn,
-            )
-        elif current_action == "poll":
-            hold_video_poll_for_reconciliation(
-                db,
-                task_id,
-                str(e),
-                expected_status="running",
-                expected_phase="polling",
-                expected_external_task_id=polled_external_task_id,
-            )
-    finally:
-        db.close()
+_install_assignment_forwarding(__name__, (_generation_video_polling_module,))

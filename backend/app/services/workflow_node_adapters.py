@@ -9,6 +9,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Iterator
 from contextlib import contextmanager
+from types import SimpleNamespace
 from typing import Any
 
 from fastapi import HTTPException, Request, Response
@@ -27,10 +28,6 @@ from ..models import (
     WorkflowRun,
 )
 from ..prompt_optimization_schemas import StudioPromptOptimizationIn
-from ..routers import generate as generate_router
-from ..routers import parse as parse_router
-from ..routers import prompt as prompt_router
-from ..routers import tasks as task_router
 from ..schemas import GenerateIn, GenerationQuoteIn, ParseIn, ReverseOperationCreate
 from . import prompt_optimization, reverse_operations, tool_workflows
 
@@ -43,6 +40,47 @@ _CONFIG_CONTROL_KEYS = {
     "timeout_seconds",
     "asset_index",
 }
+
+
+def _unconfigured_dependency(*_args, **_kwargs):
+    raise RuntimeError("工作流生产适配器尚未完成应用层依赖配置")
+
+
+# Keep these namespaces as the stable adapter surface used by tests and local
+# overrides. Application entrypoints populate them without making services
+# import FastAPI router modules in the opposite dependency direction.
+parse_router = SimpleNamespace(submit_parse=_unconfigured_dependency)
+prompt_router = SimpleNamespace(create_reverse_operation=_unconfigured_dependency)
+generate_router = SimpleNamespace(
+    quote_generation=_unconfigured_dependency,
+    generate=_unconfigured_dependency,
+)
+task_router = SimpleNamespace(
+    build_task_out=_unconfigured_dependency,
+    cancel_task=_unconfigured_dependency,
+)
+
+
+def configure_workflow_node_dependencies(
+    *,
+    submit_parse,
+    create_reverse_operation,
+    quote_generation,
+    generate,
+    build_task_out,
+    cancel_task,
+) -> None:
+    """Bind application adapters at the composition root.
+
+    The namespaces are mutated in place so existing monkeypatch and worker
+    registrations keep the same object identity across repeated wiring calls.
+    """
+    parse_router.submit_parse = submit_parse
+    prompt_router.create_reverse_operation = create_reverse_operation
+    generate_router.quote_generation = quote_generation
+    generate_router.generate = generate
+    task_router.build_task_out = build_task_out
+    task_router.cancel_task = cancel_task
 
 
 def _internal_request(path: str) -> Request:
@@ -700,11 +738,11 @@ def register_production_workflow_adapters(*, overwrite: bool = True) -> None:
         "export": export_node,
     }
     for node_type, handler in handlers.items():
-        if overwrite or node_type not in tool_workflows._NODE_HANDLERS:
+        if overwrite or not tool_workflows.has_node_handler(node_type):
             tool_workflows.register_node_handler(node_type, handler)
-    if overwrite or "cancel_external_task" not in tool_workflows._COMPENSATION_HANDLERS:
+    if overwrite or not tool_workflows.has_compensation_handler("cancel_external_task"):
         tool_workflows.register_compensation_handler("cancel_external_task", cancel_external_task)
-    if overwrite or "cleanup_video_composition" not in tool_workflows._COMPENSATION_HANDLERS:
+    if overwrite or not tool_workflows.has_compensation_handler("cleanup_video_composition"):
         tool_workflows.register_compensation_handler(
             "cleanup_video_composition",
             cleanup_video_composition,
