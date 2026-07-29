@@ -20,7 +20,7 @@ export default function StudioSubmitBar({
   structuredDirty,
   submitting,
   parsing,
-  uploading,
+  uploadBlocked,
   reversing,
   productProfiling,
   task,
@@ -35,7 +35,7 @@ export default function StudioSubmitBar({
     : 0;
   const submitDisabled = missingRequiredSource || structuredDirty || generationSubmitDisabled({
     submitting,
-    busy: parsing || uploading || reversing || productProfiling,
+    busy: parsing || uploadBlocked || reversing || productProfiling,
     currentTask: task,
     nextCategory: category,
     currentModelEnabled,
@@ -83,15 +83,21 @@ export default function StudioSubmitBar({
             ? videoModelSwitchMessage
             : structuredDirty
               ? "请先应用结构修改或撤销结构修改"
-              : undefined}
+              : uploadBlocked
+                ? "本次生成需要的素材仍在上传中"
+                : undefined}
         className="btn-primary btn-lg min-w-28 shrink-0 px-4 sm:min-w-32 sm:px-6"
       >
-        {(submitting || running) && (
+        {(submitting || running || uploadBlocked) && (
           <span className="h-4 w-4 shrink-0 animate-spin rounded-full border-2 border-white/35 border-t-white" aria-hidden />
         )}
         {missingRequiredSource
           ? missingRequiredSourceLabel
-          : videoModelSwitchRequired ? "请切换视频模型" : submitLabel}
+          : videoModelSwitchRequired
+            ? "请切换视频模型"
+            : uploadBlocked
+              ? "素材上传中"
+              : submitLabel}
       </button>
     </div>
   );

@@ -1,7 +1,13 @@
 import { buildStudioDerivedViewState } from "./viewModel";
+import { generationRequiresPendingUpload } from "./generationUploadPolicy";
 
 function buildSubmitBarProps(foundation, model, task, generation, view) {
   const missingRequiredSource = foundation.isEditMode && !foundation.productAsset;
+  const uploadBlocked = generationRequiresPendingUpload({
+    uploading: foundation.uploading,
+    uploadingRole: foundation.uploadingRole,
+    selected: foundation.selected,
+  });
   const missingRequiredSourceLabel = foundation.portraitGenerationMode
     ? "请先上传人物"
     : foundation.productGenerationMode
@@ -32,7 +38,7 @@ function buildSubmitBarProps(foundation, model, task, generation, view) {
     structuredDirty: foundation.structuredDirty,
     submitting: generation.submitting,
     parsing: foundation.parsing,
-    uploading: foundation.uploading,
+    uploadBlocked,
     reversing: foundation.reversing,
     productProfiling: foundation.productProfiling,
     task: task.task,

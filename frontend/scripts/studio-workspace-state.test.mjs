@@ -667,7 +667,7 @@ assert.match(
 );
 assert.match(
   submitBarSource,
-  /missingRequiredSource[\s\S]*\? missingRequiredSourceLabel[\s\S]*videoModelSwitchRequired \? "请切换视频模型" : submitLabel/,
+  /missingRequiredSource[\s\S]*\? missingRequiredSourceLabel[\s\S]*: videoModelSwitchRequired[\s\S]*\? "请切换视频模型"[\s\S]*: uploadBlocked[\s\S]*\? "素材上传中"[\s\S]*: submitLabel/,
   "the submit button should identify a required video model switch",
 );
 assert.match(

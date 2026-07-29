@@ -5,6 +5,7 @@ import { generateClientRequestId } from "../app/studio/generationRequestId";
 import { validateImageEvidenceMaskPreflight } from "../app/studio/imageEvidenceReview";
 import { resolveProductVideoStrategySelection } from "../app/studio/productVideoStrategy";
 import { shouldBlockNewGeneration } from "../app/studio/taskConcurrency";
+import { generationRequiresPendingUpload } from "../app/studio/generationUploadPolicy";
 import {
   modelOptionSupports,
   validateMultiReferenceSelection,
@@ -12,6 +13,7 @@ import {
 
 export function validateGenerationSubmission({
   uploading,
+  uploadingRole,
   parsing,
   reversing,
   productProfiling,
@@ -36,7 +38,9 @@ export function validateGenerationSubmission({
   reviewedImageEvidence,
   reverseEvidenceOperation,
 }) {
-  if (uploading) return { ok: false, message: "素材仍在上传中，请等待上传完成后再生成。" };
+  if (generationRequiresPendingUpload({ uploading, uploadingRole, selected })) {
+    return { ok: false, message: "本次生成需要的素材仍在上传中，请等待上传完成后再生成。" };
+  }
   if (parsing || reversing) {
     return { ok: false, message: "参考素材仍在抓取或反推中，请等待提示词完成后再生成。" };
   }

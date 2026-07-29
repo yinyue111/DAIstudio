@@ -23,6 +23,7 @@ export function createWorkspaceState() {
     appliedUrl: "",
     parsing: false,
     uploading: false,
+    uploadingRole: null,
     reversing: false,
     reverseOperation: null,
     profileOperation: null,
