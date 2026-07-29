@@ -38,4 +38,36 @@ class UserDraftOut(BaseModel):
     updated_at: UtcDateTime | None = None
 
 
+# --- 账号注销（两阶段软注销）---
+
+
+class AccountDeletionIn(BaseModel):
+    """自助注销请求:必须复核登录密码;有剩余积分时必须显式确认放弃。"""
+
+    password: str = Field(max_length=128)
+    confirm_forfeit_credits: bool = False
+
+
+class AccountDeletionBlockerOut(BaseModel):
+    code: str
+    message: str
+
+
+class AccountDeletionPreflightOut(BaseModel):
+    can_delete: bool
+    already_deleted: bool = False
+    requires_credit_forfeit_confirmation: bool
+    balance_credits: int
+    frozen_credits: int
+    blockers: list[AccountDeletionBlockerOut] = Field(default_factory=list)
+
+
+class AccountDeletionOut(BaseModel):
+    ok: bool
+    already_deleted: bool = False
+    deleted_at: UtcDateTime | None = None
+    phone_masked: str
+    forfeited_credits: int = 0
+
+
 # --- Parse ---

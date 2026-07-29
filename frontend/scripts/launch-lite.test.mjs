@@ -2,9 +2,10 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { readStudioSource } from "./studio-source.mjs";
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
-const page = readFileSync(join(root, "app/page.jsx"), "utf8");
+const page = readStudioSource(root);
 const shell = readFileSync(join(root, "components/AppShell.jsx"), "utf8");
 const recharge = readFileSync(join(root, "app/recharge/page.jsx"), "utf8");
 const prompts = readFileSync(join(root, "app/prompts/page.jsx"), "utf8");

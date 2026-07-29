@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { readStudioSource } from "./studio-source.mjs";
 
 import {
   imageEvidenceConflictGroups,
@@ -23,13 +24,13 @@ import {
   validateImageEvidenceMaskPreflight,
 } from "../app/studio/imageEvidenceReview.ts";
 import { compareReverseResultRevisions } from "../app/studio/reverseResultRevisionDiff.ts";
+import { validateGenerationSubmission } from "../hooks/generationSubmitWorkflow.js";
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
 const evidenceViewSource = readFileSync(join(root, "app/studio/StudioReverseResultViews.jsx"), "utf8");
 const resultPanelSource = readFileSync(join(root, "app/studio/StudioReverseResultPanel.jsx"), "utf8");
 const evidenceComponentSource = readFileSync(join(root, "app/studio/StudioImageEvidence.jsx"), "utf8");
-const generationSubmitSource = readFileSync(join(root, "hooks/useGenerationSubmit.js"), "utf8");
-const studioPageSource = readFileSync(join(root, "app/page.jsx"), "utf8");
+const studioPageSource = readStudioSource(root);
 
 function evidence(overrides = {}) {
   return {
@@ -483,17 +484,49 @@ assert.match(
   "live evidence controls must commit normalized rows through the supplied callback",
 );
 
-const submitFunctionSource = generationSubmitSource.slice(
-  generationSubmitSource.indexOf("async function submit"),
-  generationSubmitSource.indexOf("function resetOwnerGenerationSubmit"),
+const submissionPreflight = validateGenerationSubmission({
+  uploading: false,
+  parsing: false,
+  reversing: false,
+  productProfiling: false,
+  structuredDirty: false,
+  modelOption: { capabilities: {} },
+  productVideoTemplate: "prompt_driven",
+  category: "image",
+  creationMode: "image_edit",
+  subjectMode: "general",
+  firstLastFrameEnabled: false,
+  lastFrameAsset: null,
+  selected: null,
+  productAsset: {
+    type: "image",
+    url: "https://api.example.test/api/uploads/users/1/main.png?signature=new",
+  },
+  productDetailAssets: [],
+  task: null,
+  isEditMode: true,
+  isImageEditMode: true,
+  prompt: "keep the subject",
+  structured: {},
+  reverseOperationId: 10,
+  reverseRevisionId: 20,
+  reviewedImageEvidence: maskRows,
+  reverseEvidenceOperation: maskOperation,
+});
+assert.equal(submissionPreflight.ok, false);
+assert.deepEqual(submissionPreflight.foreign_source_indexes, [2]);
+assert.match(
+  submissionPreflight.message,
+  /参考图 2/,
+  "mask preflight must reject cross-source masks before quote and generation submission",
 );
-assert.match(submitFunctionSource, /validateImageEvidenceMaskPreflight/);
-assert.ok(
-  submitFunctionSource.indexOf("validateImageEvidenceMaskPreflight")
-    < submitFunctionSource.indexOf("await requestQuoteConfirmation("),
-  "mask preflight must run before quote and generation submission",
+assert.match(
+  studioPageSource,
+  /reviewedImageEvidence: (?:reverse\.)?generationSourceRevision\?\.payload\?\.image_evidence/,
 );
-assert.match(studioPageSource, /reviewedImageEvidence: generationSourceRevision\?\.payload\?\.image_evidence/);
-assert.match(studioPageSource, /reverseEvidenceOperation: reverseOperationForPendingResult\(\)/);
+assert.match(
+  studioPageSource,
+  /reverseEvidenceOperation: (?:reverse\.)?reverseOperationForPendingResult\(\)/,
+);
 
 console.log("image evidence tests passed");

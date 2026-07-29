@@ -7,7 +7,6 @@ import StudioReverseIntentControls from "./StudioReverseIntentControls";
 import StudioReverseBatchPanel from "./StudioReverseBatchPanel";
 import StudioReverseSourcesEditor from "./StudioReverseSourcesEditor";
 import StudioVideoAnalysisControls from "./StudioVideoAnalysisControls";
-import StudioVideoSourceTimeline from "./StudioVideoSourceTimeline";
 import { assetDims, selectedLabel } from "./helpers";
 
 export function analysisModeLabel(mode) {
@@ -392,6 +391,15 @@ export default function StudioReferencePanel({
     if (!reverseBatchEnabled) setBatchSelectionMode(false);
   }, [reverseBatchEnabled]);
 
+  // 真正生效的精度状态源是 reverseConfig.analysis_precision（由精度选择器写入）。
+  // 这里把它同步回 workspace.videoAnalysisPreset，让费用/帧数预估读到真实档位，
+  // 避免预估一直停留在默认 standard（如 fine 实际 22 帧却按 14 帧提示）。
+  const reverseAnalysisPrecision = reverseConfig?.analysis_precision || "";
+  useEffect(() => {
+    if (!reverseAnalysisPrecision || reverseAnalysisPrecision === videoAnalysisPreset) return;
+    setVideoAnalysisPreset?.(reverseAnalysisPrecision);
+  }, [reverseAnalysisPrecision, videoAnalysisPreset, setVideoAnalysisPreset]);
+
   return (
     <aside id="studio-reference-panel" className="relative min-w-0 overflow-hidden rounded-xl3 border border-iris/35 bg-gradient-to-b from-iris/20 via-base2/80 to-rose/10 p-3 shadow-glow-sm">
       <div className="pointer-events-none absolute -right-16 -top-16 h-32 w-32 rounded-full bg-rose/25 blur-3xl" />
@@ -719,6 +727,14 @@ export default function StudioReferencePanel({
               {uploading ? "上传中…" : "上传视频"}
             </button>
           </div>
+          <button
+            type="button"
+            onClick={() => onOpenAssetPicker?.("reverse_source")}
+            disabled={uploading || reversing || reverseNeedsConfirmation}
+            className="btn-secondary btn-sm w-full justify-center border-line2 bg-white/[0.08]"
+          >
+            从我的素材库选择
+          </button>
           {selected && reverseConfig && (
             <StudioReverseIntentControls
               category={category}
@@ -734,18 +750,6 @@ export default function StudioReferencePanel({
               sources={reverseSources}
               disabled={reversing || reverseNeedsConfirmation}
               onChange={setReverseSources}
-            />
-          )}
-          {category === "video" && selected?.type === "video" && reverseConfig && (
-            <StudioVideoSourceTimeline
-              asset={selected}
-              config={reverseConfig}
-              configuredDuration={selected.duration
-                || reverseVideoAnalysis?.source?.total_duration_seconds
-                || reverseVideoAnalysis?.source?.duration_seconds
-                || null}
-              disabled={reversing || reverseNeedsConfirmation}
-              onChange={setReverseConfig}
             />
           )}
           {category === "video" && selected && reverseConfig && videoAnalysisPresets.length > 0 && (

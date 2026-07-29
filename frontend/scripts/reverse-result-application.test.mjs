@@ -145,10 +145,14 @@ test("recompiles legacy image prompts with analysis scaffolding without overwrit
 });
 
 test("restoring a user-edit revision marks its prompt as authored content", () => {
-  const pageSource = readFileSync(new URL("../app/page.jsx", import.meta.url), "utf8");
+  const actionsSource = readFileSync(new URL("../hooks/useReverseResultActions.js", import.meta.url), "utf8");
   assert.match(
-    pageSource,
-    /reverseResultEnvelope\([\s\S]*revision\.payload[\s\S]*revision\.source === "user_edit"/,
+    actionsSource,
+    /restoredPayload\s*=\s*withEvidenceBackedVideoGenerationDraft\(revision\.payload, category\)/,
+  );
+  assert.match(
+    actionsSource,
+    /reverseResultEnvelope\([\s\S]*restoredPayload[\s\S]*revision\.source === "user_edit"/,
   );
 });
 
@@ -602,11 +606,11 @@ test("revision comparison covers prompt, negative, structured fields, and parame
   });
 });
 
-test("page handler persists the atomic lineage before changing the workspace", () => {
-  const pageSource = readFileSync(new URL("../app/page.jsx", import.meta.url), "utf8");
-  const handlerStart = pageSource.indexOf("async function applyPendingReverseResult");
-  const handlerEnd = pageSource.indexOf("function undoAppliedReverseResult", handlerStart);
-  const handler = pageSource.slice(handlerStart, handlerEnd);
+test("reverse result hook persists the atomic lineage before changing the workspace", () => {
+  const hookSource = readFileSync(new URL("../hooks/useReverseResultActions.js", import.meta.url), "utf8");
+  const handlerStart = hookSource.indexOf("async function applyPendingReverseResult");
+  const handlerEnd = hookSource.indexOf("function undoAppliedReverseResult", handlerStart);
+  const handler = hookSource.slice(handlerStart, handlerEnd);
   assert.match(handler, /applyPendingReverseResult\(mode, selection\)/);
   assert.match(handler, /resolveReverseResultApplicationSelection\(pending, selection\)/);
   assert.match(handler, /applyReverseResultApplication\(latestWorkspace, pending, mode, resolvedSelection\)/);
@@ -649,10 +653,10 @@ test("page handler persists the atomic lineage before changing the workspace", (
 });
 
 test("storyboard application uses the same server-first atomic path", () => {
-  const pageSource = readFileSync(new URL("../app/page.jsx", import.meta.url), "utf8");
-  const handlerStart = pageSource.indexOf("async function applyStoryboardShot");
-  const handlerEnd = pageSource.indexOf("function invalidatePromptOptimization", handlerStart);
-  const handler = pageSource.slice(handlerStart, handlerEnd);
+  const actionsSource = readFileSync(new URL("../hooks/useStoryboardActions.js", import.meta.url), "utf8");
+  const handlerStart = actionsSource.indexOf("async function applyStoryboardShot");
+  const handlerEnd = actionsSource.indexOf("return { compileStoryboardShot", handlerStart);
+  const handler = actionsSource.slice(handlerStart, handlerEnd);
   assert.match(handler, /api\.applyReverseOperationResult/);
   assert.match(handler, /response\.user_edit/);
   assert.match(handler, /response\.applied/);
@@ -665,10 +669,10 @@ test("storyboard application uses the same server-first atomic path", () => {
 });
 
 test("generation lineage discovery accepts applied revisions only", () => {
-  const pageSource = readFileSync(new URL("../app/page.jsx", import.meta.url), "utf8");
-  assert.match(pageSource, /GENERATION_SOURCE_REVISION_SOURCES = new Set\(\["applied"\]\)/);
+  const draftSource = readFileSync(new URL("../app/studio/promptDraftUtils.ts", import.meta.url), "utf8");
+  assert.match(draftSource, /GENERATION_SOURCE_REVISION_SOURCES = new Set\(\["applied"\]\)/);
   assert.doesNotMatch(
-    pageSource,
+    draftSource,
     /GENERATION_SOURCE_REVISION_SOURCES = new Set\(\[[^\]]*"normalized"/,
   );
 });

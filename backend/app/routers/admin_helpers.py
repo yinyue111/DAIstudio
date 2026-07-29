@@ -25,8 +25,13 @@ from ..services.model_gateway_config import (
     normalise_provider,
 )
 from ..services.rate_limit import incr_window
+from ..services.reporting_helpers import (
+    CSV_FORMULA_PREFIXES as CSV_FORMULA_PREFIXES,
+)
+from ..services.reporting_helpers import csv_cell as csv_cell
+from ..services.reporting_helpers import date_key as date_key
+from ..services.reporting_helpers import parse_date as parse_date
 
-CSV_FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r", "\n")
 IMAGE_SIZE_RE = re.compile(r"^(\d{2,5})x(\d{2,5})$")
 QUOTA_GRANT_REPLAY_WINDOW_SECONDS = 10 * 60
 ACTIVE_MODEL_TASK_STATUSES = ("queued", "running", generation.NEEDS_REVIEW)
@@ -122,35 +127,6 @@ def assert_no_active_model_tasks(db: Session, use: str) -> None:
             409,
             "当前模型仍有排队、运行中或待对账任务,请等待任务结束或处理后再切换网关配置",
         )
-
-
-def parse_date(s: str | None, *, end_of_day: bool = False) -> datetime | None:
-    if not s:
-        return None
-    try:
-        dt = datetime.fromisoformat(s)
-    except ValueError:
-        raise HTTPException(400, f"日期格式应为 ISO(YYYY-MM-DD),收到:{s}") from None
-    if end_of_day and re.fullmatch(r"\d{4}-\d{2}-\d{2}", s):
-        dt = dt.replace(hour=23, minute=59, second=59, microsecond=999999)
-    # gen_tasks.finished_at / created_at are tz-aware; a naive bound would raise
-    # on PostgreSQL ("can't compare offset-naive and offset-aware"). Assume UTC.
-    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
-
-
-def csv_cell(value):
-    if value is None:
-        return ""
-    text = str(value)
-    if text.lstrip(" \t\r\n").startswith(CSV_FORMULA_PREFIXES):
-        return "'" + text
-    return text
-
-
-def date_key(dt: datetime | None) -> str | None:
-    if not dt:
-        return None
-    return dt.date().isoformat()
 
 
 def quota_grant_idempotency_raw(body: QuotaGrantIn) -> str:

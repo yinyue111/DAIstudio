@@ -28,6 +28,8 @@ class SettingsIn(BaseModel):
     ) = None
     content_safety_enabled: bool | None = None
     content_safety_banned_terms: str | None = Field(default=None, max_length=4000)
+    media_moderation_enabled: bool | None = None
+    media_moderation_fail_open: bool | None = None
     image_n: int | None = Field(default=None, ge=1, le=8)
     image_size: str | None = None
     asset_retention_days: int | None = Field(default=None, ge=1, le=3650)

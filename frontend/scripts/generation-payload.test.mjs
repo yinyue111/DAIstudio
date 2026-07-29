@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { readStudioSource } from "./studio-source.mjs";
 
 import { buildGenerationPayload } from "../app/studio/generationPayload.ts";
 import { studioCreationFacts } from "../app/studio/viewModel.ts";
@@ -26,8 +27,9 @@ import {
 } from "../app/studio/generationRequestId.ts";
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
-const pageSource = readFileSync(join(root, "app/page.jsx"), "utf8");
+const pageSource = readStudioSource(root);
 const submitHookSource = readFileSync(join(root, "hooks/useGenerationSubmit.js"), "utf8");
+const submitWorkflowSource = readFileSync(join(root, "hooks/generationSubmitWorkflow.js"), "utf8");
 
 assert.doesNotMatch(
   pageSource,
@@ -40,14 +42,14 @@ assert.match(
   "main page should delegate generation submit behavior to a hook",
 );
 assert.match(
-  submitHookSource,
+  submitWorkflowSource,
   /buildGenerationPayload\(\{/,
-  "generation submit hook should own payload assembly",
+  "generation submit workflow should own payload assembly",
 );
 assert.match(
-  submitHookSource,
+  submitWorkflowSource,
   /generateClientRequestId\(/,
-  "generation submit hook should own idempotent request ids",
+  "generation submit workflow should own idempotent request ids",
 );
 assert.equal(MAX_VIDEO_DURATION_SECONDS, 15);
 assert.equal(MAX_PRODUCT_DETAIL_IMAGES, 10);

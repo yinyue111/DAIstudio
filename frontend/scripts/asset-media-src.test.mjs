@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 process.env.NEXT_PUBLIC_API_BASE = "http://127.0.0.1:8000";
 process.env.NEXT_PUBLIC_MEDIA_SRC = "";
@@ -11,6 +14,9 @@ globalThis.window = {
 const {
   assetDisplaySrc,
   assetPreviewSrc,
+  audioAssetSrc,
+  formatAudioDuration,
+  isAudioAsset,
   safeAssetMediaSrc,
   shouldRenderVideo,
 } = await import("../components/AssetMedia.jsx");
@@ -172,5 +178,53 @@ const generatedVideo = {
 };
 assert.equal(assetDisplaySrc(generatedVideo), generatedVideo.preview_url);
 assert.equal(shouldRenderVideo(generatedVideo), true, "generated video card behavior must stay unchanged");
+
+const uploadedAudio = {
+  origin: "uploaded",
+  type: "audio",
+  url: "/api/uploads/upload_audio/voiceover.mp3",
+  filename: "voiceover.mp3",
+  duration_seconds: 83,
+  unlocked: true,
+};
+assert.equal(isAudioAsset(uploadedAudio), true, "audio entries must be recognized as audio assets");
+assert.equal(isAudioAsset(uploadedVideo), false, "video entries must not be treated as audio");
+assert.equal(
+  shouldRenderVideo(uploadedAudio),
+  false,
+  "audio assets must never be handed to the video renderer",
+);
+assert.equal(
+  audioAssetSrc(uploadedAudio),
+  uploadedAudio.url,
+  "audio playback should use the owner-controlled audio URL",
+);
+assert.equal(
+  audioAssetSrc({ type: "image", url: "/media/preview/example.png" }),
+  "",
+  "non-audio assets must not produce an audio source",
+);
+assert.equal(
+  audioAssetSrc({ type: "audio", url: "https://evil.example/a.mp3" }),
+  "",
+  "audio sources must still pass the media origin allowlist",
+);
+assert.equal(formatAudioDuration(83), "1:23", "audio duration should render as m:ss");
+assert.equal(formatAudioDuration(0), "", "missing audio duration should render nothing");
+
+const assetMediaSource = readFileSync(
+  join(dirname(fileURLToPath(import.meta.url)), "../components/AssetMedia.jsx"),
+  "utf8",
+);
+assert.match(
+  assetMediaSource,
+  /if \(isAudioAsset\(asset\)\) \{/,
+  "AssetMedia must branch audio assets away from the <img>/<video> fallbacks",
+);
+assert.match(
+  assetMediaSource,
+  /<audio[\s\S]*?onError=\{onError\}/,
+  "audio cards should render a native audio player with error handling",
+);
 
 console.log("asset media source normalization test passed");

@@ -96,7 +96,7 @@ make release-check-worktree
 - [ ] `WP04-02` 验证多参考角色和逐项视频覆盖配置。
   - Acceptance：主素材与商品/人物/风格/构图角色可追溯；视频每项可覆盖片段、关键帧和音频策略。
   - Verify：`test_reverse_batches.py`、`reverse-batches.test.mjs`。
-  - Files：`backend/app/schemas.py`、`frontend/app/studio/StudioReverseSourcesEditor.jsx`、`frontend/app/studio/StudioReverseBatchPanel.jsx`。
+  - Files：`backend/app/schemas/reverse.py`（schemas 已从单文件拆分为 `backend/app/schemas/` 包）、`frontend/app/studio/StudioReverseSourcesEditor.jsx`、`frontend/app/studio/StudioReverseBatchPanel.jsx`。
 
 ### WP05 图片证据反推
 
@@ -130,7 +130,7 @@ make release-check-worktree
 - [ ] `WP06-04` 完成逐镜生成、素材替换、拼接、字幕烧录、音频混合和导出。
   - Acceptance：每个镜头绑定生成任务/资产；只使用 owner 可访问素材；导出 MP4 和工程清单可恢复。
   - Verify：ffmpeg fixture、所有权测试、工作流 compose/export E2E、浏览器导出 E2E。
-  - Files：`backend/app/services/video_composition.py`、`backend/app/routers/video_compositions.py`、`frontend/app/studio/StudioVideoComposition.jsx`。
+  - Files：`backend/app/services/video_composition.py`、`backend/app/services/workflow_node_adapters.py`（视频组合经工具工作流节点暴露，没有独立的 `video_compositions.py` 路由）、`frontend/app/studio/StudioVideoComposition.jsx`。
 
 ### WP07 结果应用与正式血缘
 
@@ -141,7 +141,7 @@ make release-check-worktree
 - [ ] `WP07-02` 完成 `model_compiled -> generation` 原子关联和恢复。
   - Acceptance：生成任务引用已验证 revision；模型切换不重跑反推；重试链保留来源。
   - Verify：`test_generation_lineage.py`、`test_reverse_revision_lineage.py`、恢复 E2E。
-  - Files：`backend/app/services/reverse_lineage.py`、`backend/app/services/generation_submit.py`、`backend/app/models.py`。
+  - Files：`backend/app/services/reverse_lineage.py`、`backend/app/services/generation_submit.py`、`backend/app/models/`（models 已从单文件拆分为包，血缘相关模型见 `models/reverse.py` / `models/generation.py`）。
 - [ ] `WP07-03` 完成图片/视频源素材与生成结果的复刻度评估和修正版本链。
   - Acceptance：双方资产经过 owner gate 且媒体一致；图片 findings 可定位 bbox，视频 findings 可定位时间段/镜头；不可用维度明确降级；选中 findings 只创建新修正 revision，不覆盖旧结果。
   - Verify：`test_reproduction_assessments.py`、图片热力图像素测试、视频差异时间线测试、修正后局部/逐镜重生成 E2E。

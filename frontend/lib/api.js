@@ -428,6 +428,7 @@ export const api = {
   getDraft: (key) => request(`/api/me/drafts/${encodeURIComponent(key)}`),
   saveDraft: (key, payload) =>
     request(`/api/me/drafts/${encodeURIComponent(key)}`, { method: "PUT", body: { payload } }),
+  // 后端 DELETE /api/me/drafts/{key} 仍在（me.py:443），保留以对齐草稿接口三件套。
   deleteDraft: (key) => request(`/api/me/drafts/${encodeURIComponent(key)}`, { method: "DELETE" }),
   config: () => request("/api/config"),
   navigation: () => request("/api/navigation"),
@@ -455,6 +456,8 @@ export const api = {
     }),
   workflowRun: (id) =>
     request(`/api/workflows/runs/${encodeURIComponent(id)}`),
+  // 后端 GET /api/workflows/runs 仍在（workflows.py:43），统一任务中心依赖此方法。
+  // 当前无调用点只是因为 tool_workflows 被 launch_lite 隐藏，不可当死代码删除。
   workflowRuns: ({ limit = 50 } = {}) => {
     const qs = new URLSearchParams({ limit: String(limit) });
     return request(`/api/workflows/runs?${qs.toString()}`);
@@ -474,40 +477,6 @@ export const api = {
       { method: "POST", body },
     ),
   profile: () => request("/api/profile"),
-  profileAssets: ({
-    type = "all",
-    favorite = false,
-    limit = 60,
-    offset = 0,
-    created_from = "",
-    created_to = "",
-    model_use = "",
-    size = "",
-    min_width = "",
-    min_height = "",
-    max_width = "",
-    max_height = "",
-  } = {}) => {
-    const qs = new URLSearchParams({
-      type,
-      favorite: String(Boolean(favorite)),
-      limit: String(limit),
-      offset: String(offset),
-    });
-    for (const [key, value] of Object.entries({
-      created_from,
-      created_to,
-      model_use,
-      size,
-      min_width,
-      min_height,
-      max_width,
-      max_height,
-    })) {
-      if (value !== undefined && value !== null && String(value).trim() !== "") qs.set(key, String(value));
-    }
-    return request(`/api/profile/assets?${qs.toString()}`);
-  },
   meAssets: ({
     origin = "all",
     type = "all",
@@ -558,11 +527,16 @@ export const api = {
     if (cursor) qs.set("cursor", String(cursor));
     return request(`/api/me/billing/entries?${qs.toString()}`);
   },
-  paymentPackages: () => request("/api/payments/packages"),
   paymentConfig: () => request("/api/payments/config"),
-  paymentOrders: (limit = 20) => request(`/api/payments/orders?limit=${limit}`),
+  paymentOrders: (limit = 20, { cursor = null } = {}) => {
+    const qs = new URLSearchParams({ limit: String(limit) });
+    if (cursor !== null && cursor !== undefined && cursor !== "") qs.set("cursor", String(cursor));
+    return request(`/api/payments/orders?${qs.toString()}`);
+  },
   createPaymentOrder: (body) => request("/api/payments/orders", { method: "POST", body }),
   paymentOrder: (orderNo) => request(`/api/payments/orders/${orderNo}`),
+  requestPaymentInvoice: (orderNo, body) =>
+    request(`/api/payments/orders/${encodeURIComponent(orderNo)}/invoice`, { method: "POST", body }),
   mockPayOrder: (orderNo) => request(`/api/payments/orders/${orderNo}/mock-pay`, { method: "POST" }),
   changePassword: (old_password, new_password) =>
     request("/api/me/password", { method: "POST", body: { old_password, new_password } }),
@@ -585,19 +559,6 @@ export const api = {
     form.append("file", file);
     return upload("/api/uploads/video", form, options);
   },
-  reverse: (
-    asset_url,
-    target = "image",
-    fallback_image = null,
-    source_type = null,
-    video_analysis_preset = null,
-    client_request_id = null,
-  ) =>
-    request("/api/prompt/reverse", {
-      method: "POST",
-      body: { asset_url, target, fallback_image, source_type, video_analysis_preset, client_request_id },
-      timeoutMs: REVERSE_TIMEOUT_MS,
-    }),
   createReverseOperation: (body) =>
     request("/api/prompt/reverse-operations", {
       method: "POST",
@@ -803,21 +764,17 @@ export const api = {
   tasks: (limit = 30, offset = 0) => request(`/api/tasks?limit=${limit}&offset=${offset}`),
   cancelTask: (taskId) => request(`/api/tasks/${taskId}/cancel`, { method: "POST" }),
   unlock: (assetId, body) => request(`/api/assets/${assetId}/unlock`, { method: "POST", body }),
-  playbackTicket: (assetId) => request(`/api/assets/${assetId}/playback-ticket`, { method: "POST" }),
   playbackUrl: (assetId) => `${API_BASE}/api/assets/${assetId}/stream`,
   favoriteAsset: (assetId) => request(`/api/assets/${assetId}/favorite`, { method: "POST" }),
   reportAsset: (assetId, body) =>
     request(`/api/assets/${assetId}/report`, { method: "POST", body }),
   deleteAsset: (assetId) => request(`/api/assets/${assetId}`, { method: "DELETE" }),
-  batchDeleteAssets: (assetIds) => request("/api/assets/batch/delete", { method: "POST", body: { asset_ids: assetIds } }),
   batchDownloadAssets: (assetIds) => downloadBlob("/api/assets/batch/download", "assets.zip", {
     method: "POST",
     body: { asset_ids: assetIds },
   }),
-  retryTask: (taskId) => request(`/api/tasks/${taskId}/retry`, { method: "POST" }),
   requoteRetryTask: (taskId, body) =>
     request(`/api/tasks/${taskId}/retry/requote`, { method: "POST", body }),
-  downloadUrl: (assetId) => `${API_BASE}/api/assets/${assetId}/download`,
   promptHistory: ({ favorite = null, category = "", source = "", q = "", limit = 50, offset = 0 } = {}) => {
     const qs = new URLSearchParams({ limit: String(limit), offset: String(offset) });
     if (favorite !== null && favorite !== undefined) qs.set("favorite", String(Boolean(favorite)));
@@ -830,10 +787,11 @@ export const api = {
   updatePromptHistory: (id, body) => request(`/api/prompts/history/${id}`, { method: "PATCH", body }),
   favoritePromptHistory: (id) => request(`/api/prompts/history/${id}/favorite`, { method: "POST" }),
   deletePromptHistory: (id) => request(`/api/prompts/history/${id}`, { method: "DELETE" }),
-  creationRecipes: ({ category = "", favorite = null, limit = 30, offset = 0 } = {}) => {
+  creationRecipes: ({ category = "", favorite = null, q = "", limit = 30, offset = 0 } = {}) => {
     const qs = new URLSearchParams({ limit: String(limit), offset: String(offset) });
     if (category) qs.set("category", category);
     if (favorite !== null && favorite !== undefined) qs.set("favorite", String(Boolean(favorite)));
+    if (q) qs.set("q", q);
     return request(`/api/recipes?${qs.toString()}`);
   },
   publicCreationRecipes: ({ category = "", q = "", limit = 30, offset = 0 } = {}) => {
@@ -948,13 +906,20 @@ export const api = {
     request(`/api/admin/users/${userId}/status`, { method: "PATCH", body }),
   adminResetPassword: (userId, body) =>
     request(`/api/admin/users/${userId}/reset_password`, { method: "POST", body }),
+  adminSetUserRole: (userId, body) =>
+    request(`/api/admin/users/${userId}/role`, { method: "PATCH", body }),
+  adminWorkflowSummary: () => request("/api/admin/workflows/summary"),
+  adminCompleteWorkflowNode: (runId, nodeKey, body) =>
+    request(
+      `/api/admin/workflows/runs/${encodeURIComponent(runId)}/nodes/${encodeURIComponent(nodeKey)}/complete`,
+      { method: "POST", body },
+    ),
   adminModels: () => request("/api/admin/models"),
   adminCreateModel: (body) => request("/api/admin/models", { method: "POST", body }),
   adminUpdateModel: (id, body) =>
     request(`/api/admin/models/${encodeURIComponent(id)}`, { method: "PATCH", body }),
   adminDeleteModel: (id) =>
     request(`/api/admin/models/${encodeURIComponent(id)}`, { method: "DELETE" }),
-  adminSaveModel: (body) => request("/api/admin/models", { method: "PUT", body }),
   adminProbeModels: (body) => request("/api/admin/models/probe", { method: "POST", body }),
   adminImportModels: (body) => request("/api/admin/models/import", { method: "POST", body }),
   adminModelVersions: (id) => request(`/api/admin/models/${encodeURIComponent(id)}/versions`),
@@ -964,7 +929,6 @@ export const api = {
   adminDisableModelVersion: (id, kind, version) => request(`/api/admin/models/${encodeURIComponent(id)}/versions/${encodeURIComponent(kind)}/${encodeURIComponent(version)}/disable`, { method: "POST" }),
   adminRetireModelVersion: (id, kind, version) => request(`/api/admin/models/${encodeURIComponent(id)}/versions/${encodeURIComponent(kind)}/${encodeURIComponent(version)}/retire`, { method: "POST" }),
   adminRollbackModelVersion: (id, kind, version) => request(`/api/admin/models/${encodeURIComponent(id)}/versions/${encodeURIComponent(kind)}/${encodeURIComponent(version)}/rollback`, { method: "POST" }),
-  adminActivateModelVersion: (id, body) => request(`/api/admin/models/${encodeURIComponent(id)}/versions/activate`, { method: "POST", body }),
   adminModelRoutes: (id) => request(`/api/admin/models/${encodeURIComponent(id)}/routes`),
   adminCreateModelRoute: (id, body) => request(`/api/admin/models/${encodeURIComponent(id)}/routes`, { method: "POST", body }),
   adminUpdateModelRoute: (id, routeId, body) => request(`/api/admin/models/${encodeURIComponent(id)}/routes/${encodeURIComponent(routeId)}`, { method: "PATCH", body }),
@@ -984,12 +948,10 @@ export const api = {
   adminDisableToolVersion: (id, version) => request(`/api/admin/tools/${encodeURIComponent(id)}/versions/${encodeURIComponent(version)}/disable`, { method: "POST" }),
   adminRetireToolVersion: (id, version) => request(`/api/admin/tools/${encodeURIComponent(id)}/versions/${encodeURIComponent(version)}/retire`, { method: "POST" }),
   adminRollbackToolVersion: (id, version) => request(`/api/admin/tools/${encodeURIComponent(id)}/versions/${encodeURIComponent(version)}/rollback`, { method: "POST" }),
-  adminActivateToolVersion: (id, version) => request(`/api/admin/tools/${encodeURIComponent(id)}/versions/${encodeURIComponent(version)}/activate`, { method: "POST" }),
   adminReport: (qs = "") => request(`/api/admin/usage/report${qs}`),
   adminUsageDashboard: (qs = "") => request(`/api/admin/usage/dashboard${qs}`),
   adminModelCosts: (qs = "") => request(`/api/admin/usage/model-costs${qs}`),
   adminReverseUsage: (qs = "") => request(`/api/admin/usage/reverse-operations${qs}`),
-  adminReportCsvUrl: (qs = "") => `${API_BASE}/api/admin/usage/report${qs}`,
   adminAudit: (qs = "") => request(`/api/admin/audit${qs}`),
   adminReviewTasks: (limit = 50, offset = 0) =>
     request(`/api/admin/tasks/review?limit=${limit}&offset=${offset}`),
@@ -1019,4 +981,24 @@ export const api = {
   adminPaymentProviders: () => request("/api/admin/payments/providers"),
   adminSavePaymentProvider: (provider, body) =>
     request(`/api/admin/payments/providers/${provider}`, { method: "PUT", body }),
+  // Admin payment ops (order search / manual sync / refund / invoices) go through
+  // the shared request() helper so cookie auth + 401 handling stay unified.
+  adminPaymentOrders: (params = {}) => {
+    const qs = new URLSearchParams();
+    Object.entries(params).forEach(([key, value]) => {
+      const text = String(value ?? "").trim();
+      if (text) qs.set(key, text);
+    });
+    return request(`/api/admin/payments/orders${qs.size ? `?${qs.toString()}` : ""}`);
+  },
+  adminSyncPaymentOrder: (orderNo) =>
+    request(`/api/admin/payments/orders/${encodeURIComponent(orderNo)}/sync`, { method: "POST" }),
+  adminRefundPaymentOrder: (orderNo, body) =>
+    request(`/api/admin/payments/orders/${encodeURIComponent(orderNo)}/refund`, { method: "POST", body }),
+  adminPaymentInvoices: ({ status = "requested", limit = 20, offset = 0 } = {}) => {
+    const qs = new URLSearchParams({ status, limit: String(limit), offset: String(offset) });
+    return request(`/api/admin/payments/invoices?${qs.toString()}`);
+  },
+  adminProcessPaymentInvoice: (orderNo, body) =>
+    request(`/api/admin/payments/invoices/${encodeURIComponent(orderNo)}`, { method: "PUT", body }),
 };

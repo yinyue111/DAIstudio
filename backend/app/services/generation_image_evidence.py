@@ -11,7 +11,8 @@ from dataclasses import dataclass
 from typing import Any
 
 from PIL import Image, ImageDraw
-from sqlalchemy.orm import Session
+from sqlalchemy import select
+from sqlalchemy.orm import Session, object_session
 
 from ..models import GenTask, ReverseOperation, ReverseResultRevision
 from . import reverse_lineage, storage
@@ -345,6 +346,135 @@ def _operation_sources(operation: ReverseOperation) -> list[str]:
         if isinstance(row, dict) and str(row.get("asset_url") or "").strip()
     ]
     return sources or [str(operation.asset_url or "").strip()]
+
+
+_SOURCE_HASH_CACHE: dict[str, tuple[tuple[int, int], str]] = {}
+_SOURCE_HASH_CACHE_LIMIT = 256
+_MISSING_SOURCE = "__missing__"
+
+
+def _current_source_content_hash(source_url: str) -> str | None:
+    """本地存储下计算当前源素材的内容哈希（按 size+mtime 缓存）。
+
+    外部 URL 或对象存储直接返回 None（序列化路径上不做网络 IO，内容校验
+    仍由生成时的 rasterize 兜底）；本地文件缺失返回 ``_MISSING_SOURCE``。
+    """
+    key = storage.key_from_url(str(source_url or "").strip())
+    if not key or storage.is_object_storage_enabled():
+        return None
+    try:
+        path = storage.local_path(key)
+        stat = path.stat()
+    except (OSError, ValueError):
+        return _MISSING_SOURCE
+    token = (int(stat.st_size), int(stat.st_mtime_ns))
+    cached = _SOURCE_HASH_CACHE.get(key)
+    if cached and cached[0] == token:
+        return cached[1]
+    digest = hashlib.sha256()
+    try:
+        with path.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+    except OSError:
+        return _MISSING_SOURCE
+    value = digest.hexdigest()
+    while len(_SOURCE_HASH_CACHE) >= _SOURCE_HASH_CACHE_LIMIT:
+        _SOURCE_HASH_CACHE.pop(next(iter(_SOURCE_HASH_CACHE)))
+    _SOURCE_HASH_CACHE[key] = (token, value)
+    return value
+
+
+def _readiness(status: str, reason: str, **extra: Any) -> dict[str, Any]:
+    return {"status": status, "reason": reason, **extra}
+
+
+def _latest_reviewed_revision(
+    db: Session, operation: ReverseOperation
+) -> ReverseResultRevision | None:
+    return db.execute(
+        select(ReverseResultRevision)
+        .where(
+            ReverseResultRevision.operation_id == int(operation.id),
+            ReverseResultRevision.user_id == int(operation.user_id),
+            ReverseResultRevision.source.in_(["user_edit", "applied"]),
+        )
+        .order_by(ReverseResultRevision.version.desc())
+        .limit(1)
+    ).scalars().first()
+
+
+def image_mask_readiness_for_operation(
+    operation: ReverseOperation,
+    *,
+    db: Session | None = None,
+    supported: bool = True,
+) -> dict[str, Any]:
+    """服务端权威的蒙版就绪状态，随反推 result/operation 回传给前端。
+
+    与 ``resolve_reviewed_evidence_plan`` 使用同一套审阅解析逻辑，
+    保证用户在标完区域证据后能看到真实的服务端校验结论，而不是恒为待校验。
+    """
+    pending = _readiness(
+        "pending", "保存审阅版本后，由服务端校验源素材与证据；不会自动应用。"
+    )
+    if getattr(operation, "error_code", None) == "RESULT_EXPIRED":
+        return _readiness("source_expired", "原始素材已过期，不能生成服务端蒙版。")
+    if not supported:
+        return _readiness("unsupported", "当前反推目标不支持服务端证据蒙版。")
+    if db is None:
+        try:
+            db = object_session(operation)
+        except Exception:  # noqa: BLE001 — 兼容测试中的非 ORM 对象
+            db = None
+    if db is None or getattr(operation, "id", None) is None:
+        return pending
+    try:
+        with db.no_autoflush:
+            revision = _latest_reviewed_revision(db, operation)
+    except Exception:  # noqa: BLE001 — 查询失败时保持待校验，不阻塞序列化
+        return pending
+    if revision is None:
+        return pending
+    detail: dict[str, Any] = {
+        "revision_id": int(revision.id),
+        "revision_version": int(revision.version),
+        "schema_version": MASK_PLAN_SCHEMA_VERSION,
+    }
+    sources = _operation_sources(operation)
+    payload = revision.payload if isinstance(revision.payload, dict) else {}
+    try:
+        regions = _reviewed_regions(payload, len(sources))
+    except ReviewedEvidenceMaskError as exc:
+        return _readiness("degraded", f"已保存的审阅版本不能安全生成蒙版：{exc}", **detail)
+    if not regions:
+        return _readiness(
+            "pending",
+            "审阅版本尚未确认可执行区域，确认保护或可编辑区域后由服务端生成蒙版。",
+            **detail,
+        )
+    if getattr(revision, "lineage_status", None) != reverse_lineage.VERIFIED:
+        return _readiness(
+            "degraded", "反推版本未完成血缘验证，服务端无法可靠生成蒙版。", **detail
+        )
+    for index in sorted({region.source_index for region in regions}):
+        fingerprint = reverse_lineage.fingerprint_for_source_index(revision, index)
+        if fingerprint is None:
+            return _readiness(
+                "degraded", "反推版本缺少素材内容指纹，服务端无法校验源素材。", **detail
+            )
+        current = _current_source_content_hash(sources[index - 1])
+        if current == _MISSING_SOURCE:
+            return _readiness(
+                "source_expired", "原始素材已不可读，不能生成服务端蒙版。", **detail
+            )
+        if current is not None and current != str(fingerprint.get("content_sha256") or ""):
+            return _readiness(
+                "source_hash_changed",
+                "源素材内容与证据版本不一致，请重新反推分析。",
+                **detail,
+            )
+    return _readiness("ready", "服务端已校验证据版本与源素材内容。", **detail)
 
 
 def resolve_reviewed_evidence_plan(

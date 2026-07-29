@@ -227,7 +227,14 @@ class ModelRoute(Base):
         CheckConstraint(
             "cooldown_seconds >= 1", name="ck_model_routes_cooldown_positive"
         ),
-        Index("uq_model_routes_model_key", "model_config_id", "route_key", unique=True),
+        Index(
+            "uq_model_routes_model_key",
+            "model_config_id",
+            "route_key",
+            unique=True,
+            postgresql_where=text("deleted_at IS NULL"),
+            sqlite_where=text("deleted_at IS NULL"),
+        ),
         Index(
             "ix_model_routes_select",
             "model_config_id",
@@ -280,6 +287,7 @@ class ModelRoute(Base):
     last_failure_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     latency_ema_ms: Mapped[int | None] = mapped_column(Integer)
     last_error_code: Mapped[str | None] = mapped_column(String(64))
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )

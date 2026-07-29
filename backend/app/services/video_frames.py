@@ -23,14 +23,14 @@ import time
 from dataclasses import dataclass
 from fractions import Fraction
 from io import BytesIO
-from math import gcd, isfinite
+from math import ceil, gcd, isfinite
 
 from PIL import Image
 
 from ..config import settings
 from .safe_logging import redact_url_for_log
 from .ssrf import MAX_REDIRECTS, assert_safe_url, pinned_client
-from .video_analysis import frame_count_for_duration
+from .video_analysis import frame_count_for_duration, max_frame_count
 
 log = logging.getLogger("video_frames")
 
@@ -42,6 +42,12 @@ SCENE_THRESHOLD = 0.28
 MIN_FRAME_GAP_SECONDS = 0.7
 FRAME_BACKOFF_SECONDS = (0.0, 0.1, 0.25, 0.5)
 SELECTION_TIME_EPSILON_SECONDS = 0.001
+# 帧回退抓取最多提前 0.5 秒，镜头归属判定允许同样的漂移余量。
+SHOT_ASSIGNMENT_EPSILON_SECONDS = 0.05
+# 短片里切点可以完全取代均匀采样：只要空窗不超过这个绝对上限，就不为均匀回填保留预算。
+CUT_PRIORITY_MAX_GAP_SECONDS = 12.0
+# 长片保底覆盖：空窗超过均匀间隔的 1.5 倍时，必须用均匀回填帧修补（长镜头证据不能真空）。
+COVERAGE_GAP_RATIO = 1.5
 _SAMPLE_SEMAPHORE = threading.BoundedSemaphore(
     max(1, int(settings.reverse_video_parallelism or 1))
 )
@@ -118,6 +124,14 @@ class SampledVideoFrame:
     priority: int = 1
     relative_timestamp_seconds: float | None = None
     source_segment_index: int | None = None
+    # 该帧落在 ffmpeg 场景切分出的哪个镜头里（跨全部片段的 1 起始序号）。
+    # 光流分析用它排除跨切点帧对；切点转场证据用它定位帧对之间的硬切。
+    detected_shot_index: int | None = None
+    detected_shot_id: str | None = None
+    detected_shot_start_seconds: float | None = None
+    detected_shot_end_seconds: float | None = None
+    # 该帧所在镜头开头切点的 lavfi 场景分值（首个镜头/时长未知时为 None）。
+    detected_shot_cut_score: float | None = None
 
 
 @dataclass(frozen=True)
@@ -139,6 +153,14 @@ class VideoSample:
                    if frame.relative_timestamp_seconds is not None else {})
                 | ({"source_segment_index": frame.source_segment_index}
                    if frame.source_segment_index is not None else {})
+                | ({
+                       "detected_shot_index": frame.detected_shot_index,
+                       "detected_shot_id": frame.detected_shot_id,
+                       "detected_shot_start_seconds": frame.detected_shot_start_seconds,
+                       "detected_shot_end_seconds": frame.detected_shot_end_seconds,
+                       "detected_shot_cut_score": frame.detected_shot_cut_score,
+                   }
+                   if frame.detected_shot_index is not None else {})
                 for index, frame in enumerate(self.frames, start=1)
             ],
         }
@@ -343,12 +365,29 @@ def _grab_frame_with_backoff(src: str, ts: float, dst: str) -> float | None:
     return None
 
 
+class _SceneCut(float):
+    """带 lavfi 场景分值的切点时间戳。
+
+    对旧消费方（含测试中的 monkeypatch）保持 float 语义不变，新消费方可以通过
+    ``getattr(ts, "scene_score", None)`` 拿到 ffmpeg 的场景变化分值（0-1）作为
+    切点置信度来源。
+    """
+
+    scene_score: float | None
+
+    def __new__(cls, value: float, scene_score: float | None = None) -> _SceneCut:
+        cut = super().__new__(cls, value)
+        cut.scene_score = scene_score
+        return cut
+
+
 def _scene_change_timestamps(src: str, limit: int) -> list[float]:
     """Best-effort ffmpeg scene detection timestamps.
 
     We prefer cut points because they carry more prompt signal than blind
     interval sampling. Any failure returns [] and callers fall back to uniform
-    timestamps.
+    timestamps. Returned floats are ``_SceneCut`` instances carrying the lavfi
+    scene score when ffmpeg reported one.
     """
     if limit < 1:
         return []
@@ -375,19 +414,28 @@ def _scene_change_timestamps(src: str, limit: int) -> list[float]:
     except (OSError, subprocess.SubprocessError):
         return []
 
-    stamps: list[float] = []
+    stamps: list[_SceneCut] = []
+    last: _SceneCut | None = None
     for line in (out.stdout or "").splitlines():
-        if "pts_time:" not in line:
-            continue
-        try:
-            ts = float(line.split("pts_time:", 1)[1].split()[0])
-        except (IndexError, ValueError):
-            continue
-        if ts < 0:
-            continue
-        if stamps and abs(ts - stamps[-1]) < MIN_FRAME_GAP_SECONDS:
-            continue
-        stamps.append(ts)
+        if "pts_time:" in line:
+            try:
+                ts = float(line.split("pts_time:", 1)[1].split()[0])
+            except (IndexError, ValueError):
+                continue
+            if ts < 0:
+                continue
+            cut = _SceneCut(ts)
+            last = cut
+            if stamps and abs(ts - float(stamps[-1])) < MIN_FRAME_GAP_SECONDS:
+                continue
+            stamps.append(cut)
+        elif "scene_score=" in line and last is not None:
+            try:
+                score = float(line.split("scene_score=", 1)[1].strip())
+            except (IndexError, ValueError):
+                continue
+            if 0.0 <= score <= 1.0:
+                last.scene_score = round(score, 6)
     return _spread_timestamps(stamps, limit)
 
 
@@ -415,33 +463,105 @@ def _spread_timestamps(stamps: list[float], count: int) -> list[float]:
     return picked
 
 
-def _merge_timestamps(primary: list[float], fallback: list[float], n: int, dur: float | None) -> list[float]:
+def _coverage_gap_cap(spacing: float) -> float:
+    """单个空窗允许的最大时长：短片给切点绝对优先，长片按均匀间隔比例保底。"""
+    return max(COVERAGE_GAP_RATIO * spacing, CUT_PRIORITY_MAX_GAP_SECONDS)
+
+
+def _repair_slots_needed(points: list[float], cap: float) -> int:
+    """把所有空窗压到 cap 以内还需要多少个均匀回填帧。"""
+    return sum(
+        max(0, ceil((right - left) / cap) - 1)
+        for left, right in zip(points, points[1:], strict=False)
+    )
+
+
+def _fill_gaps_evenly(selected: list[float], remaining: int, cap: float) -> list[float]:
+    """先修补超过 cap 的空窗，再把剩余预算按空窗长度分摊（长镜头均匀采样）。"""
+    if remaining <= 0 or len(selected) < 2:
+        return selected
+    gaps = list(zip(selected, selected[1:], strict=False))
+    counts = [max(0, ceil((right - left) / cap) - 1) for left, right in gaps]
+    # 预算不足以修补全部空窗时，优先保住修补后间隔最大的空窗
+    while sum(counts) > remaining:
+        index = min(
+            (i for i, count in enumerate(counts) if count > 0),
+            key=lambda i: (gaps[i][1] - gaps[i][0]) / (counts[i] + 1),
+        )
+        counts[index] -= 1
+    leftover = remaining - sum(counts)
+    while leftover > 0:
+        index = max(
+            range(len(gaps)),
+            key=lambda i: (gaps[i][1] - gaps[i][0]) / (counts[i] + 1),
+        )
+        counts[index] += 1
+        leftover -= 1
+    filled = list(selected)
+    for (left, right), count in zip(gaps, counts, strict=True):
+        width = right - left
+        filled.extend(
+            round(left + width * step / (count + 1), 3)
+            for step in range(1, count + 1)
+        )
+    return sorted(set(filled))
+
+
+def _merge_timestamps(
+    primary: list[float],
+    fallback: list[float],
+    n: int,
+    dur: float | None,
+    *,
+    requested: list[float] | tuple[float, ...] = (),
+) -> list[float]:
+    """切点优先的取帧时间选择。
+
+    ``primary`` 是 ffmpeg 场景切点，``requested`` 是用户显式关键帧。已知时长时：
+    端点与用户关键帧先占位，然后在“剩余预算仍够修补过大空窗”的约束下尽量多吃
+    切点（帧预算内覆盖更多镜头），最后把剩余预算按空窗长度均匀回填给长镜头。
+    """
     if n < 1:
         return []
     max_ts = max(0.0, float(dur or 0) - 0.05) if dur else None
     if max_ts is not None:
-        anchors = _uniform_timestamps(dur, n)
-        if n <= 2:
-            return anchors
-
+        if n <= 2 or max_ts <= 0:
+            return _uniform_timestamps(dur, n)
+        spacing = max_ts / (n - 1)
+        cap = _coverage_gap_cap(spacing)
+        selected = [0.0, round(max_ts, 3)]
+        # 用户显式关键帧优先于切点
+        for ts in sorted({
+            round(max(0.0, min(float(value), max_ts)), 3) for value in requested
+        }):
+            if len(selected) >= n:
+                break
+            if all(abs(ts - seen) >= MIN_FRAME_GAP_SECONDS for seen in selected):
+                selected.append(ts)
+        selected.sort()
+        remaining = n - len(selected)
         candidates = sorted({
-            max(0.0, min(float(ts), max_ts))
+            round(float(ts), 3)
             for ts in primary
             if 0.0 < float(ts) < max_ts
         })
-        merged = [anchors[0]]
-        for index in range(1, len(anchors) - 1):
-            lower = anchors[index - 1]
-            upper = anchors[index]
-            in_bucket = [
-                ts for ts in candidates
-                if lower + MIN_FRAME_GAP_SECONDS <= ts <= upper
-                and all(abs(ts - seen) >= MIN_FRAME_GAP_SECONDS for seen in merged)
-            ]
-            merged.append(max(in_bucket) if in_bucket else anchors[index])
-        merged.append(anchors[-1])
-        return sorted(merged)
+        # 先按时间散布挑一轮（镜头覆盖面最大），再补充其余切点
+        ordered = list(_spread_timestamps(candidates, remaining))
+        spread_chosen = set(ordered)
+        ordered += [ts for ts in candidates if ts not in spread_chosen]
+        for ts in ordered:
+            if remaining <= 0:
+                break
+            if any(abs(ts - seen) < MIN_FRAME_GAP_SECONDS for seen in selected):
+                continue
+            tentative = sorted([*selected, ts])
+            # 吃进这个切点后，剩余预算必须仍够修补所有过大的空窗
+            if _repair_slots_needed(tentative, cap) <= remaining - 1:
+                selected = tentative
+                remaining -= 1
+        return _fill_gaps_evenly(selected, remaining, cap)
 
+    primary = sorted({*(float(ts) for ts in requested), *(float(ts) for ts in primary)})
     endpoints = [0.0]
     interior_slots = max(0, n - len(endpoints))
     candidates = [
@@ -476,6 +596,169 @@ def _target_frame_count(n: int, dur: float | None, preset: str | None = None) ->
             target = min(target, n)
         return max(1, target)
     return max(1, frame_count_for_duration(dur, None) if n < 1 else n)
+
+
+def _adaptive_frame_target_for_detected_shots(
+    target: int,
+    *,
+    requested_max: int,
+    preset: str | None,
+    shot_detection: dict,
+) -> int:
+    """Use spare preset capacity for cross-frame and mid-shot observations."""
+    if preset not in {"standard", "fine", "ultra"}:
+        return target
+    shot_count = len([
+        shot for shot in shot_detection.get("shots") or []
+        if isinstance(shot, dict)
+    ])
+    if shot_count < 1:
+        return target
+    preset_cap = max_frame_count(preset)
+    if requested_max > 0:
+        preset_cap = min(preset_cap, requested_max)
+    observations_per_shot = _detected_shot_observations_for_preset(preset)
+    return min(preset_cap, max(target, shot_count * observations_per_shot))
+
+
+def _detected_shot_observations_for_preset(preset: str | None) -> int:
+    return 3 if preset in {"fine", "ultra"} else 2
+
+
+def _allocate_detected_shot_frame_budget(
+    total: int,
+    durations: list[float | None],
+    shot_detection: dict,
+) -> list[int]:
+    """Allocate enough segment budget to cover each detected shot before density."""
+    shot_counts = [0] * len(durations)
+    for shot in shot_detection.get("shots") or []:
+        if not isinstance(shot, dict):
+            continue
+        try:
+            segment_index = int(shot.get("source_segment_index") or 0)
+        except (TypeError, ValueError):
+            continue
+        if 1 <= segment_index <= len(shot_counts):
+            shot_counts[segment_index - 1] += 1
+    total_shots = sum(shot_counts)
+    if total_shots < 1 or total < total_shots:
+        return _allocate_frame_budget(total, durations)
+
+    counts = list(shot_counts)
+    remaining = total - total_shots
+    while remaining > 0 and any(
+        counts[index] < shot_counts[index] * 2
+        for index in range(len(counts))
+    ):
+        candidates = [
+            index for index in range(len(counts))
+            if counts[index] < shot_counts[index] * 2
+        ]
+        index = max(
+            candidates,
+            key=lambda value: (
+                (shot_counts[value] * 2 - counts[value]) / shot_counts[value],
+                float(durations[value] or 0),
+            ),
+        )
+        counts[index] += 1
+        remaining -= 1
+    while remaining > 0:
+        index = max(
+            range(len(counts)),
+            key=lambda value: float(durations[value] or 0) / (counts[value] + 1),
+        )
+        counts[index] += 1
+        remaining -= 1
+    return counts
+
+
+def _shot_aware_timestamps(
+    base: list[float],
+    *,
+    shot_detection: dict,
+    segment_index: int,
+    segment_start: float,
+    segment_duration: float | None,
+    target: int,
+    requested: list[float],
+    observations_per_shot: int = 2,
+) -> list[float]:
+    """Rebalance timestamps so short shots also receive cross-frame evidence."""
+    if target < 1 or not segment_duration or segment_duration <= 0:
+        return base
+    max_ts = max(0.0, float(segment_duration) - 0.05)
+    shots: list[tuple[float, float]] = []
+    for shot in shot_detection.get("shots") or []:
+        if not isinstance(shot, dict):
+            continue
+        try:
+            shot_segment = int(shot.get("source_segment_index") or 0)
+            start = max(0.0, float(shot["start_seconds"]) - segment_start)
+            end = min(float(segment_duration), float(shot["end_seconds"]) - segment_start)
+        except (KeyError, TypeError, ValueError):
+            continue
+        if shot_segment == segment_index and end > start:
+            shots.append((start, end))
+    if not shots or target < len(shots):
+        return base
+
+    selected: list[float] = []
+
+    def add(timestamp: float) -> None:
+        clean = round(max(0.0, min(float(timestamp), max_ts)), 3)
+        if len(selected) < target and all(abs(clean - seen) > 0.001 for seen in selected):
+            selected.append(clean)
+
+    def belongs(timestamp: float, shot_index: int) -> bool:
+        start, end = shots[shot_index]
+        return start <= timestamp < end or (
+            shot_index == len(shots) - 1 and start <= timestamp <= end
+        )
+
+    for timestamp in requested:
+        add(timestamp)
+
+    # First observation sits just inside the detected boundary so decoder seek
+    # backoff cannot accidentally assign it to the preceding shot.
+    for shot_index, (start, end) in enumerate(shots):
+        if any(belongs(timestamp, shot_index) for timestamp in selected):
+            continue
+        inset = min(0.05, max(0.001, (end - start) * 0.1))
+        add(0.0 if shot_index == 0 and start <= 0.001 else start + inset)
+
+    # Spend the next pass on end-state observations. Short shots come first
+    # when the preset cannot afford two frames for every detected shot.
+    for shot_index in sorted(
+        range(len(shots)),
+        key=lambda value: shots[value][1] - shots[value][0],
+    ):
+        if len(selected) >= target:
+            break
+        count = sum(belongs(timestamp, shot_index) for timestamp in selected)
+        if count >= 2:
+            continue
+        start, end = shots[shot_index]
+        inset = min(0.05, max(0.001, (end - start) * 0.1))
+        add(end - inset)
+
+    # Fine analysis needs the action's intermediate state as well as its start
+    # and end. This is where short-lived overlays and product interactions tend
+    # to appear, so allocate the midpoint before generic uniform fill.
+    if observations_per_shot >= 3:
+        for shot_index, (start, end) in enumerate(shots):
+            if len(selected) >= target:
+                break
+            count = sum(belongs(timestamp, shot_index) for timestamp in selected)
+            if count < 3:
+                add((start + end) / 2)
+
+    for timestamp in base:
+        add(timestamp)
+    for timestamp in _uniform_timestamps(segment_duration, target):
+        add(timestamp)
+    return sorted(selected)
 
 
 def _allocate_frame_budget(total: int, durations: list[float | None]) -> list[int]:
@@ -629,13 +912,17 @@ def _shot_detection_contract(
             unknown_duration = True
             continue
         segment_scenes = [
-            round(float(timestamp), 3)
+            (round(float(timestamp), 3), getattr(timestamp, "scene_score", None))
             for timestamp in scene_timestamps
             if start + 0.05 < float(timestamp) < end - 0.05
         ]
-        points = [round(float(start), 3), *segment_scenes, round(float(end), 3)]
+        points = [
+            (round(float(start), 3), None),
+            *segment_scenes,
+            (round(float(end), 3), None),
+        ]
         point_ids: list[str] = []
-        for point_index, timestamp in enumerate(points):
+        for point_index, (timestamp, scene_score) in enumerate(points):
             boundary_type = (
                 "source_range_start" if point_index == 0
                 else "source_range_end" if point_index == len(points) - 1
@@ -654,13 +941,16 @@ def _shot_detection_contract(
                 "timestamp_seconds": timestamp,
                 "relative_timestamp_seconds": round(timestamp - start, 3),
                 "boundary_type": boundary_type,
+                # lavfi 场景分值（0-1），仅 scene_change 边界可能有；作为切点置信度来源。
+                "scene_score": scene_score if boundary_type == "scene_change" else None,
                 "analyzer": "ffmpeg_scene",
                 "analyzer_version": "scene-threshold-v1",
             })
-        for shot_index, (shot_start, shot_end) in enumerate(
+        for shot_index, ((shot_start, _start_score), (shot_end, _end_score)) in enumerate(
             zip(points, points[1:], strict=False),
             start=1,
         ):
+            start_boundary_score = points[shot_index - 1][1] if shot_index > 1 else None
             shots.append({
                 "detected_shot_id": (
                     f"detected-shot-{segment_index}-{int(round(shot_start * 1000))}-"
@@ -671,6 +961,8 @@ def _shot_detection_contract(
                 "end_seconds": shot_end,
                 "relative_start_seconds": round(shot_start - start, 3),
                 "relative_end_seconds": round(shot_end - start, 3),
+                # 该镜头开头那个切点的场景分值；首个镜头以片段边界开头，无分值。
+                "start_scene_score": start_boundary_score,
                 "boundary_refs": [point_ids[shot_index - 1], point_ids[shot_index]],
             })
     return {
@@ -684,6 +976,45 @@ def _shot_detection_contract(
         "shots": shots,
         "degraded_reason": "源视频时长未知，无法形成完整镜头区间" if unknown_duration else None,
     }
+
+
+def _detected_shot_locator(shot_detection: dict):
+    """返回“(片段序号, 绝对秒) -> 该帧所属检测镜头字段”的查找函数。
+
+    归属规则：镜头覆盖 [start, end)，恰好落在切点上的帧归属后一个镜头（ffmpeg
+    的 scene pts_time 就是新镜头首帧）；片段最后一个镜头对 end 闭区间。找不到
+    归属（时长未知、超界）时返回 None，帧上就不会出现 detected_shot_* 字段。
+    """
+    shots_by_segment: dict[int, list[tuple[int, dict]]] = {}
+    for ordinal, shot in enumerate(shot_detection.get("shots") or [], start=1):
+        shots_by_segment.setdefault(int(shot["source_segment_index"]), []).append(
+            (ordinal, shot)
+        )
+
+    def locate(segment_index: int, timestamp: float) -> dict | None:
+        match: tuple[int, dict] | None = None
+        for ordinal, shot in shots_by_segment.get(int(segment_index)) or []:
+            if float(shot["start_seconds"]) <= timestamp + SELECTION_TIME_EPSILON_SECONDS:
+                match = (ordinal, shot)
+            else:
+                break
+        if match is None:
+            return None
+        ordinal, shot = match
+        if timestamp > float(shot["end_seconds"]) + SHOT_ASSIGNMENT_EPSILON_SECONDS:
+            return None
+        cut_score = shot.get("start_scene_score")
+        return {
+            "detected_shot_index": ordinal,
+            "detected_shot_id": str(shot["detected_shot_id"]),
+            "detected_shot_start_seconds": float(shot["start_seconds"]),
+            "detected_shot_end_seconds": float(shot["end_seconds"]),
+            "detected_shot_cut_score": (
+                float(cut_score) if isinstance(cut_score, (int, float)) else None
+            ),
+        }
+
+    return locate
 
 
 def _reencode_jpeg(jpeg: bytes, *, quality: int, max_edge: int) -> bytes:
@@ -740,6 +1071,11 @@ def fit_frame_payload_budget(
                 priority=frame.priority,
                 relative_timestamp_seconds=frame.relative_timestamp_seconds,
                 source_segment_index=frame.source_segment_index,
+                detected_shot_index=frame.detected_shot_index,
+                detected_shot_id=frame.detected_shot_id,
+                detected_shot_start_seconds=frame.detected_shot_start_seconds,
+                detected_shot_end_seconds=frame.detected_shot_end_seconds,
+                detected_shot_cut_score=frame.detected_shot_cut_score,
             )
             for frame in candidates
         ]
@@ -826,9 +1162,24 @@ def _sample_video_from_file(
         source_ranges=metadata_ranges,
     )
     target = _target_frame_count(n, selected_duration, preset)
-    allocations = _allocate_frame_budget(target, durations)
     absolute_scenes = _scene_change_timestamps(src, max(256, target * 3))
     shot_detection = _shot_detection_contract(ranges, absolute_scenes)
+    shot_aware_sampling = preset in {"standard", "fine", "ultra"}
+    if shot_aware_sampling:
+        target = _adaptive_frame_target_for_detected_shots(
+            target,
+            requested_max=n,
+            preset=preset,
+            shot_detection=shot_detection,
+        )
+        allocations = _allocate_detected_shot_frame_budget(
+            target,
+            durations,
+            shot_detection,
+        )
+    else:
+        allocations = _allocate_frame_budget(target, durations)
+    locate_shot = _detected_shot_locator(shot_detection)
 
     with tempfile.TemporaryDirectory() as td:
         frame_number = 0
@@ -845,11 +1196,23 @@ def _sample_video_from_file(
                 if float(timestamp) >= start and (end is None or float(timestamp) <= end)
             ]
             relative_stamps = _merge_timestamps(
-                sorted(set(requested + scene_stamps)),
+                sorted(set(scene_stamps)),
                 _uniform_timestamps(segment_dur, segment_target),
                 segment_target,
                 segment_dur,
+                requested=requested,
             )
+            if shot_aware_sampling:
+                relative_stamps = _shot_aware_timestamps(
+                    relative_stamps,
+                    shot_detection=shot_detection,
+                    segment_index=segment_index,
+                    segment_start=start,
+                    segment_duration=segment_dur,
+                    target=segment_target,
+                    requested=requested,
+                    observations_per_shot=_detected_shot_observations_for_preset(preset),
+                )
             for local_index, relative_ts in enumerate(relative_stamps):
                 timestamp = start + relative_ts
                 dst = os.path.join(td, f"f_{frame_number:03d}.jpg")
@@ -857,6 +1220,7 @@ def _sample_video_from_file(
                 actual_ts = _grab_frame_with_backoff(src, max(0.0, timestamp), dst)
                 if actual_ts is None:
                     continue
+                detected_shot = locate_shot(segment_index, float(actual_ts))
                 with open(dst, "rb") as f:
                     frames.append(SampledVideoFrame(
                         jpeg=f.read(),
@@ -868,6 +1232,7 @@ def _sample_video_from_file(
                         ),
                         relative_timestamp_seconds=round(max(0.0, float(actual_ts) - start), 3),
                         source_segment_index=segment_index if explicit_ranges else None,
+                        **(detected_shot or {}),
                     ))
     return VideoSample(
         frames=fit_frame_payload_budget(frames),

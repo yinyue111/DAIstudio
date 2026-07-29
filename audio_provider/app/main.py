@@ -15,8 +15,12 @@ from .config import ProviderSettings
 from .inference import (
     ANALYZER,
     CONTRACT_VERSION,
+    DiarizationEngine,
+    DisabledDiarizationEngine,
     FasterWhisperEngine,
+    PyannoteDiarizationEngine,
     TranscriptionEngine,
+    assign_speaker_labels,
 )
 
 
@@ -71,8 +75,23 @@ async def _persist_upload(file: UploadFile, settings: ProviderSettings) -> Path:
     return path
 
 
+def _speaker_health_status(
+    diarizer: DiarizationEngine, *, asr_ready: bool
+) -> str:
+    status = str(diarizer.health().get("status") or "unsupported")
+    if status not in {"available", "degraded", "unsupported"}:
+        status = "unsupported"
+    # The backend rejects speaker: available while ASR itself is not available,
+    # and a broken ASR path means no diarized evidence can be produced anyway.
+    if status == "available" and not asr_ready:
+        return "degraded"
+    return status
+
+
 def _health_payload(
-    engine: TranscriptionEngine, settings: ProviderSettings
+    engine: TranscriptionEngine,
+    diarizer: DiarizationEngine,
+    settings: ProviderSettings,
 ) -> tuple[dict[str, Any], int]:
     state = engine.health()
     ready = state.get("status") == "available"
@@ -86,7 +105,7 @@ def _health_payload(
             "provider_model": settings.model,
             "capability_statuses": {
                 "asr": "available" if ready else "degraded",
-                "speaker": "unsupported",
+                "speaker": _speaker_health_status(diarizer, asr_ready=ready),
             },
             "degraded_reason": None if ready else state.get("degraded_reason"),
         },
@@ -98,14 +117,21 @@ def create_app(
     *,
     settings: ProviderSettings | None = None,
     engine: TranscriptionEngine | None = None,
+    diarizer: DiarizationEngine | None = None,
 ) -> FastAPI:
     resolved_settings = settings or ProviderSettings.from_env()
     resolved_engine = engine or FasterWhisperEngine(resolved_settings)
+    resolved_diarizer = diarizer or (
+        PyannoteDiarizationEngine(resolved_settings)
+        if resolved_settings.diarization_enabled
+        else DisabledDiarizationEngine()
+    )
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
         if resolved_settings.eager_load:
             await asyncio.to_thread(resolved_engine.warmup)
+            await asyncio.to_thread(resolved_diarizer.warmup)
         yield
 
     app = FastAPI(
@@ -119,7 +145,9 @@ def create_app(
 
     @app.get("/health", include_in_schema=False)
     def health(_: None = Depends(authorize)) -> JSONResponse:
-        payload, status = _health_payload(resolved_engine, resolved_settings)
+        payload, status = _health_payload(
+            resolved_engine, resolved_diarizer, resolved_settings
+        )
         return JSONResponse(status_code=status, content=payload)
 
     @app.post("/v1/audio/transcriptions")
@@ -154,26 +182,47 @@ def create_app(
 
         path = await _persist_upload(file, resolved_settings)
         try:
-            result = await asyncio.to_thread(
-                resolved_engine.transcribe,
-                path,
-                language=language.lower() if language else None,
-                prompt=prompt,
+            try:
+                result = await asyncio.to_thread(
+                    resolved_engine.transcribe,
+                    path,
+                    language=language.lower() if language else None,
+                    prompt=prompt,
+                )
+            except Exception as exc:  # noqa: BLE001
+                raise HTTPException(503, "local transcription failed") from exc
+            segments = result.get("segments")
+            if not isinstance(segments, list):
+                raise HTTPException(
+                    503, "local transcription returned an invalid segment payload"
+                )
+            speaker_status = _speaker_health_status(
+                resolved_diarizer, asr_ready=True
             )
-        except Exception as exc:  # noqa: BLE001
-            raise HTTPException(503, "local transcription failed") from exc
+            if speaker_status == "available":
+                # ASR evidence must survive a diarization failure: keep the
+                # segments and honestly downgrade speaker instead of failing.
+                try:
+                    turns = await asyncio.to_thread(resolved_diarizer.diarize, path)
+                    labeled = assign_speaker_labels(
+                        segments,
+                        turns,
+                        max_speakers=resolved_settings.diarization_max_speakers,
+                    )
+                    if not labeled:
+                        speaker_status = "degraded"
+                except Exception:  # noqa: BLE001
+                    for row in segments:
+                        if isinstance(row, dict):
+                            row.pop("speaker_id", None)
+                    speaker_status = "degraded"
         finally:
             path.unlink(missing_ok=True)
-        segments = result.get("segments")
-        if not isinstance(segments, list):
-            raise HTTPException(
-                503, "local transcription returned an invalid segment payload"
-            )
         return {
             "text": str(result.get("text") or ""),
             "language": result.get("language"),
             "segments": segments,
-            "capability_statuses": {"asr": "available", "speaker": "unsupported"},
+            "capability_statuses": {"asr": "available", "speaker": speaker_status},
         }
 
     return app

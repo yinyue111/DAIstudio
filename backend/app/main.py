@@ -51,7 +51,7 @@ from .services.gateway_config_errors import gateway_config_error_contract
 from .services.model_gateway_config import ModelGatewayConfigError
 from .services.payment_config import seed_defaults as seed_payment_defaults
 from .services.product_edition import api_path_enabled
-from .services.workflow_node_adapters import register_production_workflow_adapters
+from .workflow_adapter_wiring import register_production_workflow_adapters
 
 setup_logging()
 log = logging.getLogger("main")
@@ -63,7 +63,11 @@ class BodyTooLargeError(Exception):
 
 
 class ProductEditionMiddleware:
-    """Return 404 for advanced public APIs excluded from launch_lite."""
+    """Return 404 for public API prefixes whose owning feature switch is off.
+
+    Resolution lives in services.product_edition: explicit FEATURE_*_ENABLED
+    settings win, otherwise PRODUCT_EDITION supplies the default.
+    """
 
     def __init__(self, app: ASGIApp):
         self.app = app

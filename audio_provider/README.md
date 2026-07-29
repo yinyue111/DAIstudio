@@ -8,9 +8,26 @@ of OpenAI Whisper models. The code and Whisper model weights are commercially
 deployable under their respective MIT licenses; pin a model revision internally
 if your organization needs reproducible supply-chain approvals.
 
-It returns real model-produced segment timestamps (`start`, `end`, `text`). It
-does not implement speaker diarization: every health and transcription response
-reports `speaker: unsupported`, and no `speaker_id` is ever inferred.
+It returns real model-produced segment timestamps (`start`, `end`, `text`).
+
+Speaker diarization is an opt-in adapter. By default every health and
+transcription response reports `speaker: unsupported`, and no `speaker_id` is
+ever inferred. When `ASR_PROVIDER_DIARIZATION_ENABLED=true` and the optional
+[`pyannote.audio`](https://github.com/pyannote/pyannote-audio) stack from
+`requirements-diarization.txt` is installed with licensed model weights, the
+provider attaches real `speaker_id` labels (`S1`, `S2`, …) to segments by
+temporal overlap and reports `speaker: available`. If the pipeline cannot load
+(missing dependency, missing/gated weights, no auth token) or produces no
+usable turns, the provider reports `speaker: degraded` and returns segments
+without labels — it never fabricates speakers.
+
+```dotenv
+ASR_PROVIDER_DIARIZATION_ENABLED=true
+ASR_PROVIDER_DIARIZATION_MODEL=pyannote/speaker-diarization-3.1
+ASR_PROVIDER_DIARIZATION_AUTH_TOKEN=hf_replace-with-a-read-token
+ASR_PROVIDER_DIARIZATION_DEVICE=cpu
+ASR_PROVIDER_DIARIZATION_MAX_SPEAKERS=8
+```
 
 ## Contract
 

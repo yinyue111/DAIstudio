@@ -7,13 +7,10 @@ payment came from Alipay or WeChat Pay.
 """
 from __future__ import annotations
 
-import base64
-import json
 import logging
 import secrets
 import time
 from datetime import datetime, timedelta, timezone
-from decimal import Decimal, InvalidOperation
 from urllib.parse import quote_plus, urlparse
 
 from sqlalchemy import func, select, update
@@ -22,10 +19,9 @@ from sqlalchemy.orm import Session
 from sqlalchemy.orm.attributes import set_committed_value
 
 from ..config import settings
-from ..models import AppSetting, PaymentOrder, User
+from ..models import PaymentOrder, User
 from . import credits, locks, payment_config
 from .config_store import get_bool_setting
-from .ssrf import pinned_client
 from .user_events import publish_user_event
 
 PAYMENT_PACKAGES = payment_config.DEFAULT_PAYMENT_PACKAGES
@@ -36,6 +32,10 @@ PENDING = "pending"
 PAID = "paid"
 CLOSED = "closed"
 FAILED = "failed"
+REFUNDED = "refunded"
+REFUND_PENDING = "pending"
+REFUND_SUCCEEDED = "succeeded"
+REFUND_FAILED = "failed"
 _RECONCILE_LOCK_KEY = "payment:reconcile"
 _RECONCILE_CURSOR_SETTING = "payment_reconcile_cursor"
 
@@ -165,586 +165,27 @@ def _wechat_configured(cfg: payment_config.ProviderRuntimeConfig) -> bool:
     )
 
 
-def _wrap_pem_body(text: str) -> str:
-    body = "".join(text.split())
-    return "\n".join(body[i:i + 64] for i in range(0, len(body), 64))
 
-
-def _normalise_pem_text(pem: str) -> str:
-    text = pem.replace("\\n", "\n").strip()
-    return text
-
-
-def _normalise_private_pem(pem: str) -> str:
-    text = _normalise_pem_text(pem)
-    if "-----BEGIN" in text:
-        return text
-    return "-----BEGIN PRIVATE KEY-----\n" + _wrap_pem_body(text) + "\n-----END PRIVATE KEY-----"  # gitleaks:allow
-
-
-def _normalise_public_pem(pem: str) -> str:
-    text = _normalise_pem_text(pem)
-    if "-----BEGIN" in text:
-        return text
-    return "-----BEGIN PUBLIC KEY-----\n" + _wrap_pem_body(text) + "\n-----END PUBLIC KEY-----"
-
-
-def _rsa_sha256_sign(data: str, private_key_pem: str) -> str:
-    try:
-        from cryptography.hazmat.primitives import hashes, serialization
-        from cryptography.hazmat.primitives.asymmetric import padding
-    except Exception as e:  # noqa: BLE001
-        raise PaymentError("缺少 cryptography 依赖,无法进行真实支付签名") from e
-    key = serialization.load_pem_private_key(
-        _normalise_private_pem(private_key_pem).encode(),
-        password=None,
-    )
-    sig = key.sign(data.encode(), padding.PKCS1v15(), hashes.SHA256())
-    return base64.b64encode(sig).decode()
-
-
-def _rsa_sha256_verify(data: str, signature_b64: str, public_pem: str) -> bool:
-    try:
-        from cryptography import x509
-        from cryptography.hazmat.primitives import hashes, serialization
-        from cryptography.hazmat.primitives.asymmetric import padding
-    except Exception as e:  # noqa: BLE001
-        raise PaymentError("缺少 cryptography 依赖,无法验签") from e
-    pem = _normalise_public_pem(public_pem).encode()
-    try:
-        public_key = x509.load_pem_x509_certificate(pem).public_key()
-    except Exception:
-        public_key = serialization.load_pem_public_key(pem)
-    try:
-        public_key.verify(
-            base64.b64decode(signature_b64),
-            data.encode(),
-            padding.PKCS1v15(),
-            hashes.SHA256(),
-        )
-        return True
-    except Exception:
-        return False
-
-
-def _notify_url(provider: str, cfg: payment_config.ProviderRuntimeConfig) -> str:
-    configured = str(cfg.public.get("notify_url") or "").strip()
-    if configured:
-        return configured
-    suffix = "/api/payments/alipay/notify" if provider == "alipay" else "/api/payments/wechat/notify"
-    return settings.public_base_url.rstrip("/") + suffix
-
-
-def _alipay_precreate(order: PaymentOrder, cfg: payment_config.ProviderRuntimeConfig) -> tuple[str, dict]:
-    notify_url = _notify_url("alipay", cfg)
-    expires_at = _aware(order.expires_at)
-    timeout_express = None
-    if expires_at:
-        timeout_minutes = max(1, int((expires_at - _now()).total_seconds() // 60))
-        timeout_express = f"{timeout_minutes}m"
-    biz_content = {
-        "out_trade_no": order.order_no,
-        "total_amount": f"{order.amount_cents / 100:.2f}",
-        "subject": f"{settings.payment_subject_prefix} {order.credits}积分",
-    }
-    if timeout_express:
-        biz_content["timeout_express"] = timeout_express
-    params = {
-        "app_id": cfg.public.get("app_id"),
-        "method": "alipay.trade.precreate",
-        "format": "JSON",
-        "charset": "utf-8",
-        "sign_type": "RSA2",
-        "timestamp": _now().strftime("%Y-%m-%d %H:%M:%S"),
-        "version": "1.0",
-        "notify_url": notify_url,
-        "biz_content": json.dumps(biz_content, ensure_ascii=False, separators=(",", ":")),
-    }
-    sign_src = "&".join(f"{k}={params[k]}" for k in sorted(params))
-    params["sign"] = _rsa_sha256_sign(sign_src, cfg.secret.get("private_key") or "")
-    url = cfg.public.get("gateway_url") or settings.alipay_gateway_url
-    with pinned_client(url, timeout=settings.gateway_timeout_seconds, follow_redirects=False) as client:
-        resp = client.post(url, data=params)
-    if resp.status_code >= 400:
-        raise PaymentError(f"支付宝下单失败:{resp.status_code}")
-    data = resp.json()
-    body = data.get("alipay_trade_precreate_response") or {}
-    if body.get("code") != "10000" or not body.get("qr_code"):
-        raise PaymentError(body.get("sub_msg") or body.get("msg") or "支付宝未返回二维码")
-    return body["qr_code"], data
-
-
-def _wechat_authorization(
-    method: str,
-    path: str,
-    body: str,
-    cfg: payment_config.ProviderRuntimeConfig,
-) -> str:
-    nonce = secrets.token_hex(16)
-    timestamp = str(int(time.time()))
-    message = f"{method}\n{path}\n{timestamp}\n{nonce}\n{body}\n"
-    signature = _rsa_sha256_sign(message, cfg.secret.get("private_key") or "")
-    return (
-        'WECHATPAY2-SHA256-RSA2048 '
-        f'mchid="{cfg.public.get("mchid")}",'
-        f'nonce_str="{nonce}",'
-        f'signature="{signature}",'
-        f'timestamp="{timestamp}",'
-        f'serial_no="{cfg.public.get("serial_no")}"'
-    )
-
-
-def _wechat_native(order: PaymentOrder, cfg: payment_config.ProviderRuntimeConfig) -> tuple[str, dict]:
-    path = "/v3/pay/transactions/native"
-    notify_url = _notify_url("wechat", cfg)
-    expires_at = _aware(order.expires_at)
-    payload = {
-        "appid": cfg.public.get("appid"),
-        "mchid": cfg.public.get("mchid"),
-        "description": f"{settings.payment_subject_prefix} {order.credits}积分",
-        "out_trade_no": order.order_no,
-        "notify_url": notify_url,
-        "amount": {"total": order.amount_cents, "currency": "CNY"},
-    }
-    if expires_at:
-        payload["time_expire"] = expires_at.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
-    body = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
-    headers = {
-        "Authorization": _wechat_authorization("POST", path, body, cfg),
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-    }
-    url = (cfg.public.get("gateway_url") or settings.wechat_pay_gateway_url).rstrip("/") + path
-    with pinned_client(url, timeout=settings.gateway_timeout_seconds, follow_redirects=False) as client:
-        resp = client.post(url, headers=headers, content=body)
-    if resp.status_code >= 400:
-        raise PaymentError(f"微信支付下单失败:{resp.status_code} {resp.text[:160]}")
-    data = resp.json()
-    if not data.get("code_url"):
-        raise PaymentError("微信支付未返回二维码链接")
-    return data["code_url"], data
-
-
-def _provider_code_url(order: PaymentOrder, db: Session) -> tuple[str, dict]:
-    cfg = payment_config.runtime_or_env(db, order.provider)
-    if not cfg.enabled:
-        if mock_payments_allowed():
-            cfg = payment_config.ProviderRuntimeConfig(
-                provider=order.provider, enabled=True, mode="mock", public={}, secret={}
-            )
-        else:
-            raise PaymentError(f"{order.provider} 支付渠道未启用")
-    if cfg.mode == "mock":
-        if mock_payments_allowed():
-            return _mock_code_url(order.order_no, order.provider, order.credits), {
-                "mock": True,
-                "provider": order.provider,
-            }
-        raise PaymentError("当前环境不允许模拟支付")
-    if order.provider == "alipay":
-        if _alipay_configured(cfg):
-            return _alipay_precreate(order, cfg)
-    elif order.provider == "wechat":
-        if _wechat_configured(cfg):
-            return _wechat_native(order, cfg)
-    else:
-        raise PaymentError("支付渠道非法")
-
-    raise PaymentError(f"{order.provider} 商户参数未配置")
-
-
-def _provider_raw_subset(data: dict | None, keys: tuple[str, ...]) -> dict:
-    if not isinstance(data, dict):
-        return {}
-    return {key: data.get(key) for key in keys if data.get(key) not in (None, "")}
-
-
-def _alipay_query(order: PaymentOrder, cfg: payment_config.ProviderRuntimeConfig) -> dict:
-    biz_content = {"out_trade_no": order.order_no}
-    params = {
-        "app_id": cfg.public.get("app_id"),
-        "method": "alipay.trade.query",
-        "format": "JSON",
-        "charset": "utf-8",
-        "sign_type": "RSA2",
-        "timestamp": _now().strftime("%Y-%m-%d %H:%M:%S"),
-        "version": "1.0",
-        "biz_content": json.dumps(biz_content, ensure_ascii=False, separators=(",", ":")),
-    }
-    sign_src = "&".join(f"{k}={params[k]}" for k in sorted(params))
-    params["sign"] = _rsa_sha256_sign(sign_src, cfg.secret.get("private_key") or "")
-    url = cfg.public.get("gateway_url") or settings.alipay_gateway_url
-    with pinned_client(url, timeout=settings.gateway_timeout_seconds, follow_redirects=False) as client:
-        resp = client.post(url, data=params)
-    if resp.status_code >= 400:
-        raise PaymentError(f"支付宝查单失败:{resp.status_code}")
-    data = resp.json()
-    body = data.get("alipay_trade_query_response") or {}
-    code = str(body.get("code") or "")
-    if code != "10000":
-        sub_code = str(body.get("sub_code") or "")
-        if sub_code == "ACQ.TRADE_NOT_EXIST":
-            return {"status": "unknown", "raw": {"code": code, "sub_code": sub_code}}
-        raise PaymentError(body.get("sub_msg") or body.get("msg") or "支付宝查单失败")
-    if body.get("out_trade_no") and str(body.get("out_trade_no")) != order.order_no:
-        raise PaymentError("支付宝查单订单号不匹配")
-    if body.get("total_amount"):
-        ensure_amount_matches(str(body.get("total_amount")), order.amount_cents, "支付宝查单")
-    trade_status = str(body.get("trade_status") or "")
-    raw = _provider_raw_subset(
-        body,
-        ("out_trade_no", "trade_no", "trade_status", "total_amount", "buyer_pay_amount", "send_pay_date"),
-    )
-    if trade_status in {"TRADE_SUCCESS", "TRADE_FINISHED"}:
-        return {"status": PAID, "provider_trade_no": body.get("trade_no"), "raw": raw}
-    if trade_status == "TRADE_CLOSED":
-        return {"status": CLOSED, "provider_trade_no": body.get("trade_no"), "raw": raw}
-    return {"status": PENDING if trade_status else "unknown", "raw": raw}
-
-
-def _wechat_query(order: PaymentOrder, cfg: payment_config.ProviderRuntimeConfig) -> dict:
-    mchid = str(cfg.public.get("mchid") or "").strip()
-    path = f"/v3/pay/transactions/out-trade-no/{quote_plus(order.order_no)}?mchid={quote_plus(mchid)}"
-    headers = {
-        "Authorization": _wechat_authorization("GET", path, "", cfg),
-        "Accept": "application/json",
-    }
-    url = (cfg.public.get("gateway_url") or settings.wechat_pay_gateway_url).rstrip("/") + path
-    with pinned_client(url, timeout=settings.gateway_timeout_seconds, follow_redirects=False) as client:
-        resp = client.get(url, headers=headers)
-    if resp.status_code == 404:
-        return {"status": "unknown", "raw": {"status_code": 404}}
-    if resp.status_code >= 400:
-        raise PaymentError(f"微信支付查单失败:{resp.status_code} {resp.text[:160]}")
-    data = resp.json()
-    if data.get("out_trade_no") and str(data.get("out_trade_no")) != order.order_no:
-        raise PaymentError("微信查单订单号不匹配")
-    expected_appid = str(cfg.public.get("appid") or "")
-    expected_mchid = str(cfg.public.get("mchid") or "")
-    if expected_appid and data.get("appid") and str(data.get("appid")) != expected_appid:
-        raise PaymentError("微信查单 appid 不匹配")
-    if expected_mchid and data.get("mchid") and str(data.get("mchid")) != expected_mchid:
-        raise PaymentError("微信查单 mchid 不匹配")
-    amount = data.get("amount") or {}
-    if amount.get("total") is not None and int(amount.get("total")) != int(order.amount_cents):
-        raise PaymentError("微信查单金额不匹配")
-    trade_state = str(data.get("trade_state") or "")
-    raw = _provider_raw_subset(
-        data,
-        ("out_trade_no", "transaction_id", "trade_state", "trade_state_desc", "success_time"),
-    )
-    if amount.get("total") is not None:
-        raw["amount"] = {"total": int(amount.get("total")), "currency": amount.get("currency") or "CNY"}
-    if trade_state == "SUCCESS":
-        return {"status": PAID, "provider_trade_no": data.get("transaction_id"), "raw": raw}
-    if trade_state in {"CLOSED", "REVOKED"}:
-        return {"status": CLOSED, "provider_trade_no": data.get("transaction_id"), "raw": raw}
-    if trade_state == "PAYERROR":
-        return {"status": FAILED, "provider_trade_no": data.get("transaction_id"), "raw": raw}
-    return {"status": PENDING if trade_state else "unknown", "raw": raw}
-
-
-def _query_provider_order(db: Session, order: PaymentOrder) -> dict:
-    cfg = payment_config.runtime_or_env(db, order.provider)
-    if not cfg.enabled or cfg.mode != "live":
-        raise PaymentError(f"{order.provider} 支付渠道未启用真实查单")
-    if order.provider == "alipay":
-        if not _alipay_configured(cfg):
-            raise PaymentError("支付宝商户参数未配置")
-        return _alipay_query(order, cfg)
-    if order.provider == "wechat":
-        if not _wechat_configured(cfg):
-            raise PaymentError("微信支付商户参数未配置")
-        return _wechat_query(order, cfg)
-    raise PaymentError("支付渠道非法")
-
-
-def _pending_reconcile_orders(
-    db: Session,
-    *,
-    cutoff: datetime,
-    limit: int,
-    cursor: int,
-    high_water: int,
-    exclude_ids: set[int] | None = None,
-) -> list[PaymentOrder]:
-    filters = (
-        PaymentOrder.status.in_((PENDING, CLOSED)),
-        PaymentOrder.paid_at.is_(None),
-        PaymentOrder.created_at >= cutoff,
-    )
-    id_filters = [
-        PaymentOrder.id > cursor,
-        PaymentOrder.id <= high_water,
-    ]
-    if exclude_ids:
-        id_filters.append(PaymentOrder.id.not_in(exclude_ids))
-    orders = list(
-        db.execute(
-            select(PaymentOrder)
-            .where(*filters, *id_filters)
-            .order_by(PaymentOrder.id.asc())
-            .limit(limit)
-        ).scalars()
-    )
-    return orders
-
-
-def _reconcile_high_water(db: Session, *, cutoff: datetime) -> int:
-    return int(
-        db.execute(
-            select(func.max(PaymentOrder.id)).where(
-                PaymentOrder.status.in_((PENDING, CLOSED)),
-                PaymentOrder.paid_at.is_(None),
-                PaymentOrder.created_at >= cutoff,
-            )
-        ).scalar_one_or_none()
-        or 0
-    )
-
-
-def _coerce_reconcile_position(value) -> int:
-    try:
-        return max(0, int(value or 0))
-    except (TypeError, ValueError):
-        return 0
-
-
-def _claim_reconcile_state(
-    db: Session,
-    *,
-    owner: str,
-    lock_ttl: int,
-) -> tuple[int, int] | None:
-    row = db.execute(
-        select(AppSetting)
-        .where(AppSetting.key == _RECONCILE_CURSOR_SETTING)
-        .execution_options(populate_existing=True)
-    ).scalar_one_or_none()
-    observed_value = dict(row.value or {}) if row is not None else None
-    value = observed_value or {}
-    cursor = _coerce_reconcile_position(value.get("v"))
-    high_water = _coerce_reconcile_position(value.get("high_water"))
-    claimed_value = {
-        "v": cursor,
-        "high_water": high_water,
-        "owner": owner,
-    }
-    if not locks.refresh(_RECONCILE_LOCK_KEY, owner, lock_ttl):
-        db.rollback()
-        return None
-    if row is None:
-        db.add(AppSetting(key=_RECONCILE_CURSOR_SETTING, value=claimed_value))
-        try:
-            db.commit()
-        except IntegrityError:
-            db.rollback()
-            return None
-    else:
-        result = db.execute(
-            update(AppSetting)
-            .where(
-                AppSetting.key == _RECONCILE_CURSOR_SETTING,
-                AppSetting.value == observed_value,
-            )
-            .values(value=claimed_value)
-            .execution_options(synchronize_session=False)
-        )
-        if result.rowcount != 1:
-            db.rollback()
-            return None
-        db.commit()
-    if not locks.refresh(_RECONCILE_LOCK_KEY, owner, lock_ttl):
-        return None
-    return cursor, high_water
-
-
-def _persist_reconcile_state(
-    db: Session,
-    *,
-    owner: str,
-    cursor: int,
-    high_water: int,
-) -> bool:
-    result = db.execute(
-        update(AppSetting)
-        .where(
-            AppSetting.key == _RECONCILE_CURSOR_SETTING,
-            AppSetting.value["owner"].as_string() == owner,
-        )
-        .values(value={
-            "v": _coerce_reconcile_position(cursor),
-            "high_water": _coerce_reconcile_position(high_water),
-            "owner": owner,
-        })
-        .execution_options(synchronize_session=False)
-    )
-    if result.rowcount != 1:
-        db.rollback()
-        return False
-    db.commit()
-    return True
-
-
-def reconcile_pending_orders(db: Session) -> dict:
-    """Query live providers for unpaid local orders and repair callback gaps.
-
-    Provider notifications remain the primary path. This job is a backstop for
-    missed callbacks, late provider success after local expiry, and provider-
-    confirmed terminal failures. Unknown/provider-pending results never mutate
-    local state.
-    """
-    stats = {
-        "checked": 0,
-        "paid": 0,
-        "closed": 0,
-        "failed": 0,
-        "skipped": 0,
-        "errors": 0,
-        "enabled": bool(settings.payment_reconcile_enabled),
-    }
-    if not settings.payment_reconcile_enabled or not get_bool_setting(db, "payment_enabled", False):
-        return stats
-    lock_ttl = max(180, int(settings.gateway_timeout_seconds) + 60)
-    lock_token = locks.acquire(_RECONCILE_LOCK_KEY, ttl=lock_ttl)
-    if not lock_token:
-        return stats
-    lookback = max(1, int(settings.payment_reconcile_lookback_hours))
-    limit = max(1, min(int(settings.payment_reconcile_max_orders), 500))
-    cutoff = _now() - timedelta(hours=lookback)
-    try:
-        try:
-            claimed_state = _claim_reconcile_state(
-                db,
-                owner=lock_token,
-                lock_ttl=lock_ttl,
-            )
-        except Exception:  # noqa: BLE001
-            db.rollback()
-            stats["errors"] += 1
-            log.warning("failed to claim payment reconcile cursor", exc_info=True)
-            return stats
-        if claimed_state is None:
-            stats["errors"] += 1
-            log.warning("payment reconcile lock lost or state changed during cursor claim")
-            return stats
-        cursor, high_water = claimed_state
-        if cursor >= high_water:
-            cursor = 0
-            high_water = _reconcile_high_water(db, cutoff=cutoff)
-        orders = _pending_reconcile_orders(
-            db,
-            cutoff=cutoff,
-            limit=limit,
-            cursor=cursor,
-            high_water=high_water,
-        )
-        wrapped = False
-        if cursor > 0 and len(orders) < limit:
-            high_water = _reconcile_high_water(db, cutoff=cutoff)
-            wrapped = True
-            orders.extend(
-                _pending_reconcile_orders(
-                    db,
-                    cutoff=cutoff,
-                    limit=limit - len(orders),
-                    cursor=0,
-                    high_water=high_water,
-                    exclude_ids={order.id for order in orders},
-                )
-            )
-        processed_ids = []
-        for order in orders:
-            if not locks.refresh(_RECONCILE_LOCK_KEY, lock_token, lock_ttl):
-                log.warning("payment reconcile lock lost before order_no=%s", order.order_no)
-                break
-            try:
-                result = _query_provider_order(db, order)
-                stats["checked"] += 1
-                status = str(result.get("status") or "unknown")
-                raw = {
-                    "verified_provider_query": True,
-                    "provider": order.provider,
-                    "status": status,
-                    "query": result.get("raw") or {},
-                }
-                if status == PAID:
-                    _paid, credited = mark_paid(
-                        db,
-                        order.order_no,
-                        provider=order.provider,
-                        provider_trade_no=result.get("provider_trade_no"),
-                        raw=raw,
-                        allow_expired=True,
-                    )
-                    if credited:
-                        stats["paid"] += 1
-                    continue
-                if status in {CLOSED, FAILED} and order.status == PENDING:
-                    locked = db.execute(
-                        select(PaymentOrder)
-                        .where(PaymentOrder.id == order.id)
-                        .with_for_update()
-                        .execution_options(populate_existing=True)
-                    ).scalar_one()
-                    if locked.status == PENDING and locked.paid_at is None:
-                        locked.status = status
-                        locked.provider_trade_no = result.get("provider_trade_no") or locked.provider_trade_no
-                        locked.raw = raw
-                        db.commit()
-                        stats[status] += 1
-                    else:
-                        db.rollback()
-                    continue
-                stats["skipped"] += 1
-            except Exception as e:  # noqa: BLE001
-                db.rollback()
-                stats["errors"] += 1
-                log.warning(
-                    "payment reconcile failed order_no=%s provider=%s error=%s",
-                    getattr(order, "order_no", None),
-                    getattr(order, "provider", None),
-                    str(e)[:200],
-                )
-            finally:
-                processed_ids.append(order.id)
-        next_cursor = 0
-        if high_water:
-            if wrapped and processed_ids:
-                next_cursor = processed_ids[-1]
-            elif len(orders) < limit:
-                next_cursor = high_water
-            elif processed_ids:
-                next_cursor = processed_ids[-1]
-        if high_water:
-            if not locks.refresh(_RECONCILE_LOCK_KEY, lock_token, lock_ttl):
-                db.rollback()
-                stats["errors"] += 1
-                log.warning(
-                    "payment reconcile lock lost before cursor persist cursor=%s",
-                    next_cursor,
-                )
-            else:
-                try:
-                    persisted = _persist_reconcile_state(
-                        db,
-                        owner=lock_token,
-                        cursor=next_cursor,
-                        high_water=high_water,
-                    )
-                    if not persisted:
-                        stats["errors"] += 1
-                        log.warning(
-                            "payment reconcile cursor fence rejected owner cursor=%s",
-                            next_cursor,
-                        )
-                except Exception:  # noqa: BLE001
-                    db.rollback()
-                    stats["errors"] += 1
-                    log.warning("failed to persist payment reconcile cursor", exc_info=True)
-        return stats
-    finally:
-        locks.release(_RECONCILE_LOCK_KEY, lock_token)
+from . import payment_transport as _payment_transport  # noqa: E402
+from .payment_transport import (  # noqa: E402, F401, I001
+    _alipay_precreate,
+    _alipay_query,
+    _normalise_pem_text,
+    _normalise_private_pem,
+    _normalise_public_pem,
+    _notify_url,
+    _provider_code_url,
+    _provider_raw_subset,
+    _query_provider_order,
+    _rsa_sha256_sign,
+    _rsa_sha256_verify,
+    _wechat_authorization,
+    _wechat_native,
+    _wechat_query,
+    _wrap_pem_body,
+    amount_to_cents,
+    ensure_amount_matches,
+)
 
 
 def create_order(db: Session, user: User, provider: str, package_id: str) -> PaymentOrder:
@@ -833,16 +274,44 @@ def user_order(db: Session, order_no: str, user_id: int) -> PaymentOrder | None:
     ).scalar_one_or_none()
 
 
-def list_user_orders(db: Session, user_id: int, limit: int = 20) -> list[PaymentOrder]:
+def list_user_orders(
+    db: Session,
+    user_id: int,
+    limit: int = 20,
+    *,
+    offset: int = 0,
+    before_id: int | None = None,
+) -> list[PaymentOrder]:
+    """List one user's orders, newest first.
+
+    分页与积分账单游标同思路:订单 id 追加只增,`before_id` 传上一页最后一条的
+    id 即为稳定游标;`offset` 供无游标场景兜底。
+    """
+    stmt = select(PaymentOrder).where(PaymentOrder.user_id == user_id)
+    if before_id is not None and int(before_id) > 0:
+        stmt = stmt.where(PaymentOrder.id < int(before_id))
     orders = list(
         db.execute(
-            select(PaymentOrder)
-            .where(PaymentOrder.user_id == user_id)
-            .order_by(PaymentOrder.id.desc())
+            stmt.order_by(PaymentOrder.id.desc())
+            .offset(max(int(offset), 0))
             .limit(min(max(limit, 1), 100))
         ).scalars()
     )
     return [with_display_status(order) for order in orders]
+
+
+def list_user_invoice_orders(db: Session, user_id: int, limit: int = 100) -> list[PaymentOrder]:
+    return list(
+        db.execute(
+            select(PaymentOrder)
+            .where(
+                PaymentOrder.user_id == user_id,
+                PaymentOrder.invoice_status != "none",
+            )
+            .order_by(PaymentOrder.id.desc())
+            .limit(min(max(limit, 1), 200))
+        ).scalars()
+    )
 
 
 def get_order(db: Session, order_no: str) -> PaymentOrder | None:
@@ -944,160 +413,155 @@ def with_display_status(order: PaymentOrder) -> PaymentOrder:
     return order
 
 
-def amount_to_cents(amount: str) -> int:
-    try:
-        value = Decimal(str(amount).strip())
-    except (InvalidOperation, ValueError) as e:
-        raise PaymentError("支付金额非法") from e
-    cents = value * Decimal(100)
-    if value < 0 or cents != cents.to_integral_value():
-        raise PaymentError("支付金额非法")
-    return int(cents)
+
+from . import payment_notifications as _payment_notifications  # noqa: E402
+from . import payment_reconciliation as _payment_reconciliation  # noqa: E402
+from .payment_notifications import (  # noqa: E402, F401
+    decrypt_wechat_resource,
+    ensure_wechat_merchant_matches,
+    ensure_wechat_notify_success,
+    verify_alipay_notify,
+    wechat_signature_valid,
+)
+from .payment_reconciliation import (  # noqa: E402, F401
+    _apply_provider_query_result,
+    _claim_reconcile_state,
+    _coerce_reconcile_position,
+    _pending_reconcile_orders,
+    _persist_reconcile_state,
+    _reconcile_high_water,
+    reconcile_pending_orders,
+)
+
+# --- 管理端订单查询 / 手工补单 ---------------------------------------------
+
+def admin_order_dict(order: PaymentOrder, phone: str | None = None) -> dict:
+    order = with_display_status(order)
+    return {
+        "id": int(order.id),
+        "order_no": order.order_no,
+        "user_id": int(order.user_id),
+        "phone": phone,
+        "provider": order.provider,
+        "package_id": order.package_id,
+        "amount_cents": int(order.amount_cents),
+        "credits": int(order.credits),
+        "status": order.status,
+        "provider_trade_no": order.provider_trade_no,
+        "refunded_amount_cents": int(order.refunded_amount_cents or 0),
+        "refunded_at": order.refunded_at,
+        "invoice_status": order.invoice_status or "none",
+        "invoice_type": order.invoice_type,
+        "invoice_title": order.invoice_title,
+        "invoice_tax_no": order.invoice_tax_no,
+        "invoice_email": order.invoice_email,
+        "invoice_note": order.invoice_note,
+        "invoice_requested_at": order.invoice_requested_at,
+        "invoice_issued_at": order.invoice_issued_at,
+        "expires_at": order.expires_at,
+        "paid_at": order.paid_at,
+        "created_at": order.created_at,
+    }
 
 
-def ensure_amount_matches(amount: str, expected_cents: int, provider_label: str) -> None:
-    if amount in (None, ""):
-        raise PaymentError(f"{provider_label}通知缺少金额")
-    if amount_to_cents(str(amount)) != int(expected_cents):
-        raise PaymentError(f"{provider_label}通知金额不匹配")
-
-
-def verify_alipay_notify(db: Session, form: dict) -> tuple[str, str]:
-    order_no = str(form.get("out_trade_no") or "")
-    total_amount = str(form.get("total_amount") or "")
-    trade_status = str(form.get("trade_status") or "")
-    if trade_status not in ("TRADE_SUCCESS", "TRADE_FINISHED"):
-        raise PaymentError("支付宝订单未支付")
-    if not order_no:
-        raise PaymentError("支付宝通知缺少订单号")
-    if not total_amount:
-        raise PaymentError("支付宝通知缺少金额")
-    cfg = payment_config.runtime_or_env(db, "alipay")
-    app_id = str(form.get("app_id") or "")
-    expected_app_id = str(cfg.public.get("app_id") or "")
-    if expected_app_id:
-        if not app_id:
-            raise PaymentError("支付宝通知缺少 app_id")
-        if app_id != expected_app_id:
-            raise PaymentError("支付宝通知 app_id 不匹配")
-    expected_seller_id = str(cfg.public.get("seller_id") or "").strip()
-    if expected_seller_id:
-        supplied_seller_id = str(
-            form.get("seller_id")
-            or form.get("seller_email")
-            or form.get("seller_user_id")
-            or ""
-        ).strip()
-        if not supplied_seller_id:
-            raise PaymentError("支付宝通知缺少 seller_id")
-        if supplied_seller_id != expected_seller_id:
-            raise PaymentError("支付宝通知 seller_id 不匹配")
-    signature = str(form.get("sign") or "")
-    sign_src = "&".join(
-        f"{k}={form[k]}" for k in sorted(form)
-        if k not in ("sign", "sign_type") and form.get(k) is not None
-    )
-    public_key = str(cfg.secret.get("public_key") or "")
-    if not public_key:
-        raise PaymentError("支付宝公钥未配置,无法验签")
-    if not signature or not _rsa_sha256_verify(sign_src, signature, public_key):
-        raise PaymentError("支付宝通知验签失败")
-    return order_no, total_amount
-
-
-def wechat_signature_valid(db: Session, headers: dict, body: bytes) -> bool:
-    cfg = payment_config.runtime_or_env(db, "wechat")
-    platform_cert = cfg.secret.get("platform_cert_pem")
-    if not platform_cert:
-        return False
-    expected_serial = str(cfg.public.get("platform_serial_no") or "").strip()
-    supplied_serial = (
-        headers.get("Wechatpay-Serial")
-        or headers.get("wechatpay-serial")
-        or headers.get("Wechatpay-Serial-No")
-        or headers.get("wechatpay-serial-no")
-    )
-    if expected_serial and supplied_serial != expected_serial:
-        log.warning(
-            "wechat notify platform serial mismatch expected=%s supplied=%s",
-            expected_serial,
-            supplied_serial,
+def admin_search_orders(
+    db: Session,
+    *,
+    phone: str | None = None,
+    order_no: str | None = None,
+    provider_trade_no: str | None = None,
+    provider: str | None = None,
+    status: str | None = None,
+    invoice_status: str | None = None,
+    created_from: datetime | None = None,
+    created_to: datetime | None = None,
+    limit: int = 20,
+    offset: int = 0,
+) -> dict:
+    """客服查单:按手机号/订单号/渠道单号/时间范围过滤,不限 24h 对账窗口。"""
+    filters = []
+    if phone and phone.strip():
+        filters.append(User.phone == phone.strip())
+    if order_no and order_no.strip():
+        filters.append(PaymentOrder.order_no == order_no.strip())
+    if provider_trade_no and provider_trade_no.strip():
+        filters.append(PaymentOrder.provider_trade_no == provider_trade_no.strip())
+    if provider:
+        filters.append(PaymentOrder.provider == provider)
+    if status:
+        filters.append(PaymentOrder.status == status)
+    if invoice_status == "any":
+        filters.append(PaymentOrder.invoice_status != "none")
+    elif invoice_status:
+        filters.append(PaymentOrder.invoice_status == invoice_status)
+    if created_from is not None:
+        filters.append(PaymentOrder.created_at >= created_from)
+    if created_to is not None:
+        filters.append(PaymentOrder.created_at <= created_to)
+    limit = min(max(int(limit), 1), 100)
+    offset = max(int(offset), 0)
+    joined = select(PaymentOrder, User.phone).join(User, User.id == PaymentOrder.user_id)
+    total = int(
+        db.scalar(
+            select(func.count())
+            .select_from(PaymentOrder)
+            .join(User, User.id == PaymentOrder.user_id)
+            .where(*filters)
         )
-        return False
-    supplied = headers.get("Wechatpay-Signature") or headers.get("wechatpay-signature")
-    timestamp = headers.get("Wechatpay-Timestamp") or headers.get("wechatpay-timestamp")
-    nonce = headers.get("Wechatpay-Nonce") or headers.get("wechatpay-nonce")
-    if not supplied or not timestamp or not nonce:
-        return False
-    try:
-        ts = int(str(timestamp))
-    except (TypeError, ValueError):
-        return False
-    if abs(int(time.time()) - ts) > 300:
-        return False
-    try:
-        decoded_body = body.decode()
-    except UnicodeDecodeError:
-        return False
-    message = f"{timestamp}\n{nonce}\n{decoded_body}\n"
-    return _rsa_sha256_verify(message, supplied, platform_cert)
+        or 0
+    )
+    rows = db.execute(
+        joined.where(*filters)
+        .order_by(PaymentOrder.id.desc())
+        .offset(offset)
+        .limit(limit)
+    ).all()
+    return {
+        "items": [admin_order_dict(order, user_phone) for order, user_phone in rows],
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+    }
 
 
-def decrypt_wechat_resource(db: Session, resource: dict) -> dict:
-    if not resource:
-        return {}
-    if resource.get("out_trade_no"):
-        return resource
-    cfg = payment_config.runtime_or_env(db, "wechat")
-    api_v3_key = str(cfg.secret.get("api_v3_key") or "")
-    if not api_v3_key:
-        if mock_payments_allowed():
-            return resource
-        raise PaymentError("微信支付 APIv3 密钥未配置,无法解密通知")
-    if len(api_v3_key.encode()) != 32:
-        raise PaymentError("微信支付 APIv3 密钥长度必须为 32 字节")
-    try:
-        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-    except Exception as e:  # noqa: BLE001
-        raise PaymentError("缺少 cryptography 依赖,无法解密微信通知") from e
-    try:
-        aesgcm = AESGCM(api_v3_key.encode())
-        plaintext = aesgcm.decrypt(
-            str(resource["nonce"]).encode(),
-            base64.b64decode(resource["ciphertext"]),
-            str(resource.get("associated_data") or "").encode(),
-        )
-        return json.loads(plaintext.decode())
-    except Exception as e:  # noqa: BLE001
-        raise PaymentError("微信支付通知解密失败") from e
+def admin_sync_order(db: Session, order_no: str) -> tuple[dict, str]:
+    """单笔主动向渠道查单并补单。
+
+    复用对账兜底的 `_query_provider_order` + `_apply_provider_query_result`,
+    与自动对账保持同一套状态机;渠道确认支付会立即入账积分。
+    """
+    order = get_order(db, order_no)
+    if not order:
+        raise PaymentError("订单不存在")
+    result = _query_provider_order(db, order)
+    outcome = _apply_provider_query_result(db, order, result)
+    refreshed = get_order(db, order_no)
+    return admin_order_dict(refreshed), outcome
 
 
-def ensure_wechat_merchant_matches(db: Session, resource: dict) -> None:
-    if not isinstance(resource, dict):
-        return
-    cfg = payment_config.runtime_or_env(db, "wechat")
-    appid = str(resource.get("appid") or "")
-    mchid = str(resource.get("mchid") or "")
-    expected_appid = str(cfg.public.get("appid") or "")
-    expected_mchid = str(cfg.public.get("mchid") or "")
-    if expected_appid:
-        if not appid:
-            raise PaymentError("微信通知缺少 appid")
-        if appid != expected_appid:
-            raise PaymentError("微信通知 appid 不匹配")
-    if expected_mchid:
-        if not mchid:
-            raise PaymentError("微信通知缺少 mchid")
-        if mchid != expected_mchid:
-            raise PaymentError("微信通知 mchid 不匹配")
+# --- 渠道退款 ---------------------------------------------------------------
 
 
-def ensure_wechat_notify_success(payload: dict, resource: dict) -> None:
-    event_type = str(payload.get("event_type") or "")
-    if event_type and event_type != "TRANSACTION.SUCCESS":
-        raise PaymentError("微信通知不是支付成功事件")
-    trade_state = str(resource.get("trade_state") or "")
-    if trade_state != "SUCCESS":
-        raise PaymentError("微信订单未支付成功")
-    if not resource.get("success_time"):
-        raise PaymentError("微信通知缺少支付成功时间")
+from . import payment_refunds as _payment_refunds  # noqa: E402
+from .compat_facade import (  # noqa: E402
+    install_assignment_forwarding as _install_assignment_forwarding,
+)
+from .payment_refunds import (  # noqa: E402, F401, I001
+    _alipay_refund,
+    _alipay_refund_query,
+    _provider_refund,
+    _provider_refund_query,
+    _reclaimed_credits_before,
+    _resolve_pending_refunds,
+    _wechat_refund,
+    _wechat_refund_query,
+    list_order_refunds,
+    make_refund_no,
+    refund_order,
+    refunds_enabled,
+)
+
+_install_assignment_forwarding(
+    __name__,
+    (_payment_transport, _payment_reconciliation, _payment_notifications, _payment_refunds),
+)

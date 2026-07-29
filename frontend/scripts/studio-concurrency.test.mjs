@@ -2,13 +2,15 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { readStudioSource } from "./studio-source.mjs";
 
 import { generationSubmitDisabled, shouldBlockNewGeneration } from "../app/studio/taskConcurrency.ts";
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
-const pageSource = readFileSync(join(root, "app/page.jsx"), "utf8");
+const pageSource = readStudioSource(root);
+const ownerSessionSource = readFileSync(join(root, "hooks/useStudioOwnerSession.js"), "utf8");
 const taskTrackingSource = readFileSync(join(root, "hooks/useTaskTracking.js"), "utf8");
-const studioRuntimeSource = `${pageSource}\n${taskTrackingSource}`;
+const studioRuntimeSource = `${pageSource}\n${ownerSessionSource}\n${taskTrackingSource}`;
 const studioHelpersSource = readFileSync(join(root, "app/studio/helpers.ts"), "utf8");
 const studioResultsSource = readFileSync(join(root, "app/studio/StudioResults.jsx"), "utf8");
 const viewModelSource = readFileSync(join(root, "app/studio/viewModel.ts"), "utf8");
@@ -66,7 +68,7 @@ assert.equal(
   "reference parsing, reverse prompt, upload, or subject profiling should block accidental generation",
 );
 assert.match(
-  pageSource,
+  ownerSessionSource,
   /loadWorks\(\{\s*restoreActive:\s*true\s*\}\)/,
   "studio should restore active tasks from backend on initial load",
 );

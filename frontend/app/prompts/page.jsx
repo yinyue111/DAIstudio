@@ -12,6 +12,9 @@ import { saveStudioUserDraft } from "../../lib/studioSession";
 import { reverseSnapshotFromHistory } from "../studio/reverseSnapshot";
 import CreationRecipeBrowser from "./CreationRecipeBrowser";
 
+const HISTORY_PAGE_SIZE = 30;
+const RECIPE_PAGE_SIZE = 30;
+
 export default function PromptsPage() {
   const router = useRouter();
   const notify = useToast();
@@ -23,6 +26,8 @@ export default function PromptsPage() {
   const [myPrompts, setMyPrompts] = useState([]);
   const [historyQuery, setHistoryQuery] = useState("");
   const [historyFilter, setHistoryFilter] = useState("all");
+  const [historyHasMore, setHistoryHasMore] = useState(false);
+  const [historyLoadingMore, setHistoryLoadingMore] = useState(false);
   const [manualPrompt, setManualPrompt] = useState("");
   const [manualTitle, setManualTitle] = useState("");
   const [recipes, setRecipes] = useState([]);
@@ -30,6 +35,8 @@ export default function PromptsPage() {
   const [recipeFilter, setRecipeFilter] = useState("all");
   const [recipeQuery, setRecipeQuery] = useState("");
   const [recipeLoading, setRecipeLoading] = useState(false);
+  const [recipeHasMore, setRecipeHasMore] = useState(false);
+  const [recipeLoadingMore, setRecipeLoadingMore] = useState(false);
   const [recipeError, setRecipeError] = useState("");
   const historyReqRef = useRef(0);
   const recipeReqRef = useRef(0);
@@ -59,8 +66,9 @@ export default function PromptsPage() {
     if (!recipesEnabled && activeTab === "recipes") setActiveTab("system");
   }, [activeTab, recipesEnabled]);
 
-  async function loadHistory(overrides = {}) {
+  async function loadHistory(overrides = {}, { append = false } = {}) {
     const req = ++historyReqRef.current;
+    if (append) setHistoryLoadingMore(true);
     try {
       const filter = overrides.filter ?? historyFilter;
       const q = overrides.q ?? historyQuery;
@@ -68,15 +76,21 @@ export default function PromptsPage() {
         favorite: filter === "favorite" ? true : null,
         source: filter === "reverse" || filter === "generate" ? filter : "",
         q,
-        limit: 30,
+        limit: HISTORY_PAGE_SIZE,
+        offset: append ? myPrompts.length : 0,
       });
       if (req !== historyReqRef.current) return;
-      setMyPrompts(rows);
+      setMyPrompts((prev) => (append
+        ? [...prev, ...rows.filter((row) => !prev.some((item) => item.id === row.id))]
+        : rows));
+      setHistoryHasMore(rows.length === HISTORY_PAGE_SIZE);
     } catch (e) {
       if (req !== historyReqRef.current) return;
       setMsgKind("bad");
       setMsg(e.message);
       notify.error(e.message || "提示词加载失败");
+    } finally {
+      if (req === historyReqRef.current) setHistoryLoadingMore(false);
     }
   }
 
@@ -102,32 +116,49 @@ export default function PromptsPage() {
     router.push("/");
   }
 
-  async function loadRecipes() {
+  async function loadRecipes(options = {}) {
+    const append = options?.append === true;
     const request = ++recipeReqRef.current;
-    setRecipeLoading(true);
+    if (append) setRecipeLoadingMore(true);
+    else setRecipeLoading(true);
     try {
       const category = ["image", "video"].includes(recipeFilter) ? recipeFilter : "";
+      const offset = append ? recipes.length : 0;
       const rows = recipeScope === "discover"
-        ? await api.publicCreationRecipes({ category, q: recipeQuery.trim(), limit: 60 })
+        ? await api.publicCreationRecipes({
+          category,
+          q: recipeQuery.trim(),
+          limit: RECIPE_PAGE_SIZE,
+          offset,
+        })
         : await api.creationRecipes({
           category,
           favorite: recipeFilter === "favorite" ? true : null,
-          limit: 60,
+          q: recipeQuery.trim(),
+          limit: RECIPE_PAGE_SIZE,
+          offset,
         });
       if (request !== recipeReqRef.current) return;
-      setRecipes(rows);
+      setRecipes((prev) => (append
+        ? [...prev, ...rows.filter((row) => !prev.some((item) => item.id === row.id))]
+        : rows));
+      setRecipeHasMore(rows.length === RECIPE_PAGE_SIZE);
       setRecipeError("");
     } catch (error) {
       if (request !== recipeReqRef.current) return;
       setRecipeError(error.message || "创作配方加载失败");
     } finally {
-      if (request === recipeReqRef.current) setRecipeLoading(false);
+      if (request === recipeReqRef.current) {
+        setRecipeLoading(false);
+        setRecipeLoadingMore(false);
+      }
     }
   }
 
   function changeRecipeScope(scope) {
     if (scope === recipeScope) return;
     setRecipes([]);
+    setRecipeHasMore(false);
     setRecipeError("");
     setRecipeScope(scope);
     if (scope === "discover" && recipeFilter === "favorite") setRecipeFilter("all");
@@ -428,6 +459,7 @@ export default function PromptsPage() {
             {myPrompts.length === 0 ? (
               <div className="rounded-xl border border-line bg-black/10 px-3 py-8 text-center text-xs text-fog">还没有提示词历史</div>
             ) : (
+              <>
               <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-3">
                 {myPrompts.map((item) => (
                   <article key={item.id} className="rounded-xl2 border border-line bg-black/15 p-3">
@@ -455,12 +487,30 @@ export default function PromptsPage() {
                   </article>
                 ))}
               </div>
+              <div className="mt-4 flex items-center justify-center gap-3 text-xs text-fog">
+                <span>已显示 {myPrompts.length} 条提示词</span>
+                {historyHasMore ? (
+                  <button
+                    type="button"
+                    onClick={() => loadHistory({}, { append: true })}
+                    disabled={historyLoadingMore}
+                    className="btn-secondary btn-sm"
+                  >
+                    {historyLoadingMore ? "加载中…" : "加载更多"}
+                  </button>
+                ) : (
+                  <span>已全部加载</span>
+                )}
+              </div>
+              </>
             )}
           </section>
         ) : (
           <CreationRecipeBrowser
             recipes={recipes}
             loading={recipeLoading}
+            loadingMore={recipeLoadingMore}
+            hasMore={recipeHasMore}
             error={recipeError}
             scope={recipeScope}
             filter={recipeFilter}
@@ -468,8 +518,9 @@ export default function PromptsPage() {
             onScopeChange={changeRecipeScope}
             onFilterChange={setRecipeFilter}
             onQueryChange={setRecipeQuery}
-            onSearch={loadRecipes}
-            onRefresh={loadRecipes}
+            onSearch={() => loadRecipes()}
+            onRefresh={() => loadRecipes()}
+            onLoadMore={() => loadRecipes({ append: true })}
             onRestore={useRecipe}
             onFavorite={toggleRecipeFavorite}
             onDelete={deleteRecipe}

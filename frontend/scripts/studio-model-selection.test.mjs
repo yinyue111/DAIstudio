@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { readStudioSource } from "./studio-source.mjs";
 
 import { buildGenerationPayload } from "../app/studio/generationPayload.ts";
 import {
@@ -16,6 +17,7 @@ import {
   writeModelSelections,
 } from "../app/studio/StudioModelSelector.jsx";
 import { reverseOperationRequestSignature } from "../lib/reverseOperations.ts";
+import { validateGenerationSubmission } from "../hooks/generationSubmitWorkflow.js";
 
 const options = normalizeModelOptions({
   model_options: {
@@ -101,6 +103,30 @@ assert.deepEqual(
   [15],
   "Seedance 1.5 Pro must remain available for first-frame image-to-video",
 );
+const seedanceProductPreflight = validateGenerationSubmission({
+  uploading: false,
+  parsing: false,
+  reversing: false,
+  productProfiling: false,
+  structuredDirty: false,
+  modelOption: seedance15Option,
+  productVideoTemplate: "prompt_driven",
+  category: "video",
+  creationMode: "video_edit",
+  subjectMode: "product",
+  firstLastFrameEnabled: false,
+  lastFrameAsset: null,
+  selected: { type: "video", url: "/style.mp4" },
+  productAsset: { type: "image", url: "/product.png" },
+  productDetailAssets: [],
+  task: null,
+  isEditMode: true,
+  isImageEditMode: false,
+  prompt: "产品广告",
+  structured: {},
+});
+assert.equal(seedanceProductPreflight.ok, false);
+assert.match(seedanceProductPreflight.message, /不支持独立产品主题图/);
 const grokReferenceOption = {
   id: 20,
   model_id: "grok-imagine-video",
@@ -186,20 +212,41 @@ assert.notEqual(
 );
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
-const pageSource = readFileSync(join(root, "app/page.jsx"), "utf8");
+const pageSource = readStudioSource(root);
+const runtimeBootstrapSource = readFileSync(join(root, "hooks/useStudioRuntimeBootstrap.js"), "utf8");
+const modelContextSource = readFileSync(join(root, "app/studio/studioModelContext.ts"), "utf8");
+const promptOptimizationSource = readFileSync(join(root, "hooks/usePromptOptimization.js"), "utf8");
 const reverseSource = readFileSync(join(root, "hooks/useReferenceParsing.js"), "utf8");
 const submitSource = readFileSync(join(root, "hooks/useGenerationSubmit.js"), "utf8");
 const uploadSource = readFileSync(join(root, "hooks/useMediaUpload.js"), "utf8");
-assert.match(pageSource, /window\.addEventListener\("focus", onFocus\)/, "studio config should refresh when the page regains focus");
-assert.match(pageSource, /optimizer_model_config_id: selectedPromptModelConfigId/, "prompt optimization must carry the selected optimizer id");
+const modelSelectionSource = readFileSync(join(root, "hooks/useStudioModelSelection.js"), "utf8");
+assert.match(
+  runtimeBootstrapSource,
+  /window\.addEventListener\("focus", onFocus\)/,
+  "studio config should refresh when the page regains focus",
+);
+assert.match(promptOptimizationSource, /optimizer_model_config_id: selectedPromptModelConfigId/, "prompt optimization must carry the selected optimizer id");
 assert.match(reverseSource, /model_config_id: Number\(modelConfigId\)/, "reverse creation must carry the selected vision model id");
 assert.match(submitSource, /modelConfigId,/, "generation submit must forward the selected generation model id");
-assert.match(pageSource, /visionModelConfigId: selectedVisionModelConfigId/, "profile prefetch must receive the selected vision model id");
-assert.match(uploadSource, /model_config_id: Number\(visionModelConfigId\)/, "profile prefetch must submit the selected vision model id");
-assert.match(pageSource, /message: "请先选择产品主题图"/, "detail image controls must require a product theme image");
-assert.match(uploadSource, /if \(!productAsset\?\.url\)/, "detail uploads must enforce the theme image gate internally");
 assert.match(
   pageSource,
+  /visionModelConfigId: (?:model\.)?selectedVisionModelConfigId/,
+  "profile prefetch must receive the selected vision model id",
+);
+assert.match(uploadSource, /model_config_id: Number\(visionModelConfigId\)/, "profile prefetch must submit the selected vision model id");
+assert.match(
+  modelContextSource,
+  /message: "请先选择产品主题图"/,
+  "detail image controls must require a product theme image",
+);
+assert.match(uploadSource, /if \(!productAsset\?\.url\)/, "detail uploads must enforce the theme image gate internally");
+assert.match(
+  modelSelectionSource,
+  /const generationModelOptions = allModelOptions\[category\]/,
+  "generation model selection must remain stable when a new reference is incompatible",
+);
+assert.match(
+  modelContextSource,
   /productDetailModelLimit[\s\S]*?- \(productAsset \? 0 : 1\)/,
   "detail capacity must reserve one model reference slot for the required theme image",
 );

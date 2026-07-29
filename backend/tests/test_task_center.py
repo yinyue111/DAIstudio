@@ -1048,3 +1048,81 @@ def test_task_center_projects_workflow_nodes_actions_and_output_assets(
     )
     assert attention.status_code == 200, attention.text
     assert [item["id"] for item in attention.json()["items"]] == [waiting_id]
+
+
+def test_task_center_hides_cancel_for_submitted_video_and_explains_reason(
+    client, make_user, auth
+):
+    """已提交外部网关的视频任务不再渲染必失败的取消按钮，并给出可解释文案。"""
+    user_id = make_user("13971200031", balance=100)
+    headers = auth("13971200031")
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+
+    with SessionLocal() as db:
+        submitted_video = GenTask(
+            user_id=user_id,
+            category="video",
+            stage="preview",
+            prompt={"final_text": "submitted video"},
+            model_use="video",
+            params={"duration": 5},
+            status="running",
+            phase="polling",
+            external_task_id="external-video-1",
+            cost_frozen=15,
+            cost_settled=0,
+            created_at=now,
+        )
+        queued_video = GenTask(
+            user_id=user_id,
+            category="video",
+            stage="preview",
+            prompt={"final_text": "queued video"},
+            model_use="video",
+            params={"duration": 5},
+            status="queued",
+            cost_frozen=15,
+            cost_settled=0,
+            created_at=now - timedelta(seconds=1),
+        )
+        queued_image = GenTask(
+            user_id=user_id,
+            category="image",
+            stage="preview",
+            prompt={"final_text": "queued image"},
+            model_use="image",
+            params={"n": 1},
+            status="queued",
+            cost_frozen=8,
+            cost_settled=0,
+            created_at=now - timedelta(seconds=2),
+        )
+        db.add_all([submitted_video, queued_video, queued_image])
+        db.commit()
+        submitted_id = submitted_video.id
+        queued_video_id = queued_video.id
+        queued_image_id = queued_image.id
+
+    resp = client.get("/api/task-center?kind=generation", headers=headers)
+    assert resp.status_code == 200, resp.text
+    items = {item["id"]: item for item in resp.json()["items"]}
+
+    # 已提交到外部网关的视频任务：网关不支持取消，不再诱导用户点必 409 的按钮
+    assert "cancel" not in items[submitted_id]["available_actions"]
+    assert "view" in items[submitted_id]["available_actions"]
+
+    # 未提交外部网关的任务仍可取消
+    assert "cancel" in items[queued_video_id]["available_actions"]
+    assert "cancel" in items[queued_image_id]["available_actions"]
+
+    # 服务层给出诚实的"为什么不能取消"说明，供前端渲染
+    with SessionLocal() as db:
+        submitted = db.get(GenTask, submitted_id)
+        submitted_item = task_center_service._generation_item(submitted, [])
+        queued = db.get(GenTask, queued_image_id)
+        queued_item = task_center_service._generation_item(queued, [])
+    reason = submitted_item["cancel_unavailable_reason"]
+    assert reason is not None
+    assert "外部网关" in reason
+    assert "冻结积分" in reason
+    assert queued_item["cancel_unavailable_reason"] is None

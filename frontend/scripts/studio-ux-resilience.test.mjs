@@ -2,9 +2,17 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { readStudioSource } from "./studio-source.mjs";
+import { parsePromptDraft, promptDraftMode } from "../app/studio/promptDraftUtils.ts";
 
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
-const pageSource = readFileSync(join(root, "app/page.jsx"), "utf8");
+const pageSource = readStudioSource(root);
+const ownerSessionSource = readFileSync(join(root, "hooks/useStudioOwnerSession.js"), "utf8");
+const ownerRestoreSource = readFileSync(join(root, "hooks/studioOwnerRestore.js"), "utf8");
+const promptOptimizationSource = readFileSync(join(root, "hooks/usePromptOptimization.js"), "utf8");
+const recipeActionsSource = readFileSync(join(root, "hooks/useStudioRecipeActions.js"), "utf8");
+const variationActionsSource = readFileSync(join(root, "hooks/useStudioVariationActions.js"), "utf8");
+const workspaceActionsSource = readFileSync(join(root, "hooks/useStudioWorkspaceActions.js"), "utf8");
 const apiSource = readFileSync(join(root, "lib/api.js"), "utf8");
 const errorSource = readFileSync(join(root, "lib/errorHandling.js"), "utf8");
 const mediaUploadSource = readFileSync(join(root, "hooks/useMediaUpload.js"), "utf8");
@@ -27,7 +35,7 @@ assert.match(
   "workspace gallery load failure should expose a visible retryable error",
 );
 assert.match(
-  pageSource,
+  ownerSessionSource,
   /saveStudioSessionDraft\(/,
   "studio should save workspace state before auth redirects can discard edits",
 );
@@ -77,7 +85,7 @@ assert.match(
   "reverse prompt results should remain available for saving to prompt history",
 );
 assert.match(
-  pageSource,
+  recipeActionsSource,
   /saveReversePromptToLibrary/,
   "studio should let users save reverse prompt output to their prompt library",
 );
@@ -92,37 +100,35 @@ assert.match(
   "workspace clear should remove prompts, uploads, selected references, subject profiles and reverse dimensions",
 );
 assert.match(
-  pageSource,
-  /async function clearAllWorkspaces\(\)[\s\S]*window\.confirm\([\s\S]*for \(const \{ key: mode \} of CREATION_MODES\)[\s\S]*invalidatePromptOptimization\(mode\);[\s\S]*resetOwnerReferenceParsing\(\);[\s\S]*resetOwnerMediaUpload\(\);/,
+  workspaceActionsSource,
+  /async function clearAllWorkspaces\(\)[\s\S]*window\.confirm\([\s\S]*resetAllPromptOptimizations\(CREATION_MODES\.map\(\(\{ key \}\) => key\)\);[\s\S]*resetOwnerReferenceParsing\(\);[\s\S]*resetOwnerMediaUpload\(\);/,
   "confirmed clear-all should invalidate stale optimizer, reverse and upload responses",
 );
-const optimizePromptStart = pageSource.indexOf("async function optimizeDirectPrompt()");
-const compileStoryboardShotStart = pageSource.indexOf("async function compileStoryboardShot(");
-const acceptPromptOptimizationStart = pageSource.indexOf("async function acceptPromptOptimization(");
-const rejectPromptOptimizationStart = pageSource.indexOf("function rejectPromptOptimization()");
-const undoPromptOptimizationStart = pageSource.indexOf("function undoAcceptedPromptOptimization()");
-const updatePromptFromUserStart = pageSource.indexOf("function updatePromptFromUser(");
+const optimizePromptStart = promptOptimizationSource.indexOf("async function optimize()");
+const acceptPromptOptimizationStart = promptOptimizationSource.indexOf("async function accept(");
+const rejectPromptOptimizationStart = promptOptimizationSource.indexOf("async function reject()");
+const undoPromptOptimizationStart = promptOptimizationSource.indexOf("function undoAccepted()");
+const updatePromptFromUserStart = promptOptimizationSource.indexOf("function updatePromptFromUser(");
 assert.ok(
   optimizePromptStart >= 0
-    && compileStoryboardShotStart > optimizePromptStart
     && acceptPromptOptimizationStart > optimizePromptStart
     && rejectPromptOptimizationStart > acceptPromptOptimizationStart
     && undoPromptOptimizationStart > rejectPromptOptimizationStart
     && updatePromptFromUserStart > undoPromptOptimizationStart,
   "prompt optimization proposal lifecycle should remain explicit and ordered",
 );
-const optimizePromptSource = pageSource.slice(optimizePromptStart, compileStoryboardShotStart);
-const acceptPromptOptimizationSource = pageSource.slice(
+const optimizePromptSource = promptOptimizationSource.slice(optimizePromptStart, acceptPromptOptimizationStart);
+const acceptPromptOptimizationSource = promptOptimizationSource.slice(
   acceptPromptOptimizationStart,
   rejectPromptOptimizationStart,
 );
-const rejectPromptOptimizationSource = pageSource.slice(
+const rejectPromptOptimizationSource = promptOptimizationSource.slice(
   rejectPromptOptimizationStart,
   undoPromptOptimizationStart,
 );
 assert.match(
   optimizePromptSource,
-  /setPromptOptimizationProposals\([\s\S]*\[mode\]:\s*\{[\s\S]*optimized_text:\s*optimized/,
+  /setProposals\([\s\S]*\[mode\]:\s*\{[\s\S]*optimized_text:\s*optimized/,
   "prompt optimization should save a review proposal in the mode where the request started",
 );
 assert.doesNotMatch(
@@ -176,18 +182,18 @@ assert.match(
   "needs_review tasks should tell the user that the result is under review",
 );
 assert.doesNotMatch(
-  pageSource,
+  variationActionsSource,
   /variationSourceUrl\(/,
   "variation draft recovery must not call an undefined variationSourceUrl helper",
 );
 assert.match(
-  pageSource,
+  variationActionsSource,
   /assetVariationSourceUrl\(asset,\s*\{\s*respectUnlock:\s*true\s*\}\)/,
   "variation draft recovery should reuse the canonical asset source helper",
 );
 assert.match(
-  pageSource,
-  /if \(variationDraft && applyVariationDraft\(variationDraft\)\) \{\s*removeStudioUserDraft\(window\.localStorage, STUDIO_VARIATION_DRAFT_KEY, u\?\.id\);/s,
+  ownerRestoreSource,
+  /if \(applyVariationDraft\(variationDraft\)\) \{\s*removeStudioUserDraft\(window\.localStorage, STUDIO_VARIATION_DRAFT_KEY, user\?\.id\);/s,
   "variation draft should only be removed after successful recovery",
 );
 assert.match(
@@ -205,18 +211,19 @@ assert.match(
   /savedAt:\s*Date\.now\(\)/,
   "prompt library handoff should timestamp drafts so stale cloud drafts cannot overwrite them",
 );
-assert.match(
-  pageSource,
-  /function parsePromptDraft/,
-  "studio should read structured prompt drafts while remaining compatible with legacy string drafts",
+assert.equal(
+  parsePromptDraft("legacy prompt").prompt,
+  "legacy prompt",
+  "studio should remain compatible with legacy string drafts",
 );
-assert.match(
-  pageSource,
-  /CREATION_MODES\.some\(\(item\) => item\.key === draft\.creationMode\)/,
+assert.equal(promptDraftMode({ creationMode: "video_edit" }), "video_edit");
+assert.equal(
+  promptDraftMode({ creationMode: "unknown", category: "video" }),
+  "video",
   "structured prompt drafts should validate mode keys against creation-mode objects",
 );
-const cloudDraftLoadIndex = pageSource.indexOf('const row = await api.getDraft("studio")');
-const promptTransferApplyIndex = pageSource.indexOf("if (promptDraft)");
+const cloudDraftLoadIndex = ownerRestoreSource.indexOf('const row = await api.getDraft("studio")');
+const promptTransferApplyIndex = ownerRestoreSource.indexOf("const promptTransfer = buildPromptTransfer(");
 assert.ok(
   cloudDraftLoadIndex >= 0 && promptTransferApplyIndex > cloudDraftLoadIndex,
   "prompt-library handoff must apply after cloud initialization so an older cloud workspace cannot override the selected prompt",

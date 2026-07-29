@@ -7,6 +7,7 @@ import StudioReverseStoryboard from "./StudioReverseStoryboard";
 import StudioVideoComposition from "./StudioVideoComposition";
 import StudioVideoEvidenceTimeline from "./StudioVideoEvidenceTimeline";
 import { replaceReverseResultImageEvidence } from "./imageEvidenceReview";
+import { reviveStructuredValue } from "./structuredEditor";
 import {
   compareReverseResultRevisions,
   formatReverseRevisionValue,
@@ -199,7 +200,9 @@ export function ReverseStructureView({
             onFocus={() => onSelectField?.(key)}
             onChange={(event) => onChange?.({
               ...result,
-              structured: { ...structured, [key]: event.target.value },
+              // 非字符串维度在 textarea 里以 JSON 文本呈现;写回前容错还原,
+              // 避免对象/数组字段被编辑一次就永久退化成字符串。
+              structured: { ...structured, [key]: reviveStructuredValue(event.target.value) },
             })}
           />
         </div>

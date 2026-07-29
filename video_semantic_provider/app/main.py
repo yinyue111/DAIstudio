@@ -155,6 +155,8 @@ def create_app(
             return resolved_engine.analyze(frames)
         except Exception:  # noqa: BLE001 - provider failures must not leak internals
             log.exception("video semantic analysis failed")
+            # 姿态能力已启用时，整体失败必须报 degraded 而不是谎称 unsupported。
+            pose_enabled = bool(getattr(resolved_settings, "pose_enabled", False))
             return {
                 "contract_version": CONTRACT_VERSION,
                 "analyzer": ANALYZER,
@@ -169,9 +171,13 @@ def create_app(
                 }
                 | {
                     "pose": {
-                        "status": "unsupported",
+                        "status": "degraded" if pose_enabled else "unsupported",
                         "evidence": [],
-                        "degraded_reason": "This provider does not include a pose estimation model",
+                        "degraded_reason": (
+                            "provider inference failed"
+                            if pose_enabled
+                            else "This provider does not include a pose estimation model"
+                        ),
                     },
                     "action": {
                         "status": "unsupported",

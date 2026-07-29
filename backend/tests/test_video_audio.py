@@ -19,6 +19,7 @@ from app.services import (
     gateway,
     retention,
     reverse_operations,
+    reverse_source_resolution,
     video_audio,
     video_evidence_analysis,
 )
@@ -107,8 +108,8 @@ def _stub_video_reverse(monkeypatch, audio_result: dict):
     monkeypatch.setattr(reverse_operations.usage, "record_call", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(reverse_operations, "_remember_history", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(
-        prompt,
-        "_collect_refs",
+        reverse_source_resolution,
+        "collect_refs",
         lambda *_args, **_kwargs: (
             ["data:image/jpeg;base64,YQ=="],
             {

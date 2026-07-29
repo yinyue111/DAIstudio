@@ -31,6 +31,7 @@ LOCAL_MEDIA_SUBDIRS = {
     "upload_preview",
     "upload_video",
     "upload_video_preview",
+    "upload_audio",
     "upload_model_ref",
     "model_ref",
 }
@@ -380,7 +381,9 @@ def public_url(key: str | None) -> str | None:
 def upload_api_url(key: str | None) -> str | None:
     if not key:
         return None
-    if not key.startswith(("upload/", "upload_preview/", "upload_video/", "upload_video_preview/")):
+    if not key.startswith(
+        ("upload/", "upload_preview/", "upload_video/", "upload_video_preview/", "upload_audio/")
+    ):
         return public_url(key)
     return f"{settings.storage.public_base_url.rstrip('/')}/api/uploads/{key}"
 

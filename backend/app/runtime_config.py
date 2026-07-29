@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import ipaddress
+import logging
 from urllib.parse import urlparse
 
 from . import observability
@@ -231,6 +232,15 @@ def validate_runtime_config() -> None:
     # model rows are checked in validate_model_gateway_rows() after startup seed.
     if not settings.debug and settings.mock_mode:
         raise RuntimeError("生产环境(DEBUG=false)必须设置 MOCK_MODE=false")
+    # 行为翻转显式化:历史版本生产环境默认拒绝无短信验证的公开注册,现在
+    # REGISTRATION_ENABLED 默认 true。升级到本版本的运营方必须在启动日志里
+    # 看到这一状态,而不是静默开闸;不想开放就设 REGISTRATION_ENABLED=false。
+    if not settings.debug and settings.registration_enabled:
+        logging.getLogger("runtime_config").warning(
+            "自助注册已开放(REGISTRATION_ENABLED=true,当前默认值)。历史版本生产环境"
+            "默认关闭无短信验证注册;如不希望开放注册,请设置 REGISTRATION_ENABLED=false,"
+            "或在管理后台开启短信验证(sms_auth_enabled)以要求验证码注册。"
+        )
     _validate_audio_analyzer_config()
     _validate_video_semantic_analyzer_config()
     for capability in ("detector", "segmenter"):

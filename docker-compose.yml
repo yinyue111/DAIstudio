@@ -33,6 +33,15 @@ x-app-datastores: &app_datastores
   PGPASSWORD: *pg_password
   REDIS_URL: redis://redis:6379/0
   REDIS_PASSWORD: *redis_password
+# 后端进程（api / 各 worker / beat）唯一的配置注入通道就是这个 env 文件。
+# 启用 `--profile evidence` 后，三个证据 provider 的后端侧地址
+# （IMAGE_EVIDENCE_DETECTOR_URL / IMAGE_EVIDENCE_SEGMENTER_URL /
+# VIDEO_EVIDENCE_SEMANTIC_URL 及各自 API key / health URL）必须写进
+# 该文件才会生效，正确取值见 backend/.env.example 的对应注释，
+# 完整前置清单见 docs/launch-lite-release.md「解禁到 full 的前置清单」。
+# 注意：不要把这些变量放进各服务的 environment: 段做 shell 透传——
+# Compose v5 里 environment 的 null/空插值条目会直接盖掉 env_file 的取值，
+# 未设置 shell 变量时后端会静默丢失 env 文件里配置的 URL。
 x-backend-env-file: &backend_env_file
   - path: ${BACKEND_ENV_FILE:-./backend/.env.production}
     required: true
@@ -244,7 +253,11 @@ services:
     stop_grace_period: ${WORKER_STOP_GRACE_PERIOD:-15m}
     # Keep this on threads: reverse tasks use cooperative cancellation and must
     # never enter Celery's process-killing hard-timeout path.
-    command: celery -A app.celery_app.celery_app worker -l info --pool=threads --concurrency=${WORKER_REVERSE_CONCURRENCY:-2} -Q ${WORKER_REVERSE_QUEUES:-reverse}
+    # reproduction 队列也在这里消费：复刻度评估（reproduction.assess）和反推一样是
+    # cv2/numpy 为主的 CPU 密集媒体分析（GIL 会在重计算里释放，线程池可用），
+    # 同样依赖协作式取消 + SoftTimeLimit 兜底，且需要挂载 media 卷读取素材。
+    # 放到 worker（critical）会让长评估饿死 payment/video_poll 等短任务，故与 reverse 同池隔离。
+    command: celery -A app.celery_app.celery_app worker -l info --pool=threads --concurrency=${WORKER_REVERSE_CONCURRENCY:-2} -Q ${WORKER_REVERSE_QUEUES:-reverse,reproduction}
     env_file: *backend_env_file
     environment:
       <<: *app_datastores
@@ -364,6 +377,9 @@ services:
     networks: [backend_internal, analyzer_edge]
 
   video_semantic_provider:
+    # 仅启动 provider 不够：后端还要在 BACKEND_ENV_FILE 里配置
+    # VIDEO_EVIDENCE_SEMANTIC_URL=http://video_semantic_provider:8091/v1/video-semantic/analyze
+    # 及配套 API key / health URL（见 backend/.env.example 注释），否则视频语义证据仍为 unsupported。
     profiles: [evidence]
     build: ./video_semantic_provider
     restart: unless-stopped
@@ -436,7 +452,9 @@ services:
     mem_limit: ${AUDIO_PROVIDER_MEM_LIMIT:-3g}
     networks: [backend_internal, analyzer_edge]
 
-  # Optional object storage (swap services/storage.py to use it):
+  # 可选对象存储：S3 后端已在 services/storage.py 完整实现，无需改代码。
+  # 取消注释下方 minio 服务后，在 backend 环境里设置 STORAGE_BACKEND=s3 与
+  # STORAGE_S3_*（见 backend/.env.example 的 Storage 段）即可启用。
   # minio:
   #   image: minio/minio
   #   command: server /data --console-address ":9001"

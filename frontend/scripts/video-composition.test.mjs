@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
+import { readStudioSourceFromUrl } from "./studio-source.mjs";
 
 import {
   bindGenerationTaskToVideoCompositionShot,
@@ -21,14 +22,23 @@ const storyboard = [
   { shot_id: "shot-b", start_seconds: 13, end_seconds: 17, audio_cue: "立即购买" },
 ];
 
-const pageSource = readFileSync(new URL("../app/page.jsx", import.meta.url), "utf8");
+const pageSource = readStudioSourceFromUrl(import.meta.url);
+const shotGenerationSource = readFileSync(new URL("../hooks/useShotGeneration.js", import.meta.url), "utf8");
+
+function sourceSection(source, label, startToken, endToken, fromIndex = 0) {
+  const start = source.indexOf(startToken, fromIndex);
+  assert.notEqual(start, -1, `${label} must contain ${startToken}`);
+  const end = source.indexOf(endToken, start + startToken.length);
+  assert.notEqual(end, -1, `${label} must contain ${endToken} after ${startToken}`);
+  return { source: source.slice(start, end), start, end };
+}
 
 function pageSection(startToken, endToken, fromIndex = 0) {
-  const start = pageSource.indexOf(startToken, fromIndex);
-  assert.notEqual(start, -1, `page.jsx must contain ${startToken}`);
-  const end = pageSource.indexOf(endToken, start + startToken.length);
-  assert.notEqual(end, -1, `page.jsx must contain ${endToken} after ${startToken}`);
-  return { source: pageSource.slice(start, end), start, end };
+  return sourceSection(pageSource, "page.jsx", startToken, endToken, fromIndex);
+}
+
+function shotGenerationSection(startToken, endToken, fromIndex = 0) {
+  return sourceSection(shotGenerationSource, "useShotGeneration.js", startToken, endToken, fromIndex);
 }
 
 test("composition drafts keep stable shot ids and explicit generation lineage", () => {
@@ -301,12 +311,12 @@ test("live workflow state wins over stale persisted state and can be invalidated
   assert.equal(invalidated.output, null);
 });
 
-test("page persists a submitted storyboard task before starting terminal tracking", () => {
-  const persistence = pageSection(
+test("shot generation hook persists a submitted storyboard task before starting terminal tracking", () => {
+  const persistence = shotGenerationSection(
     "async function persistShotGenerationBinding",
     "function enqueueShotGenerationBinding",
   ).source;
-  const submission = pageSection(
+  const submission = shotGenerationSection(
     "async function handleGenerationSubmitted",
     "useEffect(() => {",
   ).source;
@@ -335,12 +345,12 @@ test("page persists a submitted storyboard task before starting terminal trackin
   );
 });
 
-test("page terminal tracking binds only while the completed task still owns the shot", () => {
-  const persistence = pageSection(
+test("shot generation hook binds terminal tasks only while they still own the shot", () => {
+  const persistence = shotGenerationSection(
     "async function persistShotGenerationBinding",
     "function enqueueShotGenerationBinding",
   ).source;
-  const tracking = pageSection(
+  const tracking = shotGenerationSection(
     "function trackShotGenerationTask",
     "async function handleGenerationSubmitted",
   ).source;
@@ -363,13 +373,13 @@ test("page terminal tracking binds only while the completed task still owns the 
 });
 
 test("page restores pending shot tracking from the persisted composition and wires storyboard submissions", () => {
-  const submissionSection = pageSection(
+  const submissionSection = shotGenerationSection(
     "async function handleGenerationSubmitted",
     "useEffect(() => {",
   );
-  const restore = pageSection(
+  const restore = shotGenerationSection(
     "useEffect(() => {",
-    "const {\n    imageUploadInputRef",
+    "return { handleGenerationSubmitted }",
     submissionSection.end,
   ).source;
   const panel = pageSection(

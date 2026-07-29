@@ -59,6 +59,7 @@ BLOCKED_NAMES = {
 }
 
 BLOCKED_SUFFIXES = {
+    ".bak",
     ".pyc",
     ".pyo",
     ".db",

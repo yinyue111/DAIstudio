@@ -152,7 +152,7 @@ def test_image_remediation_plan_is_idempotent_and_request_immutable(client, make
         assert mask.editable_fraction > 0
 
 
-def test_video_composition_replaces_only_selected_shot(make_user):
+def test_video_composition_replaces_only_selected_shot(client, make_user):
     user_id = make_user("13977119902")
     source_ref, generated_ref, _generation_task_id = _seed_assets(user_id, media_type="video")
     operation_id, revision_id, _payload = _seed_reverse_revision(

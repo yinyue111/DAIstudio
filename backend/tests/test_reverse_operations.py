@@ -17,7 +17,14 @@ from app.models import (
     UserPrompt,
 )
 from app.routers import prompt
-from app.services import credits, gateway, reverse_lineage, reverse_operations
+from app.services import (
+    credits,
+    gateway,
+    reverse_lineage,
+    reverse_operations,
+    reverse_runner,
+    reverse_source_resolution,
+)
 from tests.reverse_helpers import post_reverse, post_reverse_retry
 
 
@@ -39,6 +46,19 @@ def _stub_reverse_dependencies(monkeypatch, *, result=None):
     monkeypatch.setattr(
         prompt, "_gateway_ref", lambda *_args, **_kwargs: "data:image/jpeg;base64,YQ=="
     )
+    monkeypatch.setattr(
+        reverse_source_resolution,
+        "gateway_ref",
+        lambda *_args, **_kwargs: "data:image/jpeg;base64,YQ==",
+    )
+    monkeypatch.setattr(
+        reverse_source_resolution,
+        "gateway_ref_with_content_hash",
+        lambda *_args, **_kwargs: (
+            "data:image/jpeg;base64,YQ==",
+            "ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb",
+        ),
+    )
     monkeypatch.setattr(reverse_operations, "assert_text_allowed", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(reverse_operations.usage, "record_call", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(reverse_operations, "_remember_history", lambda *_args, **_kwargs: None)
@@ -56,6 +76,29 @@ def _stub_quoted_provider_cost(monkeypatch, policy: dict) -> None:
     monkeypatch.setattr(reverse_operations, "reverse_pricing_snapshot", with_provider_cost)
 
 
+def test_video_ref_collection_passes_preset_capacity_for_shot_aware_sampling(monkeypatch):
+    captured = {}
+
+    def fake_collect_refs(*_args, **kwargs):
+        captured.update(kwargs)
+        return ["data:image/jpeg;base64,YQ=="], {"analysis_mode": "keyframes"}, []
+
+    monkeypatch.setattr(reverse_source_resolution, "collect_refs", fake_collect_refs)
+    state = reverse_runner._OperationRunState(
+        operation_id=1,
+        db=SimpleNamespace(),
+        user=SimpleNamespace(id=1),
+        body=SimpleNamespace(target="video"),
+        runtime=SimpleNamespace(source="db"),
+        preset="fine",
+        is_video_source=True,
+    )
+
+    assert reverse_runner._collect_operation_refs(state) is True
+    assert captured["frame_budget"] == 22
+    assert captured["video_preset"] == "fine"
+
+
 def test_workspace_snapshot_preserves_video_duration():
     snapshot = reverse_operations.sanitize_workspace_snapshot(
         {
@@ -69,6 +112,25 @@ def test_workspace_snapshot_preserves_video_duration():
     )
 
     assert snapshot["selected"]["duration"] == 6.016
+
+
+def test_video_analysis_report_requires_model_frame_coverage():
+    state = SimpleNamespace(
+        operation=SimpleNamespace(template_snapshot={}),
+        body=SimpleNamespace(output_purpose="analysis_report", target="video"),
+        gateway_target="video",
+        is_video_source=True,
+        runtime=None,
+        video_analysis={"sampled_frames": [{"index": 1}]},
+        preset="fine",
+        real_cost=5,
+        audio_result=None,
+        operation_id=1,
+    )
+
+    kwargs = reverse_runner._operation_gateway_kwargs(state)
+
+    assert kwargs["require_video_frame_coverage"] is True
 
 
 def test_provider_cost_detail_uses_actual_visual_path_and_audio_evidence():
@@ -850,7 +912,7 @@ def test_settlement_boundary_rebuilds_visual_prompt_and_preserves_provider_text(
     )
 
     assert result["provider_final_text"] == provider_text
-    assert result["final_text"] == "红色产品；柔和侧光；镜头1（0.000-1.000秒）：产品居中"
+    assert result["final_text"] == "红色产品；柔和侧光；镜头1：产品居中"
     assert result["structured"]["未知审计字段"] == "证据帧中有BUY NOW"
     for forbidden in ("欢迎回来", "限时优惠", "BUY NOW", "OCR", "证据帧"):
         assert forbidden not in result["final_text"]
@@ -1499,8 +1561,8 @@ def test_video_cover_confirmation_settles_reverse_price(
     _stub_reverse_dependencies(monkeypatch)
     seen_targets = []
     monkeypatch.setattr(
-        prompt,
-        "_collect_refs",
+        reverse_source_resolution,
+        "collect_refs",
         lambda *_args, **_kwargs: (
             ["data:image/jpeg;base64,YQ=="],
             {
@@ -1699,8 +1761,8 @@ def test_cover_confirmation_broker_error_after_worker_claim_keeps_worker_result(
     _stub_reverse_dependencies(monkeypatch)
     gateway_calls = []
     monkeypatch.setattr(
-        prompt,
-        "_collect_refs",
+        reverse_source_resolution,
+        "collect_refs",
         lambda *_args, **_kwargs: (
             ["data:image/jpeg;base64,YQ=="],
             {
@@ -1994,8 +2056,8 @@ def test_legacy_reverse_returns_deprecated_409_for_cover_confirmation(
     _stub_reverse_dependencies(monkeypatch)
     monkeypatch.setattr(prompt.settings, "mock_mode", False)
     monkeypatch.setattr(
-        prompt,
-        "_collect_refs",
+        reverse_source_resolution,
+        "collect_refs",
         lambda *_args, **_kwargs: (
             ["data:image/jpeg;base64,YQ=="],
             {
@@ -2399,6 +2461,206 @@ def test_evidence_bound_video_result_rebuilds_prompt_after_temporal_gating():
     assert "快速旋转" not in result["final_text"]
     assert "闪白转场" not in result["final_text"]
     assert "镜头缓慢推进" in result["final_text"]
+
+
+def test_evidence_bound_video_result_passes_transition_evidence_scores():
+    """硬切放行时 evidence_gate.transition.score 应带上 lavfi scene_score。"""
+    result = {
+        "structured": {"主体": "深蓝玻璃精华瓶"},
+        "final_text": "旧提示词",
+        "video_analysis": {
+            "evidence_analyzers": {
+                "shot_transitions": {
+                    "status": "analyzed",
+                    "events": [
+                        {"evidence_id": "cut-1", "confidence": 0.87},
+                        {"evidence_id": "cut-other", "confidence": 0.42},
+                    ],
+                },
+            },
+            "shots": [{
+                "start_seconds": 0.0,
+                "end_seconds": 4.0,
+                "visual": "产品正面居中",
+                "action": "",
+                "camera": "",
+                "transition": "硬切",
+                "transition_evidence_refs": [],
+                "cut_transition_evidence_refs": ["cut-1"],
+                "analyzer_status": {
+                    "action": "unsupported",
+                    "camera_motion": "unsupported",
+                    "shot_transitions": "analyzed",
+                },
+            }],
+        },
+    }
+
+    reverse_operations._finalize_evidence_bound_video_result(result)
+
+    shot = result["video_analysis"]["shots"][0]
+    assert shot["transition"] == "硬切"
+    gate = shot["evidence_gate"]["transition"]
+    assert gate["verified"] is True
+    assert gate["source"] == "ffmpeg_scene"
+    assert gate["score"] == pytest.approx(0.87)
+
+
+def test_evidence_bound_video_result_keeps_unverified_annotation_out_of_prompt():
+    """vlm_only 降级保留的动作绝不把「（未验证）」写进 structured/final_text——
+    那是交付给生成模型的提示词层；置信度只保留在 evidence_gate 机器可读字段，
+    由前端按 gate 渲染徽标。"""
+    result = {
+        "structured": {"主体": "白色连衣裙模特"},
+        "final_text": "旧提示词",
+        "video_analysis": {
+            "shots": [{
+                "start_seconds": 0.0,
+                "end_seconds": 4.0,
+                "visual": "模特站在花园中",
+                "action": "模特缓慢转身",
+                "camera": "",
+                "transition": "",
+                "evidence_frame_indices": [1, 2],
+                "action_evidence_refs": [],
+                "analyzer_status": {
+                    "action": "unsupported",
+                    "camera_motion": "unsupported",
+                    "shot_transitions": "unsupported",
+                },
+            }],
+        },
+    }
+
+    reverse_operations._finalize_evidence_bound_video_result(result)
+
+    shot = result["video_analysis"]["shots"][0]
+    # canonical shot 不加后缀，置信度以 evidence_gate 为准
+    assert shot["action"] == "模特缓慢转身"
+    assert shot["evidence_gate"]["action"]["confidence"] == "vlm_only"
+    assert shot["evidence_gate"]["action"]["verified"] is False
+    # 提示词层（structured 与 final_text）保持 canonical 原文，无任何标注泄漏
+    assert result["structured"]["主体动作"] == "模特缓慢转身"
+    assert "未验证" not in result["final_text"]
+    assert all("未验证" not in str(v) for v in result["structured"].values())
+
+
+def test_evidence_bound_video_result_keeps_verified_actions_unannotated():
+    result = {
+        "structured": {"主体": "白色连衣裙模特"},
+        "final_text": "旧提示词",
+        "video_analysis": {
+            "shots": [{
+                "start_seconds": 0.0,
+                "end_seconds": 4.0,
+                "visual": "模特站在花园中",
+                "action": "模特缓慢转身",
+                "camera": "",
+                "transition": "",
+                "action_evidence_refs": ["sem-1"],
+                "analyzer_status": {
+                    "action": "analyzed",
+                    "camera_motion": "unsupported",
+                    "shot_transitions": "unsupported",
+                },
+            }],
+        },
+    }
+
+    reverse_operations._finalize_evidence_bound_video_result(result)
+
+    assert result["structured"]["主体动作"] == "模特缓慢转身"
+    assert "（未验证）" not in result["final_text"]
+
+
+def test_image_ocr_gate_rejected_claims_are_purged_from_prompt():
+    """全部被拦截的字段整体移除，final_text 基于净化 structured 重新合成。"""
+    result = {
+        "structured": {
+            "主体": "深蓝玻璃精华瓶",
+            "文字版式": "瓶身白色无衬线标题“ACME PRO”，居中排列",
+        },
+        "final_text": "深蓝玻璃精华瓶，瓶身白色无衬线标题“ACME PRO”，居中排列",
+    }
+    evidence = [{
+        "analyzer_source": "vlm",
+        "evidence_type": "ocr",
+        "field_key": "文字版式",
+        "evidence_text": "ACME PRO",
+        "vlm_text_description": "ACME PRO",
+        "review_status": "rejected",
+        "ocr_gate": {
+            "status": "rejected",
+            "reason": "OCR 已分析该图片但未检出该文字",
+            "ocr_text": None,
+        },
+    }]
+
+    reverse_operations._apply_image_ocr_gate_to_text(result, evidence, "image")
+
+    assert "文字版式" not in result["structured"]
+    assert "ACME PRO" not in result["final_text"]
+    assert "深蓝玻璃精华瓶" in result["final_text"]
+
+
+def test_image_ocr_gate_overridden_claims_are_rewritten_with_ocr_text():
+    result = {
+        "structured": {
+            "主体": "深蓝玻璃精华瓶",
+            "文字版式": "瓶身标题“ACME PR0”居中",
+        },
+        "final_text": "深蓝玻璃精华瓶，瓶身标题“ACME PR0”居中",
+    }
+    evidence = [{
+        "analyzer_source": "vlm",
+        "evidence_type": "ocr",
+        "field_key": "文字版式",
+        "evidence_text": "ACME PRO",
+        "vlm_text_description": "ACME PR0",
+        "ocr_gate": {
+            "status": "overridden",
+            "reason": "该描述与 OCR 结果冲突，已以 OCR 为准",
+            "ocr_text": "ACME PRO",
+        },
+    }]
+
+    reverse_operations._apply_image_ocr_gate_to_text(result, evidence, "image")
+
+    assert result["structured"]["文字版式"] == "瓶身标题“ACME PRO”居中"
+    assert "ACME PRO" in result["final_text"]
+    assert "ACME PR0" not in result["final_text"]
+
+
+def test_image_ocr_gate_confirmed_and_unavailable_claims_keep_prompt_untouched():
+    original_final_text = "深蓝玻璃精华瓶，瓶身标题“ACME PRO”居中"
+    result = {
+        "structured": {
+            "主体": "深蓝玻璃精华瓶",
+            "文字版式": "瓶身标题“ACME PRO”居中",
+        },
+        "final_text": original_final_text,
+    }
+    evidence = [
+        {
+            "analyzer_source": "vlm",
+            "evidence_type": "ocr",
+            "field_key": "文字版式",
+            "vlm_text_description": "ACME PRO",
+            "ocr_gate": {"status": "confirmed", "ocr_text": "ACME PRO"},
+        },
+        {
+            "analyzer_source": "vlm",
+            "evidence_type": "ocr",
+            "field_key": "文字版式",
+            "vlm_text_description": "补水精华",
+            "ocr_gate": {"status": "unavailable", "ocr_text": None},
+        },
+    ]
+
+    reverse_operations._apply_image_ocr_gate_to_text(result, evidence, "image")
+
+    assert result["structured"]["文字版式"] == "瓶身标题“ACME PRO”居中"
+    assert result["final_text"] == original_final_text
 
 
 @pytest.mark.parametrize(

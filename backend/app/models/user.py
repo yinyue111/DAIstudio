@@ -44,6 +44,9 @@ class User(Base):
     frozen_credits: Mapped[int] = mapped_column(BigInteger, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     last_login_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # 自助注销时间：非空表示该账号已完成软注销（status 同时为 disabled，
+    # phone 已被不可逆脱敏）。财务/审计记录仍保留 user_id 外键但不再指向自然人。
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 class PhoneWhitelist(Base):
     __tablename__ = "phone_whitelist"
 

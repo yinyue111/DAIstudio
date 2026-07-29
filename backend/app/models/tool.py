@@ -32,7 +32,13 @@ class ToolDefinition(Base):
             "category in ('image', 'video', 'workflow', 'utility')",
             name="ck_tool_definitions_category_valid",
         ),
-        Index("uq_tool_definitions_slug", "slug", unique=True),
+        Index(
+            "uq_tool_definitions_slug",
+            "slug",
+            unique=True,
+            postgresql_where=text("deleted_at IS NULL"),
+            sqlite_where=text("deleted_at IS NULL"),
+        ),
         Index("ix_tool_definitions_enabled_sort", "enabled", "sort_order", "id"),
     )
 
@@ -47,6 +53,7 @@ class ToolDefinition(Base):
     sort_order: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     featured: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )

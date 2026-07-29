@@ -1,0 +1,185 @@
+{
+  "_comment": "clean_visual_generation_clause 的子句级 golden 用例。input -> expected 为当前锁定行为；改动 gateway_prompting.py 中任何清洗正则若使这些用例失败，说明反推质量被悄悄改变，需要人工确认。连坐删除/归因吞子句/百分比悬垂/中英不确定词不对称四个缺陷已修复，正确行为直接锁定在本文件与 test_reverse_sanitization_golden.py 中。",
+  "cases": [
+    {
+      "id": "placeholder-single",
+      "note": "单个占位词整体清空",
+      "input": "未见",
+      "expected": ""
+    },
+    {
+      "id": "placeholder-slash-combo",
+      "note": "斜杠分隔的占位组合整体清空",
+      "input": "无 / 不适用",
+      "expected": ""
+    },
+    {
+      "id": "placeholder-comma-combo",
+      "note": "顿号分隔的占位组合整体清空",
+      "input": "无、未见、不适用",
+      "expected": ""
+    },
+    {
+      "id": "placeholder-punct-only",
+      "note": "只剩标点视为空",
+      "input": "。。",
+      "expected": ""
+    },
+    {
+      "id": "placeholder-empty",
+      "note": "空输入返回空串",
+      "input": "",
+      "expected": ""
+    },
+    {
+      "id": "placeholder-sellpoint",
+      "note": "长占位词『未见明确卖点』清空",
+      "input": "未见明确卖点",
+      "expected": ""
+    },
+    {
+      "id": "placeholder-lookalike-kept",
+      "note": "以『无』开头的合法观察不能被误杀",
+      "input": "无明显纹样",
+      "expected": "无明显纹样"
+    },
+    {
+      "id": "scaffold-prefix-fact",
+      "note": "证据层级前缀『直接可见事实：』被剥离，内容保留",
+      "input": "直接可见事实：主体为蓝色方盒",
+      "expected": "主体为蓝色方盒"
+    },
+    {
+      "id": "scaffold-prefix-estimate",
+      "note": "『视觉估计：』前缀剥离",
+      "input": "视觉估计：主色为暖橙",
+      "expected": "主色为暖橙"
+    },
+    {
+      "id": "scaffold-unknown-segment",
+      "note": "『未知：...』整段删除，同串其他分句保留（分号粒度正确）",
+      "input": "未知：品牌名；主体为蓝色方盒",
+      "expected": "主体为蓝色方盒"
+    },
+    {
+      "id": "reference-label-stripped",
+      "note": "参考图序号是分析输入顺序，不是视觉指令",
+      "input": "参考图1中主体位于左侧",
+      "expected": "主体位于左侧"
+    },
+    {
+      "id": "platform-attribution-trailing",
+      "note": "句尾平台归因删除，前半句保留",
+      "input": "主体居中，可用于小红书种草图",
+      "expected": "主体居中"
+    },
+    {
+      "id": "quality-booster-english",
+      "note": "英文质量修饰词删除",
+      "input": "masterpiece, best quality, 主体居中",
+      "expected": "主体居中"
+    },
+    {
+      "id": "quality-booster-chinese",
+      "note": "中文质量修饰词删除，剩余描述保留",
+      "input": "高质量商业摄影，主体居中",
+      "expected": "商业摄影，主体居中"
+    },
+    {
+      "id": "hex-color-stripped",
+      "note": "十六进制色值删除，色名保留",
+      "input": "主色为暖橙色 #E8945A，饱和度低",
+      "expected": "主色为暖橙色，饱和度低"
+    },
+    {
+      "id": "confidence-phrase-stripped",
+      "note": "置信度话术删除",
+      "input": "镜头缓慢推近，置信度为高",
+      "expected": "镜头缓慢推近"
+    },
+    {
+      "id": "exact-percent-stripped-dangling",
+      "note": "缺陷已修复：百分比前缀双向兼容，『占画面约 55%』整体删除，不再残留『占画面约 』悬垂片段",
+      "input": "主体占画面约 55%，居中",
+      "expected": "主体，居中"
+    },
+    {
+      "id": "uncertainty-sentence-granularity",
+      "note": "句号分隔时不确定句被删、其余句保留（整句删除的正确路径）",
+      "input": "主体为红色圆瓶居中。标签文字看不清。背景为米白色台面",
+      "expected": "主体为红色圆瓶居中。背景为米白色台面"
+    },
+    {
+      "id": "uncertainty-english-passthrough",
+      "note": "缺陷已修复：英文不确定词 possibly/maybe/unclear/might 与中文侧对称，触发同粒度子句删除（带字母边界，不误伤 mighty/midnight）",
+      "input": "The bottle is centered, camera possibly pans left",
+      "expected": "The bottle is centered"
+    },
+    {
+      "id": "decimal-not-split",
+      "note": "小数点不应破坏句子（分句正则含 ASCII 句点，重组后须保持原样）",
+      "input": "瓶身高约1.5倍于盒身，居中摆放",
+      "expected": "瓶身高约1.5倍于盒身，居中摆放"
+    },
+    {
+      "id": "mixed-cjk-english-kept",
+      "note": "中英混排的有效观察完整保留",
+      "input": "瓶身印有 SUNRISE 字样，主体居中",
+      "expected": "瓶身印有 SUNRISE 字样，主体居中"
+    },
+    {
+      "id": "uncertainty-jinkeneng-kept",
+      "note": "「尽可能」是一致性约束合法措辞,不触发不确定词删除",
+      "input": "尽可能保持产品居中",
+      "expected": "尽可能保持产品居中"
+    },
+    {
+      "id": "uncertainty-keneng-xing-kept",
+      "note": "「可能性」不触发「可能」不确定词删除",
+      "input": "模特站姿挺拔，动作可能性强",
+      "expected": "模特站姿挺拔，动作可能性强"
+    },
+    {
+      "id": "uncertainty-bu-caice-kept",
+      "note": "「不猜测」是模板要求复述的禁止性约束,不被连坐删除",
+      "input": "不猜测色值，保持包装原色",
+      "expected": "不猜测色值，保持包装原色"
+    },
+    {
+      "id": "uncertainty-keneng-still-drops",
+      "note": "真正的不确定表达「可能是」仍触发子句删除",
+      "input": "材质可能为玻璃，主体居中",
+      "expected": "主体居中"
+    },
+    {
+      "id": "platform-attributive-keeps-fact",
+      "note": "平台词作定语时只摘归因修饰,保留视觉事实本体",
+      "input": "背景是电商详情页风格的浅灰渐变",
+      "expected": "背景是浅灰渐变"
+    },
+    {
+      "id": "platform-watermark-fact-kept",
+      "note": "平台水印/字样是画面可见事实,整句保留",
+      "input": "画面右下角有小红书水印字样",
+      "expected": "画面右下角有小红书水印字样"
+    },
+    {
+      "id": "platform-modifier-changjian",
+      "note": "「电商主图常见的」归因定语被摘除,事实保留",
+      "input": "文字版式为电商主图常见的价格标签排布",
+      "expected": "文字版式为价格标签排布"
+    },
+    {
+      "id": "platform-no-dangling-stump",
+      "note": "归因吞掉事实主体时丢弃整个子句,绝不留「背景是」类残句",
+      "input": "背景是电商详情页,主体居中",
+      "expected": "主体居中"
+    },
+    {
+      "id": "unverified-suffix-stripped",
+      "note": "历史 revision 里的「（未验证）」展示后缀被剥离,不进入生成提示词",
+      "input": "镜头缓慢推进（未验证）",
+      "expected": "镜头缓慢推进"
+    }
+  ]
+}

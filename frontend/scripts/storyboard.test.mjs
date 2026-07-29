@@ -41,6 +41,8 @@ function shots() {
       start_seconds: 10,
       end_seconds: 13,
       visual: "产品入场",
+      subject_tracking: "同一产品从左侧进入中央",
+      pose: "产品由倾斜转为直立",
       action: "缓慢旋转",
       camera: "推近",
       transition: "闪白",
@@ -55,6 +57,8 @@ function shots() {
       start_seconds: 13,
       end_seconds: 16,
       visual: "产品特写",
+      subject_tracking: "同一产品保持中央位置",
+      pose: "产品保持直立",
       action: "液滴滑落",
       camera: "环绕",
       transition: "淡出",
@@ -101,6 +105,8 @@ test("merge combines adjacent evidence but never crosses source segments", () =>
   assert.equal(result[0].start_seconds, 10);
   assert.equal(result[0].end_seconds, 16);
   assert.equal(result[0].visual, "产品入场；产品特写");
+  assert.equal(result[0].subject_tracking, "同一产品从左侧进入中央；同一产品保持中央位置");
+  assert.equal(result[0].pose, "产品由倾斜转为直立；产品保持直立");
   assert.equal(result[0].transition, "淡出");
   assert.deepEqual(result[0].evidence_frame_indices, [1, 2, 3, 4, 5]);
   assert.equal(result[0].compiled_prompt, undefined);
@@ -141,6 +147,8 @@ test("shot edits invalidate compile metadata and prompt includes executable fiel
   assert.match(prompt, /镜头 3/);
   assert.match(prompt, /来源片段 1/);
   assert.match(prompt, /画面：产品入场/);
+  assert.match(prompt, /主体追踪：同一产品从左侧进入中央/);
+  assert.match(prompt, /姿态：产品由倾斜转为直立/);
   assert.match(prompt, /镜头：推近/);
 });
 
@@ -149,10 +157,10 @@ test("storyboard UI exposes structural and model-compile actions", () => {
   for (const marker of ["拆分时间", "与下一镜头合并", "锁定镜头", "编译镜头", "应用镜头"]) {
     assert.match(editor, new RegExp(marker));
   }
-  const page = readFileSync(new URL("../app/page.jsx", import.meta.url), "utf8");
-  assert.match(page, /mode: "target_model_adaptation"/);
-  assert.match(page, /api\.createStudioPromptOptimization/);
-  assert.match(page, /application_mode: "storyboard_shot"/);
+  const actions = readFileSync(new URL("../hooks/useStoryboardActions.js", import.meta.url), "utf8");
+  assert.match(actions, /mode: "target_model_adaptation"/);
+  assert.match(actions, /api\.createStudioPromptOptimization/);
+  assert.match(actions, /application_mode: "storyboard_shot"/);
   const api = readFileSync(new URL("../lib/api.js", import.meta.url), "utf8");
   for (const endpoint of ["shots/edit", "shots/reanalyze", "shots/prepare-generation"]) {
     assert.match(api, new RegExp(endpoint.replace("/", "\\/")));

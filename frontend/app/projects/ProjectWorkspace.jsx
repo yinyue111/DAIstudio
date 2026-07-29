@@ -5,6 +5,7 @@ import {
   AlertTriangle,
   Archive,
   BookOpen,
+  BookPlus,
   Cloud,
   CloudAlert,
   Coins,
@@ -12,6 +13,7 @@ import {
   FilePenLine,
   FolderInput,
   Images,
+  ListPlus,
   ListTodo,
   LoaderCircle,
   PackageOpen,
@@ -194,6 +196,8 @@ export default function ProjectWorkspace({
   onDraftChange,
   onAssetRoleChange,
   onAddAssets,
+  onAddTasks,
+  onAddRecipes,
   onRemoveAsset,
   onRemoveTask,
   onRemoveRecipe,
@@ -308,8 +312,26 @@ export default function ProjectWorkspace({
           )}
         </div>
       )}
-      {activeTab === "tasks" && <div role="tabpanel"><ProjectTasks tasks={project.tasks} busy={busy} onRemove={onRemoveTask} /></div>}
-      {activeTab === "recipes" && <div role="tabpanel"><ProjectRecipes recipes={project.recipes} busy={busy} onRemove={onRemoveRecipe} onRestore={onRestoreRecipe} /></div>}
+      {activeTab === "tasks" && (
+        <div role="tabpanel">
+          <div className="flex items-center justify-end pb-4">
+            <button type="button" className="btn-primary btn-sm" onClick={onAddTasks} disabled={busy}>
+              <ListPlus size={15} aria-hidden="true" /> 添加任务
+            </button>
+          </div>
+          <ProjectTasks tasks={project.tasks} busy={busy} onRemove={onRemoveTask} />
+        </div>
+      )}
+      {activeTab === "recipes" && (
+        <div role="tabpanel">
+          <div className="flex items-center justify-end pb-4">
+            <button type="button" className="btn-primary btn-sm" onClick={onAddRecipes} disabled={busy}>
+              <BookPlus size={15} aria-hidden="true" /> 添加配方
+            </button>
+          </div>
+          <ProjectRecipes recipes={project.recipes} busy={busy} onRemove={onRemoveRecipe} onRestore={onRestoreRecipe} />
+        </div>
+      )}
       {activeTab === "draft" && (
         <div role="tabpanel">
           <ProjectDraft value={draftText} status={draftStatus} updatedAt={project.draft_updated_at} onChange={onDraftChange} />

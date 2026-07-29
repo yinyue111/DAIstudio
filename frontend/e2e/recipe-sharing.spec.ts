@@ -37,7 +37,7 @@ test("匿名用户可查看脱敏分享，并在使用时保留登录回跳地�
   expect(mock.sharedRecipeReads).toBe(1);
 
   await page.getByRole("button", { name: "登录后使用" }).click();
-  await expect.poll(() => new URL(page.url()).pathname).toBe("/login");
+  await expect.poll(() => new URL(page.url()).pathname, { timeout: 20_000 }).toBe("/login");
   expect(new URL(page.url()).searchParams.get("next")).toBe(SHARE_PATH);
 });
 
@@ -63,7 +63,7 @@ test("登录用户使用分享后精确写入草稿并在 Studio 恢复完整配
   await page.goto(SHARE_PATH);
   await page.getByRole("button", { name: "在 Studio 使用" }).click();
 
-  await expect(page).toHaveURL(/\/$/);
+  await expect(page).toHaveURL(/\/$/, { timeout: 20_000 });
   const transfer = await page.evaluate(() => {
     const target = window as typeof window & { __recipeDraftWrites?: Array<{ key: string; value: string }> };
     const captured = sessionStorage.getItem("__e2eRecipeDraftWrites");

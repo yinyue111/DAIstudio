@@ -14,6 +14,7 @@ USER_MEDIA_STORAGE_PREFIXES = (
     "upload_model_ref/",
     "upload_video/",
     "upload_video_preview/",
+    "upload_audio/",
     "preview/",
     "model_ref/",
 )

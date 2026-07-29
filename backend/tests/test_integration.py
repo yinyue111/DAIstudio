@@ -148,7 +148,7 @@ def test_sms_send_returns_disabled_when_switch_is_off(client):
     assert r.json() == {"ok": False, "disabled": True}
 
 
-def test_production_registration_rejects_public_phone_without_sms(client, monkeypatch):
+def test_production_registration_is_enabled_by_default_without_sms(client, monkeypatch):
     monkeypatch.setattr("app.routers.auth.settings.debug", False)
     db = SessionLocal()
     try:
@@ -159,11 +159,25 @@ def test_production_registration_rejects_public_phone_without_sms(client, monkey
 
     features = client.get("/api/auth/features")
     assert features.status_code == 200, features.text
-    assert features.json()["registration_enabled"] is False
+    assert features.json()["registration_enabled"] is True
 
     r = client.post(
         "/api/auth/register",
         json={"phone": "13700000005", "password": "secret1234"},
+    )
+    assert r.status_code == 200, r.text
+
+
+def test_registration_can_be_explicitly_disabled(client, monkeypatch):
+    monkeypatch.setattr("app.routers.auth.settings.registration_enabled", False)
+
+    features = client.get("/api/auth/features")
+    assert features.status_code == 200, features.text
+    assert features.json()["registration_enabled"] is False
+
+    r = client.post(
+        "/api/auth/register",
+        json={"phone": "13700000015", "password": "secret1234"},
     )
     assert r.status_code == 400, r.text
     assert "注册暂未开放" in r.text
@@ -547,7 +561,7 @@ def test_video_final_can_generate_directly_without_preview_parent(
 
 
 def test_video_preview_adapts_ratio_and_cover_from_reference(
-    client, make_user, auth, monkeypatch, quote_and_generate
+    client, make_user, auth, monkeypatch, quote_and_generate, uploaded_video_url
 ):
     make_user("13900000016", balance=1000, admin=True)
     h = auth("13900000016")
@@ -573,9 +587,10 @@ def test_video_preview_adapts_ratio_and_cover_from_reference(
         return "mock-ratio"
 
     monkeypatch.setattr("app.services.gateway.submit_video", fake_submit)
+    source_video_url = uploaded_video_url(h)
 
     r = quote_and_generate({
-        "source_asset_url": "http://example.com/source-video.mp4",
+        "source_asset_url": source_video_url,
         "source_type": "video",
         "source_asset_meta": {"user_confirmed_rights": True},
         "category": "video",
@@ -598,7 +613,7 @@ def test_video_preview_adapts_ratio_and_cover_from_reference(
 
 
 def test_video_final_uses_selected_quality_and_reference_poster(
-    client, make_user, auth, monkeypatch, tiny_mp4, quote_and_generate
+    client, make_user, auth, monkeypatch, tiny_mp4, quote_and_generate, uploaded_video_url
 ):
     make_user("13900000018", balance=1000, admin=True)
     h = auth("13900000018")
@@ -650,9 +665,10 @@ def test_video_final_uses_selected_quality_and_reference_poster(
         return storage.save_bytes(tiny_mp4, subdir, ext)
 
     monkeypatch.setattr("app.services.gateway.download_to_storage", fake_download_to_storage)
+    source_video_url = uploaded_video_url(h)
 
     preview = quote_and_generate({
-        "source_asset_url": "http://example.com/source-video.mp4",
+        "source_asset_url": source_video_url,
         "source_type": "video",
         "source_asset_meta": {"user_confirmed_rights": True},
         "category": "video",
@@ -671,7 +687,7 @@ def test_video_final_uses_selected_quality_and_reference_poster(
     parent_id = preview.json()["id"]
 
     r = quote_and_generate({
-        "source_asset_url": "http://example.com/source-video.mp4",
+        "source_asset_url": source_video_url,
         "source_type": "video",
         "source_asset_meta": {"user_confirmed_rights": True},
         "category": "video",
@@ -709,6 +725,7 @@ def test_video_final_is_idempotent_for_same_preview(
     tiny_mp4,
     quote_and_generate,
     quote_generation,
+    uploaded_video_url,
 ):
     make_user("13900000019", balance=1000, admin=True)
     h = auth("13900000019")
@@ -724,8 +741,9 @@ def test_video_final_is_idempotent_for_same_preview(
     }, headers=h)
     assert r.status_code == 200, r.text
 
+    source_video_url = uploaded_video_url(h)
     preview = quote_and_generate({
-        "source_asset_url": "http://example.com/source-video.mp4",
+        "source_asset_url": source_video_url,
         "source_type": "video",
         "source_asset_meta": {"user_confirmed_rights": True},
         "category": "video",
@@ -838,7 +856,7 @@ def test_db_rejects_duplicate_active_final_for_same_preview(client, make_user):
 
 
 def test_video_final_integrity_error_replays_active_final(
-    client, make_user, auth, monkeypatch, quote_and_generate
+    client, make_user, auth, monkeypatch, quote_and_generate, uploaded_video_url
 ):
     make_user("13900000143", balance=1000, admin=True)
     h = auth("13900000143")
@@ -852,8 +870,9 @@ def test_video_final_integrity_error_replays_active_final(
         "extra": {"preview_cost": 5},
     }, headers=h).status_code == 200
 
+    source_video_url = uploaded_video_url(h)
     preview = quote_and_generate({
-        "source_asset_url": "http://example.com/source-video.mp4",
+        "source_asset_url": source_video_url,
         "source_type": "video",
         "source_asset_meta": {"user_confirmed_rights": True},
         "category": "video",

@@ -13,7 +13,7 @@ from ..models import (
 )
 from .model_gateway_config import PROVIDER_PRESETS
 from .model_routes import model_route_summary
-from .product_edition import LAUNCH_LITE_HIDDEN_NAVIGATION, is_launch_lite
+from .product_edition import feature_enabled, hidden_navigation_keys, is_launch_lite
 
 _BOOLEAN_CAPABILITIES = {
     "text_to_image",
@@ -66,11 +66,12 @@ def app_navigation_catalog(
 ) -> dict:
     """Return only navigation entries the current user may discover."""
     configured_states = navigation_states if isinstance(navigation_states, dict) else {}
+    feature_hidden_keys = hidden_navigation_keys()
     items = []
     for item in _APP_NAVIGATION_ITEMS:
         if item.get("permission") == "admin" and not is_admin:
             continue
-        if is_launch_lite() and item["key"] in LAUNCH_LITE_HIDDEN_NAVIGATION:
+        if item["key"] in feature_hidden_keys:
             continue
         state = str(configured_states.get(item["key"], "enabled"))
         if state not in _NAVIGATION_STATES or item["key"] in {"studio", "admin"}:
@@ -78,11 +79,12 @@ def app_navigation_catalog(
         if state == "hidden":
             continue
         resolved_item = dict(item)
-        if is_launch_lite():
-            if item["key"] == "prompts":
-                resolved_item["label"] = "提示词库"
-            elif item["key"] == "recharge":
-                resolved_item["label"] = "账户"
+        # Labels follow the owning switch, not the edition, so toggling one
+        # feature doesn't rename unrelated navigation for existing users.
+        if item["key"] == "prompts" and not feature_enabled("recipes_enabled"):
+            resolved_item["label"] = "提示词库"
+        elif item["key"] == "recharge" and is_launch_lite():
+            resolved_item["label"] = "账户"
         items.append(
             {
                 **resolved_item,

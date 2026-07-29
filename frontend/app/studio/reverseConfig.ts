@@ -1,5 +1,5 @@
 export type ReverseCategory = "image" | "video";
-export type ReverseAnalysisPrecision = "fast" | "standard" | "fine";
+export type ReverseAnalysisPrecision = "fast" | "standard" | "fine" | "ultra";
 
 export interface ReverseConfigOption {
   key: string;
@@ -29,7 +29,10 @@ export interface ReverseConfigValidationError {
 }
 
 export const MAX_REVERSE_CUSTOM_INSTRUCTION_LENGTH = 500;
-export const MAX_REVERSE_CUSTOM_KEYFRAMES = 24;
+// 关键帧上限以后端为准：backend/app/schemas/reverse.py 的 custom_keyframes
+// Field(max_length=36)。此前前端为 24，用户设 25-36 个会被静默截断后提交。
+// 超限时 validateReverseConfig 会给出错误提示，而不是静默改数。
+export const MAX_REVERSE_CUSTOM_KEYFRAMES = 36;
 export const MAX_REVERSE_SOURCE_RANGES = 8;
 export const MAX_REVERSE_SELECTED_DURATION_SECONDS = 300;
 
@@ -68,11 +71,47 @@ export const REVERSE_OUTPUT_PURPOSE_OPTIONS: Readonly<Record<ReverseCategory, re
   ],
 };
 
+// 兜底精度档位：仅在尚未拿到 /api/config 下发的 reverse.video_presets 时使用。
+// 必须与后端 backend/app/schemas/reverse.py 的 ReverseAnalysisPrecision Literal 完全一致，
+// 权威档位以服务端下发为准（见 registerReversePrecisionOptions）。
 export const REVERSE_PRECISION_OPTIONS: readonly ReverseConfigOption[] = [
   { key: "fast", label: "快速", description: "较少证据采样，适合快速获得方向。" },
   { key: "standard", label: "标准", description: "平衡证据覆盖、耗时和费用。" },
   { key: "fine", label: "精细", description: "提高证据覆盖，适合复杂画面和多镜头视频。" },
+  { key: "ultra", label: "超精细", description: "高密度镜头与动作分析，适合复杂多镜头素材。" },
 ];
+
+// /api/config 下发的精度档位（reverse.video_presets）。拿到后以服务端为准，
+// 避免前端白名单与后端枚举漂移；拿不到时回退 REVERSE_PRECISION_OPTIONS。
+let dynamicPrecisionOptions: ReverseConfigOption[] | null = null;
+
+export function registerReversePrecisionOptions(presets: unknown): void {
+  if (!Array.isArray(presets)) return;
+  const options = presets
+    .map((item) => {
+      const raw = item && typeof item === "object" && !Array.isArray(item)
+        ? item as Record<string, unknown>
+        : {};
+      const key = String(raw.key ?? "").trim();
+      return key
+        ? {
+            key,
+            label: String(raw.label ?? key),
+            description: String(raw.description ?? raw.frame_range ?? ""),
+          }
+        : null;
+    })
+    .filter((item): item is ReverseConfigOption => Boolean(item));
+  if (options.length > 0) dynamicPrecisionOptions = options;
+}
+
+export function reversePrecisionOptions(): readonly ReverseConfigOption[] {
+  return dynamicPrecisionOptions ?? REVERSE_PRECISION_OPTIONS;
+}
+
+export function isReverseAnalysisPrecision(value: unknown): value is ReverseAnalysisPrecision {
+  return reversePrecisionOptions().some((option) => option.key === value);
+}
 
 export const DEFAULT_REVERSE_CONFIG: Readonly<ReverseConfig> = Object.freeze({
   analysis_focus: "comprehensive",
@@ -82,7 +121,7 @@ export const DEFAULT_REVERSE_CONFIG: Readonly<ReverseConfig> = Object.freeze({
   source_range: null,
   source_ranges: [],
   custom_keyframes: [],
-  include_audio: false,
+  include_audio: true,
 });
 
 export function reverseConfigForSourceChange(value: unknown): Record<string, unknown> | null {
@@ -103,8 +142,6 @@ export function reverseConfigForSourceChange(value: unknown): Record<string, unk
 function optionKeys(options: readonly ReverseConfigOption[]) {
   return new Set(options.map((option) => option.key));
 }
-
-const PRECISION_KEYS = optionKeys(REVERSE_PRECISION_OPTIONS);
 
 function finiteNumber(value: unknown) {
   if (value === "" || value === null || value === undefined) return null;
@@ -190,7 +227,7 @@ export function normalizeReverseConfig(
     analysis_focus: optionKeys(focusOptions).has(requestedFocus)
       ? requestedFocus
       : focusOptions[0].key,
-    analysis_precision: (PRECISION_KEYS.has(requestedPrecision)
+    analysis_precision: (isReverseAnalysisPrecision(requestedPrecision)
       ? requestedPrecision
       : DEFAULT_REVERSE_CONFIG.analysis_precision) as ReverseAnalysisPrecision,
     output_purpose: optionKeys(purposeOptions).has(requestedPurpose)
@@ -200,7 +237,9 @@ export function normalizeReverseConfig(
     source_range: sourceRanges.length === 1 ? sourceRanges[0] : null,
     source_ranges: sourceRanges,
     custom_keyframes: videoSource ? normalizeKeyframes(raw.custom_keyframes ?? raw.keyframes, duration) : [],
-    include_audio: videoSource && Boolean(raw.include_audio),
+    include_audio: videoSource && (
+      raw.include_audio === undefined ? true : Boolean(raw.include_audio)
+    ),
   };
 }
 
@@ -222,7 +261,7 @@ export function validateReverseConfig(
     errors.push({ field: "analysis_focus", message: "请选择当前媒体类型支持的分析目标。" });
   }
   const precision = String(raw.analysis_precision ?? raw.precision ?? DEFAULT_REVERSE_CONFIG.analysis_precision).trim();
-  if (!PRECISION_KEYS.has(precision)) {
+  if (!isReverseAnalysisPrecision(precision)) {
     errors.push({ field: "analysis_precision", message: "分析精度无效。" });
   }
   const purpose = String(raw.output_purpose ?? raw.purpose ?? "").trim();
@@ -232,9 +271,6 @@ export function validateReverseConfig(
   const instruction = String(raw.custom_instruction ?? "").trim();
   if (instruction.length > MAX_REVERSE_CUSTOM_INSTRUCTION_LENGTH) {
     errors.push({ field: "custom_instruction", message: `补充要求不能超过 ${MAX_REVERSE_CUSTOM_INSTRUCTION_LENGTH} 字。` });
-  }
-  if (category === "image" && raw.include_audio) {
-    errors.push({ field: "include_audio", message: "图片反推不支持音频分析。" });
   }
   const rawRanges = requestedRanges(raw);
   const maxDuration = finiteNumber(duration);

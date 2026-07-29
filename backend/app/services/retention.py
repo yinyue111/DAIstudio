@@ -479,6 +479,7 @@ def purge_uploaded_assets(db: Session, cutoff: datetime, limit: int = 1000) -> i
                 or_(
                     UploadedAsset.key.like("upload/%"),
                     UploadedAsset.key.like("upload_video/%"),
+                    UploadedAsset.key.like("upload_audio/%"),
                 ),
                 or_(
                     UploadedAsset.original_filename.is_(None),

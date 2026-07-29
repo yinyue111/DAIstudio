@@ -7,12 +7,13 @@ import {
   compactReverseOperationForStudioDraft,
   studioDraftByteSize,
 } from "../app/studio/studioDraft.ts";
+import { compactStudioSessionDraftForCloud } from "../app/studio/studioDraftSession.js";
 
-const studioPageSource = readFileSync(new URL("../app/page.jsx", import.meta.url), "utf8");
+const studioDraftSessionSource = readFileSync(new URL("../app/studio/studioDraftSession.js", import.meta.url), "utf8");
 
 test("draft asset sanitizer preserves video duration", () => {
-  const sanitizer = studioPageSource.match(
-    /function sanitizeAssetForDraft\(asset\) \{([\s\S]*?)\n  \}\n\n  function sanitizeWorkspaceForDraft/,
+  const sanitizer = studioDraftSessionSource.match(
+    /function sanitizeAssetForDraft\(asset\) \{([\s\S]*?)\n\}\n\nexport function sanitizeWorkspaceForDraft/,
   );
   assert.ok(sanitizer, "sanitizeAssetForDraft should remain available");
   assert.match(sanitizer[1], /"duration"/, "video duration must survive workspace draft compaction");
@@ -85,4 +86,43 @@ test("draft operation keeps recovery identity without duplicating result payload
     result_schema_version: "reverse.v3",
     applied_result_version: 7,
   });
+});
+
+test("cloud draft drops inactive reports before the 96KB API limit", () => {
+  const oversizedResult = {
+    kind: "pending_reverse_review",
+    operation_id: 82,
+    dirty: false,
+    result: {
+      final_text: "可恢复提示词",
+      structured: { 主体: "洗脸巾" },
+      image_evidence: Array.from({ length: 128 }, (_, index) => ({
+        ...evidence(index),
+        evidence_text: "证据".repeat(200),
+      })),
+    },
+  };
+  const draft = {
+    version: 1,
+    creationMode: "video",
+    workspaces: {
+      image: {
+        pendingReverseResult: oversizedResult,
+        reverseOperation: { id: 82, status: "succeeded" },
+        reverseUndoSnapshot: { prompt: "x".repeat(40_000) },
+      },
+      video: {
+        prompt: "视频提示词",
+        pendingReverseResult: null,
+        reverseOperation: null,
+      },
+    },
+  };
+
+  assert.ok(studioDraftByteSize(draft) > 96 * 1024);
+  const compacted = compactStudioSessionDraftForCloud(draft);
+  assert.ok(studioDraftByteSize(compacted) < 96 * 1024);
+  assert.equal(compacted.workspaces.image.pendingReverseResult, null);
+  assert.deepEqual(compacted.workspaces.image.reverseOperation, { id: 82, status: "succeeded" });
+  assert.equal(compacted.workspaces.video.prompt, "视频提示词");
 });

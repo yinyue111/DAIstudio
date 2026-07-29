@@ -190,6 +190,33 @@ def grant(db: Session, user_id: int, amount: int, note: str | None = None,
     return _finish(db, user, commit)
 
 
+def deduct(db: Session, user_id: int, amount: int, *, note: str,
+           biz_type: str = "admin", biz_ref: int | None = None,
+           allow_partial: bool = False, commit: bool = True) -> tuple[User, int]:
+    """Admin-side correction: claw back previously granted credits.
+
+    users.balance_credits 带非负约束,不允许负余额,因此策略是"拒绝透支":
+    余额不足时默认拒绝;allow_partial=True 时扣到 0 为止并返回实际扣减值。
+    走 credit_transactions 流水(type=consume),保证 sum(change)==balance 恒等。
+    """
+    if amount <= 0:
+        raise ValueError("deduct amount must be positive")
+    user = _lock_user(db, user_id)
+    actual = amount
+    if user.balance_credits < amount:
+        if not allow_partial:
+            db.rollback()
+            raise InsufficientCredits(
+                f"余额不足:需扣减 {amount},可用 {user.balance_credits}"
+            )
+        actual = int(user.balance_credits)
+    if actual == 0:
+        return _finish(db, user, commit), 0
+    user.balance_credits -= actual
+    _record(db, user, "consume", -actual, biz_type, biz_ref, note)
+    return _finish(db, user, commit), actual
+
+
 def freeze(db: Session, user_id: int, amount: int, biz_ref: int | None,
            *, biz_type: str = "gen_task", commit: bool = True) -> User:
     _reject_negative(amount, "freeze")

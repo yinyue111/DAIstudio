@@ -105,7 +105,7 @@ class UserAssetMetadataOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     asset_ref: str
-    media_type: Literal["image", "video"]
+    media_type: Literal["image", "video", "audio"]
     tags: list[str] = Field(default_factory=list)
     content_sha256: str | None = None
     perceptual_hash: str | None = None

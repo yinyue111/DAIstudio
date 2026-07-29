@@ -554,27 +554,39 @@ function ModelCostTable({ rows }) {
   );
 }
 
+const AUDIT_PAGE_SIZE = 50;
+
 export function Audit() {
   const [rows, setRows] = useState([]);
   const [action, setAction] = useState("");
   const [userId, setUserId] = useState("");
   const [msg, setMsg] = useState("");
+  const [hasMore, setHasMore] = useState(false);
+  const [loadingMore, setLoadingMore] = useState(false);
   const requestGateRef = useRef(null);
   if (!requestGateRef.current) requestGateRef.current = createLatestRequestGate();
 
-  function load() {
+  function load(options = {}) {
+    const append = options?.append === true;
     const requestGeneration = requestGateRef.current.begin();
-    const p = [];
+    const p = [`limit=${AUDIT_PAGE_SIZE}`, `offset=${append ? rows.length : 0}`];
     if (action) p.push(`action=${encodeURIComponent(action)}`);
     if (userId) p.push(`user_id=${encodeURIComponent(userId)}`);
-    const qs = p.length ? `?${p.join("&")}` : "";
     setMsg("");
-    api.adminAudit(qs)
+    if (append) setLoadingMore(true);
+    api.adminAudit(`?${p.join("&")}`)
       .then((nextRows) => {
-        if (requestGateRef.current.isCurrent(requestGeneration)) setRows(nextRows);
+        if (!requestGateRef.current.isCurrent(requestGeneration)) return;
+        setRows((prev) => (append
+          ? [...prev, ...nextRows.filter((row) => !prev.some((item) => item.id === row.id))]
+          : nextRows));
+        setHasMore(nextRows.length === AUDIT_PAGE_SIZE);
       })
       .catch((e) => {
         if (requestGateRef.current.isCurrent(requestGeneration)) setMsg(e.message);
+      })
+      .finally(() => {
+        if (requestGateRef.current.isCurrent(requestGeneration)) setLoadingMore(false);
       });
   }
   useEffect(() => {
@@ -612,6 +624,23 @@ export function Audit() {
           </tbody>
         </table>
       </div>
+      {rows.length > 0 && (
+        <div className="mt-4 flex items-center justify-center gap-3 text-xs text-fog">
+          <span>已显示 {rows.length} 条审计记录</span>
+          {hasMore ? (
+            <button
+              type="button"
+              onClick={() => load({ append: true })}
+              disabled={loadingMore}
+              className="btn-secondary btn-sm"
+            >
+              {loadingMore ? "加载中…" : "加载更多"}
+            </button>
+          ) : (
+            <span>已全部加载</span>
+          )}
+        </div>
+      )}
     </Card>
   );
 }

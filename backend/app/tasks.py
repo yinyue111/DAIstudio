@@ -424,7 +424,7 @@ def parse_url_task(parse_id: int) -> None:
 
 # API and Celery worker processes import different entrypoints. Registering at
 # task-module import gives workers the same production handlers as FastAPI.
-from .services.workflow_node_adapters import (  # noqa: E402
+from .workflow_adapter_wiring import (  # noqa: E402
     register_production_workflow_adapters,
 )
 

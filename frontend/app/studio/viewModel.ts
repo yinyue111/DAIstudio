@@ -13,6 +13,7 @@ import {
 } from "./helpers";
 import { shouldBlockNewGeneration } from "./taskConcurrency";
 import { studioQuoteRequestFingerprint } from "./generationQuote";
+import { registerReversePrecisionOptions } from "./reverseConfig";
 
 const DEFAULT_REVERSE_VIDEO_PRESET_COSTS = { fast: 5, standard: 5, fine: 5, ultra: 5 };
 
@@ -68,12 +69,16 @@ export function buildStudioDerivedViewState({
   vDuration,
   vResolution,
   videoAnalysisPreset,
+  reverseConfig,
 }) {
   const blockingGeneration = shouldBlockNewGeneration(task, category);
   const running = blockingGeneration;
   const reverseCost = cfg?.models?.vision?.cost_credits || 0;
   const reverseImageCost = cfg?.reverse?.image_cost ?? reverseCost;
   const reverseVideoPresets = Array.isArray(cfg?.reverse?.video_presets) ? cfg.reverse.video_presets : [];
+  // 把服务端下发的精度档位登记为全局白名单，保证校验、批量下拉与后端枚举一致；
+  // 该函数在拿到空列表时不做任何事，兜底仍是 reverseConfig.ts 内与后端一致的常量。
+  registerReversePrecisionOptions(reverseVideoPresets);
   const reverseVideoPreset = reverseVideoPresets.find((p) => p.key === videoAnalysisPreset) || reverseVideoPresets[0] || null;
   const reverseVideoFrameCount = Number(reverseVideoPreset?.max_frames || cfg?.reverse?.video_frame_count || 1);
   const reverseVideoMaxCost = reverseVideoPreset?.max_cost
@@ -81,7 +86,14 @@ export function buildStudioDerivedViewState({
     ?? DEFAULT_REVERSE_VIDEO_PRESET_COSTS[videoAnalysisPreset]
     ?? DEFAULT_REVERSE_VIDEO_PRESET_COSTS.standard;
   const reverseTargetsVideo = category === "video";
-  const selectedReverseCost = reverseTargetsVideo ? reverseVideoMaxCost : reverseImageCost;
+  const reverseAudioSurcharge = reverseTargetsVideo
+    && selected?.type === "video"
+    && Boolean(reverseConfig?.include_audio)
+    ? Number(cfg?.reverse?.audio_surcharge || 0)
+    : 0;
+  const selectedReverseCost = reverseTargetsVideo
+    ? Number(reverseVideoMaxCost) + reverseAudioSurcharge
+    : reverseImageCost;
   const selectedReverseCostLabel = reverseTargetsVideo && selected?.type === "image"
     ? selectedReverseCost === reverseImageCost
       ? `${reverseImageCost}积分`

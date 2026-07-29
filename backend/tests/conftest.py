@@ -99,6 +99,14 @@ def create_test_schema():
     yield
 
 
+@pytest.fixture(autouse=True)
+def reset_test_database(create_test_schema):
+    """Keep integration tests independent when the full suite runs in one process."""
+    with engine.begin() as connection:
+        for table in reversed(Base.metadata.sorted_tables):
+            connection.execute(table.delete())
+
+
 @pytest.fixture()
 def client():
     with TestClient(app) as c:
@@ -299,3 +307,18 @@ def tiny_mp4():
         )
         with open(out, "rb") as f:
             return f.read()
+
+
+@pytest.fixture()
+def uploaded_video_url(client, tiny_mp4):
+    """Upload a valid locally owned video and return its API asset URL."""
+    def _upload(headers):
+        response = client.post(
+            "/api/uploads/video",
+            files={"file": ("source.mp4", tiny_mp4, "video/mp4")},
+            headers=headers,
+        )
+        assert response.status_code == 200, response.text
+        return response.json()["url"]
+
+    return _upload

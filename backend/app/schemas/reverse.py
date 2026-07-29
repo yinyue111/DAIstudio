@@ -662,6 +662,10 @@ class ReverseBatchOut(BaseModel):
     status: ReverseBatchStatus
     status_counts: ReverseBatchStatusCounts
     total_count: int = Field(ge=1, le=20)
+    # 批级费用（各子项 ReverseOperation 求和，serialize_batch 下发）。
+    # 缺少这两个字段时 pydantic 会把 serialize_batch 的输出静默剥离。
+    cost_frozen: int = 0
+    cost_settled: int = 0
     cancel_requested: bool = False
     items: list[ReverseBatchItemOut] = Field(default_factory=list)
     created_at: UtcDateTime | None = None

@@ -1,0 +1,83 @@
+import AssetWindowControls from "../../components/AssetWindowControls";
+import StudioResults from "./StudioResults";
+
+export default function StudioResultsSection({
+  resultsRef,
+  task,
+  runningSnapshot,
+  showRunningProgress,
+  trackingLost,
+  backgroundTasks,
+  submitting,
+  works,
+  lightbox,
+  setLightbox,
+  busyAssetIds,
+  refreshActiveTask,
+  cancelActiveTask,
+  taskEtaText,
+  worksError,
+  loadWorks,
+  dismissBackgroundTask,
+  cancelBackgroundTask,
+  unlock,
+  download,
+  createImageVariation,
+  selected,
+  generationReverseOperationId,
+  generationReverseRevisionId,
+  selectedGenerationModelConfigId,
+  reproductionVideoComposition,
+  requestQuoteConfirmation,
+  handleReproductionCorrectionCreated,
+  handleReproductionRemediationCreated,
+  handleReproductionRemediationExecutionSubmitted,
+  reproductionAssessmentEnabled,
+  worksWindow,
+}) {
+  return (
+    <>
+      <StudioResults
+        ref={resultsRef}
+        task={task}
+        runningSnapshot={runningSnapshot}
+        showRunningProgress={showRunningProgress}
+        trackingLost={trackingLost}
+        backgroundTasks={backgroundTasks}
+        submitting={submitting}
+        works={works}
+        lightbox={lightbox}
+        setLightbox={setLightbox}
+        busyAssetIds={busyAssetIds}
+        onRefreshActiveTask={refreshActiveTask}
+        onCancelTask={cancelActiveTask}
+        taskEtaText={taskEtaText}
+        worksError={worksError}
+        onReloadWorks={() => loadWorks()}
+        onDismissBackgroundTask={dismissBackgroundTask}
+        onCancelBackgroundTask={cancelBackgroundTask}
+        onUnlock={unlock}
+        onDownload={download}
+        onVariation={createImageVariation}
+        sourceAsset={selected}
+        reverseOperationId={generationReverseOperationId}
+        reverseRevisionId={generationReverseRevisionId}
+        reproductionModelConfigId={selectedGenerationModelConfigId}
+        reproductionVideoComposition={reproductionVideoComposition}
+        requestQuoteConfirmation={requestQuoteConfirmation}
+        onReproductionCorrectionCreated={handleReproductionCorrectionCreated}
+        onReproductionRemediationCreated={handleReproductionRemediationCreated}
+        onReproductionRemediationExecutionSubmitted={handleReproductionRemediationExecutionSubmitted}
+        reproductionAssessmentEnabled={reproductionAssessmentEnabled}
+      />
+      <AssetWindowControls
+        totalCount={worksWindow.totalCount}
+        visibleCount={worksWindow.visibleCount}
+        initialCount={worksWindow.initialCount}
+        hasMore={worksWindow.hasMore}
+        onShowMore={worksWindow.showMore}
+        onReset={worksWindow.reset}
+      />
+    </>
+  );
+}

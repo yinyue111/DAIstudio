@@ -45,7 +45,7 @@ class AssetUnlockIn(BaseModel):
 class UserAssetItem(BaseModel):
     asset_ref: str
     origin: Literal["generated", "uploaded", "fetched"]
-    type: Literal["image", "video"]
+    type: Literal["image", "video", "audio"]
     url: str | None = None
     preview_url: str | None = None
     thumb: str | None = None
@@ -80,6 +80,7 @@ class UserAssetStats(BaseModel):
     fetched: int = 0
     images: int = 0
     videos: int = 0
+    audios: int = 0
     favorites: int = 0
     retained: int = 0
 
@@ -223,6 +224,13 @@ class AssetFolderItemOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     asset_ref: str
+    # 可读展示字段：由素材库统一视图批量填充；素材失效时保持 None / available=False
+    type: Literal["image", "video", "audio"] | None = None
+    url: str | None = None
+    preview_url: str | None = None
+    thumb: str | None = None
+    filename: str | None = None
+    available: bool = False
     created_at: UtcDateTime | None = None
 
 

@@ -14,6 +14,11 @@ from ..db import SessionLocal
 from ..models import GenAsset, GenTask
 from . import credits, gateway, locks, storage, usage, video_frames
 from .config_store import get_model_config
+from .content_safety import (
+    MediaModerationRejected,
+    MediaModerationUnavailable,
+    assert_generated_media_allowed,
+)
 from .generation_common import (
     fail_and_refund,
     mark_needs_review,
@@ -603,6 +608,32 @@ def finalize_video_success(
         if video_frames.FFPROBE and not media_meta.get("width"):
             unlink_keys(written_keys)
             raise VideoResultValidationError("视频网关返回的不是有效视频(无视频流)")
+        # 先审后发:生成产出机审挂载点(视频)。开关关闭时零开销直通;拒绝/需
+        # 复审/审核不可用(fail-closed)时清理已落盘文件并转 needs_review 对账
+        # ——供应商已报成功,冻结积分留待管理员裁决,未过审视频绝不曝光给用户。
+        try:
+            moderation_cap = max(
+                0,
+                int(getattr(settings, "media_moderation_http_max_inline_bytes", 10 * 1024 * 1024)),
+            )
+            media_path = storage.local_path(media_key)
+            media_size = int(media_path.stat().st_size)
+            assert_generated_media_allowed(
+                db,
+                task_id=task_id,
+                user_id=task_user_id,
+                media_type="video",
+                data=media_path.read_bytes() if media_size <= moderation_cap else None,
+                url=(
+                    storage.presigned_download_url(media_key, expires=600)
+                    if media_size > moderation_cap and storage.is_object_storage_enabled()
+                    else None
+                ),
+                mime_type="video/mp4",
+            )
+        except (MediaModerationRejected, MediaModerationUnavailable) as e:
+            unlink_keys(written_keys)
+            raise VideoResultValidationError(f"内容安全审核未通过:{e.detail}") from e
         if task_stage == "final":
             # gate full video behind unlock; poster = the source first frame
             hd_url = local

@@ -10,6 +10,7 @@ from sqlalchemy import select
 
 from app.db import SessionLocal
 from app.models import (
+    AssetFolderItem,
     AuditLog,
     GenAsset,
     GenTask,
@@ -472,6 +473,64 @@ def test_asset_folder_move_cycle_and_delete_preserve_assets(client, make_user, a
         db.close()
 
 
+def test_asset_folder_detail_items_expose_readable_media_fields(client, make_user, auth):
+    owner_id = make_user("13710000811", balance=100)
+    headers = auth("13710000811")
+    _, _asset_id, asset_ref = _generated_asset(owner_id)
+
+    created = client.post(
+        "/api/asset-folders",
+        headers=headers,
+        json={"name": "可读展示"},
+    )
+    assert created.status_code == 201, created.text
+    folder_id = int(created.json()["id"])
+
+    moved = client.post(
+        f"/api/asset-folders/{folder_id}/assets",
+        headers=headers,
+        json={"asset_refs": [asset_ref]},
+    )
+    assert moved.status_code == 200, moved.text
+
+    # 项目/文件夹链接可能比素材保留期活得更久：直接落一条失效引用
+    dangling_ref = user_assets.generated_asset_ref(999_999)
+    db = SessionLocal()
+    try:
+        db.add(AssetFolderItem(folder_id=folder_id, user_id=owner_id, asset_ref=dangling_ref))
+        db.commit()
+    finally:
+        db.close()
+
+    detail = client.get(f"/api/asset-folders/{folder_id}", headers=headers)
+    assert detail.status_code == 200, detail.text
+    payload = detail.json()
+    assert payload["item_count"] == 2
+    by_ref = {row["asset_ref"]: row for row in payload["items"]}
+    assert set(by_ref) == {asset_ref, dangling_ref}
+
+    valid = by_ref[asset_ref]
+    assert valid["type"] == "image"
+    assert valid["available"] is True
+    assert valid["url"] == "https://cdn.example.com/project-hd.png"
+    assert valid["preview_url"] == "https://cdn.example.com/project.png"
+    assert valid["thumb"] == "https://cdn.example.com/project.png"
+    assert valid["created_at"] is not None
+
+    dangling = by_ref[dangling_ref]
+    assert dangling["available"] is False
+    assert dangling["type"] is None
+    assert dangling["url"] is None
+    assert dangling["thumb"] is None
+
+    # 列表视图仍是轻量结构：不带条目明细，但计数完整
+    listed = client.get("/api/asset-folders", headers=headers)
+    assert listed.status_code == 200, listed.text
+    row = next(item for item in listed.json() if int(item["id"]) == folder_id)
+    assert row["items"] == []
+    assert row["item_count"] == 2
+
+
 def test_project_asset_tags_exact_duplicates_and_image_similarity(
     client,
     make_user,
@@ -573,7 +632,10 @@ def test_project_asset_similarity_reports_external_and_video_degradation(
     assert video["status"] == "degraded"
     assert video["exact_available"] is True
     assert video["perceptual_available"] is False
-    assert "暂不支持感知相似" in video["message"]
+    # 视频感知哈希已实现（会真的尝试抽帧算指纹），抽帧不可用时降级为精确匹配。
+    # 文案从早期的"暂不支持感知相似"改为说明"为什么不可用"，这里跟随实现。
+    assert "视频感知指纹不可用" in video["message"]
+    assert "SHA-256 精确重复检测" in video["message"]
     assert any(
         row["asset_ref"] == video_duplicate_ref and row["match_type"] == "exact"
         for row in video["matches"]

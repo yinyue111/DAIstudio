@@ -2,14 +2,25 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { readStudioSource } from "./studio-source.mjs";
 
 const sessionState = await import("../lib/studioSession.js").catch(() => ({}));
 const root = dirname(dirname(fileURLToPath(import.meta.url)));
-const pageSource = readFileSync(join(root, "app/page.jsx"), "utf8");
+const pageSource = readStudioSource(root);
+const ownerSessionSource = [
+  readFileSync(join(root, "hooks/useStudioOwnerSession.js"), "utf8"),
+  readFileSync(join(root, "hooks/studioOwnerRestore.js"), "utf8"),
+].join("\n");
+const variationActionsSource = readFileSync(join(root, "hooks/useStudioVariationActions.js"), "utf8");
 const taskTrackingSource = readFileSync(join(root, "hooks/useTaskTracking.js"), "utf8");
 const mediaUploadSource = readFileSync(join(root, "hooks/useMediaUpload.js"), "utf8");
 const referenceParsingSource = readFileSync(join(root, "hooks/useReferenceParsing.js"), "utf8");
 const generationSubmitSource = readFileSync(join(root, "hooks/useGenerationSubmit.js"), "utf8");
+const assetActionsSource = readFileSync(join(root, "hooks/useAssetActions.js"), "utf8");
+const taskDomainSource = readFileSync(join(root, "hooks/studio/useStudioTaskDomain.js"), "utf8");
+const reverseDomainSource = readFileSync(join(root, "hooks/studio/useStudioReverseDomain.js"), "utf8");
+const referenceDomainSource = readFileSync(join(root, "hooks/studio/useStudioReferenceDomain.js"), "utf8");
+const generationDomainSource = readFileSync(join(root, "hooks/studio/useStudioGenerationDomain.js"), "utf8");
 const promptsSource = readFileSync(join(root, "app/prompts/page.jsx"), "utf8");
 const historySource = readFileSync(join(root, "app/history/page.jsx"), "utf8");
 const profileSource = readFileSync(join(root, "app/profile/page.jsx"), "utf8");
@@ -38,24 +49,29 @@ assert.equal(
   "function",
   "studio drafts need an authenticated user-scoped storage writer",
 );
-assert.match(pageSource, /saveStudioUserDraft\(/, "Studio should persist session drafts through the user-scoped writer");
+assert.match(ownerSessionSource, /saveStudioUserDraft\(/, "Studio should persist session drafts through the user-scoped writer");
 assert.match(
-  pageSource,
-  /localDraft\s*=\s*readStudioUserDraft\(window\.localStorage,\s*STUDIO_SESSION_DRAFT_KEY,\s*u\?\.id\)/,
+  ownerSessionSource,
+  /normalizeRestoredVideoPrompt\([\s\S]*?mergeStudioWorkspaceLayers/,
+  "Studio should migrate untouched legacy video prompts before restoring them",
+);
+assert.match(
+  ownerSessionSource,
+  /localDraft\s*=\s*readStudioUserDraft\(window\.localStorage,\s*STUDIO_SESSION_DRAFT_KEY,\s*userId\)/,
   "Studio should read the authenticated user's local draft without consuming it before cloud loading finishes",
 );
 assert.doesNotMatch(
-  pageSource,
+  ownerSessionSource,
   /localDraft\s*=\s*takeStudioUserDraft\(/,
   "Studio initialization must not consume the local draft before it has been applied",
 );
 assert.doesNotMatch(
-  pageSource,
+  ownerSessionSource,
   /localStorage\.setItem\(STUDIO_SESSION_DRAFT_KEY/,
   "Studio must not write the legacy global session-draft key",
 );
 assert.doesNotMatch(
-  pageSource,
+  ownerSessionSource,
   /localStorage\.getItem\(STUDIO_SESSION_DRAFT_KEY/,
   "Studio must not restore the legacy global session-draft key",
 );
@@ -182,22 +198,22 @@ for (const [name, source] of [
   );
 }
 assert.match(
-  pageSource,
+  assetActionsSource,
   /createStudioOwnerRequestContext/,
   "Studio asset actions must use the shared executable owner request context",
 );
 assert.match(
-  pageSource,
+  assetActionsSource,
   /async function unlock[\s\S]*?\.capture\(\)[\s\S]*?await requestQuoteConfirmation[\s\S]*?ownerRequest\.isCurrent\(\)[\s\S]*?api\.unlock[\s\S]*?ownerRequest\.commit/,
   "asset unlock must capture the owner before quote confirmation and commit through the shared guard",
 );
 assert.match(
-  pageSource,
-  /setTask\(\s*\(prev\)\s*=>\s*prev\?\.id\s*===\s*capturedTaskId\s*\?\s*nextTask\s*:\s*prev\s*,?\s*\)/,
+  assetActionsSource,
+  /setTask\(\s*\((?:prev|previous)\)\s*=>\s*(?:prev|previous)\?\.id\s*===\s*capturedTaskId\s*\?\s*nextTask\s*:\s*(?:prev|previous)\s*,?\s*\)/,
   "unlock task refresh must not replace a newer task for the same owner",
 );
 assert.match(
-  pageSource,
+  assetActionsSource,
   /async function download[\s\S]*?\.capture\(\)[\s\S]*?await downloadBlob[\s\S]*?ownerRequest\.commit/,
   "asset download must not write messages or busy state after its owner becomes stale",
 );
@@ -211,7 +227,7 @@ assert.match(mediaUploadSource, /resetOwnerMediaUpload/, "media upload must inva
 assert.match(referenceParsingSource, /resetOwnerReferenceParsing/, "reference parsing must invalidate pending owner requests");
 assert.match(generationSubmitSource, /resetOwnerGenerationSubmit/, "generation submit must invalidate pending owner requests");
 assert.match(
-  pageSource,
+  ownerSessionSource,
   /createLatestOnlyStudioOwnerRequest\(\s*\(\)\s*=>\s*studioOwnerSessionRef\.current\s*,?\s*\)/,
   "Studio should guard current-user refreshes with the active owner session",
 );
@@ -220,6 +236,7 @@ for (const resetName of [
   "resetOwnerMediaUpload",
   "resetOwnerReferenceParsing",
   "resetOwnerGenerationSubmit",
+  "resetOwnerAssetActions",
 ]) {
   assert.match(
     pageSource,
@@ -227,11 +244,21 @@ for (const resetName of [
     `Studio owner reset must call ${resetName} synchronously`,
   );
 }
-assert.equal(
-  (pageSource.match(/getOwnerSession:\s*\(\)\s*=>\s*studioOwnerSessionRef\.current/g) || []).length,
-  4,
-  "all four owner-sensitive hooks must receive the current Studio owner session",
-);
+for (const [hookName, source] of [
+  ["useTaskTracking", taskDomainSource],
+  ["useShotGeneration", taskDomainSource],
+  ["useReproductionActions", taskDomainSource],
+  ["useAssetActions", taskDomainSource],
+  ["useReferenceParsing", reverseDomainSource],
+  ["useMediaUpload", referenceDomainSource],
+  ["useGenerationSubmit", generationDomainSource],
+]) {
+  assert.match(
+    source,
+    new RegExp(`${hookName}\\(\\{[\\s\\S]*?getOwnerSession(?:\\s*:\\s*foundation\\.getOwnerSession)?[,]`),
+    `${hookName} must receive the shared Studio owner session accessor`,
+  );
+}
 assert.equal(
   typeof sessionState.mergeStudioLiveDraftState,
   "function",
@@ -1070,14 +1097,14 @@ assert.equal(
   );
 }
 
-assert.match(pageSource, /mergeStudioWorkspaceLayers\(/, "Studio page must use the deterministic merge helper");
+assert.match(ownerSessionSource, /mergeStudioWorkspaceLayers\(/, "Studio owner session must use the deterministic merge helper");
 assert.match(pageSource, /Promise\.allSettled\(/, "me and config response order must not determine initialization state");
-const localDraftReadIndex = pageSource.indexOf(
-  "localDraft = readStudioUserDraft(window.localStorage, STUDIO_SESSION_DRAFT_KEY, u?.id)",
+const localDraftReadIndex = ownerSessionSource.indexOf(
+  "localDraft = readStudioUserDraft(window.localStorage, STUDIO_SESSION_DRAFT_KEY, userId)",
 );
-const cloudDraftReadIndex = pageSource.indexOf('const row = await api.getDraft("studio")');
-const localDraftRemoveIndex = pageSource.indexOf(
-  "removeStudioUserDraft(window.localStorage, STUDIO_SESSION_DRAFT_KEY, u?.id)",
+const cloudDraftReadIndex = ownerSessionSource.indexOf('const row = await api.getDraft("studio")');
+const localDraftRemoveIndex = ownerSessionSource.indexOf(
+  "removeStudioUserDraft(window.localStorage, STUDIO_SESSION_DRAFT_KEY, user?.id)",
 );
 assert.ok(
   localDraftReadIndex >= 0
@@ -1085,103 +1112,107 @@ assert.ok(
     && localDraftRemoveIndex > cloudDraftReadIndex,
   "the local Studio draft should only be removed after the cloud request returns and the draft is applied",
 );
-assert.match(pageSource, /createLatestOnlyDraftWriter\(/, "both Studio cloud-save paths should share a serialized writer");
+assert.match(ownerSessionSource, /createLatestOnlyDraftWriter\(/, "both Studio cloud-save paths should share a serialized writer");
 assert.match(
-  pageSource,
+  ownerSessionSource,
   /studioDraftClockRef\.current\s*=\s*createStudioDraftClock\(\)/,
   "each Home instance should lazily create its own Studio draft clock",
 );
 assert.match(
-  pageSource,
+  ownerSessionSource,
   /studioOwnerSessionCoordinatorRef\.current\s*=\s*createStudioOwnerSessionCoordinator\(/,
   "Home should connect owner lifecycle work to the executable coordinator",
 );
 assert.doesNotMatch(
-  pageSource,
+  ownerSessionSource,
   /lastStudioDraftSavedAtRef|nextStudioDraftSavedAt|observeStudioRestoreSavedAt/,
   "the Studio page must not retain the module-shared draft-clock helpers or a separate numeric ref",
 );
 assert.match(
-  pageSource,
+  ownerSessionSource,
   /cloudDraftWriterRef\.current\.setOwner\(ownerUserId\)/,
   "the cloud writer should bind pending writes to the authenticated owner",
 );
 assert.match(
-  pageSource,
+  ownerSessionSource,
   /cloudDraftWriterRef\.current\.cancelOwner\(ownerUserId\)/,
   "owner changes and unmount cleanup should cancel the old owner's pending writes",
 );
 assert.match(
-  pageSource,
+  ownerSessionSource,
   /cloudDraftWriterRef\.current\([^,]+,\s*me\?\.id\)/,
   "every cloud draft enqueue should carry the owner identity",
 );
-assert.match(pageSource, /mergeStudioLiveDraftState\(/, "Studio initialization should preserve live field edits");
-assert.match(pageSource, /canApplyStudioPromptTransfer\(/, "prompt transfer should be guarded by its baseline");
-assert.match(pageSource, /applyStudioVariationTransferState\(/, "variation transfer should be guarded atomically");
+assert.match(ownerSessionSource, /mergeStudioLiveDraftState\(/, "Studio initialization should preserve live field edits");
+assert.match(ownerSessionSource, /canApplyStudioPromptTransfer\(/, "prompt transfer should be guarded by its baseline");
 assert.match(
-  pageSource,
+  variationActionsSource,
+  /applyStudioVariationTransferState\(/,
+  "variation transfer should be guarded atomically",
+);
+assert.match(
+  ownerSessionSource,
   /const seq = \+\+studioInitSeqRef\.current;[\s\S]*?cancelScheduled\(\);[\s\S]*?cloudDraftLoadedRef\.current = false;/,
   "owner changes should invalidate prior initialization and automatic sync work",
 );
 assert.match(
-  pageSource,
+  ownerSessionSource,
   /const ownerSession = studioOwnerSessionCoordinatorRef\.current\.bindOwner\(me\?\.id,\s*seq\)/,
   "each initialization generation should receive a scoped owner session",
 );
 assert.match(
-  pageSource,
-  /ownerSession\.commit\(\(\) => \{[\s\S]*?ownerSession\.observeRestore\(\{[\s\S]*?promptTransferApplied,[\s\S]*?variationTransferApplied,/,
+  ownerSessionSource,
+  /ownerSession\.commit\(\(\) => \{[\s\S]*?ownerSession\.observeRestore\(\{[\s\S]*?promptTransferApplied:\s*Boolean\([\s\S]*?variationTransferApplied,/,
   "the scoped initialization clock should observe every adopted restore source",
 );
 assert.match(
-  pageSource,
-  /resetStudioOwnerWorkspace\([\s\S]*?initializeStudioOwnerSession\(me,\s*ownerSession/,
+  ownerSessionSource,
+  /resetStudioOwnerWorkspace\(baseline\)[\s\S]*?initializeStudioOwnerSession\(\{[\s\S]*?user:\s*me,[\s\S]*?ownerSession,/,
   "switching owners should clear the prior workspace before restoring the new owner",
 );
 assert.match(
-  pageSource,
+  ownerSessionSource,
   /studioOwnerSessionCoordinatorRef\.current\.schedule\(ownerSession,[\s\S]*?syncStudioDraftToCloud/,
   "automatic cloud sync should be guarded by the current owner session",
 );
 assert.doesNotMatch(
-  pageSource,
+  ownerSessionSource,
   /draftSyncTimerRef|window\.setTimeout\(\(\) => \{\s*syncStudioDraftToCloud/,
   "Home must not retain an unguarded cross-owner draft sync timer",
 );
 assert.match(
-  pageSource,
+  ownerSessionSource,
   /const savedAt = studioDraftClockRef\.current\.next\(\)/,
   "Studio saves should issue timestamps from the instance draft clock",
 );
 assert.match(
-  pageSource,
-  /const checkpoint = buildStudioSessionDraftFromState\([\s\S]*?saveStudioUserDraft\([\s\S]*?STUDIO_SESSION_DRAFT_KEY[\s\S]*?if \(checkpointSaved\) \{[\s\S]*?removeStudioUserDraft\(window\.localStorage, STUDIO_DRAFT_PROMPT_KEY, u\?\.id\);/,
+  ownerSessionSource,
+  /const checkpoint = buildStudioSessionDraftFromState\([\s\S]*?saveStudioUserDraft\([\s\S]*?STUDIO_SESSION_DRAFT_KEY[\s\S]*?if \(checkpointSaved\) \{[\s\S]*?removeStudioUserDraft\(window\.localStorage, STUDIO_DRAFT_PROMPT_KEY, user\?\.id\);/,
   "the one-shot prompt intent should only be consumed after its adopted state is checkpointed",
 );
 assert.match(
-  pageSource,
-  /const promptTransferPresent = !!promptDraft;[\s\S]*?if \(!promptTransferPresent && variationDraft\)/,
+  ownerSessionSource,
+  /if \(!promptDraft && variationDraft\)/,
   "a prompt intent should take precedence over any retained variation intent",
 );
 assert.match(
-  pageSource,
+  ownerSessionSource,
   /setUnauthorizedHandler\(\(\)\s*=>\s*saveStudioSessionDraft\("auth_expired",\s*\{\s*persistCloud:\s*false\s*\}\)\)/,
   "the 401 handler must save locally without calling the protected cloud draft endpoint again",
 );
 assert.match(
-  pageSource,
+  ownerSessionSource,
   /if\s*\(persistCloud\s*&&\s*me\?\.id\)/,
   "cloud draft persistence must be explicitly gated off during unauthorized handling",
 );
 
 for (const [label, source, key] of [
-  ["Studio prompt transfer", pageSource, "STUDIO_DRAFT_PROMPT_KEY"],
-  ["Studio variation transfer", pageSource, "STUDIO_VARIATION_DRAFT_KEY"],
+  ["Studio prompt transfer", ownerSessionSource, "STUDIO_DRAFT_PROMPT_KEY"],
+  ["Studio variation transfer", ownerSessionSource, "STUDIO_VARIATION_DRAFT_KEY"],
 ]) {
   assert.match(
     source,
-    new RegExp(`readStudioUserDraft\\(window\\.localStorage,\\s*${key},\\s*u\\?\\.id\\)`),
+    new RegExp(`readStudioUserDraft\\(window\\.localStorage,\\s*${key},\\s*userId\\)`),
     `${label} must only restore the authenticated user's draft`,
   );
 }

@@ -15,6 +15,7 @@ from ..schemas import (
     QuotaGrantIn,
     UserOut,
 )
+from ..schemas.billing import QuotaDeductIn, QuotaDeductOut
 from ..services import audit, credits, locks
 from .admin_helpers import assert_quota_grant_limits as _assert_quota_grant_limits
 from .admin_helpers import lock_admin_quota_serialization as _lock_admin_quota_serialization
@@ -26,6 +27,7 @@ from .admin_helpers import (
     reserve_quota_bulk_grant_idempotency as _reserve_quota_bulk_grant_idempotency,
 )
 from .admin_helpers import reserve_quota_grant_idempotency as _reserve_quota_grant_idempotency
+from .admin_helpers import setting_int as _setting_int
 
 router = APIRouter()
 
@@ -108,6 +110,109 @@ def grant_quota(
         detail={"amount": body.amount, "note": note, "idempotency_key": idem_key},
     )
     return user
+
+
+@router.post("/quota/deduct", response_model=QuotaDeductOut)
+def deduct_quota(
+    body: QuotaDeductIn,
+    db: Session = Depends(get_db),
+    admin: User = Depends(require_admin),
+    request: Request = None,
+):
+    """管理端积分扣减/冲正(批量发放填错等场景)。
+
+    必须走 credit_transactions 流水,禁止直改余额。余额列带非负约束,
+    不允许负余额:余额不足默认拒绝,allow_partial=true 时扣到 0 为止。
+    """
+    single_limit = _setting_int(db, "admin_quota_grant_single_limit", 100000)
+    if body.amount > single_limit:
+        raise HTTPException(400, f"单次扣减额度不能超过 {single_limit}")
+    lock_key = f"admin:quota:grant:{admin.id}"
+    lock_token = _acquire_quota_advisory_lock(lock_key)
+    if lock_token is None:
+        raise HTTPException(409, "额度操作正在处理中,请稍后重试")
+    try:
+        _lock_admin_quota_serialization(db, admin.id)
+        # 幂等键复用 quota_grant 作用域(库表约束限定),加 deduct: 前缀区分;
+        # 金额记为负数,避免与同键的发放请求混淆。
+        idem_key = f"deduct:{body.idempotency_key.strip()}"
+        existing = db.execute(
+            select(AdminIdempotencyKey).where(
+                AdminIdempotencyKey.admin_id == admin.id,
+                AdminIdempotencyKey.scope == "quota_grant",
+                AdminIdempotencyKey.key == idem_key,
+            )
+        ).scalar_one_or_none()
+        if existing is not None:
+            if (
+                int(existing.target_user_id or 0) != int(body.user_id)
+                or int(existing.amount or 0) != -int(body.amount)
+                or (existing.note or "") != body.note
+            ):
+                raise HTTPException(409, "幂等键已用于不同的额度扣减请求")
+            user = db.get(User, body.user_id)
+            if not user:
+                raise HTTPException(404, "用户不存在")
+            return QuotaDeductOut(
+                user_id=user.id,
+                requested_amount=body.amount,
+                deducted_amount=0,
+                balance_credits=int(user.balance_credits or 0),
+                frozen_credits=int(user.frozen_credits or 0),
+            )
+        if not db.get(User, body.user_id):
+            raise HTTPException(404, "用户不存在")
+        db.add(
+            AdminIdempotencyKey(
+                admin_id=admin.id,
+                scope="quota_grant",
+                key=idem_key,
+                target_user_id=body.user_id,
+                amount=-body.amount,
+                note=body.note,
+            )
+        )
+        try:
+            user, deducted = credits.deduct(
+                db,
+                body.user_id,
+                body.amount,
+                note=body.note,
+                allow_partial=body.allow_partial,
+                commit=False,
+            )
+            db.commit()
+            db.refresh(user)
+        except credits.InsufficientCredits as e:
+            db.rollback()
+            raise HTTPException(400, str(e)) from e
+        except ValueError as e:
+            db.rollback()
+            raise HTTPException(400, str(e)) from e
+    finally:
+        _release_quota_advisory_lock(lock_key, lock_token)
+    audit.log(
+        db,
+        user_id=admin.id,
+        action="deduct_quota",
+        biz_type="admin",
+        biz_id=body.user_id,
+        ip=get_client_ip(request) if request else None,
+        detail={
+            "amount": body.amount,
+            "deducted": deducted,
+            "allow_partial": body.allow_partial,
+            "note": body.note,
+            "idempotency_key": idem_key,
+        },
+    )
+    return QuotaDeductOut(
+        user_id=user.id,
+        requested_amount=body.amount,
+        deducted_amount=deducted,
+        balance_credits=int(user.balance_credits or 0),
+        frozen_credits=int(user.frozen_credits or 0),
+    )
 
 
 @router.post("/quota/bulk-grant", response_model=QuotaBulkGrantOut)

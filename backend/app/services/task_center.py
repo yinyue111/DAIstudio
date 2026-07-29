@@ -577,6 +577,25 @@ def _workflow_action_state(
     )
 
 
+def _generation_cancel_unavailable_reason(task: GenTask) -> str | None:
+    """未终态但真实不可取消时，返回给前端展示的中文说明；可取消则返回 None。
+
+    视频任务一旦提交到外部网关（存在 external_task_id），网关只支持轮询查询、
+    不支持中途撤销，此时展示取消按钮只会让用户撞上 409。这里按真实可取消性
+    过滤动作，并给出诚实的解释文案。
+    """
+    if (
+        task.status in {"queued", "running"}
+        and task.category == "video"
+        and task.external_task_id
+    ):
+        return (
+            "视频任务已提交到外部网关，网关不支持中途取消；"
+            "请等待任务完成，若长时间无结果，系统会在超时后自动结束并退回冻结积分。"
+        )
+    return None
+
+
 def _generation_actions(
     task: GenTask,
     has_results: bool,
@@ -586,7 +605,8 @@ def _generation_actions(
 ) -> list[str]:
     actions = ["view"]
     if task.status in {"queued", "running"}:
-        actions.append("cancel")
+        if _generation_cancel_unavailable_reason(task) is None:
+            actions.append("cancel")
     elif task.status == "failed":
         params = task.params if isinstance(task.params, dict) else {}
         unknown_submit = bool(
@@ -683,6 +703,7 @@ def _generation_item(
         "cost_settled": max(0, int(task.cost_settled or 0)),
         "result_refs": result_refs,
         "available_actions": actions,
+        "cancel_unavailable_reason": _generation_cancel_unavailable_reason(task),
         "error_type": error_type,
         "error_message": task.error,
         "failure_suggestion": _failure_suggestion(

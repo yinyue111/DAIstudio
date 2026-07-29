@@ -123,6 +123,13 @@ class CreationRecipeVersionOut(BaseModel):
     created_at: UtcDateTime | None = None
 
 
+class CreationRecipeUsageStatsOut(BaseModel):
+    total: int = 0
+    unique_users: int = 0
+    by_event: dict[str, int] = Field(default_factory=dict)
+    last_used_at: UtcDateTime | None = None
+
+
 class CreationRecipeOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -140,6 +147,7 @@ class CreationRecipeOut(BaseModel):
     reviewed_at: UtcDateTime | None = None
     review_note: str | None = None
     version: CreationRecipeVersionOut | None = None
+    usage: CreationRecipeUsageStatsOut | None = None
     created_at: UtcDateTime | None = None
     updated_at: UtcDateTime | None = None
 

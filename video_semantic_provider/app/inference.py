@@ -8,12 +8,104 @@ from .config import ProviderSettings
 CONTRACT_VERSION = "video-semantic-evidence.v1"
 CAPABILITIES = ("subject_tracking", "pose", "action", "transition")
 ANALYZER = "opencv_motion_subject_tracker"
+POSE_ANALYZER = "mediapipe_pose_landmarker"
+_POSE_BBOX_MARGIN = 0.15
+_ACTION_UNSUPPORTED_REASON = (
+    "This provider does not include an action recognition model"
+)
 
 
 class SemanticEngine(Protocol):
     def health(self) -> dict[str, Any]: ...
 
     def analyze(self, frames: list[dict[str, Any]]) -> dict[str, Any]: ...
+
+
+class PoseAdapter(Protocol):
+    """Pose estimation adapter.
+
+    ``health()`` reports one of ``available``/``degraded``/``unsupported``.
+    ``estimate(image)`` returns normalized keypoints for one RGB frame, or an
+    empty list when no pose is detected — it must never invent keypoints.
+    """
+
+    def health(self) -> dict[str, Any]: ...
+
+    def estimate(self, image: Any) -> list[dict[str, Any]]: ...
+
+
+class DisabledPoseAdapter:
+    """Honest default: pose estimation is off, so pose stays unsupported."""
+
+    def health(self) -> dict[str, Any]:
+        return {
+            "status": "unsupported",
+            "analyzer": POSE_ANALYZER,
+            "analyzer_version": "unavailable",
+            "degraded_reason": "This provider does not include a pose estimation model",
+        }
+
+    def estimate(self, image: Any) -> list[dict[str, Any]]:
+        raise RuntimeError("pose estimation is disabled")
+
+
+class MediaPipePoseAdapter:
+    """Single-person pose keypoints from the bundled MediaPipe Pose model.
+
+    MediaPipe ships its model weights inside the pip package, so enabling this
+    adapter needs no external downloads. Until the dependency is installed the
+    adapter reports ``degraded`` and never fabricates keypoints.
+    """
+
+    def __init__(self, settings: ProviderSettings):
+        self.settings = settings
+
+    def health(self) -> dict[str, Any]:
+        try:
+            import mediapipe
+        except ImportError:
+            return {
+                "status": "degraded",
+                "analyzer": POSE_ANALYZER,
+                "analyzer_version": "unavailable",
+                "degraded_reason": "mediapipe is not installed",
+            }
+        return {
+            "status": "available",
+            "analyzer": POSE_ANALYZER,
+            "analyzer_version": f"mediapipe-{getattr(mediapipe, '__version__', 'unknown')}",
+            "degraded_reason": None,
+        }
+
+    def estimate(self, image: Any) -> list[dict[str, Any]]:
+        import mediapipe
+
+        with mediapipe.solutions.pose.Pose(
+            static_image_mode=True,
+            model_complexity=1,
+        ) as pose:
+            result = pose.process(image)
+        landmarks = getattr(result, "pose_landmarks", None)
+        if landmarks is None:
+            return []
+        keypoints: list[dict[str, Any]] = []
+        for index, landmark in enumerate(landmarks.landmark):
+            confidence = float(getattr(landmark, "visibility", 0.0) or 0.0)
+            if confidence < self.settings.pose_min_confidence:
+                continue
+            x = float(landmark.x)
+            y = float(landmark.y)
+            if not 0.0 <= x <= 1.0 or not 0.0 <= y <= 1.0:
+                continue
+            keypoints.append(
+                {
+                    "name": mediapipe.solutions.pose.PoseLandmark(index).name.lower(),
+                    "x": round(x, 6),
+                    "y": round(y, 6),
+                    "confidence": round(min(1.0, max(0.0, confidence)), 6),
+                }
+            )
+        return keypoints
 
 
 @dataclass(slots=True)
@@ -48,10 +140,24 @@ def _bbox(
 class OpenCvSemanticEngine:
     """Tracks only sustained moving image regions; it never assigns object classes."""
 
-    def __init__(self, settings: ProviderSettings):
+    def __init__(
+        self,
+        settings: ProviderSettings,
+        pose_adapter: PoseAdapter | None = None,
+    ):
         self.settings = settings
+        self.pose_adapter = pose_adapter or (
+            MediaPipePoseAdapter(settings)
+            if settings.pose_enabled
+            else DisabledPoseAdapter()
+        )
+
+    def _pose_status(self) -> str:
+        status = str(self.pose_adapter.health().get("status") or "unsupported")
+        return status if status in {"available", "degraded", "unsupported"} else "unsupported"
 
     def health(self) -> dict[str, Any]:
+        pose_status = self._pose_status()
         try:
             import cv2
             import numpy
@@ -63,7 +169,8 @@ class OpenCvSemanticEngine:
                 "degraded_reason": "OpenCV or NumPy is not installed",
                 "capability_statuses": {
                     "subject_tracking": "degraded",
-                    "pose": "unsupported",
+                    # 姿态证据依赖主体轨迹，主体跟踪降级时姿态同样不可用。
+                    "pose": "degraded" if pose_status == "available" else pose_status,
                     "action": "unsupported",
                     "transition": "degraded",
                 },
@@ -75,7 +182,7 @@ class OpenCvSemanticEngine:
             "degraded_reason": None,
             "capability_statuses": {
                 "subject_tracking": "available",
-                "pose": "unsupported",
+                "pose": pose_status,
                 "action": "unsupported",
                 "transition": "available",
             },
@@ -84,7 +191,10 @@ class OpenCvSemanticEngine:
     def analyze(self, frames: list[dict[str, Any]]) -> dict[str, Any]:
         health = self.health()
         if health["status"] != "available":
-            return _failure(str(health["degraded_reason"]))
+            return _failure(
+                str(health["degraded_reason"]),
+                pose_result=self._degraded_pose_result(str(health["degraded_reason"])),
+            )
         tracks = self._tracks(frames)
         transitions = self._transitions(frames)
         return {
@@ -99,16 +209,8 @@ class OpenCvSemanticEngine:
                     if tracks
                     else "No sustained moving regions were detected in sampled frames",
                 ),
-                "pose": _result(
-                    "unsupported",
-                    [],
-                    "This provider does not include a pose estimation model",
-                ),
-                "action": _result(
-                    "unsupported",
-                    [],
-                    "This provider does not include an action recognition model",
-                ),
+                "pose": self._pose_result(frames, tracks),
+                "action": _result("unsupported", [], _ACTION_UNSUPPORTED_REASON),
                 "transition": _result(
                     "analyzed" if transitions else "partial",
                     transitions,
@@ -118,6 +220,97 @@ class OpenCvSemanticEngine:
                 ),
             },
         }
+
+    def _degraded_pose_result(self, reason: str) -> dict[str, Any]:
+        pose_health = self.pose_adapter.health()
+        status = self._pose_status()
+        if status == "unsupported":
+            return _result(
+                "unsupported", [], str(pose_health.get("degraded_reason") or reason)
+            )
+        if status == "degraded":
+            return _result(
+                "degraded", [], str(pose_health.get("degraded_reason") or reason)
+            )
+        return _result("degraded", [], reason)
+
+    def _pose_result(
+        self, frames: list[dict[str, Any]], tracks: list[dict[str, Any]]
+    ) -> dict[str, Any]:
+        pose_health = self.pose_adapter.health()
+        status = self._pose_status()
+        if status != "available":
+            return _result(
+                status,
+                [],
+                str(
+                    pose_health.get("degraded_reason")
+                    or "pose estimation is unavailable"
+                ),
+            )
+        if not tracks:
+            return _result(
+                "partial",
+                [],
+                "No subject track is available to anchor pose evidence",
+            )
+        try:
+            rows = self._pose_rows(frames, tracks)
+        except Exception:  # noqa: BLE001 - degrade honestly, never guess keypoints
+            return _result("degraded", [], "pose estimation failed on sampled frames")
+        return _result(
+            "analyzed" if rows else "partial",
+            rows,
+            None
+            if rows
+            else "No pose matching a tracked subject was detected in sampled frames",
+        )
+
+    def _pose_rows(
+        self, frames: list[dict[str, Any]], tracks: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        by_key = {
+            (int(frame["source_segment_index"]), int(frame["frame_index"])): frame
+            for frame in frames
+        }
+        estimates: dict[tuple[int, int], list[dict[str, Any]]] = {}
+        rows: list[dict[str, Any]] = []
+        for track in tracks:
+            segment = int(track["source_segment_index"])
+            for observation in track["observations"]:
+                key = (segment, int(observation["frame_index"]))
+                frame = by_key.get(key)
+                if frame is None:
+                    continue
+                if key not in estimates:
+                    estimates[key] = self.pose_adapter.estimate(frame["image"])
+                keypoints = estimates[key]
+                if not keypoints:
+                    continue
+                # 只把姿态挂到确实覆盖它的运动主体上：关键点大多数必须落在
+                # 该轨迹的观测框（含容差）内，否则宁可不产出证据。
+                if not _pose_matches_bbox(keypoints, observation["bbox"]):
+                    continue
+                confidence = round(
+                    sum(item["confidence"] for item in keypoints) / len(keypoints), 6
+                )
+                rows.append(
+                    {
+                        "evidence_id": (
+                            f"pose-{track['evidence_id']}-{observation['frame_index']}"
+                        ),
+                        "source_segment_index": segment,
+                        "frame_index": int(observation["frame_index"]),
+                        "absolute_timestamp_seconds": float(
+                            observation["absolute_timestamp_seconds"]
+                        ),
+                        "subject_evidence_id": track["evidence_id"],
+                        "confidence": confidence,
+                        "keypoints": keypoints,
+                        "bbox": dict(observation["bbox"]),
+                    }
+                )
+        return rows
 
     def _tracks(self, frames: list[dict[str, Any]]) -> list[dict[str, Any]]:
         import cv2
@@ -283,29 +476,44 @@ class OpenCvSemanticEngine:
         return result
 
 
+def _pose_matches_bbox(
+    keypoints: list[dict[str, Any]], bbox: dict[str, Any]
+) -> bool:
+    if not keypoints:
+        return False
+    left = float(bbox["x"]) - _POSE_BBOX_MARGIN
+    top = float(bbox["y"]) - _POSE_BBOX_MARGIN
+    right = float(bbox["x"]) + float(bbox["width"]) + _POSE_BBOX_MARGIN
+    bottom = float(bbox["y"]) + float(bbox["height"]) + _POSE_BBOX_MARGIN
+    inside = sum(
+        1
+        for keypoint in keypoints
+        if left <= float(keypoint["x"]) <= right
+        and top <= float(keypoint["y"]) <= bottom
+    )
+    return inside * 2 >= len(keypoints)
+
+
 def _result(
     status: str, evidence: list[dict[str, Any]], reason: str | None
 ) -> dict[str, Any]:
     return {"status": status, "evidence": evidence, "degraded_reason": reason}
 
 
-def _failure(reason: str) -> dict[str, Any]:
+def _failure(reason: str, pose_result: dict[str, Any] | None = None) -> dict[str, Any]:
     return {
         "contract_version": CONTRACT_VERSION,
         "analyzer": ANALYZER,
         "analyzer_version": "unavailable",
         "capabilities": {
             "subject_tracking": _result("degraded", [], reason),
-            "pose": _result(
+            "pose": pose_result
+            or _result(
                 "unsupported",
                 [],
                 "This provider does not include a pose estimation model",
             ),
-            "action": _result(
-                "unsupported",
-                [],
-                "This provider does not include an action recognition model",
-            ),
+            "action": _result("unsupported", [], _ACTION_UNSUPPORTED_REASON),
             "transition": _result("degraded", [], reason),
         },
     }

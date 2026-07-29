@@ -6,6 +6,285 @@ import { reportBackgroundError } from "../../../lib/errorHandling";
 import { paymentPackageDiff, providerLabel } from "./admin-helpers";
 import { Card, PayInput, PaySecret, Th } from "./admin-ui";
 
+const ORDER_STATUS_TEXT = {
+  pending: "待支付",
+  paid: "已支付",
+  closed: "已关闭",
+  failed: "失败",
+  refunded: "已退款",
+};
+const INVOICE_STATUS_TEXT = {
+  none: "-",
+  requested: "待开票",
+  issued: "已开票",
+  rejected: "已驳回",
+};
+const ORDERS_PAGE_SIZE = 10;
+
+export function PaymentOrdersOps() {
+  const emptyQuery = { phone: "", order_no: "", provider_trade_no: "", status: "", created_from: "", created_to: "" };
+  const [query, setQuery] = useState(emptyQuery);
+  const [orders, setOrders] = useState({ items: [], total: 0, offset: 0 });
+  const [invoices, setInvoices] = useState({ items: [], total: 0, offset: 0 });
+  const [searched, setSearched] = useState(false);
+  const [busy, setBusy] = useState("");
+  const [msg, setMsg] = useState("");
+  const [msgKind, setMsgKind] = useState("ok");
+
+  function report(text, kind = "ok") {
+    setMsg(text);
+    setMsgKind(kind);
+  }
+
+  async function search(offset = 0) {
+    setBusy("search");
+    setMsg("");
+    try {
+      const params = { limit: ORDERS_PAGE_SIZE, offset };
+      Object.entries(query).forEach(([key, value]) => {
+        if (String(value || "").trim()) params[key] = String(value).trim();
+      });
+      const data = await api.adminPaymentOrders(params);
+      setOrders({ items: data.items || [], total: data.total || 0, offset });
+      setSearched(true);
+    } catch (e) {
+      report(e.message, "bad");
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function loadInvoices(offset = 0) {
+    try {
+      const data = await api.adminPaymentInvoices({ status: "requested", limit: ORDERS_PAGE_SIZE, offset });
+      setInvoices({ items: data.items || [], total: data.total || 0, offset });
+    } catch (e) {
+      report(e.message, "bad");
+    }
+  }
+  useEffect(() => { loadInvoices(0); }, []);
+
+  async function syncOrder(orderNo) {
+    if (!window.confirm(`向渠道查询订单 ${orderNo} 并按结果补单？\n渠道确认已支付会立即入账积分。`)) return;
+    setBusy(orderNo);
+    setMsg("");
+    try {
+      const data = await api.adminSyncPaymentOrder(orderNo);
+      const outcomeText = {
+        paid: "渠道确认已支付，已补单入账",
+        closed: "渠道确认已关闭，状态已同步",
+        failed: "渠道确认支付失败，状态已同步",
+        skipped: "渠道侧未支付或结果未知，本地状态未变更",
+        noop: "订单状态无变化（已入账或并发处理中）",
+      }[data.outcome] || data.outcome;
+      report(`订单 ${orderNo}：${outcomeText}`);
+      await search(orders.offset);
+    } catch (e) {
+      report(e.message, "bad");
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function refundOrder(order) {
+    const remaining = order.amount_cents - (order.refunded_amount_cents || 0);
+    const amountText = window.prompt(
+      `订单 ${order.order_no} 可退 ${(remaining / 100).toFixed(2)} 元。\n输入退款金额（元），留空表示全额退款：`,
+      "",
+    );
+    if (amountText === null) return;
+    let amountCents = null;
+    if (String(amountText).trim()) {
+      amountCents = Math.round(Number(amountText) * 100);
+      if (!Number.isInteger(amountCents) || amountCents <= 0) {
+        report("退款金额非法", "bad");
+        return;
+      }
+    }
+    const reason = window.prompt("请填写退款原因（必填，将写入审计日志）：", "");
+    if (reason === null) return;
+    if (!String(reason).trim()) {
+      report("请填写退款原因", "bad");
+      return;
+    }
+    if (!window.confirm(
+      `确认退款订单 ${order.order_no}？\n金额：${amountCents === null ? "全额" : `￥${(amountCents / 100).toFixed(2)}`}\n将同时扣回对应积分，渠道打款不可撤销。`,
+    )) return;
+    setBusy(order.order_no);
+    setMsg("");
+    try {
+      const refund = await api.adminRefundPaymentOrder(order.order_no, {
+        amount_cents: amountCents,
+        reason: String(reason).trim(),
+      });
+      report(`退款成功：${refund.refund_no}，退 ${(refund.amount_cents / 100).toFixed(2)} 元，扣回 ${refund.credits_reclaimed} 积分`);
+      await search(orders.offset);
+    } catch (e) {
+      report(e.message, "bad");
+    } finally {
+      setBusy("");
+    }
+  }
+
+  async function processInvoice(orderNo, status) {
+    const note = window.prompt(status === "issued" ? "开票备注（如发票号，选填）：" : "驳回原因（选填）：", "");
+    if (note === null) return;
+    setBusy(orderNo);
+    setMsg("");
+    try {
+      await api.adminProcessPaymentInvoice(orderNo, {
+        status,
+        note: String(note).trim() || null,
+      });
+      report(`订单 ${orderNo} 开票申请已${status === "issued" ? "标记开票" : "驳回"}`);
+      await loadInvoices(invoices.offset);
+    } catch (e) {
+      report(e.message, "bad");
+    } finally {
+      setBusy("");
+    }
+  }
+
+  const totalPages = Math.max(1, Math.ceil(orders.total / ORDERS_PAGE_SIZE));
+  const currentPage = Math.floor(orders.offset / ORDERS_PAGE_SIZE) + 1;
+
+  return (
+    <Card>
+      <div className="mb-3">
+        <div className="text-sm font-display font-semibold text-snow">订单查询与人工补单</div>
+        <div className="mt-1 text-xs text-fog">
+          按手机号 / 订单号 / 渠道单号 / 时间范围查单，不受自动对账 24 小时窗口限制；补单与退款均写入审计日志。
+        </div>
+      </div>
+      {msg && <p className={`mb-3 text-sm ${msgKind === "bad" ? "text-bad" : "text-ok"}`}>{msg}</p>}
+      <div className="mb-3 grid gap-2 md:grid-cols-7">
+        <input className="input" placeholder="手机号" value={query.phone}
+          onChange={(e) => setQuery({ ...query, phone: e.target.value })} />
+        <input className="input" placeholder="订单号" value={query.order_no}
+          onChange={(e) => setQuery({ ...query, order_no: e.target.value })} />
+        <input className="input" placeholder="渠道单号" value={query.provider_trade_no}
+          onChange={(e) => setQuery({ ...query, provider_trade_no: e.target.value })} />
+        <select className="select" value={query.status}
+          onChange={(e) => setQuery({ ...query, status: e.target.value })}>
+          <option value="">全部状态</option>
+          {Object.entries(ORDER_STATUS_TEXT).map(([value, label]) => (
+            <option key={value} value={value}>{label}</option>
+          ))}
+        </select>
+        <input className="input" type="date" title="开始日期" value={query.created_from}
+          onChange={(e) => setQuery({ ...query, created_from: e.target.value })} />
+        <input className="input" type="date" title="结束日期" value={query.created_to}
+          onChange={(e) => setQuery({ ...query, created_to: e.target.value })} />
+        <div className="flex gap-2">
+          <button onClick={() => search(0)} disabled={busy === "search"} className="btn-primary flex-1">查询</button>
+          <button onClick={() => { setQuery(emptyQuery); setOrders({ items: [], total: 0, offset: 0 }); setSearched(false); }}
+            className="btn-ghost">重置</button>
+        </div>
+      </div>
+      {searched && (
+        <div className="overflow-x-auto">
+          <table className="w-full text-left text-sm">
+            <thead><tr className="border-b border-line">
+              <Th>订单号</Th><Th>手机号</Th><Th>渠道</Th><Th>金额</Th><Th>积分</Th>
+              <Th>状态</Th><Th>已退</Th><Th>开票</Th><Th>创建时间</Th><Th>操作</Th>
+            </tr></thead>
+            <tbody>
+              {orders.items.length === 0 && (
+                <tr><td colSpan={10} className="py-4 text-center text-fog">没有符合条件的订单</td></tr>
+              )}
+              {orders.items.map((o) => (
+                <tr key={o.order_no} className="border-b border-line/60 text-mist hover:bg-white/5">
+                  <td className="py-2 pr-3 font-mono text-xs text-snow">{o.order_no}</td>
+                  <td className="pr-3">{o.phone || o.user_id}</td>
+                  <td className="pr-3">{providerLabel(o.provider)}</td>
+                  <td className="pr-3">￥{(o.amount_cents / 100).toFixed(2)}</td>
+                  <td className="pr-3 font-display text-snow">{o.credits}</td>
+                  <td className="pr-3">
+                    <span className={`badge ${o.status === "paid" ? "bg-ok/15 text-ok" : o.status === "refunded" ? "bg-warn/15 text-warn" : "bg-white/10 text-fog"}`}>
+                      {ORDER_STATUS_TEXT[o.status] || o.status}
+                    </span>
+                  </td>
+                  <td className="pr-3">{o.refunded_amount_cents ? `￥${(o.refunded_amount_cents / 100).toFixed(2)}` : "-"}</td>
+                  <td className="pr-3">{INVOICE_STATUS_TEXT[o.invoice_status] || o.invoice_status}</td>
+                  <td className="pr-3 text-xs">{o.created_at ? new Date(o.created_at).toLocaleString() : "-"}</td>
+                  <td className="py-1 whitespace-nowrap">
+                    {["pending", "closed", "failed"].includes(o.status) && (
+                      <button onClick={() => syncOrder(o.order_no)} disabled={busy === o.order_no}
+                        className="btn-secondary btn-sm">渠道查单补单</button>
+                    )}
+                    {(o.status === "paid" && o.refunded_amount_cents < o.amount_cents) && (
+                      <button onClick={() => refundOrder(o)} disabled={busy === o.order_no}
+                        className="btn-ghost btn-sm ml-1 text-warn">退款</button>
+                    )}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          <div className="mt-3 flex items-center justify-between text-xs text-fog">
+            <span>共 {orders.total} 条 · 第 {currentPage}/{totalPages} 页</span>
+            <div className="flex gap-2">
+              <button className="btn-secondary btn-sm" disabled={orders.offset <= 0 || busy === "search"}
+                onClick={() => search(Math.max(0, orders.offset - ORDERS_PAGE_SIZE))}>上一页</button>
+              <button className="btn-secondary btn-sm"
+                disabled={orders.offset + ORDERS_PAGE_SIZE >= orders.total || busy === "search"}
+                onClick={() => search(orders.offset + ORDERS_PAGE_SIZE)}>下一页</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      <div className="mt-5 border-t border-line pt-4">
+        <div className="mb-2 flex items-center justify-between">
+          <div className="text-sm font-display font-semibold text-snow">待处理开票申请</div>
+          <button className="btn-secondary btn-sm" onClick={() => loadInvoices(0)}>刷新</button>
+        </div>
+        {invoices.items.length === 0 ? (
+          <p className="text-xs text-fog">暂无待处理的开票申请。</p>
+        ) : (
+          <div className="overflow-x-auto">
+            <table className="w-full text-left text-sm">
+              <thead><tr className="border-b border-line">
+                <Th>订单号</Th><Th>手机号</Th><Th>金额</Th><Th>抬头</Th><Th>税号</Th><Th>邮箱</Th><Th>操作</Th>
+              </tr></thead>
+              <tbody>
+                {invoices.items.map((o) => (
+                  <tr key={o.order_no} className="border-b border-line/60 text-mist hover:bg-white/5">
+                    <td className="py-2 pr-3 font-mono text-xs text-snow">{o.order_no}</td>
+                    <td className="pr-3">{o.phone || o.user_id}</td>
+                    <td className="pr-3">￥{(o.amount_cents / 100).toFixed(2)}</td>
+                    <td className="pr-3">{o.invoice_title || "-"}</td>
+                    <td className="pr-3 font-mono text-xs">{o.invoice_tax_no || "-"}</td>
+                    <td className="pr-3 text-xs">{o.invoice_email || "-"}</td>
+                    <td className="py-1 whitespace-nowrap">
+                      <button onClick={() => processInvoice(o.order_no, "issued")} disabled={busy === o.order_no}
+                        className="btn-secondary btn-sm">标记已开票</button>
+                      <button onClick={() => processInvoice(o.order_no, "rejected")} disabled={busy === o.order_no}
+                        className="btn-ghost btn-sm ml-1 text-warn">驳回</button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+            {invoices.total > ORDERS_PAGE_SIZE && (
+              <div className="mt-2 flex items-center justify-between text-xs text-fog">
+                <span>共 {invoices.total} 条</span>
+                <div className="flex gap-2">
+                  <button className="btn-secondary btn-sm" disabled={invoices.offset <= 0}
+                    onClick={() => loadInvoices(Math.max(0, invoices.offset - ORDERS_PAGE_SIZE))}>上一页</button>
+                  <button className="btn-secondary btn-sm"
+                    disabled={invoices.offset + ORDERS_PAGE_SIZE >= invoices.total}
+                    onClick={() => loadInvoices(invoices.offset + ORDERS_PAGE_SIZE)}>下一页</button>
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+    </Card>
+  );
+}
+
 const MAX_PAYMENT_AMOUNT_CENTS = 100000000;
 const MAX_PAYMENT_PACKAGE_CREDITS = 100000000;
 const MAX_PAYMENT_CREDITS_PER_CENT = 10000;
@@ -242,6 +521,7 @@ export function Payments() {
 
   return (
     <div className="space-y-4">
+      <PaymentOrdersOps />
       <Card>
         <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
           <div>
@@ -438,6 +718,8 @@ export function Settings({ launchLite = false }) {
         navigation_states: s.navigation_states || {},
         content_safety_enabled: !!s.content_safety_enabled,
         content_safety_banned_terms: s.content_safety_banned_terms || "",
+        media_moderation_enabled: !!s.media_moderation_enabled,
+        media_moderation_fail_open: !!s.media_moderation_fail_open,
         image_n: Number(s.image_n),
         image_size: s.image_size,
         asset_retention_days: Number(s.asset_retention_days),
@@ -588,8 +870,31 @@ export function Settings({ launchLite = false }) {
             />
           </label>
           <p className="text-xs text-fog">
-            开启后，生成和反推请求会在调用模型前检查用户输入文本；结果图/视频审核仍需接入独立内容审核服务。
+            开启后，生成和反推请求会在调用模型前检查用户输入文本；结果图/视频审核见下方媒体机器审核开关。
           </p>
+          <div className="border-t border-white/10 pt-3">
+            <label className="flex items-center gap-2">
+              启用图片/视频机器审核（先审后发）
+              <input
+                type="checkbox"
+                className="accent-iris"
+                checked={!!s.media_moderation_enabled}
+                onChange={(e) => setS({ ...s, media_moderation_enabled: e.target.checked })}
+              />
+            </label>
+            <label className="mt-2 flex items-center gap-2">
+              审核服务故障时放行（fail-open，默认故障拒绝）
+              <input
+                type="checkbox"
+                className="accent-iris"
+                checked={!!s.media_moderation_fail_open}
+                onChange={(e) => setS({ ...s, media_moderation_fail_open: e.target.checked })}
+              />
+            </label>
+            <p className="mt-2 text-xs text-fog">
+              需要先在环境变量配置 MEDIA_MODERATION_PROVIDER=http 与审核网关地址，未就绪时开启会被拒绝。
+            </p>
+          </div>
         </div>
       </Card>
       <Card>

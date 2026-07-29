@@ -65,6 +65,9 @@ frontend/.next/
 frontend/out/
 frontend/tsconfig.tsbuildinfo
 
+# 编辑器/重构备份残留
+*.bak
+
 # os
 .DS_Store
 .claude/

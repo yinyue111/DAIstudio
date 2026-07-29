@@ -112,6 +112,65 @@ def test_reverse_batch_create_replay_list_and_persisted_items(
         db.close()
 
 
+def test_serialize_batch_exposes_batch_level_costs_without_items(
+    client, make_user, auth, monkeypatch
+):
+    """批次列表 (include_items=false) 无子项可求和，批级 cost_frozen /
+    cost_settled 必须直接下发，否则前端总费用显示 0。"""
+    make_user("13720000041", balance=100)
+    headers = auth("13720000041")
+    _stub_batch_dependencies(monkeypatch)
+
+    created = post_reverse_batch(
+        client, _batch_body("reverse-batch-costs-001"), headers=headers
+    )
+    assert created.status_code == 202, created.text
+    batch_id = created.json()["id"]
+
+    db = SessionLocal()
+    try:
+        operations = [
+            operation
+            for _, operation in reverse_operations._batch_item_rows(db, batch_id)
+        ]
+        assert len(operations) == 2
+        # 模拟一项已结算、一项仍冻结
+        operations[0].cost_frozen = 0
+        operations[0].cost_settled = 7
+        operations[1].cost_frozen = 5
+        operations[1].cost_settled = 0
+        db.commit()
+
+        batch = db.get(ReverseOperationBatch, batch_id)
+        summary = reverse_operations.serialize_batch(db, batch, include_items=False)
+        assert summary["items"] == []
+        assert summary["cost_frozen"] == 5
+        assert summary["cost_settled"] == 7
+
+        detail = reverse_operations.serialize_batch(db, batch, include_items=True)
+        assert detail["cost_frozen"] == 5
+        assert detail["cost_settled"] == 7
+        assert [item["operation"]["cost_settled"] for item in detail["items"]] == [7, 0]
+    finally:
+        db.close()
+
+    # 端到端：字段必须穿过 response_model=ReverseBatchOut 到达 HTTP 响应，
+    # 而不是被 pydantic 静默剥离（ReverseBatchOut 缺字段时即会发生）。
+    listed = client.get("/api/prompt/reverse-batches", headers=headers)
+    assert listed.status_code == 200, listed.text
+    summary_payload = next(
+        batch for batch in listed.json() if batch["id"] == batch_id
+    )
+    assert summary_payload["cost_frozen"] == 5
+    assert summary_payload["cost_settled"] == 7
+
+    fetched = client.get(f"/api/prompt/reverse-batches/{batch_id}", headers=headers)
+    assert fetched.status_code == 200, fetched.text
+    detail_payload = fetched.json()
+    assert detail_payload["cost_frozen"] == 5
+    assert detail_payload["cost_settled"] == 7
+
+
 def test_reverse_batch_conflict_limit_and_atomic_credit_rollback(
     client, make_user, auth, monkeypatch
 ):

@@ -1096,6 +1096,24 @@ def test_video_ocr_rejects_low_confidence_and_isolated_short_fragments():
     assert frame_ocr["rejected_evidence_count"] == 6
 
 
+def test_video_ocr_rejects_generation_watermark_and_weak_four_letter_fragment():
+    assert video_evidence_analysis._credible_video_ocr_track({
+        "text": "豆包AI生成",
+        "confidence": 0.99,
+        "observations": [{}],
+    }) is False
+    assert video_evidence_analysis._credible_video_ocr_track({
+        "text": "MAME",
+        "confidence": 0.795686,
+        "observations": [{}],
+    }) is False
+    assert video_evidence_analysis._credible_video_ocr_track({
+        "text": "ACME",
+        "confidence": 0.95,
+        "observations": [{}],
+    }) is True
+
+
 def test_shot_attachment_does_not_promote_vlm_subtitle_claim_to_ocr():
     shots = [{
         "start_seconds": 10, "end_seconds": 12, "source_segment_index": 1,

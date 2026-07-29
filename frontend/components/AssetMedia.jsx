@@ -129,10 +129,6 @@ export function isPreviewVideoAsset(asset) {
   return asset?.type === "video" && asset?.unlocked && !asset?.hd_url;
 }
 
-export function isDownscaledImageAsset(asset) {
-  return false;
-}
-
 export function canDownloadAsset(asset) {
   return Boolean(
     asset?.available !== false
@@ -147,6 +143,50 @@ export function assetPreviewLabel(asset) {
   if (asset?.origin === "uploaded") return "我的上传 · 可用于创作";
   if (!asset?.unlocked) return "预览 · 带水印";
   return isPreviewVideoAsset(asset) ? "视频 · 可下载" : "预览 · 已解锁，可下载";
+}
+
+export function isAudioAsset(asset) {
+  return asset?.type === "audio";
+}
+
+export function audioAssetSrc(asset) {
+  if (!isAudioAsset(asset)) return "";
+  return safeAssetMediaSrc(asset?.url || asset?.hd_url || asset?.preview_url || "");
+}
+
+export function formatAudioDuration(value) {
+  const seconds = Math.round(Number(value) || 0);
+  if (seconds <= 0) return "";
+  const minutes = Math.floor(seconds / 60);
+  const rest = seconds % 60;
+  return `${minutes}:${String(rest).padStart(2, "0")}`;
+}
+
+function AudioCard({ asset, src, className, fallbackClassName, interactive, controls, autoPlay, onError }) {
+  const name = String(asset?.filename || asset?.title || "").trim() || "音频素材";
+  const duration = formatAudioDuration(asset?.duration_seconds ?? asset?.duration);
+  const showPlayer = Boolean(src && (interactive || controls));
+  return (
+    <div className={`${fallbackClassName || className || ""} flex flex-col items-center justify-center gap-2 px-3 py-4 text-center`}>
+      <span aria-hidden="true" className="flex h-10 w-10 items-end justify-center gap-[3px] rounded-full bg-white/10 px-2.5 py-2 text-mist">
+        {[45, 75, 100, 60, 85].map((height, index) => (
+          <span key={index} className="w-[3px] rounded-full bg-current opacity-80" style={{ height: `${height}%` }} />
+        ))}
+      </span>
+      <span className="max-w-full truncate text-xs text-mist" title={name}>{name}</span>
+      {duration && <span className="text-[11px] text-fog">{duration}</span>}
+      {showPlayer && (
+        <audio
+          src={src}
+          controls
+          autoPlay={autoPlay}
+          preload="metadata"
+          className="w-full max-w-[240px]"
+          onError={onError}
+        />
+      )}
+    </div>
+  );
 }
 
 function VideoPoster({ src, className, fallbackClassName, onError }) {
@@ -228,6 +268,30 @@ export default function AssetMedia({
       <div className={fallbackClassName || className}>
         {error}
       </div>
+    );
+  }
+  if (isAudioAsset(asset)) {
+    if (isAssetTakenDown(asset)) {
+      return (
+        <div className={fallbackClassName || className}>
+          {assetUnavailableText(asset)}
+        </div>
+      );
+    }
+    return (
+      <AudioCard
+        asset={asset}
+        src={audioAssetSrc(asset)}
+        className={className}
+        fallbackClassName={fallbackClassName}
+        interactive={interactive}
+        controls={controls}
+        autoPlay={autoPlay}
+        onError={(e) => {
+          setError("音频加载失败，请下载后播放");
+          if (onError) onError(e);
+        }}
+      />
     );
   }
   if (!src) {

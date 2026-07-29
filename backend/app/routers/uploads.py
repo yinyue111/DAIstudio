@@ -22,7 +22,8 @@ from ..db import get_db
 from ..deps import get_client_ip, get_current_user
 from ..models import UploadedAsset, User
 from ..schemas import Asset
-from ..services import audit, storage, video_frames
+from ..services import audit, storage, user_assets, video_frames
+from ..services.content_safety import assert_upload_media_allowed
 from ..services.rate_limit import incr_window
 from ..services.request_limits import enforce_content_length
 from ..services.upload_quota import ensure_user_media_quota, preflight_user_media_quota
@@ -49,6 +50,44 @@ _SUPPORTED_VIDEO_SUFFIXES = {
     ".mov": "mov",
     ".webm": "webm",
 }
+_SUPPORTED_AUDIO_CONTENT_TYPES = {
+    "audio/mpeg": "mp3",
+    "audio/mp3": "mp3",
+    "audio/mp4": "m4a",
+    "audio/x-m4a": "m4a",
+    "audio/aac": "aac",
+    "audio/wav": "wav",
+    "audio/x-wav": "wav",
+    "audio/wave": "wav",
+    "audio/flac": "flac",
+    "audio/x-flac": "flac",
+    "audio/ogg": "ogg",
+}
+_SUPPORTED_AUDIO_SUFFIXES = {
+    ".mp3": "mp3",
+    ".m4a": "m4a",
+    ".aac": "aac",
+    ".wav": "wav",
+    ".flac": "flac",
+    ".ogg": "ogg",
+}
+# 送审内联字节上限与 provider 侧同源(media_moderation_http_max_inline_bytes),
+# 避免"路由内联送了、provider 又因超限拒收"的死区;超过上限时改用审核网关
+# 可匿名访问的 URL 送审(见 _moderation_media_url)。
+def _moderation_inline_cap() -> int:
+    return max(0, int(getattr(settings, "media_moderation_http_max_inline_bytes", 10 * 1024 * 1024)))
+
+
+def _moderation_media_url(upload_key: str) -> str | None:
+    """审核网关无凭据可取的媒体地址;取不到时返回 None。
+
+    S3 后端返回短时效 presigned URL。本地后端没有匿名可访问的上传原件路由
+    (public_url 生成的 /media/upload_* 并未挂载,是死链),返回 None 让上层按
+    "无法送审"走 fail-open/closed 策略,而不是把死链交给审核网关。
+    """
+    if storage.is_object_storage_enabled():
+        return storage.presigned_download_url(upload_key, expires=600)
+    return None
 _UPLOAD_CHUNK_BYTES = 1024 * 1024
 _MAX_ORIGINAL_FILENAME = 180
 _FILENAME_SAFE_RE = re.compile(r"[\x00-\x1f\x7f/\\:]+")
@@ -321,7 +360,124 @@ def _sanitize_video_and_poster(path: Path) -> tuple[Path, int | None, int | None
         video_frames.release_video_slot()
 
 
-async def _save_upload_stream_to_temp(file: UploadFile, ext: str, *, limit: int) -> tuple[Path, int]:
+def _audio_limit_bytes() -> int:
+    # 设置项在 config.py 落地前通过 getattr 回退默认值,行为与最终配置一致。
+    return int(getattr(settings, "max_upload_audio_bytes", 30 * 1024 * 1024))
+
+
+def _max_audio_seconds() -> int:
+    return int(getattr(settings, "max_audio_seconds", 600))
+
+
+def _audio_ext(file: UploadFile) -> str:
+    content_type = (file.content_type or "").split(";", 1)[0].strip().lower()
+    if content_type in _SUPPORTED_AUDIO_CONTENT_TYPES:
+        return _SUPPORTED_AUDIO_CONTENT_TYPES[content_type]
+    suffix = Path(file.filename or "").suffix.lower()
+    if suffix in _SUPPORTED_AUDIO_SUFFIXES:
+        return _SUPPORTED_AUDIO_SUFFIXES[suffix]
+    raise HTTPException(400, "仅支持 MP3/M4A/AAC/WAV/FLAC/OGG 音频")
+
+
+def _inspect_audio(path: str) -> float | None:
+    if not video_frames.FFPROBE:
+        raise HTTPException(400, "音频校验组件不可用,请联系管理员安装 ffprobe")
+    meta = video_frames.probe_media(path)
+    if not meta.get("has_audio"):
+        raise HTTPException(400, "上传文件不是有效音频")
+    duration = meta.get("duration")
+    if duration and float(duration) > _max_audio_seconds():
+        raise HTTPException(400, f"音频时长不能超过 {_max_audio_seconds()} 秒")
+    return float(duration) if duration else None
+
+
+def _transcode_sanitized_audio(src: Path, *, duration: float | None = None) -> Path:
+    """把上传音频统一转码为去元数据的 AAC/M4A。
+
+    与视频入口同理:不直接保存用户原始字节,统一转码可以剥离元数据、
+    规范容器,并把任意受支持格式收敛为混音管线可直接消费的单一形态。
+    """
+    if not video_frames.FFMPEG:
+        raise HTTPException(400, "音频净化组件不可用,请联系管理员安装 ffmpeg")
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".m4a")
+    dst = Path(tmp.name)
+    tmp.close()
+    cmd = [
+        video_frames.FFMPEG,
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-nostdin",
+        "-protocol_whitelist",
+        "file,pipe",
+        "-i",
+        str(src),
+        "-fs",
+        str(_audio_limit_bytes()),
+        "-map",
+        "0:a:0",
+        "-map_metadata",
+        "-1",
+        "-map_chapters",
+        "-1",
+        "-vn",
+        "-dn",
+        "-sn",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "192k",
+        "-movflags",
+        "+faststart",
+        str(dst),
+    ]
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=_video_transcode_timeout(duration),
+        )
+    except subprocess.TimeoutExpired:
+        dst.unlink(missing_ok=True)
+        raise HTTPException(400, "音频净化超时,请压缩后重新上传") from None
+    except (OSError, subprocess.SubprocessError):
+        dst.unlink(missing_ok=True)
+        raise HTTPException(400, "音频净化失败,请更换标准 MP3/M4A/AAC/WAV/FLAC/OGG 文件") from None
+    if result.returncode != 0 or not dst.exists() or dst.stat().st_size <= 0:
+        dst.unlink(missing_ok=True)
+        log_msg = (result.stderr or result.stdout or "").strip()[:300]
+        if log_msg:
+            log.info("audio transcode rejected upload: %s", log_msg)
+        raise HTTPException(400, "音频净化失败,请更换标准 MP3/M4A/AAC/WAV/FLAC/OGG 文件")
+    if dst.stat().st_size > _audio_limit_bytes():
+        dst.unlink(missing_ok=True)
+        raise HTTPException(413, f"音频净化后仍超过 {_audio_limit_bytes() // 1024 // 1024}MB")
+    return dst
+
+
+def _sanitize_audio(path: Path) -> tuple[Path, float | None]:
+    # 与视频共用同一个 ffmpeg 并发闸门,避免音频转码绕过全局限流。
+    if not video_frames.acquire_video_slot():
+        raise HTTPException(429, "音频校验繁忙,请稍后再试")
+    sanitized_path: Path | None = None
+    try:
+        source_duration = _inspect_audio(str(path))
+        sanitized_path = _transcode_sanitized_audio(path, duration=source_duration)
+        duration = _inspect_audio(str(sanitized_path))
+        return sanitized_path, duration
+    except Exception:
+        if sanitized_path is not None:
+            sanitized_path.unlink(missing_ok=True)
+        raise
+    finally:
+        video_frames.release_video_slot()
+
+
+async def _save_upload_stream_to_temp(
+    file: UploadFile, ext: str, *, limit: int, media_noun: str = "视频"
+) -> tuple[Path, int]:
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=f".{ext.lstrip('.')}")
     path = Path(tmp.name)
     tmp.close()
@@ -334,14 +490,14 @@ async def _save_upload_stream_to_temp(file: UploadFile, ext: str, *, limit: int)
                     break
                 total += len(chunk)
                 if total > limit:
-                    raise HTTPException(413, f"视频不能超过 {limit // 1024 // 1024}MB")
+                    raise HTTPException(413, f"{media_noun}不能超过 {limit // 1024 // 1024}MB")
                 await _run_upload_thread(f.write, chunk)
     except (Exception, asyncio.CancelledError):
         path.unlink(missing_ok=True)
         raise
     if total <= 0:
         path.unlink(missing_ok=True)
-        raise HTTPException(400, "请选择要上传的视频")
+        raise HTTPException(400, f"请选择要上传的{media_noun}")
     return path, total
 
 
@@ -363,6 +519,15 @@ async def upload_image(
             raise HTTPException(413, f"图片不能超过 {limit // 1024 // 1024}MB")
 
         normalized_png, width, height = await _run_upload_thread(_normalize_image_upload, data)
+        # 先审后发:参考图先机审再落存储/落库,拒绝与审核不可用均为 HTTPException。
+        assert_upload_media_allowed(
+            db,
+            user_id=user.id,
+            media_type="image",
+            data=normalized_png,
+            mime_type="image/png",
+            ip=get_client_ip(request),
+        )
         try:
             preview_png, _, _ = await _run_upload_thread(
                 make_image_preview,
@@ -510,6 +675,28 @@ async def upload_video(
                 "mp4",
                 on_cancel_result=lambda key: _cleanup_storage_keys(key),
             )
+            # 先审后发:净化后的视频在 DB 落库(对用户可见)前机审。小文件内联
+            # 送审;超过内联上限则用审核网关可匿名访问的 URL 送审(仅 S3 有,
+            # 本地后端为 None,由失败策略决定拒/放),拒绝时下方统一的异常清理
+            # 会删除 upload_key,不会有未过审文件残留可见。
+            _inline_cap = _moderation_inline_cap()
+            assert_upload_media_allowed(
+                db,
+                user_id=user.id,
+                media_type="video",
+                data=(
+                    sanitized_path.read_bytes()
+                    if stored_bytes <= _inline_cap
+                    else None
+                ),
+                url=(
+                    _moderation_media_url(upload_key)
+                    if stored_bytes > _inline_cap
+                    else None
+                ),
+                mime_type="video/mp4",
+                ip=get_client_ip(request),
+            )
             stem = Path(upload_key).stem
             if poster:
                 preview_key = await _run_upload_thread(
@@ -589,6 +776,115 @@ async def upload_video(
     )
 
 
+@router.post("/audio", response_model=Asset)
+async def upload_audio(
+    request: Request,
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """上传混音用音频素材(BGM/配音),净化后存入 upload_audio/ 前缀。"""
+    _rate_limit_upload(user.id)
+    ext = _audio_ext(file)
+    limit = _audio_limit_bytes()
+    enforce_content_length(request, limit + 1024 * 1024, f"音频不能超过 {limit // 1024 // 1024}MB")
+    declared_size = _content_length(request)
+    if declared_size is not None:
+        estimated_file_bytes = max(0, min(declared_size, limit + 1024 * 1024) - 1024 * 1024)
+        preflight_user_media_quota(db, user.id, estimated_file_bytes)
+
+    upload_key = None
+    raw_path = None
+    sanitized_path = None
+    raw_bytes = 0
+    stored_bytes = 0
+    duration = None
+    async with _upload_processing_slot():
+        try:
+            raw_path, raw_bytes = await _save_upload_stream_to_temp(
+                file, ext, limit=limit, media_noun="音频"
+            )
+            preflight_user_media_quota(db, user.id, raw_bytes)
+            sanitized_path, duration = await _run_upload_thread(
+                _sanitize_audio,
+                raw_path,
+                on_cancel_result=lambda result: result[0].unlink(missing_ok=True),
+            )
+            stored_bytes = sanitized_path.stat().st_size
+            ensure_user_media_quota(db, user.id, stored_bytes)
+            upload_key = await _run_upload_thread(
+                storage.save_file,
+                sanitized_path,
+                "upload_audio",
+                "m4a",
+                on_cancel_result=lambda key: _cleanup_storage_keys(key),
+            )
+            # 先审后发:与图片/视频同一挂载点。audio 在 content_safety 侧有显式
+            # 降级语义(provider 暂不支持音频审核时直接放行并落审计),因此启用
+            # 审核后音频上传不会被 review 全量卡死;拒绝/异常时下方统一清理会
+            # 删除 upload_key,不会有未过审文件残留可见。
+            _inline_cap = _moderation_inline_cap()
+            assert_upload_media_allowed(
+                db,
+                user_id=user.id,
+                media_type="audio",
+                data=(
+                    sanitized_path.read_bytes()
+                    if stored_bytes <= _inline_cap
+                    else None
+                ),
+                url=(
+                    _moderation_media_url(upload_key)
+                    if stored_bytes > _inline_cap
+                    else None
+                ),
+                mime_type="audio/mp4",
+                ip=get_client_ip(request),
+            )
+            original_filename = _safe_original_filename(file.filename, upload_key.rsplit("/", 1)[-1])
+            db.add(
+                UploadedAsset(
+                    key=upload_key,
+                    user_id=user.id,
+                    mime="audio/mp4",
+                    duration=max(1, int(round(duration))) if duration is not None else None,
+                    bytes=stored_bytes,
+                    original_filename=original_filename,
+                )
+            )
+            db.commit()
+        except (Exception, asyncio.CancelledError):  # noqa: BLE001
+            db.rollback()
+            _cleanup_storage_keys(upload_key)
+            raise
+        finally:
+            if raw_path is not None:
+                raw_path.unlink(missing_ok=True)
+            if sanitized_path is not None:
+                sanitized_path.unlink(missing_ok=True)
+    audit.log(
+        db,
+        user_id=user.id,
+        action="upload_audio",
+        biz_type="upload",
+        ip=get_client_ip(request),
+        detail={
+            "filename": file.filename,
+            "content_type": file.content_type,
+            "raw_bytes": raw_bytes,
+            "bytes": stored_bytes,
+            "duration": duration,
+            "sanitized": True,
+        },
+    )
+    return Asset(
+        type="audio",
+        url=storage.upload_api_url(upload_key),
+        duration=duration,
+        asset_ref=user_assets.uploaded_asset_ref(upload_key),
+    )
+
+
 @router.get("/{kind}/{filename}")
 def get_uploaded_image(
     kind: str,
@@ -596,7 +892,7 @@ def get_uploaded_image(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    if kind not in {"upload", "upload_preview", "upload_video", "upload_video_preview"}:
+    if kind not in {"upload", "upload_preview", "upload_video", "upload_video_preview", "upload_audio"}:
         raise HTTPException(404, "文件不存在")
     key = f"{kind}/{filename}"
     row = db.get(UploadedAsset, key)

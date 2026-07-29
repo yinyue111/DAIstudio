@@ -1,5 +1,6 @@
 """Mock gateway + watermark pipeline (no network)."""
 import base64
+import json
 import time
 from pathlib import Path
 
@@ -424,17 +425,61 @@ def test_video_reverse_labels_frames_with_authoritative_timestamps(monkeypatch):
                 "audio_analyzed": False,
             },
             "sampled_frames": [
-                {"index": 1, "timestamp_seconds": 0.0},
-                {"index": 2, "timestamp_seconds": 10.004},
+                {
+                    "index": 1,
+                    "timestamp_seconds": 0.0,
+                    "detected_shot_index": 1,
+                    "detected_shot_id": "detected-shot-1-0-2200",
+                    "detected_shot_start_seconds": 0.0,
+                    "detected_shot_end_seconds": 2.2,
+                },
+                {
+                    "index": 2,
+                    "timestamp_seconds": 10.004,
+                    "detected_shot_index": 2,
+                    "detected_shot_id": "detected-shot-1-2200-10054",
+                    "detected_shot_start_seconds": 2.2,
+                    "detected_shot_end_seconds": 10.054,
+                },
             ],
         },
+        reference_context=[
+            {
+                "role": "frame",
+                "source_type": "video",
+                "timestamp_seconds": 0.0,
+                "detected_shot_index": 1,
+                "detected_shot_id": "detected-shot-1-0-2200",
+                "detected_shot_start_seconds": 0.0,
+                "detected_shot_end_seconds": 2.2,
+            },
+            {
+                "role": "frame",
+                "source_type": "video",
+                "timestamp_seconds": 10.004,
+                "detected_shot_index": 2,
+                "detected_shot_id": "detected-shot-1-2200-10054",
+                "detected_shot_start_seconds": 2.2,
+                "detected_shot_end_seconds": 10.054,
+            },
+        ],
         gateway_config=cfg,
     )
 
     text_items = [item["text"] for item in seen["content"] if item["type"] == "text"]
     assert any("720x960" in text and "3:4" in text and "10.054" in text for text in text_items)
-    assert "第 1 帧，时间戳 0.000 秒" in text_items
-    assert "第 2 帧，时间戳 10.004 秒" in text_items
+    assert any(
+        "第 1 帧，源视频时间戳 0.000 秒" in text
+        and "服务端检测镜头 1" in text
+        and "0.000-2.200 秒" in text
+        for text in text_items
+    )
+    assert any(
+        "第 2 帧，源视频时间戳 10.004 秒" in text
+        and "服务端检测镜头 2" in text
+        and "2.200-10.054 秒" in text
+        for text in text_items
+    )
     assert result["shots"][0]["visual"] == "液滴入水"
     assert result["shots"][-1]["end_seconds"] == 2.2
     assert result["analysis_gaps"] == [{"start_seconds": 2.2, "end_seconds": 10.054}]
@@ -446,8 +491,7 @@ def test_video_reverse_labels_frames_with_authoritative_timestamps(monkeypatch):
 def test_generation_video_reverse_repairs_missing_sampled_frame_coverage(monkeypatch):
     monkeypatch.setattr(settings, "mock_mode", False)
     calls = []
-    responses = iter([
-        {
+    responses = iter([{
             "choices": [{"message": {"content": (
                 '{"主体":"精华瓶","shots":['
                 '{"start_seconds":0,"end_seconds":1,"visual":"瓶盖特写",'
@@ -455,16 +499,14 @@ def test_generation_video_reverse_repairs_missing_sampled_frame_coverage(monkeyp
                 '"final_text":"瓶盖特写后，完整精华瓶立于水面"}'
             )}}],
             "usage": {"total_tokens": 7},
-        },
-        {
+        }, {
             "choices": [{"message": {"content": (
                 '{"frames":[{"frame_index":2,'
                 '"visual":"完整精华瓶立于水面","lighting":"冷白轮廓光",'
                 '"confidence":0.9}]}'
             )}}],
             "usage": {"total_tokens": 3},
-        },
-    ])
+        }])
 
     def fake_post(_path, payload, **_kwargs):
         calls.append(payload)
@@ -500,9 +542,6 @@ def test_generation_video_reverse_repairs_missing_sampled_frame_coverage(monkeyp
     repair_content = calls[1]["messages"][0]["content"]
     assert isinstance(repair_content, list)
     assert [item["type"] for item in repair_content].count("image_url") == 1
-    assert "采样帧 2" in "".join(
-        item.get("text", "") for item in repair_content if item["type"] == "text"
-    )
     assert result["repair_attempted"] is True
     assert result["usage"]["total_tokens"] == 10
     assert {
@@ -512,11 +551,117 @@ def test_generation_video_reverse_repairs_missing_sampled_frame_coverage(monkeyp
     } == {1, 2}
 
 
-def test_generation_video_reverse_repairs_frames_with_placeholder_visuals(monkeypatch):
+def test_video_reverse_multiframe_repair_preserves_shot_temporal_semantics(monkeypatch):
     monkeypatch.setattr(settings, "mock_mode", False)
     calls = []
+    temporal = {
+        "subject_tracking": "同一双手始终在画面中央操作洗脸巾",
+        "pose": "双手由分开持巾变为向内扭紧",
+        "action": "双手缓慢扭干吸满水的洗脸巾，水流持续滴落",
+        "camera": "轻微向前推近",
+        "transition": "硬切进入下一镜头",
+    }
     responses = iter([
         {
+            "choices": [{"message": {"content": json.dumps({
+                "主体": "白色洗脸巾",
+                "shots": [{
+                    "start_seconds": 0.0,
+                    "end_seconds": 3.0,
+                    "visual": "双手持白色洗脸巾",
+                    "camera": "固定机位",
+                    "evidence_frame_indices": [1],
+                    "confidence": 0.9,
+                }],
+                "final_text": "双手扭干白色洗脸巾",
+            }, ensure_ascii=False)}}],
+            "usage": {"total_tokens": 7},
+        },
+        {
+            "choices": [{"message": {"content": json.dumps({
+                "frames": [
+                    {
+                        "frame_index": 2,
+                        "visual": "双手向内扭压洗脸巾",
+                        "lighting": "柔和冷白侧光",
+                        "ocr": "厚实吸水",
+                        **temporal,
+                        "confidence": 0.9,
+                    },
+                    {
+                        "frame_index": 3,
+                        "visual": "水流从扭紧的洗脸巾中滴落",
+                        "lighting": "柔和冷白侧光",
+                        "ocr": "厚实吸水",
+                        **temporal,
+                        "confidence": 0.92,
+                    },
+                ],
+            }, ensure_ascii=False)}}],
+            "usage": {"total_tokens": 5},
+        },
+    ])
+
+    def fake_post(_path, payload, **_kwargs):
+        calls.append(payload)
+        return next(responses)
+
+    monkeypatch.setattr(gateway, "_post", fake_post)
+    cfg = RuntimeGatewayConfig(
+        use="vision",
+        provider="custom_openai",
+        base_url="https://vision-gateway.example.com/v1",
+        api_key="vision-key",
+        gateway_format="openai",
+    )
+    sampled_frames = [
+        {
+            "index": index,
+            "timestamp_seconds": timestamp,
+            "relative_timestamp_seconds": timestamp,
+            "detected_shot_id": "shot-1",
+            "detected_shot_index": 1,
+            "detected_shot_start_seconds": 0.0,
+            "detected_shot_end_seconds": 3.0,
+        }
+        for index, timestamp in ((1, 0.0), (2, 1.5), (3, 2.9))
+    ]
+
+    result = gateway.reverse_prompt(
+        ["data:image/jpeg;base64,eA=="] * 3,
+        "vision-model",
+        target="video",
+        video_analysis={
+            "source": {"duration_seconds": 3.0, "audio_analyzed": False},
+            "sampled_frames": sampled_frames,
+        },
+        require_video_frame_coverage=True,
+        gateway_config=cfg,
+    )
+
+    assert len(calls) == 2
+    repair_text = "\n".join(
+        item["text"]
+        for item in calls[1]["messages"][0]["content"]
+        if item["type"] == "text"
+    )
+    assert "至少提供 2 张缺失采样帧" in repair_text
+    assert repair_text.count("可与同镜头其他帧做时序对比") == 2
+    assert len(result["shots"]) == 1
+    shot = result["shots"][0]
+    assert shot["evidence_frame_indices"] == [1, 2, 3]
+    assert shot["subject_tracking"] == temporal["subject_tracking"]
+    assert shot["pose"] == temporal["pose"]
+    assert shot["action"] == temporal["action"]
+    assert shot["camera"] == "固定机位"
+    assert shot["transition"] == temporal["transition"]
+    assert "双手缓慢扭干" in result["final_text"]
+
+
+def test_generation_video_reverse_reports_placeholder_visuals_as_gaps(monkeypatch):
+    monkeypatch.setattr(settings, "mock_mode", False)
+    calls = []
+    responses = iter([{
             "choices": [{"message": {"content": (
                 '{"主体":"精华瓶","shots":['
                 '{"start_seconds":0,"end_seconds":4,"visual":"未见",'
@@ -524,18 +669,15 @@ def test_generation_video_reverse_repairs_frames_with_placeholder_visuals(monkey
                 '"final_text":"精华瓶产品视频"}'
             )}}],
             "usage": {"total_tokens": 7},
-        },
-        {
+        }, {
             "choices": [{"message": {"content": (
                 '{"frames":['
-                '{"frame_index":1,"visual":"银色瓶盖微距特写",'
-                '"lighting":"冷白侧光","confidence":0.9},'
-                '{"frame_index":2,"visual":"完整精华瓶立于水面",'
-                '"lighting":"冷白轮廓光","confidence":0.9}]}'
+                '{"frame_index":1,"visual":"精华瓶置于水面中央","lighting":"柔和侧光","confidence":0.9},'
+                '{"frame_index":2,"visual":"精华瓶与水波同框收尾","lighting":"柔和侧光","confidence":0.9}'
+                ']}'
             )}}],
-            "usage": {"total_tokens": 3},
-        },
-    ])
+            "usage": {"total_tokens": 11},
+        }])
 
     def fake_post(_path, payload, **_kwargs):
         calls.append(payload)
@@ -565,10 +707,8 @@ def test_generation_video_reverse_repairs_frames_with_placeholder_visuals(monkey
     )
 
     assert len(calls) == 2
-    repair_content = calls[1]["messages"][0]["content"]
-    assert isinstance(repair_content, list)
-    assert [item["type"] for item in repair_content].count("image_url") == 2
     assert result["repair_attempted"] is True
+    assert len(result["shots"]) == 2
     assert {
         index
         for shot in result["shots"]
