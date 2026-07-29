@@ -7,6 +7,14 @@ function buildSubmitBarProps(foundation, model, task, generation, view) {
     : foundation.productGenerationMode
       ? "请先上传产品"
       : "请先上传图片";
+  const handleVideoModelSwitchRequired = () => {
+    if (!model.videoModelSwitchMessage) return;
+    foundation.setMsg(model.videoModelSwitchMessage);
+    foundation.notify.error(model.videoModelSwitchMessage, {
+      title: "请切换视频模型",
+      duration: 6000,
+    });
+  };
 
   return {
     category: foundation.category,
@@ -18,7 +26,9 @@ function buildSubmitBarProps(foundation, model, task, generation, view) {
     submit: generation.submit,
     missingRequiredSource,
     missingRequiredSourceLabel,
-    productVideoStrategyUnsupported: model.productVideoStrategyUnsupported,
+    videoModelSwitchRequired: model.videoModelSwitchRequired,
+    videoModelSwitchMessage: model.videoModelSwitchMessage,
+    onVideoModelSwitchRequired: handleVideoModelSwitchRequired,
     structuredDirty: foundation.structuredDirty,
     submitting: generation.submitting,
     parsing: foundation.parsing,

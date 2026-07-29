@@ -1,5 +1,6 @@
 import { assetReferenceUrl } from "../../lib/unifiedAssets";
 import {
+  modelOptionSupports,
   strictMultiReferenceLimit,
   validateMultiReferenceSelection,
 } from "./StudioModelSelector";
@@ -48,6 +49,23 @@ export function buildStudioModelContext({
     && productGenerationMode
     && !productVideoStrategySelection.supported,
   );
+  const productReferenceUnsupported = Boolean(
+    category === "video"
+    && productGenerationMode
+    && productAsset
+    && !modelOptionSupports(selectedGenerationModel, [["reference_image", "multi_reference"]]),
+  );
+  const videoModelSwitchRequired = Boolean(
+    productReferenceUnsupported || productVideoStrategyUnsupported,
+  );
+  const selectedVideoModelName = String(
+    selectedGenerationModel?.display_name || selectedGenerationModel?.model_id || "当前视频模型",
+  ).trim();
+  const videoModelSwitchMessage = productReferenceUnsupported
+    ? `${selectedVideoModelName} 不支持独立产品主题图。请切换到支持产品参考的视频模型后再生成；系统不会自动切换模型。`
+    : productVideoStrategyUnsupported
+      ? `${selectedVideoModelName} 未提供可用的产品视频策略。请切换视频模型后再生成；系统不会自动切换模型。`
+      : "";
   const baseProductReferenceUrls = [productAsset, selected]
     .map(assetReferenceUrl)
     .filter(Boolean);
@@ -94,6 +112,9 @@ export function buildStudioModelContext({
     productVideoStrategySelection,
     effectiveProductVideoTemplate,
     productVideoStrategyUnsupported,
+    productReferenceUnsupported,
+    videoModelSwitchRequired,
+    videoModelSwitchMessage,
     productDetailValidation,
     productDetailLimit,
     studioCfg,
