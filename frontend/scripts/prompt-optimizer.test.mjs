@@ -23,8 +23,13 @@ const compileShotSource = storyboardActionsSource.slice(compileShotStart, applyS
 assert.match(apiSource, /\/api\/studio\/prompt-optimizations/);
 assert.match(
   optimizerSource,
-  /function requestOptions\([\s\S]{0,1800}reverse_operation_id:[\s\S]{0,300}reverse_revision_id:[\s\S]{0,500}lineage \|\| \{[\s\S]{0,300}prompt:/,
-  "lineage-backed optimization should send only server identities while ordinary prompts send text",
+  /function requestOptions\([\s\S]{0,500}promptText = String\(prompt \|\| ""\)\.trim\(\)[\s\S]{0,500}prompt: String\(promptText \|\| ""\)\.trim\(\)/,
+  "direct optimization should always send the current editor text snapshot",
+);
+assert.doesNotMatch(
+  optimizerSource.slice(optimizerSource.indexOf("function requestOptions("), optimizeDirectStart),
+  /reverse_operation_id|reverse_revision_id|lineage/,
+  "direct optimization must not replace edited text with an older reverse revision",
 );
 assert.match(
   optimizerSource,
@@ -52,7 +57,22 @@ assert.doesNotMatch(compileShotSource, /requestQuoteConfirmation|api\.optimizePr
 assert.doesNotMatch(apiSource, /\/api\/prompt\/optimize|optimizePrompt:/);
 assert.match(apiSource, /acceptStudioPromptOptimization[\s\S]{0,300}\/accept/);
 assert.match(apiSource, /rejectStudioPromptOptimization[\s\S]{0,300}\/reject/);
-assert.match(optimizerSource, /Boolean\(String\(prompt \|\| ""\)\.trim\(\) && promptDirty\)/);
+assert.match(optimizerSource, /const ready = Boolean\(String\(prompt \|\| ""\)\.trim\(\)\)/);
+assert.doesNotMatch(
+  optimizeDirectSource,
+  /!promptDirty/,
+  "editor text should remain optimizable even when it came from reverse analysis or a saved workspace",
+);
+assert.match(
+  optimizeDirectSource,
+  /requestOptions\(\{ promptText: source \}\)/,
+  "the optimization request should use the text captured at click time",
+);
+assert.match(
+  optimizeDirectSource,
+  /failedAndRefunded[\s\S]{0,240}clearPendingStudioActionRequest[\s\S]{0,180}attempt === 0\) continue/,
+  "a failed and refunded replay should receive a fresh request id and retry once",
+);
 assert.match(
   optimizerSource,
   /function updatePromptFromUser\([\s\S]{0,160}invalidate\(\)[\s\S]{0,120}setPrompt\(valueOrUpdater\)/,

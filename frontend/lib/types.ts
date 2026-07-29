@@ -119,6 +119,7 @@ export interface WorkspaceState {
   appliedUrl: string;
   parsing: boolean;
   uploading: boolean;
+  uploadingRole: import("../app/studio/generationUploadPolicy").StudioUploadRole | null;
   reversing: boolean;
   reverseOperation: import("./api").ReverseOperation | null;
   profileOperation: import("./api").ReverseOperation | null;

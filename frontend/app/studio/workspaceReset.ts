@@ -9,6 +9,7 @@ export function clearWorkspaceContent(current: Record<string, unknown>) {
     appliedUrl: "",
     parsing: false,
     uploading: false,
+    uploadingRole: null,
     reversing: false,
     reverseOperation: null,
     profileOperation: null,

@@ -14,11 +14,13 @@ export default function StudioSubmitBar({
   submit,
   missingRequiredSource,
   missingRequiredSourceLabel,
-  productVideoStrategyUnsupported,
+  videoModelSwitchRequired,
+  videoModelSwitchMessage,
+  onVideoModelSwitchRequired,
   structuredDirty,
   submitting,
   parsing,
-  uploading,
+  uploadBlocked,
   reversing,
   productProfiling,
   task,
@@ -31,6 +33,21 @@ export default function StudioSubmitBar({
   const imageUnitCredits = category === "image" && imageCount > 0
     ? estCost / imageCount
     : 0;
+  const submitDisabled = missingRequiredSource || structuredDirty || generationSubmitDisabled({
+    submitting,
+    busy: parsing || uploadBlocked || reversing || productProfiling,
+    currentTask: task,
+    nextCategory: category,
+    currentModelEnabled,
+  });
+
+  const handleSubmit = () => {
+    if (videoModelSwitchRequired) {
+      onVideoModelSwitchRequired?.();
+      return;
+    }
+    submit(category === "video" ? "final" : "preview");
+  };
 
   return (
     <div
@@ -58,29 +75,29 @@ export default function StudioSubmitBar({
         )}
       </div>
       <button
-        onClick={() => submit(category === "video" ? "final" : "preview")}
-        disabled={missingRequiredSource || productVideoStrategyUnsupported || structuredDirty || generationSubmitDisabled({
-          submitting,
-          busy: parsing || uploading || reversing || productProfiling,
-          currentTask: task,
-          nextCategory: category,
-          currentModelEnabled,
-        })}
+        onClick={handleSubmit}
+        disabled={submitDisabled}
         title={missingRequiredSource
           ? `${missingRequiredSourceLabel}后再生成`
-          : productVideoStrategyUnsupported
-            ? "当前视频模型未提供可用的产品视频策略，请先切换模型"
+          : videoModelSwitchRequired
+            ? videoModelSwitchMessage
             : structuredDirty
               ? "请先应用结构修改或撤销结构修改"
-              : undefined}
+              : uploadBlocked
+                ? "本次生成需要的素材仍在上传中"
+                : undefined}
         className="btn-primary btn-lg min-w-28 shrink-0 px-4 sm:min-w-32 sm:px-6"
       >
-        {(submitting || running) && (
+        {(submitting || running || uploadBlocked) && (
           <span className="h-4 w-4 shrink-0 animate-spin rounded-full border-2 border-white/35 border-t-white" aria-hidden />
         )}
         {missingRequiredSource
           ? missingRequiredSourceLabel
-          : productVideoStrategyUnsupported ? "请切换视频模型" : submitLabel}
+          : videoModelSwitchRequired
+            ? "请切换视频模型"
+            : uploadBlocked
+              ? "素材上传中"
+              : submitLabel}
       </button>
     </div>
   );

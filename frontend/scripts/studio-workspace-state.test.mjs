@@ -29,6 +29,7 @@ const referenceParsingSource = readFileSync(join(root, "hooks/useReferenceParsin
 const viewModelSource = readFileSync(join(root, "app/studio/viewModel.ts"), "utf8");
 const structuredEditorSource = readFileSync(join(root, "app/studio/StudioStructuredEditor.jsx"), "utf8");
 const submitBarSource = readFileSync(join(root, "app/studio/StudioSubmitBar.jsx"), "utf8");
+const presentationSource = readFileSync(join(root, "app/studio/buildStudioPresentation.js"), "utf8");
 const generationControlsSource = readFileSync(join(root, "components/StudioGenerationControls.jsx"), "utf8");
 const studioSource = `${pageSource}\n${workspaceStateSource}\n${workspaceActionsSource}\n${variationActionsSource}\n${promptWorkspaceSource}\n${editPromptSource}\n${generationPayloadSource}\n${referenceParsingSource}\n${viewModelSource}\n${constantsSource}\n${generationControlsSource}`;
 assert.match(
@@ -656,13 +657,23 @@ assert.match(
 );
 assert.match(
   submitBarSource,
-  /disabled=\{missingRequiredSource \|\| productVideoStrategyUnsupported \|\| structuredDirty \|\| generationSubmitDisabled/,
-  "generation must stay disabled until source, strategy, and structured constraints are satisfied",
+  /const submitDisabled = missingRequiredSource \|\| structuredDirty \|\| generationSubmitDisabled/,
+  "hard generation constraints must still disable the submit button",
 );
 assert.match(
   submitBarSource,
-  /missingRequiredSource[\s\S]*\? missingRequiredSourceLabel[\s\S]*productVideoStrategyUnsupported \? "请切换视频模型" : submitLabel/,
-  "the disabled submit button should explain which source image is missing",
+  /if \(videoModelSwitchRequired\)[\s\S]*onVideoModelSwitchRequired\?\.\(\)[\s\S]*return;[\s\S]*submit\(/,
+  "model compatibility conflicts must be clickable explanations instead of inert disabled buttons",
+);
+assert.match(
+  submitBarSource,
+  /missingRequiredSource[\s\S]*\? missingRequiredSourceLabel[\s\S]*: videoModelSwitchRequired[\s\S]*\? "请切换视频模型"[\s\S]*: uploadBlocked[\s\S]*\? "素材上传中"[\s\S]*: submitLabel/,
+  "the submit button should identify a required video model switch",
+);
+assert.match(
+  presentationSource,
+  /foundation\.setMsg\(model\.videoModelSwitchMessage\)[\s\S]*foundation\.notify\.error\(model\.videoModelSwitchMessage/,
+  "clicking an incompatible video model should show both persistent and toast feedback",
 );
 assert.doesNotMatch(
   pageSource,

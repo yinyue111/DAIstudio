@@ -412,6 +412,7 @@ export default function useGenerationSubmit({
   subjectMode,
   parsing = false,
   uploading = false,
+  uploadingRole = null,
   reversing = false,
   productProfiling = false,
   prompt,
@@ -534,6 +535,7 @@ export default function useGenerationSubmit({
     const preflight = validateGenerationSubmission({
       ...generationRequestInput,
       uploading,
+      uploadingRole,
       parsing,
       reversing,
       productProfiling,

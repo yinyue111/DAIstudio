@@ -450,7 +450,7 @@ export default function useMediaUpload({
     const refVersion = bumpRefVersion(mode);
     bumpReverseRequest(mode);
     setMsg("");
-    setWorkspacePatch({ uploading: true }, mode);
+    setWorkspacePatch({ uploading: true, uploadingRole: "reference" }, mode);
     const uploadRequest = activeUploadRequestsRef.current.capture();
     try {
       const uploaded = await api.uploadImage(file, { signal: uploadRequest.signal });
@@ -470,7 +470,7 @@ export default function useMediaUpload({
         ownerRequest.isCurrent()
         && isRequestCurrent(uploadRequestRef, mode, reqId)
       ) {
-        setWorkspacePatch({ uploading: false }, mode);
+        setWorkspacePatch({ uploading: false, uploadingRole: null }, mode);
         resetInput(imageUploadInputRef);
       }
     }
@@ -500,7 +500,7 @@ export default function useMediaUpload({
     const productReqId = bumpRequest(productUploadRequestRef, mode);
     const reqId = bumpRequest(uploadRequestRef, mode);
     setMsg("");
-    setWorkspacePatch({ uploading: true }, mode);
+    setWorkspacePatch({ uploading: true, uploadingRole: "product" }, mode);
     const uploadRequest = activeUploadRequestsRef.current.capture();
     try {
       const uploaded = await api.uploadImage(file, { signal: uploadRequest.signal });
@@ -540,7 +540,7 @@ export default function useMediaUpload({
         ownerRequest.isCurrent()
         && isRequestCurrent(uploadRequestRef, mode, reqId)
       ) {
-        setWorkspacePatch({ uploading: false }, mode);
+        setWorkspacePatch({ uploading: false, uploadingRole: null }, mode);
         resetInput(productUploadInputRef);
       }
     }
@@ -612,7 +612,7 @@ export default function useMediaUpload({
     const ownerRequest = ownerRequestContextRef.current.capture();
     const reqId = bumpRequest(uploadRequestRef, mode);
     setMsg("");
-    setWorkspacePatch({ uploading: true }, mode);
+    setWorkspacePatch({ uploading: true, uploadingRole: "product_detail" }, mode);
     const uploadRequest = activeUploadRequestsRef.current.capture();
     try {
       const uploadedRows = [];
@@ -637,7 +637,7 @@ export default function useMediaUpload({
     } finally {
       uploadRequest.release();
       if (ownerRequest.isCurrent() && isRequestCurrent(uploadRequestRef, mode, reqId)) {
-        setWorkspacePatch({ uploading: false }, mode);
+        setWorkspacePatch({ uploading: false, uploadingRole: null }, mode);
         resetInput(productDetailUploadInputRef);
       }
     }
@@ -658,7 +658,7 @@ export default function useMediaUpload({
     }
     const reqId = bumpRequest(uploadRequestRef, mode);
     setMsg("");
-    setWorkspacePatch({ uploading: true }, mode);
+    setWorkspacePatch({ uploading: true, uploadingRole: "last_frame" }, mode);
     const uploadRequest = activeUploadRequestsRef.current.capture();
     try {
       const uploaded = await api.uploadImage(file, { signal: uploadRequest.signal });
@@ -674,7 +674,7 @@ export default function useMediaUpload({
     } finally {
       uploadRequest.release();
       if (ownerRequest.isCurrent() && isRequestCurrent(uploadRequestRef, mode, reqId)) {
-        setWorkspacePatch({ uploading: false }, mode);
+        setWorkspacePatch({ uploading: false, uploadingRole: null }, mode);
         resetInput(lastFrameUploadInputRef);
       }
     }
@@ -706,7 +706,7 @@ export default function useMediaUpload({
     bumpReverseRequest(targetMode);
     setMsg("");
     if (targetMode !== mode) setCreationMode(targetMode);
-    setWorkspacePatch({ uploading: true }, targetMode);
+    setWorkspacePatch({ uploading: true, uploadingRole: "video_reference" }, targetMode);
     const uploadRequest = activeUploadRequestsRef.current.capture();
     try {
       const uploaded = await api.uploadVideo(file, { signal: uploadRequest.signal });
@@ -729,7 +729,7 @@ export default function useMediaUpload({
         ownerRequest.isCurrent()
         && isRequestCurrent(uploadRequestRef, targetMode, reqId)
       ) {
-        setWorkspacePatch({ uploading: false }, targetMode);
+        setWorkspacePatch({ uploading: false, uploadingRole: null }, targetMode);
         resetInput(videoUploadInputRef);
       }
     }

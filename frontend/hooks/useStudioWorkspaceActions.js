@@ -109,6 +109,7 @@ export default function useStudioWorkspaceActions({
       appliedUrl: "",
       parsing: false,
       uploading: false,
+      uploadingRole: null,
       reversing: false,
       structured: {},
       structuredBaseline: {},

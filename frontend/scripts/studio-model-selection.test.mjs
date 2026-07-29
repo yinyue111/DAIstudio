@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import React from "react";
 import { readStudioSource } from "./studio-source.mjs";
 
 import { buildGenerationPayload } from "../app/studio/generationPayload.ts";
@@ -16,8 +17,12 @@ import {
   validateMultiReferenceSelection,
   writeModelSelections,
 } from "../app/studio/StudioModelSelector.jsx";
+import StudioSubmitBar from "../app/studio/StudioSubmitBar.jsx";
+import { buildStudioModelContext } from "../app/studio/studioModelContext.ts";
 import { reverseOperationRequestSignature } from "../lib/reverseOperations.ts";
 import { validateGenerationSubmission } from "../hooks/generationSubmitWorkflow.js";
+
+globalThis.React = React;
 
 const options = normalizeModelOptions({
   model_options: {
@@ -69,6 +74,7 @@ assert.equal(
 );
 const seedance15Option = {
   id: 15,
+  display_name: "Seedance 1.5 Pro",
   model_id: "doubao-seedance-1-5-pro-251215",
   capabilities: {
     image_to_video: true,
@@ -127,6 +133,56 @@ const seedanceProductPreflight = validateGenerationSubmission({
 });
 assert.equal(seedanceProductPreflight.ok, false);
 assert.match(seedanceProductPreflight.message, /不支持独立产品主题图/);
+const seedance15ProductContext = buildStudioModelContext({
+  cfg: {},
+  category: "video",
+  creationMode: "video",
+  subjectMode: "product",
+  productGenerationMode: true,
+  selected: null,
+  lastFrameAsset: null,
+  productAsset: { type: "image", url: "/product.png" },
+  productDetailAssets: [],
+  productVideoTemplate: "prompt_driven",
+  generationModelOptions: [seedance15Option],
+  selectedGenerationModel: seedance15Option,
+});
+assert.equal(seedance15ProductContext.productReferenceUnsupported, true);
+assert.equal(seedance15ProductContext.videoModelSwitchRequired, true);
+assert.match(seedance15ProductContext.videoModelSwitchMessage, /Seedance 1\.5 Pro 不支持独立产品主题图/);
+
+let generationSubmitCount = 0;
+let modelSwitchWarningCount = 0;
+const incompatibleSubmitBar = StudioSubmitBar({
+  category: "video",
+  videoFinalCost: 10,
+  estCost: 10,
+  imageCount: 1,
+  videoDuration: 5,
+  vResolution: "720p",
+  submit: () => { generationSubmitCount += 1; },
+  missingRequiredSource: false,
+  missingRequiredSourceLabel: "请先上传产品",
+  videoModelSwitchRequired: true,
+  videoModelSwitchMessage: seedance15ProductContext.videoModelSwitchMessage,
+  onVideoModelSwitchRequired: () => { modelSwitchWarningCount += 1; },
+  structuredDirty: false,
+  submitting: false,
+  parsing: false,
+  uploading: false,
+  reversing: false,
+  productProfiling: false,
+  task: null,
+  currentModelEnabled: true,
+  running: false,
+  submitLabel: "生成成片",
+});
+const incompatibleSubmitButton = incompatibleSubmitBar.props.children[1];
+assert.equal(incompatibleSubmitButton.props.disabled, false, "model conflicts must remain clickable so the UI can explain them");
+assert.equal(incompatibleSubmitButton.props.children.at(-1), "请切换视频模型");
+incompatibleSubmitButton.props.onClick();
+assert.equal(modelSwitchWarningCount, 1, "clicking an incompatible model should show the switch-model warning");
+assert.equal(generationSubmitCount, 0, "an incompatible model must never submit or silently switch generation models");
 const grokReferenceOption = {
   id: 20,
   model_id: "grok-imagine-video",
@@ -157,6 +213,7 @@ assert.deepEqual(
   "product reference mode must offer grok-imagine-video and hide Grok 1.5",
 );
 const seedance20Option = {
+  display_name: "Seedance 2.0",
   model_id: "doubao-seedance-2-0-mini-260615",
   capabilities: { multi_reference: true, max_reference_images: 10 },
 };
@@ -171,6 +228,22 @@ assert.equal(
   false,
   "Seedance 2.0 must reject more than ten total reference images",
 );
+const seedance20ProductContext = buildStudioModelContext({
+  cfg: {},
+  category: "video",
+  creationMode: "video",
+  subjectMode: "product",
+  productGenerationMode: true,
+  selected: null,
+  lastFrameAsset: null,
+  productAsset: { type: "image", url: "/product.png" },
+  productDetailAssets: [],
+  productVideoTemplate: "prompt_driven",
+  generationModelOptions: [seedance20Option],
+  selectedGenerationModel: seedance20Option,
+});
+assert.equal(seedance20ProductContext.videoModelSwitchRequired, false);
+assert.equal(seedance20ProductContext.videoModelSwitchMessage, "");
 assert.deepEqual(
   filterModelOptions(options.vision, { use: "vision", selected: { type: "video" } }).map((item) => item.id),
   [2],

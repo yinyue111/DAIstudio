@@ -96,6 +96,7 @@ export function sanitizeWorkspaceForDraft(current) {
     promptDirty: !!current.promptDirty,
     parsing: false,
     uploading: false,
+    uploadingRole: null,
     reversing: false,
     productProfiling: false,
     subjectProtection: null,

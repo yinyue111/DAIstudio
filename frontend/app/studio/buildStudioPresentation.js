@@ -1,12 +1,26 @@
 import { buildStudioDerivedViewState } from "./viewModel";
+import { generationRequiresPendingUpload } from "./generationUploadPolicy";
 
 function buildSubmitBarProps(foundation, model, task, generation, view) {
   const missingRequiredSource = foundation.isEditMode && !foundation.productAsset;
+  const uploadBlocked = generationRequiresPendingUpload({
+    uploading: foundation.uploading,
+    uploadingRole: foundation.uploadingRole,
+    selected: foundation.selected,
+  });
   const missingRequiredSourceLabel = foundation.portraitGenerationMode
     ? "请先上传人物"
     : foundation.productGenerationMode
       ? "请先上传产品"
       : "请先上传图片";
+  const handleVideoModelSwitchRequired = () => {
+    if (!model.videoModelSwitchMessage) return;
+    foundation.setMsg(model.videoModelSwitchMessage);
+    foundation.notify.error(model.videoModelSwitchMessage, {
+      title: "请切换视频模型",
+      duration: 6000,
+    });
+  };
 
   return {
     category: foundation.category,
@@ -18,11 +32,13 @@ function buildSubmitBarProps(foundation, model, task, generation, view) {
     submit: generation.submit,
     missingRequiredSource,
     missingRequiredSourceLabel,
-    productVideoStrategyUnsupported: model.productVideoStrategyUnsupported,
+    videoModelSwitchRequired: model.videoModelSwitchRequired,
+    videoModelSwitchMessage: model.videoModelSwitchMessage,
+    onVideoModelSwitchRequired: handleVideoModelSwitchRequired,
     structuredDirty: foundation.structuredDirty,
     submitting: generation.submitting,
     parsing: foundation.parsing,
-    uploading: foundation.uploading,
+    uploadBlocked,
     reversing: foundation.reversing,
     productProfiling: foundation.productProfiling,
     task: task.task,
