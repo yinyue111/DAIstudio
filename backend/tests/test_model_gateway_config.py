@@ -11,6 +11,7 @@ from app.services.model_gateway_config import (
     _env_runtime_config,
     decrypt_row_api_key,
     normalise_gateway_format,
+    runtime_config_for_model,
 )
 
 
@@ -486,3 +487,158 @@ def test_admin_probe_rejects_saved_key_with_temporary_base_url(client, make_user
     assert leaked.status_code == 400
     assert "不能临时覆盖 Base URL" in leaked.text
     assert called is False
+
+
+def test_saved_allowlisted_model_probe_uses_trusted_transport(client, make_user, auth, monkeypatch):
+    make_user("13900001009", balance=1000, admin=True)
+    headers = auth("13900001009")
+    monkeypatch.setattr(settings, "trusted_egress_hosts", "sub.aiwuq.cn")
+    seen = {}
+
+    saved = client.put(
+        "/api/admin/models",
+        json={
+            "use": "image",
+            "provider": "yinyue",
+            "base_url": "https://sub.aiwuq.cn",
+            "api_key": "saved-key",
+            "gateway_format": "openai",
+            "model_id": "gpt-image-2",
+            "cost_credits": 8,
+            "unlock_cost": 0,
+            "enabled": True,
+            "admin_password": "pass123456",
+        },
+        headers=headers,
+    )
+    assert saved.status_code == 200, saved.text
+    model_id = next(
+        item["id"]
+        for item in client.get("/api/admin/models", headers=headers).json()["models"]
+        if item["use"] == "image"
+    )
+
+    def fake_list_models(config):
+        seen["config"] = config
+        return [{"id": "gpt-image-2"}]
+
+    monkeypatch.setattr(gateway, "list_models", fake_list_models)
+    response = client.post(
+        "/api/admin/models/probe",
+        json={
+            "model_config_id": model_id,
+            "use": "image",
+            "provider": "yinyue",
+            "base_url": "https://sub.aiwuq.cn",
+            "gateway_format": "openai",
+        },
+        headers=headers,
+    )
+
+    assert response.status_code == 200, response.text
+    assert seen["config"].trusted_hosts == ("sub.aiwuq.cn",)
+
+
+def test_temporary_or_changed_probe_cannot_claim_saved_trusted_host(
+    client, make_user, auth, monkeypatch
+):
+    make_user("13900001010", balance=1000, admin=True)
+    headers = auth("13900001010")
+    monkeypatch.setattr(settings, "trusted_egress_hosts", "sub.aiwuq.cn")
+    called = False
+
+    def fake_list_models(config):
+        nonlocal called
+        called = True
+        return [{"id": "model-a"}]
+
+    monkeypatch.setattr(gateway, "list_models", fake_list_models)
+    temporary = client.post(
+        "/api/admin/models/probe",
+        json={
+            "use": "image",
+            "provider": "yinyue",
+            "base_url": "https://sub.aiwuq.cn",
+            "api_key": "temporary-key",
+            "gateway_format": "openai",
+        },
+        headers=headers,
+    )
+    assert temporary.status_code == 400, temporary.text
+    assert "不能临时探测受信任内网网关" in temporary.text
+
+    with SessionLocal() as db:
+        row = db.query(ModelConfig).filter(ModelConfig.use == "image").one()
+        model_id = row.id
+    changed = client.post(
+        "/api/admin/models/probe",
+        json={
+            "model_config_id": model_id,
+            "use": "image",
+            "provider": "yinyue",
+            "base_url": "https://sub.aiwuq.cn",
+            "api_key": "temporary-key",
+            "gateway_format": "openai",
+        },
+        headers=headers,
+    )
+    assert changed.status_code == 400, changed.text
+    assert "不能临时探测受信任内网网关" in changed.text
+    assert called is False
+
+
+def test_saved_allowlisted_runtime_config_bypasses_only_gateway_dns_guard(monkeypatch):
+    monkeypatch.setattr(settings, "debug", False)
+    monkeypatch.setattr(settings, "mock_mode", False)
+    monkeypatch.setattr(settings, "trusted_egress_hosts", "sub.aiwuq.cn")
+    row = ModelConfig(
+        id=999,
+        use="image",
+        model_id="gpt-image-2",
+        provider="yinyue",
+        base_url="https://sub.aiwuq.cn",
+        api_key_encrypted="saved-key",
+        gateway_format="openai",
+    )
+
+    config = runtime_config_for_model(row)
+
+    assert config.trusted_hosts == ("sub.aiwuq.cn",)
+    assert config.source == "model"
+
+    seen = {}
+
+    class FakeResponse:
+        status_code = 200
+        is_redirect = False
+        text = '{"data":[{"id":"gpt-image-2"}]}'
+
+        @staticmethod
+        def json():
+            return {"data": [{"id": "gpt-image-2"}]}
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            seen["client_kwargs"] = kwargs
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def request(self, method, url, **kwargs):
+            seen["request"] = (method, url, kwargs)
+            return FakeResponse()
+
+    def unexpected_pinned_client(*_args, **_kwargs):
+        raise AssertionError("allowlisted saved gateways must use the trusted transport")
+
+    monkeypatch.setattr(gateway.httpx, "Client", FakeClient)
+    monkeypatch.setattr(gateway, "pinned_client", unexpected_pinned_client)
+
+    models = gateway.list_models(config)
+
+    assert models == [{"id": "gpt-image-2", "owned_by": None, "object": None}]
+    assert seen["client_kwargs"]["trust_env"] is False
+    assert seen["request"][0:2] == ("GET", "https://sub.aiwuq.cn/v1/models")

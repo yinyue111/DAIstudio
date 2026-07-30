@@ -30,6 +30,7 @@ def test_ip_classification():
     assert _ip_is_blocked("127.0.0.1")
     assert _ip_is_blocked("169.254.169.254")
     assert _ip_is_blocked("10.1.2.3")
+    assert _ip_is_blocked("198.18.0.22")
     assert not _ip_is_blocked("1.1.1.1")
 
 

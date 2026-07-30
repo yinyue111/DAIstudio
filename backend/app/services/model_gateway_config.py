@@ -137,6 +137,7 @@ class RuntimeGatewayConfig:
     api_key: str
     gateway_format: str
     source: str = "model"
+    trusted_hosts: tuple[str, ...] = ()
 
     @property
     def configured(self) -> bool:
@@ -233,7 +234,19 @@ def normalise_base_url(value: str | None) -> str | None:
     return text or None
 
 
-def validate_base_url(name: str, url: str | None) -> None:
+def _persisted_trusted_hosts(url: str | None) -> tuple[str, ...]:
+    host = (urlparse(url or "").hostname or "").rstrip(".").lower()
+    if host and host in settings.trusted_egress_host_list:
+        return (host,)
+    return ()
+
+
+def validate_base_url(
+    name: str,
+    url: str | None,
+    *,
+    persisted_trusted_hosts: tuple[str, ...] = (),
+) -> None:
     if not url:
         return
     parsed = urlparse(url)
@@ -244,6 +257,8 @@ def validate_base_url(name: str, url: str | None) -> None:
     if not settings.debug and parsed.scheme != "https" and not trusted:
         raise ModelGatewayConfigError(f"{name} 必须使用 HTTPS,或将主机加入 TRUSTED_EGRESS_HOSTS")
     if settings.debug:
+        return
+    if host in persisted_trusted_hosts and trusted:
         return
     try:
         assert_safe_url(url)
@@ -270,6 +285,7 @@ def apply_model_gateway_update(
     api_key: str | None,
     api_key_clear: bool,
     gateway_format: str | None,
+    persisted_trusted_hosts: tuple[str, ...] = (),
 ) -> None:
     current_provider = normalise_provider(getattr(row, "provider", None))
     current_base_url = normalise_base_url(getattr(row, "base_url", None))
@@ -281,7 +297,19 @@ def apply_model_gateway_update(
     provider = normalise_provider(provider)
     base_url = normalise_base_url(base_url)
     gateway_format = normalise_gateway_format(gateway_format, provider, row.use)
-    validate_base_url("模型 Base URL", base_url)
+    unchanged_trusted_hosts = (
+        _persisted_trusted_hosts(base_url)
+        if getattr(row, "id", None) is not None
+        and current_provider == provider
+        and current_base_url == base_url
+        and current_gateway_format == gateway_format
+        else ()
+    )
+    validate_base_url(
+        "模型 Base URL",
+        base_url,
+        persisted_trusted_hosts=persisted_trusted_hosts or unchanged_trusted_hosts,
+    )
     if api_key and not (settings.model_config_secret or settings.payment_config_secret or settings.debug):
         raise ModelGatewayConfigError("MODEL_CONFIG_SECRET 未配置,无法保存模型 API Key")
     existing_key_present = encrypted_key_present(row)
@@ -371,8 +399,15 @@ def runtime_config_for_model(row: ModelConfig | None, use: str | None = None) ->
         if has_model_gateway_override:
             provider = normalise_provider(getattr(row, "provider", None)) or "custom_openai"
             gateway_format = normalise_gateway_format(getattr(row, "gateway_format", None), provider, resolved_use)
+            trusted_hosts = (
+                _persisted_trusted_hosts(base_url) if getattr(row, "id", None) is not None else ()
+            )
             if base_url:
-                validate_base_url("模型 Base URL", base_url)
+                validate_base_url(
+                    "模型 Base URL",
+                    base_url,
+                    persisted_trusted_hosts=trusted_hosts,
+                )
             return RuntimeGatewayConfig(
                 use=resolved_use,
                 provider=provider,
@@ -380,6 +415,7 @@ def runtime_config_for_model(row: ModelConfig | None, use: str | None = None) ->
                 api_key=api_key,
                 gateway_format=gateway_format or "openai",
                 source="model",
+                trusted_hosts=trusted_hosts,
             )
     return _env_runtime_config(resolved_use)
 
@@ -398,6 +434,7 @@ def apply_saved_model_gateway(row: ModelConfig, source: ModelConfig | None) -> N
         api_key=config.api_key,
         api_key_clear=False,
         gateway_format=config.gateway_format,
+        persisted_trusted_hosts=config.trusted_hosts,
     )
 
 
@@ -409,6 +446,7 @@ def runtime_config_from_probe(
     api_key: str | None,
     gateway_format: str | None,
     fallback_row: ModelConfig | None = None,
+    allow_saved_trusted_host: bool = False,
 ) -> RuntimeGatewayConfig:
     resolved_use = use or getattr(fallback_row, "use", None) or "image"
     supplied_key = str(api_key or "").strip()
@@ -446,7 +484,20 @@ def runtime_config_from_probe(
         or fallback_gateway_format
         or "openai"
     )
-    validate_base_url("模型 Base URL", base_url)
+    matches_saved_gateway = bool(
+        allow_saved_trusted_host
+        and fallback_row is not None
+        and getattr(fallback_row, "id", None) is not None
+        and base_url == fallback_base_url
+        and provider == fallback_provider
+        and gateway_format == fallback_gateway_format
+    )
+    trusted_hosts = _persisted_trusted_hosts(base_url) if matches_saved_gateway else ()
+    validate_base_url(
+        "模型 Base URL",
+        base_url,
+        persisted_trusted_hosts=trusted_hosts,
+    )
     return RuntimeGatewayConfig(
         use=resolved_use,
         provider=provider,
@@ -454,4 +505,5 @@ def runtime_config_from_probe(
         api_key=key,
         gateway_format=gateway_format,
         source="probe",
+        trusted_hosts=trusted_hosts,
     )

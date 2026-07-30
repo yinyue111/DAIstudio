@@ -89,31 +89,15 @@ def _required_video_prompt_constraints(
     product_lock_mode: str | None,
     product_video_template: str | None,
 ) -> list[str]:
+    # Duration, aspect ratio, resolution, provider identity and prompt budgets
+    # shape the optimization process, but are native generation parameters or
+    # internal capacity metadata. Repeating them in the model-facing prompt
+    # wastes the provider's prompt budget and can conflict with a later UI
+    # selection.
+    del duration, max_shots, prompt_budget_chars
+    del target_model_id, target_model_provider, aspect_ratio, resolution
     constraints: list[str] = []
-    if duration is not None:
-        constraints.append(f"目标时长 {max(1, int(duration))} 秒")
-    if aspect_ratio:
-        constraints.append(f"画幅 {aspect_ratio}")
-    if resolution:
-        constraints.append(f"分辨率 {resolution}")
-    if target_model_id or target_model_provider:
-        target = " / ".join(
-            item
-            for item in (
-                str(target_model_id or "").strip(),
-                str(target_model_provider or "").strip(),
-            )
-            if item
-        )
-        constraints.append(f"适配目标模型 {target}")
-    constraints.extend(
-        [
-            f"单段常规舒适密度约 {max(1, int(max_shots))} 个主要动作；"
-            "超出时在同一视频内按原顺序连续串联，不得删减或替换",
-            f"单段提示词预算约 {max(1, int(prompt_budget_chars))} 字符",
-            "保持主体、场景、动作和运镜连续，禁止将原始动作合并成泛化描述",
-        ]
-    )
+    constraints.append("保持主体、场景、动作和运镜连续")
     if effective_product_mode:
         constraints.append("同一 SKU 的包装外形与比例、Logo、品牌色、可见文字、材质和纹理保持一致")
         constraints.append("不得新增用户未提供的商品、配件或突兀道具")
@@ -154,6 +138,7 @@ def _normalize_video_optimizer_output(
         style = sections["style"]
         scenes = sections["shots"]
         constraints = sections["constraints"]
+    constraints = _model_facing_video_constraints(constraints)
     style_text = clean_video_prompt_section(style) or "沿用原稿明确的视觉风格、色调、光线和氛围"
     shots = [
         clean_video_prompt_section(shot) for shot in scenes if clean_video_prompt_section(shot)
@@ -168,21 +153,33 @@ def _normalize_video_optimizer_output(
     source_shots = video_action_requirements(source_plan_shots)
     if len(source_shots) > len(shots):
         shots = source_shots
+    elif source_shots and len(source_shots) == len(shots):
+        def semantic_action_key(value: str) -> str:
+            key = re.sub(
+                r"[\s,，。；;:：、.!！？?]+",
+                "",
+                value,
+            ).lower()
+            return re.sub(
+                r"人物|女主|男主|模特|产品|商品|镜头|"
+                r"随后|然后|接着|慢速|缓慢|稳定|轻轻|先|再",
+                "",
+                key,
+            )
+
+        optimized_scene_keys = [semantic_action_key(shot) for shot in shots]
+        for source_shot in source_shots:
+            source_key = semantic_action_key(source_shot)
+            covered = any(
+                source_key in optimized_key
+                for optimized_key in optimized_scene_keys
+                if optimized_key
+            )
+            if source_key and not covered:
+                shots.append(source_shot)
+                optimized_scene_keys.append(source_key)
     source_shot_count = len(shots)
     condensed_for_single_clip = False
-    optimized_scene_key = re.sub(r"[\s,，。；;：:、.!！？?]+", "", "".join(shots)).lower()
-    missing_source_shots = [
-        source_shot
-        for source_shot in source_shots
-        if re.sub(r"[\s,，。；;：:、.!！？?]+", "", source_shot).lower()
-        not in optimized_scene_key
-    ]
-    original_action_constraint = ""
-    if missing_source_shots and not condensed_for_single_clip:
-        inventory = "；".join(
-            f"{index}. {shot}" for index, shot in enumerate(missing_source_shots, start=1)
-        )
-        original_action_constraint = f"必须完整执行且不得替换的原始动作要求（按顺序）：{inventory}"
     requested_post_constraints: list[str] = []
     if preserve_requested_post_production:
         requested_post = split_video_post_production(source)
@@ -204,7 +201,6 @@ def _normalize_video_optimizer_output(
         constraints,
         *required_constraints,
         *requested_post_constraints,
-        original_action_constraint,
     )
     normalized = render_structured_video_prompt(
         style=style_text,
@@ -246,6 +242,28 @@ def _normalize_video_optimizer_output(
             "sequence_required": sequence_required,
         },
     }
+
+
+_VIDEO_EXECUTION_METADATA_RE = re.compile(
+    r"^(?:(?:目标|总)?时长|画幅|分辨率|适配目标模型|原稿含|执行方式|"
+    r"单段常规舒适密度|单段提示词预算|超出时|建议拆分|最终按原镜头顺序)",
+    re.IGNORECASE,
+)
+
+
+def _model_facing_video_constraints(value: str) -> str:
+    """Keep visual constraints while dropping native request metadata."""
+    text = re.split(
+        r"必须完整执行且不得替换的原始动作要求",
+        str(value or ""),
+        maxsplit=1,
+    )[0]
+    kept = [
+        clause.strip()
+        for clause in re.split(r"[\n。；;]+", text)
+        if clause.strip() and not _VIDEO_EXECUTION_METADATA_RE.search(clause.strip())
+    ]
+    return merge_video_constraint_clauses(*kept)
 
 
 def _assert_complete_video_optimizer_output(prompt: str, *, max_chars: int = 4000) -> None:
@@ -667,10 +685,11 @@ def _video_optimization_contract(
         "只返回一个 JSON 对象，不要 Markdown、代码围栏或解释。JSON 必须且只能包含三个键："
         "“风格设定”（字符串，只写整体风格、场景基调、色调、光线、质感和氛围，不写动作）；"
         "“场景脚本”（字符串数组，每项一个镜头，按时间顺序写主体+一个主要动作+景别/运镜，不带 Shot 编号）；"
-        "“技术约束”（字符串，写时长、画幅、分辨率、连续性、模型适配和主体一致性）。"
+        "“技术约束”（字符串，只写主体一致性、连续性、文字保真和必要的视觉约束，"
+        "不写时长、画幅、分辨率、模型名、预算或拆分建议）。"
         f"场景脚本按单段建议最多 {context.max_shots} 个主要镜头组织；"
         "不得删除用户明确要求的动作，超过单段容量时保留全部动作并在技术约束中明确要求拆分生成。"
-        f"必须纳入这些技术事实：{technical_context}。"
+        f"必须纳入这些视觉约束：{technical_context}。"
     )
     return constraints, structured_contract
 

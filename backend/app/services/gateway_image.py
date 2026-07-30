@@ -505,6 +505,7 @@ def _post_single_image_repeated(
                         payload=payload,
                         timeout=timeout,
                         retries=0,
+                        **_gw._trusted_request_options(config),
                     )
                 images, diagnostics = _decode_image_response_with_diagnostics(data)
                 if not images:
@@ -645,6 +646,7 @@ def _post_single_image_multipart_repeated(
                         files=files,
                         timeout=timeout,
                         retries=0,
+                        **_gw._trusted_request_options(config),
                     )
                 images, diagnostics = _decode_image_response_with_diagnostics(response)
                 if not images:

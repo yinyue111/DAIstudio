@@ -40,6 +40,7 @@ export default function usePromptOptimization({
   reverseAppliedRevisionId,
   reverseOperationForPendingResult,
   me,
+  refreshMe,
   requestQuoteConfirmation,
   workspace,
   workspacesRef,
@@ -209,6 +210,7 @@ export default function usePromptOptimization({
       )) return;
       const optimized = String(result?.suggestion?.final_text || "").trim();
       if (!optimized) throw new Error("优化模型未返回有效提示词");
+      refreshMe();
       setProposals((current) => ({
         ...current,
         [mode]: {
@@ -269,6 +271,7 @@ export default function usePromptOptimization({
       notify.error(text);
       return;
     }
+    refreshMe();
     const latestWorkspace = workspacesRef.current?.[mode] || workspace;
     const applied = applyPromptOptimizationDecision(
       latestWorkspace,

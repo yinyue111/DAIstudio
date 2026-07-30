@@ -533,9 +533,6 @@ def probe_models(
         elif body.use:
             fallback = get_model_config(db, body.use)
         requested_base = normalise_base_url(body.base_url)
-        requested_host = (urlparse(requested_base).hostname or "").lower() if requested_base else ""
-        if requested_host and requested_host in app_config.trusted_egress_host_list:
-            raise HTTPException(400, "不能临时探测受信任内网网关,请保存配置后再探测")
         if requested_base and requested_base.lower().startswith("http://"):
             raise HTTPException(400, "不能临时探测非 HTTPS 网关,请使用 HTTPS Base URL")
         cfg = runtime_config_from_probe(
@@ -545,7 +542,17 @@ def probe_models(
             api_key=body.api_key,
             gateway_format=body.gateway_format,
             fallback_row=fallback,
+            allow_saved_trusted_host=bool(
+                body.model_config_id is not None or body.provider_config_id is not None
+            ),
         )
+        target_host = (urlparse(cfg.base_url).hostname or "").rstrip(".").lower()
+        if (
+            target_host
+            and target_host in app_config.trusted_egress_host_list
+            and target_host not in cfg.trusted_hosts
+        ):
+            raise HTTPException(400, "不能临时探测受信任内网网关,请保存配置后再探测")
         models = annotate_discovered_models(
             gateway.list_models(cfg),
             provider=cfg.provider,

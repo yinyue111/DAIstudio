@@ -589,6 +589,7 @@ def finalize_video_success(
                 low_speed_timeout_seconds=int(settings.video_download_low_speed_timeout_seconds),
                 low_speed_min_bytes_per_second=int(settings.video_download_low_speed_bytes_per_second),
                 request_headers=request_headers or None,
+                trusted_hosts=settings.trusted_egress_host_list,
             )
             mark_download_progress()
             written_keys.append(media_key)

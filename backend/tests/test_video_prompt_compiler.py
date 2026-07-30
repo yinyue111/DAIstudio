@@ -76,7 +76,7 @@ def test_direct_product_video_passthrough_separates_post_production_from_visual_
     assert result["metadata"]["shot_count"] == 1
 
 
-def test_timed_direct_prompt_counts_shots_and_embeds_seedance_15_audio_visual_requirements():
+def test_timed_direct_prompt_counts_shots_and_embeds_seedance_15_audio_requirements():
     raw_text = (
         "10秒高端个护广告。\n"
         "Shot 1（0.00-2.00s）：人物伸懒腰后硬切。\n"
@@ -103,12 +103,13 @@ def test_timed_direct_prompt_counts_shots_and_embeds_seedance_15_audio_visual_re
     assert result["metadata"]["shot_count"] == 3
     assert result["metadata"]["source_shot_count"] == 3
     assert result["metadata"]["embedded_av_requirements"] is True
+    assert result["metadata"]["embedded_text_overlays"] is False
     assert result["prompt"].count("Shot ") == 3
     assert result["plan"]["post_overlays"] == ["干湿两用", "厚实吸水", "亲肤"]
     assert "仅出现上述三组卖点" not in result["plan"]["post_overlays"]
     assert result["plan"]["sfx"] == ["水滴声和纸巾摩擦声"]
     assert "音画生成要求" in result["prompt"]
-    assert "干湿两用" in result["prompt"]
+    assert "干湿两用" not in result["prompt"]
     assert "水滴声和纸巾摩擦声" in result["prompt"]
     assert any("3 个镜头" in warning for warning in result["plan"]["warnings"])
 
@@ -1303,3 +1304,128 @@ def test_compiler_deduplicates_guard_and_style_but_preserves_repeated_timeline_b
         "0-4s 从底部抽出一张洗脸巾",
         "4-8s 微距展开如意云纹",
     ]
+
+
+def test_long_direct_seedance_prompt_compacts_runtime_metadata_and_duplicate_inventory():
+    shots = [
+        f"Shot {index}：同一女性与同一洗脸巾包装完成动作{index}，"
+        "保持包装正面文字、珍珠纹理、暖色侧光和固定机位；硬切。"
+        + ("画面文字：干湿两用。" if index == 5 else "")
+        + ("声音：持续背景音乐。" if index in (1, 5, 10) else "")
+        for index in range(1, 11)
+    ]
+    inventory = "；".join(
+        f"{index}. 画面执行第{index}个已在场景脚本详细描述的动作，"
+        "主体追踪、姿态、运镜、光线和转场再次完整重复，"
+        "再次逐项复述镜头内的主体位置、动作初态终态、景别、光线方向、"
+        "硬切关系和跨镜连续性，不得遗漏或替换任何已在场景脚本中明确的执行细节"
+        for index in range(1, 11)
+    )
+    raw_text = (
+        "风格设定：现代家居个护广告，白色、米色和暖木色，柔和自然侧光。\n"
+        "场景脚本：\n"
+        + "\n".join(shots)
+        + "\n技术约束：目标时长10秒；画幅9:16；分辨率720p；"
+        "适配目标模型Seedance 1.5 Pro；单段提示词预算约1800字符；"
+        "同一女性、服装、洗脸巾包装和珍珠纹理跨镜头保持一致；"
+        "用户指定卖点文字：干湿两用，按原文准确显示；"
+        "用户指定音效：声音：持续背景音乐；声音：持续背景音乐；"
+        f"必须完整执行且不得替换的原始动作要求（按顺序）：{inventory}"
+    )
+    assert len(raw_text) > 1800
+
+    result = compile_video_prompt(
+        {
+            "input_mode": "direct_input",
+            "user_instruction": raw_text,
+            "raw_text": raw_text,
+            "assembled_text": raw_text,
+            "final_text": raw_text,
+        },
+        duration=10,
+        model_id="doubao-seedance-1-5-pro-251215",
+        provider="volcengine_ark",
+        references=[{"role": "product", "url": "https://example.com/product.png"}],
+        product_reference=True,
+        fit_mode="single_clip",
+    )
+
+    assert result["metadata"]["prompt_mode"] == "direct_compacted"
+    assert result["metadata"]["prompt_over_budget"] is False
+    assert result["metadata"]["prompt_char_count"] <= 1800
+    assert result["metadata"]["shot_count"] == 10
+    assert result["sequence_required"] is False
+    assert result["plan"]["post_overlays"] == ["干湿两用"]
+    assert result["plan"]["sfx"] == ["持续背景音乐"]
+    assert "上传产品图为唯一商品主体" in result["prompt"]
+    for metadata_text in (
+        "目标时长",
+        "画幅9:16",
+        "分辨率720p",
+        "适配目标模型",
+        "单段提示词预算",
+        "必须完整执行且不得替换的原始动作要求",
+    ):
+        assert metadata_text not in result["prompt"]
+
+
+def test_seedance_execution_prompt_separates_packaging_ocr_and_neutralizes_actions():
+    packaging_ocr = "DAMAH DARK MAGIC DAMAH 4TH GEN 166PCS"
+    shots = [
+        "Shot 1：墙上倒挂DAMAH洗脸巾包装，手指从底部向下拉拽抽出一张；"
+        f"画面文字：{packaging_ocr}；硬切。声音：持续背景音乐",
+        "Shot 2：双手在水槽上方握住湿润洗脸巾用力拧干，水滴滴落；"
+        "画面文字：DAMAH 干湿两用 厚实吸水；硬切。声音：持续背景音乐",
+        "Shot 3：女性用洗脸巾轻拭脸颊；画面文字：亲肤；硬切。声音：持续背景音乐",
+        "Shot 4：双手紧握洗脸巾向外用力拉扯，绷紧至出现撕裂口，展示韧性；"
+        f"画面文字：耐拉扯 不易掉絮 {packaging_ocr}；硬切。声音：持续背景音乐",
+    ]
+    raw_text = (
+        "风格设定：温馨家居个护广告，柔和自然侧光。\n场景脚本：\n"
+        + "\n".join(shots)
+        + "\n技术约束：包装上印刷文字（"
+        + packaging_ocr
+        + "）跨镜头保持一致；包装文字准确保留，仅生成指定卖点字幕；"
+        + "人物、包装和洗脸巾纹理跨镜头保持一致；"
+        + "必须完整执行且不得替换的原始动作要求（按顺序）："
+        + "；".join("重复镜头证据和执行约束" for _ in range(180))
+    )
+
+    result = compile_video_prompt(
+        {
+            "input_mode": "direct_input",
+            "user_instruction": raw_text,
+            "raw_text": raw_text,
+            "assembled_text": raw_text,
+            "final_text": raw_text,
+        },
+        duration=10,
+        model_id="doubao-seedance-1-5-pro-251215",
+        provider="volcengine_ark",
+        references=[{"role": "first_frame", "url": "https://example.com/first.png"}],
+        fit_mode="single_clip",
+    )
+
+    assert result["plan"]["post_overlays"] == [
+        "干湿两用 厚实吸水",
+        "亲肤",
+        "耐拉扯 不易掉絮",
+    ]
+    assert result["metadata"]["packaging_overlay_cleaned_count"] == 3
+    assert result["metadata"]["packaging_ocr_literal_removed_count"] >= 1
+    assert result["metadata"]["packaging_brand_literal_removed_count"] >= 1
+    assert result["metadata"]["model_overlay_instruction_removed_count"] >= 1
+    assert result["metadata"]["embedded_text_overlays"] is False
+    assert result["metadata"]["execution_language_normalized"] is True
+    assert packaging_ocr not in result["prompt"]
+    assert "DAMAH" not in result["prompt"]
+    assert "包装上印刷文字跨镜头保持一致" in result["prompt"]
+    assert "向下拉拽抽出" not in result["prompt"]
+    assert "用力拧干" not in result["prompt"]
+    assert "用力拉扯" not in result["prompt"]
+    assert "撕裂口" not in result["prompt"]
+    assert "洗脸巾" not in result["prompt"]
+    assert "洁面巾" in result["prompt"]
+    assert "向下抽出" in result["prompt"]
+    assert "缓慢拧出水分" in result["prompt"]
+    assert "纤维断面" in result["prompt"]

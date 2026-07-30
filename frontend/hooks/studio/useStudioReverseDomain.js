@@ -22,11 +22,20 @@ export function resolvePendingReverseOperation({
       || pendingReverseResult?.operationId
       || 0,
   );
-  const operations = [trackedOperation, workspaceOperation];
+  const operations = [workspaceOperation, trackedOperation];
   if (operationId) {
-    return operations.find((item) => Number(item?.id) === operationId) || null;
+    const matching = operations.filter((item) => Number(item?.id) === operationId);
+    const terminal = matching.find((item) => ["succeeded", "failed", "canceled"].includes(item?.status));
+    if (terminal) return terminal;
+    return matching.find((item) => item === trackedOperation) || matching[0] || null;
   }
-  return workspaceOperation || trackedOperation || null;
+  if (
+    workspaceOperation
+    && trackedOperation
+    && Number(workspaceOperation.id) === Number(trackedOperation.id)
+    && ["succeeded", "failed", "canceled"].includes(workspaceOperation.status)
+  ) return workspaceOperation;
+  return trackedOperation || workspaceOperation || null;
 }
 
 export function useStudioReverseOperationBridge(foundation) {

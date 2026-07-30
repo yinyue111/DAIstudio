@@ -401,8 +401,8 @@ def test_anthropic_prompt_optimizer_uses_messages_protocol(monkeypatch):
     assert "场景脚本" in seen["payload"]["system"]
     assert "技术约束" in seen["payload"]["system"]
     assert "只返回一个 JSON 对象" in seen["payload"]["system"]
-    assert "画幅 9:16" in seen["payload"]["system"]
-    assert "分辨率 1080p" in seen["payload"]["system"]
+    assert "画幅 9:16" not in seen["payload"]["system"]
+    assert "分辨率 1080p" not in seen["payload"]["system"]
     assert "slow_push" in seen["payload"]["system"]
     assert "参考主体档案" in seen["payload"]["messages"][0]["content"]
     assert "3D 如意云纹" in seen["payload"]["messages"][0]["content"]
@@ -410,8 +410,8 @@ def test_anthropic_prompt_optimizer_uses_messages_protocol(monkeypatch):
     assert "\n场景脚本：\nShot 1：手从悬挂包装底部抽出洗脸巾" in result["prompt"]
     assert "\nShot 2：微距展开并展示3D如意云纹" in result["prompt"]
     assert "\n技术约束：" in result["prompt"]
-    assert "画幅 9:16" in result["prompt"]
-    assert "分辨率 1080p" in result["prompt"]
+    assert "画幅 9:16" not in result["prompt"]
+    assert "分辨率 1080p" not in result["prompt"]
     assert "同一 SKU" in result["prompt"]
     assert result["usage"] == {
         "prompt_tokens": 10,
@@ -556,7 +556,7 @@ def test_openai_prompt_optimizer_uses_runtime_video_prompt_profile(monkeypatch):
     assert "场景脚本：\nShot 1：产品稳定入镜\nShot 2：镜头慢速推近Logo" in result["prompt"]
     assert "按用户要求显示指定卖点文字" in result["prompt"]
     assert "画面无字" not in result["prompt"]
-    assert "必须完整执行且不得替换的原始动作要求" in result["prompt"]
+    assert "必须完整执行且不得替换的原始动作要求" not in result["prompt"]
 
 
 def test_video_prompt_optimizer_infers_product_constraints_from_direct_text(monkeypatch):
@@ -808,8 +808,9 @@ def test_video_prompt_optimizer_restores_replaced_action_when_shot_count_matches
 
     assert "Shot 1：人物走进浴室" in result["prompt"]
     assert "Shot 2：人物看向镜子" in result["prompt"]
-    assert "必须完整执行且不得替换的原始动作要求（按顺序）：1. 拿起毛巾" in result["prompt"]
-    assert result["compiler_metadata"]["shot_count"] == 2
+    assert "Shot 3：拿起毛巾" in result["prompt"]
+    assert "必须完整执行且不得替换的原始动作要求" not in result["prompt"]
+    assert result["compiler_metadata"]["shot_count"] == 3
 
 
 def test_video_prompt_optimizer_preserves_directional_and_common_source_actions(monkeypatch):
@@ -836,8 +837,8 @@ def test_video_prompt_optimizer_preserves_directional_and_common_source_actions(
     )
 
     for source, expected in (
-        ("人物走出浴室。", "1. 人物走出浴室"),
-        ("人物打开瓶盖。", "1. 人物打开瓶盖"),
+        ("人物走出浴室。", "Shot 2：人物走出浴室"),
+        ("人物打开瓶盖。", "Shot 2：人物打开瓶盖"),
     ):
         result = gateway.optimize_prompt(
             source,
@@ -849,7 +850,7 @@ def test_video_prompt_optimizer_preserves_directional_and_common_source_actions(
             gateway_config=cfg,
         )
         assert expected in result["prompt"]
-        assert "必须完整执行且不得替换的原始动作要求" in result["prompt"]
+        assert "必须完整执行且不得替换的原始动作要求" not in result["prompt"]
 
 
 def test_video_prompt_optimizer_keeps_subject_actions_that_mention_the_camera(monkeypatch):
@@ -881,7 +882,8 @@ def test_video_prompt_optimizer_keeps_subject_actions_that_mention_the_camera(mo
         gateway_config=cfg,
     )
 
-    assert "原始动作要求（按顺序）：1. 人物凝视镜头，随后轻抚脸颊" in result["prompt"]
+    assert "Shot 2：人物凝视镜头，随后轻抚脸颊" in result["prompt"]
+    assert "原始动作要求" not in result["prompt"]
 
 
 def test_video_prompt_optimizer_excludes_style_prefix_from_action_inventory(monkeypatch):
@@ -919,7 +921,8 @@ def test_video_prompt_optimizer_excludes_style_prefix_from_action_inventory(monk
             gateway_config=cfg,
         )
 
-        assert f"原始动作要求（按顺序）：1. {expected_action}" in result["prompt"]
+        assert f"Shot 2：{expected_action}" in result["prompt"]
+        assert "原始动作要求" not in result["prompt"]
         if excluded_prefix:
             assert f"原始动作要求（按顺序）：1. {excluded_prefix}" not in result["prompt"]
 

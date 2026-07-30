@@ -214,9 +214,13 @@ def extract_by_path(data, path: str | None):
     return current
 
 
-def ark_text(prompt: str, params: dict) -> str:
-    """Seedance takes generation params as --flags appended to the text prompt."""
-    parts = [prompt.strip()]
+def ark_text(prompt: str, params: dict, *, legacy_flags: bool = False) -> str:
+    """Return Ark's text content, using native request fields by default."""
+    text = str(prompt or "").strip()
+    if not legacy_flags:
+        return text
+
+    parts = [text]
     negative = str((params or {}).get("negative_prompt") or "").strip()
     if negative:
         parts.append(f"负向约束：{negative}")
@@ -250,8 +254,13 @@ def _bind_ark_product_reference(text: str, image_number: int) -> str:
     return text
 
 
-def ark_content(prompt: str, params: dict) -> list:
-    content = [{"type": "text", "text": ark_text(prompt, params)}]
+def ark_content(prompt: str, params: dict, *, legacy_flags: bool = False) -> list:
+    content = [
+        {
+            "type": "text",
+            "text": ark_text(prompt, params, legacy_flags=legacy_flags),
+        }
+    ]
     seen_images: set[tuple[str, str]] = set()
     role_notes: list[str] = []
 
@@ -330,16 +339,24 @@ def ark_content(prompt: str, params: dict) -> list:
     return content
 
 
-def ark_payload(model_id: str, prompt: str, params: dict) -> dict:
+def ark_payload(
+    model_id: str,
+    prompt: str,
+    params: dict,
+    extra: dict | None = None,
+) -> dict:
     """Build the Ark video task body with native generation fields.
 
-    Keep text flags in ``content`` for older gateways, but also send the fields
-    Ark exposes at the request-body layer. Without these native fields, some
-    gateways treat ``--resolution 1080p`` as plain prompt text and fall back to
-    their default 480p output.
+    Current Ark endpoints accept generation controls at the request-body layer.
+    Older compatible gateways can opt into text flags through model-owned
+    ``ark_legacy_text_flags`` configuration.
     """
     params = params or {}
-    payload = {"model": model_id, "content": ark_content(prompt, params)}
+    legacy_flags = (extra or {}).get("ark_legacy_text_flags") is True
+    payload = {
+        "model": model_id,
+        "content": ark_content(prompt, params, legacy_flags=legacy_flags),
+    }
     if params.get("resolution"):
         payload["resolution"] = str(params["resolution"])
     if params.get("duration") not in (None, ""):

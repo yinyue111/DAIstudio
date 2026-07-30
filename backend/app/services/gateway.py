@@ -183,6 +183,7 @@ from .gateway_transport import (  # noqa: F401
     _request_json,
     _request_multipart_json,
     _trusted_configured_host,
+    _trusted_request_options,
     _video_gateway_mock,
     list_models,
 )

@@ -1501,6 +1501,75 @@ def test_download_to_path_drops_auth_on_cross_origin_redirect(monkeypatch, tmp_p
     assert all(headers["Accept-Encoding"] == "identity" for headers in seen_headers)
 
 
+def test_download_to_path_allows_exact_trusted_result_host(monkeypatch, tmp_path):
+    host = "ark-content-generation-cn-beijing.tos-cn-beijing.volces.com"
+    seen = {}
+
+    class Video:
+        is_redirect = False
+        status_code = 200
+        headers = {"content-type": "video/mp4"}
+
+        def iter_raw(self):
+            yield b"video"
+
+    @gateway.contextmanager
+    def fake_guarded_stream(_client, _method, url, **kwargs):
+        seen["url"] = url
+        seen["trusted_hosts"] = kwargs.get("trusted_hosts")
+        yield Video()
+
+    monkeypatch.setattr(
+        gateway,
+        "assert_safe_url",
+        lambda _url: (_ for _ in ()).throw(AssertionError("trusted host used DNS guard")),
+    )
+    monkeypatch.setattr(gateway, "_guarded_stream", fake_guarded_stream)
+    out = Path(tmp_path) / "trusted.mp4"
+
+    gateway.download_to_path(
+        f"https://{host}/rendered.mp4",
+        out,
+        allowed_content_types=("video/",),
+        trusted_hosts=(host,),
+    )
+
+    assert out.read_bytes() == b"video"
+    assert seen["trusted_hosts"] == (host,)
+
+
+def test_download_to_path_rechecks_redirect_from_trusted_host(monkeypatch, tmp_path):
+    host = "ark-content-generation-cn-beijing.tos-cn-beijing.volces.com"
+
+    class Redirect:
+        is_redirect = True
+        status_code = 302
+        headers = {"location": "http://127.0.0.1/private.mp4"}
+
+    @gateway.contextmanager
+    def fake_guarded_stream(_client, _method, _url, **_kwargs):
+        yield Redirect()
+
+    def fake_assert_safe_url(url):
+        if "127.0.0.1" in url:
+            raise gateway.SsrfError("禁止访问内网/保留地址")
+        return url
+
+    monkeypatch.setattr(gateway, "assert_safe_url", fake_assert_safe_url)
+    monkeypatch.setattr(gateway, "_guarded_stream", fake_guarded_stream)
+    out = Path(tmp_path) / "redirected-private.mp4"
+
+    with pytest.raises(gateway.GatewayError, match="安全策略拦截"):
+        gateway.download_to_path(
+            f"https://{host}/rendered.mp4",
+            out,
+            allowed_content_types=("video/",),
+            trusted_hosts=(host,),
+        )
+
+    assert not out.exists()
+
+
 def test_download_uses_remaining_deadline_for_each_redirect(monkeypatch):
     monkeypatch.setattr(settings, "mock_mode", False)
 

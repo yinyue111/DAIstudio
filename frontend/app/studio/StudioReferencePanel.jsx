@@ -31,6 +31,9 @@ export function videoAnalysisEvidenceData(analysis) {
   const source = analysis.source || {};
   const frames = Array.isArray(analysis.sampled_frames) ? analysis.sampled_frames : [];
   const gaps = Array.isArray(analysis.analysis_gaps) ? analysis.analysis_gaps : [];
+  const audio = analysis.audio && typeof analysis.audio === "object" ? analysis.audio : {};
+  const audioAnalyzed = ["analyzed", "partial"].includes(String(audio.status || ""))
+    || (Array.isArray(audio.evidence) && audio.evidence.length > 0);
   const coverage = analysis.evidence_coverage && typeof analysis.evidence_coverage === "object"
     ? analysis.evidence_coverage
     : {};
@@ -65,6 +68,7 @@ export function videoAnalysisEvidenceData(analysis) {
     coverageEnd,
     degradedReason,
     gapTexts,
+    audioAnalyzed,
   };
 }
 
@@ -78,6 +82,7 @@ function VideoAnalysisEvidence({ analysis }) {
     coverageEnd,
     degradedReason,
     gapTexts,
+    audioAnalyzed,
   } = evidence;
 
   return (
@@ -92,7 +97,7 @@ function VideoAnalysisEvidence({ analysis }) {
         )}
       </div>
       {degradedReason && <p className="mt-1 text-warn">降级原因：{degradedReason}</p>}
-      {source.audio_analyzed === false && (
+      {source.audio_analyzed === false && !audioAnalyzed && (
         <p className="mt-1 text-warn">音频未分析：旁白、音效和镜头音频提示不会自动补写。</p>
       )}
       {gapTexts.length > 0 && <p className="mt-1">分析缺口：{gapTexts.join("；")}</p>}

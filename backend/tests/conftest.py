@@ -38,18 +38,28 @@ rc.blocking_redis_client = rc.redis_client
 # guard's happy path passes without network.
 _real_getaddrinfo = socket.getaddrinfo
 _PUBLIC_RESULT = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 0))]
+_SYNTHETIC_DNS_RANGE = ipaddress.ip_network("198.18.0.0/15")
 
 
 def _test_getaddrinfo(host, *args, **kwargs):
+    host_text = str(host).rstrip(".").lower()
+    if host_text == "example.com" or host_text.endswith(".example.com"):
+        return _PUBLIC_RESULT
     try:
-        ipaddress.ip_address(str(host))
+        ipaddress.ip_address(host_text)
         return _real_getaddrinfo(host, *args, **kwargs)  # literal -> real
     except ValueError:
         pass
     try:
-        return _real_getaddrinfo(host, *args, **kwargs)
+        result = _real_getaddrinfo(host, *args, **kwargs)
     except socket.gaierror:
         return _PUBLIC_RESULT
+    if any(
+        ipaddress.ip_address(info[4][0]) in _SYNTHETIC_DNS_RANGE
+        for info in result
+    ):
+        return _PUBLIC_RESULT
+    return result
 
 
 socket.getaddrinfo = _test_getaddrinfo

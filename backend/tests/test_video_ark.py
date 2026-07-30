@@ -6,26 +6,39 @@ from app.services import gateway
 from app.services.model_gateway_config import RuntimeGatewayConfig
 
 
-def test_ark_text_flags():
-    t = gateway._ark_text("a cat walking",
-                          {"resolution": "1080p", "duration": 5, "ratio": "16:9", "seed": 42})
-    assert "a cat walking" in t
-    assert "--resolution 1080p" in t
-    assert "--duration 5" in t
-    assert "--ratio 16:9" in t
-    assert "--seed 42" in t
-    assert "--watermark false" in t
+def test_ark_text_uses_plain_prompt_by_default():
+    t = gateway._ark_text(
+        "a cat walking",
+        {
+            "resolution": "1080p",
+            "duration": 5,
+            "ratio": "16:9",
+            "seed": 42,
+            "negative_prompt": "distorted anatomy",
+        },
+    )
+
+    assert t == "a cat walking"
+    assert "--" not in t
+    assert "distorted anatomy" not in t
 
 
-def test_ark_text_formats_duration_flag():
-    t = gateway._ark_text("long ad sequence", {"duration": 15, "resolution": "1080p"})
+def test_ark_text_supports_explicit_legacy_flags():
+    t = gateway._ark_text(
+        "long ad sequence",
+        {"duration": 15, "resolution": "1080p"},
+        legacy_flags=True,
+    )
+
     assert "--duration 15" in t
+    assert "--resolution 1080p" in t
+    assert "--watermark false" in t
 
 
 def test_ark_payload_preserves_negative_prompt():
     payload = gateway._ark_payload(
-        "premium product video",
         "doubao-seedance-1-5-pro-251215",
+        "premium product video",
         {
             "duration": 5,
             "resolution": "1080p",
@@ -34,7 +47,7 @@ def test_ark_payload_preserves_negative_prompt():
     )
 
     assert payload["negative_prompt"] == "包装文字乱码，Logo扭曲"
-    assert "负向约束：包装文字乱码，Logo扭曲" in payload["content"][0]["text"]
+    assert payload["content"][0]["text"] == "premium product video"
 
 
 def test_ark_content_image_to_video():
@@ -746,6 +759,43 @@ def test_video_ark_uses_per_model_gateway_config(monkeypatch):
     assert seen["json"]["ratio"] == "9:16"
     assert seen["json"]["seed"] == 42
     assert seen["json"]["watermark"] is False
+    assert seen["json"]["content"][0]["text"] == "animate"
+
+
+def test_video_ark_legacy_text_flags_require_model_config(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(settings, "mock_mode", False)
+    cfg = RuntimeGatewayConfig(
+        use="video",
+        provider="volcengine_ark",
+        base_url="https://ark.model.example.com/api/v3",
+        api_key="ark-key",
+        gateway_format="ark",
+    )
+
+    def fake_request(method, url, *, headers, json=None, timeout, retries):
+        seen["json"] = json
+
+        class Resp:
+            status_code = 200
+            is_redirect = False
+
+            def json(self):
+                return {"id": "ark-task-legacy"}
+
+        return Resp()
+
+    monkeypatch.setattr(gateway, "_request", fake_request)
+    task_id = gateway.submit_video(
+        "animate",
+        "doubao-seedance-x",
+        {"duration": 5, "resolution": "1080p"},
+        extra={"ark_legacy_text_flags": True},
+        gateway_config=cfg,
+    )
+
+    assert task_id == "ark-task-legacy"
+    assert "--duration 5" in seen["json"]["content"][0]["text"]
     assert "--resolution 1080p" in seen["json"]["content"][0]["text"]
 
 

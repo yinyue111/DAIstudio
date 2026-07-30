@@ -212,8 +212,12 @@ function buildReferenceController({ foundation, model, reverse, reference }) {
 }
 
 function buildReverseController({ foundation, model, reverse }, view) {
+  const resolvedReverseOperation = reverse.reverseOperationForPendingResult();
+  const resolvedReversing = resolvedReverseOperation
+    ? ["queued", "running"].includes(resolvedReverseOperation.status)
+    : foundation.reversing;
   return {
-    reversing: foundation.reversing,
+    reversing: resolvedReversing,
     batchReverseAssets: foundation.batchReverseAssets,
     pendingReverseResult: foundation.pendingReverseResult,
     reverseEnabled: view.reverseEnabled,
@@ -225,7 +229,7 @@ function buildReverseController({ foundation, model, reverse }, view) {
     videoAnalysisPreset: foundation.videoAnalysisPreset,
     reverseVideoPresets: view.reverseVideoPresets,
     reverseVideoAnalysis: foundation.reverseVideoAnalysis,
-    reverseOperation: reverse.reverseOperation,
+    reverseOperation: resolvedReverseOperation || reverse.reverseOperation,
     workspaceReverseOperation: foundation.workspaceReverseOperation,
     reverseBatch: reverse.reverseBatch,
     recentReverseBatches: reverse.recentReverseBatches,

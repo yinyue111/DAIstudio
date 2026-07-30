@@ -501,7 +501,7 @@ def test_review_billing_exposes_pending_and_audited_refund_resolution(
             stage="preview",
             prompt={"final_text": "review billing"},
             model_use="video",
-            params={},
+            params={"_video_submit_state_unknown": True},
             status="needs_review",
             phase="reconciling",
             error="供应商结果状态不明确",
@@ -545,6 +545,8 @@ def test_review_billing_exposes_pending_and_audited_refund_resolution(
     assert item["balance_conserved"] is True
     assert item["reservation_conserved"] is True
     with SessionLocal() as db:
+        task = db.get(GenTask, task_id)
+        assert not (task.params or {}).get("_video_submit_state_unknown")
         audit_row = db.query(AuditLog).filter_by(
             action="refund_review_task",
             biz_type="gen_task",

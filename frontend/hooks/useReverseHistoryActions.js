@@ -26,6 +26,7 @@ export function buildReverseHistoryWorkspacePatch({
     ...(restored?.workspace || {}),
     editSubjectMode: restored?.subjectMode || "general",
     imageEditProductMode: ["product", "portrait"].includes(restored?.subjectMode),
+    reversing: false,
     reverseOperation: operation,
     pendingReverseResult: reverseResultEnvelope(operation, normalizedResult),
     reverseResultTab: operation.target === "video" ? "report" : "draft",

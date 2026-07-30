@@ -446,7 +446,11 @@ class Settings(BaseSettings):
     # capped separately by effective_max_video_generation_seconds.
     max_video_seconds: int = 15 * 60
     max_video_generation_seconds: int = VIDEO_GENERATION_HARD_MAX_SECONDS
+    # A layered prompt keeps source, optimized and assembled text for audit.
+    # Bound each executable text with max_prompt_chars, while allowing those
+    # bounded layers to coexist in one request payload.
     max_prompt_chars: int = 8_000
+    max_prompt_payload_chars: int = 64_000
     max_generate_params_bytes: int = 16_384
     # How many keyframes to sample from a reference video for understanding.
     reverse_video_frames: int = 4

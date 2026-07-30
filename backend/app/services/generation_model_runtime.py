@@ -458,6 +458,14 @@ def _runtime_gateway_config_for_snapshot(
         raise ModelSnapshotMismatchError(
             "模型网关配置已变更: 任务模型快照的网关配置不完整,请重新生成"
         )
+    trusted_hosts = (
+        secret_config.trusted_hosts
+        if source == "model"
+        and provider == secret_config.provider
+        and base_url == secret_config.base_url
+        and gateway_format == secret_config.gateway_format
+        else ()
+    )
     frozen_config = RuntimeGatewayConfig(
         use=resolved_use,
         provider=provider,
@@ -465,9 +473,14 @@ def _runtime_gateway_config_for_snapshot(
         api_key=secret_config.api_key,
         gateway_format=gateway_format,
         source=source,
+        trusted_hosts=trusted_hosts,
     )
     try:
-        validate_base_url("任务快照 Base URL", frozen_config.base_url)
+        validate_base_url(
+            "任务快照 Base URL",
+            frozen_config.base_url,
+            persisted_trusted_hosts=frozen_config.trusted_hosts,
+        )
     except ModelGatewayConfigError as exc:
         raise ModelSnapshotMismatchError(
             "模型网关配置已变更: "

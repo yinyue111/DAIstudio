@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from math import ceil
 from typing import Any
 
@@ -18,8 +19,9 @@ from .video_prompt_parsing import (
     split_video_post_production,
 )
 
-COMPILER_VERSION = "video-prompt-v6"
+COMPILER_VERSION = "video-prompt-v11"
 VIDEO_SUBMIT_CONTRACT_VERSION = "video-submit-v3"
+SEEDANCE_EXECUTION_REVISION = "seedance-execution-v2"
 PRODUCT_SUBJECT_LOCK = (
     "上传产品是唯一商品主体；仅锁定同一SKU的包装外形与比例、Logo、"
     "包装结构、品牌色、标签排版、可见文字和材质纹理。"
@@ -213,6 +215,263 @@ def _normalize_compile_plan(
     return direct_passthrough_text, plan
 
 
+_PACKAGING_OCR_RE = re.compile(
+    r"(?:包装|瓶身|标签)(?:上|正面)?(?:的)?"
+    r"(?:印刷|原有|可见)?(?:文字|字段)\s*[（(]"
+    r"(?P<text>[^）)\n。；;]{2,160})[）)]",
+    re.IGNORECASE,
+)
+_LEADING_LATIN_TOKEN_RE = re.compile(r"^\s*([A-Z][A-Z0-9&._-]{1,31})\b")
+_SEEDANCE_EXECUTION_REPLACEMENTS = (
+    ("向下拉拽抽出", "向下抽出"),
+    ("双手紧握", "双手分别握住"),
+    ("向外用力拉扯", "平稳向两侧拉开"),
+    ("用力拉扯", "平稳拉开"),
+    ("绷紧至出现撕裂口", "拉开后展示纤维断面"),
+    ("出现撕裂口", "展示纤维断面"),
+    ("用力拧干", "缓慢拧出水分"),
+)
+_SEEDANCE_15_SAFETY_REPLACEMENTS = (("洗脸巾", "洁面巾"),)
+
+
+def _packaging_ocr_candidates(plan: dict[str, Any]) -> list[str]:
+    values = [
+        str(plan.get("technical_constraints") or ""),
+        str(plan.get("subject_lock") or ""),
+    ]
+    return _unique_items(
+        match.group("text").strip()
+        for value in values
+        for match in _PACKAGING_OCR_RE.finditer(value)
+    )
+
+
+def _packaging_brand_candidates(candidates: list[str]) -> list[str]:
+    brands: list[str] = []
+    for candidate in candidates:
+        match = _LEADING_LATIN_TOKEN_RE.search(candidate)
+        if match and match.group(1) not in brands:
+            brands.append(match.group(1))
+    return brands
+
+
+def _clean_seedance_overlays(plan: dict[str, Any]) -> tuple[list[str], int]:
+    """Keep sell-point overlays separate from static packaging OCR."""
+    candidates = _packaging_ocr_candidates(plan)
+    brands = _packaging_brand_candidates(candidates)
+
+    original = [
+        str(item).strip()
+        for item in plan.get("post_overlays") or []
+        if str(item).strip()
+    ]
+    cleaned: list[str] = []
+    changed_count = 0
+    for item in original:
+        value = item
+        for candidate in candidates:
+            value = re.sub(re.escape(candidate), " ", value, flags=re.IGNORECASE)
+        for brand in brands:
+            value = re.sub(
+                rf"^\s*{re.escape(brand)}\s+(?=[\u3400-\u9fff])",
+                "",
+                value,
+                flags=re.IGNORECASE,
+            )
+            value = re.sub(
+                rf"(?<=[\u3400-\u9fff])\s+{re.escape(brand)}\s*$",
+                "",
+                value,
+                flags=re.IGNORECASE,
+            )
+        value = re.sub(r"\s+", " ", value).strip(" ，,。；;:|")
+        if value != item:
+            changed_count += 1
+        if value and value not in cleaned:
+            cleaned.append(value)
+    return cleaned, changed_count
+
+
+def is_seedance_15_profile(*, family: str = "", model_id: str = "") -> bool:
+    normalized = f"{family} {model_id}".lower().replace("_", "-")
+    return "seedance-1.5" in normalized or "seedance-1-5" in normalized
+
+
+def _seedance_execution_language(
+    value: str,
+    *,
+    seedance_15_compat: bool = False,
+) -> tuple[str, bool]:
+    text = str(value or "")
+    original = text
+    replacements = _SEEDANCE_EXECUTION_REPLACEMENTS
+    if seedance_15_compat:
+        replacements += _SEEDANCE_15_SAFETY_REPLACEMENTS
+    for source, replacement in replacements:
+        text = text.replace(source, replacement)
+    return text, text != original
+
+
+def _without_packaging_ocr_literals(
+    value: str,
+    candidates: list[str],
+) -> tuple[str, int]:
+    text = str(value or "")
+    removed = 0
+    for candidate in candidates:
+        text, count = re.subn(
+            rf"[（(]\s*{re.escape(candidate)}\s*[）)]",
+            "",
+            text,
+            flags=re.IGNORECASE,
+        )
+        removed += count
+        text, count = re.subn(
+            re.escape(candidate),
+            "",
+            text,
+            flags=re.IGNORECASE,
+        )
+        removed += count
+    text = re.sub(r"\s+([,，。；;])", r"\1", text)
+    return text, removed
+
+
+def _without_packaging_brand_literals(
+    value: str,
+    brands: list[str],
+) -> tuple[str, int]:
+    text = str(value or "")
+    removed = 0
+    for brand in brands:
+        text, count = re.subn(
+            rf"(?<![A-Za-z0-9]){re.escape(brand)}(?![A-Za-z0-9])",
+            "",
+            text,
+            flags=re.IGNORECASE,
+        )
+        removed += count
+    text = re.sub(r"[ \t]{2,}", " ", text)
+    return text, removed
+
+
+_MODEL_OVERLAY_INSTRUCTION_RE = re.compile(
+    r"(?:画面文字|卖点文字|卖点字幕).*(?:显示|生成|指定)|"
+    r"(?:显示|生成).*(?:卖点文字|卖点字幕)"
+)
+
+
+def _without_model_overlay_instructions(value: str) -> tuple[str, int]:
+    text = str(value or "")
+    parts = re.split(r"([；;\n])", text)
+    kept: list[str] = []
+    removed = 0
+    for index in range(0, len(parts), 2):
+        clause = parts[index]
+        separator = parts[index + 1] if index + 1 < len(parts) else ""
+        if _MODEL_OVERLAY_INSTRUCTION_RE.search(clause):
+            removed += 1
+            continue
+        kept.append(clause)
+        if separator:
+            kept.append(separator)
+    normalized = "".join(kept)
+    normalized = re.sub(r"([；;])\s*(?=[；;])", "", normalized)
+    return normalized.strip(" ；;"), removed
+
+
+def _prepare_seedance_execution_plan(
+    direct_passthrough_text: str,
+    plan: dict[str, Any],
+    *,
+    seedance_15_compat: bool = False,
+) -> tuple[str, int, int, int, int, bool]:
+    packaging_ocr = _packaging_ocr_candidates(plan)
+    packaging_brands = _packaging_brand_candidates(packaging_ocr)
+    overlays, filtered_count = _clean_seedance_overlays(plan)
+    plan["post_overlays"] = overlays
+    changed = False
+    removed_ocr_count = 0
+    removed_brand_count = 0
+    removed_overlay_instruction_count = 0
+    for key in ("global_style", "subject_lock", "voiceover"):
+        plan[key], item_changed = _seedance_execution_language(
+            str(plan.get(key) or ""),
+            seedance_15_compat=seedance_15_compat,
+        )
+        changed = changed or item_changed
+    for key in ("reference_guidance", "post_overlays", "sfx"):
+        normalized_items: list[str] = []
+        for item in plan.get(key) or []:
+            normalized, item_changed = _seedance_execution_language(
+                str(item),
+                seedance_15_compat=seedance_15_compat,
+            )
+            normalized_items.append(normalized)
+            changed = changed or item_changed
+        plan[key] = normalized_items
+    normalized_shots: list[str] = []
+    for shot in plan.get("shots") or []:
+        normalized, item_changed = _seedance_execution_language(
+            str(shot),
+            seedance_15_compat=seedance_15_compat,
+        )
+        normalized, removed = _without_packaging_ocr_literals(normalized, packaging_ocr)
+        removed_ocr_count += removed
+        normalized, removed = _without_packaging_brand_literals(
+            normalized,
+            packaging_brands,
+        )
+        removed_brand_count += removed
+        normalized_shots.append(normalized)
+        changed = changed or item_changed
+    plan["shots"] = normalized_shots
+    plan["technical_constraints"], technical_changed = _seedance_execution_language(
+        str(plan.get("technical_constraints") or ""),
+        seedance_15_compat=seedance_15_compat,
+    )
+    plan["technical_constraints"], removed = _without_packaging_ocr_literals(
+        plan["technical_constraints"],
+        packaging_ocr,
+    )
+    removed_ocr_count += removed
+    plan["technical_constraints"], removed = _without_packaging_brand_literals(
+        plan["technical_constraints"],
+        packaging_brands,
+    )
+    removed_brand_count += removed
+    plan["technical_constraints"], removed = _without_model_overlay_instructions(
+        plan["technical_constraints"]
+    )
+    removed_overlay_instruction_count += removed
+    direct_passthrough_text, direct_changed = _seedance_execution_language(
+        direct_passthrough_text,
+        seedance_15_compat=seedance_15_compat,
+    )
+    direct_passthrough_text, removed = _without_packaging_ocr_literals(
+        direct_passthrough_text,
+        packaging_ocr,
+    )
+    removed_ocr_count += removed
+    direct_passthrough_text, removed = _without_packaging_brand_literals(
+        direct_passthrough_text,
+        packaging_brands,
+    )
+    removed_brand_count += removed
+    direct_passthrough_text, removed = _without_model_overlay_instructions(
+        direct_passthrough_text
+    )
+    removed_overlay_instruction_count += removed
+    return (
+        direct_passthrough_text,
+        filtered_count,
+        removed_ocr_count,
+        removed_brand_count,
+        removed_overlay_instruction_count,
+        bool(changed or technical_changed or direct_changed),
+    )
+
+
 def _compile_reference_context(
     references: list[dict[str, Any]] | None,
     *,
@@ -324,6 +583,12 @@ def _supports_embedded_av_requirements(
     return "seedance-1-5-pro" in normalized
 
 
+def _supports_embedded_text_overlays(extra: dict[str, Any] | None) -> bool:
+    capabilities = (extra or {}).get("capabilities")
+    capabilities = capabilities if isinstance(capabilities, dict) else {}
+    return bool(capabilities.get("embedded_text_overlays", False))
+
+
 def _append_embedded_av_requirements(
     prompt: str,
     plan: dict[str, Any],
@@ -335,20 +600,78 @@ def _append_embedded_av_requirements(
         return prompt, False
     requirements: list[str] = []
     overlays = [str(item).strip() for item in plan.get("post_overlays") or [] if str(item).strip()]
-    if overlays:
+    embed_text_overlays = bool(overlays and _supports_embedded_text_overlays(extra))
+    plan["embedded_text_overlays"] = embed_text_overlays
+    if embed_text_overlays:
         quoted = "、".join(f"“{item}”" for item in overlays)
         requirements.append(
-            f"按对应镜头时间顺序依次清晰显示画面文字{quoted}，除这些文字和包装原字外不生成额外字幕"
+            f"按镜头顺序显示{quoted}，仅保留这些文字和包装原字"
         )
     voiceover = str(plan.get("voiceover") or "").strip()
     if voiceover:
-        requirements.append(f"生成同步旁白“{voiceover}”")
+        requirements.append(f"同步旁白“{voiceover}”")
     sfx = [str(item).strip() for item in plan.get("sfx") or [] if str(item).strip()]
     if sfx:
-        requirements.append(f"生成并与动作同步的声音：{'；'.join(sfx)}")
+        requirements.append(f"同步声音：{'；'.join(sfx)}")
     if not requirements:
         return prompt, False
     return f"{prompt.rstrip()}\n音画生成要求：{'；'.join(requirements)}。", True
+
+
+_DIRECT_EXECUTION_METADATA_RE = re.compile(
+    r"^(?:(?:目标|总)?时长|画幅|分辨率|适配目标模型|原稿含|执行方式|"
+    r"单段常规舒适密度|单段提示词预算|超出时|建议拆分|最终按原镜头顺序)",
+    re.IGNORECASE,
+)
+
+
+def _direct_visual_constraints(value: str) -> str:
+    """Remove optimizer/runtime metadata while retaining executable visuals."""
+    text = re.split(
+        r"必须完整执行且不得替换的原始动作要求",
+        str(value or ""),
+        maxsplit=1,
+    )[0]
+    clauses = [part.strip() for part in re.split(r"[\n。；;]+", text) if part.strip()]
+    kept: list[str] = []
+    for clause in clauses:
+        if _DIRECT_EXECUTION_METADATA_RE.search(clause):
+            continue
+        if clause not in kept:
+            kept.append(clause)
+    return "；".join(kept)
+
+
+def _compact_direct_model_prompt(
+    plan: dict[str, Any],
+    *,
+    budget: int,
+    av_reserve: int = 0,
+) -> tuple[str, bool]:
+    target = max(80, budget - max(0, av_reserve))
+    technical = _direct_visual_constraints(str(plan.get("technical_constraints") or ""))
+    subject_lock = str(plan.get("subject_lock") or "").strip()
+    reference_guidance = [
+        str(item).strip()
+        for item in plan.get("reference_guidance") or []
+        if str(item).strip()
+    ]
+    technical = _join_unique(
+        technical,
+        f"主体锁定：{subject_lock}" if subject_lock else "",
+        *reference_guidance,
+    )
+    compacted = compact_single_clip_prompt(
+        style=str(plan.get("global_style") or ""),
+        shots=[str(item) for item in plan.get("shots") or []],
+        technical=technical,
+        mandatory_technical=technical,
+        budget=target,
+    )
+    plan["global_style"] = str(compacted["style"])
+    plan["shots"] = list(compacted["shots"])
+    plan["technical_constraints"] = str(compacted["technical"])
+    return str(compacted["prompt"]), True
 
 
 def _direct_compile_result(
@@ -372,17 +695,41 @@ def _direct_compile_result(
             f"产品身份约束：{DIRECT_PRODUCT_SUBJECT_LOCK}\n"
             f"原始生成要求：\n{direct_passthrough_text}"
         )
+    prompt_budget_chars = max(1, int(profile.get("prompt_budget_chars") or 1))
+    compacted_for_budget = False
+    if normalized_fit_mode == "single_clip" and len(prompt) > prompt_budget_chars:
+        prompt, compacted_for_budget = _compact_direct_model_prompt(
+            plan,
+            budget=prompt_budget_chars,
+        )
+    prompt_without_av = prompt
     prompt, embedded_av = _append_embedded_av_requirements(
         prompt,
         plan,
         model_id=model_id,
         extra=extra,
     )
+    if (
+        normalized_fit_mode == "single_clip"
+        and len(prompt) > prompt_budget_chars
+        and embedded_av
+    ):
+        av_reserve = len(prompt) - len(prompt_without_av)
+        prompt_without_av, compacted_for_budget = _compact_direct_model_prompt(
+            plan,
+            budget=prompt_budget_chars,
+            av_reserve=av_reserve,
+        )
+        prompt, embedded_av = _append_embedded_av_requirements(
+            prompt_without_av,
+            plan,
+            model_id=model_id,
+            extra=extra,
+        )
     plan["embedded_av_requirements"] = embedded_av
     shot_count = max(1, len(plan.get("shots") or []))
     max_shots = max(1, int(profile.get("recommended_max_shots") or 1))
     prompt_char_count = len(prompt)
-    prompt_budget_chars = max(1, int(profile.get("prompt_budget_chars") or 1))
     prompt_overload = prompt_char_count > prompt_budget_chars
     shot_overload = shot_count > max_shots
     if shot_overload:
@@ -392,10 +739,15 @@ def _direct_compile_result(
         )
     if prompt_overload:
         plan["warnings"].append(
-            f"直输提示词已按原文完整保留；当前长度超过模型建议的 "
-            f"{prompt_budget_chars} 字符预算，模型可能弱化部分细节。"
+            f"模型执行稿精简后仍超过 {prompt_budget_chars} 字符预算。"
         )
-    sequence_required = normalized_fit_mode != "single_clip" and (shot_overload or prompt_overload)
+    elif compacted_for_budget:
+        plan["warnings"].append(
+            f"完整原稿已保留在任务记录；发给视频模型的执行稿已精简至 {prompt_char_count} 字符。"
+        )
+    sequence_required = prompt_overload or (
+        normalized_fit_mode != "single_clip" and shot_overload
+    )
     recommended_clip_count = (
         1
         if normalized_fit_mode == "single_clip"
@@ -415,7 +767,7 @@ def _direct_compile_result(
             "duration": duration,
             "model_id": model_id,
             "provider": provider,
-            "prompt_mode": "direct_passthrough",
+            "prompt_mode": "direct_compacted" if compacted_for_budget else "direct_passthrough",
             "shot_count": shot_count,
             "source_shot_count": shot_count,
             "selected_shot_count": shot_count,
@@ -424,7 +776,7 @@ def _direct_compile_result(
             "prompt_over_budget": prompt_overload,
             "omitted_shot_count": 0,
             "condensed_for_single_clip": False,
-            "compacted_for_budget": False,
+            "compacted_for_budget": compacted_for_budget,
             "fit_mode": normalized_fit_mode,
             "recommended_clip_count": recommended_clip_count,
             "reference_roles": sorted(reference_roles),
@@ -432,6 +784,22 @@ def _direct_compile_result(
             "product_lock_mode": normalized_lock_mode if has_product_reference else "",
             "product_video_template": normalized_template if has_product_reference else "",
             "embedded_av_requirements": embedded_av,
+            "packaging_overlay_cleaned_count": int(
+                plan.get("_packaging_overlay_cleaned_count") or 0
+            ),
+            "packaging_ocr_literal_removed_count": int(
+                plan.get("_packaging_ocr_literal_removed_count") or 0
+            ),
+            "packaging_brand_literal_removed_count": int(
+                plan.get("_packaging_brand_literal_removed_count") or 0
+            ),
+            "model_overlay_instruction_removed_count": int(
+                plan.get("_model_overlay_instruction_removed_count") or 0
+            ),
+            "embedded_text_overlays": bool(plan.get("embedded_text_overlays")),
+            "execution_language_normalized": bool(
+                plan.get("_execution_language_normalized")
+            ),
             "post_overlays": list(plan["post_overlays"]),
             "voiceover": plan["voiceover"],
             "sfx": list(plan["sfx"]),
@@ -688,6 +1056,22 @@ def _compile_result(
             "voiceover": plan["voiceover"],
             "sfx": list(plan["sfx"]),
             "embedded_av_requirements": bool(plan.get("embedded_av_requirements")),
+            "packaging_overlay_cleaned_count": int(
+                plan.get("_packaging_overlay_cleaned_count") or 0
+            ),
+            "packaging_ocr_literal_removed_count": int(
+                plan.get("_packaging_ocr_literal_removed_count") or 0
+            ),
+            "packaging_brand_literal_removed_count": int(
+                plan.get("_packaging_brand_literal_removed_count") or 0
+            ),
+            "model_overlay_instruction_removed_count": int(
+                plan.get("_model_overlay_instruction_removed_count") or 0
+            ),
+            "embedded_text_overlays": bool(plan.get("embedded_text_overlays")),
+            "execution_language_normalized": bool(
+                plan.get("_execution_language_normalized")
+            ),
             "technical_constraints": plan["technical_constraints"],
             "shot_evidence": [dict(entry) for entry in plan["shot_evidence"]],
         },
@@ -738,6 +1122,29 @@ def compile_video_prompt(
         extra=extra,
         model_profiles=model_profiles,
     )
+    if str(profile.get("family") or "").startswith("seedance"):
+        (
+            direct_text,
+            cleaned_count,
+            removed_count,
+            removed_brand_count,
+            removed_overlay_instruction_count,
+            language_normalized,
+        ) = _prepare_seedance_execution_plan(
+            direct_text,
+            plan,
+            seedance_15_compat=is_seedance_15_profile(
+                family=str(profile.get("family") or ""),
+                model_id=model_id,
+            ),
+        )
+        plan["_packaging_overlay_cleaned_count"] = cleaned_count
+        plan["_packaging_ocr_literal_removed_count"] = removed_count
+        plan["_packaging_brand_literal_removed_count"] = removed_brand_count
+        plan["_model_overlay_instruction_removed_count"] = (
+            removed_overlay_instruction_count
+        )
+        plan["_execution_language_normalized"] = language_normalized
     if direct_text:
         return _direct_compile_result(
             direct_passthrough_text=direct_text,
@@ -928,6 +1335,15 @@ def store_video_prompt_compile(
     params["_video_reference_roles"] = references
     params["_prompt_compiler_version"] = str(compiled.get("compiler_version") or "").strip()
     params["_video_submit_contract_version"] = VIDEO_SUBMIT_CONTRACT_VERSION
+    profile = compiled.get("profile") if isinstance(compiled.get("profile"), dict) else {}
+    metadata = compiled.get("metadata") if isinstance(compiled.get("metadata"), dict) else {}
+    if is_seedance_15_profile(
+        family=str(profile.get("family") or ""),
+        model_id=str(metadata.get("model_id") or ""),
+    ):
+        params["_seedance_execution_revision"] = SEEDANCE_EXECUTION_REVISION
+    else:
+        params.pop("_seedance_execution_revision", None)
     params["_post_overlays"] = list(plan.get("post_overlays") or [])
     params["_voiceover"] = str(plan.get("voiceover") or "").strip()
     params["_sfx"] = list(plan.get("sfx") or [])
@@ -991,10 +1407,12 @@ __all__ = [
     "PORTRAIT_SUBJECT_LOCK",
     "PRODUCT_SUBJECT_LOCK",
     "PRODUCT_VIDEO_TEMPLATE_KEYS",
+    "SEEDANCE_EXECUTION_REVISION",
     "VIDEO_SUBMIT_CONTRACT_VERSION",
     "build_video_prompt_references",
     "compile_video_prompt",
     "infer_video_model_profile",
+    "is_seedance_15_profile",
     "source_video_is_analysis_only",
     "store_video_prompt_compile",
     "_PRODUCT_INTERACTION_RE",

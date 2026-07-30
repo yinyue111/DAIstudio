@@ -149,11 +149,21 @@ def _trusted_configured_host(url: str, trusted_hosts: Collection[str] | None) ->
     return bool(host and host in {str(item).rstrip(".").lower() for item in trusted_hosts or ()})
 
 
+def _trusted_request_options(config: RuntimeGatewayConfig | None) -> dict:
+    if config is None or not config.trusted_hosts:
+        return {}
+    return {"trusted_hosts": config.trusted_hosts}
+
+
 @contextmanager
 def _guarded_stream(client: httpx.Client, method: str, url: str, **kwargs):
     from . import gateway as _gw
 
-    if _pin_required(url):
+    trusted_hosts = kwargs.pop("trusted_hosts", None)
+    if _trusted_configured_host(url, trusted_hosts):
+        with client.stream(method, url, **kwargs) as response:
+            yield response
+    elif _pin_required(url):
         timeout = kwargs.pop("timeout", getattr(client, "timeout", None))
         with _gw.pinned_client(
             url,
@@ -292,6 +302,7 @@ def _post(
         json=payload,
         timeout=timeout or settings.gateway_timeout_seconds,
         retries=settings.gateway_max_retries if retries is None else retries,
+        **_trusted_request_options(config),
     )
     return r.json()
 
@@ -350,6 +361,7 @@ def _get(path: str, timeout: int | None = None, config: RuntimeGatewayConfig | N
         headers=_auth(config),
         timeout=timeout or settings.gateway_timeout_seconds,
         retries=settings.gateway_max_retries,
+        **_trusted_request_options(config),
     )
     return r.json()
 

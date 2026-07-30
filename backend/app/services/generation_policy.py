@@ -34,10 +34,23 @@ REFERENCE_URL_KEYS = (
     "mask_image_url",
 )
 
+PROMPT_TEXT_KEYS = (
+    "final_text",
+    "instruction",
+    "user_instruction",
+    "raw_text",
+    "optimized_text",
+    "assembled_text",
+    "negative",
+    "negative_prompt",
+)
+
 
 def validate_prompt_payload(prompt: dict, instruction: str | None = None) -> None:
     """Apply the same bounded JSON contract to every executable prompt."""
-    if instruction is not None and len(instruction) > int(settings.max_prompt_chars):
+    text_limit = max(1, int(settings.max_prompt_chars))
+    payload_limit = max(text_limit, int(settings.max_prompt_payload_chars))
+    if instruction is not None and len(instruction) > text_limit:
         raise HTTPException(400, "instruction 过长")
     if not prompt:
         return
@@ -45,12 +58,15 @@ def validate_prompt_payload(prompt: dict, instruction: str | None = None) -> Non
         raw = json.dumps(prompt, ensure_ascii=False)
     except (TypeError, ValueError):
         raise HTTPException(400, "prompt 必须是可序列化 JSON")
-    if len(raw) > int(settings.max_prompt_chars):
-        raise HTTPException(400, "prompt 过长")
-    for key in ("final_text", "instruction", "negative", "negative_prompt"):
+    if len(raw) > payload_limit:
+        raise HTTPException(400, f"prompt 过长：完整提示词数据不能超过 {payload_limit} 字符")
+    for key in PROMPT_TEXT_KEYS:
         value = prompt.get(key)
-        if isinstance(value, str) and len(value) > int(settings.max_prompt_chars):
-            raise HTTPException(400, f"{key} 过长")
+        if isinstance(value, str) and len(value) > text_limit:
+            raise HTTPException(
+                400,
+                f"prompt 过长：{key} 不能超过 {text_limit} 字符",
+            )
 
 
 def _is_local_user_asset(db: Session, user_id: int, url: str | None) -> bool:

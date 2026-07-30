@@ -146,6 +146,7 @@ def _video_post(
         json=payload,
         timeout=timeout or settings.video_submit_timeout_seconds,
         retries=0,
+        **_gw._trusted_request_options(config),
     )
     return r.json()
 
@@ -160,6 +161,7 @@ def _video_get(path: str, timeout: int = 30, config: RuntimeGatewayConfig | None
         headers=_video_auth(config),
         timeout=timeout,
         retries=settings.gateway_max_retries,
+        **_gw._trusted_request_options(config),
     )
     return r.json()
 
@@ -185,7 +187,13 @@ def submit_video(
         else settings.video_gateway_format
     )
     if fmt == "ark":
-        return _submit_video_ark(prompt, video_model_id, params, gateway_config=gateway_config)
+        return _submit_video_ark(
+            prompt,
+            video_model_id,
+            params,
+            extra=extra,
+            gateway_config=gateway_config,
+        )
     extra = extra or {}
     submit_path = extra.get("submit_path", "/v1/videos/generations")
     id_field = extra.get("id_field", "id")
@@ -314,11 +322,15 @@ def find_video_by_request_id(
 
 
 def _submit_video_ark(
-    prompt: str, model_id: str, params: dict, gateway_config: RuntimeGatewayConfig | None = None
+    prompt: str,
+    model_id: str,
+    params: dict,
+    extra: dict | None = None,
+    gateway_config: RuntimeGatewayConfig | None = None,
 ) -> str:
     from . import gateway as _gw
 
-    payload = _ark_payload(model_id, prompt, params)
+    payload = _ark_payload(model_id, prompt, params, extra=extra)
     if gateway_config is None:
         data = _gw._video_post("/contents/generations/tasks", payload)
     else:

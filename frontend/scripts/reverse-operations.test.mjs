@@ -124,6 +124,15 @@ assert.equal(
   "a pending result should resolve only to its own operation",
 );
 assert.equal(
+  resolvePendingReverseOperation({
+    pendingReverseResult: { operation_id: 82 },
+    trackedOperation: { id: 82, status: "running", progress: 45, cost_settled: 0 },
+    workspaceOperation: { id: 82, status: "succeeded", progress: 100, cost_settled: 7 },
+  })?.cost_settled,
+  7,
+  "a recovered terminal operation should replace stale in-memory progress for the same result",
+);
+assert.equal(
   reverseOperationRequestSignature({
     target: "image",
     asset_url: "/source.jpg",
@@ -186,6 +195,7 @@ assert.equal(explicitRestorePatch.pendingReverseResult.result.video_analysis.sho
 assert.match(explicitRestorePatch.pendingReverseResult.result.final_text, /镜头6/);
 assert.doesNotMatch(explicitRestorePatch.pendingReverseResult.result.final_text, /历史压缩稿/);
 assert.equal(explicitRestorePatch.reverseOperation.id, 76);
+assert.equal(explicitRestorePatch.reversing, false);
 assert.match(deepLinkBootstrapSource, /cloudDraftLoadedRef\.current[\s\S]*?parseUnifiedTaskKey[\s\S]*?task\.kind !== "reverse"/);
 assert.match(deepLinkBootstrapSource, /openRecentReverseOperation\(\{ id: task\.id \}\)/);
 
@@ -786,7 +796,13 @@ const evidence = videoAnalysisEvidenceData({
 assert.equal(evidence.degradedReason, "抽帧失败");
 assert.equal(evidence.coverageStart, 1.25);
 assert.equal(evidence.coverageEnd, 6.75);
+assert.equal(evidence.audioAnalyzed, false);
 assert.deepEqual(evidence.gapTexts, ["6.8s 后无视觉证据"]);
+const audioEvidence = videoAnalysisEvidenceData({
+  source: { audio_analyzed: false },
+  audio: { status: "partial", evidence: [{ evidence_type: "music_likelihood" }] },
+});
+assert.equal(audioEvidence.audioAnalyzed, true);
 const rangedEvidence = videoAnalysisEvidenceData({
   analysis_gaps: [
     { start_seconds: 2.2, end_seconds: 10.1 },

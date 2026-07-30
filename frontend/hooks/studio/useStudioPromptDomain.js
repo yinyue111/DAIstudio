@@ -73,6 +73,7 @@ export default function useStudioPromptDomain(
     reverseAppliedRevisionId,
     reverseOperationForPendingResult,
     me,
+    refreshMe: foundation.refreshMe,
     requestQuoteConfirmation: model.requestQuoteConfirmation,
     workspace,
     workspacesRef: refs.workspacesRef,

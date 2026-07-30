@@ -64,6 +64,29 @@ def _config_video(client, h, extra=None):
     assert r.status_code == 200, r.text
 
 
+def test_public_video_submit_error_explains_content_safety_rejection():
+    error = gateway.GatewayError(
+        "content[0] may contain sensitive information",
+        status_code=400,
+    )
+
+    message = generation_video_submit.public_video_submit_error(error)
+
+    assert "内容安全检查" in message
+    assert "重复品牌词、字幕或过度动作描述" in message
+    assert "已退回冻结积分" in message
+
+
+def test_public_video_submit_error_explains_provider_bad_request():
+    error = gateway.GatewayError("upstream rejected request", status_code=400)
+
+    message = generation_video_submit.public_video_submit_error(error)
+
+    assert "视频模型拒绝了当前提示词或生成参数" in message
+    assert "时长、比例和参考图方式" in message
+    assert "已退回冻结积分" in message
+
+
 def _stranded_video(uid, ext_id):
     db = SessionLocal()
     try:
@@ -167,7 +190,7 @@ def test_legacy_video_worker_compiles_and_persists_prompt_before_submit(
         assert task.phase == "polling"
         assert task.external_task_id == "ext-legacy-compiled"
         assert params["_generation_prompt"] == submitted["prompt"]
-        assert params["_prompt_compiler_version"] == "video-prompt-v6"
+        assert params["_prompt_compiler_version"] == "video-prompt-v11"
         assert params["_video_submit_contract_version"] == "video-submit-v3"
         assert params["_post_overlays"] == ["新品上市"]
         assert params["_video_prompt_plan"]["shots"] == ["手持产品稳定入镜"]
@@ -218,6 +241,60 @@ def test_legacy_video_worker_separates_direct_product_prompt_and_post_metadata(c
     assert persisted["_voiceover"] == "温柔开始。"
     assert persisted["_sfx"] == ["水滴声"]
     assert persisted["_video_prompt_metadata"]["prompt_mode"] == "direct_passthrough"
+
+
+def test_seedance_worker_recompiles_pre_safety_revision_prompt(
+    client, make_user, auth
+):
+    uid = make_user("13900003119", balance=1000, admin=True)
+    headers = auth("13900003119")
+    _config_video(
+        client,
+        headers,
+        extra={"video_prompt_profile": {"family": "seedance-1.5"}},
+    )
+    original = "温馨家居广告，白色洗脸巾平整放在白色圆桌上，固定近景"
+    db = SessionLocal()
+    try:
+        task = GenTask(
+            user_id=uid,
+            category="video",
+            stage="preview",
+            status="queued",
+            prompt={"final_text": original},
+            params={
+                "duration": 5,
+                "resolution": "720p",
+                "ratio": "9:16",
+                "_generation_prompt": original,
+                "_prompt_compiler_version": "video-prompt-v11",
+                "_video_submit_contract_version": "video-submit-v3",
+            },
+            cost_frozen=5,
+        )
+        db.add(task)
+        db.flush()
+        task_id = task.id
+        credits.freeze(db, uid, 5, biz_ref=task_id, commit=False)
+        db.commit()
+    finally:
+        db.close()
+
+    submitted = {}
+    generation_video_submit.start_video_task(
+        task_id,
+        submit_video_fn=lambda _model, prompt, params: (
+            submitted.update(prompt=prompt, params=params) or "ext-safety-migrated"
+        ),
+        try_enqueue_poll_fn=lambda *_args: None,
+    )
+
+    assert "洗脸巾" not in submitted["prompt"]
+    assert "洁面巾" in submitted["prompt"]
+    with SessionLocal() as verify_db:
+        task = verify_db.get(GenTask, task_id)
+        assert task.params["_seedance_execution_revision"] == "seedance-execution-v2"
+        assert task.params["_generation_prompt"] == submitted["prompt"]
 
 
 def test_legacy_video_worker_preserves_dense_prompt_before_provider_submit(

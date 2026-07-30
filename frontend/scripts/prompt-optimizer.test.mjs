@@ -70,6 +70,11 @@ assert.match(
 );
 assert.match(
   optimizeDirectSource,
+  /if \(!optimized\)[\s\S]{0,160}refreshMe\(\)[\s\S]{0,160}setProposals\(/,
+  "a successfully settled proposal should refresh the visible account balance",
+);
+assert.match(
+  optimizeDirectSource,
   /failedAndRefunded[\s\S]{0,240}clearPendingStudioActionRequest[\s\S]{0,180}attempt === 0\) continue/,
   "a failed and refunded replay should receive a fresh request id and retry once",
 );
@@ -77,6 +82,11 @@ assert.match(
   optimizerSource,
   /function updatePromptFromUser\([\s\S]{0,160}invalidate\(\)[\s\S]{0,120}setPrompt\(valueOrUpdater\)/,
   "editing the prompt should invalidate any in-flight optimization response",
+);
+assert.match(
+  optimizerSource.slice(optimizerSource.indexOf("async function accept("), optimizerSource.indexOf("async function reject()")),
+  /acceptStudioPromptOptimization[\s\S]{0,900}refreshMe\(\)[\s\S]{0,300}applyPromptOptimizationDecision/,
+  "accepting a paid optimization should refresh the visible balance after settlement",
 );
 assert.match(
   creationConsoleSource,

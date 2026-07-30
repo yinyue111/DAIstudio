@@ -66,9 +66,12 @@ from .model_pricing import usage_from_response  # noqa: F401 - polling facade de
 from .progress import set_progress
 from .video_prompt_compiler import (
     COMPILER_VERSION,
+    SEEDANCE_EXECUTION_REVISION,
     VIDEO_SUBMIT_CONTRACT_VERSION,
     build_video_prompt_references,
     compile_video_prompt,
+    infer_video_model_profile,
+    is_seedance_15_profile,
     source_video_is_analysis_only,
     store_video_prompt_compile,
 )
@@ -91,6 +94,26 @@ class SourceVideoUrlUnavailable(RuntimeError):
     与其他失败不同，这一类是"部署能力不足"而非"请求非法"：调用方可以
     退回首帧生成，但必须显式标注降级，绝不允许静默丢失运动信息。
     """
+
+
+def public_video_submit_error(exc: Exception) -> str:
+    message = str(exc)
+    lowered = message.lower()
+    if "sensitive information" in lowered or "内容安全" in message or "敏感" in message:
+        return (
+            "提示词触发了视频模型的内容安全检查，已退回冻结积分。"
+            "请删除可能被误判的重复品牌词、字幕或过度动作描述后重试。"
+        )
+    if isinstance(exc, gateway.GatewayError) and getattr(exc, "status_code", None) == 400:
+        return (
+            "视频模型拒绝了当前提示词或生成参数，已退回冻结积分。"
+            "请缩短提示词，或检查当前模型支持的时长、比例和参考图方式。"
+        )
+    if "timed out" in lowered or "timeout" in lowered or "超时" in message:
+        return "视频提交等待超时，已退回冻结积分，请稍后重试。"
+    if "没有可用账号" in message or "no available compatible accounts" in lowered:
+        return "视频网关当前没有可用账号支持该模型，已退回冻结积分。"
+    return "视频提交失败，已退回冻结积分，请稍后重试"
 
 
 def lineage_video_analysis_for_compile(payload: Any) -> dict[str, Any] | None:
@@ -695,6 +718,31 @@ def _prepare_video_submission(db, task: GenTask, model) -> tuple[dict, str, dict
     stored_contract_version = str(
         original_params.get("_video_submit_contract_version") or ""
     ).strip()
+    model_extra = (
+        getattr(model, "extra", None)
+        if isinstance(getattr(model, "extra", None), dict)
+        else {}
+    )
+    model_profiles = model_extra.get("video_prompt_profiles") or model_extra.get(
+        "prompt_profiles"
+    )
+    if not isinstance(model_profiles, dict):
+        model_profiles = None
+    model_profile = infer_video_model_profile(
+        model_id=str(getattr(model, "model_id", "") or ""),
+        provider=str(getattr(model, "provider", "") or ""),
+        duration=video_render_duration(original_params, task.stage),
+        extra=model_extra,
+        model_profiles=model_profiles,
+    )
+    needs_seedance_safety_recompile = (
+        is_seedance_15_profile(
+            family=str(model_profile.get("family") or ""),
+            model_id=str(getattr(model, "model_id", "") or ""),
+        )
+        and str(original_params.get("_seedance_execution_revision") or "").strip()
+        != SEEDANCE_EXECUTION_REVISION
+    )
     if not prompt or not stored_compiler_version or not stored_contract_version:
         prompt, original_params = _compile_legacy_video_prompt(task, model, original_params, db=db)
     elif stored_contract_version != VIDEO_SUBMIT_CONTRACT_VERSION:
@@ -705,6 +753,8 @@ def _prepare_video_submission(db, task: GenTask, model) -> tuple[dict, str, dict
         raise VideoSubmitVersionMismatch(
             "视频提示词编译器版本不一致，已停止提交；请重启 API 与 Worker 后重试"
         )
+    elif needs_seedance_safety_recompile:
+        prompt, original_params = _compile_legacy_video_prompt(task, model, original_params, db=db)
     if not prompt:
         raise RuntimeError("视频提示词为空，无法提交生成")
     if not original_params.get("_video_request_id"):
@@ -886,7 +936,7 @@ def start_video_task(
         public_error = (
             str(e)
             if isinstance(e, VideoSubmitVersionMismatch)
-            else "视频提交失败，已退回冻结积分，请稍后重试"
+            else public_video_submit_error(e)
         )
         fail_and_refund(db, task_id, str(e), public_error=public_error)
     finally:

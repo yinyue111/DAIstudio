@@ -742,14 +742,18 @@ def split_video_post_production(text: str) -> dict[str, Any]:
     label_separator = r"\s*(?:(?:[:：]|为|是|说)|内容\s*(?:为|是))?\s*"
     overlay_label = (
         r"(?:字幕(?:卖点)?|后期叠字|OCR(?:识别)?(?:文字|内容)?|"
-        r"(?:画面(?:中)?)?文字(?:浮现|出现|显示)?|"
+        r"用户指定卖点文字|"
+        r"画面(?:中)?文字(?:浮现|出现|显示)?|"
+        r"文字(?:浮现|出现|显示)|"
+        r"文字(?=\s*(?:[:：]|[“\"'‘]))|"
         r"画面(?:中)?(?:浮现|出现|显示)文字)"
     )
     overlay_separator = (
         r"\s*(?:(?:[:：]|为|是|写着)|内容\s*(?:为|是)|显示\s*(?:为|是)?)?\s*"
     )
     sfx_label = (
-        r"(?:音效|SFX|环境音|背景配乐|背景音乐|配乐|音乐|BGM|声音设计|音频)"
+        r"(?:用户指定音效|音效|SFX|环境音|背景配乐|背景音乐|配乐|音乐|BGM|"
+        r"声音设计|声音|音频)"
     )
     sfx_separator = r"\s*(?:(?:[:：]|为|是|随|随着)|内容\s*(?:为|是))?\s*"
 
@@ -788,7 +792,11 @@ def split_video_post_production(text: str) -> dict[str, Any]:
 
     def remove_overlay(match: re.Match[str]) -> str:
         content = match.group("content").strip()
-        if re.match(r"^(?:仅|只|不得|不要|不(?:出现|显示)|无|必须|应当|保持)", content):
+        if re.match(
+            r"^(?:仅|只|不得|不要|不(?:出现|显示)|无|必须|应当|保持|"
+            r"按|依照|根据|准确)",
+            content,
+        ):
             return match.group(0)
         overlays.append(content)
         return match.group("boundary")
@@ -801,6 +809,26 @@ def split_video_post_production(text: str) -> dict[str, Any]:
             if value.strip()
         )
         return match.group("boundary")
+
+    def remove_requested_overlay_list(match: re.Match[str]) -> str:
+        content = re.sub(
+            r"[，,]\s*按原文准确显示\s*$",
+            "",
+            match.group("content").strip(),
+        )
+        overlays.extend(_clauses(content))
+        return match.group("boundary")
+
+    text = re.sub(
+        boundary
+        + r"用户指定卖点文字\s*[:：]\s*"
+        + r"(?P<content>[^\n。]+?)"
+        + r"(?=(?:[；;]\s*(?:用户指定音效|"
+        + r"必须完整执行且不得替换的原始动作要求))|$|\n|。)",
+        remove_requested_overlay_list,
+        text,
+        flags=post_flags,
+    )
 
     text = re.sub(
         boundary
@@ -837,7 +865,17 @@ def split_video_post_production(text: str) -> dict[str, Any]:
     )
 
     def remove_sfx(match: re.Match[str]) -> str:
-        sfx.extend(_clauses(match.group("content")))
+        for value in _clauses(match.group("content")):
+            item = re.sub(
+                r"^(?:(?:用户指定)?(?:音效|声音|音频))\s*[:：]\s*",
+                "",
+                value.strip(),
+                flags=re.IGNORECASE,
+            )
+            if re.search(r"持续背景音乐|背景音乐.*贯穿", item):
+                item = "持续背景音乐"
+            if item:
+                sfx.append(item)
         return match.group("boundary")
 
     text = re.sub(
@@ -888,9 +926,9 @@ def split_video_post_production(text: str) -> dict[str, Any]:
     text = re.sub(r"([。；;，,])\s*(?=[。；;，,])", "", text)
     return {
         "text": text.strip(" \n。；;"),
-        "post_overlays": overlays,
+        "post_overlays": _unique_items(overlays),
         "voiceover": voiceover,
-        "sfx": sfx,
+        "sfx": _unique_items(sfx),
     }
 
 

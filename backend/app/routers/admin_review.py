@@ -53,6 +53,10 @@ def refund_needs_review_task(
             db.rollback()
             raise HTTPException(400, str(e)) from e
     note = (body.note or "").strip()
+    params = dict(task.params or {})
+    params.pop("_video_submit_state_unknown", None)
+    params.pop("_image_submit_state_unknown", None)
+    task.params = params
     discarded_assets = db.execute(
         update(GenAsset)
         .where(GenAsset.task_id == task.id, GenAsset.moderation_status == "active")

@@ -72,6 +72,49 @@ def test_generate_rejects_oversized_prompt(client, make_user, auth, monkeypatch)
     assert "prompt 过长" in r.text
 
 
+def test_generate_accepts_bounded_layered_prompt(client, make_user, auth, monkeypatch):
+    make_user("13900000144", balance=1000)
+    h = auth("13900000144")
+    monkeypatch.setattr("app.routers.generate.settings.max_prompt_chars", 128)
+    monkeypatch.setattr("app.routers.generate.settings.max_prompt_payload_chars", 1_024)
+    text = "x" * 96
+
+    r = client.post("/api/quotes", json={
+        "category": "video",
+        "stage": "preview",
+        "prompt": {
+            "input_mode": "direct_input",
+            "raw_text": text,
+            "assembled_text": text,
+            "final_text": text,
+            "user_instruction": text,
+        },
+        "params": {"duration": 5, "resolution": "720p", "ratio": "16:9"},
+    }, headers=h)
+
+    assert r.status_code == 201, r.text
+
+
+def test_generate_rejects_oversized_layered_prompt_field(client, make_user, auth, monkeypatch):
+    make_user("13900000145", balance=1000)
+    h = auth("13900000145")
+    monkeypatch.setattr("app.routers.generate.settings.max_prompt_chars", 32)
+    monkeypatch.setattr("app.routers.generate.settings.max_prompt_payload_chars", 1_024)
+
+    r = client.post("/api/quotes", json={
+        "category": "video",
+        "stage": "preview",
+        "prompt": {
+            "final_text": "short prompt",
+            "raw_text": "x" * 64,
+        },
+        "params": {"duration": 5, "resolution": "720p", "ratio": "16:9"},
+    }, headers=h)
+
+    assert r.status_code == 400
+    assert "raw_text" in r.text
+
+
 def test_image_partial_success_settles_actual_count(
     client, make_user, auth, monkeypatch, quote_and_generate
 ):

@@ -4,6 +4,7 @@ from __future__ import annotations
 import logging
 import tempfile
 import time
+from collections.abc import Collection
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
 
@@ -18,6 +19,22 @@ from .ssrf import MAX_REDIRECTS, SsrfError
 log = logging.getLogger("gateway")
 _DOWNLOAD_HEADERS = {"Accept-Encoding": "identity"}
 _MAX_DOWNLOAD_BYTES = 512 * 1024 * 1024  # generous cap for video results
+
+
+def _trusted_download_host(url: str, trusted_hosts: Collection[str] | None) -> bool:
+    host = (urlparse(url).hostname or "").rstrip(".").lower()
+    allowed = {str(item).rstrip(".").lower() for item in trusted_hosts or ()}
+    return bool(host and host in allowed)
+
+
+def _assert_download_url(
+    url: str,
+    trusted_hosts: Collection[str] | None,
+    assert_safe_url,
+) -> None:
+    if _trusted_download_host(url, trusted_hosts):
+        return
+    assert_safe_url(url)
 
 
 def _reject_compressed_download(response: httpx.Response) -> None:
@@ -89,6 +106,7 @@ def _download(
     timeout_seconds: int | None = None,
     low_speed_timeout_seconds: int | None = None,
     low_speed_min_bytes_per_second: int | None = None,
+    trusted_hosts: Collection[str] | None = None,
 ) -> bytes:
     """Download a gateway-returned result URL with the SSRF guard applied.
 
@@ -100,7 +118,7 @@ def _download(
     from . import gateway as _gw
 
     try:
-        _gw.assert_safe_url(url)
+        _assert_download_url(url, trusted_hosts, _gw.assert_safe_url)
         timeout = int(timeout_seconds or settings.image_download_timeout_seconds)
         deadline = time.monotonic() + timeout
         with httpx.Client(follow_redirects=False, timeout=_download_httpx_timeout(timeout)) as c:
@@ -112,10 +130,11 @@ def _download(
                     url,
                     timeout=_download_httpx_timeout(remaining),
                     headers=_DOWNLOAD_HEADERS,
+                    trusted_hosts=trusted_hosts,
                 ) as r:
                     if r.is_redirect and r.headers.get("location"):
                         url = urljoin(url, r.headers["location"])
-                        _gw.assert_safe_url(url)  # red line: re-check every hop
+                        _assert_download_url(url, trusted_hosts, _gw.assert_safe_url)
                         continue
                     if r.status_code >= 400:
                         log.warning(
@@ -164,6 +183,7 @@ def download_bytes_limited(
     timeout_seconds: int | None = None,
     low_speed_timeout_seconds: int | None = None,
     low_speed_min_bytes_per_second: int | None = None,
+    trusted_hosts: Collection[str] | None = None,
 ) -> bytes:
     return _download(
         url,
@@ -172,6 +192,7 @@ def download_bytes_limited(
         timeout_seconds=timeout_seconds,
         low_speed_timeout_seconds=low_speed_timeout_seconds,
         low_speed_min_bytes_per_second=low_speed_min_bytes_per_second,
+        trusted_hosts=trusted_hosts,
     )
 
 
@@ -186,12 +207,13 @@ def download_to_path(
     low_speed_timeout_seconds: int | None = None,
     low_speed_min_bytes_per_second: int | None = None,
     request_headers: dict[str, str] | None = None,
+    trusted_hosts: Collection[str] | None = None,
 ) -> int:
     """Download a gateway result directly to disk with SSRF/redirect checks."""
     from . import gateway as _gw
 
     try:
-        _gw.assert_safe_url(url)
+        _assert_download_url(url, trusted_hosts, _gw.assert_safe_url)
         credential_origin = _url_origin(url) if request_headers else None
         timeout = int(timeout_seconds or settings.image_download_timeout_seconds)
         deadline = time.monotonic() + timeout
@@ -207,10 +229,11 @@ def download_to_path(
                     url,
                     timeout=_download_httpx_timeout(remaining),
                     headers=headers,
+                    trusted_hosts=trusted_hosts,
                 ) as r:
                     if r.is_redirect and r.headers.get("location"):
                         url = urljoin(url, r.headers["location"])
-                        _gw.assert_safe_url(url)
+                        _assert_download_url(url, trusted_hosts, _gw.assert_safe_url)
                         continue
                     if r.status_code >= 400:
                         log.warning(
@@ -271,6 +294,7 @@ def download_to_storage(
     low_speed_timeout_seconds: int | None = None,
     low_speed_min_bytes_per_second: int | None = None,
     request_headers: dict[str, str] | None = None,
+    trusted_hosts: Collection[str] | None = None,
 ) -> str:
     from . import gateway as _gw
 
@@ -288,6 +312,7 @@ def download_to_storage(
             low_speed_timeout_seconds=low_speed_timeout_seconds,
             low_speed_min_bytes_per_second=low_speed_min_bytes_per_second,
             request_headers=request_headers,
+            trusted_hosts=trusted_hosts,
         )
         return storage.save_file(path, subdir, ext)
     finally:
