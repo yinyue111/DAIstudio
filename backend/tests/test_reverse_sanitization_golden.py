@@ -27,6 +27,9 @@ from app.services.gateway_prompting import (
 )
 
 _FIXTURE_PATH = Path(__file__).parent / "fixtures" / "reverse_sanitization_clauses.json"
+_VIDEO_DRAFT_FIXTURE_PATH = (
+    Path(__file__).parent / "fixtures" / "video_generation_draft_contract.json"
+)
 
 
 def _load_clause_cases() -> list[dict]:
@@ -408,7 +411,7 @@ class TestComposeVisualFinalTextWhitelist:
                 "camera": f"第{index + 1}镜运镜",
                 "lighting": f"第{index + 1}镜光线",
                 "transition": "硬切" if index < 5 else "定帧收尾",
-                "ocr": "厚实吸水" if index == 2 else "",
+                "ocr": "后期字幕：厚实吸水" if index == 2 else "",
                 "audio_cue": "水滴入水声" if index == 2 else "未分析",
             }
             for index in range(6)
@@ -420,17 +423,19 @@ class TestComposeVisualFinalTextWhitelist:
         assert "720x1280" not in draft
         assert "9:16" not in draft
         assert "36.000秒" not in draft
-        assert "参考片含 6 个高密度剪辑镜头" in draft
+        assert "复刻执行" not in draft
         assert "镜头1：" in draft
         assert "镜头6：" in draft
         assert "镜头1（" not in draft
-        assert "主体追踪：第6镜主体连续" in draft
-        assert "姿态：第6镜姿态" in draft
+        assert "主体轨迹：第6镜主体连续" in draft
+        assert "姿态变化：第6镜姿态" in draft
+        assert "动作与可见终态：第6镜动作" in draft
         assert "运镜：第6镜运镜" in draft
-        assert "画面字幕：干湿两用" in draft
-        assert "画面文字：厚实吸水" in draft
-        assert "声音：持续背景音乐" in draft
-        assert "声音：水滴入水声" in draft
+        assert "后期字幕（后期叠加）：干湿两用" in draft
+        assert "后期字幕（后期叠加）：厚实吸水" in draft
+        assert "声音基线：持续背景音乐" in draft
+        assert "同步声音：水滴入水声" in draft
+        assert draft.count("持续背景音乐") == 1
         assert "BPM" not in draft
         assert "未分类瞬态声" not in draft
         assert "5.92秒" not in draft
@@ -466,13 +471,13 @@ class TestComposeVisualFinalTextWhitelist:
 
         draft = compose_video_generation_draft(structured, shots)
 
-        assert "画面文字：干湿两用" in draft
-        assert "画面文字：亲肤" in draft
-        assert "画面文字：DAMAH 166PCS" in draft
-        assert "画面文字：生成" not in draft
+        assert "可见原字：干湿两用" in draft
+        assert "可见原字：亲肤" in draft
+        assert "可见原字：DAMAH 166PCS" in draft
+        assert "可见原字：生成" not in draft
         assert "可能错误的包装文字" not in draft
 
-    def test_canonical_video_draft_marks_dense_short_timeline_for_shotwise_generation(self):
+    def test_canonical_video_draft_keeps_shots_without_execution_advice(self):
         structured = {
             "图像类型": "人物+产品混合视频",
             "主体": "女性与白色洗脸巾包装",
@@ -490,12 +495,73 @@ class TestComposeVisualFinalTextWhitelist:
 
         draft = compose_video_generation_draft(structured, shots)
 
-        assert "参考片含 7 个高密度剪辑镜头" in draft
-        assert "逐镜独立生成" in draft
-        assert "单镜含多步动作或内部硬切" in draft
-        assert "一段一个主动作/可见结果" in draft
-        assert "最后按原镜头顺序剪辑" in draft
-        assert "不要将全部镜头压入一次生成" in draft
+        assert "镜头1：" in draft
+        assert "镜头7：" in draft
+        assert "复刻执行" not in draft
+        assert "逐镜独立生成" not in draft
+
+    def test_canonical_video_draft_separates_product_text_and_post_subtitles(self):
+        structured = {"图像类型": "产品视频", "主体": "银灰圆柱精华瓶"}
+        shots = [{
+            "visual": "精华瓶正面定帧",
+            "ocr": "包装原字：DAMAH 50ml；后期字幕：清透保湿",
+        }]
+
+        draft = compose_video_generation_draft(structured, shots)
+
+        assert "包装原字：DAMAH 50ml" in draft
+        assert "后期字幕（后期叠加）：清透保湿" in draft
+
+    @pytest.mark.parametrize("separator", ["，", ", "])
+    def test_canonical_video_draft_splits_adjacent_ocr_markers(self, separator):
+        draft = compose_video_generation_draft(
+            {"主体": "银灰圆柱精华瓶"},
+            [{
+                "visual": "精华瓶正面定帧",
+                "ocr": f"包装原字：DAMAH 50ml{separator}后期字幕：清透保湿",
+            }],
+        )
+
+        assert "包装原字：DAMAH 50ml" in draft
+        assert "包装原字：DAMAH 50ml 后期字幕" not in draft
+        assert "后期字幕（后期叠加）：清透保湿" in draft
+
+    def test_canonical_video_draft_keeps_unprefixed_ocr_neutral(self):
+        draft = compose_video_generation_draft(
+            {"主体": "银灰圆柱精华瓶", "字幕卖点": "清透保湿"},
+            [{"visual": "标签正面定帧", "ocr": "清透保湿"}],
+        )
+
+        assert "可见原字：清透保湿" in draft
+
+    def test_canonical_video_draft_matches_shared_frontend_contract(self):
+        fixture = json.loads(_VIDEO_DRAFT_FIXTURE_PATH.read_text(encoding="utf-8"))
+
+        draft = compose_video_generation_draft(
+            fixture["structured"],
+            fixture["video_analysis"]["shots"],
+        )
+
+        assert draft == fixture["expected"]
+        assert draft.count("全新上市") == 1
+        assert draft.count("持续背景音乐") == 1
+        assert "[]" not in draft
+
+    def test_canonical_video_draft_keeps_product_ratio_but_removes_video_ratio(self):
+        structured = {
+            "图像类型": "产品视频",
+            "主体": "瓶身高宽比 3:1，银灰圆柱结构",
+            "视角构图": "视频画幅 9:16，产品居中",
+            "广告目标": "建立品牌信任",
+            "氛围情绪": "高级、舒缓",
+        }
+
+        draft = compose_video_generation_draft(structured, [])
+
+        assert "高宽比 3:1" in draft
+        assert "9:16" not in draft
+        assert "建立品牌信任" not in draft
+        assert "高级、舒缓" not in draft
 
 
 class TestAudioEvidenceSanitization:
@@ -523,6 +589,10 @@ class TestAudioEvidenceSanitization:
         assert shots[0]["audio_cue"] == "对白/旁白：全新上市"
         # music/beat/sfx 未声明状态 → 未支持
         assert structured["音效"] == "未支持"
+
+        draft = compose_video_generation_draft(structured, shots)
+        assert draft.count("全新上市") == 1
+        assert "[]" not in draft
 
     def test_local_music_beat_and_transients_enter_summary_and_shot_cues(self):
         structured = {"旁白": "模型虚构旁白", "音效": "模型虚构水滴声"}

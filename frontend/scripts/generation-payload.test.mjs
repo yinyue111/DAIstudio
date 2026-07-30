@@ -182,6 +182,47 @@ assert.doesNotMatch(
   "audit-only video fields must not cross the final generation boundary",
 );
 
+const providerVideoEditPayload = buildGenerationPayload({
+  stage: "preview",
+  cfg: {
+    video_duration_min_seconds: 1,
+    video_duration_max_seconds: 15,
+  },
+  category: "video",
+  creationMode: "video",
+  isEditMode: false,
+  subjectMode: "general",
+  prompt: "保持原片时序，将画面调整为低饱和护肤品广告",
+  promptDirty: true,
+  selected: {
+    type: "video",
+    url: "https://cdn.example.com/source-edit.mp4",
+    width: 1080,
+    height: 1920,
+  },
+  productAsset: null,
+  structured: {},
+  ratio: "9:16",
+  imageQuality: "1k",
+  n: 1,
+  vDuration: 15,
+  vResolution: "1080p",
+  providerVideoEditMode: true,
+});
+assert.equal(
+  providerVideoEditPayload.payload.source_asset_url,
+  "https://cdn.example.com/source-edit.mp4",
+  "provider video editing must keep the source video",
+);
+assert.deepEqual(
+  providerVideoEditPayload.payload.params,
+  {},
+  "provider video editing must not send generation-only duration, resolution, or ratio controls",
+);
+for (const field of ["duration", "resolution", "target_resolution", "ratio"]) {
+  assert.equal(providerVideoEditPayload.payload.params[field], undefined);
+}
+
 const firstFrameAsset = {
   id: 701,
   type: "image",
@@ -737,6 +778,7 @@ const portraitEdit = buildGenerationPayload({
 
 assert.equal(portraitEdit.payload.params.subject_mode, "portrait");
 assert.equal(portraitEdit.payload.params.character_reference_image, productAsset.url);
+assert.equal(portraitEdit.payload.params.reference_image_url, productAsset.url);
 assert.match(portraitEdit.payload.prompt.final_text, /上传人像是唯一人物身份/);
 assert.ok(portraitEdit.payload.prompt.final_text.length <= 450);
 assert.match(portraitEdit.payload.prompt.final_text, /专业商业人像/);
@@ -746,6 +788,32 @@ assert.match(portraitEdit.payload.params.negative_prompt, /幼态成人化/);
 assert.match(portraitEdit.payload.params.negative_prompt, /低机位身体凝视/);
 assert.match(portraitEdit.payload.params.negative_prompt, /五官漂移/);
 assert.doesNotMatch(portraitEdit.payload.prompt.final_text, /未经白名单/);
+
+const portraitVideo = buildGenerationPayload({
+  stage: "preview",
+  cfg: { video_duration_max_seconds: 15 },
+  category: "video",
+  creationMode: "video_edit",
+  isEditMode: true,
+  isImageEditMode: false,
+  subjectMode: "portrait",
+  prompt: "人物保持身份一致，缓慢转头看向镜头",
+  promptDirty: true,
+  selected: null,
+  productAsset,
+  structured: {},
+  ratio: "9:16",
+  imageQuality: "1k",
+  n: 1,
+  seed: "",
+  vDuration: 5,
+  vResolution: "720p",
+});
+
+assert.equal(portraitVideo.payload.params.character_reference_image, productAsset.url);
+assert.equal(portraitVideo.payload.params.reference_image_url, undefined);
+assert.equal(portraitVideo.payload.params.first_frame_image, undefined);
+assert.equal(portraitVideo.payload.params.last_frame_image, undefined);
 
 const dirtyPortraitCanonical = "保持低机位后仰坐姿，使用硬质影棚主光、高锐度 HDR，明确无柔雾、无光晕。";
 const dirtyPortraitEdit = buildGenerationPayload({

@@ -48,7 +48,7 @@ export default function useStudioGenerationDomain(foundation, model, prompt, tas
   } = foundation;
 
   return useGenerationSubmit({
-    cfg,
+    cfg: model.studioCfg || cfg,
     task: task.task,
     category,
     creationMode,
@@ -83,14 +83,16 @@ export default function useStudioGenerationDomain(foundation, model, prompt, tas
     imageQuality,
     n,
     seed,
-    editMaskMode,
-    productPixelLockMode,
+    editMaskMode: model.maskEditSupported ? editMaskMode : "off",
+    productPixelLockMode: model.maskEditSupported ? productPixelLockMode : "off",
     vDuration,
     vResolution,
+    providerVideoEditMode: model.providerVideoEditMode,
     productVideoTemplate: model.effectiveProductVideoTemplate || productVideoTemplate,
     modelConfigId: model.selectedGenerationModelConfigId,
     reverseOperationId: reverse.generationReverseOperationId,
     reverseRevisionId: reverse.generationReverseRevisionId,
+    reverseSourceSignature: model.reverseSourceSignature,
     reviewedImageEvidence: reverse.generationSourceRevision?.payload?.image_evidence || null,
     reverseEvidenceOperation: reverse.reverseOperationForPendingResult(),
     modelOption: model.selectedGenerationModel,

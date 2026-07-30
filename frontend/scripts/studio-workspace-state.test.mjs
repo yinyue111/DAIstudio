@@ -451,6 +451,16 @@ assert.match(
 );
 assert.match(
   generationControlsSource,
+  /isEditMode && productGenerationMode && !portraitGenerationMode && maskEditSupported/,
+  "mask protection controls must stay hidden for image providers without mask-edit support",
+);
+assert.match(
+  pageSource,
+  /maskEditSupported=\{maskEditSupported\}/,
+  "the selected image model capability must reach the generation controls",
+);
+assert.match(
+  generationControlsSource,
   /中心保护/,
   "product image editing controls should expose the center-box compatibility mode",
 );
@@ -652,8 +662,8 @@ assert.doesNotMatch(
 );
 assert.match(
   pageSource,
-  /const missingRequiredSource = (?:foundation\.)?isEditMode && !(?:foundation\.)?productAsset/,
-  "edit generation should treat its source image as a required input",
+  /\(foundation\.isEditMode && !foundation\.productAsset\) \|\| missingVideoFirstFrame/,
+  "edit generation and first-frame-only models should treat their source images as required input",
 );
 assert.match(
   submitBarSource,
@@ -662,18 +672,18 @@ assert.match(
 );
 assert.match(
   submitBarSource,
-  /if \(videoModelSwitchRequired\)[\s\S]*onVideoModelSwitchRequired\?\.\(\)[\s\S]*return;[\s\S]*submit\(/,
+  /if \(modelSwitchRequired\)[\s\S]*onModelSwitchRequired\?\.\(\)[\s\S]*return;[\s\S]*submit\(/,
   "model compatibility conflicts must be clickable explanations instead of inert disabled buttons",
 );
 assert.match(
   submitBarSource,
-  /missingRequiredSource[\s\S]*\? missingRequiredSourceLabel[\s\S]*: videoModelSwitchRequired[\s\S]*\? "请切换视频模型"[\s\S]*: uploadBlocked[\s\S]*\? "素材上传中"[\s\S]*: submitLabel/,
-  "the submit button should identify a required video model switch",
+  /missingRequiredSource[\s\S]*\? missingRequiredSourceLabel[\s\S]*: modelSwitchRequired[\s\S]*\? `请切换\$\{category === "video" \? "视频" : "图片"\}模型`[\s\S]*: uploadBlocked[\s\S]*\? "素材上传中"[\s\S]*: submitLabel/,
+  "the submit button should identify the required generation model switch",
 );
 assert.match(
   presentationSource,
-  /foundation\.setMsg\(model\.videoModelSwitchMessage\)[\s\S]*foundation\.notify\.error\(model\.videoModelSwitchMessage/,
-  "clicking an incompatible video model should show both persistent and toast feedback",
+  /foundation\.setMsg\(model\.modelSwitchMessage\)[\s\S]*foundation\.notify\.error\(model\.modelSwitchMessage/,
+  "clicking an incompatible generation model should show both persistent and toast feedback",
 );
 assert.doesNotMatch(
   pageSource,

@@ -1319,6 +1319,13 @@ def test_image_reference_fails_instead_of_falling_back_without_edit_endpoint(
 
     monkeypatch.setattr("app.services.gateway.gen_image", fake_gen_image)
     monkeypatch.setattr("app.services.generation_image_flow.settings.image_edit_path", "")
+    with SessionLocal() as db:
+        model = get_model_config(db, "image")
+        assert model is not None
+        extra = dict(model.extra or {})
+        extra.pop("edit_path", None)
+        model.extra = extra
+        db.commit()
 
     r = quote_and_generate({
         "source_asset_url": source.json()["url"],
@@ -3037,9 +3044,10 @@ def test_uploaded_portrait_image_can_drive_video_character_reference(
     }, headers=h)
     assert r.status_code == 200, r.text
     assert seen["character_reference_image"].startswith("data:image/jpeg;base64,")
-    assert seen["first_frame_image"].startswith("data:image/jpeg;base64,")
-    assert seen["last_frame_image"] == seen["first_frame_image"]
-    assert seen["_portrait_locked"] is True
+    assert "first_frame_image" not in seen
+    assert "reference_image_url" not in seen
+    assert "last_frame_image" not in seen
+    assert "_portrait_locked" not in seen
 
 
 def test_uploaded_image_final_video_uses_data_uri_first_frame(

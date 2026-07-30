@@ -1,16 +1,22 @@
 """video_to_video 真通道：源视频 URL 必须进入上游 payload，失败必须显式报错。"""
+from copy import deepcopy
 from types import SimpleNamespace
 
 import pytest
 
 from app.config import settings
-from app.services import gateway
+from app.db import SessionLocal
+from app.models import ModelConfig, UploadedAsset
+from app.services import gateway, storage
 from app.services import generation_video_submit as submit_mod
 from app.services.gateway_video_payloads import (
     ark_content,
     ark_payload,
     generic_video_payload_params,
 )
+from app.services.model_gateway_config import encrypt_api_key
+from app.services.model_routes import ensure_legacy_route
+from app.services.model_versions import sync_model_versions
 
 # ---------------------------------------------------------------------------
 # generic（OpenAI 风格）payload 构建
@@ -91,6 +97,209 @@ def test_generic_submit_video_sends_source_video_field(monkeypatch):
     assert "source_video_url" not in seen["payload"]
 
 
+def test_grok_video_edit_uses_edit_endpoint_and_official_payload(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(settings, "mock_mode", False)
+    monkeypatch.setattr(settings, "video_gateway_base_url", "https://api.x.ai")
+    monkeypatch.setattr(settings, "video_gateway_api_key", "test-key")
+    monkeypatch.setattr(settings, "video_gateway_format", "openai")
+
+    def fake_post(path, payload, timeout=120):
+        seen["path"] = path
+        seen["payload"] = payload
+        return {"id": "task-grok-edit"}
+
+    monkeypatch.setattr(gateway, "_video_post", fake_post)
+
+    task_id = gateway.submit_video(
+        "replace the background",
+        "grok-imagine-video",
+        {
+            "source_video_url": "https://cdn.example.com/source.mp4",
+            "duration": 8,
+            "ratio": "9:16",
+            "resolution": "720p",
+            "seed": 42,
+            "request_id": "must-not-be-sent",
+        },
+        extra={"submit_path": "/v1/videos/generations"},
+    )
+
+    assert task_id == "task-grok-edit"
+    assert seen["path"] == "/v1/videos/edits"
+    assert seen["payload"] == {
+        "model": "grok-imagine-video",
+        "prompt": "replace the background",
+        "video": {"url": "https://cdn.example.com/source.mp4"},
+    }
+
+
+def test_grok_model_id_does_not_override_explicit_non_grok_provider_route(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(settings, "mock_mode", False)
+    config = gateway.RuntimeGatewayConfig(
+        use="video",
+        provider="custom_openai",
+        base_url="https://video.example.com/v1",
+        api_key="test-key",
+        gateway_format="openai",
+    )
+
+    def fake_post(path, payload, timeout=120, config=None):
+        seen["path"] = path
+        seen["payload"] = payload
+        return {"id": "task-custom-edit"}
+
+    monkeypatch.setattr(gateway, "_video_post", fake_post)
+
+    gateway.submit_video(
+        "restyle this clip",
+        "grok-imagine-video",
+        {"source_video_url": "https://cdn.example.com/source.mp4"},
+        extra={
+            "submit_path": "/v1/custom/video/jobs",
+            "video_url_field": "source_video",
+        },
+        gateway_config=config,
+    )
+
+    assert seen["path"] == "/v1/custom/video/jobs"
+    assert seen["payload"]["source_video"] == "https://cdn.example.com/source.mp4"
+    assert "video" not in seen["payload"]
+
+
+def test_grok_video_generation_without_source_keeps_generation_endpoint(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(settings, "mock_mode", False)
+    monkeypatch.setattr(settings, "video_gateway_base_url", "https://api.x.ai")
+    monkeypatch.setattr(settings, "video_gateway_api_key", "test-key")
+    monkeypatch.setattr(settings, "video_gateway_format", "openai")
+
+    def fake_post(path, payload, timeout=120):
+        seen["path"] = path
+        seen["payload"] = payload
+        return {"id": "task-grok-generate"}
+
+    monkeypatch.setattr(gateway, "_video_post", fake_post)
+
+    gateway.submit_video(
+        "a cinematic ocean",
+        "grok-imagine-video",
+        {"duration": 8, "ratio": "9:16", "resolution": "720p"},
+    )
+
+    assert seen["path"] == "/v1/videos/generations"
+    assert seen["payload"]["duration"] == 8
+    assert seen["payload"]["aspect_ratio"] == "9:16"
+    assert seen["payload"]["resolution"] == "720p"
+
+
+def test_quote_rejects_grok_edit_with_independent_image_reference(
+    client,
+    make_user,
+    auth,
+):
+    phone = "13900003991"
+    user_id = make_user(phone, balance=1000)
+    headers = auth(phone)
+    video_key = "upload_video/grok-edit-source.mp4"
+    image_key = "upload/grok-edit-style.png"
+    source_url = storage.upload_api_url(video_key)
+    style_url = storage.upload_api_url(image_key)
+
+    with SessionLocal() as db:
+        model = db.query(ModelConfig).filter(ModelConfig.use == "video").one()
+        model_id = int(model.id)
+        original = {
+            "model_id": model.model_id,
+            "provider": model.provider,
+            "base_url": model.base_url,
+            "api_key_encrypted": model.api_key_encrypted,
+            "gateway_format": model.gateway_format,
+            "extra": deepcopy(model.extra),
+        }
+        model.model_id = "grok-imagine-video"
+        model.provider = "grok"
+        model.base_url = "https://api.x.ai/v1"
+        model.api_key_encrypted = encrypt_api_key("grok-edit-test-key")
+        model.gateway_format = "openai"
+        model.extra = {
+            **dict(model.extra or {}),
+            "capabilities": {
+                "text_to_video": True,
+                "image_to_video": True,
+                "reference_image": True,
+                "multi_reference": True,
+                "max_reference_images": 7,
+                "video_to_video": True,
+                "video_reference": False,
+                "video_edit": True,
+                "audio_reference": False,
+                "max_reference_videos": 1,
+                "max_reference_audio": 0,
+            },
+        }
+        db.add_all(
+            [
+                UploadedAsset(
+                    key=video_key,
+                    user_id=user_id,
+                    mime="video/mp4",
+                    bytes=10,
+                    original_filename="source.mp4",
+                ),
+                UploadedAsset(
+                    key=image_key,
+                    user_id=user_id,
+                    mime="image/png",
+                    bytes=10,
+                    original_filename="style.png",
+                ),
+            ]
+        )
+        sync_model_versions(db, model)
+        db.commit()
+
+    try:
+        response = client.post(
+            "/api/quotes",
+            headers=headers,
+            json={
+                "model_config_id": model_id,
+                "source_asset_url": source_url,
+                "source_type": "video",
+                "category": "video",
+                "stage": "preview",
+                "prompt": {"final_text": "replace the background"},
+                "params": {
+                    "duration": 5,
+                    "resolution": "720p",
+                    "ratio": "9:16",
+                    "style_reference_image": style_url,
+                },
+            },
+        )
+
+        assert response.status_code == 400, response.text
+        assert "不能同时提交独立参考图" in response.text
+    finally:
+        with SessionLocal() as db:
+            model = db.get(ModelConfig, model_id)
+            if model is not None:
+                model.model_id = original["model_id"]
+                model.provider = original["provider"]
+                model.base_url = original["base_url"]
+                model.api_key_encrypted = original["api_key_encrypted"]
+                model.gateway_format = original["gateway_format"]
+                model.extra = original["extra"]
+                sync_model_versions(db, model)
+                ensure_legacy_route(db, model)
+            db.query(UploadedAsset).filter(
+                UploadedAsset.key.in_([video_key, image_key])
+            ).delete(synchronize_session=False)
+            db.commit()
+
+
 # ---------------------------------------------------------------------------
 # Ark（Seedance）payload 构建
 # ---------------------------------------------------------------------------
@@ -111,7 +320,7 @@ def test_ark_content_appends_reference_video_item():
 
 def test_ark_payload_includes_reference_video():
     payload = ark_payload(
-        "doubao-seedance-1-5-pro-251215",
+        "doubao-seedance-2-0-260128",
         "remake",
         {"duration": 5, "source_video_url": "https://cdn.example.com/source.mp4"},
     )

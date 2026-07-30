@@ -442,10 +442,12 @@ export default function useGenerationSubmit({
   productPixelLockMode,
   vDuration,
   vResolution,
+  providerVideoEditMode = false,
   productVideoTemplate = "prompt_driven",
   modelConfigId = null,
   reverseOperationId = null,
   reverseRevisionId = null,
+  reverseSourceSignature = "",
   reviewedImageEvidence = null,
   reverseEvidenceOperation = null,
   modelOption = null,
@@ -524,10 +526,12 @@ export default function useGenerationSubmit({
     productPixelLockMode,
     vDuration,
     vResolution,
+    providerVideoEditMode,
     productVideoTemplate,
     modelConfigId,
     reverseOperationId,
     reverseRevisionId,
+    reverseSourceSignature,
   };
 
   async function submit(stage = "preview") {
@@ -563,7 +567,16 @@ export default function useGenerationSubmit({
     );
     let requestId = null;
     try {
-      if (!modelEnabled(category)) {
+      if (!modelEnabled(category, {
+        analysisOnlySourceVideo: Boolean(
+          category === "video"
+          && selected?.type === "video"
+          && Number(reverseOperationId) > 0
+          && Number(reverseRevisionId) > 0
+          && Boolean(reverseSourceSignature)
+          && reverseSourceSignature === assetSignature(selected)
+        ),
+      })) {
         setMsg(`${category === "video" ? "视频" : "图片"}模型未启用，请联系管理员配置后再使用。`);
         return;
       }

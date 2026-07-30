@@ -7,9 +7,12 @@ import { resolveProductVideoStrategySelection } from "../app/studio/productVideo
 import { shouldBlockNewGeneration } from "../app/studio/taskConcurrency";
 import { generationRequiresPendingUpload } from "../app/studio/generationUploadPolicy";
 import {
+  modelRequirements,
   modelOptionSupports,
   validateMultiReferenceSelection,
 } from "../app/studio/StudioModelSelector";
+import { videoModelRequiresFirstFrame } from "../app/studio/studioModelContext";
+import { assetSignature } from "../app/studio/helpers";
 
 export function validateGenerationSubmission({
   uploading,
@@ -27,7 +30,8 @@ export function validateGenerationSubmission({
   lastFrameAsset,
   selected,
   productAsset,
-  productDetailAssets,
+  productDetailAssets = [],
+  variationSource = null,
   task,
   isEditMode,
   isImageEditMode,
@@ -35,6 +39,7 @@ export function validateGenerationSubmission({
   structured,
   reverseOperationId,
   reverseRevisionId,
+  reverseSourceSignature = "",
   reviewedImageEvidence,
   reverseEvidenceOperation,
 }) {
@@ -53,6 +58,30 @@ export function validateGenerationSubmission({
     modelOption?.capabilities,
     productVideoTemplate,
   );
+  const analysisOnlySourceVideo = Boolean(
+    category === "video"
+    && selected?.type === "video"
+    && Number(reverseOperationId) > 0
+    && Number(reverseRevisionId) > 0
+    && Boolean(reverseSourceSignature)
+    && reverseSourceSignature === assetSignature(selected)
+  );
+  const videoRequiresFirstFrame = Boolean(
+    category === "video" && videoModelRequiresFirstFrame(modelOption),
+  );
+  const requirements = modelRequirements({
+    use: category,
+    creationMode,
+    selected,
+    productAsset,
+    subjectMode,
+    analysisOnlySourceVideo,
+  });
+  const independentSubjectReference = Boolean(
+    category === "video"
+    && productAsset
+    && ["product", "portrait"].includes(subjectMode)
+  );
   const modelSupportsFirstLastFrame = Boolean(
     category === "video"
     && creationMode === "video"
@@ -65,14 +94,32 @@ export function validateGenerationSubmission({
     ? lastFrameAsset
     : null;
   if (
-    category === "video"
-    && subjectMode === "product"
-    && productAsset
+    independentSubjectReference
     && !modelOptionSupports(modelOption, [["reference_image", "multi_reference"]])
   ) {
     return {
       ok: false,
-      message: "当前视频模型不支持独立产品主题图，请主动切换支持产品参考的模型后再生成。",
+      message: subjectMode === "portrait"
+        ? "当前视频模型不支持独立人物参考图，请切换支持人物参考的模型后再生成。"
+        : "当前视频模型不支持独立产品主题图，请切换支持产品参考的模型后再生成。",
+    };
+  }
+  if (!modelOptionSupports(modelOption, requirements)) {
+    if (videoRequiresFirstFrame && selected?.type !== "image") {
+      return {
+        ok: false,
+        message: "当前视频模型必须使用图片首帧，请上传视频首帧或切换模型。",
+      };
+    }
+    if (category === "video" && selected?.type === "video" && !analysisOnlySourceVideo) {
+      return {
+        ok: false,
+        message: "当前视频模型不支持视频输入；请切换支持视频参考或视频编辑的模型，或先完成视频反推并应用反推版本后再生成。",
+      };
+    }
+    return {
+      ok: false,
+      message: `${category === "video" ? "当前视频" : "当前图片"}模型不支持本次生成所需的素材方式，请切换模型后再生成。`,
     };
   }
   if (category === "video" && subjectMode === "product" && !productVideoStrategy.supported) {
@@ -91,14 +138,40 @@ export function validateGenerationSubmission({
       return { ok: false, message: "视频首帧和尾帧不能使用同一张图片。" };
     }
   }
-  if (productDetailAssets.length) {
-    const urls = [productAsset, ...productDetailAssets, selected]
-      .map(assetReferenceUrl)
-      .filter(Boolean);
+  const directProductVideo = Boolean(
+    category === "video"
+    && creationMode === "video"
+    && subjectMode === "product"
+    && productAsset
+  );
+  const sourceAsset = isEditMode || directProductVideo ? productAsset : selected;
+  const styleReferenceAsset = isEditMode || directProductVideo
+    ? (variationSource || selected)
+    : null;
+  const imageReferenceUrls = [
+    sourceAsset,
+    styleReferenceAsset,
+    variationSource,
+    ...productDetailAssets,
+    effectiveLastFrameAsset,
+  ]
+    .filter((asset) => asset?.type === "image")
+    .map(assetReferenceUrl)
+    .filter(Boolean);
+  const uniqueImageReferenceCount = new Set(imageReferenceUrls).size;
+  const pureFirstLastFramePair = Boolean(
+    effectiveLastFrameAsset
+    && selected?.type === "image"
+    && !productAsset
+    && !styleReferenceAsset
+    && productDetailAssets.length === 0
+    && uniqueImageReferenceCount === 2
+  );
+  if (uniqueImageReferenceCount > 1 && !pureFirstLastFramePair) {
     const validation = validateMultiReferenceSelection(
       modelOption,
-      new Set(urls).size,
-      productDetailAssets.length,
+      uniqueImageReferenceCount,
+      uniqueImageReferenceCount - 1,
     );
     if (!validation.ok) return { ok: false, message: validation.message };
   }

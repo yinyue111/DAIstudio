@@ -3,6 +3,7 @@
 import { useMemo, useState } from "react";
 import {
   Check,
+  Eye,
   Image as ImageIcon,
   LoaderCircle,
   MessageSquareText,
@@ -14,8 +15,9 @@ import { api } from "../../../lib/api";
 import { modelUseLabel } from "./admin-helpers";
 import { Card } from "./admin-ui";
 
-const USE_ORDER = ["image", "video", "prompt"];
+const USE_ORDER = ["vision", "image", "video", "prompt"];
 const USE_ICON = {
+  vision: Eye,
   image: ImageIcon,
   video: Video,
   prompt: MessageSquareText,
@@ -24,11 +26,17 @@ const USE_ICON = {
 function defaultCost(rows, use) {
   const exact = rows.find((row) => row.use === use && row.is_default)
     || rows.find((row) => row.use === use);
-  return Number(exact?.cost_credits || (use === "image" ? 15 : use === "video" ? 16 : 1));
+  return Number(exact?.cost_credits || (
+    use === "image" ? 15 : use === "video" ? 16 : use === "vision" ? 5 : 1
+  ));
+}
+
+function modelImportUse(model) {
+  return model.recommended_use || model.recommended_uses?.[0] || null;
 }
 
 function modelImportKey(model) {
-  return `${model.id}:${model.recommended_uses?.[0] || "unsupported"}`;
+  return `${model.id}:${modelImportUse(model) || "unsupported"}`;
 }
 
 export function ModelCatalogImporter({ providers, rows, onImported }) {
@@ -50,21 +58,27 @@ export function ModelCatalogImporter({ providers, rows, onImported }) {
     () => new Set(rows.map((row) => `${row.use}:${row.model_id}`)),
     [rows],
   );
+  const importCandidates = useMemo(() => models.flatMap((model) => {
+    const uses = Array.isArray(model.recommended_uses) && model.recommended_uses.length
+      ? model.recommended_uses
+      : [null];
+    return uses.map((use) => ({ ...model, recommended_use: use }));
+  }), [models]);
   const visibleModels = useMemo(() => {
     const needle = query.trim().toLowerCase();
-    return models.filter((model) => {
-      const use = model.recommended_uses?.[0] || "unsupported";
+    return importCandidates.filter((model) => {
+      const use = modelImportUse(model) || "unsupported";
       if (filter !== "all" && use !== filter) return false;
       if (!needle) return true;
       return `${model.id} ${model.owned_by || ""} ${model.capability_label || ""}`
         .toLowerCase()
         .includes(needle);
     });
-  }, [filter, models, query]);
+  }, [filter, importCandidates, query]);
   const selectedModels = Object.values(selected);
   const counts = Object.fromEntries(USE_ORDER.map((use) => [
     use,
-    models.filter((model) => model.recommended_uses?.[0] === use).length,
+    importCandidates.filter((model) => modelImportUse(model) === use).length,
   ]));
 
   function changeConnection(key, value) {
@@ -114,7 +128,7 @@ export function ModelCatalogImporter({ providers, rows, onImported }) {
   }
 
   function toggleModel(model) {
-    const use = model.recommended_uses?.[0];
+    const use = modelImportUse(model);
     if (!use) return;
     const key = modelImportKey(model);
     setSelected((current) => {
@@ -133,7 +147,7 @@ export function ModelCatalogImporter({ providers, rows, onImported }) {
           unlock_cost: 0,
           enabled: true,
           sort_order: rows.filter((row) => row.use === use).length * 10 + 10,
-          extra: model.default_extra || null,
+          extra: model.default_extra_by_use?.[use] || model.default_extra || null,
         },
       };
     });
@@ -227,7 +241,7 @@ export function ModelCatalogImporter({ providers, rows, onImported }) {
         <div className="mt-5 border-t border-line pt-4">
           <div className="flex flex-wrap items-center justify-between gap-3">
             <div className="flex flex-wrap gap-1.5 text-xs">
-              <button type="button" onClick={() => setFilter("all")} className={`badge ${filter === "all" ? "bg-iris/20 text-iris" : "bg-white/10 text-mist"}`}>全部 {models.length}</button>
+              <button type="button" onClick={() => setFilter("all")} className={`badge ${filter === "all" ? "bg-iris/20 text-iris" : "bg-white/10 text-mist"}`}>全部 {importCandidates.length}</button>
               {USE_ORDER.map((use) => {
                 const Icon = USE_ICON[use];
                 return (
@@ -246,7 +260,7 @@ export function ModelCatalogImporter({ providers, rows, onImported }) {
 
           <div className="mt-3 max-h-[28rem] divide-y divide-line overflow-y-auto border-y border-line">
             {visibleModels.map((model) => {
-              const use = model.recommended_uses?.[0];
+              const use = modelImportUse(model);
               const key = modelImportKey(model);
               const choice = selected[key];
               const duplicate = use ? existing.has(`${use}:${model.id}`) : false;

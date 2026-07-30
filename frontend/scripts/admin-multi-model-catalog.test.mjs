@@ -86,7 +86,8 @@ test("provider onboarding probes once and atomically imports selected capability
   ]) {
     assert.match(importerSource, new RegExp(label));
   }
-  assert.match(importerSource, /const USE_ORDER = \["image", "video", "prompt"\]/);
+  assert.match(importerSource, /const USE_ORDER = \["vision", "image", "video", "prompt"\]/);
+  assert.match(importerSource, /model\.default_extra_by_use\?\.\[use\]/);
   assert.match(importerSource, /\{modelUseLabel\(use\)\} \{counts\[use\]\}/);
   assert.match(importerSource, /api\.adminProbeModels\(connection\)/);
   assert.match(importerSource, /api\.adminImportModels\(\{ \.\.\.connection, models: selectedModels \}\)/);

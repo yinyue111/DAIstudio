@@ -104,8 +104,8 @@ export default function useStudioPromptDomain(
     image_quality: imageQuality,
     count: n,
     seed,
-    edit_mask_mode: editMaskMode,
-    product_pixel_lock_mode: productPixelLockMode,
+    edit_mask_mode: model.maskEditSupported ? editMaskMode : "off",
+    product_pixel_lock_mode: model.maskEditSupported ? productPixelLockMode : "off",
     video_duration: vDuration,
     video_resolution: vResolution,
     product_video_template: category === "video" && productGenerationMode
@@ -125,7 +125,10 @@ export default function useStudioPromptDomain(
   useEffect(() => {
     if (previousQuoteInputRevisionRef.current === quoteInputRevision) return;
     previousQuoteInputRevisionRef.current = quoteInputRevision;
-    model.invalidateQuote("工作区输入或模型已变化，本次操作已取消，请重新执行。");
+    model.invalidateQuote(
+      "工作区输入或模型已变化，本次操作已取消，请重新执行。",
+      { preserveKinds: ["generation"] },
+    );
   }, [quoteInputRevision, model.invalidateQuote]);
 
   useEffect(() => {

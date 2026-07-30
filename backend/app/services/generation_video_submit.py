@@ -349,6 +349,7 @@ def video_submit_params(db, task: GenTask) -> dict:
         params["ratio"] = video_ratio(ref_w, ref_h)
     subject_mode = str(params.get("subject_mode") or "").lower()
     is_product_image_video = task.source_type == "image" and subject_mode == "product"
+    is_portrait_image_video = task.source_type == "image" and subject_mode == "portrait"
     if is_product_image_video:
         params["negative_prompt"] = product_video_negative_prompt(params.get("negative_prompt"))
         product_reference = (
@@ -415,7 +416,7 @@ def video_submit_params(db, task: GenTask) -> dict:
     # it reaches the model gateway. Product identity references stay separate
     # so the provider does not interpret them as the opening or closing frame.
     first_frame = params.get("first_frame_image")
-    if not is_product_image_video:
+    if not is_product_image_video and not is_portrait_image_video:
         first_frame = first_frame or params.get("reference_image_url")
         if task.source_type == "image":
             first_frame = first_frame or task.source_asset_url
@@ -448,9 +449,6 @@ def video_submit_params(db, task: GenTask) -> dict:
             last_frame,
             **frame_reference_kwargs,
         )
-    elif safe_first_frame and task.source_type == "image" and subject_mode == "portrait":
-        params["last_frame_image"] = safe_first_frame
-        params["_portrait_locked"] = True
     style_ref = params.get("style_reference_image")
     if style_ref:
         params["style_reference_image"] = gateway_reference_image(
@@ -470,11 +468,6 @@ def video_submit_params(db, task: GenTask) -> dict:
             max_side=VIDEO_FIRST_FRAME_MAX_SIDE,
         )
         params["character_reference_image"] = safe_character_ref
-        if str(params.get("subject_mode") or "").lower() == "portrait":
-            params.setdefault("first_frame_image", safe_character_ref)
-            params.setdefault("reference_image_url", safe_character_ref)
-            params.setdefault("last_frame_image", safe_character_ref)
-            params["_portrait_locked"] = True
     return params
 
 

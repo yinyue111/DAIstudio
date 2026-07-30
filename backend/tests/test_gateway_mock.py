@@ -115,6 +115,39 @@ def test_antigravity_messages_image_transport_sends_edit_references(monkeypatch)
     }
 
 
+def test_antigravity_messages_image_transport_rejects_mask(monkeypatch):
+    monkeypatch.setattr(settings, "mock_mode", False)
+    calls = []
+    monkeypatch.setattr(
+        gateway,
+        "_post",
+        lambda *args, **kwargs: calls.append((args, kwargs)),
+    )
+    cfg = RuntimeGatewayConfig(
+        use="image",
+        provider="antigravity",
+        base_url="https://gateway.example.com/antigravity",
+        api_key="secret",
+        gateway_format="anthropic",
+    )
+
+    with pytest.raises(gateway.GatewayError, match="不支持蒙版编辑"):
+        gateway.gen_image(
+            "edit the source image",
+            "gemini-3.1-flash-image",
+            n=1,
+            reference_image_url="data:image/png;base64,eA==",
+            edit_path="/messages",
+            extra_payload={
+                "image_transport": "anthropic_messages",
+                "mask": "data:image/png;base64,bWFzaw==",
+            },
+            gateway_config=cfg,
+        )
+
+    assert calls == []
+
+
 def test_grok_image_transport_maps_canvas_to_native_fields(monkeypatch):
     monkeypatch.setattr(settings, "mock_mode", False)
     seen = {}
@@ -193,7 +226,6 @@ def test_grok_image_transport_maps_native_edit_payload(
         extra_payload={
             "image_transport": "grok_images",
             "edit_payload_format": "json",
-            "mask": "data:image/png;base64,bWFzaw==",
         },
         gateway_config=cfg,
     )
@@ -201,7 +233,6 @@ def test_grok_image_transport_maps_native_edit_payload(
     assert images == [b"edited"]
     assert seen["path"] == "/images/edits"
     assert source_field in seen["payload"]
-    assert "mask" not in seen["payload"]
     assert "edit_payload_format" not in seen["payload"]
     sources = (
         [seen["payload"][source_field]]
@@ -209,6 +240,39 @@ def test_grok_image_transport_maps_native_edit_payload(
         else seen["payload"][source_field]
     )
     assert [source["url"] for source in sources] == refs
+
+
+def test_grok_image_transport_rejects_mask(monkeypatch):
+    monkeypatch.setattr(settings, "mock_mode", False)
+    calls = []
+    monkeypatch.setattr(
+        gateway,
+        "_post_single_image_repeated",
+        lambda *args, **kwargs: calls.append((args, kwargs)),
+    )
+    cfg = RuntimeGatewayConfig(
+        use="image",
+        provider="grok",
+        base_url="https://gateway.example.com/v1",
+        api_key="secret",
+        gateway_format="openai",
+    )
+
+    with pytest.raises(gateway.GatewayError, match="Grok .*不支持蒙版编辑"):
+        gateway.gen_image(
+            "edit the source image",
+            "grok-imagine-image",
+            n=1,
+            reference_image_url="data:image/png;base64,eA==",
+            edit_path="/images/edits",
+            extra_payload={
+                "image_transport": "grok_images",
+                "mask": "data:image/png;base64,bWFzaw==",
+            },
+            gateway_config=cfg,
+        )
+
+    assert calls == []
 
 
 def test_discovery_marks_only_explicit_media_models_as_importable():
@@ -224,15 +288,17 @@ def test_discovery_marks_only_explicit_media_models_as_importable():
         gateway_format="openai",
     )
 
-    assert models[0]["recommended_uses"] == ["image"]
-    assert models[0]["default_extra"]["image_transport"] == "grok_images"
-    assert models[0]["default_extra"]["capabilities"]["image_to_image"] is False
+    assert models[0]["recommended_uses"] == []
+    assert models[0]["default_extra"] is None
     assert models[1]["recommended_uses"] == ["video"]
     assert models[1]["default_extra"]["capabilities"]["image_to_video"] is True
-    assert models[2]["recommended_uses"] == ["video"]
-    assert models[2]["default_extra"]["capabilities"]["image_to_video"] is False
+    assert models[2]["recommended_uses"] == []
+    assert models[2]["default_extra"] is None
     assert models[3]["recommended_uses"] == []
     assert models[4]["recommended_uses"] == ["prompt"]
+    assert models[4]["default_extra"] == {
+        "capabilities": {"prompt_optimization": True}
+    }
 
 
 def test_discovery_marks_verified_grok_and_gemini_image_edit_models():
@@ -249,10 +315,62 @@ def test_discovery_marks_verified_grok_and_gemini_image_edit_models():
 
     assert grok["default_extra"]["edit_path"] == "/images/edits"
     assert grok["default_extra"]["capabilities"]["image_to_image"] is True
-    assert grok["default_extra"]["capabilities"]["max_reference_images"] == 3
+    assert grok["default_extra"]["capabilities"]["max_reference_images"] == 2
+    assert grok["default_extra"]["capabilities"]["mask_edit"] is False
     assert gemini["default_extra"]["edit_path"] == "/messages"
     assert gemini["default_extra"]["capabilities"]["image_to_image"] is True
     assert gemini["default_extra"]["capabilities"]["max_reference_images"] == 2
+    assert gemini["default_extra"]["capabilities"]["mask_edit"] is False
+    assert "image_edit" not in grok["default_extra"]["capabilities"]
+    assert "image_edit" not in gemini["default_extra"]["capabilities"]
+
+
+def test_discovery_marks_gpt_image_2_with_verified_openai_edit_adapter():
+    image = annotate_discovered_models(
+        [{"id": "gpt-image-2"}],
+        provider="yinyue",
+        gateway_format="openai",
+    )[0]
+
+    assert image["recommended_uses"] == ["image"]
+    assert image["default_extra"]["edit_path"] == "/v1/images/edits"
+    assert image["default_extra"]["multi_image_edit_enabled"] is True
+    assert image["default_extra"]["capabilities"] == {
+        "text_to_image": True,
+        "image_to_image": True,
+        "reference_image": True,
+        "multi_reference": True,
+        "max_reference_images": 2,
+        "mask_edit": True,
+    }
+
+
+def test_discovery_routes_verified_visual_models_to_vision_imports():
+    gpt = annotate_discovered_models(
+        [{"id": "gpt-5.6-sol"}],
+        provider="yinyue",
+        gateway_format="openai",
+    )[0]
+    gemini = annotate_discovered_models(
+        [{"id": "gemini-3.1-pro-high"}],
+        provider="antigravity",
+        gateway_format="anthropic",
+    )[0]
+
+    assert gpt["recommended_uses"] == ["vision"]
+    assert gpt["default_extra_by_use"]["vision"]["capabilities"] == {
+        "image_analysis": True,
+        "video_analysis": True,
+        "product_profile": True,
+        "portrait_profile": True,
+    }
+    assert gemini["recommended_uses"] == ["vision", "prompt"]
+    assert gemini["default_extra_by_use"]["vision"]["capabilities"][
+        "video_analysis"
+    ] is True
+    assert gemini["default_extra_by_use"]["prompt"]["capabilities"] == {
+        "prompt_optimization": True
+    }
 
 
 def test_discovery_marks_seedance_15_as_first_last_frame_only():
@@ -287,9 +405,22 @@ def test_discovery_splits_grok_reference_video_from_15_image_to_video():
     assert grok_reference["default_extra"]["capabilities"] == {
         "text_to_video": True,
         "image_to_video": True,
-        "multi_reference": True,
         "reference_image": True,
-        "max_reference_images": 3,
+        "multi_reference": True,
+        "max_reference_images": 7,
+        "max_reference_duration_seconds": 10,
+        "durations": list(range(1, 16)),
+        "min_duration_seconds": 1,
+        "max_duration_seconds": 15,
+        "reference_image_mode_exclusive": True,
+        "first_last_frame": False,
+        "video_to_video": True,
+        "video_reference": False,
+        "video_edit": True,
+        "audio_reference": False,
+        "resolutions": ["480p", "720p"],
+        "max_reference_videos": 1,
+        "max_reference_audio": 0,
     }
 
     assert grok_15["recommended_uses"] == ["video"]
@@ -297,22 +428,48 @@ def test_discovery_splits_grok_reference_video_from_15_image_to_video():
     assert grok_15["default_extra"]["first_frame_item_field"] == "url"
     assert "product_images_field" not in grok_15["default_extra"]
     assert grok_15["default_extra"]["capabilities"] == {
-        "text_to_video": True,
+        "text_to_video": False,
         "image_to_video": True,
-        "multi_reference": False,
         "reference_image": False,
+        "multi_reference": False,
+        "first_last_frame": False,
+        "video_to_video": False,
+        "video_reference": False,
+        "video_edit": False,
+        "audio_reference": False,
+        "durations": list(range(1, 16)),
+        "min_duration_seconds": 1,
+        "max_duration_seconds": 15,
+        "resolutions": ["480p", "720p", "1080p"],
+        "max_reference_videos": 0,
+        "max_reference_audio": 0,
     }
 
 
 @pytest.mark.parametrize(
     "model_id",
+    ["grok-imagine-video", "grok-imagine-video-1.5"],
+)
+def test_discovery_does_not_enable_grok_video_for_non_openai_gateway(model_id):
+    model = annotate_discovered_models(
+        [{"id": model_id}],
+        provider="grok",
+        gateway_format="anthropic",
+    )[0]
+
+    assert model["recommended_uses"] == []
+    assert model["default_extra"] is None
+
+
+@pytest.mark.parametrize(
+    "model_id",
     [
+        "doubao-seedance-2-0-pro-260128",
+        "doubao-seedance-2-0-fast-260615",
         "doubao-seedance-2-0-mini-260615",
-        "doubao-seedance-2-1-pro-270101",
-        "doubao-seedance-3-0-pro-280101",
     ],
 )
-def test_discovery_marks_ark_seedance_20_plus_as_ten_image_video_model(model_id):
+def test_discovery_marks_verified_ark_seedance_20_capabilities(model_id):
     seedance = annotate_discovered_models(
         [{"id": model_id}],
         provider="volcengine_ark",
@@ -323,19 +480,115 @@ def test_discovery_marks_ark_seedance_20_plus_as_ten_image_video_model(model_id)
     capabilities = seedance["default_extra"]["capabilities"]
     assert capabilities["text_to_video"] is True
     assert capabilities["image_to_video"] is True
+    assert capabilities["reference_image"] is True
+    assert capabilities["first_last_frame"] is True
     assert capabilities["multi_reference"] is True
-    assert capabilities["max_reference_images"] == 10
+    assert capabilities["max_reference_images"] == 9
+    assert capabilities["video_to_video"] is True
+    assert capabilities["video_reference"] is True
+    assert capabilities["video_edit"] is False
+    assert capabilities["audio_reference"] is False
+    assert capabilities["max_reference_videos"] == 1
+    assert capabilities["max_reference_audio"] == 0
 
 
-def test_discovery_does_not_enable_seedance_multi_reference_for_unverified_provider():
+@pytest.mark.parametrize(
+    "model_id",
+    [
+        "doubao-seedance-2-1-pro-270101",
+        "doubao-seedance-3-0-pro-280101",
+    ],
+)
+def test_discovery_does_not_inherit_seedance_20_capabilities_for_future_versions(model_id):
+    seedance = annotate_discovered_models(
+        [{"id": model_id}],
+        provider="volcengine_ark",
+        gateway_format="ark",
+    )[0]
+
+    assert seedance["recommended_uses"] == []
+    assert seedance["capability_label"] == "视频模型（需手动配置）"
+    assert seedance["default_extra"] is None
+
+
+@pytest.mark.parametrize(
+    ("provider", "gateway_format"),
+    [
+        ("custom_openai", "openai"),
+        ("custom_openai", "ark"),
+        ("volcengine_ark", "openai"),
+    ],
+)
+def test_discovery_does_not_enable_seedance_for_mismatched_provider_route(
+    provider,
+    gateway_format,
+):
     seedance = annotate_discovered_models(
         [{"id": "doubao-seedance-2-0-mini-260615"}],
-        provider="custom_openai",
+        provider=provider,
+        gateway_format=gateway_format,
+    )[0]
+
+    assert seedance["recommended_uses"] == []
+    assert seedance["default_extra"] is None
+
+
+@pytest.mark.parametrize(
+    "model_id",
+    [
+        "text-embedding-3-large",
+        "whisper-1",
+        "omni-moderation-latest",
+        "bge-reranker-v2-m3",
+        "tts-1",
+    ],
+)
+def test_discovery_does_not_recommend_non_chat_models_for_prompt_optimization(
+    model_id,
+):
+    model = annotate_discovered_models(
+        [{"id": model_id}],
+        provider="openai",
         gateway_format="openai",
     )[0]
 
-    assert seedance["recommended_uses"] == ["prompt"]
-    assert seedance["default_extra"] is None
+    assert model["recommended_uses"] == []
+    assert model["default_extra"] is None
+    assert model["capability_label"] == "未识别模型（需手动配置）"
+
+
+@pytest.mark.parametrize(
+    ("provider", "gateway_format", "model_id"),
+    [
+        ("openai", "openai", "gpt-5.2"),
+        ("openrouter", "openai", "anthropic/claude-sonnet-4"),
+        ("siliconflow", "openai", "deepseek-ai/DeepSeek-V3"),
+        ("deepseek", "openai", "deepseek-chat"),
+        ("moonshot", "openai", "moonshot-v1-128k"),
+        ("zhipu", "openai", "glm-4.5"),
+        ("dashscope", "openai", "qwen-max"),
+        ("baidu_qianfan", "openai", "ernie-4.5-turbo"),
+        ("tencent_hunyuan", "openai", "hunyuan-turbos-latest"),
+        ("anthropic", "anthropic", "claude-sonnet-4-5"),
+        ("gemini", "openai", "gemini-2.5-pro"),
+        ("custom_openai", "openai", "llama-3.3-70b-instruct"),
+    ],
+)
+def test_discovery_recommends_supported_chat_model_families_for_prompt_use(
+    provider,
+    gateway_format,
+    model_id,
+):
+    model = annotate_discovered_models(
+        [{"id": model_id}],
+        provider=provider,
+        gateway_format=gateway_format,
+    )[0]
+
+    assert model["recommended_uses"] == ["prompt"]
+    assert model["default_extra"] == {
+        "capabilities": {"prompt_optimization": True}
+    }
 
 
 def test_mock_video_is_a_playable_mp4(tmp_path):
@@ -1741,6 +1994,73 @@ def test_image_edit_repeats_without_n(monkeypatch):
     assert all(timeout == settings.image_gateway_timeout_seconds
                for _method, _url, _data, _files, timeout, _retries, _headers in calls)
     assert all(retries == 0 for _method, _url, _data, _files, _timeout, retries, _headers in calls)
+
+
+@pytest.mark.parametrize(
+    ("reference_image_url", "edit_path", "extra_payload", "error"),
+    [
+        (
+            "data:image/png;base64,aW1hZ2U=",
+            None,
+            {},
+            "未配置参考图编辑端点",
+        ),
+        (
+            None,
+            "/v1/images/edits",
+            {"mask": "data:image/png;base64,bWFzaw=="},
+            "蒙版编辑必须提供参考图",
+        ),
+        (
+            "https://example.com/source.png",
+            "/custom/images/edits",
+            {
+                "edit_payload_format": "json",
+                "mask": "data:image/png;base64,bWFzaw==",
+            },
+            "蒙版编辑仅支持 multipart",
+        ),
+    ],
+)
+def test_image_edit_invalid_input_fails_before_http(
+    monkeypatch,
+    reference_image_url,
+    edit_path,
+    extra_payload,
+    error,
+):
+    monkeypatch.setattr(settings, "mock_mode", False)
+    calls = []
+    monkeypatch.setattr(
+        gateway,
+        "_post_single_image_repeated",
+        lambda *args, **kwargs: calls.append((args, kwargs)),
+    )
+    monkeypatch.setattr(
+        gateway,
+        "_post_single_image_multipart_repeated",
+        lambda *args, **kwargs: calls.append((args, kwargs)),
+    )
+    cfg = RuntimeGatewayConfig(
+        use="image",
+        provider="openai",
+        base_url="https://gateway.example.com/v1",
+        api_key="secret",
+        gateway_format="openai",
+    )
+
+    with pytest.raises(gateway.GatewayError, match=error):
+        gateway.gen_image(
+            "edit the source image",
+            "gpt-image-2",
+            n=1,
+            reference_image_url=reference_image_url,
+            edit_path=edit_path,
+            extra_payload=extra_payload,
+            gateway_config=cfg,
+        )
+
+    assert calls == []
 
 
 def test_image_edit_can_use_json_payload_format(monkeypatch):

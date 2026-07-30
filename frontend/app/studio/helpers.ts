@@ -278,20 +278,28 @@ const VIDEO_EVIDENCE_SHOT_FIELDS = [
   "visual", "subject_tracking", "pose", "action", "camera", "lighting", "transition", "ocr", "audio_cue",
 ];
 const VIDEO_DRAFT_SHOT_LABELS = {
-  visual: "画面",
-  subject_tracking: "主体追踪",
-  pose: "姿态",
-  action: "动作",
+  visual: "初始画面",
+  subject_tracking: "主体轨迹",
+  pose: "姿态变化",
+  action: "动作与可见终态",
   camera: "运镜",
-  lighting: "光线",
+  lighting: "光线/材质反馈",
   transition: "转场",
-  ocr: "画面文字",
-  audio_cue: "声音",
 };
+const VIDEO_DRAFT_PLANNING_FIELDS = new Set(["广告目标", "氛围情绪"]);
+const VIDEO_DRAFT_POST_FIELDS = ["字幕卖点", "旁白", "音效"];
+const VIDEO_DRAFT_PACKAGE_TEXT_LABELS = new Set(["包装原字", "产品原字", "包装文字", "产品文字"]);
+const VIDEO_DRAFT_SUBTITLE_LABELS = new Set(["后期字幕", "画面字幕", "卖点字幕"]);
+const VIDEO_DRAFT_OCR_MARKER_RE = /(包装原字|产品原字|包装文字|产品文字|后期字幕|画面字幕|卖点字幕)\s*[:：]\s*/gi;
+const VIDEO_DRAFT_OVERLAY_CUE_RE = /字幕|后期叠加|文字(?:浮现|淡入|出现|显示)|浮现文字/i;
+const VIDEO_DRAFT_SPEECH_CUE_RE = /对白|旁白|台词|独白|解说|画外音|说话|人声转写/i;
+const VIDEO_DRAFT_SPEECH_ROLE_RE = /对白|旁白|台词|独白|解说|画外音|说话|人声转写|女声|男声/gi;
+const VIDEO_DRAFT_MUSIC_CUE_RE = /(?:全程|持续|舒缓|轻柔|轻快|紧凑|平稳|低沉|明快|\s)*(?:背景音乐|背景乐|音乐铺底|BGM)/i;
+const VIDEO_GENERATION_WATERMARK_RE = /(?:豆包|即梦|可灵)?\s*AI\s*生成/gi;
 
 const VIDEO_GENERATION_OUTPUT_SPEC_RE = /(?:输出规格|视频规格|生成规格|源视频规格)\s*[:：]\s*[^\n；;。]*/gi;
 const VIDEO_GENERATION_RESOLUTION_RE = /(^|\D)\d{3,4}\s*[x×]\s*\d{3,4}(?!\d)/gi;
-const VIDEO_GENERATION_RATIO_RE = /(^|\D)\d{1,2}\s*:\s*\d{1,2}(?!\d)\s*(?:画幅|比例|竖版|横版)?/gi;
+const VIDEO_GENERATION_RATIO_RE = /(?:(?:视频|画面|输出|生成|成片)\s*(?:画幅|比例|宽高比)|(?:竖版|横版)\s*(?:画幅|比例)?)\s*(?:为|是|[:：])?\s*\d{1,2}\s*:\s*\d{1,2}|\d{1,2}\s*:\s*\d{1,2}\s*(?:画幅|竖版|横版|视频比例|画面比例|输出比例|生成比例)/gi;
 const VIDEO_GENERATION_TIMESTAMP_LIST_RE = /(?:在|于)\s*(?:约\s*)?\d+(?:\.\d+)?\s*(?:秒|s)(?:\s*[、,，]\s*\d+(?:\.\d+)?\s*(?:秒|s))*\s*(?:等)?\s*/gi;
 const VIDEO_GENERATION_TIME_RANGE_RE = /(^|\D)\d+(?:\.\d+)?\s*(?:-|–|—|~|至|到)\s*\d+(?:\.\d+)?\s*(?:秒|s)(?![A-Za-z])/gi;
 const VIDEO_GENERATION_RUNTIME_RE = /(?:总时长|视频时长|成片时长|全片时长|片长|建议生成)\s*(?:为|约|建议)?\s*\d+(?:\.\d+)?\s*(?:秒钟?|seconds?|secs?|s)(?![A-Za-z])|\d+(?:\.\d+)?\s*秒钟?\s*(?=(?:视频|广告|短片|成片))/gi;
@@ -315,7 +323,7 @@ export function normalizeLegacyVideoGenerationPrompt(value) {
   text = stripNonExecutableAudioSignals(text)
     .replace(VIDEO_GENERATION_OUTPUT_SPEC_RE, "")
     .replace(VIDEO_GENERATION_RESOLUTION_RE, "$1")
-    .replace(VIDEO_GENERATION_RATIO_RE, "$1")
+    .replace(VIDEO_GENERATION_RATIO_RE, "")
     .replace(VIDEO_GENERATION_TIME_RANGE_RE, "$1")
     .replace(VIDEO_GENERATION_RUNTIME_RE, "")
     .replace(VIDEO_GENERATION_RELATIVE_SECONDS_RE, (token) => {
@@ -324,6 +332,7 @@ export function normalizeLegacyVideoGenerationPrompt(value) {
       return "";
     });
   return text
+    .replace(/\[\s*\]|【\s*】|\(\s*\)|（\s*）/g, "")
     .replace(/([,，;；、])(?:\s*[,，;；、])+/g, "$1")
     .replace(/[ \t]+\n/g, "\n")
     .replace(/\n{3,}/g, "\n\n")
@@ -335,7 +344,7 @@ function cleanVideoGenerationValue(value) {
   let text = cleanVisualStructuredValue(value);
   text = text.replace(VIDEO_GENERATION_OUTPUT_SPEC_RE, "");
   text = text.replace(VIDEO_GENERATION_RESOLUTION_RE, "$1");
-  text = text.replace(VIDEO_GENERATION_RATIO_RE, "$1");
+  text = text.replace(VIDEO_GENERATION_RATIO_RE, "");
   text = text.replace(VIDEO_GENERATION_TIMESTAMP_LIST_RE, "");
   text = text.replace(VIDEO_GENERATION_TIME_RANGE_RE, "$1");
   text = text.replace(VIDEO_GENERATION_RUNTIME_RE, "");
@@ -345,6 +354,7 @@ function cleanVideoGenerationValue(value) {
     return "";
   });
   return text
+    .replace(/\[\s*\]|【\s*】|\(\s*\)|（\s*）/g, "")
     .replace(/([,，;；、])(?:\s*[,，;；、])+/g, "$1")
     .replace(/\s+/g, " ")
     .replace(/^[\s,，;；。、]+|[\s,，;；。、]+$/g, "");
@@ -364,6 +374,140 @@ function stripNonExecutableAudioSignals(value) {
 function cleanVideoGenerationAudioValue(value) {
   return stripNonExecutableAudioSignals(cleanVideoGenerationValue(value));
 }
+
+function generationTextIdentity(value) {
+  return String(value || "").replace(/[^\p{L}\p{N}]+/gu, "").toLowerCase();
+}
+
+function withoutGenerationWatermark(value) {
+  const cleaned = String(value || "")
+    .replace(VIDEO_GENERATION_WATERMARK_RE, "")
+    .replace(/^[\s··,，:：;；._-]+|[\s··,，:：;；._-]+$/g, "")
+    .trim();
+  return /^(?:生成|ai生成)$/i.test(cleaned) ? "" : cleaned;
+}
+
+function videoDraftOcrSegments(value) {
+  const text = String(value || "");
+  const matches = [...text.matchAll(VIDEO_DRAFT_OCR_MARKER_RE)];
+  if (!matches.length) {
+    return text
+      .split(/[\n；;]+/g)
+      .map((clause) => ["", clause.replace(/^[\s,，;；。、]+|[\s,，;；。、]+$/g, "")])
+      .filter(([, clause]) => Boolean(clause));
+  }
+
+  const segments = text
+    .slice(0, matches[0].index)
+    .split(/[\n；;]+/g)
+    .map((clause) => ["", clause.replace(/^[\s,，;；。、]+|[\s,，;；。、]+$/g, "")])
+    .filter(([, clause]) => Boolean(clause));
+  for (let index = 0; index < matches.length; index += 1) {
+    const match = matches[index];
+    const end = index + 1 < matches.length ? matches[index + 1].index : text.length;
+    const content = text
+      .slice((match.index || 0) + match[0].length, end)
+      .replace(/^[\s,，;；。、]+|[\s,，;；。、]+$/g, "");
+    if (content) segments.push([match[1], content]);
+  }
+  return segments;
+}
+
+function videoDraftOcrDetails(shot) {
+  let text = cleanVideoGenerationValue(shot?.ocr);
+  if (!withoutGenerationWatermark(text)) {
+    text = cleanVideoGenerationValue(shot?.vlm_text_description);
+  }
+  const details = [];
+  for (const [marker, rawClause] of videoDraftOcrSegments(text)) {
+    const clause = rawClause.replace(/^[\s,，;；。、]+|[\s,，;；。、]+$/g, "");
+    if (!clause) continue;
+    let label;
+    let cleaned;
+    if (VIDEO_DRAFT_PACKAGE_TEXT_LABELS.has(marker)) {
+      label = "包装原字";
+      cleaned = clause;
+    } else if (VIDEO_DRAFT_SUBTITLE_LABELS.has(marker)) {
+      label = "后期字幕（后期叠加）";
+      cleaned = clause;
+    } else {
+      cleaned = clause;
+      const isSubtitle = VIDEO_DRAFT_OVERLAY_CUE_RE.test(cleaned);
+      label = isSubtitle ? "后期字幕（后期叠加）" : "可见原字";
+    }
+    cleaned = withoutGenerationWatermark(cleaned);
+    const detail = cleaned ? `${label}：${cleaned}` : "";
+    if (detail && !details.includes(detail)) details.push(detail);
+  }
+  return details;
+}
+
+function withoutGlobalAudioCues(value, globalAudio) {
+  const globalHasMusic = VIDEO_DRAFT_MUSIC_CUE_RE.test(String(globalAudio || ""));
+  const clauses = [];
+  for (const rawClause of cleanVideoGenerationAudioValue(value).split(/[\n；;]+/g)) {
+    const fragments = rawClause
+      .split(/[,，、]+/g)
+      .map((rawFragment) => {
+        let fragment = rawFragment.replace(/^[\s,，;；。、]+|[\s,，;；。、]+$/g, "");
+        if (globalHasMusic) {
+          fragment = fragment.replace(new RegExp(VIDEO_DRAFT_MUSIC_CUE_RE.source, "gi"), "");
+          fragment = fragment.replace(/(?:伴随|配合|叠加|和|与)\s*$/g, "");
+        }
+        return fragment.replace(/^[\s,，;；。、]+|[\s,，;；。、]+$/g, "");
+      })
+      .filter(Boolean);
+    const clause = [...new Set(fragments)].join("，");
+    if (!clause) continue;
+    if (!clauses.includes(clause)) clauses.push(clause);
+  }
+  return clauses.join("；");
+}
+
+function generationSpokenIdentity(value) {
+  return generationTextIdentity(
+    cleanVideoGenerationAudioValue(value).replace(VIDEO_DRAFT_SPEECH_ROLE_RE, ""),
+  );
+}
+
+function shotSpokenCues(value) {
+  return cleanVideoGenerationAudioValue(value)
+    .split(/[\n；;]+/g)
+    .map((clause) => clause.replace(/^[\s,，;；。、]+|[\s,，;；。、]+$/g, ""))
+    .filter((clause) => clause && VIDEO_DRAFT_SPEECH_CUE_RE.test(clause));
+}
+
+function withoutCoveredSpokenCues(value, shotSpeechCues) {
+  const shotIdentities = shotSpeechCues.map(generationSpokenIdentity).filter(Boolean);
+  const clauses = [];
+  for (const rawClause of cleanVideoGenerationValue(value).split(/[\n；;]+/g)) {
+    const clause = rawClause.replace(/^[\s,，;；。、]+|[\s,，;；。、]+$/g, "");
+    const identity = generationSpokenIdentity(clause);
+    if (
+      !clause
+      || (
+        identity
+        && shotIdentities.some((shotIdentity) => (
+          shotIdentity.includes(identity) || identity.includes(shotIdentity)
+        ))
+      )
+    ) continue;
+    if (!clauses.includes(clause)) clauses.push(clause);
+  }
+  return clauses.join("；");
+}
+
+function subtitleSummaryIsCovered(summary, shotSubtitles) {
+  const summaryParts = String(summary || "")
+    .split(/[\n；;,，、]+/g)
+    .map(generationTextIdentity)
+    .filter(Boolean);
+  const shotParts = shotSubtitles.map(generationTextIdentity).filter(Boolean);
+  return Boolean(summaryParts.length) && summaryParts.every(
+    (part) => shotParts.some((shotPart) => shotPart.includes(part) || part.includes(shotPart)),
+  );
+}
+
 const VIDEO_DRAFT_FIELD_LABELS = {
   主体: "主体",
   人像意图: "人物",
@@ -376,18 +520,40 @@ const VIDEO_DRAFT_FIELD_LABELS = {
   商品服装: "产品/服装",
   细节特征: "关键细节",
   场景背景: "场景",
-  广告目标: "叙事目标",
   风格: "风格",
   视角构图: "构图",
   光线: "光线",
   色调配色: "配色",
   材质纹理: "材质",
-  氛围情绪: "氛围",
   一致性约束: "连续性约束",
-  字幕卖点: "画面字幕",
+  字幕卖点: "后期字幕（后期叠加）",
   旁白: "旁白/对白",
-  音效: "声音",
+  音效: "声音基线",
 };
+
+function orderedVideoDraftFields(structured) {
+  const base = visualStructuredFieldOrder("video");
+  const kind = String(structured?.["图像类型"] || "");
+  const identity = [];
+  if (kind.includes("产品")) identity.push("商品服装");
+  if (kind.includes("人物")) {
+    identity.push("妆发五官", "服装结构", "人物比例", "身材体态");
+  }
+  return [...new Set([
+    "主体",
+    ...identity,
+    "场景背景",
+    "视角构图",
+    "光线",
+    "色调配色",
+    "一致性约束",
+    "风格",
+    "材质纹理",
+    "氛围情绪",
+    "细节特征",
+    ...base,
+  ])];
+}
 
 function composeCanonicalVideoDraft(
   initialParts,
@@ -396,21 +562,11 @@ function composeCanonicalVideoDraft(
   { excludeReferenceIdentity = false, includePostProduction = true } = {},
 ) {
   const parts = [...initialParts].filter(Boolean);
-  const source = videoAnalysis?.source && typeof videoAnalysis.source === "object"
-    ? videoAnalysis.source
-    : {};
   const shots = Array.isArray(videoAnalysis?.shots) ? videoAnalysis.shots : [];
-  const sourceDuration = Math.max(
-    Number(source.duration_seconds) || 0,
-    ...shots.map((shot) => Number(shot?.end_seconds) || 0),
-  );
-  if (shots.length > 3) {
-    parts.push(
-      `复刻执行：参考片含 ${shots.length} 个高密度剪辑镜头；建议逐镜独立生成，单镜含多步动作或内部硬切时再按一段一个主动作/可见结果拆分，最后按原镜头顺序剪辑。`,
-    );
-  } else if (sourceDuration > MAX_VIDEO_DURATION_SECONDS) {
-    parts.push("复刻执行：参考片时间线较长，建议逐镜分别生成后按顺序合成，不压缩、不省略原镜头。");
-  }
+  const subtitleSummary = cleanVideoGenerationValue(structured?.["字幕卖点"]);
+  const globalAudio = cleanVideoGenerationAudioValue(structured?.["音效"]);
+  const shotPostSubtitles = [];
+  const shotSpeechCues = [];
   const frameTimes = new Map(
     (Array.isArray(videoAnalysis?.sampled_frames) ? videoAnalysis.sampled_frames : [])
       .map((frame) => [Number(frame?.index), Number(frame?.timestamp_seconds)])
@@ -431,18 +587,47 @@ function composeCanonicalVideoDraft(
         : ["visual", "lighting", "ocr", "audio_cue"]
     ).filter((key) => includePostProduction || !["ocr", "audio_cue"].includes(key));
     const details = allowedFields
+      .filter((key) => !["ocr", "audio_cue"].includes(key))
       .map((key) => {
-        const value = key === "audio_cue"
-          ? cleanVideoGenerationAudioValue(shot[key])
-          : cleanVideoGenerationValue(shot[key]);
+        const value = cleanVideoGenerationValue(shot[key]);
         if (!value || (excludeReferenceIdentity && hasReferenceIdentityLeak(value, structured))) return "";
         return `${VIDEO_DRAFT_SHOT_LABELS[key]}：${value}`;
       })
       .filter(Boolean);
+    if (includePostProduction && allowedFields.includes("ocr")) {
+      const ocrDetails = videoDraftOcrDetails(shot);
+      for (const detail of ocrDetails) {
+        if (!detail.startsWith("后期字幕")) continue;
+        const value = detail.split(/[:：]/, 2)[1]?.trim();
+        if (value && !shotPostSubtitles.includes(value)) shotPostSubtitles.push(value);
+      }
+      details.push(...ocrDetails);
+    }
+    if (includePostProduction && allowedFields.includes("audio_cue")) {
+      for (const cue of shotSpokenCues(shot.audio_cue)) {
+        if (!shotSpeechCues.includes(cue)) shotSpeechCues.push(cue);
+      }
+      const audioCue = withoutGlobalAudioCues(shot.audio_cue, globalAudio);
+      if (audioCue) details.push(`同步声音：${audioCue}`);
+    }
     if (!details.length) continue;
     const segmentIndex = Number(shot.source_segment_index);
     const segment = Number.isInteger(segmentIndex) && segmentIndex > 0 ? `片段${segmentIndex} ` : "";
     parts.push(`${segment}镜头${index + 1}：${[...new Set(details)].join("；")}`);
+  }
+  if (includePostProduction) {
+    for (const key of VIDEO_DRAFT_POST_FIELDS) {
+      const value = key === "音效"
+        ? globalAudio
+        : key === "旁白"
+          ? withoutCoveredSpokenCues(structured?.[key], shotSpeechCues)
+          : cleanVideoGenerationValue(structured?.[key]);
+      if (
+        !value
+        || (key === "字幕卖点" && subtitleSummaryIsCovered(value, shotPostSubtitles))
+      ) continue;
+      parts.push(`${VIDEO_DRAFT_FIELD_LABELS[key]}：${value}`);
+    }
   }
   return [...new Set(parts)].join("\n").trim();
 }
@@ -453,26 +638,26 @@ export function composeEvidenceBackedVideoGenerationDraft(
   providerFinalText = "",
 ) {
   const visual = visualStructuredFields(structured, "video");
-  const parts = visualStructuredFieldOrder("video")
+  const parts = orderedVideoDraftFields(structured)
     .map((key) => {
+      if (VIDEO_DRAFT_PLANNING_FIELDS.has(key)) return "";
       const value = cleanVideoGenerationValue(visual[key]);
       return value ? `${VIDEO_DRAFT_FIELD_LABELS[key] || key}：${value}` : "";
     })
     .filter(Boolean);
-  for (const key of ["字幕卖点", "旁白", "音效"]) {
-    const value = key === "音效"
-      ? cleanVideoGenerationAudioValue(structured?.[key])
-      : cleanVideoGenerationValue(structured?.[key]);
-    if (value) parts.push(`${VIDEO_DRAFT_FIELD_LABELS[key]}：${value}`);
-  }
   const draft = composeCanonicalVideoDraft(parts, structured, videoAnalysis);
   if (draft.includes("镜头")) return draft;
   const providerNarrative = cleanVideoGenerationAudioValue(providerFinalText);
   return [...new Set([draft, providerNarrative].filter(Boolean))].join("\n").trim();
 }
 
-export function withEvidenceBackedVideoGenerationDraft(result, target = "video") {
+export function withEvidenceBackedVideoGenerationDraft(
+  result,
+  target = "video",
+  { preserveStored = false } = {},
+) {
   if (target !== "video" || !result || typeof result !== "object") return result;
+  if (preserveStored) return result;
   const structured = result.structured && typeof result.structured === "object"
     ? result.structured
     : {};
@@ -490,12 +675,15 @@ export function withEvidenceBackedVideoGenerationDraft(result, target = "video")
   const storedFinalText = String(result.final_text || "").trim();
   const normalizedStoredFinalText = normalizeLegacyVideoGenerationPrompt(storedFinalText);
   const hasLegacyParameters = LEGACY_VIDEO_GENERATION_PARAMETER_RE.test(storedFinalText);
+  const hasLegacyDraftStructure = /(?:^|\n)复刻执行：|镜头\d+：画面：|主体追踪：|画面字幕：/.test(
+    storedFinalText,
+  );
   const hasRebuiltShots = /(?:^|\n)(?:片段\d+\s*)?镜头\d+：/.test(draft);
   const useDraft = Boolean(
     draft
     && (
       draft.length > normalizedStoredFinalText.length
-      || (hasLegacyParameters && hasRebuiltShots)
+      || ((hasLegacyParameters || hasLegacyDraftStructure) && hasRebuiltShots)
     )
   );
   const finalText = useDraft ? draft : normalizedStoredFinalText;
@@ -783,11 +971,18 @@ export function videoDurationLimit(max = MAX_VIDEO_DURATION_SECONDS) {
   return Math.min(MAX_VIDEO_DURATION_SECONDS, configured);
 }
 
-export function boundedVideoDuration(value, max = MAX_VIDEO_DURATION_SECONDS) {
+export function videoDurationMinimum(min = 1, max = MAX_VIDEO_DURATION_SECONDS) {
   const limit = videoDurationLimit(max);
+  const configured = Math.max(1, Number(min) || 1);
+  return Math.min(limit, configured);
+}
+
+export function boundedVideoDuration(value, max = MAX_VIDEO_DURATION_SECONDS, min = 1) {
+  const limit = videoDurationLimit(max);
+  const minimum = videoDurationMinimum(min, limit);
   const parsed = Number.parseInt(value, 10);
-  if (!Number.isFinite(parsed)) return 5;
-  return Math.max(1, Math.min(limit, parsed));
+  if (!Number.isFinite(parsed)) return Math.max(minimum, Math.min(limit, 5));
+  return Math.max(minimum, Math.min(limit, parsed));
 }
 
 type ReverseVideoWorkspacePatchArgs = {

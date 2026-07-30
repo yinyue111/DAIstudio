@@ -86,7 +86,12 @@ def _restore_retry_model_overrides(client):
         db.commit()
 
 
-def _configure_model(use: str, *, capabilities: dict | None = None) -> int:
+def _configure_model(
+    use: str,
+    *,
+    capabilities: dict | None = None,
+    model_id: str | None = None,
+) -> int:
     with SessionLocal() as db:
         row = (
             db.query(ModelConfig)
@@ -101,6 +106,8 @@ def _configure_model(use: str, *, capabilities: dict | None = None) -> int:
             if capabilities is not None
             else (_IMAGE_CAPABILITIES if use == "image" else _VIDEO_CAPABILITIES)
         )
+        if model_id is not None:
+            row.model_id = model_id
         row.enabled = True
         row.cost_credits = 7
         row.extra = extra
@@ -727,7 +734,10 @@ def test_retry_rechecks_video_reference_actionability_before_any_side_effect(
 ):
     user_id = make_user("13981000404", balance=1000)
     headers = auth("13981000404")
-    model_id = _configure_model("video")
+    model_id = _configure_model(
+        "video",
+        model_id="retry-video-reference-actionability",
+    )
     task_id = _failed_task(
         user_id=user_id,
         model_config_id=model_id,

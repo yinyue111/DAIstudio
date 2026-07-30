@@ -2,6 +2,7 @@ import io
 
 from PIL import Image
 
+from app.config import settings
 from app.db import SessionLocal
 from app.models import GenTask, ModelConfig
 
@@ -12,9 +13,8 @@ def _png_bytes(size=(96, 128), color=(232, 244, 238)) -> bytes:
     return buffer.getvalue()
 
 
-# 与迁移 0078 的目录口径一致：grok-imagine-video-1.5 只做文/图生视频，
-# 参考图直出（product_reference_image 等）属于 R2V 模型 grok-imagine-video。
-_I2V_CAPABILITIES = {
+# 通用文生视频夹具，避免把厂商模型的限制编进提示词管线测试。
+_T2V_CAPABILITIES = {
     "text_to_video": True,
     "image_to_video": True,
     "reference_image": False,
@@ -25,12 +25,19 @@ _R2V_CAPABILITIES = {
     "image_to_video": True,
     "reference_image": True,
     "multi_reference": True,
-    "max_reference_images": 3,
+    "max_reference_images": 7,
+    "video_to_video": True,
 }
 
 
+def _configure_grok_environment_gateway(monkeypatch) -> None:
+    monkeypatch.setattr(settings, "video_gateway_base_url", "https://api.x.ai/v1")
+    monkeypatch.setattr(settings, "video_gateway_api_key", "test-key")
+    monkeypatch.setattr(settings, "video_gateway_format", "openai")
+
+
 def _configure_video_model(
-    model_id: str = "grok-imagine-video-1.5",
+    model_id: str = "test-text-video",
     *,
     prompt_profile: dict | None = None,
     capabilities: dict | None = None,
@@ -38,7 +45,15 @@ def _configure_video_model(
     with SessionLocal() as db:
         model = db.query(ModelConfig).filter(ModelConfig.use == "video").one()
         model.model_id = model_id
-        model.provider = "yinyue"
+        if model_id.startswith("doubao-seedance-"):
+            model.provider = "volcengine_ark"
+            model.gateway_format = "ark"
+        elif model_id.startswith("grok-"):
+            model.provider = "grok"
+            model.gateway_format = "openai"
+        else:
+            model.provider = "yinyue"
+            model.gateway_format = "openai"
         model.enabled = True
         model.cost_credits = 1
         model.extra = {
@@ -49,7 +64,7 @@ def _configure_video_model(
             },
             # 显式覆盖 capabilities：共享测试库里其他用例会改同一行模型，
             # 不覆盖的话本文件的用例会依赖执行顺序。
-            "capabilities": dict(capabilities or _I2V_CAPABILITIES),
+            "capabilities": dict(capabilities or _T2V_CAPABILITIES),
         }
         db.commit()
 
@@ -285,6 +300,7 @@ def test_direct_product_video_submits_visual_copy_and_keeps_post_metadata(
 ):
     make_user("13900003103", balance=1000)
     headers = auth("13900003103")
+    _configure_grok_environment_gateway(monkeypatch)
     _configure_video_model("grok-imagine-video", capabilities=_R2V_CAPABILITIES)
     upload = client.post(
         "/api/uploads/image",

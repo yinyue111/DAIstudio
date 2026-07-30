@@ -10,6 +10,7 @@ import {
 import { resolveModelConfigId } from "../app/studio/StudioModelSelector";
 import {
   applyPromptOptimizationDecision,
+  isPromptOptimizationProposalCurrent,
   isPromptOptimizationResultCurrent,
   promptOptimizationContextKey,
   undoPromptOptimization,
@@ -63,7 +64,7 @@ export default function usePromptOptimization({
   const recordsRef = useRef({});
 
   const setting = settings[creationMode] || DEFAULT_SETTING;
-  const proposal = proposals[creationMode] || null;
+  const storedProposal = proposals[creationMode] || null;
   const optimizing = optimizingPromptMode === creationMode;
   const ready = Boolean(String(prompt || "").trim());
   const context = {
@@ -91,6 +92,9 @@ export default function usePromptOptimization({
     ...context,
     promptText: prompt,
   });
+  const proposal = isPromptOptimizationProposalCurrent(storedProposal, currentContextKey)
+    ? storedProposal
+    : null;
   contextRef.current[creationMode] = currentContextKey;
   const scopeKey = promptOptimizationContextKey(context);
   const record = recordsRef.current[creationMode];
@@ -230,6 +234,7 @@ export default function usePromptOptimization({
             : [],
           warnings: Array.isArray(result.warnings) ? result.warnings : [],
           charged_credits: Number(result.charged_credits || 0),
+          context_key: request.contextKey,
         },
       }));
       setMsg("优化建议已生成，请对比后选择接受或拒绝。");
@@ -253,7 +258,10 @@ export default function usePromptOptimization({
   async function accept(acceptedSegmentIds = []) {
     const mode = creationMode;
     const currentProposal = proposals[mode];
-    if (!currentProposal?.optimized_text) return;
+    if (
+      !currentProposal?.optimized_text
+      || !isPromptOptimizationProposalCurrent(currentProposal, currentContextKey)
+    ) return;
     const allSegmentIds = (currentProposal.segments || []).map((item) => item.id);
     const acceptedIds = acceptedSegmentIds.length ? acceptedSegmentIds : allSegmentIds;
     const rejectedIds = allSegmentIds.filter((id) => !acceptedIds.includes(id));
@@ -335,7 +343,10 @@ export default function usePromptOptimization({
 
   async function reject() {
     const currentProposal = proposals[creationMode];
-    if (!currentProposal?.proposal_id) return;
+    if (
+      !currentProposal?.proposal_id
+      || !isPromptOptimizationProposalCurrent(currentProposal, currentContextKey)
+    ) return;
     try {
       await api.rejectStudioPromptOptimization(currentProposal.proposal_id, {
         proposal_version: currentProposal.proposal_version,
@@ -437,6 +448,14 @@ export default function usePromptOptimization({
         || Number(modelSelectionsRef.current?.[category] || 0) !== Number(nextModelId)
       ) return;
       const selectedTarget = generationModelOptions.find((item) => item.id === Number(nextModelId));
+      const proposalContextKey = promptOptimizationContextKey({
+        ...context,
+        promptText: promptSnapshot,
+        targetModelId: selectedTarget?.model_id || "",
+        targetModelProvider: selectedTarget?.provider || "",
+        targetModelConfigId: nextModelId,
+        optimizationDirection: "target_model_adaptation",
+      });
       setSettings((current) => ({
         ...current,
         [mode]: { ...setting, direction: "target_model_adaptation" },
@@ -458,6 +477,7 @@ export default function usePromptOptimization({
           change_summary: (result.segments || []).filter((item) => item.changed).map((item) => item.label),
           warnings: Array.isArray(result.warnings) ? result.warnings : [],
           charged_credits: 0,
+          context_key: proposalContextKey,
         },
       }));
       setMsg("目标模型已切换，编译预览已生成；反推素材未重新分析。");

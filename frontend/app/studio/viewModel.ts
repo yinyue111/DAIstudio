@@ -1,6 +1,12 @@
 "use client";
 
-import { CREATION_MODES, EDIT_STYLE_KEYS, RATIOS, creationModeLabel } from "./constants";
+import {
+  CREATION_MODES,
+  EDIT_STYLE_KEYS,
+  RATIOS,
+  VIDEO_QUALITIES,
+  creationModeLabel,
+} from "./constants";
 import {
   boundedImageCount,
   boundedVideoDuration,
@@ -9,6 +15,7 @@ import {
   imageSizeFor,
   shouldUseImageReference,
   videoDurationLimit,
+  videoDurationMinimum,
   videoRatioOptions,
 } from "./helpers";
 import { shouldBlockNewGeneration } from "./taskConcurrency";
@@ -107,7 +114,17 @@ export function buildStudioDerivedViewState({
   const maxImageN = Number(cfg?.image_n_max || 8);
   const imageCount = boundedImageCount(n, maxImageN);
   const maxVideoDuration = videoDurationLimit(cfg?.video_duration_max_seconds);
-  const videoDuration = boundedVideoDuration(vDuration, maxVideoDuration);
+  const minVideoDuration = videoDurationMinimum(
+    cfg?.video_duration_min_seconds,
+    maxVideoDuration,
+  );
+  const videoDuration = boundedVideoDuration(vDuration, maxVideoDuration, minVideoDuration);
+  const configuredVideoResolutions = Array.isArray(cfg?.video_resolutions)
+    ? new Set(cfg.video_resolutions.map((value) => String(value || "").toLowerCase()))
+    : null;
+  const videoQualityOptions = configuredVideoResolutions
+    ? VIDEO_QUALITIES.filter((quality) => configuredVideoResolutions.has(quality.key))
+    : VIDEO_QUALITIES;
   const currentImageSize = imageSizeFor(ratioOption, imageQuality, cfg?.image_size_max_dim || 2048);
   const taskParams = task?.params || {};
   const imageReferenceSource = productGenerationMode && productAsset
@@ -194,8 +211,10 @@ export function buildStudioDerivedViewState({
     ratioOption,
     maxImageN,
     imageCount,
+    minVideoDuration,
     maxVideoDuration,
     videoDuration,
+    videoQualityOptions,
     currentImageSize,
     videoFinalCost,
     estCost,

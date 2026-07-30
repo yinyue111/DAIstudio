@@ -27,8 +27,6 @@ _MODEL_REFERENCE_COLUMNS = {
     "gen_tasks": ("model_config_id",),
     "reverse_operations": ("model_config_id",),
     "gateway_calls": ("model_config_id",),
-    "model_capability_versions": ("model_config_id",),
-    "model_price_versions": ("model_config_id",),
     "generation_quotes": ("model_config_id",),
     "prompt_optimization_proposals": (
         "target_model_config_id",
@@ -135,6 +133,22 @@ def downgrade() -> None:
         raise RuntimeError(
             "0071 downgrade blocked: migration-created Gemini vision model "
             f"is referenced by {reference}"
+        )
+    inspector = sa.inspect(bind)
+    tables = set(inspector.get_table_names())
+    for table_name in ("model_capability_versions", "model_price_versions"):
+        if table_name not in tables:
+            continue
+        owned_versions = sa.Table(
+            table_name,
+            metadata,
+            autoload_with=bind,
+            extend_existing=True,
+        )
+        bind.execute(
+            sa.delete(owned_versions).where(
+                owned_versions.c.model_config_id == int(row["id"])
+            )
         )
     bind.execute(
         sa.delete(model_configs).where(model_configs.c.id == int(row["id"]))

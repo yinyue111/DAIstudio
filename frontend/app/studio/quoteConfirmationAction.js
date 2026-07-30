@@ -31,8 +31,13 @@ export function endQuoteConfirmationExecution(action) {
   if (action) action.executing = false;
 }
 
-export function canInvalidateQuoteConfirmation(action) {
-  return Boolean(action && !action.settled && !action.executing);
+export function canInvalidateQuoteConfirmation(action, { preserveKinds = [] } = {}) {
+  return Boolean(
+    action
+    && !action.settled
+    && !action.executing
+    && !preserveKinds.includes(action.envelope?.kind),
+  );
 }
 
 export function settleQuoteConfirmationAction(action, value) {

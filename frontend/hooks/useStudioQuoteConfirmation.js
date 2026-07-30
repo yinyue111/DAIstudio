@@ -74,9 +74,12 @@ export default function useStudioQuoteConfirmation({ balanceCredits = null } = {
     });
   }, [executeAction]);
 
-  const invalidate = useCallback((reason = "输入参数已变化，本次操作已取消，请重新执行。") => {
+  const invalidate = useCallback((
+    reason = "输入参数已变化，本次操作已取消，请重新执行。",
+    options = {},
+  ) => {
     const action = actionRef.current;
-    if (!canInvalidateQuoteConfirmation(action)) return false;
+    if (!canInvalidateQuoteConfirmation(action, options)) return false;
     actionRef.current = null;
     settleQuoteConfirmationAction(action, { status: "invalidated", reason });
     return true;

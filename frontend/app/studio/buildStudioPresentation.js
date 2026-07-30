@@ -2,22 +2,29 @@ import { buildStudioDerivedViewState } from "./viewModel";
 import { generationRequiresPendingUpload } from "./generationUploadPolicy";
 
 function buildSubmitBarProps(foundation, model, task, generation, view) {
-  const missingRequiredSource = foundation.isEditMode && !foundation.productAsset;
+  const missingVideoFirstFrame = Boolean(
+    model.videoRequiresFirstFrame && foundation.selected?.type !== "image",
+  );
+  const missingRequiredSource = Boolean(
+    (foundation.isEditMode && !foundation.productAsset) || missingVideoFirstFrame,
+  );
   const uploadBlocked = generationRequiresPendingUpload({
     uploading: foundation.uploading,
     uploadingRole: foundation.uploadingRole,
     selected: foundation.selected,
   });
-  const missingRequiredSourceLabel = foundation.portraitGenerationMode
-    ? "请先上传人物"
-    : foundation.productGenerationMode
-      ? "请先上传产品"
-      : "请先上传图片";
-  const handleVideoModelSwitchRequired = () => {
-    if (!model.videoModelSwitchMessage) return;
-    foundation.setMsg(model.videoModelSwitchMessage);
-    foundation.notify.error(model.videoModelSwitchMessage, {
-      title: "请切换视频模型",
+  const missingRequiredSourceLabel = missingVideoFirstFrame
+    ? "请先上传视频首帧"
+    : foundation.portraitGenerationMode
+      ? "请先上传人物"
+      : foundation.productGenerationMode
+        ? "请先上传产品"
+        : "请先上传图片";
+  const handleModelSwitchRequired = () => {
+    if (!model.modelSwitchMessage) return;
+    foundation.setMsg(model.modelSwitchMessage);
+    foundation.notify.error(model.modelSwitchMessage, {
+      title: `请切换${foundation.category === "video" ? "视频" : "图片"}模型`,
       duration: 6000,
     });
   };
@@ -32,9 +39,10 @@ function buildSubmitBarProps(foundation, model, task, generation, view) {
     submit: generation.submit,
     missingRequiredSource,
     missingRequiredSourceLabel,
-    videoModelSwitchRequired: model.videoModelSwitchRequired,
-    videoModelSwitchMessage: model.videoModelSwitchMessage,
-    onVideoModelSwitchRequired: handleVideoModelSwitchRequired,
+    videoRequiresFirstFrame: model.videoRequiresFirstFrame,
+    modelSwitchRequired: model.modelSwitchRequired,
+    modelSwitchMessage: model.modelSwitchMessage,
+    onModelSwitchRequired: handleModelSwitchRequired,
     structuredDirty: foundation.structuredDirty,
     submitting: generation.submitting,
     parsing: foundation.parsing,
@@ -136,8 +144,10 @@ function buildCreationController(domains, view, submitBarProps) {
       imageCount: view.imageCount,
       n: foundation.n,
       setN: foundation.setN,
+      minVideoDuration: view.minVideoDuration,
       maxVideoDuration: view.maxVideoDuration,
       videoDuration: view.videoDuration,
+      videoQualityOptions: view.videoQualityOptions,
       vDuration: foundation.vDuration,
       setVDuration: foundation.setVDuration,
       vResolution: foundation.vResolution,
@@ -146,6 +156,7 @@ function buildCreationController(domains, view, submitBarProps) {
       setSeed: foundation.setSeed,
       editMaskMode: foundation.editMaskMode,
       setEditMaskMode: foundation.setEditMaskMode,
+      maskEditSupported: model.maskEditSupported,
       productPixelLockMode: foundation.productPixelLockMode,
       setProductPixelLockMode: foundation.setProductPixelLockMode,
       submitting: generation.submitting,
@@ -187,6 +198,7 @@ function buildReferenceController({ foundation, model, reverse, reference }) {
     subjectProtectionLoading: foundation.subjectProtectionLoading,
     effectiveLastFrameAsset: model.effectiveLastFrameAsset,
     firstLastFrameEnabled: model.firstLastFrameEnabled,
+    videoRequiresFirstFrame: model.videoRequiresFirstFrame,
     productDetailAssets: foundation.productDetailAssets,
     productDetailValidation: model.productDetailValidation,
     productDetailLimit: model.productDetailLimit,

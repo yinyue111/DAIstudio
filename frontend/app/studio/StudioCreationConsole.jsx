@@ -53,9 +53,9 @@ export default function StudioCreationConsole({ controller }) {
     selectedGenerationModelConfigId, generationModelOptions, changeGenerationModelSelection,
     productVideoStrategySelection, effectiveProductVideoTemplate, changeProductVideoTemplate,
     submit, ratioOptions, ratio, setRatio, imageQuality, setImageQuality,
-    currentImageSize, maxImageN, imageCount, n, setN, maxVideoDuration, videoDuration,
-    vDuration, setVDuration, vResolution, setVResolution,
-    seed, setSeed, editMaskMode, setEditMaskMode, productPixelLockMode,
+    currentImageSize, maxImageN, imageCount, n, setN, minVideoDuration, maxVideoDuration, videoDuration,
+    vDuration, setVDuration, vResolution, setVResolution, videoQualityOptions,
+    seed, setSeed, editMaskMode, setEditMaskMode, maskEditSupported, productPixelLockMode,
     setProductPixelLockMode, submitting, selectedGenerationModel, targetModelId,
     compileStoryboardShot, applyStoryboardShot, handleGenerationSubmitted,
     requestQuoteConfirmation, videoCompositionEnabled,
@@ -64,6 +64,7 @@ export default function StudioCreationConsole({ controller }) {
     url, updateReferenceUrl, lastFrameAsset, productAsset, productProfile,
     portraitProfile, parsing, uploading, productProfiling, subjectProtection,
     subjectProtectionLoading, effectiveLastFrameAsset, firstLastFrameEnabled,
+    videoRequiresFirstFrame, providerVideoEditMode,
     productDetailAssets, productDetailValidation, productDetailLimit, appliedUrl,
     profileOperation, reverseSources, imageUploadInputRef, productUploadInputRef,
     productDetailUploadInputRef, lastFrameUploadInputRef, videoUploadInputRef, clearRef,
@@ -193,12 +194,15 @@ export default function StudioCreationConsole({ controller }) {
                 imageCount={imageCount}
                 n={n}
                 onImageCountChange={setN}
+                minVideoDuration={minVideoDuration}
                 maxVideoDuration={maxVideoDuration}
                 videoDuration={videoDuration}
                 vDuration={vDuration}
                 onVideoDurationChange={setVDuration}
                 vResolution={vResolution}
                 onVideoResolutionChange={setVResolution}
+                videoQualityOptions={videoQualityOptions}
+                providerVideoEditMode={providerVideoEditMode}
                 isEditMode={isEditMode}
                 productGenerationMode={productGenerationMode}
                 portraitGenerationMode={portraitGenerationMode}
@@ -208,6 +212,7 @@ export default function StudioCreationConsole({ controller }) {
                 onSeedChange={setSeed}
                 editMaskMode={editMaskMode}
                 onEditMaskModeChange={setEditMaskMode}
+                maskEditSupported={maskEditSupported}
                 productPixelLockMode={productPixelLockMode}
                 onProductPixelLockModeChange={setProductPixelLockMode}
                 subjectProtection={subjectProtection}
@@ -229,6 +234,7 @@ export default function StudioCreationConsole({ controller }) {
             selected={selected}
             lastFrameAsset={effectiveLastFrameAsset}
             firstLastFrameEnabled={firstLastFrameEnabled}
+            videoRequiresFirstFrame={videoRequiresFirstFrame}
             productAsset={productAsset}
             productDetailAssets={productDetailAssets}
             productDetailValidation={productDetailValidation}
@@ -289,7 +295,10 @@ export default function StudioCreationConsole({ controller }) {
                 return;
               }
               setAssetPicker(role === "reverse_source"
-                ? { role, mediaType: category === "video" ? "video" : "image" }
+                ? {
+                    role,
+                    mediaType: category === "video" && !videoRequiresFirstFrame ? "all" : "image",
+                  }
                 : { role });
             }}
             onRemoveProductDetail={(index) => setWorkspacePatch((current) => ({

@@ -17,6 +17,7 @@ from __future__ import annotations
 import hashlib
 from types import SimpleNamespace
 
+from app.config import settings
 from app.db import SessionLocal
 from app.models import GenTask, ModelConfig, ReverseOperation, ReverseResultRevision
 from app.services import reverse_lineage
@@ -35,11 +36,18 @@ VLM_ONLY_ACTION = "手指捏住洗脸巾边缘缓慢展开"
 FINAL_TEXT = "真实家庭浴室，产品展示广告，突出洗脸巾质感。"
 
 
-def _configure_video_model(model_id: str = "grok-imagine-video-1.5") -> None:
+def _configure_grok_environment_gateway(monkeypatch) -> None:
+    monkeypatch.setattr(settings, "video_gateway_base_url", "https://api.x.ai/v1")
+    monkeypatch.setattr(settings, "video_gateway_api_key", "test-key")
+    monkeypatch.setattr(settings, "video_gateway_format", "openai")
+
+
+def _configure_video_model(model_id: str = "grok-imagine-video") -> None:
     with SessionLocal() as db:
         model = db.query(ModelConfig).filter(ModelConfig.use == "video").one()
         model.model_id = model_id
-        model.provider = "yinyue"
+        model.provider = "grok"
+        model.gateway_format = "openai"
         model.enabled = True
         model.cost_credits = 1
         model.extra = {
@@ -47,6 +55,15 @@ def _configure_video_model(model_id: str = "grok-imagine-video-1.5") -> None:
             "prompt_profile": {
                 "max_prompt_chars": 900,
                 "max_shots_by_duration": {"5": 2, "10": 3, "15": 4},
+            },
+            "capabilities": {
+                "text_to_video": True,
+                "image_to_video": True,
+                "reference_image": True,
+                "multi_reference": True,
+                "max_reference_images": 7,
+                "first_last_frame": False,
+                "video_to_video": True,
             },
         }
         db.commit()
@@ -183,6 +200,7 @@ def test_generate_with_reverse_lineage_submits_evidence_gated_motion(
 ):
     user_id = make_user("13900004201", balance=1000)
     headers = auth("13900004201")
+    _configure_grok_environment_gateway(monkeypatch)
     _configure_video_model()
     operation_id, revision_id = _seed_video_reverse_result(
         user_id, video_analysis=_gated_video_analysis()
@@ -233,6 +251,7 @@ def test_generate_without_lineage_keeps_legacy_compile_output(
 ):
     make_user("13900004202", balance=1000)
     headers = auth("13900004202")
+    _configure_grok_environment_gateway(monkeypatch)
     _configure_video_model()
     submitted = {}
 
@@ -251,7 +270,7 @@ def test_generate_without_lineage_keeps_legacy_compile_output(
     baseline = compile_video_prompt(
         {"final_text": FINAL_TEXT},
         duration=10,
-        model_id="grok-imagine-video-1.5",
+        model_id="grok-imagine-video",
         provider="yinyue",
         extra={
             "prompt_profile": {
@@ -269,6 +288,30 @@ def test_generate_without_lineage_keeps_legacy_compile_output(
     with SessionLocal() as db:
         task = db.get(GenTask, response.json()["id"])
         assert (task.params or {})["_video_shot_evidence"] == []
+
+
+def test_quote_rejects_grok_model_when_environment_gateway_is_ark(
+    client, make_user, auth, monkeypatch
+):
+    make_user("13900004206", balance=1000)
+    headers = auth("13900004206")
+    monkeypatch.setattr(
+        settings,
+        "video_gateway_base_url",
+        "https://ark.cn-beijing.volces.com/api/v3",
+    )
+    monkeypatch.setattr(settings, "video_gateway_api_key", "test-key")
+    monkeypatch.setattr(settings, "video_gateway_format", "ark")
+    _configure_video_model()
+
+    response = client.post(
+        "/api/quotes",
+        json=_video_payload("video-gateway-mismatch-001"),
+        headers=headers,
+    )
+
+    assert response.status_code == 400, response.text
+    assert response.json()["detail"] == "所选视频模型不支持文生视频"
 
 
 def test_lineage_without_gated_shots_never_changes_compiler_input():
@@ -311,7 +354,7 @@ def test_legacy_worker_recompile_walks_evidence_path_for_lineage_tasks(
         source_revision_id=revision_id,
     )
     model = SimpleNamespace(
-        model_id="grok-imagine-video-1.5",
+        model_id="grok-imagine-video",
         provider="yinyue",
         extra={},
     )
@@ -336,7 +379,7 @@ def test_legacy_worker_recompile_unchanged_without_lineage(client):
         stage="final",
     )
     model = SimpleNamespace(
-        model_id="grok-imagine-video-1.5",
+        model_id="grok-imagine-video",
         provider="yinyue",
         extra={},
     )
@@ -345,7 +388,7 @@ def test_legacy_worker_recompile_unchanged_without_lineage(client):
     baseline = compile_video_prompt(
         {"final_text": FINAL_TEXT},
         duration=10,
-        model_id="grok-imagine-video-1.5",
+        model_id="grok-imagine-video",
         provider="yinyue",
         extra={},
         references=[],

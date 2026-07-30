@@ -261,7 +261,11 @@ export default function useReverseResultActions({
 
   function restoreReverseRevision(revision) {
     const operation = reverseOperationForPendingResult();
-    const restoredPayload = withEvidenceBackedVideoGenerationDraft(revision.payload, category);
+    const restoredPayload = withEvidenceBackedVideoGenerationDraft(
+      revision.payload,
+      category,
+      { preserveStored: revision.source === "user_edit" },
+    );
     setWorkspacePatch({
       pendingReverseResult: reverseResultEnvelope(
         operation || {

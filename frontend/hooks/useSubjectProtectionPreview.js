@@ -12,6 +12,7 @@ export default function useSubjectProtectionPreview({
   portraitGenerationMode,
   productAsset,
   editMaskMode,
+  maskEditSupported = true,
   setWorkspacePatch,
 }) {
   const productAssetSignature = assetSignature(productAsset);
@@ -23,6 +24,7 @@ export default function useSubjectProtectionPreview({
       && productGenerationMode
       && !portraitGenerationMode
       && productAsset?.url
+      && maskEditSupported
     );
     if (!shouldPreview) {
       setWorkspacePatch({
@@ -92,5 +94,6 @@ export default function useSubjectProtectionPreview({
     productAssetSignature,
     productAsset?.url,
     editMaskMode,
+    maskEditSupported,
   ]);
 }

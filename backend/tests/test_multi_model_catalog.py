@@ -17,7 +17,7 @@ from app.models import (
     ModelConfig,
     ModelPriceVersion,
 )
-from app.services.catalog import public_capabilities
+from app.services.catalog import public_capabilities, public_model_option
 from app.services.config_store import (
     ModelConfigResolutionError,
     get_model_config,
@@ -45,6 +45,41 @@ def test_public_catalog_exposes_only_supported_product_video_templates():
             }
         }
     ) == {"product_video_templates": ["stable_showcase"]}
+
+
+def test_public_catalog_exposes_platform_video_input_capabilities():
+    assert public_capabilities(
+        {
+            "capabilities": {
+                "video_to_video": True,
+                "video_reference": False,
+                "video_edit": True,
+                "audio_reference": False,
+                "max_reference_videos": 1,
+                "max_reference_audio": 0,
+                "vendor_max_reference_videos": 3,
+            }
+        }
+    ) == {
+        "video_to_video": True,
+        "video_reference": False,
+        "video_edit": True,
+        "audio_reference": False,
+        "max_reference_videos": 1,
+        "max_reference_audio": 0,
+    }
+
+
+def test_public_catalog_exposes_canonical_image_mask_capability_only():
+    assert public_capabilities(
+        {
+            "capabilities": {
+                "mask_edit": True,
+                "image_mask": True,
+                "inpainting": True,
+            }
+        }
+    ) == {"mask_edit": True}
 
 
 def test_admin_catalog_create_patch_and_public_secret_boundary(
@@ -763,6 +798,315 @@ def test_reverse_capabilities_only_reject_explicitly_unsupported_modes():
         assert_reverse_capability(no_portraits, target="portrait_profile", source_type="image")
 
 
+def test_known_grok_15_profile_rejects_text_video_when_admin_metadata_is_missing():
+    model = type(
+        "Grok15Model",
+        (),
+        {
+            "use": "video",
+            "model_id": "grok-imagine-video-1.5",
+            "provider": "grok",
+            "gateway_format": "openai",
+            "extra": {},
+        },
+    )()
+
+    with pytest.raises(ModelCapabilityError, match="不支持文生视频"):
+        assert_generation_capability(
+            model,
+            category="video",
+            source_asset_url=None,
+            source_type=None,
+            params={},
+        )
+
+    assert_generation_capability(
+        model,
+        category="video",
+        source_asset_url="https://example.com/first.png",
+        source_type="image",
+        params={},
+    )
+
+
+def test_known_profile_does_not_reenable_an_admin_disabled_supported_mode():
+    model = type(
+        "GptImage2Model",
+        (),
+        {
+            "use": "image",
+            "model_id": "gpt-image-2",
+            "provider": "yinyue",
+            "gateway_format": "openai",
+            "extra": {"capabilities": {"text_to_image": False}},
+        },
+    )()
+
+    with pytest.raises(ModelCapabilityError, match="不支持文生图"):
+        assert_generation_capability(
+            model,
+            category="image",
+            source_asset_url=None,
+            source_type=None,
+            params={},
+        )
+
+
+def test_known_seedance_15_profile_overrides_stale_reference_flags():
+    model = type(
+        "Seedance15Model",
+        (),
+        {
+            "use": "video",
+            "model_id": "doubao-seedance-1-5-pro-251215",
+            "provider": "volcengine_ark",
+            "gateway_format": "ark",
+            "extra": {
+                "capabilities": {
+                    "reference_image": True,
+                    "multi_reference": True,
+                    "video_to_video": True,
+                }
+            },
+        },
+    )()
+
+    with pytest.raises(ModelCapabilityError, match="不支持主体或风格参考图"):
+        assert_generation_capability(
+            model,
+            category="video",
+            source_asset_url="https://example.com/product.png",
+            source_type="image",
+            params={"product_reference_image": "https://example.com/product.png"},
+        )
+    with pytest.raises(ModelCapabilityError, match="不支持视频输入"):
+        assert_generation_capability(
+            model,
+            category="video",
+            source_asset_url="https://example.com/source.mp4",
+            source_type="video",
+            params={},
+        )
+
+
+def test_verified_video_profiles_split_reference_from_edit_semantics():
+    seedance = type(
+        "Seedance20Model",
+        (),
+        {
+            "use": "video",
+            "model_id": "doubao-seedance-2-0-260128",
+            "provider": "volcengine_ark",
+            "gateway_format": "ark",
+            "extra": {},
+        },
+    )()
+    grok = type(
+        "GrokVideoModel",
+        (),
+        {
+            "use": "video",
+            "model_id": "grok-imagine-video",
+            "provider": "grok",
+            "gateway_format": "openai",
+            "extra": {},
+        },
+    )()
+
+    assert_generation_capability(
+        seedance,
+        category="video",
+        source_asset_url="https://example.com/source.mp4",
+        source_type="video",
+        params={"product_reference_image": "https://example.com/product.png"},
+    )
+    assert_generation_capability(
+        grok,
+        category="video",
+        source_asset_url="https://example.com/source.mp4",
+        source_type="video",
+        params={},
+    )
+    with pytest.raises(ModelCapabilityError, match="不能同时提交独立参考图"):
+        assert_generation_capability(
+            grok,
+            category="video",
+            source_asset_url="https://example.com/source.mp4",
+            source_type="video",
+            params={"style_reference_image": "https://example.com/style.png"},
+        )
+
+
+def test_known_image_profile_enforces_platform_total_reference_limit():
+    model = type(
+        "GptImage2Model",
+        (),
+        {
+            "use": "image",
+            "model_id": "gpt-image-2",
+            "provider": "yinyue",
+            "gateway_format": "openai",
+            "extra": {"capabilities": {"max_reference_images": 16}},
+        },
+    )()
+
+    assert_generation_capability(
+        model,
+        category="image",
+        source_asset_url="https://example.com/source.png",
+        source_type="image",
+        params={"style_reference_image": "https://example.com/style.png"},
+    )
+    with pytest.raises(ModelCapabilityError, match="最多支持 2 张"):
+        assert_generation_capability(
+            model,
+            category="image",
+            source_asset_url="https://example.com/source.png",
+            source_type="image",
+            params={
+                "style_reference_image": "https://example.com/style.png",
+                "character_reference_image": "https://example.com/character.png",
+            },
+        )
+
+
+@pytest.mark.parametrize(
+    ("provider", "gateway_format"),
+    [
+        ("custom_openai", "openai"),
+        ("custom_openai", "ark"),
+        ("volcengine_ark", "openai"),
+    ],
+)
+def test_verified_profile_requires_the_matching_provider_adapter(
+    provider,
+    gateway_format,
+):
+    model = type(
+        "UnverifiedSeedance20Model",
+        (),
+        {
+            "use": "video",
+            "model_id": "doubao-seedance-2-0-pro-unverified",
+            "provider": provider,
+            "gateway_format": gateway_format,
+            "extra": {
+                "capabilities": {
+                    "text_to_video": True,
+                    "image_to_video": True,
+                    "reference_image": True,
+                    "multi_reference": True,
+                    "max_reference_images": 10,
+                }
+            },
+        },
+    )()
+
+    with pytest.raises(ModelCapabilityError, match="不支持图生视频"):
+        assert_generation_capability(
+            model,
+            category="video",
+            source_asset_url="https://example.com/first.png",
+            source_type="image",
+            params={},
+        )
+
+
+def test_verified_profile_accepts_matching_environment_gateway_snapshot():
+    model = type(
+        "SeedanceEnvSnapshot",
+        (),
+        {
+            "use": "video",
+            "model_id": "doubao-seedance-1-5-pro-251215",
+            "provider": "env",
+            "gateway_format": "ark",
+            "gateway_source": "env",
+            "extra": {
+                "capabilities": {
+                    "text_to_video": True,
+                    "image_to_video": True,
+                    "reference_image": False,
+                    "first_last_frame": True,
+                    "multi_reference": False,
+                    "video_to_video": False,
+                }
+            },
+        },
+    )()
+
+    assert_generation_capability(
+        model,
+        category="video",
+        source_asset_url=None,
+        source_type=None,
+        params={},
+    )
+
+
+@pytest.mark.parametrize("legacy_alias", ["image_mask", "inpainting"])
+def test_verified_image_profile_drops_legacy_mask_alias_overrides(legacy_alias):
+    model = type(
+        "GeminiImageModel",
+        (),
+        {
+            "use": "image",
+            "model_id": "gemini-3.1-flash-image",
+            "provider": "antigravity",
+            "gateway_format": "anthropic",
+            "extra": {
+                "capabilities": {
+                    "image_to_image": True,
+                    "reference_image": True,
+                    legacy_alias: True,
+                }
+            },
+        },
+    )()
+
+    with pytest.raises(ModelCapabilityError, match="不支持蒙版编辑"):
+        assert_generation_capability(
+            model,
+            category="image",
+            source_asset_url="https://example.com/source.png",
+            source_type="image",
+            params={"mask_image_url": "https://example.com/mask.png"},
+        )
+
+
+def test_public_catalog_uses_route_clamped_capabilities():
+    model = ModelConfig(
+        id=99001,
+        use="video",
+        model_id="doubao-seedance-2-0-pro-unverified",
+        display_name="Wrong Seedance route",
+        provider="custom_openai",
+        gateway_format="openai",
+        is_default=False,
+        sort_order=0,
+        cost_credits=1,
+        unlock_cost=0,
+        enabled=True,
+        extra={
+            "capabilities": {
+                "text_to_video": True,
+                "image_to_video": True,
+                "reference_image": True,
+                "multi_reference": True,
+                "max_reference_images": 10,
+            }
+        },
+    )
+
+    capabilities = public_model_option(model)["capabilities"]
+
+    assert capabilities["text_to_video"] is False
+    assert capabilities["image_to_video"] is False
+    assert capabilities["reference_image"] is False
+    assert capabilities["multi_reference"] is False
+    assert "max_reference_images" not in capabilities
+
+
 @pytest.mark.parametrize(
     ("capabilities", "message"),
     [
@@ -863,11 +1207,15 @@ def test_seedance_15_supports_frame_pair_but_rejects_independent_references():
         )
 
 
-def test_seedance_20_limit_allows_theme_plus_nine_details_only():
+def test_seedance_20_limit_counts_theme_with_eight_detail_images():
     model = type(
         "Seedance20Model",
         (),
         {
+            "use": "video",
+            "model_id": "doubao-seedance-2-0-260128",
+            "provider": "volcengine_ark",
+            "gateway_format": "ark",
             "extra": {
                 "capabilities": {
                     "image_to_video": True,
@@ -877,10 +1225,10 @@ def test_seedance_20_limit_allows_theme_plus_nine_details_only():
             }
         },
     )()
-    nine_details = [f"https://example.com/detail-{index}.png" for index in range(9)]
+    eight_details = [f"https://example.com/detail-{index}.png" for index in range(8)]
     base_params = {
         "product_reference_image": "https://example.com/product.png",
-        "product_detail_images": nine_details,
+        "product_detail_images": eight_details,
     }
 
     assert_generation_capability(
@@ -890,7 +1238,7 @@ def test_seedance_20_limit_allows_theme_plus_nine_details_only():
         source_type=None,
         params=base_params,
     )
-    with pytest.raises(ModelCapabilityError, match="最多支持 10 张"):
+    with pytest.raises(ModelCapabilityError, match="最多支持 9 张"):
         assert_generation_capability(
             model,
             category="video",
@@ -899,8 +1247,8 @@ def test_seedance_20_limit_allows_theme_plus_nine_details_only():
             params={
                 **base_params,
                 "product_detail_images": [
-                    *nine_details,
-                    "https://example.com/detail-10.png",
+                    *eight_details,
+                    "https://example.com/detail-9.png",
                 ],
             },
         )

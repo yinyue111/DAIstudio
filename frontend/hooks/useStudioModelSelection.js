@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 
 import {
   filterModelOptions,
+  markGenerationModelCompatibility,
   MODEL_SELECTION_USES,
   normalizeModelOptions,
   readModelSelections,
@@ -23,6 +24,7 @@ export default function useStudioModelSelection({
   creationMode,
   selected,
   productAsset,
+  productDetailAssets = [],
   subjectMode,
   ownerId,
   notify,
@@ -41,7 +43,14 @@ export default function useStudioModelSelection({
   // incompatible. Submission preflight provides the actionable compatibility
   // error; silently filtering here would switch models and could start a paid
   // subject-profile analysis under a model the user did not choose.
-  const generationModelOptions = allModelOptions[category];
+  const generationModelOptions = markGenerationModelCompatibility(allModelOptions[category], {
+    use: category,
+    creationMode,
+    selected,
+    productAsset,
+    productDetailAssets,
+    subjectMode,
+  });
   const visionModelOptions = filterModelOptions(allModelOptions.vision, {
     use: "vision",
     creationMode,
@@ -152,7 +161,7 @@ export default function useStudioModelSelection({
     return next;
   }
 
-  function modelEnabled(kind) {
+  function modelEnabled(kind, requirementOverrides = {}) {
     const use = String(kind || "").startsWith("video") ? "video" : "image";
     if (cfg?.model_options) {
       return filterModelOptions(allModelOptions[use], {
@@ -161,6 +170,7 @@ export default function useStudioModelSelection({
         selected: kind === creationMode ? selected : null,
         productAsset: kind === creationMode ? productAsset : null,
         subjectMode: kind === creationMode ? subjectMode : "general",
+        ...requirementOverrides,
       }).length > 0;
     }
     return modelEnabledForConfig(cfg, kind);

@@ -194,14 +194,42 @@ def submit_video(
             extra=extra,
             gateway_config=gateway_config,
         )
-    extra = extra or {}
-    submit_path = extra.get("submit_path", "/v1/videos/generations")
+    extra = dict(extra or {})
+    normalized_model_id = str(video_model_id or "").strip().lower()
+    configured_transport = str(extra.get("video_transport") or "").strip().lower()
+    if configured_transport:
+        is_grok_video_adapter = configured_transport == "grok_videos"
+    elif gateway_config is not None:
+        is_grok_video_adapter = (
+            gateway_config.provider == "grok"
+            and fmt == "openai"
+            and normalized_model_id
+            in {"grok-imagine-video", "grok-imagine-video-1.5"}
+        )
+    else:
+        # Environment-backed tasks predate per-model provider snapshots.
+        is_grok_video_adapter = normalized_model_id in {
+            "grok-imagine-video",
+            "grok-imagine-video-1.5",
+        }
+    if is_grok_video_adapter:
+        extra["video_transport"] = "grok_videos"
+    is_grok_video_edit = (
+        is_grok_video_adapter
+        and normalized_model_id == "grok-imagine-video"
+        and bool(str((params or {}).get("source_video_url") or "").strip())
+    )
+    submit_path = (
+        "/v1/videos/edits"
+        if is_grok_video_edit
+        else extra.get("submit_path", "/v1/videos/generations")
+    )
     id_field = extra.get("id_field", "id")
     payload_params = _generic_video_payload_params(params or {}, extra, video_model_id)
     payload_prompt = prompt
     negative_prompt_mode = str(
         extra.get("negative_prompt_mode")
-        or ("append_to_prompt" if "grok" in str(video_model_id).strip().lower() else "")
+        or ("append_to_prompt" if is_grok_video_adapter else "")
     ).strip().lower()
     if negative_prompt_mode == "append_to_prompt":
         negative_prompt = str(payload_params.pop("negative_prompt", "") or "").strip()

@@ -37,12 +37,17 @@ _COMPILER_CAPABILITY_KEYS = frozenset(
         "text_to_video",
         "image_to_video",
         "video_to_video",
+        "video_reference",
+        "video_edit",
+        "audio_reference",
         "first_last_frame",
         "aspect_ratios",
         "resolutions",
         "durations",
         "max_duration_seconds",
         "max_reference_images",
+        "max_reference_videos",
+        "max_reference_audio",
     }
 )
 

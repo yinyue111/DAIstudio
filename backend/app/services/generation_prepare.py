@@ -26,13 +26,17 @@ from .generation_image_evidence import (
     resolve_reviewed_evidence_plan_for_lineage,
 )
 from .generation_media import video_render_duration
-from .generation_model_runtime import model_from_persisted_snapshot
+from .generation_model_runtime import (
+    FrozenAdapterConfigError,
+    model_from_persisted_snapshot,
+    validate_frozen_adapter_snapshot,
+)
 from .generation_policy import (
     assert_generation_request_policy,
     validate_prompt_payload,
 )
 from .generation_prompts import compact_image_prompt_payload
-from .generation_quotes import validate_quote_snapshot_integrity
+from .generation_quotes import _invalid_quote_snapshot, validate_quote_snapshot_integrity
 from .generation_request import (
     assert_client_request_replay,
     default_image_n,
@@ -769,10 +773,25 @@ def _resolve_generation_model(
                     "message": str(exc),
                 },
             ) from exc
-        policy_model = route_selection.runtime_model
         snapshot = attach_route_snapshot(
             dependencies.snapshot_builder(route_selection.runtime_model),
             route_selection,
+        )
+        try:
+            validate_frozen_adapter_snapshot(snapshot, model_use)
+        except FrozenAdapterConfigError as exc:
+            _invalid_quote_snapshot(f"报价出站适配器非法: {exc}")
+        # Validate the same frozen execution identity that the generated task
+        # will use. A catalog route may name one provider/protocol while its
+        # missing credentials fall back to a different environment gateway.
+        # Using the pre-snapshot route model here would let quoting succeed and
+        # defer the capability rejection until execution.
+        policy_model = _runtime_model_for_snapshot(
+            db,
+            snapshot=snapshot,
+            model=model,
+            model_use=model_use,
+            dependencies=dependencies,
         )
     return _GenerationModelContext(
         model=model,
