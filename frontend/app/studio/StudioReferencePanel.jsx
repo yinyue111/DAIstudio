@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { ReferenceAssetPreview } from "./StudioMedia.jsx";
-import StudioModelSelector from "./StudioModelSelector";
+import StudioModelSelector, { VIDEO_IMAGE_INPUT_MODE } from "./StudioModelSelector";
 import StudioReverseIntentControls from "./StudioReverseIntentControls";
 import StudioReverseBatchPanel from "./StudioReverseBatchPanel";
 import StudioReverseSourcesEditor from "./StudioReverseSourcesEditor";
@@ -245,6 +245,7 @@ export default function StudioReferencePanel({
   lastFrameAsset = null,
   firstLastFrameEnabled = false,
   videoRequiresFirstFrame = false,
+  videoSubjectImageInputMode = "",
   productAsset,
   productDetailAssets = [],
   productDetailValidation = { ok: true, message: "" },
@@ -257,6 +258,7 @@ export default function StudioReferencePanel({
   productBusy = false,
   productProfiling = false,
   profileOperation = null,
+  parseNotice = null,
   assets,
   refOpen,
   setRefOpen,
@@ -326,6 +328,7 @@ export default function StudioReferencePanel({
   const productGenerationMode = subjectMode === "product";
   const portraitGenerationMode = subjectMode === "portrait";
   const productSubjectMode = productGenerationMode || directProductVideoMode;
+  const subjectImageIsFirstFrame = videoSubjectImageInputMode === VIDEO_IMAGE_INPUT_MODE.FIRST_FRAME;
   const productActionBusy = Boolean(uploading || productBusy);
   const firstFrameInputEnabled = firstLastFrameEnabled || videoRequiresFirstFrame;
   const imageUploadTargetsProduct = isImageEditMode && productGenerationMode && !productAsset;
@@ -384,6 +387,8 @@ export default function StudioReferencePanel({
         : productSubjectMode
         ? "上传产品图作为唯一产品身份，生成时强保护Logo、包装和细节"
         : "上传需要被编辑的图片，未要求修改的内容默认保留")
+    : subjectImageIsFirstFrame
+      ? "当前模型会把这张主体图作为视频首帧，不提供独立身份锁定"
     : (portraitGenerationMode
         ? "上传要生成进目标视频风格的人物照片，参考视频只提供动作、镜头和风格"
         : "上传产品图作为视频中的唯一商品主体，不作为风格参考；保留Logo、包装、颜色、形状和文字标识");
@@ -625,7 +630,7 @@ export default function StudioReferencePanel({
                   <>
                     <ReferenceAssetPreview asset={productAsset} />
                     <span className="badge absolute left-2 top-2 bg-aqua/90 text-black">
-                      {portraitGenerationMode ? "人物照片" : isImageEditMode ? "编辑源" : "产品主体"}
+                      {subjectImageIsFirstFrame ? "视频首帧" : portraitGenerationMode ? "人物照片" : isImageEditMode ? "编辑源" : "产品主体"}
                     </span>
                   </>
                 ) : (
@@ -641,7 +646,9 @@ export default function StudioReferencePanel({
                         {portraitGenerationMode ? "上传人物照片" : isImageEditMode ? "上传要编辑的图片" : "上传产品图片"}
                       </span>
                       <span className="mt-1 block text-xs text-fog">
-                        {portraitGenerationMode
+                        {subjectImageIsFirstFrame
+                          ? "作为视频首帧，不是独立主体参考"
+                          : portraitGenerationMode
                           ? "作为视频人物身份参考"
                           : isImageEditMode
                           ? "作为图片编辑源"
@@ -658,6 +665,8 @@ export default function StudioReferencePanel({
                 <div className="mt-1 text-fog">
                   {isImageEditMode
                     ? "生成时会按提示词编辑这张图，未指定修改的部分默认保留。"
+                    : subjectImageIsFirstFrame
+                    ? "生成时将这张图作为视频首帧；主体延续由模型根据首帧推演，不是独立身份锁定。"
                     : portraitGenerationMode
                     ? "生成时保留这张人物照片的身份，目标视频只迁移动作、镜头和风格；当前不是逐帧换脸。"
                     : "生成时以这张图片锁定同一产品身份，场景、动作和首尾画面由提示词决定。"}
@@ -713,6 +722,21 @@ export default function StudioReferencePanel({
               {parsing ? "抓取中" : "抓取"}
             </button>
           </div>
+          {parseNotice?.message && (
+            <p
+              role={parseNotice.kind === "bad" ? "alert" : "status"}
+              aria-live={parseNotice.kind === "bad" ? "assertive" : "polite"}
+              className={`rounded-lg border px-3 py-2 text-[11px] leading-relaxed ${
+                parseNotice.kind === "bad"
+                  ? "border-bad/35 bg-bad/10 text-bad"
+                  : parseNotice.kind === "ok"
+                    ? "border-ok/35 bg-ok/10 text-ok"
+                    : "border-warn/35 bg-warn/10 text-warn"
+              }`}
+            >
+              {parseNotice.message}
+            </p>
+          )}
           {appliedUrl && appliedUrl !== url.trim() && (
             <p className="truncate text-[11px] text-fog" title={appliedUrl}>当前素材仍来自：{appliedUrl}</p>
           )}

@@ -47,6 +47,21 @@ assert.equal(
   "canceled tasks should not block new generation",
 );
 assert.equal(
+  shouldBlockNewGeneration({ category: "video", status: "needs_review" }, "video"),
+  true,
+  "a video awaiting provider reconciliation must block duplicate video submission",
+);
+assert.equal(
+  shouldBlockNewGeneration({ category: "video", status: "needs_review", phase: "reconciling" }, "video"),
+  true,
+  "a reconciling video must remain guarded even though needs_review stops task polling",
+);
+assert.equal(
+  shouldBlockNewGeneration({ category: "image", status: "needs_review" }, "image"),
+  false,
+  "terminal image review state should keep the existing image concurrency behavior",
+);
+assert.equal(
   generationSubmitDisabled({
     submitting: true,
     currentTask: null,

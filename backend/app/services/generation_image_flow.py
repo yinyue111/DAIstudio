@@ -436,6 +436,7 @@ def _prepare_image_references(
             explicit_reference_url or task.source_asset_url,
             max_side=reference_max_side,
             prefer_original_upload=True,
+            prefer_original_generated=request.is_product or request.is_portrait,
             quality=92,
             subsampling=0,
             return_content_hash=True,

@@ -1705,6 +1705,9 @@ def test_auto_subject_mask_recovers_white_product_body_on_white_background():
     assert top < 250
     assert right > 705
     assert bottom > 565
+    assert _mask_alpha_at(result.data_uri, 560, 390) > 200
+    assert _mask_alpha_at(result.data_uri, 400, 520) > 200
+    assert _mask_alpha_at(result.data_uri, 40, 40) < 20
 
 
 def test_auto_subject_mask_handles_common_white_product_shapes():
@@ -1948,6 +1951,98 @@ def test_subject_protection_preview_distinguishes_auto_center_and_off(client, ma
     assert off_data["mode"] == "none"
     assert off_data["risk_level"] == "high"
     assert off_data["will_send_mask"] is False
+
+
+def test_generated_product_reference_and_mask_use_unlocked_hd_asset(make_user):
+    uid = make_user("13900001969", balance=1000)
+    hd_img = Image.new("RGB", (1200, 1200), (255, 255, 255))
+    draw = ImageDraw.Draw(hd_img)
+    draw.rounded_rectangle(
+        (45, 185, 1155, 985),
+        radius=28,
+        fill=(238, 238, 238),
+        outline=(115, 115, 115),
+        width=7,
+    )
+    draw.rectangle((390, 435, 810, 610), fill=(25, 25, 25))
+    hd_buf = io.BytesIO()
+    hd_img.save(hd_buf, format="JPEG", quality=96)
+    hd_key = storage.save_bytes(hd_buf.getvalue(), "hd", "jpg")
+
+    preview_buf = io.BytesIO()
+    hd_img.resize((768, 768), Image.Resampling.LANCZOS).save(preview_buf, format="PNG")
+    preview_key = storage.save_bytes(preview_buf.getvalue(), "preview", "png")
+    model_ref_buf = io.BytesIO()
+    hd_img.resize((384, 384), Image.Resampling.LANCZOS).save(
+        model_ref_buf,
+        format="JPEG",
+        quality=82,
+    )
+    storage.save_bytes_named(
+        model_ref_buf.getvalue(),
+        "model_ref",
+        preview_key.rsplit("/", 1)[-1].rsplit(".", 1)[0] + ".jpg",
+    )
+
+    db = SessionLocal()
+    try:
+        source_task = GenTask(
+            user_id=uid,
+            category="image",
+            stage="preview",
+            prompt={"final_text": "source product"},
+            model_use="image",
+            params={},
+            status="succeeded",
+            cost_frozen=0,
+            cost_settled=0,
+        )
+        db.add(source_task)
+        db.flush()
+        asset = GenAsset(
+            task_id=source_task.id,
+            user_id=uid,
+            type="image",
+            preview_url=storage.public_url(preview_key),
+            hd_url=storage.public_url(hd_key),
+            watermarked=False,
+            unlocked=True,
+            width=1200,
+            height=1200,
+        )
+        db.add(asset)
+        db.commit()
+
+        default_ref = generation_media.gateway_reference_image(
+            db,
+            source_task,
+            asset.hd_url,
+            max_side=1536,
+        )
+        hd_ref = generation_media.gateway_reference_image(
+            db,
+            source_task,
+            asset.hd_url,
+            max_side=1536,
+            prefer_original_generated=True,
+        )
+        default_img = Image.open(io.BytesIO(base64.b64decode(default_ref.split(",", 1)[1])))
+        forwarded_hd = Image.open(io.BytesIO(base64.b64decode(hd_ref.split(",", 1)[1])))
+        assert default_img.size == (384, 384)
+        assert forwarded_hd.size == (1200, 1200)
+
+        mask = generation_media.gateway_image_edit_mask(
+            db,
+            source_task,
+            asset.hd_url,
+            max_side=1536,
+            edit_mask_mode="protect_subject",
+        )
+        assert mask is not None
+        assert (mask.width, mask.height) == (1200, 1200)
+        assert mask.mode == "auto_subject"
+    finally:
+        db.close()
 
 
 def test_product_image_edit_strict_lock_composites_original_subject_pixels(
@@ -2829,6 +2924,70 @@ def test_uploaded_image_can_drive_video_first_frame(
     ref_bytes = base64.b64decode(seen["first_frame_image"].split(",", 1)[1])
     ref_img = Image.open(io.BytesIO(ref_bytes))
     assert min(ref_img.size) >= 300
+
+
+def test_single_product_image_first_frame_mode_never_becomes_product_reference(
+    client, make_user, auth, monkeypatch, quote_and_generate
+):
+    make_user("13900002106", balance=1000, admin=True)
+    headers = auth("13900002106")
+    assert client.put("/api/admin/models", json={
+        "use": "video",
+        "model_id": "mock-first-frame-product-video",
+        "cost_credits": 50,
+        "unlock_cost": 0,
+        "enabled": True,
+        "extra": {
+            "preview_cost": 5,
+            "capabilities": {
+                "text_to_video": True,
+                "image_to_video": True,
+                "reference_image": False,
+                "multi_reference": False,
+            },
+        },
+        "admin_password": "pass123456",
+    }, headers=headers).status_code == 200
+    upload = client.post(
+        "/api/uploads/image",
+        files={"file": ("product.png", _png_bytes(size=(480, 720)), "image/png")},
+        headers=headers,
+    )
+    assert upload.status_code == 200, upload.text
+    product_url = upload.json()["url"]
+    submitted = {}
+
+    def fake_submit(prompt, video_model_id, params, extra=None):
+        submitted.update(params)
+        return "mock-first-frame-product"
+
+    monkeypatch.setattr("app.services.gateway.submit_video", fake_submit)
+    response = quote_and_generate({
+        "source_asset_url": product_url,
+        "source_type": "image",
+        "category": "video",
+        "stage": "preview",
+        "prompt": {"final_text": "产品缓慢旋转，镜头向前推进"},
+        "params": {
+            "duration": 5,
+            "resolution": "720p",
+            "ratio": "9:16",
+            "subject_mode": "product",
+            "video_image_input_mode": "first_frame",
+            "first_frame_image": product_url,
+        },
+    }, headers=headers)
+
+    assert response.status_code == 200, response.text
+    assert submitted["video_image_input_mode"] == "first_frame"
+    assert submitted["first_frame_image"].startswith("data:image/jpeg;base64,")
+    assert "product_reference_image" not in submitted
+    assert "character_reference_image" not in submitted
+    with SessionLocal() as db:
+        task = db.get(GenTask, response.json()["id"])
+        assert task.params["video_image_input_mode"] == "first_frame"
+        assert task.params["first_frame_image"] == product_url
+        assert "product_reference_image" not in task.params
 
 
 def test_uploaded_product_video_free_motion_uses_identity_reference_without_frame_lock(

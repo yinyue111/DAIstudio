@@ -1,7 +1,9 @@
 import { isTerminalTaskStatus } from "./helpers";
 
 export function shouldBlockNewGeneration(currentTask, nextCategory) {
-  if (!currentTask || isTerminalTaskStatus(currentTask.status)) return false;
+  if (!currentTask) return false;
+  if (currentTask.category === "video" && currentTask.status === "needs_review") return true;
+  if (isTerminalTaskStatus(currentTask.status)) return false;
   return currentTask.category !== "image" || nextCategory !== "image";
 }
 

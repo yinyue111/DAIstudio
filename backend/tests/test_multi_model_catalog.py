@@ -2,6 +2,7 @@ from pathlib import Path
 
 import pytest
 import sqlalchemy as sa
+from fastapi import HTTPException
 
 from alembic import command
 from alembic.config import Config
@@ -24,6 +25,7 @@ from app.services.config_store import (
     resolve_model_config,
 )
 from app.services.generation_model_runtime import model_snapshot
+from app.services.generation_request import validate_generation_params
 from app.services.model_capabilities import (
     ModelCapabilityError,
     assert_generation_capability,
@@ -886,6 +888,103 @@ def test_known_seedance_15_profile_overrides_stale_reference_flags():
             source_asset_url="https://example.com/source.mp4",
             source_type="video",
             params={},
+        )
+
+    assert_generation_capability(
+        model,
+        category="video",
+        source_asset_url="https://example.com/product.png",
+        source_type="image",
+        params={
+            "subject_mode": "product",
+            "video_image_input_mode": "first_frame",
+            "first_frame_image": "https://example.com/product.png",
+        },
+    )
+    with pytest.raises(ModelCapabilityError, match="不能同时提交产品"):
+        assert_generation_capability(
+            model,
+            category="video",
+            source_asset_url="https://example.com/product.png",
+            source_type="image",
+            params={
+                "subject_mode": "product",
+                "video_image_input_mode": "first_frame",
+                "first_frame_image": "https://example.com/product.png",
+                "product_reference_image": "https://example.com/product.png",
+            },
+        )
+
+
+def test_video_image_input_mode_request_contract_is_strict():
+    params = validate_generation_params(
+        "video",
+        {
+            "subject_mode": "product",
+            "video_image_input_mode": " FIRST_FRAME ",
+            "reference_image_url": "https://example.com/product.png",
+            "product_reference_image": "https://example.com/product.png",
+            "product_detail_images": ["https://example.com/detail.png"],
+            "style_reference_image": "https://example.com/style.png",
+            "character_reference_image": "https://example.com/character.png",
+            "product_lock_mode": "locked",
+            "product_video_template": "prompt_driven",
+        },
+    )
+    assert params["video_image_input_mode"] == "first_frame"
+    assert params["first_frame_image"] == "https://example.com/product.png"
+    for key in (
+        "reference_image_url",
+        "product_reference_image",
+        "product_detail_images",
+        "style_reference_image",
+        "character_reference_image",
+        "product_lock_mode",
+        "product_video_template",
+    ):
+        assert key not in params
+
+    with pytest.raises(HTTPException, match="video_image_input_mode 不支持"):
+        validate_generation_params(
+            "video",
+            {"video_image_input_mode": "automatic"},
+        )
+
+
+def test_subject_reference_mode_requires_the_matching_subject_image():
+    model = type(
+        "ReferenceVideoModel",
+        (),
+        {
+            "use": "video",
+            "model_id": "grok-imagine-video",
+            "provider": "grok",
+            "gateway_format": "openai",
+            "extra": {},
+        },
+    )()
+
+    assert_generation_capability(
+        model,
+        category="video",
+        source_asset_url="https://example.com/product.png",
+        source_type="image",
+        params={
+            "subject_mode": "product",
+            "video_image_input_mode": "subject_reference",
+            "product_reference_image": "https://example.com/product.png",
+        },
+    )
+    with pytest.raises(ModelCapabilityError, match="必须提供产品参考图"):
+        assert_generation_capability(
+            model,
+            category="video",
+            source_asset_url="https://example.com/product.png",
+            source_type="image",
+            params={
+                "subject_mode": "product",
+                "video_image_input_mode": "subject_reference",
+            },
         )
 
 

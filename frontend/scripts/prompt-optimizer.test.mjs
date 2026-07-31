@@ -38,7 +38,7 @@ assert.match(
 );
 assert.match(
   optimizeDirectSource,
-  /kind: "prompt_optimization"[\s\S]{0,500}clientRequestId: actionRequestId[\s\S]{0,500}api\.createStudioPromptOptimization\(confirmedRequest\)/,
+  /kind: "prompt_optimization"[\s\S]{0,500}clientRequestId: actionRequestId[\s\S]{0,700}api\.createStudioPromptOptimization\(confirmedRequest/,
   "paid Studio rewrites should quote first and execute the confirmed proposal request",
 );
 assert.match(optimizeDirectSource, /idempotency_key: actionRequestId/);
@@ -82,6 +82,16 @@ assert.match(
   optimizerSource,
   /function updatePromptFromUser\([\s\S]{0,160}invalidate\(\)[\s\S]{0,120}setPrompt\(valueOrUpdater\)/,
   "editing the prompt should invalidate any in-flight optimization response",
+);
+assert.match(
+  optimizerSource,
+  /function invalidate\([\s\S]{0,180}abortMode\(mode\)[\s\S]{0,180}requestRef\.current\[mode\]/,
+  "invalidating edited prompt input should abort its active optimization request before ignoring stale state",
+);
+assert.match(
+  optimizeDirectSource,
+  /createStudioPromptOptimization\(confirmedRequest, \{ signal: controller\.signal \}\)/,
+  "paid prompt optimization should pass its cancellation signal through quote execution",
 );
 assert.match(
   optimizerSource.slice(optimizerSource.indexOf("async function accept("), optimizerSource.indexOf("async function reject()")),

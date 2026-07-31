@@ -20,6 +20,7 @@ const referenceParsingSource = readFileSync(join(root, "hooks/useReferenceParsin
 const taskTrackingSource = readFileSync(join(root, "hooks/useTaskTracking.js"), "utf8");
 const studioResultsSource = readFileSync(join(root, "app/studio/StudioResults.jsx"), "utf8");
 const promptWorkspaceSource = readFileSync(join(root, "app/studio/StudioPromptWorkspace.jsx"), "utf8");
+const referencePanelSource = readFileSync(join(root, "app/studio/StudioReferencePanel.jsx"), "utf8");
 const workspaceResetSource = readFileSync(join(root, "app/studio/workspaceReset.ts"), "utf8");
 const promptsPageSource = readFileSync(join(root, "app/prompts/page.jsx"), "utf8");
 const toastSource = readFileSync(join(root, "components/ToastProvider.jsx"), "utf8");
@@ -83,6 +84,16 @@ assert.match(
   referenceParsingSource,
   /lastReversePromptRef/,
   "reverse prompt results should remain available for saving to prompt history",
+);
+assert.match(
+  referenceParsingSource,
+  /setParseNoticeForMode\([\s\S]*抓取完成，已提取/,
+  "link parsing should retain an explicit local progress or terminal notice",
+);
+assert.match(
+  referencePanelSource,
+  /role=\{parseNotice\.kind === "bad" \? "alert" : "status"\}/,
+  "link parsing failures should render next to the fetch control instead of only at the page bottom",
 );
 assert.match(
   recipeActionsSource,
@@ -176,10 +187,15 @@ assert.match(
   /function resetOwnerMediaUpload\(\)[\s\S]*resetInput\(imageUploadInputRef\)[\s\S]*resetInput\(productUploadInputRef\)[\s\S]*resetInput\(videoUploadInputRef\)/,
   "workspace clear should reset file inputs so the same file can be uploaded again",
 );
+assert.doesNotMatch(
+  studioResultsSource,
+  /内容审核中|管理员可在后台待确认任务中处理/,
+  "generation reconciliation must not be presented as content moderation",
+);
 assert.match(
   studioResultsSource,
-  /内容审核中|管理员已收到/,
-  "needs_review tasks should tell the user that the result is under review",
+  /模型提交或结果状态待核对/,
+  "needs_review tasks should describe provider reconciliation accurately",
 );
 assert.doesNotMatch(
   variationActionsSource,

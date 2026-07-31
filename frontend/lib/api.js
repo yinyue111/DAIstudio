@@ -47,6 +47,7 @@ const UPLOAD_TIMEOUT_MS = 600_000;
 const DOWNLOAD_TIMEOUT_MS = 300_000;
 const GENERATE_TIMEOUT_MS = 600_000;
 const ONLINE_UPDATE_TIMEOUT_MS = 600_000;
+const PROMPT_OPTIMIZATION_NETWORK_RETRY_DELAYS_MS = [800, 2_000, 5_000, 10_000];
 
 export function wsUrl(path) {
   const base = API_BASE || (typeof window !== "undefined" ? window.location.origin : "");
@@ -105,6 +106,63 @@ export class ApiError extends Error {
     this.detail = detail;
     if (detail && typeof detail === "object" && !Array.isArray(detail)) {
       this.retryAfter = Number(detail.retry_after || 0);
+    }
+  }
+}
+
+export function isTransientNetworkError(error) {
+  if (!error || error?.name === "AbortError" || error instanceof ApiError) return false;
+  const message = String(error?.message || error).trim().toLowerCase();
+  return /failed to fetch|fetch failed|load failed|network\s*error|network request failed|connection refused|could not connect|offline/.test(message);
+}
+
+function throwIfAborted(signal) {
+  if (!signal?.aborted) return;
+  if (signal.reason instanceof Error) throw signal.reason;
+  const error = new Error("The operation was aborted");
+  error.name = "AbortError";
+  throw error;
+}
+
+function waitForRetry(delayMs, signal) {
+  throwIfAborted(signal);
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, delayMs);
+    function onAbort() {
+      clearTimeout(timer);
+      try {
+        throwIfAborted(signal);
+      } catch (error) {
+        reject(error);
+      }
+    }
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+export async function retryTransientNetworkOperation(
+  operation,
+  {
+    delaysMs = PROMPT_OPTIMIZATION_NETWORK_RETRY_DELAYS_MS,
+    wait = waitForRetry,
+    signal = null,
+  } = {},
+) {
+  const delays = Array.isArray(delaysMs) ? delaysMs : [];
+  let attempt = 0;
+  while (true) {
+    throwIfAborted(signal);
+    try {
+      return await operation();
+    } catch (error) {
+      if (!isTransientNetworkError(error) || attempt >= delays.length) throw error;
+      const delayMs = Math.max(0, Number(delays[attempt]) || 0);
+      attempt += 1;
+      await wait(delayMs, signal);
+      throwIfAborted(signal);
     }
   }
 }
@@ -367,6 +425,30 @@ async function request(
     });
   }
   return data;
+}
+
+export async function createStudioPromptOptimizationRequest(body, retryOptions = undefined) {
+  const signal = retryOptions?.signal || null;
+  const execute = () => request("/api/studio/prompt-optimizations", {
+    method: "POST",
+    body,
+    timeoutMs: REVERSE_TIMEOUT_MS,
+    signal,
+  });
+  const idempotent = Boolean(String(body?.idempotency_key || "").trim());
+  try {
+    return idempotent
+      ? await retryTransientNetworkOperation(execute, retryOptions)
+      : await execute();
+  } catch (error) {
+    if (!isTransientNetworkError(error)) throw error;
+    throw new ApiError(
+      idempotent
+        ? "暂时无法连接到服务，已自动重试。请稍后再点一次，系统会复用同一请求以避免重复扣费。"
+        : "暂时无法连接到服务，请稍后再点一次。",
+      { detail: { code: "NETWORK_UNAVAILABLE" } },
+    );
+  }
 }
 
 async function upload(path, formData, { auth = true, signal = null } = {}) {
@@ -699,12 +781,7 @@ export const api = {
   },
   studioPromptOptimization: (proposalId) =>
     request(`/api/studio/prompt-optimizations/${encodeURIComponent(proposalId)}`),
-  createStudioPromptOptimization: (body) =>
-    request("/api/studio/prompt-optimizations", {
-      method: "POST",
-      body,
-      timeoutMs: REVERSE_TIMEOUT_MS,
-    }),
+  createStudioPromptOptimization: (body, options) => createStudioPromptOptimizationRequest(body, options),
   acceptStudioPromptOptimization: (proposalId, body) =>
     request(`/api/studio/prompt-optimizations/${encodeURIComponent(proposalId)}/accept`, {
       method: "POST",

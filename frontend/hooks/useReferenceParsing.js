@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import { api } from "../lib/api";
 import { reportBackgroundError } from "../lib/errorHandling";
 import {
@@ -150,6 +150,7 @@ export default function useReferenceParsing({
   const urlByModeRef = useRef({});
   const getOwnerSessionRef = useRef(getOwnerSession);
   const ownerRequestContextRef = useRef(null);
+  const [parseNoticesByMode, setParseNoticesByMode] = useState({});
 
   urlByModeRef.current[creationMode] = String(url || "").trim();
   getOwnerSessionRef.current = getOwnerSession;
@@ -533,6 +534,13 @@ export default function useReferenceParsing({
     return bumpRequest(parseRequestRef, mode);
   }
 
+  function setParseNoticeForMode(mode, targetUrl, message, kind = "info") {
+    setParseNoticesByMode((current) => ({
+      ...current,
+      [mode]: message ? { targetUrl, message, kind } : null,
+    }));
+  }
+
   function bumpReverseRequest(mode = creationMode) {
     return bumpRequest(reverseRequestRef, mode);
   }
@@ -622,6 +630,7 @@ export default function useReferenceParsing({
     const reqId = bumpParseRequest(mode);
     const refVersion = bumpRefVersion(mode);
     setMsg("");
+    setParseNoticeForMode(mode, targetUrl, "正在抓取链接并提取可用素材…", "warn");
     setWorkspacePatch({ parsing: true }, mode);
     setRefOpen(true);
     try {
@@ -634,14 +643,20 @@ export default function useReferenceParsing({
       ) return;
       if (!result) return;
       if (result.pending_timeout) {
-        setMsg(result.error || "抓取仍在后台处理中，稍后刷新。");
+        const message = result.error || "抓取仍在后台处理中，稍后刷新。";
+        setParseNoticeForMode(mode, targetUrl, message, "warn");
+        setMsg(message);
         return;
       }
       if (result.status === "failed") throw new Error(result.error || "抓取失败，请稍后重试或更换链接");
       if (result.status !== "done") throw new Error("抓取状态异常，请稍后重试");
       const parsedAssets = Array.isArray(result.assets) ? result.assets : [];
       if (!parsedAssets.length) {
-        if (isModeVisible(mode)) setMsg("未在该页面发现可用素材，已保留当前工作区。");
+        if (isModeVisible(mode)) {
+          const message = "未在该页面发现可用素材，已保留当前工作区。";
+          setParseNoticeForMode(mode, targetUrl, message, "warn");
+          setMsg(message);
+        }
         return;
       }
       await cancelReverseOperationForMode(mode);
@@ -664,12 +679,22 @@ export default function useReferenceParsing({
           : { promptSourceSignature: "" }),
         ...(current.negativeTouched ? {} : { negative: "" }),
       }), mode);
+      setParseNoticeForMode(
+        mode,
+        targetUrl,
+        `抓取完成，已提取 ${parsedAssets.length} 个素材，请选择一个继续反推。`,
+        "ok",
+      );
     } catch (e) {
       if (
         ownerRequest.isCurrent()
         && isRefVersionCurrent(mode, refVersion)
         && isModeVisible(mode)
-      ) setMsg(e.message);
+      ) {
+        const message = e.message || "抓取失败，请稍后重试或更换链接";
+        setParseNoticeForMode(mode, targetUrl, message, "bad");
+        setMsg(message);
+      }
     } finally {
       if (
         ownerRequest.isCurrent()
@@ -970,7 +995,13 @@ export default function useReferenceParsing({
     lastReversePromptRef.current = {};
     reverseContextsRef.current = {};
     urlByModeRef.current = {};
+    setParseNoticesByMode({});
   }
+
+  const currentParseNotice = parseNoticesByMode[creationMode] || null;
+  const parseNotice = currentParseNotice?.targetUrl === String(url || "").trim()
+    ? currentParseNotice
+    : null;
 
   return {
     bumpRefVersion,
@@ -982,6 +1013,7 @@ export default function useReferenceParsing({
     selectAssetForMode,
     pickAsset,
     doParse,
+    parseNotice,
     doReverse,
     confirmReverseCover,
     cancelReverseOperationForMode,

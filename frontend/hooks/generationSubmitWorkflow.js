@@ -9,6 +9,8 @@ import { generationRequiresPendingUpload } from "../app/studio/generationUploadP
 import {
   modelRequirements,
   modelOptionSupports,
+  resolveVideoSubjectImageInputMode,
+  VIDEO_IMAGE_INPUT_MODE,
   validateMultiReferenceSelection,
 } from "../app/studio/StudioModelSelector";
 import { videoModelRequiresFirstFrame } from "../app/studio/studioModelContext";
@@ -74,14 +76,35 @@ export function validateGenerationSubmission({
     creationMode,
     selected,
     productAsset,
+    productDetailAssets,
     subjectMode,
     analysisOnlySourceVideo,
   });
-  const independentSubjectReference = Boolean(
-    category === "video"
-    && productAsset
-    && ["product", "portrait"].includes(subjectMode)
-  );
+  const videoImageInputMode = resolveVideoSubjectImageInputMode(modelOption, {
+    category,
+    creationMode,
+    selected,
+    productAsset,
+    productDetailAssets,
+    variationSource,
+    subjectMode,
+  });
+  if (videoImageInputMode === VIDEO_IMAGE_INPUT_MODE.UNSUPPORTED) {
+    const requiredCount = new Set([
+      productAsset,
+      selected,
+      variationSource,
+      ...productDetailAssets,
+    ].filter((asset) => asset?.type !== "video").map(assetReferenceUrl).filter(Boolean)).size;
+    return {
+      ok: false,
+      message: requiredCount > 1
+        ? `当前素材需要 ${requiredCount} 张独立参考图，当前视频模型仅支持单图首帧。`
+        : subjectMode === "portrait"
+          ? "当前视频模型既不支持人物参考，也不支持单图首帧，请切换模型后再生成。"
+          : "当前视频模型既不支持产品参考，也不支持单图首帧，请切换模型后再生成。",
+    };
+  }
   const modelSupportsFirstLastFrame = Boolean(
     category === "video"
     && creationMode === "video"
@@ -93,17 +116,6 @@ export function validateGenerationSubmission({
   const effectiveLastFrameAsset = firstLastFrameEnabled && modelSupportsFirstLastFrame
     ? lastFrameAsset
     : null;
-  if (
-    independentSubjectReference
-    && !modelOptionSupports(modelOption, [["reference_image", "multi_reference"]])
-  ) {
-    return {
-      ok: false,
-      message: subjectMode === "portrait"
-        ? "当前视频模型不支持独立人物参考图，请切换支持人物参考的模型后再生成。"
-        : "当前视频模型不支持独立产品主题图，请切换支持产品参考的模型后再生成。",
-    };
-  }
   if (!modelOptionSupports(modelOption, requirements)) {
     if (videoRequiresFirstFrame && selected?.type !== "image") {
       return {
@@ -122,7 +134,12 @@ export function validateGenerationSubmission({
       message: `${category === "video" ? "当前视频" : "当前图片"}模型不支持本次生成所需的素材方式，请切换模型后再生成。`,
     };
   }
-  if (category === "video" && subjectMode === "product" && !productVideoStrategy.supported) {
+  if (
+    category === "video"
+    && subjectMode === "product"
+    && videoImageInputMode !== VIDEO_IMAGE_INPUT_MODE.FIRST_FRAME
+    && !productVideoStrategy.supported
+  ) {
     return { ok: false, message: "当前视频模型未提供可用的产品视频策略，请切换模型后再生成。" };
   }
   if (effectiveLastFrameAsset) {
@@ -212,7 +229,12 @@ export function validateGenerationSubmission({
     );
     if (!maskPreflight.ok) return maskPreflight;
   }
-  return { ok: true, productVideoStrategy, effectiveLastFrameAsset };
+  return {
+    ok: true,
+    productVideoStrategy,
+    effectiveLastFrameAsset,
+    videoImageInputMode,
+  };
 }
 
 export function prepareGenerationSubmission({
@@ -221,6 +243,7 @@ export function prepareGenerationSubmission({
   subjectProfile,
   productVideoStrategy,
   effectiveLastFrameAsset,
+  videoImageInputMode,
   pendingGenerateRequestRef,
 }) {
   const { payload, ratioOption } = buildGenerationPayload({
@@ -232,6 +255,7 @@ export function prepareGenerationSubmission({
     productProfile: subjectProfile.productProfile,
     productProfileSource: subjectProfile.productProfileSource,
     productVideoTemplate: productVideoStrategy.effectiveValue || input.productVideoTemplate,
+    videoImageInputMode,
   });
   payload.client_request_id = generateClientRequestId(
     pendingGenerateRequestRef,

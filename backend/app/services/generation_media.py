@@ -76,6 +76,7 @@ def gateway_reference_image(
     min_side: int = 1,
     max_side: int = 384,
     prefer_original_upload: bool = False,
+    prefer_original_generated: bool = False,
     quality: int = 82,
     subsampling: int = 2,
     return_content_hash: bool = False,
@@ -94,6 +95,7 @@ def gateway_reference_image(
             min_side=min_side,
             max_side=max_side,
             prefer_original_upload=prefer_original_upload,
+            prefer_original_generated=prefer_original_generated,
             quality=quality,
             subsampling=subsampling,
             return_content_hash=return_content_hash,
@@ -121,7 +123,12 @@ def _asset_image_bytes_for_mask(db, task: GenTask | int, url: str | None) -> byt
     elif key.startswith(("upload/", "upload_preview/", "upload_video/", "upload_video_preview/")):
         raise RuntimeError("上传素材不存在")
     else:
-        path = asset_refs.generated_asset_reference_path(db, user_id, key)
+        path = asset_refs.generated_asset_reference_path(
+            db,
+            user_id,
+            key,
+            prefer_original=True,
+        )
     if not path.exists() or not path.is_file():
         raise RuntimeError("素材文件不存在")
     return Path(path).read_bytes()

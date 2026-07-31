@@ -555,7 +555,7 @@ export default function useGenerationSubmit({
       setMsg(preflight.message);
       return;
     }
-    const { productVideoStrategy, effectiveLastFrameAsset } = preflight;
+    const { productVideoStrategy, effectiveLastFrameAsset, videoImageInputMode } = preflight;
 
     setSubmitting(true);
     setMsg("");
@@ -613,6 +613,7 @@ export default function useGenerationSubmit({
         subjectProfile,
         productVideoStrategy,
         effectiveLastFrameAsset,
+        videoImageInputMode,
         pendingGenerateRequestRef,
       });
       requestId = payload.client_request_id;

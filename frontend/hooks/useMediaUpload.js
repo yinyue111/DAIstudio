@@ -517,6 +517,8 @@ export default function useMediaUpload({
       productObjectUrlsRef.current[mode] = previewUrl;
       setWorkspacePatch({
         productAsset: asset,
+        editMaskMode: "protect_subject",
+        productPixelLockMode: "auto",
         productProfile: null,
         productProfileSource: "",
         portraitProfile: null,
@@ -561,6 +563,8 @@ export default function useMediaUpload({
     revokeProductObjectUrl(mode);
     setWorkspacePatch({
       productAsset: asset,
+      editMaskMode: "protect_subject",
+      productPixelLockMode: "auto",
       productProfile: null,
       productProfileSource: "",
       portraitProfile: null,

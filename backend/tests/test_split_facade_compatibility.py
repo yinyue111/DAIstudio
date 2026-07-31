@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import ast
+import subprocess
+import sys
 from pathlib import Path
 
 from app.services import (
@@ -36,6 +38,21 @@ from app.services import (
 
 APP_DIR = Path(__file__).resolve().parents[1] / "app"
 SERVICES_DIR = APP_DIR / "services"
+
+
+def test_generation_service_modules_support_cold_imports():
+    for module in (
+        "app.services.generation_request",
+        "app.services.generation_video_submit",
+    ):
+        completed = subprocess.run(
+            [sys.executable, "-c", f"import {module}"],
+            cwd=APP_DIR.parent,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert completed.returncode == 0, completed.stderr
 
 # Stable application entry points retained while implementation modules move.
 # Private helpers remain covered by focused monkeypatch tests; this manifest is

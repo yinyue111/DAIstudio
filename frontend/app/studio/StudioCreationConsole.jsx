@@ -64,9 +64,9 @@ export default function StudioCreationConsole({ controller }) {
     url, updateReferenceUrl, lastFrameAsset, productAsset, productProfile,
     portraitProfile, parsing, uploading, productProfiling, subjectProtection,
     subjectProtectionLoading, effectiveLastFrameAsset, firstLastFrameEnabled,
-    videoRequiresFirstFrame, providerVideoEditMode,
+    videoRequiresFirstFrame, providerVideoEditMode, videoSubjectImageInputMode,
     productDetailAssets, productDetailValidation, productDetailLimit, appliedUrl,
-    profileOperation, reverseSources, imageUploadInputRef, productUploadInputRef,
+    profileOperation, parseNotice, reverseSources, imageUploadInputRef, productUploadInputRef,
     productDetailUploadInputRef, lastFrameUploadInputRef, videoUploadInputRef, clearRef,
     clearProductAsset, doParse, doUploadImage, doUploadProductImage,
     doUploadProductDetailImages, doUploadLastFrameImage, setAssetPicker, doUploadVideo,
@@ -215,6 +215,7 @@ export default function StudioCreationConsole({ controller }) {
                 maskEditSupported={maskEditSupported}
                 productPixelLockMode={productPixelLockMode}
                 onProductPixelLockModeChange={setProductPixelLockMode}
+                subjectAsset={productAsset}
                 subjectProtection={subjectProtection}
                 subjectProtectionLoading={subjectProtectionLoading}
                 negative={negative}
@@ -235,6 +236,7 @@ export default function StudioCreationConsole({ controller }) {
             lastFrameAsset={effectiveLastFrameAsset}
             firstLastFrameEnabled={firstLastFrameEnabled}
             videoRequiresFirstFrame={videoRequiresFirstFrame}
+            videoSubjectImageInputMode={videoSubjectImageInputMode}
             productAsset={productAsset}
             productDetailAssets={productDetailAssets}
             productDetailValidation={productDetailValidation}
@@ -247,6 +249,7 @@ export default function StudioCreationConsole({ controller }) {
             productBusy={submitting}
             productProfiling={productProfiling}
             profileOperation={profileOperation}
+            parseNotice={parseNotice}
             assets={assets}
             refOpen={refOpen}
             setRefOpen={setRefOpen}
