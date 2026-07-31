@@ -39,6 +39,8 @@ export type PromptOptimizationContext = {
   subjectProfileSource?: string;
   targetModelId?: string;
   targetModelProvider?: string;
+  targetModelConfigId?: number | string | null;
+  optimizerModelConfigId?: number | string | null;
   optimizationDirection?: PromptOptimizationDirection;
   optimizationTargetLanguage?: "zh-CN" | "en";
 };
@@ -64,6 +66,8 @@ export function promptOptimizationContextKey(context: PromptOptimizationContext)
     String(context.subjectProfileSource || ""),
     String(context.targetModelId || ""),
     String(context.targetModelProvider || ""),
+    String(context.targetModelConfigId || ""),
+    String(context.optimizerModelConfigId || ""),
     String(context.optimizationDirection || "faithful"),
     String(context.optimizationTargetLanguage || "en"),
   ]);
@@ -75,6 +79,17 @@ export function isPromptOptimizationResultCurrent(
   currentContextKey: string | undefined,
 ): boolean {
   return request.id === currentRequestId && request.contextKey === currentContextKey;
+}
+
+export function isPromptOptimizationProposalCurrent(
+  proposal: Record<string, unknown> | null | undefined,
+  currentContextKey: string,
+): boolean {
+  return Boolean(
+    proposal
+    && String(proposal.context_key || "")
+    && String(proposal.context_key) === currentContextKey,
+  );
 }
 
 export type PromptOptimizationSegment = {
@@ -99,6 +114,7 @@ export type PromptOptimizationDisplayProposal = PromptOptimizationProposal & {
   model_name: string;
   direction: PromptOptimizationDirection;
   optimization_kind?: "rewrite" | "model_compile";
+  context_key?: string;
   [key: string]: unknown;
 };
 

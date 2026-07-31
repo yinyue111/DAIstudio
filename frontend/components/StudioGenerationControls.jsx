@@ -19,12 +19,15 @@ export default function StudioGenerationControls({
   imageCount,
   n,
   onImageCountChange,
+  minVideoDuration = 1,
   maxVideoDuration,
   videoDuration,
   vDuration,
   onVideoDurationChange,
   vResolution,
   onVideoResolutionChange,
+  videoQualityOptions = VIDEO_QUALITIES,
+  providerVideoEditMode = false,
   isEditMode = false,
   productGenerationMode = false,
   portraitGenerationMode = false,
@@ -34,6 +37,7 @@ export default function StudioGenerationControls({
   onSeedChange,
   editMaskMode = "protect_subject",
   onEditMaskModeChange,
+  maskEditSupported = true,
   productPixelLockMode = "auto",
   onProductPixelLockModeChange,
   subjectProtection = null,
@@ -118,7 +122,7 @@ export default function StudioGenerationControls({
   return (
     <>
       <div className="grid min-w-0 gap-3 px-1 py-1">
-        <div className="min-w-0">
+        {!providerVideoEditMode && <div className="min-w-0">
           <span className="text-xs text-fog">比例</span>
           <div className="no-scrollbar mt-1 flex gap-1 overflow-x-auto pb-1">
             {ratioOptions.map((r) => (
@@ -139,7 +143,7 @@ export default function StudioGenerationControls({
               </button>
             ))}
           </div>
-        </div>
+        </div>}
 
         {category === "image" ? (
           <div className="grid min-w-0 gap-3 sm:grid-cols-2">
@@ -192,7 +196,7 @@ export default function StudioGenerationControls({
                 />
               </div>
             </div>
-            {isEditMode && productGenerationMode && !portraitGenerationMode && (
+            {isEditMode && productGenerationMode && !portraitGenerationMode && maskEditSupported && (
               <div className={`${controlCardClass} sm:col-span-2`}>
                 <div className="flex min-w-0 items-center justify-between gap-3">
                   <span className={controlLabelClass}>编辑保护</span>
@@ -275,16 +279,20 @@ export default function StudioGenerationControls({
               </div>
             )}
           </div>
-        ) : (
+        ) : providerVideoEditMode ? null : (
           <div className="grid min-w-0 gap-3 sm:grid-cols-[minmax(0,1fr)_minmax(0,0.8fr)]">
             <div className={controlCardClass}>
               <div className="flex min-w-0 items-center justify-between gap-3">
                 <span className={controlLabelClass}>时长</span>
-                <span className="text-xs text-fog">最长 {formatDuration(maxVideoDuration)}</span>
+                <span className="text-xs text-fog">
+                  {formatDuration(minVideoDuration)}–{formatDuration(maxVideoDuration)}
+                </span>
               </div>
               <div className="mt-2 grid min-w-0 grid-cols-[minmax(0,1fr)_5.5rem] items-center gap-2">
                 <div className={scrollPillRowClass}>
-                  {VIDEO_DURATION_PRESETS.filter((p) => p.seconds <= maxVideoDuration).map((p) => (
+                  {VIDEO_DURATION_PRESETS.filter(
+                    (p) => p.seconds >= minVideoDuration && p.seconds <= maxVideoDuration,
+                  ).map((p) => (
                     <button
                       key={p.seconds}
                       type="button"
@@ -299,19 +307,21 @@ export default function StudioGenerationControls({
                 <input
                   className="input h-[38px] min-w-0 px-2 py-1 text-center text-xs"
                   type="number"
-                  min="1"
+                  min={minVideoDuration}
                   max={maxVideoDuration}
                   value={vDuration}
                   onChange={(e) => onVideoDurationChange(e.target.value)}
-                  onBlur={() => onVideoDurationChange(boundedVideoDuration(vDuration, maxVideoDuration))}
-                  title={`最长 ${formatDuration(maxVideoDuration)}`}
+                  onBlur={() => onVideoDurationChange(
+                    boundedVideoDuration(vDuration, maxVideoDuration, minVideoDuration),
+                  )}
+                  title={`${formatDuration(minVideoDuration)}–${formatDuration(maxVideoDuration)}`}
                 />
               </div>
             </div>
             <div className={controlCardClass}>
               <span className={controlLabelClass}>质量</span>
               <div className={`${scrollPillRowClass} mt-2`}>
-                {VIDEO_QUALITIES.map((q) => (
+                {videoQualityOptions.map((q) => (
                   <button
                     key={q.key}
                     type="button"

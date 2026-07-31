@@ -195,6 +195,8 @@ def _gen_image_via_anthropic_messages(
 ) -> ImageBatchResult:
     from . import gateway as _gw
 
+    if "mask" in extra:
+        raise GatewayError("Anthropic Messages 图片适配器不支持蒙版编辑")
     max_tokens = int(extra.pop("message_max_tokens", 4096) or 4096)
     if refs:
         request_prompt = (
@@ -282,7 +284,8 @@ def _grok_image_edit_payload(
 ) -> dict:
     extra.pop("edit_payload_format", None)
     extra.pop("_edit_payload_format", None)
-    extra.pop("mask", None)
+    if "mask" in extra:
+        raise GatewayError("Grok 图片适配器不支持蒙版编辑")
     payload = _grok_image_payload(image_model_id, prompt, size, extra)
     sources = [{"type": "image_url", "url": ref} for ref in refs]
     if len(sources) == 1:
@@ -726,10 +729,9 @@ def gen_image(
 ) -> list[bytes]:
     """Returns a list of raw image bytes (already downloaded / decoded).
 
-    If a reference image + an edit endpoint are provided (reverse-off,
-    image+instruction -> image), call the image-to-image endpoint; otherwise
-    fall back to plain text -> image. This keeps the default path safe even
-    when the gateway has no edit endpoint configured.
+    If reference images are provided, an edit endpoint is required. Ignoring
+    those references and silently falling back to text-to-image would produce
+    a valid-looking result that does not honor the user's source material.
     """
     from . import gateway as _gw
 
@@ -762,6 +764,8 @@ def gen_image(
             gateway_config=gateway_config,
         )
     if image_transport == "grok_images":
+        if "mask" in extra:
+            raise GatewayError("Grok 图片适配器不支持蒙版编辑")
         if refs:
             if not edit_path:
                 raise GatewayError("Grok 图片编辑需要配置 edit_path")
@@ -791,8 +795,14 @@ def gen_image(
     extra.setdefault("quality", _image_quality_for_size(size))
     extra.setdefault("output_format", "jpeg")
     extra.setdefault("output_compression", 100)
+    if "mask" in extra and not refs:
+        raise GatewayError("图片蒙版编辑必须提供参考图")
+    if refs and not edit_path:
+        raise GatewayError("当前图片模型未配置参考图编辑端点 edit_path")
     if refs and edit_path:
         edit_payload_format = _image_edit_payload_format(edit_path, extra)
+        if "mask" in extra and edit_payload_format != "multipart":
+            raise GatewayError("图片蒙版编辑仅支持 multipart 编辑请求")
         if edit_payload_format == "multipart":
             form_data, files = _image_edit_multipart_parts(
                 model=image_model_id,

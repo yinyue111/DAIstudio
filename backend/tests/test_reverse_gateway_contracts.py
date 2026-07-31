@@ -67,7 +67,17 @@ def test_video_template_requires_main_model_subject_tracking_and_pose_per_multif
     assert "初态→过程→终态" in template
     assert "不得缩写" in template
     assert "如何接触" in template
-    assert "每镜都填" in template
+    assert "全片基线只写一次" in template
+    assert "一个主要可见变化" in template
+    assert "明确完成状态" in template
+    assert "visual 只写本镜开场可见画面" in template
+    assert "action、camera、lighting" in template
+    assert "与全片基线完全相同时可留空" in template
+    assert "包装原字：" in template
+    assert "后期字幕：" in template
+    assert "全片持续背景音乐只写在全局音效字段" in template
+    assert "类别、数量、稳定外观、产品结构/包装等跨镜头不可变身份特征" in template
+    assert '"主体": "类别、数量、外观、产品结构/包装特征、位置、朝向和初始状态"' not in template
     assert "几何结构" in template
     assert "内部硬切" in template
     for field in (

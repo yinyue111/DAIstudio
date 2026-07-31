@@ -35,6 +35,7 @@ import {
   buildReverseOperationRequestSnapshotV3,
   workspacePatchFromReverseSnapshot,
 } from "../app/studio/reverseSnapshot";
+import { clearReverseLineage } from "../app/studio/workspaceReset";
 import {
   normalizeReverseConfig,
   reverseConfigForSourceChange,
@@ -553,12 +554,12 @@ export default function useReferenceParsing({
       appliedUrl: String(asset.source_page_url || "").trim(),
       ...(previousSignature !== nextSignature
         ? {
+            ...clearReverseLineage(),
             structured: {},
             structuredBaseline: {},
             structuredDirty: false,
             structuredSource: "",
             reverseVideoAnalysis: null,
-            reverseOperation: null,
             reverseConfig: reverseConfigForSourceChange(current.reverseConfig),
             ...(
               current.promptSourceSignature
@@ -657,7 +658,7 @@ export default function useReferenceParsing({
         structuredDirty: false,
         structuredSource: "",
         reverseVideoAnalysis: null,
-        reverseOperation: null,
+        ...clearReverseLineage(),
         ...(current.promptSourceSignature && !current.promptDirty
           ? { prompt: "", promptSourceSignature: "", promptDirty: false }
           : { promptSourceSignature: "" }),

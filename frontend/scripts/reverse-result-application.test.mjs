@@ -148,7 +148,7 @@ test("restoring a user-edit revision marks its prompt as authored content", () =
   const actionsSource = readFileSync(new URL("../hooks/useReverseResultActions.js", import.meta.url), "utf8");
   assert.match(
     actionsSource,
-    /restoredPayload\s*=\s*withEvidenceBackedVideoGenerationDraft\(revision\.payload, category\)/,
+    /preserveStored:\s*revision\.source === "user_edit"/,
   );
   assert.match(
     actionsSource,

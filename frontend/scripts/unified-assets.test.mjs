@@ -109,8 +109,8 @@ assert.match(
 );
 assert.match(
   studioSource,
-  /role === "reverse_source"[\s\S]*mediaType: category === "video" \? "video" : "image"/,
-  "the reverse source picker must filter assets to the active media mode",
+  /role === "reverse_source"[\s\S]*mediaType: category === "video" && !videoRequiresFirstFrame \? "all" : "image"/,
+  "video reverse should allow both media types unless the selected model requires an image first frame",
 );
 
 console.log("unified asset tests passed");

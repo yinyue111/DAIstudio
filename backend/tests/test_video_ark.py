@@ -75,8 +75,8 @@ def test_ark_content_image_to_video_with_last_frame():
 
 def test_seedance_15_ark_payload_assigns_both_frame_roles():
     payload = gateway._ark_payload(
-        "animate between two frames",
         "doubao-seedance-1-5-pro-251215",
+        "animate between two frames",
         {
             "first_frame_image": "http://x/first.png",
             "last_frame_image": "http://x/last.png",
@@ -87,6 +87,66 @@ def test_seedance_15_ark_payload_assigns_both_frame_roles():
         "first_frame",
         "last_frame",
     ]
+
+
+@pytest.mark.parametrize(
+    "params, message",
+    [
+        (
+            {"product_reference_image": "http://x/product.png"},
+            "不支持独立参考图",
+        ),
+        (
+            {"source_video_url": "http://x/source.mp4"},
+            "不支持视频参考输入",
+        ),
+    ],
+)
+def test_seedance_15_ark_payload_rejects_unsupported_frozen_task_inputs(
+    params,
+    message,
+):
+    with pytest.raises(ValueError, match=message):
+        gateway._ark_payload(
+            "doubao-seedance-1-5-pro-251215",
+            "animate",
+            params,
+        )
+
+
+def test_seedance_20_ark_payload_rejects_frame_and_multimodal_reference_mix():
+    with pytest.raises(ValueError, match="不能与多模态参考图"):
+        gateway._ark_payload(
+            "doubao-seedance-2-0-pro-260128",
+            "animate",
+            {
+                "first_frame_image": "http://x/first.png",
+                "product_reference_image": "http://x/product.png",
+            },
+        )
+
+
+def test_seedance_20_ark_payload_rejects_more_than_nine_independent_images():
+    with pytest.raises(ValueError, match="最多支持 9 张"):
+        gateway._ark_payload(
+            "doubao-seedance-2-0-pro-260128",
+            "animate",
+            {
+                "product_reference_image": "http://x/product.png",
+                "product_detail_images": [
+                    f"http://x/detail-{index}.png" for index in range(1, 10)
+                ],
+            },
+        )
+
+
+def test_seedance_ark_payload_rejects_last_frame_without_first_frame():
+    with pytest.raises(ValueError, match="尾帧必须配合首帧"):
+        gateway._ark_payload(
+            "doubao-seedance-2-0-pro-260128",
+            "animate",
+            {"last_frame_image": "http://x/last.png"},
+        )
 
 
 def test_ark_content_keeps_same_image_for_distinct_first_and_last_frame_roles():

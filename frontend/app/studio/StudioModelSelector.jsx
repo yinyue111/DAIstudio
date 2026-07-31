@@ -83,14 +83,14 @@ function capabilityValue(capabilities, aliases) {
   if (!capabilities || typeof capabilities !== "object") return null;
   const declared = aliases.filter((alias) => Object.prototype.hasOwnProperty.call(capabilities, alias));
   if (!declared.length) return null;
-  return declared.some((alias) => capabilities[alias] !== false);
+  return declared.some((alias) => capabilities[alias] === true);
 }
 
 export function modelOptionSupports(option, requirements = []) {
   if (!option || !requirements.length) return true;
   const capabilities = option.capabilities;
   if (!capabilities) return true;
-  return requirements.every((aliases) => capabilityValue(capabilities, aliases) !== false);
+  return requirements.every((aliases) => capabilityValue(capabilities, aliases) === true);
 }
 
 export function strictMultiReferenceLimit(option) {
@@ -110,7 +110,7 @@ export function validateMultiReferenceSelection(option, requiredCount, detailCou
     return {
       ok: false,
       limit: 0,
-      message: "当前模型未明确支持多参考图，不能添加产品细节图。",
+      message: "当前模型未明确支持多张参考图，不能同时提交这些图片。",
     };
   }
   const required = Number(requiredCount || 0);
@@ -124,7 +124,14 @@ export function validateMultiReferenceSelection(option, requiredCount, detailCou
   return { ok: true, limit, message: "" };
 }
 
-export function modelRequirements({ use, creationMode, selected, productAsset, subjectMode }) {
+export function modelRequirements({
+  use,
+  creationMode,
+  selected,
+  productAsset,
+  subjectMode,
+  analysisOnlySourceVideo = false,
+}) {
   if (use === "prompt") return [["prompt_optimization", "optimize_prompt", "text"]];
   if (use === "vision") {
     if (productAsset && subjectMode === "portrait") return [["portrait_profile"]];
@@ -133,22 +140,24 @@ export function modelRequirements({ use, creationMode, selected, productAsset, s
     return [["image_analysis", "image_input", "vision"]];
   }
   if (use === "image") {
-    const requirements = creationMode === "image_edit"
+    const hasImageReference = Boolean(selected || productAsset);
+    const requirements = creationMode === "image_edit" || hasImageReference
       ? [["image_to_image", "image_edit", "edit"]]
       : [["image_generation", "text_to_image", "image"]];
-    if (creationMode !== "image_edit" && selected) {
+    if (hasImageReference) {
       requirements.push(["reference_image", "image_reference", "image_input"]);
-    } else if (selected && productAsset) {
+    }
+    if (selected && productAsset) {
       requirements.push(["multi_reference", "reference_image", "image_reference"]);
     }
     return requirements;
   }
   if (use === "video") {
     const requirements = [];
-    if (creationMode === "video_edit" || productAsset || selected?.type === "image") {
+    if (selected?.type === "video" && !analysisOnlySourceVideo) {
+      requirements.push(["video_reference", "video_edit", "video_to_video", "reference_video"]);
+    } else if (creationMode === "video_edit" || productAsset || selected?.type === "image") {
       requirements.push(["image_to_video", "reference_image", "image_reference"]);
-    } else if (selected?.type === "video") {
-      requirements.push(["video_to_video", "reference_video", "video_reference"]);
     } else {
       requirements.push(["video_generation", "text_to_video", "video"]);
     }
@@ -165,6 +174,31 @@ export function filterModelOptions(options, context) {
   return (Array.isArray(options) ? options : []).filter((option) => (
     modelOptionSupports(option, requirements)
   ));
+}
+
+function referenceImageCount({ selected, productAsset, productDetailAssets = [] }) {
+  const references = [selected, productAsset, ...productDetailAssets];
+  return new Set(references.flatMap((asset) => {
+    if (!asset || asset.type === "video") return [];
+    const identity = String(asset.url || asset.id || asset.local_path || "").trim();
+    return identity ? [identity] : [];
+  })).size;
+}
+
+export function markGenerationModelCompatibility(options, context) {
+  const requirements = modelRequirements(context);
+  const requiredImages = referenceImageCount(context);
+  return (Array.isArray(options) ? options : []).map((option) => {
+    let message = "";
+    if (!modelOptionSupports(option, requirements)) {
+      message = "当前模型不支持已选择的素材类型";
+    } else if (requiredImages > 1 && strictMultiReferenceLimit(option) < requiredImages) {
+      message = `当前素材需要 ${requiredImages} 张参考图，模型未提供足够的多图能力`;
+    }
+    return message
+      ? { ...option, selection_disabled: true, selection_disabled_reason: message }
+      : option;
+  });
 }
 
 export function resolveModelConfigId(options, preferredId) {
@@ -234,8 +268,13 @@ export default function StudioModelSelector({
           {options.length === 0 ? (
             <option value="">暂无可用模型</option>
           ) : options.map((option) => (
-            <option key={option.id} value={String(option.id)}>
-              {modelOptionName(option)}
+            <option
+              key={option.id}
+              value={String(option.id)}
+              disabled={option.selection_disabled === true}
+              title={option.selection_disabled_reason || undefined}
+            >
+              {modelOptionName(option)}{option.selection_disabled ? "（当前素材不支持）" : ""}
             </option>
           ))}
         </select>

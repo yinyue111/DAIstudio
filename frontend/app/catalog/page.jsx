@@ -57,17 +57,21 @@ const TOOL_META = {
 const CAPABILITY_LABELS = {
   text_to_image: "文生图",
   image_to_image: "图片编辑",
-  reference_image: "参考图",
-  multi_reference: "多参考图",
+  mask_edit: "蒙版编辑",
+  reference_image: "独立参考图",
+  multi_reference: "多图参考",
   text_to_video: "文生视频",
-  image_to_video: "图生视频",
-  video_to_video: "视频编辑",
+  image_to_video: "首帧图生视频",
+  video_reference: "视频参考",
+  video_edit: "视频编辑",
+  audio_reference: "音频参考输入",
+  generated_audio: "生成同步音频",
   first_last_frame: "首尾帧",
-  product_profile: "商品保真",
-  portrait_profile: "人物保真",
+  product_profile: "商品档案识别",
+  portrait_profile: "人物档案识别",
   prompt_optimization: "提示词优化",
   image_analysis: "图片反推",
-  video_analysis: "视频反推",
+  video_analysis: "视频反推（平台抽帧分析）",
 };
 
 function capabilityLabels(capabilities) {
@@ -100,8 +104,12 @@ const CONSTRAINT_ROWS = [
   ["aspect_ratios", "画幅比例"],
   ["resolutions", "分辨率"],
   ["durations", "可选时长"],
+  ["min_duration_seconds", "最短时长"],
   ["max_duration_seconds", "最长时长"],
-  ["max_reference_images", "最大参考图"],
+  ["max_reference_duration_seconds", "参考图模式最长时长"],
+  ["max_reference_images", "平台最多参考图"],
+  ["max_reference_videos", "平台最多视频输入"],
+  ["max_reference_audio", "平台最多音频输入"],
 ];
 
 function hasCapability(capabilities, key) {
@@ -124,7 +132,12 @@ function constraintValue(model, key) {
   const value = capabilities[key];
   if (Array.isArray(value)) return value.length ? value.join(" / ") : "未声明";
   if (key === "max_reference_images") return `${value} 张`;
-  if (key === "max_duration_seconds") return `${value} 秒`;
+  if (["max_reference_videos", "max_reference_audio"].includes(key)) {
+    return `${value} 个`;
+  }
+  if (["min_duration_seconds", "max_duration_seconds", "max_reference_duration_seconds"].includes(key)) {
+    return `${value} 秒`;
+  }
   return String(value);
 }
 

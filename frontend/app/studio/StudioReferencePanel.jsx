@@ -244,6 +244,7 @@ export default function StudioReferencePanel({
   selected,
   lastFrameAsset = null,
   firstLastFrameEnabled = false,
+  videoRequiresFirstFrame = false,
   productAsset,
   productDetailAssets = [],
   productDetailValidation = { ok: true, message: "" },
@@ -326,26 +327,29 @@ export default function StudioReferencePanel({
   const portraitGenerationMode = subjectMode === "portrait";
   const productSubjectMode = productGenerationMode || directProductVideoMode;
   const productActionBusy = Boolean(uploading || productBusy);
+  const firstFrameInputEnabled = firstLastFrameEnabled || videoRequiresFirstFrame;
   const imageUploadTargetsProduct = isImageEditMode && productGenerationMode && !productAsset;
   const imageUploadLabel = imageUploadTargetsProduct
     ? "上传产品主体"
-    : firstLastFrameEnabled
-      ? (selected?.type === "image" ? "替换首帧" : "上传首帧")
+    : firstFrameInputEnabled
+      ? (selected?.type === "image" ? "替换视频首帧" : "上传视频首帧")
     : isImageEditMode
       ? "上传风格参考图"
       : directProductVideoMode
       ? "上传图片参考"
       : "上传图片";
-  const modeTitle = firstLastFrameEnabled
-    ? "首尾帧视频"
+  const modeTitle = firstFrameInputEnabled
+    ? (firstLastFrameEnabled ? "首尾帧视频" : "首帧图生视频")
     : isEditMode
     ? (creationMode === "video_edit" ? (portraitGenerationMode ? "视频人物重构" : "图生视频重构") : "图片编辑")
     : (category === "video" ? "文生视频" : "链接反推");
-  const styleTitle = firstLastFrameEnabled
+  const styleTitle = firstFrameInputEnabled
     ? "视频首帧"
     : isImageEditMode || directProductVideoMode ? "可选风格参考" : (isEditMode ? "风格参考" : "参考素材");
-  const styleDescription = firstLastFrameEnabled
-    ? "上传图片作为视频起始画面；尾帧可在下方单独设置"
+  const styleDescription = firstFrameInputEnabled
+    ? firstLastFrameEnabled
+      ? "上传图片作为视频起始画面；尾帧可在下方单独设置"
+      : "当前模型必须上传图片作为视频首帧"
     : isImageEditMode
     ? (portraitGenerationMode ? "可选：反推另一张图/视频的场景、光线、妆造和画面风格" : "可选：反推另一张图的场景、构图、光线和广告质感")
     : directProductVideoMode
@@ -353,12 +357,12 @@ export default function StudioReferencePanel({
     : isEditMode
     ? (portraitGenerationMode ? "目标视频/风格参考：只迁移动作、镜头、场景和画面质感，不保证逐帧换脸" : "用于反推场景、构图、光线和广告质感")
     : (category === "video" ? "上传视频或粘贴链接做反推" : "上传图片或粘贴链接做反推");
-  const emptyStyleTitle = firstLastFrameEnabled
+  const emptyStyleTitle = firstFrameInputEnabled
     ? "上传视频首帧"
     : isImageEditMode
     ? "添加可选风格参考"
     : (portraitGenerationMode ? "上传目标视频 / 风格参考" : category === "video" ? "上传可选视频 / 图片参考" : "上传图片参考");
-  const emptyStyleHint = firstLastFrameEnabled
+  const emptyStyleHint = firstFrameInputEnabled
     ? "支持 JPG、PNG、WebP 或 GIF"
     : isImageEditMode
     ? "不加也能编辑；需要同款风格时再上传或粘贴链接"
@@ -411,7 +415,7 @@ export default function StudioReferencePanel({
       <div className="relative">
         <div className="mb-3 flex min-w-0 items-start justify-between gap-3">
           <div className="min-w-0">
-            <p className="text-xs font-display font-semibold text-iris-400">{firstLastFrameEnabled ? "首尾帧" : directProductVideoMode ? "产品与参考" : "参考素材"}</p>
+            <p className="text-xs font-display font-semibold text-iris-400">{firstFrameInputEnabled ? "视频首帧" : directProductVideoMode ? "产品与参考" : "参考素材"}</p>
             <h3 className="mt-1 text-lg font-display font-semibold text-snow">
               {modeTitle}
             </h3>
@@ -546,13 +550,13 @@ export default function StudioReferencePanel({
                 <>
                   <ReferenceAssetPreview asset={selected} />
                   <span className="badge absolute left-2 top-2 bg-black/70 text-white">
-                    {firstLastFrameEnabled ? "首帧" : selected.type === "video" ? "视频参考" : "图片参考"}
+                    {firstFrameInputEnabled && selected.type === "image" ? "首帧" : selected.type === "video" ? "视频参考" : "图片参考"}
                   </span>
                 </>
               ) : (
                 <button
                   type="button"
-                  onClick={() => (category === "video" && !firstLastFrameEnabled ? videoUploadInputRef : imageUploadInputRef).current?.click()}
+                  onClick={() => (category === "video" && !firstFrameInputEnabled ? videoUploadInputRef : imageUploadInputRef).current?.click()}
                   className="flex h-full w-full flex-col items-center justify-center gap-3 px-4 text-center transition hover:bg-white/[0.03]"
                 >
                   <span className="flex h-11 w-11 items-center justify-center rounded-full bg-brand text-lg text-white shadow-glow-sm">+</span>
@@ -574,8 +578,10 @@ export default function StudioReferencePanel({
               <div className="truncate text-mist">{selectedLabel(selected)}</div>
               {selected?.type === "image" && selected?.url?.includes("/api/uploads/upload/") && (
                 <div className="mt-1 text-fog">
-                  {firstLastFrameEnabled
-                    ? "作为视频首帧约束起始画面，可在下方继续添加尾帧。"
+                  {firstFrameInputEnabled
+                    ? firstLastFrameEnabled
+                      ? "作为视频首帧约束起始画面，可在下方继续添加尾帧。"
+                      : "作为当前模型必需的视频首帧。"
                     : isEditMode || directProductVideoMode
                     ? "仅作为风格参考，不会覆盖产品主体。"
                     : "可直接作为编辑源生成。"}
@@ -710,7 +716,7 @@ export default function StudioReferencePanel({
           {appliedUrl && appliedUrl !== url.trim() && (
             <p className="truncate text-[11px] text-fog" title={appliedUrl}>当前素材仍来自：{appliedUrl}</p>
           )}
-          <div className="grid grid-cols-2 gap-2">
+          <div className={`grid gap-2 ${videoRequiresFirstFrame ? "grid-cols-1" : "grid-cols-2"}`}>
             <button
               type="button"
               onClick={() => (imageUploadTargetsProduct ? productUploadInputRef : imageUploadInputRef).current?.click()}
@@ -719,18 +725,20 @@ export default function StudioReferencePanel({
             >
               {uploading ? "上传中…" : imageUploadLabel}
             </button>
-            <button
-              type="button"
-              onClick={() => videoUploadInputRef.current?.click()}
-              disabled={uploading}
-              className={`btn-sm justify-center rounded-full font-display font-medium transition ${
-                category === "video"
-                    ? "bg-brand text-white shadow-glow-sm hover:brightness-110 active:scale-[0.98]"
-                    : "border border-line2 bg-white/[0.08] text-snow hover:bg-white/10"
-              }`}
-            >
-              {uploading ? "上传中…" : "上传视频"}
-            </button>
+            {!videoRequiresFirstFrame && (
+              <button
+                type="button"
+                onClick={() => videoUploadInputRef.current?.click()}
+                disabled={uploading}
+                className={`btn-sm justify-center rounded-full font-display font-medium transition ${
+                  category === "video"
+                      ? "bg-brand text-white shadow-glow-sm hover:brightness-110 active:scale-[0.98]"
+                      : "border border-line2 bg-white/[0.08] text-snow hover:bg-white/10"
+                }`}
+              >
+                {uploading ? "上传中…" : "上传视频"}
+              </button>
+            )}
           </div>
           <button
             type="button"

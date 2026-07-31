@@ -1,6 +1,10 @@
 """Pure video-gateway payload and response helpers."""
 from __future__ import annotations
 
+import re
+
+_SEEDANCE_VERSION_RE = re.compile(r"^doubao-seedance-(\d+)-(\d+)(?:-|$)")
+
 VIDEO_STATUS = {
     "succeeded": "succeeded", "success": "succeeded", "completed": "succeeded",
     "complete": "succeeded",
@@ -28,9 +32,19 @@ def _reference_payload_value(value, item_field: str) -> object:
     return {item_field: value} if item_field else value
 
 
+def _normalized_unique_references(values) -> list[str]:
+    normalized = (str(value or "").strip() for value in values)
+    return list(dict.fromkeys(value for value in normalized if value))
+
+
 def generic_video_payload_params(params: dict, extra: dict, model_id: str = "") -> dict:
+    normalized_model_id = str(model_id or "").strip().lower()
+    is_grok_video = str(extra.get("video_transport") or "").strip().lower() == "grok_videos"
     allowed = set(GENERIC_VIDEO_ALLOWED_PARAMS)
     allowed.update(str(k) for k in (extra.get("allowed_param_fields") or []))
+    if is_grok_video:
+        # xAI's generation schema does not accept these generic gateway fields.
+        allowed.difference_update({"seed", "request_id", "prompt_extend", "last_frame_image"})
     payload_params = {
         k: v
         for k, v in dict(params or {}).items()
@@ -49,7 +63,6 @@ def generic_video_payload_params(params: dict, extra: dict, model_id: str = "") 
         and v not in (None, "")
     }
     first_frame = (params or {}).get("first_frame_image")
-    is_grok_video = "grok" in str(model_id or "").strip().lower()
     ratio = payload_params.pop("ratio", None)
     ratio_field = (
         extra.get("ratio_field")
@@ -82,6 +95,37 @@ def generic_video_payload_params(params: dict, extra: dict, model_id: str = "") 
         payload_params[str(last_frame_field)] = last_frame
     product = (params or {}).get("product_reference_image")
     product_details = (params or {}).get("product_detail_images")
+    character = (params or {}).get("character_reference_image")
+    style = (params or {}).get("style_reference_image")
+    source_video = (params or {}).get("source_video_url")
+    is_grok_reference_video = (
+        is_grok_video and normalized_model_id == "grok-imagine-video"
+    )
+    if is_grok_reference_video:
+        if product_details and not product:
+            raise ValueError("产品细节图必须配合产品主题图使用")
+        ordered_references = [
+            product,
+            *list(product_details or []),
+            character,
+            style,
+        ]
+        unique_references = _normalized_unique_references(ordered_references)
+        if unique_references:
+            if first_frame or last_frame or source_video:
+                raise ValueError(
+                    "Grok 独立参考图不能与首帧、尾帧或源视频混用"
+                )
+            if len(unique_references) > 7:
+                raise ValueError("Grok 独立参考图最多支持 7 张")
+            payload_params["reference_images"] = [
+                {"url": value} for value in unique_references
+            ]
+        # All independent image roles share xAI's reference_images field.
+        product = None
+        product_details = None
+        character = None
+        style = None
     product_images_field = str(extra.get("product_images_field") or "").strip()
     if is_grok_video and product_images_field in {"", "images"}:
         # Migrate frozen pre-0076 task snapshots at execution time. Product
@@ -144,19 +188,39 @@ def generic_video_payload_params(params: dict, extra: dict, model_id: str = "") 
             _reference_payload_value(value, detail_item_field)
             for value in product_details
         ]
-    character = (params or {}).get("character_reference_image")
     character_field = extra.get("character_image_field", "character_reference_image")
     if character and character_field:
         payload_params[str(character_field)] = character
-    style = (params or {}).get("style_reference_image")
     style_field = extra.get("style_image_field", "style_reference_image")
     if style and style_field:
         payload_params[str(style_field)] = style
-    # 真·视频参考通道：管理员已声明 video_to_video 能力时，源视频 URL 必须
-    # 进入上游 payload。这里宁可显式报错，也不允许静默退化成"仅首帧"。
-    source_video = (params or {}).get("source_video_url")
+    # A source video is either a provider reference or an edit input. Grok's
+    # edit endpoint has a strict request shape and cannot be combined with
+    # generation-only image or render controls.
     if source_video:
-        video_field = extra.get("video_url_field", "video_url")
+        is_grok_video_edit = (
+            is_grok_video and normalized_model_id == "grok-imagine-video"
+        )
+        if is_grok_video_edit:
+            if any(
+                (params or {}).get(key)
+                for key in (
+                    "first_frame_image",
+                    "reference_image_url",
+                    "last_frame_image",
+                    "product_reference_image",
+                    "product_detail_images",
+                    "character_reference_image",
+                    "style_reference_image",
+                )
+            ):
+                raise ValueError(
+                    "Grok 视频编辑不能同时提交图片参考或首尾帧"
+                )
+            return {"video": {"url": source_video}}
+        video_field = (
+            extra.get("video_url_field", "video_url")
+        )
         if not video_field:
             raise ValueError(
                 "当前视频模型未配置源视频上游字段，无法提交视频参考生成；"
@@ -252,6 +316,57 @@ def _bind_ark_product_reference(text: str, image_number: int) -> str:
     ):
         text = text.replace(marker, product_ref)
     return text
+
+
+def _validate_ark_model_inputs(model_id: str, params: dict) -> None:
+    """Keep frozen Seedance tasks inside the provider's verified input modes."""
+    normalized_model_id = str(model_id or "").strip().lower()
+    match = _SEEDANCE_VERSION_RE.match(normalized_model_id)
+    if match is None:
+        return
+    version = int(match.group(1)), int(match.group(2))
+    first_frame = str(params.get("first_frame_image") or "").strip()
+    last_frame = str(params.get("last_frame_image") or "").strip()
+    if last_frame and not first_frame:
+        raise ValueError("Seedance 尾帧必须配合首帧提交")
+
+    product = str(params.get("product_reference_image") or "").strip()
+    details = params.get("product_detail_images")
+    detail_values = (
+        [str(value).strip() for value in details if str(value or "").strip()]
+        if isinstance(details, list)
+        else []
+    )
+    if detail_values and not product:
+        raise ValueError("产品细节图必须配合产品主题图使用")
+    independent_values = [
+        product,
+        *detail_values,
+        str(params.get("character_reference_image") or "").strip(),
+        str(params.get("style_reference_image") or "").strip(),
+    ]
+    independent_references = list(
+        dict.fromkeys(value for value in independent_values if value)
+    )
+    source_video = str(params.get("source_video_url") or "").strip()
+
+    if version == (1, 5):
+        if independent_references:
+            raise ValueError(
+                "Seedance 1.5 Pro 仅支持首帧或首尾帧，不支持独立参考图"
+            )
+        if source_video:
+            raise ValueError("Seedance 1.5 Pro 不支持视频参考输入")
+        return
+
+    if version != (2, 0):
+        return
+    if (first_frame or last_frame) and (independent_references or source_video):
+        raise ValueError(
+            "Seedance 2.0 的首帧/首尾帧模式不能与多模态参考图或参考视频混用"
+        )
+    if len(independent_references) > 9:
+        raise ValueError("Seedance 2.0 最多支持 9 张独立参考图")
 
 
 def ark_content(prompt: str, params: dict, *, legacy_flags: bool = False) -> list:
@@ -352,6 +467,7 @@ def ark_payload(
     ``ark_legacy_text_flags`` configuration.
     """
     params = params or {}
+    _validate_ark_model_inputs(model_id, params)
     legacy_flags = (extra or {}).get("ark_legacy_text_flags") is True
     payload = {
         "model": model_id,

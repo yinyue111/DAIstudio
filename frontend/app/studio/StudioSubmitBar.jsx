@@ -14,9 +14,9 @@ export default function StudioSubmitBar({
   submit,
   missingRequiredSource,
   missingRequiredSourceLabel,
-  videoModelSwitchRequired,
-  videoModelSwitchMessage,
-  onVideoModelSwitchRequired,
+  modelSwitchRequired,
+  modelSwitchMessage,
+  onModelSwitchRequired,
   structuredDirty,
   submitting,
   parsing,
@@ -42,8 +42,8 @@ export default function StudioSubmitBar({
   });
 
   const handleSubmit = () => {
-    if (videoModelSwitchRequired) {
-      onVideoModelSwitchRequired?.();
+    if (modelSwitchRequired) {
+      onModelSwitchRequired?.();
       return;
     }
     submit(category === "video" ? "final" : "preview");
@@ -79,8 +79,8 @@ export default function StudioSubmitBar({
         disabled={submitDisabled}
         title={missingRequiredSource
           ? `${missingRequiredSourceLabel}后再生成`
-          : videoModelSwitchRequired
-            ? videoModelSwitchMessage
+          : modelSwitchRequired
+            ? modelSwitchMessage
             : structuredDirty
               ? "请先应用结构修改或撤销结构修改"
               : uploadBlocked
@@ -93,8 +93,8 @@ export default function StudioSubmitBar({
         )}
         {missingRequiredSource
           ? missingRequiredSourceLabel
-          : videoModelSwitchRequired
-            ? "请切换视频模型"
+          : modelSwitchRequired
+            ? `请切换${category === "video" ? "视频" : "图片"}模型`
             : uploadBlocked
               ? "素材上传中"
               : submitLabel}

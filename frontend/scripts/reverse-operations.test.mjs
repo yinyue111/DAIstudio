@@ -512,7 +512,10 @@ const evidenceTransfer = composeEvidenceBackedVideoTransferPrompt({
     confidence: 0.9,
   }],
 }, "product");
-assert.match(evidenceTransfer, /镜头1：画面：产品居中；动作：缓慢旋转；运镜：镜头缓慢推近/);
+assert.match(
+  evidenceTransfer,
+  /镜头1：初始画面：产品居中；动作与可见终态：缓慢旋转；运镜：镜头缓慢推近/,
+);
 assert.doesNotMatch(evidenceTransfer, /未证实|新品上市|水滴声|evidence/i);
 assert.ok(evidenceTransfer.length > 0);
 const compressedLongTransfer = composeEvidenceBackedVideoTransferPrompt({}, {
@@ -528,8 +531,8 @@ const compressedLongTransfer = composeEvidenceBackedVideoTransferPrompt({}, {
     confidence: 0.9,
   }],
 }, "");
-assert.match(compressedLongTransfer, /参考片时间线较长/);
-assert.match(compressedLongTransfer, /逐镜分别生成后按顺序合成/);
+assert.doesNotMatch(compressedLongTransfer, /参考片时间线较长|逐镜分别生成后按顺序合成/);
+assert.match(compressedLongTransfer, /深蓝玻璃精华瓶依次展示滴管、液滴和瓶身折射/);
 assert.match(compressedLongTransfer, /镜头1：/);
 assert.doesNotMatch(compressedLongTransfer, /25\.41 秒|镜头1（/);
 const singleFrameTransfer = composeEvidenceBackedVideoTransferPrompt({}, {
@@ -549,7 +552,7 @@ const singleFrameTransfer = composeEvidenceBackedVideoTransferPrompt({}, {
     confidence: 0.95,
   }],
 }, "portrait");
-assert.match(singleFrameTransfer, /画面：产品居中；光线：柔和侧光/);
+assert.match(singleFrameTransfer, /初始画面：产品居中；光线\/材质反馈：柔和侧光/);
 assert.doesNotMatch(singleFrameTransfer, /幻觉旋转|幻觉环绕|幻觉闪白/);
 const missingEvidenceTransfer = composeEvidenceBackedVideoTransferPrompt({}, {
   sampled_frames: [{ index: 1, timestamp_seconds: 0 }],

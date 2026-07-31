@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { buildReverseProfessionalReport } from "../app/studio/reverseProfessionalReport.ts";
 import { summarizeVideoAnalyzerHealth } from "../app/studio/reverseAnalyzerHealth.ts";
 import {
@@ -138,7 +139,7 @@ const draftShots = Array.from({ length: 6 }, (_, index) => ({
   camera: `第${index + 1}镜运镜`,
   lighting: `第${index + 1}镜光线`,
   transition: index < 5 ? "硬切" : "定帧收尾",
-  ocr: index === 2 ? "厚实吸水，画面右侧浮现" : "",
+  ocr: index === 2 ? "后期字幕：厚实吸水，画面右侧浮现" : "",
   audio_cue: index === 2 ? "水滴入水声" : "未分析",
   evidence_frame_indices: [index * 2 + 1, index * 2 + 2],
   confidence: 0.9,
@@ -161,18 +162,20 @@ const richDraft = composeEvidenceBackedVideoGenerationDraft(
     shots: draftShots,
   },
 );
-assert.match(richDraft, /参考片含 6 个高密度剪辑镜头/);
+assert.doesNotMatch(richDraft, /复刻执行|逐镜独立生成/);
 assert.match(richDraft, /镜头1：/);
 assert.match(richDraft, /镜头6：/);
 assert.doesNotMatch(richDraft, /输出规格|720x1280|9:16|36\.00秒|镜头1（/);
-assert.match(richDraft, /主体追踪：第6镜主体连续/);
-assert.match(richDraft, /姿态：第6镜姿态/);
+assert.match(richDraft, /主体轨迹：第6镜主体连续/);
+assert.match(richDraft, /姿态变化：第6镜姿态/);
+assert.match(richDraft, /动作与可见终态：第6镜动作/);
 assert.match(richDraft, /运镜：第6镜运镜/);
 assert.match(richDraft, /主体：蓝色纸巾盒/);
-assert.match(richDraft, /画面字幕：干湿两用/);
-assert.match(richDraft, /画面文字：厚实吸水，画面右侧浮现/);
-assert.match(richDraft, /声音：持续背景音乐/);
-assert.match(richDraft, /声音：水滴入水声/);
+assert.match(richDraft, /后期字幕（后期叠加）：干湿两用/);
+assert.match(richDraft, /后期字幕（后期叠加）：厚实吸水，画面右侧浮现/);
+assert.match(richDraft, /声音基线：持续背景音乐/);
+assert.match(richDraft, /同步声音：水滴入水声/);
+assert.equal((richDraft.match(/持续背景音乐/g) || []).length, 1);
 assert.doesNotMatch(richDraft, /BPM|未分类瞬态声/);
 assert.doesNotMatch(richDraft, /5\.92秒|6\.24秒/);
 assert.doesNotMatch(richDraft, /未分析/);
@@ -219,7 +222,28 @@ const recoveredLegacyDraft = withEvidenceBackedVideoGenerationDraft({
   },
 }, "video");
 assert.doesNotMatch(recoveredLegacyDraft.final_text, /输出规格|608x1080|9:16|10\.05秒/);
-assert.match(recoveredLegacyDraft.final_text, /镜头1：画面：纸巾盒居中；动作：缓慢展开纸巾/);
+assert.match(recoveredLegacyDraft.final_text, /镜头1：初始画面：纸巾盒居中；动作与可见终态：缓慢展开纸巾/);
+
+const recoveredLegacyStructureDraft = withEvidenceBackedVideoGenerationDraft({
+  structured: { 主体: "蓝色纸巾盒" },
+  final_text: "复刻执行：建议逐镜独立生成。\n镜头1：画面：纸巾盒居中；动作：缓慢展开纸巾",
+  video_analysis: {
+    sampled_frames: [
+      { index: 1, timestamp_seconds: 0 },
+      { index: 2, timestamp_seconds: 2 },
+    ],
+    shots: [{
+      start_seconds: 0,
+      end_seconds: 2,
+      visual: "纸巾盒居中",
+      action: "缓慢展开纸巾并停在盒体前方",
+      evidence_frame_indices: [1, 2],
+      confidence: 0.9,
+    }],
+  },
+}, "video");
+assert.doesNotMatch(recoveredLegacyStructureDraft.final_text, /复刻执行|镜头1：画面：/);
+assert.match(recoveredLegacyStructureDraft.final_text, /动作与可见终态：缓慢展开纸巾并停在盒体前方/);
 
 const recoveredAudioMetricDraft = withEvidenceBackedVideoGenerationDraft({
   structured: {
@@ -229,7 +253,7 @@ const recoveredAudioMetricDraft = withEvidenceBackedVideoGenerationDraft({
   final_text: "主体：蓝色纸巾盒\n声音：节拍约 170.5 BPM；检测到 2 个未分类瞬态声",
   video_analysis: { shots: [] },
 }, "video");
-assert.match(recoveredAudioMetricDraft.final_text, /声音：持续背景音乐/);
+assert.match(recoveredAudioMetricDraft.final_text, /声音基线：持续背景音乐/);
 assert.doesNotMatch(recoveredAudioMetricDraft.final_text, /BPM|未分类瞬态声/);
 
 const restoredCloudDraft = normalizeRestoredVideoPrompt({
@@ -274,10 +298,81 @@ const restoredCloudDraft = normalizeRestoredVideoPrompt({
     },
   },
 });
-assert.match(restoredCloudDraft.video.prompt, /镜头1：画面：纸巾盒置于云层中央/);
+assert.match(restoredCloudDraft.video.prompt, /镜头1：初始画面：纸巾盒置于云层中央/);
 assert.match(
   restoredCloudDraft.video.pendingReverseResult.result.final_text,
-  /镜头1：画面：洗脸巾包装悬挂在墙面；动作：手从下方抽出一张洗脸巾/,
+  /镜头1：初始画面：洗脸巾包装悬挂在墙面；动作与可见终态：手从下方抽出一张洗脸巾/,
+);
+
+const productRatioDraft = composeEvidenceBackedVideoGenerationDraft(
+  {
+    主体: "瓶身高宽比 3:1，银灰圆柱结构",
+    视角构图: "视频画幅 9:16，产品居中",
+    广告目标: "建立品牌信任",
+    氛围情绪: "高级、舒缓",
+  },
+  { shots: [] },
+);
+assert.match(productRatioDraft, /高宽比 3:1/);
+assert.doesNotMatch(productRatioDraft, /9:16|建立品牌信任|高级、舒缓/);
+
+const separatedTextDraft = composeEvidenceBackedVideoGenerationDraft(
+  { 主体: "银灰圆柱精华瓶" },
+  {
+    sampled_frames: [
+      { index: 1, timestamp_seconds: 0 },
+      { index: 2, timestamp_seconds: 1 },
+    ],
+    shots: [{
+      visual: "精华瓶正面定帧",
+      ocr: "包装原字：DAMAH 50ml；后期字幕：清透保湿",
+      evidence_frame_indices: [1, 2],
+      confidence: 0.9,
+    }],
+  },
+);
+assert.match(separatedTextDraft, /包装原字：DAMAH 50ml/);
+assert.match(separatedTextDraft, /后期字幕（后期叠加）：清透保湿/);
+
+const neutralUnprefixedOcrDraft = composeEvidenceBackedVideoGenerationDraft(
+  { 主体: "银灰圆柱精华瓶", 字幕卖点: "清透保湿" },
+  {
+    sampled_frames: [{ index: 1, timestamp_seconds: 0 }],
+    shots: [{
+      visual: "标签正面定帧",
+      ocr: "清透保湿",
+      evidence_frame_indices: [1],
+      confidence: 0.9,
+    }],
+  },
+);
+assert.match(neutralUnprefixedOcrDraft, /可见原字：清透保湿/);
+
+const sharedDraftFixture = JSON.parse(readFileSync(
+  new URL("../../backend/tests/fixtures/video_generation_draft_contract.json", import.meta.url),
+  "utf8",
+));
+const sharedFrontendDraft = composeEvidenceBackedVideoGenerationDraft(
+  sharedDraftFixture.structured,
+  sharedDraftFixture.video_analysis,
+);
+assert.equal(sharedFrontendDraft, sharedDraftFixture.expected);
+assert.equal((sharedFrontendDraft.match(/全新上市/g) || []).length, 1);
+assert.equal((sharedFrontendDraft.match(/持续背景音乐/g) || []).length, 1);
+assert.doesNotMatch(sharedFrontendDraft, /\[\]/);
+
+const userEditedHistoricalResult = {
+  final_text: "用户手写短稿，必须原样保留",
+  structured: sharedDraftFixture.structured,
+  video_analysis: sharedDraftFixture.video_analysis,
+};
+assert.strictEqual(
+  withEvidenceBackedVideoGenerationDraft(
+    userEditedHistoricalResult,
+    "video",
+    { preserveStored: true },
+  ),
+  userEditedHistoricalResult,
 );
 
 const restoredHistoricalDraft = withEvidenceBackedVideoGenerationDraft({

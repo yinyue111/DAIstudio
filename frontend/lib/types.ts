@@ -229,7 +229,9 @@ export interface AppConfig {
   image_n_max: number;
   max_upload_image_bytes: number;
   max_upload_video_bytes: number;
+  video_duration_min_seconds?: number;
   video_duration_max_seconds: number;
+  video_resolutions?: string[];
   reverse: {
     image_cost: number;
     video_default_preset: string;

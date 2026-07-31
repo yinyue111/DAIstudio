@@ -974,29 +974,63 @@ def compose_visual_final_text(
 
 _VIDEO_DRAFT_FIELD_LABELS = {
     "主体": "主体",
+    "人像意图": "人物",
+    "人物比例": "人物比例",
+    "身材体态": "体态",
+    "体态线条": "体态线条",
+    "服装结构": "服装",
+    "服装覆盖": "服装覆盖",
+    "妆发五官": "妆发",
+    "商品服装": "产品/服装",
+    "细节特征": "关键细节",
     "场景背景": "场景",
-    "广告目标": "叙事目标",
     "风格": "风格",
     "视角构图": "构图",
     "光线": "光线",
     "色调配色": "配色",
     "材质纹理": "材质",
-    "氛围情绪": "氛围",
     "一致性约束": "连续性约束",
-    "字幕卖点": "画面字幕",
+    "字幕卖点": "后期字幕（后期叠加）",
     "旁白": "旁白/对白",
-    "音效": "声音",
+    "音效": "声音基线",
 }
 _VIDEO_DRAFT_SHOT_LABELS = (
-    ("visual", "画面"),
-    ("subject_tracking", "主体追踪"),
-    ("pose", "姿态"),
-    ("action", "动作"),
+    ("visual", "初始画面"),
+    ("subject_tracking", "主体轨迹"),
+    ("pose", "姿态变化"),
+    ("action", "动作与可见终态"),
     ("camera", "运镜"),
-    ("lighting", "光线"),
+    ("lighting", "光线/材质反馈"),
     ("transition", "转场"),
-    ("ocr", "画面文字"),
-    ("audio_cue", "声音"),
+)
+
+_VIDEO_DRAFT_PLANNING_FIELDS = frozenset({"广告目标", "氛围情绪"})
+_VIDEO_DRAFT_POST_FIELDS = ("字幕卖点", "旁白", "音效")
+_VIDEO_DRAFT_PACKAGE_TEXT_LABELS = frozenset({
+    "包装原字", "产品原字", "包装文字", "产品文字",
+})
+_VIDEO_DRAFT_SUBTITLE_LABELS = frozenset({"后期字幕", "画面字幕", "卖点字幕"})
+_VIDEO_DRAFT_OCR_MARKER_RE = re.compile(
+    r"(包装原字|产品原字|包装文字|产品文字|后期字幕|画面字幕|卖点字幕)"
+    r"\s*[:：]\s*",
+    re.IGNORECASE,
+)
+_VIDEO_DRAFT_OVERLAY_CUE_RE = re.compile(
+    r"字幕|后期叠加|文字(?:浮现|淡入|出现|显示)|浮现文字",
+    re.IGNORECASE,
+)
+_VIDEO_DRAFT_SPEECH_CUE_RE = re.compile(
+    r"对白|旁白|台词|独白|解说|画外音|说话|人声转写",
+    re.IGNORECASE,
+)
+_VIDEO_DRAFT_SPEECH_ROLE_RE = re.compile(
+    r"对白|旁白|台词|独白|解说|画外音|说话|人声转写|女声|男声",
+    re.IGNORECASE,
+)
+_VIDEO_DRAFT_MUSIC_CUE_RE = re.compile(
+    r"(?:全程|持续|舒缓|轻柔|轻快|紧凑|平稳|低沉|明快|\s)*"
+    r"(?:背景音乐|背景乐|音乐铺底|BGM)",
+    re.IGNORECASE,
 )
 
 
@@ -1017,7 +1051,11 @@ _GENERATION_OUTPUT_SPEC_RE = re.compile(
 )
 _GENERATION_RESOLUTION_RE = re.compile(r"(?<!\d)\d{3,4}\s*[x×]\s*\d{3,4}(?!\d)")
 _GENERATION_RATIO_RE = re.compile(
-    r"(?<!\d)\d{1,2}\s*:\s*\d{1,2}(?!\d)\s*(?:画幅|比例|竖版|横版)?",
+    r"(?:(?:视频|画面|输出|生成|成片)\s*(?:画幅|比例|宽高比)|"
+    r"(?:竖版|横版)\s*(?:画幅|比例)?)\s*(?:为|是|[:：])?\s*"
+    r"\d{1,2}\s*:\s*\d{1,2}|"
+    r"(?<!\d)\d{1,2}\s*:\s*\d{1,2}(?!\d)\s*"
+    r"(?:画幅|竖版|横版|视频比例|画面比例|输出比例|生成比例)",
     re.IGNORECASE,
 )
 _GENERATION_TIMESTAMP_LIST_RE = re.compile(
@@ -1059,7 +1097,11 @@ _GENERATION_RAW_AUDIO_SIGNAL_RE = re.compile(
 
 def _without_generation_watermark(value: str) -> str:
     cleaned = _GENERATION_WATERMARK_RE.sub("", value)
-    cleaned = re.sub(r"[\s··,，:：;；._-]+", " ", cleaned).strip()
+    cleaned = re.sub(
+        r"^[\s··,，:：;；._-]+|[\s··,，:：;；._-]+$",
+        "",
+        cleaned,
+    ).strip()
     return "" if cleaned.lower() in _GENERATION_WATERMARK_TEXTS else cleaned
 
 
@@ -1082,6 +1124,7 @@ def _without_generation_parameters_and_timing(value: object) -> str:
         return ""
 
     text = _GENERATION_RELATIVE_SECONDS_RE.sub(replace_relative_seconds, text)
+    text = re.sub(r"\[\s*\]|【\s*】|\(\s*\)|（\s*）", "", text)
     text = re.sub(r"([,，;；、])(?:\s*[,，;；、])+", r"\1", text)
     text = re.sub(r"\s+", " ", text)
     return text.strip(" ,，;；。、")
@@ -1114,6 +1157,135 @@ def _generation_draft_shot_value(shot: dict, key: str) -> str:
     return value or vlm_text
 
 
+def _generation_text_identity(value: object) -> str:
+    return re.sub(r"[\W_]+", "", str(value or "")).lower()
+
+
+def _video_draft_ocr_segments(text: str) -> list[tuple[str, str]]:
+    matches = list(_VIDEO_DRAFT_OCR_MARKER_RE.finditer(text))
+    if not matches:
+        return [
+            ("", clause.strip(" ,，;；。、"))
+            for clause in re.split(r"[\n；;]+", text)
+            if clause.strip(" ,，;；。、")
+        ]
+
+    segments: list[tuple[str, str]] = []
+    prefix = text[:matches[0].start()]
+    segments.extend(
+        ("", clause.strip(" ,，;；。、"))
+        for clause in re.split(r"[\n；;]+", prefix)
+        if clause.strip(" ,，;；。、")
+    )
+    for index, match in enumerate(matches):
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
+        content = text[match.end():end].strip(" ,，;；。、")
+        if content:
+            segments.append((match.group(1), content))
+    return segments
+
+
+def _video_draft_ocr_details(shot: dict) -> list[tuple[str, str]]:
+    """Separate product identity text from captions intended for post."""
+    text = _without_generation_parameters_and_timing(shot.get("ocr"))
+    if not _without_generation_watermark(text):
+        text = _without_generation_parameters_and_timing(
+            shot.get("vlm_text_description")
+        )
+    details: list[tuple[str, str]] = []
+    for marker, raw_clause in _video_draft_ocr_segments(text):
+        clause = raw_clause.strip(" ,，;；。、")
+        if not clause:
+            continue
+        if marker in _VIDEO_DRAFT_PACKAGE_TEXT_LABELS:
+            label, cleaned = "包装原字", clause
+        elif marker in _VIDEO_DRAFT_SUBTITLE_LABELS:
+            label, cleaned = "后期字幕（后期叠加）", clause
+        else:
+            cleaned = clause
+            is_subtitle = bool(_VIDEO_DRAFT_OVERLAY_CUE_RE.search(cleaned))
+            label = "后期字幕（后期叠加）" if is_subtitle else "可见原字"
+        cleaned = _without_generation_watermark(cleaned)
+        item = (label, cleaned)
+        if cleaned and item not in details:
+            details.append(item)
+    return details
+
+
+def _without_global_audio_cues(value: object, global_audio: str) -> str:
+    """Keep shot-synchronous sound while avoiding a repeated global music bed."""
+    shot_audio = _generation_ready_audio_value(value)
+    global_has_music = bool(_VIDEO_DRAFT_MUSIC_CUE_RE.search(global_audio))
+    clauses = []
+    for raw_clause in re.split(r"[\n；;]+", shot_audio):
+        fragments = []
+        for raw_fragment in re.split(r"[,，、]+", raw_clause):
+            fragment = raw_fragment.strip(" ,，;；。、")
+            if global_has_music:
+                fragment = _VIDEO_DRAFT_MUSIC_CUE_RE.sub("", fragment)
+                fragment = re.sub(r"(?:伴随|配合|叠加|和|与)\s*$", "", fragment)
+                fragment = fragment.strip(" ,，;；。、")
+            if fragment and fragment not in fragments:
+                fragments.append(fragment)
+        clause = "，".join(fragments)
+        if not clause:
+            continue
+        if clause not in clauses:
+            clauses.append(clause)
+    return "；".join(clauses)
+
+
+def _generation_spoken_identity(value: object) -> str:
+    text = _generation_ready_audio_value(value)
+    text = _VIDEO_DRAFT_SPEECH_ROLE_RE.sub("", text)
+    return _generation_text_identity(text)
+
+
+def _shot_spoken_cues(value: object) -> list[str]:
+    return [
+        clause.strip(" ,，;；。、")
+        for clause in re.split(r"[\n；;]+", _generation_ready_audio_value(value))
+        if _VIDEO_DRAFT_SPEECH_CUE_RE.search(clause)
+        and clause.strip(" ,，;；。、")
+    ]
+
+
+def _without_covered_spoken_cues(value: object, shot_speech_cues: list[str]) -> str:
+    shot_identities = [
+        identity
+        for cue in shot_speech_cues
+        if (identity := _generation_spoken_identity(cue))
+    ]
+    clauses = []
+    for raw_clause in re.split(
+        r"[\n；;]+",
+        _without_generation_parameters_and_timing(value),
+    ):
+        clause = raw_clause.strip(" ,，;；。、")
+        identity = _generation_spoken_identity(clause)
+        if not clause or (
+            identity
+            and any(identity in shot_id or shot_id in identity for shot_id in shot_identities)
+        ):
+            continue
+        if clause not in clauses:
+            clauses.append(clause)
+    return "；".join(clauses)
+
+
+def _subtitle_summary_is_covered(summary: str, shot_subtitles: list[str]) -> bool:
+    summary_parts = [
+        _generation_text_identity(clause)
+        for clause in re.split(r"[\n；;,，、]+", summary)
+        if _generation_text_identity(clause)
+    ]
+    shot_parts = [_generation_text_identity(value) for value in shot_subtitles]
+    return bool(summary_parts) and all(
+        any(part in shot_part or shot_part in part for shot_part in shot_parts)
+        for part in summary_parts
+    )
+
+
 def compose_video_generation_draft(
     structured: dict,
     shots: list[dict] | None = None,
@@ -1129,7 +1301,10 @@ def compose_video_generation_draft(
 
     static_parts = []
     for key in _ordered_visual_fields(structured, "video"):
-        if key in {"源视频规格", "时长建议", "时序分镜"}:
+        if key in {
+            "源视频规格", "时长建议", "时序分镜",
+            *_VIDEO_DRAFT_PLANNING_FIELDS,
+        }:
             continue
         value = _without_generation_parameters_and_timing(structured.get(key))
         if not value or value in static_parts:
@@ -1137,40 +1312,11 @@ def compose_video_generation_draft(
         label = _VIDEO_DRAFT_FIELD_LABELS.get(key, key)
         static_parts.append(value)
         lines.append(f"{label}：{value}")
-    for key in ("字幕卖点", "旁白", "音效"):
-        value = (
-            _generation_ready_audio_value(structured.get(key))
-            if key == "音效"
-            else _without_generation_parameters_and_timing(structured.get(key))
-        )
-        if not value or value in static_parts:
-            continue
-        static_parts.append(value)
-        lines.append(f"{_VIDEO_DRAFT_FIELD_LABELS[key]}：{value}")
 
     valid_shots = [shot for shot in shots or [] if isinstance(shot, dict)]
-    finite_ends = []
-    for shot in valid_shots:
-        try:
-            end = float(shot.get("end_seconds"))
-        except (TypeError, ValueError):
-            continue
-        if isfinite(end):
-            finite_ends.append(end)
-    source_duration = max(finite_ends, default=0.0)
-    if len(valid_shots) > 3:
-        lines.append(
-            f"复刻执行：参考片含 {len(valid_shots)} 个高密度剪辑镜头；"
-            "为保留每镜主动作、产品身份和材质响应，建议逐镜独立生成；"
-            "单镜含多步动作或内部硬切时，再按一段一个主动作/可见结果拆分，"
-            "最后按原镜头顺序剪辑，"
-            "不要将全部镜头压入一次生成。"
-        )
-    elif source_duration > 15:
-        lines.append(
-            "复刻执行：参考片时间线较长，建议逐镜分别生成后按顺序合成，"
-            "不压缩、不省略原镜头。"
-        )
+    global_audio = _generation_ready_audio_value(structured.get("音效"))
+    shot_post_subtitles: list[str] = []
+    shot_speech_cues: list[str] = []
 
     for index, shot in enumerate(valid_shots, start=1):
         details = []
@@ -1178,6 +1324,18 @@ def compose_video_generation_draft(
             value = _generation_draft_shot_value(shot, key)
             if value:
                 details.append(f"{label}：{value}")
+        for label, value in _video_draft_ocr_details(shot):
+            if label.startswith("后期字幕") and value not in shot_post_subtitles:
+                shot_post_subtitles.append(value)
+            details.append(f"{label}：{value}")
+        shot_speech_cues.extend(
+            cue
+            for cue in _shot_spoken_cues(shot.get("audio_cue"))
+            if cue not in shot_speech_cues
+        )
+        audio_cue = _without_global_audio_cues(shot.get("audio_cue"), global_audio)
+        if audio_cue:
+            details.append(f"同步声音：{audio_cue}")
         if not details:
             continue
         segment_index = shot.get("source_segment_index")
@@ -1187,6 +1345,27 @@ def compose_video_generation_draft(
             else ""
         )
         lines.append(f"{segment}镜头{index}：" + "；".join(details))
+
+    for key in _VIDEO_DRAFT_POST_FIELDS:
+        value = (
+            global_audio
+            if key == "音效"
+            else _without_covered_spoken_cues(
+                structured.get(key),
+                shot_speech_cues,
+            )
+            if key == "旁白"
+            else _without_generation_parameters_and_timing(structured.get(key))
+        )
+        if not value or value in static_parts:
+            continue
+        if key == "字幕卖点" and _subtitle_summary_is_covered(
+            value,
+            shot_post_subtitles,
+        ):
+            continue
+        static_parts.append(value)
+        lines.append(f"{_VIDEO_DRAFT_FIELD_LABELS[key]}：{value}")
 
     if not lines:
         raise ReverseResultValidationError("反推结果缺少可用于生成的视觉白名单字段")

@@ -3955,3 +3955,1329 @@ def test_0075_does_not_enable_unverified_grok_video_provider(tmp_path, monkeypat
     assert extra == old_extra
     assert version_count == 0
     engine.dispose()
+
+
+def test_0082_aligns_verified_model_capabilities_and_versions(tmp_path, monkeypatch):
+    backend = Path(__file__).resolve().parents[1]
+    db_path = tmp_path / "verified-model-capability-matrix.db"
+    database_url = f"sqlite:///{db_path}"
+    monkeypatch.setattr(settings, "database_url", database_url)
+    cfg = Config(str(backend / "alembic.ini"))
+    cfg.set_main_option("script_location", str(backend / "alembic"))
+    command.upgrade(cfg, "0081_refunds_soft_delete")
+
+    engine = sa.create_engine(database_url)
+    metadata = sa.MetaData()
+    model_configs = sa.Table("model_configs", metadata, autoload_with=engine)
+    capability_versions = sa.Table(
+        "model_capability_versions",
+        metadata,
+        autoload_with=engine,
+    )
+    specs = [
+        (
+            "image",
+            "gpt-image-2",
+            "yinyue",
+            "openai",
+            {
+                "text_to_image": True,
+                "image_to_image": True,
+                "reference_image": True,
+                "multi_reference": True,
+                "max_reference_images": 2,
+                "mask_edit": True,
+            },
+        ),
+        (
+            "image",
+            "gemini-3.1-flash-image",
+            "antigravity",
+            "anthropic",
+            {
+                "text_to_image": True,
+                "image_to_image": True,
+                "reference_image": True,
+                "multi_reference": True,
+                "max_reference_images": 2,
+                "mask_edit": False,
+            },
+        ),
+        (
+            "image",
+            "grok-imagine-image",
+            "grok",
+            "openai",
+            {
+                "text_to_image": True,
+                "image_to_image": True,
+                "reference_image": True,
+                "multi_reference": True,
+                "max_reference_images": 2,
+                "mask_edit": False,
+            },
+        ),
+        (
+            "video",
+            "doubao-seedance-1-5-pro-251215",
+            "volcengine_ark",
+            "ark",
+            {
+                "text_to_video": True,
+                "image_to_video": True,
+                "reference_image": False,
+                "first_last_frame": True,
+                "multi_reference": False,
+                "video_to_video": False,
+            },
+        ),
+        (
+            "video",
+            "doubao-seedance-2-0-260128",
+            "volcengine_ark",
+            "ark",
+            {
+                "text_to_video": True,
+                "image_to_video": True,
+                "reference_image": True,
+                "first_last_frame": True,
+                "multi_reference": True,
+                "max_reference_images": 9,
+                "video_to_video": True,
+            },
+        ),
+        (
+            "video",
+            "grok-imagine-video",
+            "grok",
+            "openai",
+            {
+                "text_to_video": True,
+                "image_to_video": True,
+                "reference_image": True,
+                "multi_reference": True,
+                "max_reference_images": 7,
+                "first_last_frame": False,
+                "video_to_video": True,
+            },
+        ),
+        (
+            "video",
+            "grok-imagine-video-1.5",
+            "grok",
+            "openai",
+            {
+                "text_to_video": False,
+                "image_to_video": True,
+                "reference_image": False,
+                "multi_reference": False,
+                "first_last_frame": False,
+                "video_to_video": False,
+            },
+        ),
+        (
+            "vision",
+            "gpt-5.6-sol",
+            None,
+            "openai",
+            {
+                "image_analysis": True,
+                "video_analysis": True,
+                "product_profile": True,
+                "portrait_profile": True,
+            },
+        ),
+        (
+            "vision",
+            "gemini-3.1-pro-high",
+            "antigravity",
+            "anthropic",
+            {
+                "image_analysis": True,
+                "video_analysis": True,
+                "product_profile": True,
+                "portrait_profile": True,
+            },
+        ),
+        (
+            "prompt",
+            "claude-opus-4-6-thinking",
+            "antigravity",
+            "anthropic",
+            {"prompt_optimization": True},
+        ),
+        (
+            "prompt",
+            "gemini-3.5-flash-low",
+            "antigravity",
+            "anthropic",
+            {"prompt_optimization": True},
+        ),
+        (
+            "prompt",
+            "gemini-3.1-pro-high",
+            "antigravity",
+            "anthropic",
+            {"prompt_optimization": True},
+        ),
+        (
+            "prompt",
+            "grok-4.5",
+            "grok",
+            "openai",
+            {"prompt_optimization": True},
+        ),
+    ]
+    model_ids: dict[tuple[str, str], int] = {}
+    deleted_model_id: int | None = None
+    now = datetime.now(timezone.utc)
+    with engine.begin() as connection:
+        for use, model_id, _provider, _gateway_format, _expected in specs:
+            existing_ids = list(
+                connection.scalars(
+                    sa.select(model_configs.c.id).where(
+                        model_configs.c.use == use,
+                        model_configs.c.model_id == model_id,
+                    )
+                )
+            )
+            if existing_ids:
+                connection.execute(
+                    sa.delete(capability_versions).where(
+                        capability_versions.c.model_config_id.in_(existing_ids)
+                    )
+                )
+            connection.execute(
+                sa.delete(model_configs).where(
+                    model_configs.c.use == use,
+                    model_configs.c.model_id == model_id,
+                )
+            )
+        for sort_order, (use, model_id, provider, gateway_format, _expected) in enumerate(
+            specs,
+            start=1,
+        ):
+            old_capabilities = {"custom_flag": "keep"}
+            if use == "image":
+                old_capabilities.update(
+                    {
+                        "image_edit": True,
+                        "image_to_image": False,
+                        "multi_reference": True,
+                        "max_reference_images": 10,
+                    }
+                )
+            elif use == "video":
+                old_capabilities.update(
+                    {
+                        "image_to_video": False,
+                        "reference_image": True,
+                        "multi_reference": True,
+                        "max_reference_images": 10,
+                    }
+                )
+            elif use == "vision":
+                old_capabilities.update(
+                    {"image_analysis": False, "video_analysis": False}
+                )
+            else:
+                old_capabilities["prompt_optimization"] = False
+            extra = {"keep_extra": True, "capabilities": old_capabilities}
+            if model_id == "grok-imagine-video-1.5":
+                extra.update(
+                    {
+                        "product_images_field": "reference_images",
+                        "product_images_item_field": "url",
+                    }
+                )
+            result = connection.execute(
+                model_configs.insert().values(
+                    use=use,
+                    model_id=model_id,
+                    display_name=model_id,
+                    is_default=False,
+                    sort_order=sort_order,
+                    provider=provider,
+                    gateway_format=gateway_format,
+                    cost_credits=5,
+                    unlock_cost=0,
+                    enabled=True,
+                    extra=extra,
+                )
+            )
+            model_config_id = int(result.inserted_primary_key[0])
+            model_ids[(use, model_id)] = model_config_id
+            connection.execute(
+                capability_versions.insert().values(
+                    model_config_id=model_config_id,
+                    version=1,
+                    schema_version="capability.v1",
+                    capabilities=old_capabilities,
+                    metadata_snapshot={
+                        "schema_version": "model-catalog-metadata.v1",
+                        "origin": "test",
+                        "model_id": model_id,
+                        "display_name": model_id,
+                        "is_default": False,
+                        "sort_order": sort_order,
+                        "enabled": True,
+                    },
+                    status="published",
+                    is_active=True,
+                    activated_at=now,
+                )
+            )
+        deleted_result = connection.execute(
+            model_configs.insert().values(
+                use="image",
+                model_id="gpt-image-2",
+                display_name="deleted-gpt-image-2",
+                is_default=False,
+                sort_order=999,
+                provider="yinyue",
+                gateway_format="openai",
+                cost_credits=5,
+                unlock_cost=0,
+                enabled=False,
+                extra={
+                    "keep_deleted": True,
+                    "capabilities": {"image_to_image": False},
+                },
+                deleted_at=now,
+            )
+        )
+        deleted_model_id = int(deleted_result.inserted_primary_key[0])
+        connection.execute(
+            capability_versions.insert().values(
+                model_config_id=deleted_model_id,
+                version=1,
+                schema_version="capability.v1",
+                capabilities={"image_to_image": False},
+                metadata_snapshot={
+                    "schema_version": "model-catalog-metadata.v1",
+                    "origin": "test",
+                    "model_id": "gpt-image-2",
+                    "display_name": "deleted-gpt-image-2",
+                    "is_default": False,
+                    "sort_order": 999,
+                    "enabled": False,
+                },
+                status="published",
+                is_active=True,
+                activated_at=now,
+            )
+        )
+
+    command.upgrade(cfg, "0082_model_capability_matrix")
+    with engine.connect() as connection:
+        rows = connection.execute(
+            sa.select(
+                model_configs.c.use,
+                model_configs.c.model_id,
+                model_configs.c.extra,
+            ).where(model_configs.c.id.in_(list(model_ids.values())))
+        ).mappings().all()
+        versions = connection.execute(
+            sa.select(
+                capability_versions.c.model_config_id,
+                capability_versions.c.version,
+                capability_versions.c.status,
+                capability_versions.c.is_active,
+                capability_versions.c.source_version_id,
+                capability_versions.c.capabilities,
+            )
+            .where(capability_versions.c.model_config_id.in_(list(model_ids.values())))
+            .order_by(
+                capability_versions.c.model_config_id,
+                capability_versions.c.version,
+            )
+        ).mappings().all()
+        deleted_row = connection.execute(
+            sa.select(model_configs.c.extra).where(
+                model_configs.c.id == deleted_model_id
+            )
+        ).mappings().one()
+        deleted_version_count = connection.scalar(
+            sa.select(sa.func.count(capability_versions.c.id)).where(
+                capability_versions.c.model_config_id == deleted_model_id
+            )
+        )
+
+    rows_by_key = {(row["use"], row["model_id"]): row for row in rows}
+    for use, model_id, _provider, _gateway_format, expected in specs:
+        extra = rows_by_key[(use, model_id)]["extra"]
+        assert extra["keep_extra"] is True
+        assert extra["capabilities"] == {"custom_flag": "keep", **expected}
+        assert "image_edit" not in extra["capabilities"]
+
+    assert rows_by_key[("image", "gpt-image-2")]["extra"]["edit_path"] == (
+        "/v1/images/edits"
+    )
+    assert rows_by_key[("video", "grok-imagine-video")]["extra"][
+        "product_images_field"
+    ] == "reference_images"
+    grok_15_extra = rows_by_key[("video", "grok-imagine-video-1.5")]["extra"]
+    assert "product_images_field" not in grok_15_extra
+    assert grok_15_extra["first_frame_field"] == "image"
+
+    versions_by_model: dict[int, list[dict]] = {}
+    for version in versions:
+        versions_by_model.setdefault(int(version["model_config_id"]), []).append(version)
+    for use, model_id, _provider, _gateway_format, expected in specs:
+        model_versions = versions_by_model[model_ids[(use, model_id)]]
+        assert [
+            (row["version"], row["status"], row["is_active"])
+            for row in model_versions
+        ] == [(1, "disabled", False), (2, "published", True)]
+        assert model_versions[1]["source_version_id"] is not None
+        assert model_versions[1]["capabilities"] == {"custom_flag": "keep", **expected}
+
+    assert deleted_row["extra"] == {
+        "keep_deleted": True,
+        "capabilities": {"image_to_image": False},
+    }
+    assert deleted_version_count == 1
+
+    command.downgrade(cfg, "0081_refunds_soft_delete")
+    command.upgrade(cfg, "0082_model_capability_matrix")
+    with engine.connect() as connection:
+        version_count = connection.scalar(
+            sa.select(sa.func.count(capability_versions.c.id)).where(
+                capability_versions.c.model_config_id.in_(list(model_ids.values()))
+            )
+        )
+    assert version_count == len(specs) * 2
+    engine.dispose()
+
+
+def test_0082_publishes_missing_version_for_unchanged_migration_model(
+    tmp_path,
+    monkeypatch,
+):
+    backend = Path(__file__).resolve().parents[1]
+    db_path = tmp_path / "unchanged-model-capability.db"
+    database_url = f"sqlite:///{db_path}"
+    monkeypatch.setattr(settings, "database_url", database_url)
+    cfg = Config(str(backend / "alembic.ini"))
+    cfg.set_main_option("script_location", str(backend / "alembic"))
+    command.upgrade(cfg, "0081_refunds_soft_delete")
+
+    engine = sa.create_engine(database_url)
+    metadata = sa.MetaData()
+    model_configs = sa.Table("model_configs", metadata, autoload_with=engine)
+    capability_versions = sa.Table(
+        "model_capability_versions",
+        metadata,
+        autoload_with=engine,
+    )
+    with engine.connect() as connection:
+        model_row = connection.execute(
+            sa.select(model_configs).where(
+                model_configs.c.use == "vision",
+                model_configs.c.model_id == "gemini-3.1-pro-high",
+            )
+        ).mappings().one()
+        before_count = connection.scalar(
+            sa.select(sa.func.count(capability_versions.c.id)).where(
+                capability_versions.c.model_config_id == int(model_row["id"])
+            )
+        )
+    assert model_row["extra"]["catalog_origin"] == "migration_0071"
+    assert model_row["extra"]["capabilities"] == {
+        "image_analysis": True,
+        "video_analysis": True,
+        "product_profile": True,
+        "portrait_profile": True,
+    }
+    assert before_count == 0
+
+    command.upgrade(cfg, "0082_model_capability_matrix")
+    with engine.connect() as connection:
+        published_versions = connection.execute(
+            sa.select(
+                capability_versions.c.status,
+                capability_versions.c.is_active,
+                capability_versions.c.capabilities,
+            ).where(
+                capability_versions.c.model_config_id == int(model_row["id"])
+            )
+        ).mappings().all()
+    assert published_versions == [
+        {
+            "status": "published",
+            "is_active": True,
+            "capabilities": model_row["extra"]["capabilities"],
+        }
+    ]
+
+    command.downgrade(cfg, "0070_video_model_capabilities")
+    with engine.connect() as connection:
+        remaining = connection.scalar(
+            sa.select(sa.func.count(model_configs.c.id)).where(
+                model_configs.c.id == int(model_row["id"])
+            )
+        )
+    assert remaining == 0
+    engine.dispose()
+
+
+def test_0082_does_not_assign_seedance_20_capabilities_to_future_versions(
+    tmp_path,
+    monkeypatch,
+):
+    backend = Path(__file__).resolve().parents[1]
+    db_path = tmp_path / "future-seedance-capabilities.db"
+    database_url = f"sqlite:///{db_path}"
+    monkeypatch.setattr(settings, "database_url", database_url)
+    cfg = Config(str(backend / "alembic.ini"))
+    cfg.set_main_option("script_location", str(backend / "alembic"))
+    command.upgrade(cfg, "0081_refunds_soft_delete")
+
+    engine = sa.create_engine(database_url)
+    metadata = sa.MetaData()
+    model_configs = sa.Table("model_configs", metadata, autoload_with=engine)
+    capability_versions = sa.Table(
+        "model_capability_versions",
+        metadata,
+        autoload_with=engine,
+    )
+    future_model_ids = [
+        "doubao-seedance-2-1-pro-270101",
+        "doubao-seedance-3-0-pro-280101",
+    ]
+    inserted_ids: list[int] = []
+    original_extra = {"capabilities": {"custom_flag": "manual-review"}}
+    with engine.begin() as connection:
+        for sort_order, model_id in enumerate(future_model_ids, start=901):
+            result = connection.execute(
+                model_configs.insert().values(
+                    use="video",
+                    model_id=model_id,
+                    display_name=model_id,
+                    is_default=False,
+                    sort_order=sort_order,
+                    provider="volcengine_ark",
+                    gateway_format="ark",
+                    cost_credits=100,
+                    unlock_cost=0,
+                    enabled=False,
+                    extra=original_extra,
+                )
+            )
+            inserted_ids.append(int(result.inserted_primary_key[0]))
+
+    command.upgrade(cfg, "0082_model_capability_matrix")
+    with engine.connect() as connection:
+        extras = list(
+            connection.scalars(
+                sa.select(model_configs.c.extra).where(
+                    model_configs.c.id.in_(inserted_ids)
+                )
+            )
+        )
+        version_count = connection.scalar(
+            sa.select(sa.func.count(capability_versions.c.id)).where(
+                capability_versions.c.model_config_id.in_(inserted_ids)
+            )
+        )
+
+    assert extras == [original_extra, original_extra]
+    assert version_count == 0
+    engine.dispose()
+
+
+@pytest.mark.parametrize(
+    "row",
+    [
+        {
+            "use": "video",
+            "model_id": "doubao-seedance-2-0-260128",
+            "provider": "volcengine_ark",
+            "gateway_format": "openai",
+        },
+        {
+            "use": "video",
+            "model_id": "doubao-seedance-2-0-260128",
+            "provider": "custom_openai",
+            "gateway_format": "ark",
+        },
+        {
+            "use": "vision",
+            "model_id": "gemini-3.1-pro-high",
+            "provider": "custom_openai",
+            "gateway_format": "anthropic",
+        },
+        {
+            "use": "prompt",
+            "model_id": "gemini-3.1-pro-high",
+            "provider": "antigravity",
+            "gateway_format": "openai",
+        },
+    ],
+)
+def test_0082_requires_matching_provider_and_gateway_format(row):
+    migration = _load_migration_module("0082_model_capability_matrix")
+
+    assert migration._correction(row) is None
+
+
+def test_0083_splits_video_input_semantics_and_preserves_version_history(
+    tmp_path,
+    monkeypatch,
+):
+    backend = Path(__file__).resolve().parents[1]
+    db_path = tmp_path / "video-input-capability-semantics.db"
+    database_url = f"sqlite:///{db_path}"
+    monkeypatch.setattr(settings, "database_url", database_url)
+    cfg = Config(str(backend / "alembic.ini"))
+    cfg.set_main_option("script_location", str(backend / "alembic"))
+    command.upgrade(cfg, "0082_model_capability_matrix")
+
+    engine = sa.create_engine(database_url)
+    metadata = sa.MetaData()
+    model_configs = sa.Table("model_configs", metadata, autoload_with=engine)
+    capability_versions = sa.Table(
+        "model_capability_versions",
+        metadata,
+        autoload_with=engine,
+    )
+    specs = [
+        (
+            "doubao-seedance-1-5-pro-251215",
+            "volcengine_ark",
+            "ark",
+            False,
+            {
+                "video_to_video": False,
+                "video_reference": False,
+                "video_edit": False,
+                "audio_reference": False,
+                "max_reference_videos": 0,
+                "max_reference_audio": 0,
+            },
+        ),
+        (
+            "doubao-seedance-2-0-260128",
+            "volcengine_ark",
+            "ark",
+            True,
+            {
+                "video_to_video": True,
+                "video_reference": True,
+                "video_edit": False,
+                "audio_reference": False,
+                "max_reference_videos": 1,
+                "max_reference_audio": 0,
+            },
+        ),
+        (
+            "grok-imagine-video",
+            "grok",
+            "openai",
+            False,
+            {
+                "video_to_video": True,
+                "video_reference": False,
+                "video_edit": True,
+                "audio_reference": False,
+                "max_reference_videos": 1,
+                "max_reference_audio": 0,
+            },
+        ),
+        (
+            "grok-imagine-video-1.5",
+            "grok",
+            "openai",
+            True,
+            {
+                "video_to_video": False,
+                "video_reference": False,
+                "video_edit": False,
+                "audio_reference": False,
+                "max_reference_videos": 0,
+                "max_reference_audio": 0,
+            },
+        ),
+    ]
+    model_ids: dict[str, int] = {}
+    old_version_ids: dict[str, int] = {}
+    stale_capabilities: dict[str, dict] = {}
+    now = datetime.now(timezone.utc)
+    with engine.begin() as connection:
+        for model_id, _provider, _gateway_format, _enabled, _expected in specs:
+            existing_ids = list(
+                connection.scalars(
+                    sa.select(model_configs.c.id).where(
+                        model_configs.c.use == "video",
+                        model_configs.c.model_id == model_id,
+                    )
+                )
+            )
+            if existing_ids:
+                connection.execute(
+                    sa.delete(capability_versions).where(
+                        capability_versions.c.model_config_id.in_(existing_ids)
+                    )
+                )
+            connection.execute(
+                sa.delete(model_configs).where(
+                    model_configs.c.use == "video",
+                    model_configs.c.model_id == model_id,
+                )
+            )
+
+        for sort_order, (
+            model_id,
+            provider,
+            gateway_format,
+            enabled,
+            expected,
+        ) in enumerate(specs, start=801):
+            stale = {
+                "custom_flag": "keep",
+                "text_to_video": True,
+                "video_to_video": not expected["video_to_video"],
+                "video_reference": not expected["video_reference"],
+                "video_edit": not expected["video_edit"],
+                "audio_reference": True,
+                "max_reference_videos": 99,
+                "max_reference_audio": 99,
+            }
+            stale_capabilities[model_id] = stale
+            result = connection.execute(
+                model_configs.insert().values(
+                    use="video",
+                    model_id=model_id,
+                    display_name=model_id,
+                    is_default=False,
+                    sort_order=sort_order,
+                    provider=provider,
+                    gateway_format=gateway_format,
+                    cost_credits=20,
+                    unlock_cost=0,
+                    enabled=enabled,
+                    extra={
+                        "keep_extra": f"extra:{model_id}",
+                        "capabilities": stale,
+                    },
+                )
+            )
+            model_config_id = int(result.inserted_primary_key[0])
+            model_ids[model_id] = model_config_id
+            version_result = connection.execute(
+                capability_versions.insert().values(
+                    model_config_id=model_config_id,
+                    version=4,
+                    schema_version="capability.v1",
+                    capabilities=stale,
+                    metadata_snapshot={
+                        "schema_version": "model-catalog-metadata.v1",
+                        "origin": "test_0083",
+                        "model_id": model_id,
+                        "display_name": model_id,
+                        "is_default": False,
+                        "sort_order": sort_order,
+                        "enabled": enabled,
+                    },
+                    status="published",
+                    is_active=True,
+                    activated_at=now,
+                )
+            )
+            old_version_ids[model_id] = int(version_result.inserted_primary_key[0])
+
+        deleted_extra = {
+            "keep_deleted": True,
+            "capabilities": {"video_reference": False},
+        }
+        deleted_result = connection.execute(
+            model_configs.insert().values(
+                use="video",
+                model_id="doubao-seedance-2-0-260128",
+                display_name="deleted-seedance-2.0",
+                is_default=False,
+                sort_order=899,
+                provider="volcengine_ark",
+                gateway_format="ark",
+                cost_credits=20,
+                unlock_cost=0,
+                enabled=False,
+                extra=deleted_extra,
+                deleted_at=now,
+            )
+        )
+        deleted_model_id = int(deleted_result.inserted_primary_key[0])
+        connection.execute(
+            capability_versions.insert().values(
+                model_config_id=deleted_model_id,
+                version=1,
+                schema_version="capability.v1",
+                capabilities=deleted_extra["capabilities"],
+                metadata_snapshot={
+                    "schema_version": "model-catalog-metadata.v1",
+                    "origin": "test_0083_deleted",
+                    "model_id": "doubao-seedance-2-0-260128",
+                    "display_name": "deleted-seedance-2.0",
+                    "is_default": False,
+                    "sort_order": 899,
+                    "enabled": False,
+                },
+                status="published",
+                is_active=True,
+                activated_at=now,
+            )
+        )
+
+        ignored_specs = [
+            (
+                "doubao-seedance-2-1-pro-270101",
+                "volcengine_ark",
+                "ark",
+            ),
+            (
+                "doubao-seedance-2-0-unverified-260128",
+                "custom_openai",
+                "ark",
+            ),
+        ]
+        ignored_model_ids = []
+        for sort_order, (model_id, provider, gateway_format) in enumerate(
+            ignored_specs,
+            start=901,
+        ):
+            result = connection.execute(
+                model_configs.insert().values(
+                    use="video",
+                    model_id=model_id,
+                    display_name=model_id,
+                    is_default=False,
+                    sort_order=sort_order,
+                    provider=provider,
+                    gateway_format=gateway_format,
+                    cost_credits=20,
+                    unlock_cost=0,
+                    enabled=False,
+                    extra={"capabilities": {"custom_flag": "manual-review"}},
+                )
+            )
+            ignored_model_ids.append(int(result.inserted_primary_key[0]))
+
+    command.upgrade(cfg, "0083_video_input_semantics")
+    with engine.connect() as connection:
+        rows = connection.execute(
+            sa.select(
+                model_configs.c.id,
+                model_configs.c.model_id,
+                model_configs.c.enabled,
+                model_configs.c.extra,
+            ).where(model_configs.c.id.in_(list(model_ids.values())))
+        ).mappings().all()
+        versions = connection.execute(
+            sa.select(
+                capability_versions.c.id,
+                capability_versions.c.model_config_id,
+                capability_versions.c.version,
+                capability_versions.c.status,
+                capability_versions.c.is_active,
+                capability_versions.c.source_version_id,
+                capability_versions.c.capabilities,
+                capability_versions.c.metadata_snapshot,
+                capability_versions.c.disabled_at,
+            )
+            .where(capability_versions.c.model_config_id.in_(list(model_ids.values())))
+            .order_by(
+                capability_versions.c.model_config_id,
+                capability_versions.c.version,
+            )
+        ).mappings().all()
+        deleted_row = connection.execute(
+            sa.select(model_configs.c.extra).where(
+                model_configs.c.id == deleted_model_id
+            )
+        ).mappings().one()
+        deleted_version_count = connection.scalar(
+            sa.select(sa.func.count(capability_versions.c.id)).where(
+                capability_versions.c.model_config_id == deleted_model_id
+            )
+        )
+        ignored_extras = list(
+            connection.scalars(
+                sa.select(model_configs.c.extra)
+                .where(model_configs.c.id.in_(ignored_model_ids))
+                .order_by(model_configs.c.id)
+            )
+        )
+        ignored_version_count = connection.scalar(
+            sa.select(sa.func.count(capability_versions.c.id)).where(
+                capability_versions.c.model_config_id.in_(ignored_model_ids)
+            )
+        )
+
+    rows_by_model = {row["model_id"]: row for row in rows}
+    versions_by_model: dict[int, list[dict]] = {}
+    for version in versions:
+        versions_by_model.setdefault(int(version["model_config_id"]), []).append(version)
+
+    for model_id, _provider, _gateway_format, enabled, expected in specs:
+        row = rows_by_model[model_id]
+        assert row["enabled"] is enabled
+        assert row["extra"]["keep_extra"] == f"extra:{model_id}"
+        assert row["extra"]["capabilities"] == {
+            "custom_flag": "keep",
+            "text_to_video": True,
+            **expected,
+        }
+        model_versions = versions_by_model[model_ids[model_id]]
+        assert [
+            (version["version"], version["status"], version["is_active"])
+            for version in model_versions
+        ] == [(4, "disabled", False), (5, "published", True)]
+        old_version, new_version = model_versions
+        assert old_version["id"] == old_version_ids[model_id]
+        assert old_version["capabilities"] == stale_capabilities[model_id]
+        assert old_version["disabled_at"] is not None
+        assert new_version["source_version_id"] == old_version_ids[model_id]
+        assert new_version["capabilities"] == {
+            "custom_flag": "keep",
+            "text_to_video": True,
+            **expected,
+        }
+        assert new_version["metadata_snapshot"]["origin"] == "test_0083"
+
+    assert deleted_row["extra"] == deleted_extra
+    assert deleted_version_count == 1
+    assert ignored_extras == [
+        {"capabilities": {"custom_flag": "manual-review"}},
+        {"capabilities": {"custom_flag": "manual-review"}},
+    ]
+    assert ignored_version_count == 0
+
+    command.downgrade(cfg, "0082_model_capability_matrix")
+    command.upgrade(cfg, "0083_video_input_semantics")
+    with engine.connect() as connection:
+        version_count_after_repeat = connection.scalar(
+            sa.select(sa.func.count(capability_versions.c.id)).where(
+                capability_versions.c.model_config_id.in_(list(model_ids.values()))
+            )
+        )
+    assert version_count_after_repeat == len(specs) * 2
+    engine.dispose()
+
+@pytest.mark.parametrize(
+    "row",
+    [
+        {
+            "use": "video",
+            "model_id": "doubao-seedance-2-1-pro-270101",
+            "provider": "volcengine_ark",
+            "gateway_format": "ark",
+        },
+        {
+            "use": "video",
+            "model_id": "doubao-seedance-2-0-260128",
+            "provider": "custom_openai",
+            "gateway_format": "ark",
+        },
+        {
+            "use": "video",
+            "model_id": "doubao-seedance-2-0-260128",
+            "provider": "volcengine_ark",
+            "gateway_format": "openai",
+        },
+        {
+            "use": "video",
+            "model_id": "grok-imagine-video",
+            "provider": "custom_openai",
+            "gateway_format": "openai",
+        },
+        {
+            "use": "video",
+            "model_id": "grok-imagine-video",
+            "provider": "grok",
+            "gateway_format": "ark",
+        },
+        {
+            "use": "vision",
+            "model_id": "grok-imagine-video-1.5",
+            "provider": "grok",
+            "gateway_format": "openai",
+        },
+    ],
+)
+def test_0083_requires_matching_model_provider_and_gateway_format(row):
+    migration = _load_migration_module("0083_video_input_capability_semantics")
+
+    assert migration._correction(row) is None
+
+
+@pytest.mark.parametrize(
+    ("model_id", "provider", "gateway_format", "expected"),
+    [
+        (
+            "doubao-seedance-1-5-pro-251215",
+            "volcengine_ark",
+            "ark",
+            {
+                "durations": list(range(4, 13)),
+                "generated_audio": True,
+                "generated_audio_configurable": False,
+                "max_duration_seconds": 12,
+                "min_duration_seconds": 4,
+                "resolutions": ["480p", "720p", "1080p"],
+            },
+        ),
+        (
+            "doubao-seedance-2-0-260128",
+            "volcengine_ark",
+            "ark",
+            {
+                "durations": list(range(4, 16)),
+                "frame_reference_mode_exclusive": True,
+                "generated_audio": True,
+                "generated_audio_configurable": False,
+                "max_duration_seconds": 15,
+                "min_duration_seconds": 4,
+                "resolutions": ["480p", "720p", "1080p"],
+            },
+        ),
+        (
+            "doubao-seedance-2-0-fast-260128",
+            "volcengine_ark",
+            "ark",
+            {
+                "durations": list(range(4, 16)),
+                "frame_reference_mode_exclusive": True,
+                "generated_audio": True,
+                "generated_audio_configurable": False,
+                "max_duration_seconds": 15,
+                "min_duration_seconds": 4,
+                "resolutions": ["480p", "720p"],
+            },
+        ),
+        (
+            "doubao-seedance-2-0-mini-260615",
+            "volcengine_ark",
+            "ark",
+            {
+                "durations": list(range(4, 16)),
+                "frame_reference_mode_exclusive": True,
+                "generated_audio": True,
+                "generated_audio_configurable": False,
+                "max_duration_seconds": 15,
+                "min_duration_seconds": 4,
+                "resolutions": ["480p", "720p"],
+            },
+        ),
+        (
+            "grok-imagine-video",
+            "grok",
+            "openai",
+            {
+                "durations": list(range(1, 16)),
+                "max_duration_seconds": 15,
+                "max_reference_duration_seconds": 10,
+                "min_duration_seconds": 1,
+                "reference_image_mode_exclusive": True,
+                "resolutions": ["480p", "720p"],
+            },
+        ),
+        (
+            "grok-imagine-video-1.5",
+            "grok",
+            "openai",
+            {
+                "durations": list(range(1, 16)),
+                "max_duration_seconds": 15,
+                "min_duration_seconds": 1,
+                "resolutions": ["480p", "720p", "1080p"],
+            },
+        ),
+    ],
+)
+def test_0084_declares_verified_video_mode_constraints(
+    model_id,
+    provider,
+    gateway_format,
+    expected,
+):
+    migration = _load_migration_module("0084_video_mode_constraints")
+
+    assert migration._correction(
+        {
+            "use": "video",
+            "model_id": model_id,
+            "provider": provider,
+            "gateway_format": gateway_format,
+        }
+    ) == expected
+
+
+@pytest.mark.parametrize(
+    "row",
+    [
+        {
+            "use": "image",
+            "model_id": "grok-imagine-video",
+            "provider": "grok",
+            "gateway_format": "openai",
+        },
+        {
+            "use": "video",
+            "model_id": "grok-imagine-video",
+            "provider": "custom_openai",
+            "gateway_format": "openai",
+        },
+        {
+            "use": "video",
+            "model_id": "doubao-seedance-2-0-260128",
+            "provider": "volcengine_ark",
+            "gateway_format": "openai",
+        },
+        {
+            "use": "video",
+            "model_id": "doubao-seedance-2-1-pro-270101",
+            "provider": "volcengine_ark",
+            "gateway_format": "ark",
+        },
+    ],
+)
+def test_0084_requires_matching_model_provider_and_gateway_format(row):
+    migration = _load_migration_module("0084_video_mode_constraints")
+
+    assert migration._correction(row) is None
+
+
+def test_0084_publishes_immutable_capability_versions_idempotently(
+    tmp_path,
+    monkeypatch,
+):
+    backend = Path(__file__).resolve().parents[1]
+    db_path = tmp_path / "video-mode-constraints.db"
+    database_url = f"sqlite:///{db_path}"
+    monkeypatch.setattr(settings, "database_url", database_url)
+    cfg = Config(str(backend / "alembic.ini"))
+    cfg.set_main_option("script_location", str(backend / "alembic"))
+    command.upgrade(cfg, "0083_video_input_semantics")
+
+    engine = sa.create_engine(database_url)
+    metadata = sa.MetaData()
+    model_configs = sa.Table("model_configs", metadata, autoload_with=engine)
+    capability_versions = sa.Table(
+        "model_capability_versions",
+        metadata,
+        autoload_with=engine,
+    )
+    specs = [
+        (
+            "doubao-seedance-1-5-pro-251215",
+            "volcengine_ark",
+            "ark",
+            {
+                "durations": list(range(4, 13)),
+                "generated_audio": True,
+                "generated_audio_configurable": False,
+                "max_duration_seconds": 12,
+                "min_duration_seconds": 4,
+                "resolutions": ["480p", "720p", "1080p"],
+            },
+        ),
+        (
+            "doubao-seedance-2-0-260128",
+            "volcengine_ark",
+            "ark",
+            {
+                "durations": list(range(4, 16)),
+                "frame_reference_mode_exclusive": True,
+                "generated_audio": True,
+                "generated_audio_configurable": False,
+                "max_duration_seconds": 15,
+                "min_duration_seconds": 4,
+                "resolutions": ["480p", "720p", "1080p"],
+            },
+        ),
+        (
+            "doubao-seedance-2-0-fast-260128",
+            "volcengine_ark",
+            "ark",
+            {
+                "durations": list(range(4, 16)),
+                "frame_reference_mode_exclusive": True,
+                "generated_audio": True,
+                "generated_audio_configurable": False,
+                "max_duration_seconds": 15,
+                "min_duration_seconds": 4,
+                "resolutions": ["480p", "720p"],
+            },
+        ),
+        (
+            "doubao-seedance-2-0-mini-260615",
+            "volcengine_ark",
+            "ark",
+            {
+                "durations": list(range(4, 16)),
+                "frame_reference_mode_exclusive": True,
+                "generated_audio": True,
+                "generated_audio_configurable": False,
+                "max_duration_seconds": 15,
+                "min_duration_seconds": 4,
+                "resolutions": ["480p", "720p"],
+            },
+        ),
+        (
+            "grok-imagine-video",
+            "grok",
+            "openai",
+            {
+                "durations": list(range(1, 16)),
+                "max_duration_seconds": 15,
+                "max_reference_duration_seconds": 10,
+                "min_duration_seconds": 1,
+                "reference_image_mode_exclusive": True,
+                "resolutions": ["480p", "720p"],
+            },
+        ),
+        (
+            "grok-imagine-video-1.5",
+            "grok",
+            "openai",
+            {
+                "durations": list(range(1, 16)),
+                "max_duration_seconds": 15,
+                "min_duration_seconds": 1,
+                "resolutions": ["480p", "720p", "1080p"],
+            },
+        ),
+    ]
+    model_ids = {}
+    old_version_ids = {}
+    stale_capabilities = {
+        "custom_flag": "keep",
+        "durations": [5],
+        "generated_audio_configurable": True,
+        "max_duration_seconds": 99,
+        "min_duration_seconds": 2,
+        "resolutions": ["4k"],
+    }
+    now = datetime.now(timezone.utc)
+    with engine.begin() as connection:
+        for model_id, _provider, _gateway_format, _expected in specs:
+            existing_ids = list(
+                connection.scalars(
+                    sa.select(model_configs.c.id).where(
+                        model_configs.c.use == "video",
+                        model_configs.c.model_id == model_id,
+                    )
+                )
+            )
+            if existing_ids:
+                connection.execute(
+                    sa.delete(capability_versions).where(
+                        capability_versions.c.model_config_id.in_(existing_ids)
+                    )
+                )
+                connection.execute(
+                    sa.delete(model_configs).where(model_configs.c.id.in_(existing_ids))
+                )
+        for sort_order, (model_id, provider, gateway_format, _expected) in enumerate(
+            specs,
+            start=1,
+        ):
+            result = connection.execute(
+                model_configs.insert().values(
+                    use="video",
+                    model_id=model_id,
+                    display_name=model_id,
+                    is_default=False,
+                    sort_order=sort_order,
+                    provider=provider,
+                    gateway_format=gateway_format,
+                    cost_credits=10,
+                    unlock_cost=0,
+                    enabled=True,
+                    extra={
+                        "keep_extra": f"extra:{model_id}",
+                        "capabilities": dict(stale_capabilities),
+                    },
+                )
+            )
+            model_config_id = int(result.inserted_primary_key[0])
+            model_ids[model_id] = model_config_id
+            version_result = connection.execute(
+                capability_versions.insert().values(
+                    model_config_id=model_config_id,
+                    version=4,
+                    schema_version="capability.v1",
+                    capabilities=dict(stale_capabilities),
+                    metadata_snapshot={
+                        "schema_version": "model-catalog-metadata.v1",
+                        "origin": "test_0084",
+                        "model_id": model_id,
+                        "display_name": model_id,
+                        "is_default": False,
+                        "sort_order": sort_order,
+                        "enabled": True,
+                    },
+                    status="published",
+                    is_active=True,
+                    activated_at=now,
+                )
+            )
+            old_version_ids[model_id] = int(version_result.inserted_primary_key[0])
+
+    command.upgrade(cfg, "0084_video_mode_constraints")
+    with engine.connect() as connection:
+        rows = connection.execute(
+            sa.select(model_configs.c.model_id, model_configs.c.extra).where(
+                model_configs.c.id.in_(list(model_ids.values()))
+            )
+        ).mappings().all()
+        versions = connection.execute(
+            sa.select(
+                capability_versions.c.id,
+                capability_versions.c.model_config_id,
+                capability_versions.c.version,
+                capability_versions.c.status,
+                capability_versions.c.is_active,
+                capability_versions.c.source_version_id,
+                capability_versions.c.capabilities,
+                capability_versions.c.metadata_snapshot,
+                capability_versions.c.disabled_at,
+            )
+            .where(capability_versions.c.model_config_id.in_(list(model_ids.values())))
+            .order_by(
+                capability_versions.c.model_config_id,
+                capability_versions.c.version,
+            )
+        ).mappings().all()
+
+    rows_by_model = {row["model_id"]: row for row in rows}
+    versions_by_model = {}
+    for version in versions:
+        versions_by_model.setdefault(int(version["model_config_id"]), []).append(version)
+    for model_id, _provider, _gateway_format, expected in specs:
+        capabilities = rows_by_model[model_id]["extra"]["capabilities"]
+        assert capabilities == {"custom_flag": "keep", **expected}
+        assert rows_by_model[model_id]["extra"]["keep_extra"] == f"extra:{model_id}"
+        model_versions = versions_by_model[model_ids[model_id]]
+        assert [
+            (version["version"], version["status"], version["is_active"])
+            for version in model_versions
+        ] == [(4, "disabled", False), (5, "published", True)]
+        old_version, new_version = model_versions
+        assert old_version["id"] == old_version_ids[model_id]
+        assert old_version["capabilities"] == stale_capabilities
+        assert old_version["disabled_at"] is not None
+        assert new_version["source_version_id"] == old_version_ids[model_id]
+        assert new_version["capabilities"] == {"custom_flag": "keep", **expected}
+        assert new_version["metadata_snapshot"]["origin"] == "test_0084"
+
+    command.downgrade(cfg, "0083_video_input_semantics")
+    command.upgrade(cfg, "0084_video_mode_constraints")
+    with engine.connect() as connection:
+        version_count_after_repeat = connection.scalar(
+            sa.select(sa.func.count(capability_versions.c.id)).where(
+                capability_versions.c.model_config_id.in_(list(model_ids.values()))
+            )
+        )
+    assert version_count_after_repeat == len(specs) * 2
+    engine.dispose()

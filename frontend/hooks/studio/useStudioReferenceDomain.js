@@ -65,6 +65,7 @@ export default function useStudioReferenceDomain(foundation, model, prompt, reve
     portraitGenerationMode,
     productAsset,
     editMaskMode: foundation.editMaskMode,
+    maskEditSupported: model.maskEditSupported,
     setWorkspacePatch,
   });
 

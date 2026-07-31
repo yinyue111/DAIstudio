@@ -20,6 +20,18 @@ test("model catalog compares up to three models and deep-links exact selections"
   assert.match(catalog, /resolutions/);
   assert.match(catalog, /durations/);
   assert.match(catalog, /max_reference_images/);
+  assert.match(catalog, /video_reference: "视频参考"/);
+  assert.match(catalog, /video_edit: "视频编辑"/);
+  assert.match(catalog, /mask_edit: "蒙版编辑"/);
+  assert.match(catalog, /audio_reference: "音频参考输入"/);
+  assert.match(catalog, /generated_audio: "生成同步音频"/);
+  assert.doesNotMatch(catalog, /video_to_video: "视频参考\/编辑"/);
+  assert.match(catalog, /product_profile: "商品档案识别"/);
+  assert.match(catalog, /portrait_profile: "人物档案识别"/);
+  assert.match(catalog, /\["max_reference_images", "平台最多参考图"\]/);
+  assert.match(catalog, /\["max_reference_videos", "平台最多视频输入"\]/);
+  assert.match(catalog, /\["max_reference_audio", "平台最多音频输入"\]/);
+  assert.match(catalog, /视频反推（平台抽帧分析）/);
   assert.match(catalog, /CapabilityState/);
   assert.match(catalog, />不支持</);
   assert.match(catalog, />未知</);

@@ -114,9 +114,13 @@ const modelCases = [
   ["image", { text_to_image: true }, "image"],
   ["image", { image_to_image: true }, "image_edit"],
   ["video", { text_to_video: true }, "video"],
-  ["video", { image_to_video: true }, "video_edit"],
+  ["video", { image_to_video: true }, "video"],
+  ["video", { video_reference: true }, "video"],
+  ["video", { video_edit: true }, "video"],
+  ["video", { video_to_video: true }, "video"],
+  ["video", { first_last_frame: true }, "video"],
   ["vision", { image_analysis: true }, "image_edit"],
-  ["vision", { video_analysis: true }, "video_edit"],
+  ["vision", { video_analysis: true }, "video"],
 ];
 for (const [use, capabilities, creationMode] of modelCases) {
   const result = resolveCatalogModelIntent({ id: 42, use, capabilities });
@@ -142,6 +146,14 @@ assert.equal(
   ).status,
   "incompatible_mode",
 );
+assert.equal(
+  resolveCatalogModelIntent(
+    { id: 47, use: "video", capabilities: { image_to_video: true } },
+    "video_edit",
+  ).status,
+  "incompatible_mode",
+  "image-to-video models should enter the ordinary video workspace instead of subject reconstruction",
+);
 
 const href = catalogModelStudioHref({
   id: 46,
@@ -151,7 +163,7 @@ const href = catalogModelStudioHref({
 assert.equal(href.status, "ready");
 assert.match(href.href, /model_config_id=46/);
 assert.match(href.href, /model_use=vision/);
-assert.match(href.href, /studio_mode=video_edit/);
+assert.match(href.href, /studio_mode=video/);
 assert.doesNotMatch(href.href, /workflow=/);
 
 console.log("workflow preset and catalog model intent tests passed");

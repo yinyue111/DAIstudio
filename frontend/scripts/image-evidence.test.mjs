@@ -490,7 +490,7 @@ const submissionPreflight = validateGenerationSubmission({
   reversing: false,
   productProfiling: false,
   structuredDirty: false,
-  modelOption: { capabilities: {} },
+  modelOption: { capabilities: { image_to_image: true, reference_image: true } },
   productVideoTemplate: "prompt_driven",
   category: "image",
   creationMode: "image_edit",

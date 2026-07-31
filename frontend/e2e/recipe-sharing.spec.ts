@@ -116,7 +116,7 @@ test("登录用户使用分享后精确写入草稿并在 Studio 恢复完整配
   await expect(page.getByRole("button", { name: /图生视频/ })).toHaveClass(/bg-brand/);
   await expect(page.locator("label").filter({ hasText: /^主体$/ }).locator("xpath=following-sibling::input"))
     .toHaveValue("银色香水瓶");
-  await expect(page.locator('input[type="number"][title^="最长"]')).toHaveValue("8");
+  await expect(page.getByRole("spinbutton", { name: "1s–15s" })).toHaveValue("8");
   await expect(page.locator("button.chip").filter({ hasText: /^1080p$/ })).toHaveClass(/chip-active/);
   const storyboard = page.getByRole("list", { name: "反推分镜" });
   await expect(storyboard).toBeVisible();

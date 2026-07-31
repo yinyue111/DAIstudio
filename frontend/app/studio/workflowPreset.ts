@@ -182,14 +182,16 @@ export function resolveCatalogModelIntent(
     : modelUse === "video"
       ? [
           { mode: "video", capability: "text_to_video" },
-          { mode: "video_edit", capability: "image_to_video" },
-          { mode: "video_edit", capability: "video_to_video" },
-          { mode: "video_edit", capability: "first_last_frame" },
+          { mode: "video", capability: "image_to_video" },
+          { mode: "video", capability: "video_reference" },
+          { mode: "video", capability: "video_edit" },
+          { mode: "video", capability: "video_to_video" },
+          { mode: "video", capability: "first_last_frame" },
         ]
       : modelUse === "vision"
         ? [
             { mode: "image_edit", capability: "image_analysis" },
-            { mode: "video_edit", capability: "video_analysis" },
+            { mode: "video", capability: "video_analysis" },
           ]
         : [{ capability: "prompt_optimization" }];
   const compatible = candidates.filter((candidate) => (

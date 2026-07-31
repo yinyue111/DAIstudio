@@ -11,6 +11,7 @@ from ..models import (
     ToolDefinition,
     ToolVersion,
 )
+from .model_capabilities import effective_model_capabilities
 from .model_gateway_config import PROVIDER_PRESETS
 from .model_routes import model_route_summary
 from .product_edition import feature_enabled, hidden_navigation_keys, is_launch_lite
@@ -18,19 +19,34 @@ from .product_edition import feature_enabled, hidden_navigation_keys, is_launch_
 _BOOLEAN_CAPABILITIES = {
     "text_to_image",
     "image_to_image",
+    "mask_edit",
     "reference_image",
     "multi_reference",
     "text_to_video",
     "image_to_video",
     "video_to_video",
+    "video_reference",
+    "video_edit",
+    "audio_reference",
     "first_last_frame",
+    "reference_image_mode_exclusive",
+    "frame_reference_mode_exclusive",
+    "generated_audio",
+    "generated_audio_configurable",
     "product_profile",
     "portrait_profile",
     "prompt_optimization",
     "image_analysis",
     "video_analysis",
 }
-_INTEGER_CAPABILITIES = {"max_reference_images", "max_duration_seconds"}
+_INTEGER_CAPABILITIES = {
+    "max_reference_images",
+    "max_reference_videos",
+    "max_reference_audio",
+    "max_reference_duration_seconds",
+    "min_duration_seconds",
+    "max_duration_seconds",
+}
 _LIST_CAPABILITIES = {
     "aspect_ratios",
     "resolutions",
@@ -138,6 +154,10 @@ def public_capabilities(extra: dict | None) -> dict:
 
 def public_model_option(model: ModelConfig) -> dict:
     extra = model.extra if isinstance(model.extra, dict) else {}
+    effective_extra = {
+        **extra,
+        "capabilities": effective_model_capabilities(model),
+    }
     preview_cost = (
         int(extra.get("preview_cost", max(1, int(model.cost_credits or 0) // 10)))
         if model.use == "video"
@@ -158,7 +178,7 @@ def public_model_option(model: ModelConfig) -> dict:
         "unlock_cost": int(model.unlock_cost or 0),
         "preview_cost": preview_cost,
         "final_cost": int(model.cost_credits or 0),
-        "capabilities": public_capabilities(extra),
+        "capabilities": public_capabilities(effective_extra),
     }
 
 

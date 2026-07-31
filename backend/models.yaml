@@ -15,13 +15,21 @@ models:
     cost_credits: 3
     unlock_cost: 0
     enabled: true
+    extra:
+      capabilities:
+        prompt_optimization: true
 
   - use: vision        # 反推:图 -> 结构化提示词  (/v1/chat/completions)
-    model_id: gpt-5.5
+    model_id: gpt-5.6-sol
     cost_credits: 5
     unlock_cost: 0
     enabled: true
     extra:
+      capabilities:
+        image_analysis: true
+        video_analysis: true
+        product_profile: true
+        portrait_profile: true
       official_pricing:
         source: https://openai.com/api/pricing/
         checked_at: "2026-06-21"
@@ -39,11 +47,16 @@ models:
     cost_credits: 8     # fallback/admin display; runtime pricing is per image
     unlock_cost: 0      # generated assets are visible in history without HD unlock fee
     enabled: true
-    # Optional: enable true 图+指令->图 (reverse-off). When set, an instruction
-    # with an image source is sent to this image-to-image endpoint instead of
-    # plain text->image. Leave unset to always use text->image.
-    # extra:
-    #   edit_path: /v1/images/edits
+    extra:
+      edit_path: /v1/images/edits
+      multi_image_edit_enabled: true
+      capabilities:
+        text_to_image: true
+        image_to_image: true
+        reference_image: true
+        multi_reference: true
+        max_reference_images: 2
+        mask_edit: true
 
   - use: video         # 文生/图生视频 (Volcengine Ark / Doubao Seedance, async)
     model_id: doubao-seedance-1-5-pro-251215
@@ -59,6 +72,18 @@ models:
         reference_image: false
         first_last_frame: true
         multi_reference: false
+        video_to_video: false
+        video_reference: false
+        video_edit: false
+        audio_reference: false
+        generated_audio: true
+        generated_audio_configurable: false
+        resolutions: [480p, 720p, 1080p]
+        durations: [4, 5, 6, 7, 8, 9, 10, 11, 12]
+        min_duration_seconds: 4
+        max_duration_seconds: 12
+        max_reference_videos: 0
+        max_reference_audio: 0
       official_pricing:
         source: https://www.volcengine.com/docs/82379/1544106
         checked_at: "2026-06-21"

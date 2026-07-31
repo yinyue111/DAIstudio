@@ -53,13 +53,18 @@ def product_detail_model(client):
     with SessionLocal() as db:
         model = db.query(ModelConfig).filter(ModelConfig.use == "video").one()
         model_id = model.id
+        original_model_id = model.model_id
         original_extra = deepcopy(model.extra)
+        model.model_id = "doubao-seedance-2-0-260128"
         model.extra = {
             **dict(model.extra or {}),
             "capabilities": {
+                "text_to_video": True,
                 "image_to_video": True,
+                "reference_image": True,
                 "multi_reference": True,
-                "max_reference_images": 10,
+                "max_reference_images": 9,
+                "video_to_video": True,
             },
         }
         db.commit()
@@ -69,6 +74,7 @@ def product_detail_model(client):
         with SessionLocal() as db:
             model = db.get(ModelConfig, model_id)
             if model is not None:
+                model.model_id = original_model_id
                 model.extra = original_extra
                 db.commit()
 

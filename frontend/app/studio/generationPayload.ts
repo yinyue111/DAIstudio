@@ -80,6 +80,7 @@ interface BuildGenerationPayloadInput {
   productPixelLockMode?: ProductPixelLockMode;
   vDuration: number | string;
   vResolution: string;
+  providerVideoEditMode?: boolean;
   productVideoTemplate?: ProductVideoStrategy | string;
   modelConfigId?: number | null;
   reverseOperationId?: number | null;
@@ -199,6 +200,7 @@ export function buildGenerationPayload({
   productPixelLockMode = "auto",
   vDuration,
   vResolution,
+  providerVideoEditMode = false,
   productVideoTemplate = "prompt_driven",
   modelConfigId = null,
   reverseOperationId = null,
@@ -211,6 +213,7 @@ export function buildGenerationPayload({
   const finalResolution = parentParams.target_resolution || parentParams.resolution || vResolution;
   const finalDuration = parentParams.target_duration || parentParams.duration || vDuration;
   const maxVideoDuration = videoDurationLimit(cfg?.video_duration_max_seconds);
+  const minVideoDuration = Number(cfg?.video_duration_min_seconds) || 1;
   const ratioPool = effCategory === "video" ? videoRatioOptions() : RATIOS;
   const ratioOption = ratioPool.find((r) => r.key === finalRatioKey) || ratioPool[0];
   const imageSize = imageSizeFor(ratioOption, imageQuality, cfg?.image_size_max_dim || 2048);
@@ -456,8 +459,8 @@ export function buildGenerationPayload({
             ...(isImageEditMode && productMode ? { product_pixel_lock: editMaskMode === "off" ? "off" : (productPixelLockMode || "auto") } : {}),
             ...(effectiveEditNegative ? { negative_prompt: effectiveEditNegative } : {}),
           }
-        : {
-            duration: boundedVideoDuration(finalDuration, maxVideoDuration),
+        : providerVideoEditMode ? {} : {
+            duration: boundedVideoDuration(finalDuration, maxVideoDuration, minVideoDuration),
             resolution: finalResolution,
             target_resolution: finalResolution,
             ratio: ratioOption.key,
@@ -468,7 +471,7 @@ export function buildGenerationPayload({
                   ? { product_reference_image: refImage }
                   : (isFinal && parentParams.product_reference_image
                       ? { product_reference_image: parentParams.product_reference_image }
-                      : (refImage ? { reference_image_url: refImage } : {})))),
+                      : (refImage && !portraitMode ? { reference_image_url: refImage } : {})))),
             ...(productDetailUrls.length ? { product_detail_images: productDetailUrls } : {}),
             ...(styleReferenceUrl ? { style_reference_image: styleReferenceUrl } : {}),
             ...(portraitMode && refImage ? { character_reference_image: refImage } : {}),
