@@ -6,6 +6,7 @@ import {
   VIDEO_QUALITIES,
 } from "../app/studio/constants";
 import { boundedImageCount, boundedVideoDuration, formatDuration } from "../app/studio/helpers";
+import AssetMedia from "./AssetMedia";
 
 export default function StudioGenerationControls({
   category,
@@ -40,6 +41,7 @@ export default function StudioGenerationControls({
   maskEditSupported = true,
   productPixelLockMode = "auto",
   onProductPixelLockModeChange,
+  subjectAsset = null,
   subjectProtection = null,
   subjectProtectionLoading = false,
   negative,
@@ -110,7 +112,13 @@ export default function StudioGenerationControls({
     : !subjectProtection
       ? "待上传"
       : subjectProtection.will_send_mask
-        ? `置信度 ${Math.round((subjectProtection.confidence || 0) * 100)}%`
+        ? subjectProtection.mode === "alpha_subject"
+          ? "精确蒙版"
+          : subjectProtection.mode === "auto_subject"
+            ? "自动蒙版"
+            : subjectProtection.mode === "center_box"
+              ? "中心蒙版"
+              : "蒙版可用"
         : subjectProtection.title === "整图编辑"
           ? "已关闭"
           : String(subjectProtection.title || "").includes("失败")
@@ -250,11 +258,29 @@ export default function StudioGenerationControls({
                   ) : subjectProtection ? (
                     <div className="mt-2 grid min-w-0 gap-2 sm:grid-cols-[72px_minmax(0,1fr)]">
                       {subjectProtection.mask_data_uri ? (
-                        <div className="flex h-[68px] w-[68px] items-center justify-center rounded-md border border-line bg-black/20">
-                          <img
-                            src={subjectProtection.mask_data_uri}
-                            alt="主体保护蒙版预览"
-                            className="max-h-[62px] max-w-[62px] object-contain"
+                        <div
+                          className="relative h-[68px] w-[68px] overflow-hidden rounded-md border border-line bg-black/20"
+                          aria-label="主体保护范围预览"
+                        >
+                          {subjectAsset ? (
+                            <AssetMedia
+                              asset={subjectAsset}
+                              className="absolute inset-0 h-full w-full object-contain"
+                              fallbackClassName="absolute inset-0 flex items-center justify-center text-[10px] text-fog"
+                            />
+                          ) : null}
+                          <div
+                            className="pointer-events-none absolute inset-0 bg-aqua/45"
+                            style={{
+                              WebkitMaskImage: `url("${subjectProtection.mask_data_uri}")`,
+                              maskImage: `url("${subjectProtection.mask_data_uri}")`,
+                              WebkitMaskPosition: "center",
+                              maskPosition: "center",
+                              WebkitMaskRepeat: "no-repeat",
+                              maskRepeat: "no-repeat",
+                              WebkitMaskSize: "contain",
+                              maskSize: "contain",
+                            }}
                           />
                         </div>
                       ) : (

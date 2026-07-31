@@ -25,7 +25,7 @@ export function classifyGenerationError(error, { category = "" } = {}) {
   const typeMessages = {
     moderation: {
       kind: "moderation",
-      message: "内容审核中，管理员确认后会在历史记录里更新结果；请不要重复提交同一任务。",
+      message: "模型内容策略未放行本次请求。请调整提示词或参考素材后重新提交。",
     },
     user_input: {
       kind: "user_actionable",
@@ -53,16 +53,16 @@ export function classifyGenerationError(error, { category = "" } = {}) {
   const lower = text.toLowerCase();
   const isVideo = category === "video";
 
-  if (/needs_review|人工|审核|确认中|review/.test(lower)) {
-    return {
-      kind: "moderation",
-      message: "内容审核中，管理员确认后会在历史记录里更新结果；请不要重复提交同一任务。",
-    };
-  }
-  if (/违规|敏感|policy|safety|unsafe|blocked|moderation|content/.test(lower)) {
+  if (/违规|敏感|policy|safety|unsafe|blocked|moderation|content|审核/.test(lower)) {
     return {
       kind: "user_actionable",
-      message: "提示词或参考素材可能触发模型审核。请弱化敏感描述、减少露骨表达，或更换参考图后重试。",
+      message: "提示词或参考素材可能触发模型内容策略。请弱化敏感描述、减少露骨表达，或更换参考图后重试。",
+    };
+  }
+  if (/needs_review|人工确认|确认中|reconcil|review/.test(lower)) {
+    return {
+      kind: "provider",
+      message: "模型提交或结果状态待核对。平台会按实际结果结算或退回积分，请勿重复提交。",
     };
   }
   if (/格式|format|unsupported|不支持|invalid image|invalid video|file/.test(lower)) {

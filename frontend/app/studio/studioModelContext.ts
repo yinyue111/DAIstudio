@@ -2,7 +2,9 @@ import { assetReferenceUrl } from "../../lib/unifiedAssets";
 import {
   modelRequirements,
   modelOptionSupports,
+  resolveVideoSubjectImageInputMode,
   strictMultiReferenceLimit,
+  VIDEO_IMAGE_INPUT_MODE,
   validateMultiReferenceSelection,
 } from "./StudioModelSelector";
 import { MAX_PRODUCT_DETAIL_IMAGES } from "./constants";
@@ -92,16 +94,25 @@ export function buildStudioModelContext({
     productVideoTemplate,
   );
   const effectiveProductVideoTemplate = productVideoStrategySelection.effectiveValue;
+  const videoSubjectImageInputMode = resolveVideoSubjectImageInputMode(
+    selectedGenerationModel,
+    {
+      category,
+      creationMode,
+      subjectMode,
+      selected,
+      productAsset,
+      productDetailAssets,
+    },
+  );
   const productVideoStrategyUnsupported = Boolean(
     category === "video"
     && productGenerationMode
+    && videoSubjectImageInputMode !== VIDEO_IMAGE_INPUT_MODE.FIRST_FRAME
     && !productVideoStrategySelection.supported,
   );
   const independentSubjectReferenceUnsupported = Boolean(
-    category === "video"
-    && productAsset
-    && ["product", "portrait"].includes(subjectMode)
-    && !modelOptionSupports(selectedGenerationModel, [["reference_image", "multi_reference"]]),
+    videoSubjectImageInputMode === VIDEO_IMAGE_INPUT_MODE.UNSUPPORTED,
   );
   const productReferenceUnsupported = Boolean(
     independentSubjectReferenceUnsupported && subjectMode === "product",
@@ -114,6 +125,7 @@ export function buildStudioModelContext({
     creationMode,
     selected,
     productAsset,
+    productDetailAssets,
     subjectMode,
     analysisOnlySourceVideo,
   });
@@ -134,10 +146,18 @@ export function buildStudioModelContext({
   const selectedModelName = String(
     selectedGenerationModel?.display_name || selectedGenerationModel?.model_id || `当前${mediaLabel}模型`,
   ).trim();
+  const subjectImageReferenceCount = new Set(
+    [productAsset, selected, ...productDetailAssets]
+      .filter((asset) => asset && asset.type !== "video")
+      .map(assetReferenceUrl)
+      .filter(Boolean),
+  ).size;
   const modelSwitchMessage = independentSubjectReferenceUnsupported
-    ? subjectMode === "portrait"
-      ? `${selectedModelName} 不支持独立人物参考图。请切换到支持人物参考的视频模型后再生成；系统不会自动切换模型。`
-      : `${selectedModelName} 不支持独立产品主题图。请切换到支持产品参考的视频模型后再生成；系统不会自动切换模型。`
+    ? subjectImageReferenceCount > 1
+      ? `${selectedModelName} 仅支持单图首帧，本次需要 ${subjectImageReferenceCount} 张图片。请移除多余图片或切换支持多参考图的视频模型；系统不会自动切换模型。`
+      : subjectMode === "portrait"
+        ? `${selectedModelName} 不支持当前人物图片输入方式。请切换视频模型后再生成；系统不会自动切换模型。`
+        : `${selectedModelName} 不支持当前产品图片输入方式。请切换视频模型后再生成；系统不会自动切换模型。`
     : generationInputUnsupported
       ? category === "video" && selected?.type === "video" && !analysisOnlySourceVideo
         ? `${selectedModelName} 不支持视频输入。请切换支持视频参考或视频编辑的模型，或先完成该素材的视频反推并应用反推版本；系统不会自动切换模型。`
@@ -182,7 +202,7 @@ export function buildStudioModelContext({
   const independentReferenceMode = Boolean(
     category === "video"
     && (
-      (productAsset && ["product", "portrait"].includes(subjectMode))
+      videoSubjectImageInputMode === VIDEO_IMAGE_INPUT_MODE.SUBJECT_REFERENCE
       || productDetailAssets.length > 0
     )
   );
@@ -241,6 +261,7 @@ export function buildStudioModelContext({
     productVideoStrategySelection,
     effectiveProductVideoTemplate,
     productVideoStrategyUnsupported,
+    videoSubjectImageInputMode,
     independentSubjectReferenceUnsupported,
     productReferenceUnsupported,
     portraitReferenceUnsupported,

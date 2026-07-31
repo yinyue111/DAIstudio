@@ -11,6 +11,7 @@ class ModelCapabilityError(ValueError):
 
 
 _SEEDANCE_VERSION_RE = re.compile(r"^doubao-seedance-(\d+)-(\d+)(?:-|$)")
+_VIDEO_IMAGE_INPUT_MODES = {"first_frame", "subject_reference"}
 
 _IMAGE_CAPABILITY_ALIASES = {
     "text_to_image",
@@ -472,6 +473,48 @@ def assert_generation_capability(
     params: dict | None,
 ) -> None:
     params = params or {}
+    video_image_input_mode = str(params.get("video_image_input_mode") or "").strip().lower()
+    if video_image_input_mode and video_image_input_mode not in _VIDEO_IMAGE_INPUT_MODES:
+        raise ModelCapabilityError("视频图片输入模式不受支持")
+    if video_image_input_mode and category != "video":
+        raise ModelCapabilityError("视频图片输入模式只能用于视频生成")
+    subject_mode = str(params.get("subject_mode") or "").strip().lower()
+    product_reference = str(params.get("product_reference_image") or "").strip()
+    character_reference = str(params.get("character_reference_image") or "").strip()
+    details = params.get("product_detail_images")
+    independent_reference_values = [
+        product_reference,
+        params.get("style_reference_image"),
+        character_reference,
+    ]
+    has_independent_reference = any(independent_reference_values) or bool(
+        details if isinstance(details, list) else []
+    )
+    if video_image_input_mode:
+        if subject_mode not in {"product", "portrait"}:
+            raise ModelCapabilityError("视频图片输入模式只能用于产品或人物主体")
+        if video_image_input_mode == "first_frame":
+            if has_independent_reference:
+                raise ModelCapabilityError("单图首帧模式不能同时提交产品、人物、风格或细节参考图")
+            if params.get("last_frame_image"):
+                raise ModelCapabilityError("单图首帧模式不能同时提交尾帧")
+            if not str(
+                params.get("first_frame_image")
+                or params.get("reference_image_url")
+                or (source_asset_url if source_type == "image" else "")
+                or ""
+            ).strip():
+                raise ModelCapabilityError("单图首帧模式必须提供一张首帧图片")
+        else:
+            if any(
+                params.get(key)
+                for key in ("first_frame_image", "reference_image_url", "last_frame_image")
+            ):
+                raise ModelCapabilityError("主体参考模式不能同时提交首帧、尾帧或通用参考图")
+            if subject_mode == "product" and not product_reference:
+                raise ModelCapabilityError("产品主体参考模式必须提供产品参考图")
+            if subject_mode == "portrait" and not character_reference:
+                raise ModelCapabilityError("人物主体参考模式必须提供人物参考图")
     product_video_template = str(params.get("product_video_template") or "").strip()
     if product_video_template:
         if category != "video":
@@ -604,15 +647,6 @@ def assert_generation_capability(
             raise ModelCapabilityError(
                 f"所选视频模型仅支持 {options}，当前请求为 {requested_resolution}"
             )
-    independent_reference_values = [
-        params.get("product_reference_image"),
-        params.get("style_reference_image"),
-        params.get("character_reference_image"),
-    ]
-    details = params.get("product_detail_images")
-    has_independent_reference = any(independent_reference_values) or bool(
-        details if isinstance(details, list) else []
-    )
     if has_independent_reference:
         _require(
             model,
@@ -628,7 +662,6 @@ def assert_generation_capability(
                     f"所选视频模型的参考图模式最长支持 {max_reference_duration} 秒，"
                     f"当前请求为 {duration_seconds:g} 秒"
                 )
-    subject_mode = str(params.get("subject_mode") or "").strip().lower()
     source_image_is_subject_reference = bool(
         source_type == "image"
         and subject_mode in {"product", "portrait"}

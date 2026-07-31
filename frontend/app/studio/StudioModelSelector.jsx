@@ -2,6 +2,11 @@
 
 export const MODEL_SELECTION_USES = ["vision", "image", "video", "prompt"];
 export const MODEL_SELECTION_STORAGE_KEY = "studio_model_selections_v1";
+export const VIDEO_IMAGE_INPUT_MODE = {
+  FIRST_FRAME: "first_frame",
+  SUBJECT_REFERENCE: "subject_reference",
+  UNSUPPORTED: "unsupported",
+};
 
 const USE_LABELS = {
   vision: "反推模型",
@@ -129,6 +134,7 @@ export function modelRequirements({
   creationMode,
   selected,
   productAsset,
+  productDetailAssets = [],
   subjectMode,
   analysisOnlySourceVideo = false,
 }) {
@@ -157,11 +163,11 @@ export function modelRequirements({
     if (selected?.type === "video" && !analysisOnlySourceVideo) {
       requirements.push(["video_reference", "video_edit", "video_to_video", "reference_video"]);
     } else if (creationMode === "video_edit" || productAsset || selected?.type === "image") {
-      requirements.push(["image_to_video", "reference_image", "image_reference"]);
+      requirements.push(["image_to_video"]);
     } else {
       requirements.push(["video_generation", "text_to_video", "video"]);
     }
-    if (productAsset) {
+    if (productAsset && referenceImageCount({ selected, productAsset, productDetailAssets }) > 1) {
       requirements.push(["reference_image", "multi_reference"]);
     }
     return requirements;
@@ -170,14 +176,18 @@ export function modelRequirements({
 }
 
 export function filterModelOptions(options, context) {
-  const requirements = modelRequirements(context);
-  return (Array.isArray(options) ? options : []).filter((option) => (
-    modelOptionSupports(option, requirements)
-  ));
+  return markGenerationModelCompatibility(options, context).filter(
+    (option) => option.selection_disabled !== true,
+  );
 }
 
-function referenceImageCount({ selected, productAsset, productDetailAssets = [] }) {
-  const references = [selected, productAsset, ...productDetailAssets];
+function referenceImageCount({
+  selected,
+  productAsset,
+  productDetailAssets = [],
+  variationSource = null,
+}) {
+  const references = [selected, productAsset, variationSource, ...productDetailAssets];
   return new Set(references.flatMap((asset) => {
     if (!asset || asset.type === "video") return [];
     const identity = String(asset.url || asset.id || asset.local_path || "").trim();
@@ -185,19 +195,67 @@ function referenceImageCount({ selected, productAsset, productDetailAssets = [] 
   })).size;
 }
 
+function isVideoSubjectImageContext({ use, category, subjectMode, productAsset }) {
+  const targetUse = String(use || category || "").trim().toLowerCase();
+  return Boolean(
+    targetUse === "video"
+    && productAsset
+    && ["product", "portrait"].includes(subjectMode),
+  );
+}
+
+export function resolveVideoSubjectImageInputMode(option, context) {
+  if (!isVideoSubjectImageContext(context)) return "";
+  const requiredImages = referenceImageCount(context);
+  if (
+    requiredImages < 1
+    || !modelOptionSupports(option, [["image_to_video"]])
+  ) {
+    return VIDEO_IMAGE_INPUT_MODE.UNSUPPORTED;
+  }
+  if (modelOptionSupports(option, [["reference_image", "multi_reference"]])) {
+    if (requiredImages > 1 && strictMultiReferenceLimit(option) < requiredImages) {
+      return VIDEO_IMAGE_INPUT_MODE.UNSUPPORTED;
+    }
+    return VIDEO_IMAGE_INPUT_MODE.SUBJECT_REFERENCE;
+  }
+  return requiredImages === 1
+    ? VIDEO_IMAGE_INPUT_MODE.FIRST_FRAME
+    : VIDEO_IMAGE_INPUT_MODE.UNSUPPORTED;
+}
+
 export function markGenerationModelCompatibility(options, context) {
   const requirements = modelRequirements(context);
   const requiredImages = referenceImageCount(context);
+  const targetUse = String(context.use || context.category || "").trim().toLowerCase();
+  const validatesGenerationReferences = ["image", "video"].includes(targetUse);
   return (Array.isArray(options) ? options : []).map((option) => {
     let message = "";
+    const videoImageInputMode = resolveVideoSubjectImageInputMode(option, context);
     if (!modelOptionSupports(option, requirements)) {
       message = "当前模型不支持已选择的素材类型";
-    } else if (requiredImages > 1 && strictMultiReferenceLimit(option) < requiredImages) {
+    } else if (videoImageInputMode === VIDEO_IMAGE_INPUT_MODE.UNSUPPORTED) {
+      message = requiredImages > 1
+        ? `当前素材需要 ${requiredImages} 张独立参考图，模型仅支持单图首帧`
+        : "当前模型不支持这张主体图片的输入方式";
+    } else if (
+      validatesGenerationReferences
+      && requiredImages > 1
+      && strictMultiReferenceLimit(option) < requiredImages
+    ) {
       message = `当前素材需要 ${requiredImages} 张参考图，模型未提供足够的多图能力`;
     }
-    return message
-      ? { ...option, selection_disabled: true, selection_disabled_reason: message }
-      : option;
+    const inputModeLabel = videoImageInputMode === VIDEO_IMAGE_INPUT_MODE.FIRST_FRAME
+      ? "单图首帧"
+      : videoImageInputMode === VIDEO_IMAGE_INPUT_MODE.SUBJECT_REFERENCE
+        ? (context.subjectMode === "portrait" ? "人物参考" : "产品参考")
+        : "";
+    return {
+      ...option,
+      ...(videoImageInputMode ? { video_image_input_mode: videoImageInputMode } : {}),
+      ...(inputModeLabel ? { video_image_input_label: inputModeLabel } : {}),
+      ...(message ? { selection_disabled: true, selection_disabled_reason: message } : {}),
+    };
   });
 }
 
@@ -274,7 +332,9 @@ export default function StudioModelSelector({
               disabled={option.selection_disabled === true}
               title={option.selection_disabled_reason || undefined}
             >
-              {modelOptionName(option)}{option.selection_disabled ? "（当前素材不支持）" : ""}
+              {modelOptionName(option)}
+              {option.video_image_input_label ? `（${option.video_image_input_label}）` : ""}
+              {option.selection_disabled ? "（当前素材不支持）" : ""}
             </option>
           ))}
         </select>

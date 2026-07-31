@@ -357,7 +357,10 @@ export const api: {
   retryReverseOperation(id: number | string, body: ReverseOperationRetryInput): Promise<ReverseOperation>;
   studioPromptOptimizations(query?: StudioPromptOptimizationQuery): Promise<StudioPromptOptimizationPage>;
   studioPromptOptimization(proposalId: number | string): Promise<StudioPromptOptimizationDetail>;
-  createStudioPromptOptimization(body: StudioPromptOptimizationRequest): Promise<StudioPromptOptimizationProposal>;
+  createStudioPromptOptimization(
+    body: StudioPromptOptimizationRequest,
+    options?: { signal?: AbortSignal | null },
+  ): Promise<StudioPromptOptimizationProposal>;
   acceptStudioPromptOptimization(proposalId: number | string, body: StudioPromptOptimizationDecision): Promise<StudioPromptOptimizationDecisionResponse>;
   rejectStudioPromptOptimization(proposalId: number | string, body: StudioPromptOptimizationDecision): Promise<StudioPromptOptimizationDecisionResponse>;
   subjectProtectionPreview(asset_url: string, edit_mask_mode?: EditMaskMode): Promise<SubjectProtectionPreview>;

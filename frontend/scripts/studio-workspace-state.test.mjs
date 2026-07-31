@@ -52,6 +52,16 @@ assert.match(
   /最多 \$\{safeLimit\} 张/,
   "the reference panel should show the effective product detail limit",
 );
+assert.match(
+  presentationSource,
+  /providerVideoEditMode: model\.providerVideoEditMode[\s\S]{0,120}videoSubjectImageInputMode: model\.videoSubjectImageInputMode/,
+  "presentation wiring should preserve provider edit and subject-image input capabilities",
+);
+assert.match(
+  referencePanelSource,
+  /subjectImageIsFirstFrame[\s\S]*作为视频首帧，不是独立主体参考[\s\S]*主体延续由模型根据首帧推演，不是独立身份锁定/,
+  "single-image video models must explain first-frame semantics instead of promising identity reference",
+);
 assert.doesNotMatch(
   generationControlsSource,
   /applyVideoProductTemplate/,
@@ -546,6 +556,26 @@ assert.match(
   "an empty subject-protection state should be shown as waiting for upload",
 );
 assert.match(
+  generationControlsSource,
+  /subjectProtection\.mode === "alpha_subject"[\s\S]*?"精确蒙版"[\s\S]*?subjectProtection\.mode === "auto_subject"[\s\S]*?"自动蒙版"/,
+  "subject-protection status should describe the mask type instead of presenting a heuristic score as accuracy",
+);
+assert.doesNotMatch(
+  generationControlsSource,
+  /`置信度 \$\{Math\.round/,
+  "subject-protection status should not expose a heuristic score as an exact confidence percentage",
+);
+assert.match(
+  generationControlsSource,
+  /<AssetMedia[\s\S]*?asset=\{subjectAsset\}[\s\S]*?WebkitMaskImage/,
+  "subject-protection preview should overlay the mask on the original product image",
+);
+assert.match(
+  pageSource,
+  /subjectAsset=\{productAsset\}/,
+  "generation controls should receive the original product asset for aligned mask preview",
+);
+assert.match(
   referencePanelSource,
   /const imageUploadTargetsProduct = isImageEditMode && productGenerationMode && !productAsset/,
   "the generic image action should target the product slot until a product exists",
@@ -640,6 +670,8 @@ const productUploadPatch = mediaUploadSource.match(
 );
 assert.ok(productUploadPatch, "product upload should update the product workspace");
 for (const staleField of [
+  'editMaskMode: "protect_subject"',
+  'productPixelLockMode: "auto"',
   "subjectProtection: null",
   "subjectProtectionLoading: true",
   'subjectProtectionSource: ""',
@@ -649,6 +681,16 @@ for (const staleField of [
     `product replacement should reset ${staleField}`,
   );
 }
+assert.match(
+  mediaUploadSource,
+  /async function selectProductAsset[\s\S]*?productAsset: asset,[\s\S]*?editMaskMode: "protect_subject",[\s\S]*?productPixelLockMode: "auto"/,
+  "selecting another product should not inherit disabled protection from the previous product",
+);
+assert.match(
+  workspaceActionsSource,
+  /async function clearProductAsset[\s\S]*?editMaskMode: "protect_subject",[\s\S]*?productPixelLockMode: "auto"/,
+  "clearing a product should restore safe protection defaults",
+);
 const apiSource = readFileSync(join(root, "lib/api.js"), "utf8");
 assert.match(
   apiSource,

@@ -426,6 +426,59 @@ assert.equal(
   "direct product video should retain text-to-video prompt semantics",
 );
 assert.equal(directProductVideo.payload.params.character_reference_image, undefined);
+const firstFrameProductVideo = buildGenerationPayload({
+  stage: "preview",
+  cfg: { video_duration_max_seconds: 15 },
+  category: "video",
+  creationMode: "video",
+  subjectMode: "product",
+  prompt: "产品缓慢旋转，镜头向前推进",
+  promptDirty: true,
+  selected: null,
+  productAsset,
+  productDetailAssets: [],
+  structured: {},
+  ratio: "9:16",
+  imageQuality: "1k",
+  n: 1,
+  vDuration: 5,
+  vResolution: "720p",
+  productVideoTemplate: "stable_showcase",
+  videoImageInputMode: "first_frame",
+});
+assert.equal(firstFrameProductVideo.payload.params.video_image_input_mode, "first_frame");
+assert.equal(firstFrameProductVideo.payload.params.first_frame_image, productAsset.url);
+assert.equal(firstFrameProductVideo.payload.params.product_reference_image, undefined);
+assert.equal(firstFrameProductVideo.payload.params.character_reference_image, undefined);
+assert.equal(firstFrameProductVideo.payload.params.style_reference_image, undefined);
+assert.equal(firstFrameProductVideo.payload.params.product_detail_images, undefined);
+assert.equal(firstFrameProductVideo.payload.params.product_lock_mode, undefined);
+assert.equal(firstFrameProductVideo.payload.params.product_video_template, undefined);
+
+const explicitProductReferenceVideo = buildGenerationPayload({
+  stage: "preview",
+  cfg: { video_duration_max_seconds: 15 },
+  category: "video",
+  creationMode: "video",
+  subjectMode: "product",
+  prompt: "保持产品外观一致",
+  promptDirty: true,
+  selected: null,
+  productAsset,
+  productDetailAssets: [],
+  structured: {},
+  ratio: "9:16",
+  imageQuality: "1k",
+  n: 1,
+  vDuration: 5,
+  vResolution: "720p",
+  productVideoTemplate: "prompt_driven",
+  videoImageInputMode: "subject_reference",
+});
+assert.equal(explicitProductReferenceVideo.payload.params.video_image_input_mode, "subject_reference");
+assert.equal(explicitProductReferenceVideo.payload.params.product_reference_image, productAsset.url);
+assert.equal(explicitProductReferenceVideo.payload.params.first_frame_image, undefined);
+assert.equal(explicitProductReferenceVideo.payload.params.product_video_template, "prompt_driven");
 assert.throws(
   () => buildGenerationPayload({
     category: "video",
@@ -814,6 +867,28 @@ assert.equal(portraitVideo.payload.params.character_reference_image, productAsse
 assert.equal(portraitVideo.payload.params.reference_image_url, undefined);
 assert.equal(portraitVideo.payload.params.first_frame_image, undefined);
 assert.equal(portraitVideo.payload.params.last_frame_image, undefined);
+const portraitFirstFrameVideo = buildGenerationPayload({
+  stage: "preview",
+  cfg: { video_duration_max_seconds: 15 },
+  category: "video",
+  creationMode: "video_edit",
+  isEditMode: true,
+  subjectMode: "portrait",
+  prompt: "人物缓慢转头看向镜头",
+  promptDirty: true,
+  selected: null,
+  productAsset,
+  structured: {},
+  ratio: "9:16",
+  imageQuality: "1k",
+  n: 1,
+  vDuration: 5,
+  vResolution: "720p",
+  videoImageInputMode: "first_frame",
+});
+assert.equal(portraitFirstFrameVideo.payload.params.video_image_input_mode, "first_frame");
+assert.equal(portraitFirstFrameVideo.payload.params.first_frame_image, productAsset.url);
+assert.equal(portraitFirstFrameVideo.payload.params.character_reference_image, undefined);
 
 const dirtyPortraitCanonical = "保持低机位后仰坐姿，使用硬质影棚主光、高锐度 HDR，明确无柔雾、无光晕。";
 const dirtyPortraitEdit = buildGenerationPayload({
@@ -883,6 +958,33 @@ assert.equal(finalVideo.payload.params.subject_mode, "product");
 assert.equal(finalVideo.payload.params.product_lock_mode, "free");
 assert.equal(finalVideo.payload.params.product_video_template, "background_motion");
 assert.equal(finalVideo.ratioOption.key, "9:16");
+const finalFirstFrameProductVideo = buildGenerationPayload({
+  stage: "final",
+  task: {
+    id: 43,
+    category: "video",
+    params: {
+      target_ratio: "9:16",
+      target_resolution: "1080p",
+      target_duration: 10,
+      subject_mode: "product",
+      video_image_input_mode: "first_frame",
+      first_frame_image: productAsset.url,
+    },
+  },
+  cfg: { video_duration_max_seconds: 15 },
+  category: "image",
+  creationMode: "image",
+  ratio: "1:1",
+  imageQuality: "1k",
+  n: 1,
+  vDuration: 5,
+  vResolution: "720p",
+});
+assert.equal(finalFirstFrameProductVideo.payload.params.video_image_input_mode, "first_frame");
+assert.equal(finalFirstFrameProductVideo.payload.params.first_frame_image, productAsset.url);
+assert.equal(finalFirstFrameProductVideo.payload.params.product_reference_image, undefined);
+assert.equal(finalFirstFrameProductVideo.payload.params.product_video_template, undefined);
 
 const directFinalVideo = buildGenerationPayload({
   stage: "final",

@@ -106,7 +106,9 @@ const StudioResults = forwardRef(function StudioResults({
             )}
             {task.status === "needs_review" && (
               <div className="mb-3 rounded-lg border border-warn/30 bg-warn/10 px-3 py-2 text-sm text-warn">
-                内容审核中，管理员可在后台待确认任务中处理；确认后可在历史记录中查看结果和积分状态。
+                {task.phase === "reconciling"
+                  ? "模型提交或结果状态待核对；平台会按实际结果结算或退回积分，请勿重复提交。"
+                  : "任务状态待确认，请在历史记录查看后续结果和积分状态。"}
               </div>
             )}
             {task.error && (

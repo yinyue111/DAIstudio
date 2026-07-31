@@ -1218,6 +1218,10 @@ def test_parse_video_thumb_is_cleared_when_localize_fails(client, make_user, aut
             }
         ],
     )
+    monkeypatch.setattr(
+        "app.routers.parse._download_media_bytes",
+        lambda *_a, **_k: _png_bytes(),
+    )
     monkeypatch.setattr("app.routers.parse._localize_media_url", lambda *_a, **_k: None)
 
     r = client.post("/api/parse", json={"url": "https://www.xiaohongshu.com/explore/abc"}, headers=h)
@@ -1242,6 +1246,10 @@ def test_parse_localized_image_thumb_uses_local_preview(client, make_user, auth,
                 "height": 4096,
             }
         ],
+    )
+    monkeypatch.setattr(
+        "app.routers.parse._download_media_bytes",
+        lambda *_a, **_k: _png_bytes(),
     )
     monkeypatch.setattr(
         "app.routers.parse._localize_media_url",
@@ -1469,6 +1477,10 @@ def test_parse_localizes_all_images_not_just_first_eight(client, make_user, auth
         ],
     )
     monkeypatch.setattr(
+        "app.routers.parse._download_media_bytes",
+        lambda *_a, **_k: _png_bytes(),
+    )
+    monkeypatch.setattr(
         "app.routers.parse._localize_media_url",
         lambda url, *_a, **_k: f"http://localhost:8000/media/preview/{url.rsplit('-', 1)[-1].replace('.jpg', '.png')}",
     )
@@ -1516,6 +1528,45 @@ def test_parse_localize_uses_parse_specific_download_timeout(
     assert seen["timeout_seconds"] == 7
 
 
+def test_parse_localize_downloads_images_in_parallel(client, make_user, auth, monkeypatch):
+    make_user("13900000193", balance=1000)
+    h = auth("13900000193")
+    monkeypatch.setattr(settings, "parse_localize_parallelism", 2)
+    monkeypatch.setattr(
+        "app.routers.parse.parse_url",
+        lambda _url: [
+            {"type": "image", "url": f"https://cdn.example.com/parallel-{idx}.jpg"}
+            for idx in range(2)
+        ],
+    )
+    barrier = threading.Barrier(2)
+    thread_ids = set()
+    thread_ids_lock = threading.Lock()
+
+    def fake_download(_url, **_kwargs):
+        with thread_ids_lock:
+            thread_ids.add(threading.get_ident())
+        barrier.wait(timeout=2)
+        return _png_bytes()
+
+    def fake_localize(url, *_args, raw_bytes=None, **_kwargs):
+        assert raw_bytes == _png_bytes()
+        return f"http://localhost:8000/media/preview/{url.rsplit('/', 1)[-1]}.png"
+
+    monkeypatch.setattr("app.routers.parse._download_media_bytes", fake_download)
+    monkeypatch.setattr("app.routers.parse._localize_media_url", fake_localize)
+
+    r = client.post(
+        "/api/parse",
+        json={"url": "https://www.xiaohongshu.com/explore/parallel-localize"},
+        headers=h,
+    )
+
+    assert r.status_code == 200, r.text
+    assert len(r.json()["assets"]) == 2
+    assert len(thread_ids) == 2
+
+
 def test_parse_localize_respects_localization_cap(client, make_user, auth, monkeypatch):
     make_user("13900000192", balance=1000)
     h = auth("13900000192")
@@ -1531,6 +1582,10 @@ def test_parse_localize_respects_localization_cap(client, make_user, auth, monke
             }
             for idx in range(10)
         ],
+    )
+    monkeypatch.setattr(
+        "app.routers.parse._download_media_bytes",
+        lambda *_a, **_k: _png_bytes(),
     )
 
     def fake_localize(url, *_args, **_kwargs):

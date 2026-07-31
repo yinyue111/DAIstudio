@@ -14,6 +14,10 @@ from ..models import GenAsset, GenTask, UploadedAsset
 from . import asset_refs, retention, storage
 from .config_store import get_setting
 from .generation_pricing import generation_cost, generation_cost_from_snapshot
+from .generation_video_inputs import (
+    VIDEO_IMAGE_INPUT_MODES,
+    canonicalize_video_image_input_params,
+)
 from .ssrf import local_storage_key_from_user_asset_url
 
 _SIZE_RE = re.compile(r"^(\d{2,5})x(\d{2,5})$")
@@ -56,6 +60,7 @@ _VIDEO_PARAM_KEYS = _COMMON_PARAM_KEYS | {
     "character_reference_image",
     "product_lock_mode",
     "product_video_template",
+    "video_image_input_mode",
     "preview_resolution",
     "preview_duration",
 }
@@ -149,6 +154,15 @@ def validate_generation_params(category: str, params: dict) -> dict:
         if params.get(key) is not None and not isinstance(params[key], str):
             raise HTTPException(400, f"{key} 非法")
     if category == "video":
+        if params.get("video_image_input_mode") is not None:
+            raw_input_mode = params["video_image_input_mode"]
+            if not isinstance(raw_input_mode, str):
+                raise HTTPException(400, "video_image_input_mode 非法")
+            input_mode = raw_input_mode.strip().lower()
+            if input_mode not in VIDEO_IMAGE_INPUT_MODES:
+                raise HTTPException(400, "video_image_input_mode 不支持")
+            params["video_image_input_mode"] = input_mode
+        canonicalize_video_image_input_params(params)
         validate_product_detail_images(params)
     _normalise_reference_dimensions(params)
     if params.get("subject_mode") not in (None, ""):

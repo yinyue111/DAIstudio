@@ -5,6 +5,10 @@ import re
 
 _SEEDANCE_VERSION_RE = re.compile(r"^doubao-seedance-(\d+)-(\d+)(?:-|$)")
 
+
+class VideoPayloadValidationError(ValueError):
+    """The video request is invalid before any provider call is made."""
+
 VIDEO_STATUS = {
     "succeeded": "succeeded", "success": "succeeded", "completed": "succeeded",
     "complete": "succeeded",
@@ -103,7 +107,7 @@ def generic_video_payload_params(params: dict, extra: dict, model_id: str = "") 
     )
     if is_grok_reference_video:
         if product_details and not product:
-            raise ValueError("产品细节图必须配合产品主题图使用")
+            raise VideoPayloadValidationError("产品细节图必须配合产品主题图使用")
         ordered_references = [
             product,
             *list(product_details or []),
@@ -113,11 +117,11 @@ def generic_video_payload_params(params: dict, extra: dict, model_id: str = "") 
         unique_references = _normalized_unique_references(ordered_references)
         if unique_references:
             if first_frame or last_frame or source_video:
-                raise ValueError(
+                raise VideoPayloadValidationError(
                     "Grok 独立参考图不能与首帧、尾帧或源视频混用"
                 )
             if len(unique_references) > 7:
-                raise ValueError("Grok 独立参考图最多支持 7 张")
+                raise VideoPayloadValidationError("Grok 独立参考图最多支持 7 张")
             payload_params["reference_images"] = [
                 {"url": value} for value in unique_references
             ]
@@ -133,9 +137,9 @@ def generic_video_payload_params(params: dict, extra: dict, model_id: str = "") 
         product_images_field = "reference_images"
     if product_images_field and (product_details or (is_grok_video and product)):
         if not product:
-            raise ValueError("产品细节图必须配合产品主题图使用")
+            raise VideoPayloadValidationError("产品细节图必须配合产品主题图使用")
         if product_images_field in payload_params:
-            raise ValueError("产品多图与其他参考图映射到了同一上游字段")
+            raise VideoPayloadValidationError("产品多图与其他参考图映射到了同一上游字段")
         ordered_images = [product, *list(product_details or [])]
         item_field = str(
             extra.get("product_images_item_field")
@@ -161,7 +165,7 @@ def generic_video_payload_params(params: dict, extra: dict, model_id: str = "") 
         and str(product_field) == str(first_frame_field)
         and str(product) != str(first_frame)
     ):
-        raise ValueError("产品身份参考与首帧不能映射到同一供应商字段")
+        raise VideoPayloadValidationError("产品身份参考与首帧不能映射到同一供应商字段")
     if product and product_field:
         product_item_field = str(
             extra.get("product_image_item_field")
@@ -176,10 +180,10 @@ def generic_video_payload_params(params: dict, extra: dict, model_id: str = "") 
             "reference_images" if is_grok_video else None
         )
         if not detail_field:
-            raise ValueError("当前视频模型未配置产品细节图上游字段")
+            raise VideoPayloadValidationError("当前视频模型未配置产品细节图上游字段")
         detail_field = str(detail_field)
         if detail_field in payload_params:
-            raise ValueError("产品细节图与其他参考图映射到了同一上游字段")
+            raise VideoPayloadValidationError("产品细节图与其他参考图映射到了同一上游字段")
         detail_item_field = str(
             extra.get("product_detail_images_item_field")
             or ("url" if is_grok_video else "")
@@ -214,7 +218,7 @@ def generic_video_payload_params(params: dict, extra: dict, model_id: str = "") 
                     "style_reference_image",
                 )
             ):
-                raise ValueError(
+                raise VideoPayloadValidationError(
                     "Grok 视频编辑不能同时提交图片参考或首尾帧"
                 )
             return {"video": {"url": source_video}}
@@ -222,13 +226,13 @@ def generic_video_payload_params(params: dict, extra: dict, model_id: str = "") 
             extra.get("video_url_field", "video_url")
         )
         if not video_field:
-            raise ValueError(
+            raise VideoPayloadValidationError(
                 "当前视频模型未配置源视频上游字段，无法提交视频参考生成；"
                 "请在模型 extra 中配置 video_url_field，或关闭该模型的视频参考能力"
             )
         video_field = str(video_field)
         if video_field in payload_params:
-            raise ValueError("源视频与其他参考素材映射到了同一上游字段")
+            raise VideoPayloadValidationError("源视频与其他参考素材映射到了同一上游字段")
         video_item_field = str(extra.get("video_url_item_field") or "").strip()
         payload_params[video_field] = _reference_payload_value(
             source_video,
@@ -328,7 +332,7 @@ def _validate_ark_model_inputs(model_id: str, params: dict) -> None:
     first_frame = str(params.get("first_frame_image") or "").strip()
     last_frame = str(params.get("last_frame_image") or "").strip()
     if last_frame and not first_frame:
-        raise ValueError("Seedance 尾帧必须配合首帧提交")
+        raise VideoPayloadValidationError("Seedance 尾帧必须配合首帧提交")
 
     product = str(params.get("product_reference_image") or "").strip()
     details = params.get("product_detail_images")
@@ -338,7 +342,7 @@ def _validate_ark_model_inputs(model_id: str, params: dict) -> None:
         else []
     )
     if detail_values and not product:
-        raise ValueError("产品细节图必须配合产品主题图使用")
+        raise VideoPayloadValidationError("产品细节图必须配合产品主题图使用")
     independent_values = [
         product,
         *detail_values,
@@ -352,21 +356,21 @@ def _validate_ark_model_inputs(model_id: str, params: dict) -> None:
 
     if version == (1, 5):
         if independent_references:
-            raise ValueError(
+            raise VideoPayloadValidationError(
                 "Seedance 1.5 Pro 仅支持首帧或首尾帧，不支持独立参考图"
             )
         if source_video:
-            raise ValueError("Seedance 1.5 Pro 不支持视频参考输入")
+            raise VideoPayloadValidationError("Seedance 1.5 Pro 不支持视频参考输入")
         return
 
     if version != (2, 0):
         return
     if (first_frame or last_frame) and (independent_references or source_video):
-        raise ValueError(
+        raise VideoPayloadValidationError(
             "Seedance 2.0 的首帧/首尾帧模式不能与多模态参考图或参考视频混用"
         )
     if len(independent_references) > 9:
-        raise ValueError("Seedance 2.0 最多支持 9 张独立参考图")
+        raise VideoPayloadValidationError("Seedance 2.0 最多支持 9 张独立参考图")
 
 
 def ark_content(prompt: str, params: dict, *, legacy_flags: bool = False) -> list:

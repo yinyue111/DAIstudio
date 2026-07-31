@@ -16,6 +16,7 @@ from __future__ import annotations
 import ipaddress
 import socket
 import threading
+import time
 import typing
 from collections.abc import Sequence
 from urllib.parse import urlparse
@@ -34,6 +35,16 @@ MAX_REDIRECTS = 5
 
 # Carrier-grade NAT range — not flagged by is_private but still internal-ish.
 _CGNAT = ipaddress.ip_network("100.64.0.0/10")
+_FAKE_IP = ipaddress.ip_network("198.18.0.0/15")
+_DOH_ENDPOINTS = (
+    "https://1.1.1.1/dns-query",
+    "https://1.0.0.1/dns-query",
+)
+_DOH_CACHE_TTL_SECONDS = 30.0
+_DOH_CACHE_MAX_ENTRIES = 256
+_doh_cache: dict[str, tuple[float, tuple[str, ...]]] = {}
+_doh_cache_lock = threading.Lock()
+_doh_query_locks = tuple(threading.Lock() for _ in range(32))
 
 
 class SsrfError(Exception):
@@ -66,6 +77,109 @@ def _ip_is_blocked(ip: str) -> bool:
     return _classify_blocked(ipaddress.ip_address(ip))
 
 
+def _is_fake_ip(ip: str) -> bool:
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    return isinstance(addr, ipaddress.IPv4Address) and addr in _FAKE_IP
+
+
+def _is_ip_literal(host: str) -> bool:
+    try:
+        ipaddress.ip_address(host.rstrip("."))
+    except ValueError:
+        return False
+    return True
+
+
+def _doh_addresses(payload: object) -> list[str]:
+    if not isinstance(payload, dict):
+        return []
+    answers = payload.get("Answer")
+    if not isinstance(answers, list):
+        return []
+    ips: list[str] = []
+    for answer in answers:
+        if not isinstance(answer, dict) or answer.get("type") not in (1, 28):
+            continue
+        try:
+            ip = str(ipaddress.ip_address(str(answer.get("data") or "")))
+        except ValueError:
+            continue
+        if ip not in ips:
+            ips.append(ip)
+    return ips
+
+
+def _query_public_doh(host: str) -> list[str]:
+    try:
+        dns_host = _host_key(host).encode("idna").decode("ascii")
+    except UnicodeError as exc:
+        raise SsrfError("域名解析失败") from exc
+
+    for endpoint in _DOH_ENDPOINTS:
+        try:
+            ips: list[str] = []
+            with httpx.Client(
+                trust_env=False,
+                timeout=3.0,
+                headers={"accept": "application/dns-json"},
+            ) as client:
+                for record_type in ("A", "AAAA"):
+                    response = client.get(
+                        endpoint,
+                        params={"name": dns_host, "type": record_type},
+                    )
+                    response.raise_for_status()
+                    for ip in _doh_addresses(response.json()):
+                        if ip not in ips:
+                            ips.append(ip)
+            if ips:
+                return ips
+        except (httpx.HTTPError, TypeError, ValueError):
+            continue
+    raise SsrfError("域名解析失败")
+
+
+def _resolve_via_public_doh(host: str) -> list[str]:
+    """Resolve around a local fake-IP DNS layer with a small bounded cache.
+
+    Cached addresses are still classified on every ``resolve_safe`` call and
+    every connection remains pinned to those vetted addresses. The cache only
+    removes repeated public DoH round trips within one parse/download burst.
+    """
+    host_key = _host_key(host)
+    now = time.monotonic()
+    with _doh_cache_lock:
+        cached = _doh_cache.get(host_key)
+        if cached and cached[0] > now:
+            return list(cached[1])
+        if cached:
+            _doh_cache.pop(host_key, None)
+
+    query_lock = _doh_query_locks[hash(host_key) % len(_doh_query_locks)]
+    with query_lock:
+        now = time.monotonic()
+        with _doh_cache_lock:
+            cached = _doh_cache.get(host_key)
+            if cached and cached[0] > now:
+                return list(cached[1])
+            if cached:
+                _doh_cache.pop(host_key, None)
+
+        ips = _query_public_doh(host_key)
+        with _doh_cache_lock:
+            if len(_doh_cache) >= _DOH_CACHE_MAX_ENTRIES:
+                expired = [key for key, value in _doh_cache.items() if value[0] <= now]
+                for key in expired:
+                    _doh_cache.pop(key, None)
+                while len(_doh_cache) >= _DOH_CACHE_MAX_ENTRIES:
+                    _doh_cache.pop(next(iter(_doh_cache)))
+            _doh_cache[host_key] = (now + _DOH_CACHE_TTL_SECONDS, tuple(ips))
+        return list(ips)
+
+
 def resolve_safe(host: str) -> list[str]:
     """Resolve ``host`` and raise SsrfError if ANY resolved IP is internal.
 
@@ -77,9 +191,29 @@ def resolve_safe(host: str) -> list[str]:
     except socket.gaierror:
         raise SsrfError("域名解析失败")
 
-    ips: list[str] = []
+    resolved_ips: list[str] = []
     for info in infos:
         ip = info[4][0]
+        if ip not in resolved_ips:
+            resolved_ips.append(ip)
+
+    # Clash/Surge-style TUN proxies commonly map every public hostname into
+    # RFC 2544's 198.18.0.0/15 benchmark range. Resolve those hostnames through
+    # a numeric public DoH endpoint, then pin the connection to the returned
+    # public IP. Literal fake-IP URLs and mixed public/private answers still
+    # fail closed.
+    if (
+        resolved_ips
+        and not _is_ip_literal(host)
+        and all(_is_fake_ip(ip) for ip in resolved_ips)
+    ):
+        resolved_ips = _resolve_via_public_doh(host)
+
+    if not resolved_ips:
+        raise SsrfError("域名解析失败")
+
+    ips: list[str] = []
+    for ip in resolved_ips:
         try:
             if _ip_is_blocked(ip):
                 raise SsrfError("禁止访问内网/保留地址")

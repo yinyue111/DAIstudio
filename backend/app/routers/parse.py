@@ -6,7 +6,9 @@ import io
 import logging
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
+from functools import partial
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from PIL import Image, UnidentifiedImageError
@@ -111,18 +113,23 @@ def _localize_media_url(
     *,
     timeout_seconds: int | None = None,
     register_asset: bool = True,
+    raw_bytes: bytes | None = None,
 ) -> LocalizedMedia | None:
     if not url:
         return None
     if storage.key_from_url(url):
         return LocalizedMedia(url=url, width=None, height=None)
     try:
-        raw = gateway.download_bytes_limited(
-            url,
-            max_bytes=int(settings.parse_localize_image_max_bytes),
-            allowed_content_types=("image/",),
-            timeout_seconds=int(timeout_seconds or settings.parse_localize_download_timeout_seconds),
-        )
+        raw = raw_bytes
+        if raw is None:
+            raw = _download_media_bytes(
+                url,
+                timeout_seconds=int(
+                    timeout_seconds or settings.parse_localize_download_timeout_seconds
+                ),
+            )
+        if raw is None:
+            return None
         try:
             img = Image.open(io.BytesIO(raw))
             width, height = img.size
@@ -240,6 +247,21 @@ def _localize_media_url(
         return None
 
 
+def _download_media_bytes(url: str | None, *, timeout_seconds: int) -> bytes | None:
+    if not url:
+        return None
+    try:
+        return gateway.download_bytes_limited(
+            url,
+            max_bytes=int(settings.parse_localize_image_max_bytes),
+            allowed_content_types=("image/",),
+            timeout_seconds=timeout_seconds,
+        )
+    except Exception as e:  # noqa: BLE001
+        log.info("parse media download skipped url=%s error=%s", redact_url_for_log(url), e)
+        return None
+
+
 def _localize_assets(
     assets: list[dict],
     db: Session | None = None,
@@ -252,9 +274,11 @@ def _localize_assets(
     captured_iso = (captured_at or datetime.now(timezone.utc)).isoformat()
     localized_count = 0
     max_localized = max(1, int(settings.parse_localize_max_assets or 1))
+    parallelism = max(1, int(settings.parse_localize_parallelism or 1))
     total_timeout = max(1, int(settings.parse_localize_total_timeout_seconds or 1))
     deadline = time.monotonic() + total_timeout
-    for asset in assets:
+    next_index = 0
+    while next_index < len(assets):
         if localized_count >= max_localized:
             log.info(
                 "parse asset localization cap reached localized=%s cap=%s total_assets=%s",
@@ -263,7 +287,8 @@ def _localize_assets(
                 len(assets),
             )
             break
-        if time.monotonic() > deadline:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
             log.info(
                 "parse asset localization budget exhausted localized=%s budget_seconds=%s total_assets=%s",
                 localized_count,
@@ -271,59 +296,85 @@ def _localize_assets(
                 len(assets),
             )
             break
-        item = dict(asset)
-        item["source_page_url"] = source_page_url
-        item["source_captured_at"] = captured_iso
-        remaining_timeout = max(1, min(int(settings.parse_localize_download_timeout_seconds), int(deadline - time.monotonic())))
-        if item.get("type") == "image":
-            local = _localize_media_url(
-                item.get("url"),
-                db=db,
-                user_id=user_id,
+        batch_size = min(
+            parallelism,
+            max_localized - localized_count,
+            len(assets) - next_index,
+        )
+        batch = [dict(asset) for asset in assets[next_index:next_index + batch_size]]
+        next_index += batch_size
+        remaining_timeout = max(
+            1,
+            min(
+                int(settings.parse_localize_download_timeout_seconds),
+                int(remaining),
+            ),
+        )
+        source_urls = [
+            item.get("url") if item.get("type") == "image" else item.get("thumb")
+            for item in batch
+        ]
+        with ThreadPoolExecutor(max_workers=batch_size, thread_name_prefix="parse-media") as pool:
+            download = partial(
+                _download_media_bytes,
                 timeout_seconds=remaining_timeout,
             )
-            if local:
-                localized_count += 1
-                item["original_url"] = item.get("url")
-                if item.get("thumb"):
+            downloaded = list(pool.map(download, source_urls))
+
+        for item, raw in zip(batch, downloaded, strict=True):
+            item["source_page_url"] = source_page_url
+            item["source_captured_at"] = captured_iso
+            if item.get("type") == "image":
+                local = _localize_media_url(
+                    item.get("url"),
+                    db=db,
+                    user_id=user_id,
+                    timeout_seconds=remaining_timeout,
+                    raw_bytes=raw,
+                ) if raw is not None else None
+                if local:
+                    localized_count += 1
+                    item["original_url"] = item.get("url")
+                    if item.get("thumb"):
+                        item["original_thumb"] = item.get("thumb")
+                    item["url"] = _localized_url(local)
+                    item["thumb"] = _localized_url(local)
+                    asset_ref = _localized_asset_ref(local)
+                    if asset_ref:
+                        item["asset_ref"] = asset_ref
+                    if not item.get("width") and _localized_int(local, "width"):
+                        item["width"] = _localized_int(local, "width")
+                    if not item.get("height") and _localized_int(local, "height"):
+                        item["height"] = _localized_int(local, "height")
+                else:
+                    item["original_url"] = item.get("url")
+                    if item.get("thumb"):
+                        item["original_thumb"] = item.get("thumb")
+                    # Do not hand external image URLs to the browser: production CSP
+                    # intentionally only allows platform-owned media origins. If an
+                    # image cannot be localized, omit it from the selectable assets.
+                    continue
+            elif item.get("type") == "video":
+                local_thumb = _localize_media_url(
+                    item.get("thumb"),
+                    db=db,
+                    user_id=user_id,
+                    timeout_seconds=remaining_timeout,
+                    register_asset=False,
+                    raw_bytes=raw,
+                ) if raw is not None else None
+                if local_thumb:
+                    localized_count += 1
                     item["original_thumb"] = item.get("thumb")
-                item["url"] = _localized_url(local)
-                item["thumb"] = _localized_url(local)
-                asset_ref = _localized_asset_ref(local)
-                if asset_ref:
-                    item["asset_ref"] = asset_ref
-                if not item.get("width") and _localized_int(local, "width"):
-                    item["width"] = _localized_int(local, "width")
-                if not item.get("height") and _localized_int(local, "height"):
-                    item["height"] = _localized_int(local, "height")
-            else:
-                item["original_url"] = item.get("url")
-                if item.get("thumb"):
+                    item["thumb"] = _localized_url(local_thumb)
+                    if not item.get("thumb_width") and _localized_int(local_thumb, "width"):
+                        item["thumb_width"] = _localized_int(local_thumb, "width")
+                    if not item.get("thumb_height") and _localized_int(local_thumb, "height"):
+                        item["thumb_height"] = _localized_int(local_thumb, "height")
+                else:
                     item["original_thumb"] = item.get("thumb")
-                # Do not hand external image URLs to the browser: production CSP
-                # intentionally only allows platform-owned media origins. If an
-                # image cannot be localized, omit it from the selectable assets.
-                continue
-        elif item.get("type") == "video":
-            local_thumb = _localize_media_url(
-                item.get("thumb"),
-                db=db,
-                user_id=user_id,
-                timeout_seconds=remaining_timeout,
-                register_asset=False,
-            )
-            if local_thumb:
-                localized_count += 1
-                item["original_thumb"] = item.get("thumb")
-                item["thumb"] = _localized_url(local_thumb)
-                if not item.get("thumb_width") and _localized_int(local_thumb, "width"):
-                    item["thumb_width"] = _localized_int(local_thumb, "width")
-                if not item.get("thumb_height") and _localized_int(local_thumb, "height"):
-                    item["thumb_height"] = _localized_int(local_thumb, "height")
-            else:
-                item["original_thumb"] = item.get("thumb")
-                item["thumb"] = None
-        out.append(item)
+                    item["thumb"] = None
+            out.append(item)
     return out
 
 

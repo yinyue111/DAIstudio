@@ -69,6 +69,8 @@ export default function useStudioWorkspaceActions({
     setWorkspacePatch({
       productAsset: null,
       productDetailAssets: [],
+      editMaskMode: "protect_subject",
+      productPixelLockMode: "auto",
       productProfile: null,
       productProfileSource: "",
       portraitProfile: null,

@@ -35,6 +35,7 @@ function effectiveSubjectFlags({ isEditMode, directProductVideo, subjectMode }) 
 }
 
 type GenerationStage = "preview" | "final";
+type VideoImageInputMode = "first_frame" | "subject_reference";
 
 interface BuildGenerationPayloadInput {
   stage?: GenerationStage;
@@ -82,6 +83,7 @@ interface BuildGenerationPayloadInput {
   vResolution: string;
   providerVideoEditMode?: boolean;
   productVideoTemplate?: ProductVideoStrategy | string;
+  videoImageInputMode?: VideoImageInputMode | string;
   modelConfigId?: number | null;
   reverseOperationId?: number | null;
   reverseRevisionId?: number | null;
@@ -202,6 +204,7 @@ export function buildGenerationPayload({
   vResolution,
   providerVideoEditMode = false,
   productVideoTemplate = "prompt_driven",
+  videoImageInputMode = "",
   modelConfigId = null,
   reverseOperationId = null,
   reverseRevisionId = null,
@@ -209,6 +212,14 @@ export function buildGenerationPayload({
   const isFinal = stage === "final" && Boolean(task);
   const effCategory = isFinal ? task.category : category;
   const parentParams = isFinal ? (task?.params || {}) : {};
+  const requestedVideoImageInputMode = cleanText(
+    isFinal ? parentParams.video_image_input_mode : videoImageInputMode,
+  );
+  const effectiveVideoImageInputMode: VideoImageInputMode | "" = (
+    requestedVideoImageInputMode === "first_frame"
+    || requestedVideoImageInputMode === "subject_reference"
+  ) ? requestedVideoImageInputMode : "";
+  const independentReferenceMode = effectiveVideoImageInputMode !== "first_frame";
   const finalRatioKey = parentParams.target_ratio || parentParams.ratio || ratio;
   const finalResolution = parentParams.target_resolution || parentParams.resolution || vResolution;
   const finalDuration = parentParams.target_duration || parentParams.duration || vDuration;
@@ -286,10 +297,10 @@ export function buildGenerationPayload({
   const requestedProductVideoTemplate = isFinal
     ? (parentParams.product_video_template ?? "prompt_driven")
     : productVideoTemplate;
-  const normalizedProductVideoTemplate = productMode
+  const normalizedProductVideoTemplate = productMode && independentReferenceMode
     ? normalizeProductVideoStrategyKey(requestedProductVideoTemplate)
     : null;
-  if (productMode && !normalizedProductVideoTemplate) {
+  if (productMode && independentReferenceMode && !normalizedProductVideoTemplate) {
     throw new Error("产品视频策略无效，请重新选择后再生成。");
   }
   const productLockMode = isFinal
@@ -378,6 +389,38 @@ export function buildGenerationPayload({
     analysisFocus,
   });
   const useRefVideo = !isFinal && sourceAsset && sourceAsset.type === "video" && Object.keys(effectiveStructured).length === 0;
+  const productReferenceUrl = cleanText(refImage || parentParams.product_reference_image);
+  const characterReferenceUrl = cleanText(refImage || parentParams.character_reference_image);
+  const videoImageReferenceParams: Record<string, unknown> = (() => {
+    if (effCategory !== "video") return {};
+    if (firstLastFramePair) {
+      return { first_frame_image: firstFrameUrl, last_frame_image: lastFrameUrl };
+    }
+    if (effectiveVideoImageInputMode === "first_frame") {
+      return {
+        video_image_input_mode: effectiveVideoImageInputMode,
+        ...(firstFrameUrl ? { first_frame_image: firstFrameUrl } : {}),
+      };
+    }
+    if (effectiveVideoImageInputMode === "subject_reference") {
+      return {
+        video_image_input_mode: effectiveVideoImageInputMode,
+        ...(productMode && productReferenceUrl
+          ? { product_reference_image: productReferenceUrl }
+          : {}),
+        ...(portraitMode && characterReferenceUrl
+          ? { character_reference_image: characterReferenceUrl }
+          : {}),
+      };
+    }
+    if (productMode && productReferenceUrl) {
+      return { product_reference_image: productReferenceUrl };
+    }
+    if (isFinal && parentParams.product_reference_image) {
+      return { product_reference_image: parentParams.product_reference_image };
+    }
+    return refImage && !portraitMode ? { reference_image_url: refImage } : {};
+  })();
   const sourceAssetMeta = sourceAsset ? {
     ...buildSourceAssetMeta(sourceAsset),
     mode: creationMode,
@@ -465,18 +508,18 @@ export function buildGenerationPayload({
             target_resolution: finalResolution,
             ratio: ratioOption.key,
             ...(dims ? { reference_width: dims.width, reference_height: dims.height } : {}),
-            ...(firstLastFramePair
-              ? { first_frame_image: firstFrameUrl, last_frame_image: lastFrameUrl }
-              : (productMode && refImage
-                  ? { product_reference_image: refImage }
-                  : (isFinal && parentParams.product_reference_image
-                      ? { product_reference_image: parentParams.product_reference_image }
-                      : (refImage && !portraitMode ? { reference_image_url: refImage } : {})))),
-            ...(productDetailUrls.length ? { product_detail_images: productDetailUrls } : {}),
-            ...(styleReferenceUrl ? { style_reference_image: styleReferenceUrl } : {}),
-            ...(portraitMode && refImage ? { character_reference_image: refImage } : {}),
+            ...videoImageReferenceParams,
+            ...(independentReferenceMode && productDetailUrls.length
+              ? { product_detail_images: productDetailUrls }
+              : {}),
+            ...(independentReferenceMode && styleReferenceUrl
+              ? { style_reference_image: styleReferenceUrl }
+              : {}),
+            ...(independentReferenceMode && portraitMode && characterReferenceUrl
+              ? { character_reference_image: characterReferenceUrl }
+              : {}),
             ...(subjectModeParam ? { subject_mode: subjectModeParam } : {}),
-            ...((isFinal || isEditMode || directProductVideo) && productMode ? {
+            ...((isFinal || isEditMode || directProductVideo) && productMode && independentReferenceMode ? {
               product_lock_mode: productLockMode,
               product_video_template: normalizedProductVideoTemplate,
             } : {}),

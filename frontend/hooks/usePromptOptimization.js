@@ -1,6 +1,6 @@
 "use client";
 
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { api } from "../lib/api";
 import { errorMessage } from "../lib/errorHandling";
 import {
@@ -62,6 +62,7 @@ export default function usePromptOptimization({
   const requestRef = useRef({});
   const contextRef = useRef({});
   const recordsRef = useRef({});
+  const abortControllersRef = useRef({});
 
   const setting = settings[creationMode] || DEFAULT_SETTING;
   const storedProposal = proposals[creationMode] || null;
@@ -113,7 +114,36 @@ export default function usePromptOptimization({
       }
     : prompt;
 
+  function abortMode(mode) {
+    const controller = abortControllersRef.current[mode];
+    if (controller && !controller.signal.aborted) controller.abort();
+    if (abortControllersRef.current[mode] === controller) {
+      delete abortControllersRef.current[mode];
+    }
+  }
+
+  function startRequest(mode) {
+    abortMode(mode);
+    const controller = new AbortController();
+    abortControllersRef.current[mode] = controller;
+    return controller;
+  }
+
+  function finishRequest(mode, controller) {
+    if (abortControllersRef.current[mode] === controller) {
+      delete abortControllersRef.current[mode];
+    }
+  }
+
+  useEffect(() => () => {
+    for (const controller of Object.values(abortControllersRef.current)) {
+      if (!controller.signal.aborted) controller.abort();
+    }
+    abortControllersRef.current = {};
+  }, []);
+
   function invalidate(mode = creationMode) {
+    abortMode(mode);
     requestRef.current[mode] = (requestRef.current[mode] || 0) + 1;
     setOptimizingPromptMode((current) => (current === mode ? "" : current));
     setProposals((current) => {
@@ -152,6 +182,7 @@ export default function usePromptOptimization({
     const requestId = (requestRef.current[mode] || 0) + 1;
     requestRef.current[mode] = requestId;
     const request = { id: requestId, contextKey: currentContextKey };
+    const controller = startRequest(mode);
     setOptimizingPromptMode(mode);
     try {
       const optimizationRequest = requestOptions({ promptText: source });
@@ -178,7 +209,7 @@ export default function usePromptOptimization({
               request: executableRequest,
               clientRequestId: actionRequestId,
               execute: ({ request: confirmedRequest }) => (
-                api.createStudioPromptOptimization(confirmedRequest)
+                api.createStudioPromptOptimization(confirmedRequest, { signal: controller.signal })
               ),
             });
             if (confirmation.status !== "executed") {
@@ -193,7 +224,9 @@ export default function usePromptOptimization({
             }
             result = confirmation.result;
           } else {
-            result = await api.createStudioPromptOptimization(executableRequest);
+            result = await api.createStudioPromptOptimization(executableRequest, {
+              signal: controller.signal,
+            });
           }
           clearPendingStudioActionRequest(studioActionPendingRequestRef, actionRequestId);
           break;
@@ -240,6 +273,7 @@ export default function usePromptOptimization({
       setMsg("优化建议已生成，请对比后选择接受或拒绝。");
       notify.success("优化建议已生成，当前提示词尚未改变。");
     } catch (error) {
+      if (error?.name === "AbortError") return;
       if (!isPromptOptimizationResultCurrent(
         request,
         requestRef.current[mode],
@@ -249,6 +283,7 @@ export default function usePromptOptimization({
       setMsg(text);
       notify.error(text);
     } finally {
+      finishRequest(mode, controller);
       if (requestId === requestRef.current[mode]) {
         setOptimizingPromptMode((current) => (current === mode ? "" : current));
       }
@@ -418,10 +453,12 @@ export default function usePromptOptimization({
 
   async function changeGenerationModelSelection(modelConfigId) {
     const nextModelId = resolveModelConfigId(generationModelOptions, modelConfigId);
+    const mode = creationMode;
+    invalidate(mode);
     changeModelSelection(category, nextModelId);
     const operation = reverseOperationForPendingResult();
     if (!operation?.id || !reverseAppliedRevisionId || !String(prompt || "").trim() || !nextModelId) return;
-    const mode = creationMode;
+    const controller = startRequest(mode);
     const promptSnapshot = prompt;
     setOptimizingPromptMode(mode);
     try {
@@ -439,7 +476,7 @@ export default function usePromptOptimization({
       const result = await api.createStudioPromptOptimization({
         ...optimizationRequest,
         idempotency_key: actionRequestId,
-      });
+      }, { signal: controller.signal });
       clearPendingStudioActionRequest(studioActionPendingRequestRef, actionRequestId);
       const currentWorkspace = workspacesRef.current?.[mode];
       if (
@@ -482,10 +519,12 @@ export default function usePromptOptimization({
       }));
       setMsg("目标模型已切换，编译预览已生成；反推素材未重新分析。");
     } catch (error) {
+      if (error?.name === "AbortError") return;
       const text = errorMessage(error, "目标模型编译失败");
       setMsg(text);
       notify.error(text);
     } finally {
+      finishRequest(mode, controller);
       setOptimizingPromptMode((current) => (current === mode ? "" : current));
     }
   }

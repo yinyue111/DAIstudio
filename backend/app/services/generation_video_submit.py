@@ -16,6 +16,7 @@ from ..db import SessionLocal
 from ..models import GenAsset, GenTask, ReverseResultRevision, UploadedAsset
 from . import credits, gateway, locks, storage, usage
 from .config_store import get_model_config
+from .gateway_video_payloads import VideoPayloadValidationError
 from .generation_common import (
     TaskCanceled,
     TaskLockedError,
@@ -62,6 +63,7 @@ from .generation_video_flow import (  # noqa: F401 - polling facade dependencies
     reset_poll_errors,
     video_task_action,
 )
+from .generation_video_inputs import canonicalize_video_image_input_params
 from .model_pricing import usage_from_response  # noqa: F401 - polling facade dependency
 from .progress import set_progress
 from .video_prompt_compiler import (
@@ -109,6 +111,8 @@ def public_video_submit_error(exc: Exception) -> str:
             "视频模型拒绝了当前提示词或生成参数，已退回冻结积分。"
             "请缩短提示词，或检查当前模型支持的时长、比例和参考图方式。"
         )
+    if isinstance(exc, VideoPayloadValidationError):
+        return f"视频生成参数未通过本地校验，已退回冻结积分：{message[:300]}"
     if "timed out" in lowered or "timeout" in lowered or "超时" in message:
         return "视频提交等待超时，已退回冻结积分，请稍后重试。"
     if "没有可用账号" in message or "no available compatible accounts" in lowered:
@@ -330,7 +334,7 @@ def gateway_source_video_url(db, task: GenTask) -> str:
 
 def video_submit_params(db, task: GenTask) -> dict:
     """Stage-aware effective gateway params for a video render."""
-    params = dict(task.params or {})
+    params = canonicalize_video_image_input_params(dict(task.params or {}))
     target_resolution = video_target_resolution(params)
     target_duration = video_target_duration(params)
     # preview = cheap/short low-res render; final = selected quality
@@ -348,10 +352,13 @@ def video_submit_params(db, task: GenTask) -> dict:
     if not params.get("ratio"):
         params["ratio"] = video_ratio(ref_w, ref_h)
     subject_mode = str(params.get("subject_mode") or "").lower()
+    video_image_input_mode = str(params.get("video_image_input_mode") or "").lower()
+    uses_first_frame_mode = video_image_input_mode == "first_frame"
     is_product_image_video = task.source_type == "image" and subject_mode == "product"
     is_portrait_image_video = task.source_type == "image" and subject_mode == "portrait"
     if is_product_image_video:
         params["negative_prompt"] = product_video_negative_prompt(params.get("negative_prompt"))
+    if is_product_image_video and not uses_first_frame_mode:
         product_reference = (
             params.get("product_reference_image")
             or params.get("reference_image_url")
@@ -416,7 +423,7 @@ def video_submit_params(db, task: GenTask) -> dict:
     # it reaches the model gateway. Product identity references stay separate
     # so the provider does not interpret them as the opening or closing frame.
     first_frame = params.get("first_frame_image")
-    if not is_product_image_video and not is_portrait_image_video:
+    if uses_first_frame_mode or (not is_product_image_video and not is_portrait_image_video):
         first_frame = first_frame or params.get("reference_image_url")
         if task.source_type == "image":
             first_frame = first_frame or task.source_asset_url
@@ -494,15 +501,30 @@ def video_persisted_params(task: GenTask, original: dict, submitted: dict) -> di
         if submitted.get(key):
             persisted[key] = submitted[key]
     subject_mode = str(original.get("subject_mode") or "").lower()
+    video_image_input_mode = str(original.get("video_image_input_mode") or "").lower()
+    if video_image_input_mode in {"first_frame", "subject_reference"}:
+        persisted["video_image_input_mode"] = video_image_input_mode
     if original.get("product_reference_image"):
         persisted["product_reference_image"] = original["product_reference_image"]
-    elif subject_mode == "product" and task.source_type == "image" and task.source_asset_url:
+    elif (
+        video_image_input_mode != "first_frame"
+        and subject_mode == "product"
+        and task.source_type == "image"
+        and task.source_asset_url
+    ):
         persisted["product_reference_image"] = task.source_asset_url
     if "product_detail_images" in original:
         persisted["product_detail_images"] = list(original.get("product_detail_images") or [])
     if original.get("first_frame_image"):
         persisted["first_frame_image"] = original["first_frame_image"]
-    elif subject_mode != "product" and task.source_type == "image" and task.source_asset_url:
+    elif (
+        task.source_type == "image"
+        and task.source_asset_url
+        and (
+            video_image_input_mode == "first_frame"
+            or (not video_image_input_mode and subject_mode != "product")
+        )
+    ):
         persisted["first_frame_image"] = task.source_asset_url
     if original.get("last_frame_image"):
         persisted["last_frame_image"] = original["last_frame_image"]
@@ -511,6 +533,7 @@ def video_persisted_params(task: GenTask, original: dict, submitted: dict) -> di
     for key in ("subject_mode",):
         if original.get(key):
             persisted[key] = original[key]
+    canonicalize_video_image_input_params(persisted)
     if task.stage != "preview":
         return persisted
     persisted["preview_resolution"] = submitted.get("resolution")
@@ -693,6 +716,8 @@ def recover_unknown_submit_by_request_id(
 
 def submit_state_unknown(exc: Exception) -> bool:
     """True when the upstream submit may have been accepted."""
+    if isinstance(exc, VideoPayloadValidationError):
+        return False
     if isinstance(exc, gateway.GatewayError):
         explicit = getattr(exc, "submit_state_unknown", None)
         if explicit is not None:

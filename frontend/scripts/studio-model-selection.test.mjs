@@ -16,6 +16,7 @@ import {
   readModelSelections,
   resolveModelConfigId,
   strictMultiReferenceLimit,
+  VIDEO_IMAGE_INPUT_MODE,
   validateMultiReferenceSelection,
   writeModelSelections,
 } from "../app/studio/StudioModelSelector.jsx";
@@ -108,6 +109,27 @@ assert.deepEqual(
   [32],
   "text-to-image-only models must not be offered once an image reference is selected",
 );
+const multiAssetNonGenerationContext = {
+  selected: { type: "image", url: "/style.png" },
+  productAsset: { type: "image", url: "/product.png" },
+  subjectMode: "product",
+};
+assert.deepEqual(
+  filterModelOptions(
+    [{ id: 33, capabilities: { prompt_optimization: true } }],
+    { ...multiAssetNonGenerationContext, use: "prompt" },
+  ).map((item) => item.id),
+  [33],
+  "generation reference limits must not hide prompt optimization models",
+);
+assert.deepEqual(
+  filterModelOptions(
+    [{ id: 34, capabilities: { product_profile: true } }],
+    { ...multiAssetNonGenerationContext, use: "vision" },
+  ).map((item) => item.id),
+  [34],
+  "generation reference limits must not hide subject analysis models",
+);
 assert.equal(strictMultiReferenceLimit({ capabilities: {} }), 0);
 assert.equal(strictMultiReferenceLimit({ capabilities: { multi_reference: true } }), 0);
 assert.equal(
@@ -190,6 +212,29 @@ const seedance15Option = {
     resolutions: ["480p", "720p", "1080p"],
   },
 };
+const referenceOnlyVideoOption = {
+  id: 16,
+  display_name: "Reference-only metadata",
+  capabilities: {
+    text_to_video: true,
+    image_to_video: false,
+    reference_image: true,
+    multi_reference: true,
+    max_reference_images: 7,
+  },
+};
+assert.deepEqual(
+  filterModelOptions([referenceOnlyVideoOption], {
+    use: "video",
+    creationMode: "video",
+    subjectMode: "product",
+    selected: null,
+    productAsset: { type: "image", url: "/product.png" },
+    productDetailAssets: [],
+  }),
+  [],
+  "reference-image metadata must not bypass an explicit image-to-video rejection",
+);
 assert.equal(strictMultiReferenceLimit(seedance15Option), 0);
 assert.equal(
   validateMultiReferenceSelection(seedance15Option, 2, 1).ok,
@@ -200,12 +245,23 @@ assert.deepEqual(
   filterModelOptions([seedance15Option], {
     use: "video",
     creationMode: "video",
+    subjectMode: "product",
     selected: null,
     productAsset: { type: "image", url: "/product.png" },
-  }),
-  [],
-  "Seedance 1.5 Pro must not be offered for independent product references",
+  }).map((item) => item.id),
+  [15],
+  "Seedance 1.5 Pro must accept one product image as the opening frame",
 );
+const annotatedSeedanceProduct = markGenerationModelCompatibility([seedance15Option], {
+  use: "video",
+  creationMode: "video",
+  subjectMode: "product",
+  selected: null,
+  productAsset: { type: "image", url: "/product.png" },
+  productDetailAssets: [],
+})[0];
+assert.equal(annotatedSeedanceProduct.video_image_input_mode, VIDEO_IMAGE_INPUT_MODE.FIRST_FRAME);
+assert.equal(annotatedSeedanceProduct.video_image_input_label, "单图首帧");
 assert.deepEqual(
   filterModelOptions([seedance15Option], {
     use: "video",
@@ -239,7 +295,31 @@ const seedanceProductPreflight = validateGenerationSubmission({
   structured: {},
 });
 assert.equal(seedanceProductPreflight.ok, false);
-assert.match(seedanceProductPreflight.message, /不支持独立产品主题图/);
+assert.match(seedanceProductPreflight.message, /不支持视频输入/);
+const seedanceSingleProductPreflight = validateGenerationSubmission({
+  uploading: false,
+  parsing: false,
+  reversing: false,
+  productProfiling: false,
+  structuredDirty: false,
+  modelOption: seedance15Option,
+  productVideoTemplate: "prompt_driven",
+  category: "video",
+  creationMode: "video",
+  subjectMode: "product",
+  firstLastFrameEnabled: false,
+  lastFrameAsset: null,
+  selected: null,
+  productAsset: { type: "image", url: "/product.png" },
+  productDetailAssets: [],
+  task: null,
+  isEditMode: false,
+  isImageEditMode: false,
+  prompt: "产品广告",
+  structured: {},
+});
+assert.equal(seedanceSingleProductPreflight.ok, true);
+assert.equal(seedanceSingleProductPreflight.videoImageInputMode, VIDEO_IMAGE_INPUT_MODE.FIRST_FRAME);
 const seedance15ProductContext = buildStudioModelContext({
   cfg: {},
   category: "video",
@@ -254,12 +334,31 @@ const seedance15ProductContext = buildStudioModelContext({
   generationModelOptions: [seedance15Option],
   selectedGenerationModel: seedance15Option,
 });
-assert.equal(seedance15ProductContext.productReferenceUnsupported, true);
-assert.equal(seedance15ProductContext.modelSwitchRequired, true);
+assert.equal(seedance15ProductContext.videoSubjectImageInputMode, VIDEO_IMAGE_INPUT_MODE.FIRST_FRAME);
+assert.equal(seedance15ProductContext.productReferenceUnsupported, false);
+assert.equal(seedance15ProductContext.modelSwitchRequired, false);
 assert.equal(seedance15ProductContext.minVideoDuration, 4);
 assert.equal(seedance15ProductContext.maxVideoDuration, 12);
 assert.deepEqual(seedance15ProductContext.videoResolutions, ["480p", "720p", "1080p"]);
-assert.match(seedance15ProductContext.modelSwitchMessage, /Seedance 1\.5 Pro 不支持独立产品主题图/);
+assert.equal(seedance15ProductContext.modelSwitchMessage, "");
+const seedance15MultiProductContext = buildStudioModelContext({
+  ...seedance15ProductContext,
+  cfg: {},
+  category: "video",
+  creationMode: "video",
+  subjectMode: "product",
+  productGenerationMode: true,
+  selected: null,
+  lastFrameAsset: null,
+  productAsset: { type: "image", url: "/product.png" },
+  productDetailAssets: [{ type: "image", url: "/detail.png" }],
+  productVideoTemplate: "prompt_driven",
+  generationModelOptions: [seedance15Option],
+  selectedGenerationModel: seedance15Option,
+});
+assert.equal(seedance15MultiProductContext.productReferenceUnsupported, true);
+assert.equal(seedance15MultiProductContext.modelSwitchRequired, true);
+assert.match(seedance15MultiProductContext.modelSwitchMessage, /仅支持单图首帧/);
 
 let generationSubmitCount = 0;
 let modelSwitchWarningCount = 0;
@@ -274,7 +373,7 @@ const incompatibleSubmitBar = StudioSubmitBar({
   missingRequiredSource: false,
   missingRequiredSourceLabel: "请先上传产品",
   modelSwitchRequired: true,
-  modelSwitchMessage: seedance15ProductContext.modelSwitchMessage,
+  modelSwitchMessage: seedance15MultiProductContext.modelSwitchMessage,
   onModelSwitchRequired: () => { modelSwitchWarningCount += 1; },
   structuredDirty: false,
   submitting: false,
@@ -348,6 +447,26 @@ const seedance20VideoOption = {
     max_reference_audio: 0,
   },
 };
+assert.deepEqual(
+  markGenerationModelCompatibility(
+    [seedance15Option, grok15Option, grokReferenceOption, seedance20VideoOption],
+    {
+      use: "video",
+      creationMode: "video",
+      subjectMode: "product",
+      selected: null,
+      productAsset: { type: "image", url: "/product.png" },
+      productDetailAssets: [],
+    },
+  ).map((item) => [item.id, item.video_image_input_mode, item.selection_disabled === true]),
+  [
+    [15, VIDEO_IMAGE_INPUT_MODE.FIRST_FRAME, false],
+    [21, VIDEO_IMAGE_INPUT_MODE.FIRST_FRAME, false],
+    [20, VIDEO_IMAGE_INPUT_MODE.SUBJECT_REFERENCE, false],
+    [22, VIDEO_IMAGE_INPUT_MODE.SUBJECT_REFERENCE, false],
+  ],
+  "every enabled video capability profile must accept one product image through its real input mode",
+);
 const videoSubmission = (overrides = {}) => validateGenerationSubmission({
   uploading: false,
   parsing: false,
@@ -510,8 +629,8 @@ const seedancePortraitReference = videoSubmission({
   isEditMode: true,
   productAsset: { type: "image", url: "/portrait.png" },
 });
-assert.equal(seedancePortraitReference.ok, false);
-assert.match(seedancePortraitReference.message, /不支持独立人物参考图/);
+assert.equal(seedancePortraitReference.ok, true);
+assert.equal(seedancePortraitReference.videoImageInputMode, VIDEO_IMAGE_INPUT_MODE.FIRST_FRAME);
 const grok15Context = buildStudioModelContext({
   cfg: {},
   category: "video",
@@ -570,11 +689,24 @@ assert.deepEqual(
   filterModelOptions([grokReferenceOption, grok15Option], {
     use: "video",
     creationMode: "video",
+    subjectMode: "product",
     selected: null,
     productAsset: { type: "image", url: "/product.png" },
   }).map((item) => item.id),
-  [20],
-  "product reference mode must offer grok-imagine-video and hide Grok 1.5",
+  [20, 21],
+  "single product images must support both independent-reference and first-frame models",
+);
+assert.deepEqual(
+  filterModelOptions([grokReferenceOption, grok15Option, seedance15Option, seedance20VideoOption], {
+    use: "video",
+    creationMode: "video",
+    subjectMode: "product",
+    selected: null,
+    productAsset: { type: "image", url: "/product.png" },
+    productDetailAssets: [{ type: "image", url: "/detail.png" }],
+  }).map((item) => item.id),
+  [20, 22],
+  "multiple product images must remain limited to models with declared multi-reference capacity",
 );
 assert.deepEqual(
   filterModelOptions(

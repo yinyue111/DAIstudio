@@ -411,6 +411,9 @@ class Settings(BaseSettings):
     parse_localize_download_timeout_seconds: int = 15
     parse_localize_total_timeout_seconds: int = 45
     parse_localize_max_assets: int = 20
+    # Parallelize only remote reads. Image decoding, quota checks, storage, and
+    # database registration remain serial inside one parse task.
+    parse_localize_parallelism: int = 4
     # Upper bound for gateway-produced images before PIL converts/decompresses.
     # Keep it aligned with upload/parse caps so a bad gateway response cannot OOM a worker.
     generated_image_max_pixels: int = 50_000_000

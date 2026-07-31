@@ -1,4 +1,5 @@
 """Recoverable video lifecycle: non-blocking submit + self-polling + crash recovery."""
+import json
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
@@ -32,6 +33,7 @@ from app.services import (
     video_frames,
 )
 from app.services.config_store import get_setting, set_setting
+from app.services.gateway_video_payloads import VideoPayloadValidationError
 
 
 @pytest.fixture(autouse=True)
@@ -513,6 +515,128 @@ def test_video_submit_unknown_state_holds_for_review_without_refund(
         assert user.frozen_credits == 50
     finally:
         db.close()
+
+
+def test_video_submit_local_validation_error_fails_and_refunds(
+    client,
+    make_user,
+    auth,
+    monkeypatch,
+    quote_and_generate,
+):
+    make_user("13900002065", balance=1000, admin=True)
+    h = auth("13900002065")
+    _config_video(client, h)
+
+    def fail_submit(*_a, **_k):
+        raise VideoPayloadValidationError("当前模型不支持独立参考图")
+
+    monkeypatch.setattr("app.services.gateway.submit_video", fail_submit)
+    response = quote_and_generate({
+        "category": "video",
+        "stage": "preview",
+        "prompt": {"final_text": "local validation failure"},
+        "params": {"duration": 2},
+    }, headers=h)
+    assert response.status_code == 200, response.text
+
+    task = client.get(f"/api/tasks/{response.json()['id']}", headers=h).json()
+    assert task["status"] == "failed"
+    assert "本地校验" in task["error"]
+    assert task["cost_settled"] == 0
+    assert client.get("/api/me", headers=h).json()["balance_credits"] == 1000
+    with SessionLocal() as db:
+        row = db.get(GenTask, task["id"])
+        assert not (row.params or {}).get("_video_submit_state_unknown")
+
+
+def test_video_submit_json_decode_error_holds_for_reconciliation_without_refund(
+    client,
+    make_user,
+    auth,
+    monkeypatch,
+    quote_and_generate,
+):
+    make_user("13900002066", balance=1000, admin=True)
+    h = auth("13900002066")
+    _config_video(client, h)
+
+    def fail_after_response(*_a, **_k):
+        raise json.JSONDecodeError("invalid provider response", "not-json", 0)
+
+    monkeypatch.setattr("app.services.gateway.submit_video", fail_after_response)
+    response = quote_and_generate({
+        "category": "video",
+        "stage": "preview",
+        "prompt": {"final_text": "accepted but malformed response"},
+        "params": {"duration": 2},
+    }, headers=h)
+    assert response.status_code == 200, response.text
+
+    task = client.get(f"/api/tasks/{response.json()['id']}", headers=h).json()
+    assert task["status"] == "needs_review"
+    assert task["cost_settled"] == 0
+    me = client.get("/api/me", headers=h).json()
+    assert me["balance_credits"] == 950
+    assert me["frozen_credits"] == 50
+    with SessionLocal() as db:
+        row = db.get(GenTask, task["id"])
+        assert row.phase == "reconciling"
+        assert (row.params or {}).get("_video_submit_state_unknown") is True
+
+
+def test_video_first_frame_submit_strips_legacy_independent_references(monkeypatch):
+    first_frame = "https://example.com/product.png"
+    task = SimpleNamespace(
+        id=182,
+        stage="preview",
+        source_type="image",
+        source_asset_url=first_frame,
+        params={
+            "duration": 5,
+            "resolution": "720p",
+            "reference_width": 720,
+            "reference_height": 1280,
+            "subject_mode": "product",
+            "video_image_input_mode": "first_frame",
+            "first_frame_image": first_frame,
+            "product_reference_image": first_frame,
+            "product_detail_images": ["https://example.com/detail.png"],
+            "style_reference_image": "https://example.com/style.png",
+            "character_reference_image": "https://example.com/character.png",
+            "product_lock_mode": "locked",
+            "product_video_template": "prompt_driven",
+        },
+    )
+    monkeypatch.setattr(
+        generation_video_submit,
+        "gateway_reference_image",
+        lambda _db, _task, value, **_kwargs: value,
+    )
+
+    submitted = generation_video_submit.video_submit_params(None, task)
+    assert submitted["first_frame_image"] == first_frame
+    for key in (
+        "product_reference_image",
+        "product_detail_images",
+        "style_reference_image",
+        "character_reference_image",
+        "product_lock_mode",
+        "product_video_template",
+    ):
+        assert key not in submitted
+
+    persisted = generation_video_submit.video_persisted_params(task, task.params, submitted)
+    assert persisted["first_frame_image"] == first_frame
+    for key in (
+        "product_reference_image",
+        "product_detail_images",
+        "style_reference_image",
+        "character_reference_image",
+        "product_lock_mode",
+        "product_video_template",
+    ):
+        assert key not in persisted
 
 
 def test_video_submit_cancel_during_provider_call_preserves_cancel_and_refunds(

@@ -244,7 +244,10 @@ def submit_video(
         data = _gw._video_post(submit_path, payload, config=gateway_config)
     task_id = data.get(id_field) or data.get("task_id") or data.get("id") or data.get("request_id")
     if not task_id:
-        raise GatewayError(f"视频网关未返回任务号: {str(data)[:200]}")
+        raise GatewayError(
+            f"视频网关未返回任务号: {str(data)[:200]}",
+            submit_state_unknown=True,
+        )
     return str(task_id)
 
 
@@ -365,7 +368,10 @@ def _submit_video_ark(
         data = _gw._video_post("/contents/generations/tasks", payload, config=gateway_config)
     task_id = data.get("id")
     if not task_id:
-        raise GatewayError(f"Ark 未返回任务号: {str(data)[:200]}")
+        raise GatewayError(
+            f"Ark 未返回任务号: {str(data)[:200]}",
+            submit_state_unknown=True,
+        )
     return str(task_id)
 
 

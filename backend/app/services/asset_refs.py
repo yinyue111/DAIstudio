@@ -30,6 +30,7 @@ def gateway_ref_for_user_asset(
     min_side: int = 1,
     max_side: int = 384,
     prefer_original_upload: bool = False,
+    prefer_original_generated: bool = False,
     quality: int = 82,
     subsampling: int = 2,
     return_content_hash: bool = False,
@@ -69,7 +70,12 @@ def gateway_ref_for_user_asset(
         elif key.startswith(("upload/", "upload_preview/", "upload_video/", "upload_video_preview/")):
             raise AssetRefError("上传素材不存在")
         else:
-            path = generated_asset_reference_path(db, user_id, key)
+            path = generated_asset_reference_path(
+                db,
+                user_id,
+                key,
+                prefer_original=prefer_original_generated,
+            )
         if not path.exists() or not path.is_file():
             raise AssetRefError("素材文件不存在")
         raw = path.read_bytes()
@@ -193,7 +199,13 @@ def _preview_model_ref_path(preview_key: str):
     return model_ref if model_ref.exists() else preview
 
 
-def generated_asset_reference_path(db: Session, user_id: int, key: str):
+def generated_asset_reference_path(
+    db: Session,
+    user_id: int,
+    key: str,
+    *,
+    prefer_original: bool = False,
+):
     """Return a safe local image path for a generated asset reference.
 
     Generated HD/final files are protected by owner + unlock checks on the
@@ -213,6 +225,12 @@ def generated_asset_reference_path(db: Session, user_id: int, key: str):
         raise AssetRefError("生成素材不存在")
     if is_hd and not asset.unlocked:
         raise AssetRefError("请先解锁该素材后再作为参考")
+    if prefer_original and asset.type == "image" and asset.unlocked and asset.hd_url:
+        hd_key = storage.key_from_url(asset.hd_url)
+        if hd_key and hd_key.startswith("hd/"):
+            hd_path = storage.local_path(hd_key)
+            if hd_path.exists() and hd_path.is_file():
+                return hd_path
     if key.startswith("preview/"):
         model_ref_jpg_key = key.replace("preview/", "model_ref/", 1).rsplit(".", 1)[0] + ".jpg"
         model_ref_jpg_path = storage.local_path(model_ref_jpg_key)
