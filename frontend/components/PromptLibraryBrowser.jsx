@@ -117,7 +117,14 @@ export default function PromptLibraryBrowser({
 
   const total = library?.stats?.total || library?.items?.length || 0;
   const visibleItems = filteredItems.slice(0, visible);
-  const licenseSourceUrl = safeExternalUrl(license?.sourceUrl);
+  const licenseSources = (Array.isArray(license?.sources) ? license.sources : [license])
+    .map((source) => ({
+      name: source?.name || source?.source || "",
+      url: safeExternalUrl(source?.url || source?.sourceUrl),
+      license: source?.license || "",
+      licenseUrl: safeExternalUrl(source?.licenseUrl),
+    }))
+    .filter((source) => source.name && source.url);
 
   return (
     <div className={isPage ? "panel p-4 sm:p-5" : "mt-2.5 rounded-xl3 border border-line bg-base2/40 p-3 animate-fadeup"}>
@@ -131,17 +138,26 @@ export default function PromptLibraryBrowser({
             {description}
             {!isPage && library?.preview?.sourceTotal ? ` · 面板预览 ${library.items.length} / ${library.preview.sourceTotal}` : ""}
           </p>
-          {licenseSourceUrl && (
+          {licenseSources.length > 0 && (
             <p className="mt-1 text-[11px] text-fog">
               来源：
-              <a
-                className="text-brand hover:text-iris-400"
-                href={licenseSourceUrl}
-                target="_blank"
-                rel="noreferrer"
-              >
-                {license.source}
-              </a>
+              {licenseSources.map((source, index) => (
+                <span key={source.name}>
+                  {index > 0 ? <span> · </span> : null}
+                  <a className="text-brand hover:text-iris-400" href={source.url} target="_blank" rel="noreferrer">
+                    {source.name}
+                  </a>
+                  {source.licenseUrl ? (
+                    <>
+                      <span> (</span>
+                      <a className="hover:text-snow" href={source.licenseUrl} target="_blank" rel="noreferrer">
+                        {source.license}
+                      </a>
+                      <span>)</span>
+                    </>
+                  ) : null}
+                </span>
+              ))}
               <span> · 第三方参考库，公开商用前需完成授权和内容风险审核</span>
             </p>
           )}

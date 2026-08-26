@@ -1,6 +1,29 @@
 {
-  "source": "EvoLinkAI/awesome-gpt-image-2-API-and-Prompts",
+  "source": "EvoLinkAI + freestylefly + YouMind OpenLab",
   "sourceUrl": "https://github.com/EvoLinkAI/awesome-gpt-image-2-API-and-Prompts",
-  "licenseStatus": "third_party_reference",
-  "notice": "This prompt library is a third-party reference dataset. Keep attribution visible, review source license and remove high-risk people, brand, IP or adult-themed samples before public/commercial release."
+  "licenseStatus": "mixed_open_source_with_attribution",
+  "notice": "Curated third-party reference prompts and previews. Source attribution is preserved. Entries with explicit public figures, protected brands/IP, adult content, missing prompts, or missing previews are excluded during sync.",
+  "sources": [
+    {
+      "name": "EvoLinkAI/awesome-gpt-image-2-API-and-Prompts",
+      "url": "https://github.com/EvoLinkAI/awesome-gpt-image-2-API-and-Prompts",
+      "license": "CC0-1.0",
+      "licenseUrl": "https://creativecommons.org/publicdomain/zero/1.0/",
+      "revision": "e2a269ad1a055a0b4f6c1e170341c6c1aba30faa"
+    },
+    {
+      "name": "freestylefly/awesome-gpt-image-2",
+      "url": "https://github.com/freestylefly/awesome-gpt-image-2",
+      "license": "MIT",
+      "licenseUrl": "https://opensource.org/license/mit",
+      "revision": "685469889fb72fd5adefae45e1645d527edcb5e7"
+    },
+    {
+      "name": "YouMind-OpenLab/awesome-gpt-image-2",
+      "url": "https://github.com/YouMind-OpenLab/awesome-gpt-image-2",
+      "license": "CC-BY-4.0",
+      "licenseUrl": "https://creativecommons.org/licenses/by/4.0/",
+      "revision": "f2106b0137cedb1b471005ca8956392e31ef1f82"
+    }
+  ]
 }

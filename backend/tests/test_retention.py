@@ -1,7 +1,7 @@
 """Retention math (expiry / days_left / expired), including tz-naive coercion."""
 from datetime import datetime, timedelta, timezone
 
-from app.config import settings
+from app.config import Settings, settings
 from app.db import SessionLocal
 from app.models import (
     AssetReport,
@@ -15,6 +15,7 @@ from app.models import (
     UserDraft,
 )
 from app.services import credits, retention, storage
+from app.services.config_store import set_setting
 
 
 def _clear_active_generation_tasks(db):
@@ -48,6 +49,77 @@ def test_none_created_at():
     assert retention.is_expired(None, 30) is False
     assert retention.days_left(None, 30) is None
     assert retention.expiry_of(None, 30) is None
+
+
+def test_asset_retention_default_is_ten_years():
+    assert Settings.model_fields["asset_retention_days"].default == 3650
+
+
+def test_admin_retention_setting_applies_to_existing_assets(client, make_user, auth):
+    uid = make_user("13900000448", balance=1000)
+    make_user("13900000449", balance=1000, admin=True)
+    headers = auth("13900000449")
+    db = SessionLocal()
+    try:
+        old = datetime.now(timezone.utc) - timedelta(days=40)
+        asset = GenAsset(
+            user_id=uid,
+            type="image",
+            preview_url=None,
+            moderation_status="active",
+            created_at=old,
+        )
+        db.add(asset)
+        db.commit()
+        asset_id = asset.id
+
+        response = client.put(
+            "/api/admin/settings",
+            json={"asset_retention_days": 45},
+            headers=headers,
+        )
+        assert response.status_code == 200, response.text
+        assert response.json()["asset_retention_days"] == 45
+        db.expire_all()
+        assert retention.get_retention_days(db) == 45
+        assert retention.purge_expired(db, user_id=uid) == 0
+        assert db.get(GenAsset, asset_id) is not None
+
+        response = client.put(
+            "/api/admin/settings",
+            json={"asset_retention_days": 30},
+            headers=headers,
+        )
+        assert response.status_code == 200, response.text
+        db.expire_all()
+        assert retention.get_retention_days(db) == 30
+        assert retention.purge_expired(db, user_id=uid) == 1
+        assert db.get(GenAsset, asset_id) is None
+    finally:
+        db.close()
+
+
+def test_asset_retention_setting_rejects_out_of_range_values(client, make_user, auth):
+    make_user("13900000450", balance=1000, admin=True)
+    headers = auth("13900000450")
+
+    for value in (0, 3651):
+        response = client.put(
+            "/api/admin/settings",
+            json={"asset_retention_days": value},
+            headers=headers,
+        )
+        assert response.status_code == 422
+
+
+def test_asset_retention_falls_back_to_environment_default(client):
+    db = SessionLocal()
+    try:
+        assert retention.get_retention_days(db) == settings.asset_retention_days
+        set_setting(db, "asset_retention_days", 60)
+        assert retention.get_retention_days(db) == 60
+    finally:
+        db.close()
 
 
 def test_purge_parsed_previews_removes_file_and_row(client, make_user):
@@ -1486,6 +1558,7 @@ def test_purge_expired_detaches_asset_reports(client, make_user):
     uid = make_user("13900000447", balance=1000)
     db = SessionLocal()
     try:
+        set_setting(db, "asset_retention_days", 30)
         old = datetime.now(timezone.utc) - timedelta(days=60)
         task = GenTask(
             user_id=uid,

@@ -1,5 +1,5 @@
 """Personal profile: user info + a gallery of the user's generated assets,
-with 30-day (configurable) retention. Expired assets are filtered out and
+with configurable retention. Expired assets are filtered out and
 best-effort purged on load."""
 from __future__ import annotations
 

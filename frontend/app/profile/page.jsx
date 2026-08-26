@@ -566,10 +566,11 @@ export default function ProfilePage() {
             <span className="badge bg-black/70 text-white">{asset.origin === "fetched" ? "抓取" : asset.origin === "uploaded" ? "上传" : "生成"}</span>
             <span className="badge bg-black/70 text-white">{asset.type === "video" ? "视频" : "图片"}</span>
           </div>
-          <div className="pointer-events-none absolute bottom-2 left-2 flex flex-wrap gap-1">
-            {asset.retained && <span className="badge bg-aqua/90 text-black">长期保留</span>}
-            {!asset.retained && asset.days_left != null && <span className="badge bg-black/70 text-white">{asset.days_left} 天后过期</span>}
-          </div>
+          {asset.retained && (
+            <div className="pointer-events-none absolute bottom-2 left-2 flex flex-wrap gap-1">
+              <span className="badge bg-aqua/90 text-black">长期保留</span>
+            </div>
+          )}
         </div>
         <div className="space-y-2 p-3">
           <div className="flex min-w-0 items-center justify-between gap-2 text-xs text-fog">
@@ -829,7 +830,7 @@ export default function ProfilePage() {
       </main>
 
       {lightbox && (
-        <AssetPreviewDialog asset={lightbox} onClose={() => setLightbox(null)} onError={(error) => setMsg(error?.message || "预览加载失败")} meta={lightbox.retained ? " · 长期保留" : (lightbox.days_left != null ? ` · ${lightbox.days_left} 天后过期` : "")}>
+        <AssetPreviewDialog asset={lightbox} onClose={() => setLightbox(null)} onError={(error) => setMsg(error?.message || "预览加载失败")} meta={lightbox.retained ? " · 长期保留" : ""}>
           {({ asset }) => {
             const ref = unifiedAssetKey(asset);
             return (

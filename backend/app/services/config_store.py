@@ -4,7 +4,7 @@ from __future__ import annotations
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from ..config import load_models_yaml
+from ..config import load_models_yaml, settings
 from ..models import AppSetting, ModelConfig
 
 DEFAULT_SETTINGS = {
@@ -18,7 +18,7 @@ DEFAULT_SETTINGS = {
     "media_moderation_fail_open": False,
     "image_n": 1,
     "image_size": "1024x1024",
-    "asset_retention_days": 30,
+    "asset_retention_days": settings.asset_retention_days,
     "audit_retention_days": 90,
     "admin_api_rate_per_hour": 600,
     "admin_quota_grant_single_limit": 100000,

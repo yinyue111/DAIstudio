@@ -782,8 +782,8 @@ export function Settings({ launchLite = false }) {
           </label>
           <label className="flex items-center gap-2">
             素材保留天数
-            <input type="number" min="1" max="365" className="input w-20"
-              value={s.asset_retention_days ?? 30}
+            <input type="number" min="1" max="3650" step="1" className="input w-20"
+              value={s.asset_retention_days ?? 3650}
               onChange={(e) => setS({ ...s, asset_retention_days: e.target.value })} />
           </label>
           <label className="flex items-center gap-2">

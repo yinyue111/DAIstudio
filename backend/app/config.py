@@ -467,7 +467,7 @@ class Settings(BaseSettings):
     # when the image model has no explicit extra.edit_path. Set "" to force plain
     # text->image even with a reference image present.
     image_edit_path: str = "/v1/images/edits"
-    asset_retention_days: int = 30  # generated assets kept this long by default
+    asset_retention_days: int = 3650  # generated assets kept this long by default
     parse_retention_days: int = 7  # link-parse records kept this long
 
     # --- Payment / credit recharge ---

@@ -5281,3 +5281,50 @@ def test_0084_publishes_immutable_capability_versions_idempotently(
         )
     assert version_count_after_repeat == len(specs) * 2
     engine.dispose()
+
+
+def test_0085_updates_only_the_legacy_asset_retention_default(tmp_path, monkeypatch):
+    backend = Path(__file__).resolve().parents[1]
+    db_path = tmp_path / "asset-retention-default.db"
+    database_url = f"sqlite:///{db_path}"
+    monkeypatch.setattr(settings, "database_url", database_url)
+    cfg = Config(str(backend / "alembic.ini"))
+    cfg.set_main_option("script_location", str(backend / "alembic"))
+    command.upgrade(cfg, "0084_video_mode_constraints")
+
+    engine = sa.create_engine(database_url)
+    metadata = sa.MetaData()
+    app_settings = sa.Table("app_settings", metadata, autoload_with=engine)
+    with engine.begin() as connection:
+        connection.execute(
+            app_settings.insert().values(
+                key="asset_retention_days",
+                value={"v": 30},
+            )
+        )
+
+    command.upgrade(cfg, "0085_asset_retention_3650")
+    with engine.connect() as connection:
+        value = connection.scalar(
+            sa.select(app_settings.c.value).where(
+                app_settings.c.key == "asset_retention_days"
+            )
+        )
+    assert value == {"v": 3650}
+
+    command.downgrade(cfg, "0084_video_mode_constraints")
+    with engine.begin() as connection:
+        connection.execute(
+            sa.update(app_settings)
+            .where(app_settings.c.key == "asset_retention_days")
+            .values(value={"v": 45})
+        )
+    command.upgrade(cfg, "0085_asset_retention_3650")
+    with engine.connect() as connection:
+        value = connection.scalar(
+            sa.select(app_settings.c.value).where(
+                app_settings.c.key == "asset_retention_days"
+            )
+        )
+    assert value == {"v": 45}
+    engine.dispose()
