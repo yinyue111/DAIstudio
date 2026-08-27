@@ -1070,6 +1070,109 @@ def test_known_image_profile_enforces_platform_total_reference_limit():
 
 
 @pytest.mark.parametrize(
+    "model_id",
+    ["grok-imagine-image", "grok-imagine-image-quality"],
+)
+def test_grok_image_profile_accepts_explicit_custom_openai_transport(model_id):
+    model = type(
+        "CustomOpenAIGrokImageModel",
+        (),
+        {
+            "id": 99002,
+            "use": "image",
+            "model_id": model_id,
+            "display_name": model_id,
+            "provider": "custom_openai",
+            "gateway_format": "openai",
+            "is_default": False,
+            "sort_order": 0,
+            "cost_credits": 8,
+            "unlock_cost": 0,
+            "extra": {
+                "image_transport": "grok_images",
+                "capabilities": {
+                    "text_to_image": True,
+                    "image_to_image": True,
+                    "reference_image": True,
+                    "multi_reference": True,
+                    "max_reference_images": 2,
+                },
+            },
+        },
+    )()
+
+    assert_generation_capability(
+        model,
+        category="image",
+        source_asset_url=None,
+        source_type=None,
+        params={},
+    )
+    assert_generation_capability(
+        model,
+        category="image",
+        source_asset_url="https://example.com/source.png",
+        source_type="image",
+        params={},
+    )
+    capabilities = public_model_option(model)["capabilities"]
+    assert capabilities["text_to_image"] is True
+    assert capabilities["image_to_image"] is True
+    assert capabilities["reference_image"] is True
+
+
+@pytest.mark.parametrize(
+    ("gateway_format", "image_transport"),
+    [
+        ("openai", ""),
+        ("openai", "openai_images"),
+        ("ark", "grok_images"),
+    ],
+)
+def test_grok_image_profile_rejects_unverified_custom_openai_route(
+    gateway_format,
+    image_transport,
+):
+    model = type(
+        "UnverifiedCustomOpenAIGrokImageModel",
+        (),
+        {
+            "id": 99003,
+            "use": "image",
+            "model_id": "grok-imagine-image",
+            "display_name": "grok-imagine-image",
+            "provider": "custom_openai",
+            "gateway_format": gateway_format,
+            "is_default": False,
+            "sort_order": 0,
+            "cost_credits": 8,
+            "unlock_cost": 0,
+            "extra": {
+                "image_transport": image_transport,
+                "capabilities": {
+                    "text_to_image": True,
+                    "image_to_image": True,
+                    "reference_image": True,
+                },
+            },
+        },
+    )()
+
+    with pytest.raises(ModelCapabilityError, match="不支持文生图"):
+        assert_generation_capability(
+            model,
+            category="image",
+            source_asset_url=None,
+            source_type=None,
+            params={},
+        )
+    capabilities = public_model_option(model)["capabilities"]
+    assert capabilities["text_to_image"] is False
+    assert capabilities["image_to_image"] is False
+    assert capabilities["reference_image"] is False
+
+
+@pytest.mark.parametrize(
     ("provider", "gateway_format"),
     [
         ("custom_openai", "openai"),
