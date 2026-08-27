@@ -45,6 +45,11 @@ assert.doesNotMatch(profileSource, /offset: reset \? 0 : current\.length/, "curs
 assert.match(profileSource, /const hasMore = Boolean\(nextCursor\)/, "profile pagination must stop when the server cursor is exhausted");
 assert.match(profileSource, /assetMeta\(asset\)/, "asset cards must expose available media metadata");
 assert.match(profileSource, /retainedDelta/, "retention metadata changes must update the visible summary immediately");
+assert.doesNotMatch(
+  profileSource,
+  /days_left|\u5929\u540e\u8fc7\u671f/,
+  "user-facing asset views must not display remaining retention time",
+);
 assert.match(profileSource, /asset-library-search/, "the asset library must expose text search");
 assert.match(profileSource, /asset-library-tag/, "the asset library must expose tag filtering");
 assert.match(profileSource, /asset-library-folder/, "the asset library must expose folder filtering");

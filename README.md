@@ -536,6 +536,7 @@ SMS_TEMPLATE_CODE=<your-template-code>
 | `MAX_IMAGE_DIM` | 图片最大边长，默认 2048；当前前端隐藏 4K，2K 会按请求提交并展示网关实际返回图 |
 | `MAX_VIDEO_SECONDS` | 上传/参考视频源最大时长，默认 900 秒 |
 | `MAX_VIDEO_GENERATION_SECONDS` | 单条生成视频最大时长，默认 15 秒，应用层硬上限 15 秒 |
+| `ASSET_RETENTION_DAYS` | 新数据库的素材保留天数初始值，默认 3650；运行后在管理后台“平台设置”中动态修改，数据库配置优先 |
 | `REVERSE_VIDEO_FRAMES` | 视频反推抽帧数量 |
 | `WS_TICKET_RATE_PER_MINUTE` | 单用户 WebSocket ticket 申请频率，默认 60/分钟 |
 | `WS_CONNECT_RATE_PER_MINUTE` | 单用户 WebSocket 连接频率，默认 60/分钟 |

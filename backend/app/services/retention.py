@@ -93,9 +93,9 @@ def _image_render_started_at(params: dict | None, fallback: datetime | None) -> 
 
 def get_retention_days(db: Session) -> int:
     try:
-        return int(get_setting(db, "asset_retention_days", 30))
+        return int(get_setting(db, "asset_retention_days", settings.asset_retention_days))
     except Exception:
-        return 30
+        return int(settings.asset_retention_days)
 
 
 def _aware(dt: datetime | None) -> datetime | None:
