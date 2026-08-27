@@ -222,6 +222,7 @@ def _profile_route_matches(
     model_id: str,
     provider: str,
     gateway_format: str,
+    image_transport: str,
 ) -> bool:
     if not _profile_protocol_matches(use, model_id, gateway_format):
         return False
@@ -238,6 +239,16 @@ def _profile_route_matches(
         ("prompt", "gemini-3.1-pro-high"),
     }:
         return provider == "antigravity"
+    if (
+        provider == "custom_openai"
+        and image_transport == "grok_images"
+        and (use, model_id)
+        in {
+            ("image", "grok-imagine-image"),
+            ("image", "grok-imagine-image-quality"),
+        }
+    ):
+        return True
     if provider == "grok":
         return (use, model_id) in {
             ("image", "grok-imagine-image"),
@@ -305,6 +316,10 @@ def _verified_model_capabilities(model) -> dict | None:
     gateway_source = str(
         getattr(model, "gateway_source", None) or ""
     ).strip().lower()
+    extra = getattr(model, "extra", None)
+    image_transport = str(
+        extra.get("image_transport", "") if isinstance(extra, dict) else ""
+    ).strip().lower()
     profile = _profile_for_model(use, model_id)
     if profile is None:
         return None
@@ -321,7 +336,13 @@ def _verified_model_capabilities(model) -> dict | None:
         if not _profile_protocol_matches(use, model_id, gateway_format):
             return _disabled_profile(use)
         return profile
-    if not _profile_route_matches(use, model_id, provider, gateway_format):
+    if not _profile_route_matches(
+        use,
+        model_id,
+        provider,
+        gateway_format,
+        image_transport,
+    ):
         return _disabled_profile(use)
     return profile
 
