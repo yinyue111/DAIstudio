@@ -21,7 +21,10 @@ from ..schemas import (
 )
 from ..services import audit, gateway
 from ..services.config_store import get_model_config
-from ..services.model_discovery import annotate_discovered_models
+from ..services.model_discovery import (
+    annotate_discovered_models,
+    model_extra_with_defaults,
+)
 from ..services.model_gateway_config import (
     PROVIDER_PRESETS,
     ModelGatewayConfigError,
@@ -280,6 +283,13 @@ def create_model(
             )
     except ModelGatewayConfigError as e:
         raise HTTPException(400, str(e)) from e
+    row.extra = model_extra_with_defaults(
+        row.extra,
+        use=row.use,
+        provider=row.provider,
+        gateway_format=row.gateway_format,
+        model_id=row.model_id,
+    )
     db.flush()
     if body.is_default is True or has_default is None:
         _set_default(db, row)
@@ -350,7 +360,13 @@ def upsert_model(
     row.cost_credits = body.cost_credits
     row.unlock_cost = body.unlock_cost
     row.enabled = body.enabled
-    row.extra = body.extra
+    row.extra = model_extra_with_defaults(
+        body.extra,
+        use=row.use,
+        provider=row.provider,
+        gateway_format=row.gateway_format,
+        model_id=row.model_id,
+    )
     if body.is_default is True or not row.is_default:
         _set_default(db, row)
     _sync_use_model_versions(db, row.use)
@@ -443,6 +459,13 @@ def patch_model(
     ):
         if field in fields:
             setattr(row, field, getattr(body, field))
+    row.extra = model_extra_with_defaults(
+        row.extra,
+        use=row.use,
+        provider=row.provider,
+        gateway_format=row.gateway_format,
+        model_id=row.model_id,
+    )
     if body.is_default is True:
         _set_default(db, row)
     elif body.is_default is False and row.is_default:
@@ -673,6 +696,13 @@ def import_models(
                 api_key=body.api_key,
                 api_key_clear=False,
                 gateway_format=body.gateway_format,
+            )
+            row.extra = model_extra_with_defaults(
+                row.extra,
+                use=row.use,
+                provider=row.provider,
+                gateway_format=row.gateway_format,
+                model_id=row.model_id,
             )
             db.add(row)
             rows.append(row)

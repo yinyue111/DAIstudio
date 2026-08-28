@@ -302,11 +302,16 @@ def test_discovery_marks_only_explicit_media_models_as_importable():
 
 
 def test_discovery_marks_verified_grok_and_gemini_image_edit_models():
-    grok = annotate_discovered_models(
-        [{"id": "grok-imagine-image"}],
-        provider="grok",
+    grok_models = annotate_discovered_models(
+        [
+            {"id": "grok-imagine-image"},
+            {"id": "grok-imagine-image-quality"},
+            {"id": "grok-imagine-image-2.0"},
+        ],
+        provider="custom_openai",
         gateway_format="openai",
-    )[0]
+    )
+    grok = grok_models[0]
     gemini = annotate_discovered_models(
         [{"id": "gemini-3.1-flash-image"}],
         provider="antigravity",
@@ -317,6 +322,10 @@ def test_discovery_marks_verified_grok_and_gemini_image_edit_models():
     assert grok["default_extra"]["capabilities"]["image_to_image"] is True
     assert grok["default_extra"]["capabilities"]["max_reference_images"] == 2
     assert grok["default_extra"]["capabilities"]["mask_edit"] is False
+    assert all(model["recommended_uses"] == ["image"] for model in grok_models)
+    assert all(
+        model["default_extra"] == grok["default_extra"] for model in grok_models
+    )
     assert gemini["default_extra"]["edit_path"] == "/messages"
     assert gemini["default_extra"]["capabilities"]["image_to_image"] is True
     assert gemini["default_extra"]["capabilities"]["max_reference_images"] == 2

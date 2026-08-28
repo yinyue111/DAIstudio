@@ -11,6 +11,9 @@ class ModelCapabilityError(ValueError):
 
 
 _SEEDANCE_VERSION_RE = re.compile(r"^doubao-seedance-(\d+)-(\d+)(?:-|$)")
+_GROK_IMAGE_MODEL_RE = re.compile(
+    r"^grok-imagine-image(?:$|-[a-z0-9][a-z0-9.-]*)"
+)
 _VIDEO_IMAGE_INPUT_MODES = {"first_frame", "subject_reference"}
 
 _IMAGE_CAPABILITY_ALIASES = {
@@ -28,6 +31,25 @@ _IMAGE_CAPABILITY_ALIASES = {
     "mask_edit",
     "inpainting",
 }
+
+_GROK_IMAGE_CAPABILITIES = {
+    "text_to_image": True,
+    "image_to_image": True,
+    "reference_image": True,
+    "multi_reference": True,
+    "max_reference_images": 2,
+    "mask_edit": False,
+}
+
+
+def _is_grok_image_model(use: str, model_id: str) -> bool:
+    return bool(
+        use == "image"
+        and _GROK_IMAGE_MODEL_RE.fullmatch(model_id)
+        and not model_id.endswith("-edit")
+    )
+
+
 _VIDEO_CAPABILITY_ALIASES = {
     "text_to_video",
     "video_generation",
@@ -181,6 +203,8 @@ def _profile_for_model(use: str, model_id: str) -> dict | None:
     capabilities = _VERIFIED_MODEL_CAPABILITIES.get((use, model_id))
     if capabilities is not None:
         return capabilities
+    if _is_grok_image_model(use, model_id):
+        return _GROK_IMAGE_CAPABILITIES
     seedance_match = _SEEDANCE_VERSION_RE.match(model_id)
     if use == "video" and seedance_match is not None:
         version = int(seedance_match.group(1)), int(seedance_match.group(2))
@@ -238,6 +262,8 @@ def _profile_route_matches(
         ("prompt", "gemini-3.1-pro-high"),
     }:
         return provider == "antigravity"
+    if _is_grok_image_model(use, model_id):
+        return provider in {"grok", "custom_openai"}
     if provider == "grok":
         return (use, model_id) in {
             ("image", "grok-imagine-image"),
@@ -254,6 +280,8 @@ def _profile_route_matches(
 
 
 def _profile_protocol_matches(use: str, model_id: str, gateway_format: str) -> bool:
+    if _is_grok_image_model(use, model_id):
+        return gateway_format == "openai"
     if (use, model_id) in {
         ("image", "gpt-image-2"),
         ("image", "grok-imagine-image"),

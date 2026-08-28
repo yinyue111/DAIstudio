@@ -648,7 +648,7 @@ def test_admin_create_reuses_existing_provider_without_resubmitting_secret(
 
         def fake_list_models(config):
             seen["probe"] = config
-            return [{"id": "grok-imagine-image"}]
+            return [{"id": "grok-imagine-image-2.0"}]
 
         monkeypatch.setattr("app.routers.admin_models.gateway.list_models", fake_list_models)
         probed = client.post(
@@ -660,14 +660,15 @@ def test_admin_create_reuses_existing_provider_without_resubmitting_secret(
         assert seen["probe"].use == "image"
         assert seen["probe"].provider == "grok"
         assert seen["probe"].api_key == "saved-provider-secret"
+        assert probed.json()["models"][0]["recommended_uses"] == ["image"]
 
         created = client.post(
             "/api/admin/models",
             headers=headers,
             json={
                 "use": "image",
-                "model_id": "grok-imagine-image",
-                "display_name": "Grok Imagine Image",
+                "model_id": "grok-imagine-image-2.0",
+                "display_name": "Grok Imagine Image 2.0",
                 "provider_config_id": source_id,
                 "cost_credits": 15,
                 "is_default": False,
@@ -682,6 +683,21 @@ def test_admin_create_reuses_existing_provider_without_resubmitting_secret(
             assert target.base_url == "https://models.example.com/v1"
             assert target.gateway_format == "openai"
             assert decrypt_row_api_key(target) == "saved-provider-secret"
+            assert target.extra == {
+                "image_transport": "grok_images",
+                "response_format": "b64_json",
+                "edit_path": "/images/edits",
+                "edit_payload_format": "json",
+                "multi_image_edit_enabled": True,
+                "capabilities": {
+                    "text_to_image": True,
+                    "image_to_image": True,
+                    "reference_image": True,
+                    "multi_reference": True,
+                    "max_reference_images": 2,
+                    "mask_edit": False,
+                },
+            }
 
         conflict = client.post(
             "/api/admin/models",
@@ -852,6 +868,50 @@ def test_known_profile_does_not_reenable_an_admin_disabled_supported_mode():
             source_type=None,
             params={},
         )
+
+
+def test_grok_image_family_profile_supports_custom_openai_generation_and_editing():
+    model = type(
+        "GrokImage20Model",
+        (),
+        {
+            "id": 200,
+            "use": "image",
+            "model_id": "grok-imagine-image-2.0",
+            "display_name": "Grok Imagine Image 2.0",
+            "provider": "custom_openai",
+            "gateway_format": "openai",
+            "is_default": False,
+            "sort_order": 50,
+            "cost_credits": 8,
+            "unlock_cost": 0,
+            "extra": {},
+        },
+    )()
+
+    assert_generation_capability(
+        model,
+        category="image",
+        source_asset_url=None,
+        source_type=None,
+        params={},
+    )
+    assert_generation_capability(
+        model,
+        category="image",
+        source_asset_url="https://example.com/source.png",
+        source_type="image",
+        params={"style_reference_image": "https://example.com/style.png"},
+    )
+    option = public_model_option(model)
+    assert option["capabilities"] == {
+        "text_to_image": True,
+        "image_to_image": True,
+        "reference_image": True,
+        "multi_reference": True,
+        "max_reference_images": 2,
+        "mask_edit": False,
+    }
 
 
 def test_known_seedance_15_profile_overrides_stale_reference_flags():

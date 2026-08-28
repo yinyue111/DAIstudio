@@ -5328,3 +5328,106 @@ def test_0085_updates_only_the_legacy_asset_retention_default(tmp_path, monkeypa
         )
     assert value == {"v": 45}
     engine.dispose()
+
+
+def test_0086_adds_grok_image_20_from_the_saved_provider(tmp_path, monkeypatch):
+    backend = Path(__file__).resolve().parents[1]
+    db_path = tmp_path / "grok-image-20.db"
+    database_url = f"sqlite:///{db_path}"
+    monkeypatch.setattr(settings, "database_url", database_url)
+    cfg = Config(str(backend / "alembic.ini"))
+    cfg.set_main_option("script_location", str(backend / "alembic"))
+    command.upgrade(cfg, "0085_asset_retention_3650")
+
+    engine = sa.create_engine(database_url)
+    metadata = sa.MetaData()
+    model_configs = sa.Table("model_configs", metadata, autoload_with=engine)
+    capability_versions = sa.Table(
+        "model_capability_versions", metadata, autoload_with=engine
+    )
+    price_versions = sa.Table("model_price_versions", metadata, autoload_with=engine)
+    with engine.begin() as connection:
+        connection.execute(
+            model_configs.insert().values(
+                use="image",
+                model_id="grok-provider-source-for-20",
+                display_name="Grok provider source",
+                is_default=False,
+                sort_order=90,
+                provider="custom_openai",
+                base_url="https://models.example.com/v1",
+                api_key_encrypted="encrypted-grok-provider-key",
+                gateway_format="openai",
+                cost_credits=13,
+                unlock_cost=0,
+                enabled=True,
+                extra={},
+                deleted_at=None,
+            )
+        )
+
+    command.upgrade(cfg, "0086_grok_image_20")
+    with engine.connect() as connection:
+        model = connection.execute(
+            sa.select(model_configs).where(
+                model_configs.c.use == "image",
+                model_configs.c.model_id == "grok-imagine-image-2.0",
+                model_configs.c.deleted_at.is_(None),
+            )
+        ).mappings().one()
+        capability = connection.execute(
+            sa.select(capability_versions).where(
+                capability_versions.c.model_config_id == int(model["id"]),
+                capability_versions.c.is_active.is_(True),
+            )
+        ).mappings().one()
+        price = connection.execute(
+            sa.select(price_versions).where(
+                price_versions.c.model_config_id == int(model["id"]),
+                price_versions.c.is_active.is_(True),
+            )
+        ).mappings().one()
+
+    assert model["display_name"] == "Grok Imagine Image 2.0"
+    assert model["provider"] == "custom_openai"
+    assert model["gateway_format"] == "openai"
+    assert model["base_url"] == "https://models.example.com/v1"
+    assert model["api_key_encrypted"] == "encrypted-grok-provider-key"
+    assert model["enabled"] is True
+    assert model["extra"] == {
+        "image_transport": "grok_images",
+        "response_format": "b64_json",
+        "edit_path": "/images/edits",
+        "edit_payload_format": "json",
+        "multi_image_edit_enabled": True,
+        "capabilities": {
+            "text_to_image": True,
+            "image_to_image": True,
+            "reference_image": True,
+            "multi_reference": True,
+            "max_reference_images": 2,
+            "mask_edit": False,
+        },
+    }
+    assert capability["capabilities"] == model["extra"]["capabilities"]
+    assert capability["status"] == "published"
+    assert capability["metadata_snapshot"]["origin"] == "migration_0086"
+    assert price["base_cost_credits"] == 13
+    assert price["unlock_cost_credits"] == 0
+    assert price["pricing"]["image"] == {"1k": 8, "2k": 8, "4k": 8}
+    assert price["pricing"]["image_edit"] == {"1k": 8, "2k": 8, "4k": 8}
+
+    command.downgrade(cfg, "0085_asset_retention_3650")
+    command.upgrade(cfg, "0086_grok_image_20")
+    with engine.connect() as connection:
+        assert connection.scalar(
+            sa.select(sa.func.count(capability_versions.c.id)).where(
+                capability_versions.c.model_config_id == int(model["id"])
+            )
+        ) == 1
+        assert connection.scalar(
+            sa.select(sa.func.count(price_versions.c.id)).where(
+                price_versions.c.model_config_id == int(model["id"])
+            )
+        ) == 1
+    engine.dispose()

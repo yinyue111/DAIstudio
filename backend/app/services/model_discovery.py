@@ -2,9 +2,13 @@
 from __future__ import annotations
 
 import re
+from copy import deepcopy
 from typing import Any
 
 _SEEDANCE_VERSION_RE = re.compile(r"^doubao-seedance-(\d+)-(\d+)(?:-|$)")
+_GROK_IMAGE_MODEL_RE = re.compile(
+    r"^grok-imagine-image(?:$|-[a-z0-9][a-z0-9.-]*)"
+)
 
 _PROMPT_MODEL_PREFIXES = (
     "gpt-",
@@ -89,10 +93,10 @@ def _image_extra(
             "capabilities": {**capabilities, "mask_edit": False},
         }
     if (
-        provider == "grok"
+        provider in {"grok", "custom_openai"}
         and gateway_format == "openai"
-        and normalized_model_id
-        in {"grok-imagine-image", "grok-imagine-image-quality"}
+        and _GROK_IMAGE_MODEL_RE.fullmatch(normalized_model_id)
+        and not normalized_model_id.endswith("-edit")
     ):
         return {
             "image_transport": "grok_images",
@@ -103,6 +107,40 @@ def _image_extra(
             "capabilities": {**capabilities, "mask_edit": False},
         }
     return None
+
+
+def model_extra_with_defaults(
+    extra: dict[str, Any] | None,
+    *,
+    use: str,
+    provider: str | None,
+    gateway_format: str | None,
+    model_id: str,
+) -> dict[str, Any] | None:
+    """Merge verified adapter defaults without overriding explicit admin choices."""
+    if str(use or "").strip().lower() != "image":
+        return deepcopy(extra) if isinstance(extra, dict) else extra
+    defaults = _image_extra(
+        str(provider or "").strip().lower(),
+        str(gateway_format or "").strip().lower(),
+        str(model_id or "").strip(),
+    )
+    if defaults is None:
+        return deepcopy(extra) if isinstance(extra, dict) else extra
+    configured = deepcopy(extra) if isinstance(extra, dict) else {}
+    merged = {**deepcopy(defaults), **configured}
+    default_capabilities = defaults.get("capabilities")
+    configured_capabilities = configured.get("capabilities")
+    if isinstance(default_capabilities, dict):
+        merged["capabilities"] = {
+            **deepcopy(default_capabilities),
+            **(
+                deepcopy(configured_capabilities)
+                if isinstance(configured_capabilities, dict)
+                else {}
+            ),
+        }
+    return merged
 
 
 def _video_extra(
